@@ -2481,3 +2481,24 @@ describe("create-session input on touch-primary devices", () => {
     }
   });
 });
+
+describe("landing published attachment policy", () => {
+  it.each([[".mp4"], "*", undefined])("uses the published picker policy %j", (allowed) => {
+    renderLanding([], {
+      filesystem_attachment_policy:
+        allowed === undefined
+          ? undefined
+          : {
+              allowed_extensions: allowed as string[] | "*",
+              denied_extensions: [],
+              max_bytes: 100,
+              max_files: 1,
+              max_total_bytes: 100,
+              harnesses: ["claude-native"],
+            },
+    });
+    const input = screen.getByTestId("new-chat-landing-file-input") as HTMLInputElement;
+    if (Array.isArray(allowed)) expect(input.accept).toContain(".mp4");
+    else expect(input.hasAttribute("accept")).toBe(false);
+  });
+});

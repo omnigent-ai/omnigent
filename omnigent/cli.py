@@ -4410,6 +4410,7 @@ def server(
     from omnigent.server.server_config import (
         SESSION_TITLE_INSTRUCTIONS_KEY,
         config_str_list,
+        load_server_config,
     )
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -4421,14 +4422,21 @@ def server(
     from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     cfg = _load_config(config_path)
-    title_server_config = cfg
+    app_server_config = cfg
     if config_path is None:
         global_cfg = _load_global_config()
         title_instructions = global_cfg.get(SESSION_TITLE_INSTRUCTIONS_KEY)
-        title_server_config = (
+        app_server_config = (
             {SESSION_TITLE_INSTRUCTIONS_KEY: title_instructions}
             if title_instructions is not None
             else {}
+        )
+        app_server_config.update(
+            {
+                key: value
+                for key, value in load_server_config().items()
+                if key.startswith("filesystem_attachment_")
+            }
         )
 
     # Let the server-config reader (branding) see the same ``-c`` file.
@@ -4663,7 +4671,7 @@ def server(
         github_store=github_store,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
-        server_config=title_server_config,
+        server_config=app_server_config,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")

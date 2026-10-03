@@ -62,8 +62,20 @@ export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "customiz
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
 
+export interface FilesystemAttachmentPolicy {
+  inline_extensions?: Record<string, "image" | "pdf" | "text">;
+  non_inline_extensions?: string[];
+  allowed_extensions: string[] | "*";
+  denied_extensions: string[];
+  max_bytes: number;
+  max_files: number;
+  max_total_bytes: number;
+  harnesses: string[];
+}
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  filesystem_attachment_policy?: FilesystemAttachmentPolicy;
   accounts_enabled: boolean;
   /**
    * True only on an explicit single-user local runtime
@@ -200,6 +212,77 @@ export interface ServerInfo {
   branding?: Branding | null;
 }
 
+function parseFilesystemAttachmentPolicy(raw: unknown): FilesystemAttachmentPolicy | undefined {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const strings = (candidate: unknown): candidate is string[] =>
+    Array.isArray(candidate) &&
+    candidate.every((entry) => typeof entry === "string" && entry.length > 0);
+  const suffix = (entry: string) =>
+    entry.startsWith(".") &&
+    entry.length > 1 &&
+    !entry.includes("/") &&
+    !entry.includes("\\") &&
+    !/[\s:*\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(entry);
+  const extensions = (candidate: unknown): candidate is string[] =>
+    strings(candidate) && candidate.every(suffix);
+  const positiveInteger = (candidate: unknown): candidate is number =>
+    typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate > 0;
+  const {
+    allowed_extensions,
+    denied_extensions,
+    max_bytes,
+    max_files,
+    max_total_bytes,
+    harnesses,
+    inline_extensions,
+    non_inline_extensions,
+  } = value;
+  if (
+    (allowed_extensions !== "*" && !extensions(allowed_extensions)) ||
+    !extensions(denied_extensions) ||
+    !positiveInteger(max_bytes) ||
+    !positiveInteger(max_files) ||
+    !positiveInteger(max_total_bytes) ||
+    !strings(harnesses)
+  )
+    return undefined;
+  if (
+    inline_extensions !== undefined &&
+    (inline_extensions === null ||
+      typeof inline_extensions !== "object" ||
+      Array.isArray(inline_extensions))
+  )
+    return undefined;
+  if (non_inline_extensions !== undefined && !Array.isArray(non_inline_extensions))
+    return undefined;
+  return {
+    allowed_extensions,
+    denied_extensions,
+    max_bytes,
+    max_files,
+    max_total_bytes,
+    harnesses,
+    ...(inline_extensions === undefined
+      ? {}
+      : {
+          inline_extensions: Object.fromEntries(
+            Object.entries(inline_extensions).filter(
+              ([extension, category]) =>
+                suffix(extension) && ["image", "pdf", "text"].includes(category),
+            ),
+          ) as FilesystemAttachmentPolicy["inline_extensions"],
+        }),
+    ...(non_inline_extensions === undefined
+      ? {}
+      : {
+          non_inline_extensions: non_inline_extensions.filter(
+            (entry): entry is string => typeof entry === "string" && suffix(entry),
+          ),
+        }),
+  };
+}
+
 function parseBranding(raw: unknown): Branding | null {
   if (raw === null || typeof raw !== "object") return null;
   const value = raw as Record<string, unknown>;
@@ -296,6 +379,7 @@ let pendingServerInfo: Promise<ServerInfo> | null = null;
 
 /**
  * Fetch ``/v1/info`` once and cache the result.
+ * Policy changes require a server restart followed by a page reload.
  *
  * Resolves to ``FALLBACK_SERVER_INFO`` on any failure (network error, non-JSON,
  * 5xx). The frontend treats "no probe result" as "accounts is
@@ -356,6 +440,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           dictation_available: data.dictation_available === true,
           branding: parseBranding(data.branding),
+          filesystem_attachment_policy: parseFilesystemAttachmentPolicy(
+            data.filesystem_attachment_policy,
+          ),
         };
         return cachedServerInfo;
       }

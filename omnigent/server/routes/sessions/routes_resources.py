@@ -76,6 +76,7 @@ from omnigent.server.routes._sessions.helpers import (
     _ancestor_session_ids,
     _attachment_disposition,
     _await_settled_managed_launch,
+    _classify_attachment_upload,
     _enforce_filesystem_attachment_policy,
     _file_content_etag,
     _get_runner_client_for_resource_access,
@@ -215,6 +216,7 @@ def register_resources_routes(
             )
         await asyncio.to_thread(
             require_filesystem_attachment_runtime,
+            filename=filename,
             host_id=conv.host_id,
             runner_id=conv.runner_id,
             host_registry=host_registry,
@@ -1649,31 +1651,23 @@ def register_resources_routes(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        from omnigent.inner.native_attachments import requires_filesystem
         from omnigent.runtime.content_resolver import (
             _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
             ImageCompressionError,
-            _resolve_content_type,
-            attachment_text_type_for_extension,
             attachment_upload_limit,
             compress_image_attachment,
             image_filename_for_content_type,
             image_needs_compression,
         )
+        from omnigent.server.routes._sessions.helpers import _request_attachment_policy
 
-        # Validate the type and limits before buffering the file.
-        content_type = _resolve_content_type(
-            file.content_type,
-            file.filename,
+        policy = _request_attachment_policy(request)
+        filename, content_type, filesystem_required = _classify_attachment_upload(
+            file.filename, file.content_type, policy
         )
-        # Check the filename first so a misleading MIME cannot skip the
-        # harness requirement or the quotas for files that need local tools.
-        filesystem_required = requires_filesystem(file.filename)
         if filesystem_required:
-            # Drop the declared type so the file is never stored as text.
-            content_type = _resolve_content_type("application/octet-stream", file.filename)
-            await _require_filesystem_attachment_support(request, conv, file.filename)
+            await _require_filesystem_attachment_support(request, conv, filename)
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
@@ -1684,32 +1678,15 @@ def register_resources_routes(
         async with attachment_lock:
             if filesystem_required:
                 read_limit = _enforce_filesystem_attachment_policy(
-                    [file.filename],
-                    session_id=session_id,
-                    file_store=file_store,
+                    [filename], session_id=session_id, file_store=file_store, policy=policy
                 )
             else:
                 type_limit = attachment_upload_limit(content_type)
                 if type_limit is None:
-                    # The browser/OS can mislabel a text/code file as binary (e.g. a
-                    # .csv reported as application/vnd.ms-excel on Windows). Fall back
-                    # to the extension — matching the web client's allowlist — and
-                    # normalize the type so the resolver inlines it as text.
-                    ext_type = attachment_text_type_for_extension(file.filename)
-                    if ext_type is not None:
-                        content_type = ext_type
-                        type_limit = attachment_upload_limit(content_type)
-                if type_limit is None:
                     raise HTTPException(
-                        status_code=415,
-                        detail=(
-                            f"Unsupported attachment type '{content_type}'. Attach images, PDF, "
-                            "or text/code files, or use Claude Code or Codex for archives, "
-                            "Office documents, and databases."
-                        ),
+                        status_code=415, detail="Unsupported inline attachment type"
                     )
                 read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
-            filename = file.filename
             # Persist original dimensions only after a downscale.
             source_dims: tuple[int, int] | None = None
             if content_type in _COMPRESSIBLE_IMAGE_MIMES:
@@ -1733,9 +1710,7 @@ def register_resources_routes(
                         # A re-encode (e.g. PNG → JPEG) changes the type; realign the
                         # filename extension so name, bytes, and MIME stay consistent.
                         if resolved_type != content_type:
-                            filename = image_filename_for_content_type(
-                                file.filename, resolved_type
-                            )
+                            filename = image_filename_for_content_type(filename, resolved_type)
                         content, content_type = compressed, resolved_type
             else:
                 # PDF/text/SVG and other non-compressed types use their smaller
@@ -1747,7 +1722,11 @@ def register_resources_routes(
                 bytes=len(content),
                 content_type=content_type,
                 source_metadata=(
-                    {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
+                    {"delivery": "filesystem"}
+                    if filesystem_required
+                    else {"width": source_dims[0], "height": source_dims[1]}
+                    if source_dims
+                    else None
                 ),
             )
             try:
@@ -2042,17 +2021,40 @@ def register_resources_routes(
 
         # Files requiring filesystem tools entering a session pass the same checks as an upload,
         # held under the same lock, so a copy can't skip the harness or quotas.
-        from omnigent.inner.native_attachments import requires_filesystem
+        from omnigent.inner.native_attachments import (
+            requires_filesystem,
+            stored_file_requires_filesystem,
+        )
+        from omnigent.server.routes._sessions.helpers import _request_attachment_policy
 
+        policy = _request_attachment_policy(request)
+        classifications: dict[str, tuple[str, str | None, bool]] = {}
+        for stored in sources:
+            filesystem = stored_file_requires_filesystem(stored.filename, stored.source_metadata)
+            classification = _classify_attachment_upload(
+                stored.filename, stored.content_type, policy, historic_inline=not filesystem
+            )
+            classifications[stored.id] = (
+                classification
+                if filesystem or classification[2]
+                else (stored.filename, stored.content_type, False)
+            )
         filesystem_sources = [
             stored
             for stored in sources
-            if stored.filename and requires_filesystem(stored.filename)
+            if stored_file_requires_filesystem(stored.filename, stored.source_metadata)
+            or classifications[stored.id][2]
         ]
         if filesystem_sources:
-            await _require_filesystem_attachment_support(
-                request, conv, filesystem_sources[0].filename or ""
+            strongest = next(
+                (
+                    stored
+                    for stored in filesystem_sources
+                    if not requires_filesystem(stored.filename)
+                ),
+                filesystem_sources[0],
             )
+            await _require_filesystem_attachment_support(request, conv, strongest.filename)
         attachment_lock = (
             _attachment_upload_lock(session_id) if filesystem_sources else contextlib.nullcontext()
         )
@@ -2063,6 +2065,7 @@ def register_resources_routes(
                     session_id=session_id,
                     file_store=file_store,
                     sizes=[stored.bytes for stored in filesystem_sources],
+                    policy=policy,
                 )
             # Commit the copies one file at a time (read → create → put) so peak
             # memory is a single blob, not the whole batch. If any step fails
@@ -2075,11 +2078,16 @@ def register_resources_routes(
                     content = artifact_store.get(stored.blob_key or stored.id)
                     new = file_store.create(
                         session_id=session_id,
-                        filename=stored.filename,
+                        filename=classifications[stored.id][0],
                         bytes=stored.bytes,
-                        content_type=stored.content_type,
-                        # Preserve transform metadata on copies.
-                        source_metadata=stored.source_metadata,
+                        content_type="application/octet-stream"
+                        if stored in filesystem_sources
+                        else classifications[stored.id][1],
+                        source_metadata=(
+                            {**(stored.source_metadata or {}), "delivery": "filesystem"}
+                            if stored in filesystem_sources
+                            else stored.source_metadata
+                        ),
                     )
                     created.append(new.id)
                     artifact_store.put(new.id, content)

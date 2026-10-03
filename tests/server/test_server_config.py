@@ -628,3 +628,30 @@ def test_branding_logo_rejects_symlinked_assets_directory(
     (tmp_path / BRANDING_ASSETS_DIRNAME).symlink_to(external, target_is_directory=True)
 
     assert branding_logo_asset() is None
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ({}, {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"}),
+        ({"filesystem_attachment_allowed_extensions": []}, set()),
+        (
+            {"filesystem_attachment_allowed_extensions": ["MP4", ".mp4", " .Tar.Gz "]},
+            {".mp4", ".tar.gz"},
+        ),
+        ({"filesystem_attachment_allowed_extensions": "*"}, "*"),
+        ({"filesystem_attachment_allowed_extensions": ["*"]}, set()),
+        ({"filesystem_attachment_allowed_extensions": "mp4"}, set()),
+    ],
+)
+def test_filesystem_policy_snapshot_normalizes_replacement(monkeypatch, raw, expected) -> None:
+    calls = []
+
+    def load():
+        calls.append(True)
+        return raw
+
+    monkeypatch.setattr(server_config_module, "load_server_config", load)
+    policy = server_config_module.filesystem_attachment_policy()
+    assert policy.allowed_extensions == expected
+    assert len(calls) == 1

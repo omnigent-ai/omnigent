@@ -27,7 +27,10 @@ from os import PathLike
 from typing import Any, NoReturn
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.inner.native_attachments import (
+    CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_GENERALIZED_FILESYSTEM_ATTACHMENTS,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -56,6 +59,7 @@ CAP_MCP_INVENTORY = "mcp_inventory"
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
     CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_GENERALIZED_FILESYSTEM_ATTACHMENTS,
     CAP_MCP_INVENTORY,
 ]
 

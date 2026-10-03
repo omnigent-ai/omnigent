@@ -114,6 +114,7 @@ class RunnerSessionInitializer:
                     )
                     if attachment is not None:
                         require_filesystem_attachment_runtime(
+                            filename=attachment,
                             host_id=None,
                             runner_id=runner_id,
                             host_registry=None,

@@ -413,3 +413,37 @@ async def test_init_attributes_dropped_tunnel_to_runner(error: Exception) -> Non
     [failed] = [row for row in rows if row["event_name"] == "runner_session_init_failed"]
     assert failed["attributes"]["error_category"] == "runner"
     assert failed["attributes"]["error_impact"] == "transient"
+
+
+@pytest.mark.asyncio
+async def test_generalized_history_rechecks_replaced_runner_after_legacy_file(db_uri: str) -> None:
+    initializer, conversation, registry, client = _attachment_initializer(
+        db_uri, "sample.zip", [CAP_FILESYSTEM_ATTACHMENTS]
+    )
+    files = SqlAlchemyFileStore(db_uri)
+    video = files.create(
+        "clip.mp4", bytes=4, session_id=conversation.id, source_metadata={"delivery": "filesystem"}
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.append(
+        conversation.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="c" * 32,
+                data=MessageData(
+                    role="user", content=[{"type": "input_file", "file_id": video.id}]
+                ),
+            )
+        ],
+    )
+    client.release.set()
+    with pytest.raises(OmnigentError, match="Update Omnigent"):
+        await initializer.initialize(conversation, client, timeout=10)
+    assert not client.calls
+    registry.connection = _AdvertisedRunner(
+        [CAP_FILESYSTEM_ATTACHMENTS, "generalized_filesystem_attachments"]
+    )
+    response = await initializer.initialize(conversation, client, timeout=10)
+    assert response.status_code == 201
+    assert len(client.calls) == 1

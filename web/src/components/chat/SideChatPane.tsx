@@ -1,3 +1,4 @@
+import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -342,7 +343,9 @@ function SideChatComposer({
   const queryClient = useQueryClient();
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
   const [text, setText] = useState("");
-  const [files, setFiles] = useState<File[]>([]);
+  const { files, addFiles, removeFile, restoreFiles, clear, onPaste, accept, attachmentError } =
+    useComposerAttachments();
+  const [sendError, setSendError] = useState<string | null>(null);
   const [autoSend, setAutoSend] = useState<string | null>(null);
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -396,10 +399,16 @@ function SideChatComposer({
     }
     if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
     setText("");
+    setSendError(null);
     const outgoing = files;
-    setFiles([]);
+    clear();
     void send(trimmed, agentId, outgoing.length > 0 ? outgoing : undefined, {
       pinnedConversationId: childId,
+      onError: (message) => {
+        setText((current) => (current ? `${trimmed}\n\n${current}` : trimmed));
+        restoreFiles((current) => [...outgoing, ...current]);
+        setSendError(message);
+      },
     }).finally(refreshLabels);
   };
 
@@ -410,15 +419,20 @@ function SideChatComposer({
           ref={fileInputRef}
           type="file"
           multiple
-          accept="image/*,application/pdf,text/*,application/json"
+          accept={accept}
           className="hidden"
           onChange={(event) => {
             if (event.target.files) {
-              setFiles((prev) => [...prev, ...Array.from(event.target.files ?? [])]);
+              addFiles(Array.from(event.target.files));
               event.target.value = "";
             }
           }}
         />
+      )}
+      {(attachmentError || sendError) && (
+        <p role="alert" className="mb-2 text-sm text-destructive">
+          {attachmentError || sendError}
+        </p>
       )}
       <ChatComposer
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
@@ -429,6 +443,7 @@ function SideChatComposer({
           placeholder: "Ask a side question...",
           disabled: !ready,
           "data-testid": "side-chat-input",
+          onPaste: pending ? undefined : onPaste,
           onKeyDown: (event, intent) => {
             if (intent.shouldSubmitFromKeyboard) {
               event.preventDefault();
@@ -439,10 +454,7 @@ function SideChatComposer({
         slots={{
           attachments:
             !pending && files.length > 0 ? (
-              <ComposerAttachments
-                files={files}
-                onRemove={(index) => setFiles((prev) => prev.filter((_, i) => i !== index))}
-              />
+              <ComposerAttachments files={files} onRemove={removeFile} />
             ) : undefined,
         }}
         actions={{

@@ -1,3 +1,5 @@
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { create } from "zustand";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
@@ -11,7 +13,15 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as rtlRender,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter } from "react-router-dom";
@@ -35,6 +45,27 @@ import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+
+const defaultAttachmentPolicy = {
+  allowed_extensions: [".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"],
+  denied_extensions: [],
+  max_bytes: 50 * 1024 * 1024,
+  max_files: 20,
+  max_total_bytes: 200 * 1024 * 1024,
+  harnesses: ["claude-native", "codex-native"],
+};
+function DefaultAttachmentProvider({ children }: { children: React.ReactNode }) {
+  return (
+    <CapabilitiesProvider
+      info={{ ...FALLBACK_SERVER_INFO, filesystem_attachment_policy: defaultAttachmentPolicy }}
+    >
+      {children}
+    </CapabilitiesProvider>
+  );
+}
+function render(ui: ReactElement, options?: Parameters<typeof rtlRender>[1]) {
+  return rtlRender(ui, { wrapper: DefaultAttachmentProvider, ...options });
+}
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -5949,4 +5980,55 @@ describe("saved sandbox inference policy", () => {
       expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("Composer published attachment policy", () => {
+  afterEach(cleanup);
+  it.each([[".mp4"], "*", undefined])("uses the published picker policy %j", (allowed) => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          filesystem_attachment_policy:
+            allowed === undefined
+              ? undefined
+              : {
+                  allowed_extensions: allowed as string[] | "*",
+                  denied_extensions: [],
+                  max_bytes: 100,
+                  max_files: 1,
+                  max_total_bytes: 100,
+                  harnesses: ["claude-native"],
+                },
+        }}
+      >
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    if (Array.isArray(allowed)) expect(input.accept).toContain(".mp4");
+    else expect(input.hasAttribute("accept")).toBe(false);
+  });
+});
+
+it("preserves an older server's rejected unknown file in the failed-send draft", () => {
+  setComposerState({ conversationId: "conv_test", skills: [] });
+  clearSessionDrafts();
+  render(
+    <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+      <Composer {...composerProps()} />
+    </CapabilitiesProvider>,
+  );
+  act(() =>
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_test",
+        text: "analyze this",
+        files: [new File(["video"], "clip.mp4", { type: "video/mp4" })],
+      },
+    }),
+  );
+  expect(screen.getByText("clip.mp4")).toBeInTheDocument();
+  expect(textarea()).toHaveValue("analyze this");
+  cleanup();
 });

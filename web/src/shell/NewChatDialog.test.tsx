@@ -7712,6 +7712,18 @@ function fileDrag(files: File[] = []) {
 // in-session composer; files ride the pending-prompt handoff (covered in
 // the flow tests), this suite covers the local chip UI.
 describe("NewChatLandingScreen attachments", () => {
+  // A deployment whose published policy admits archives but no video.
+  const videoDisallowedPolicy = {
+    allowed_extensions: [".zip"],
+    denied_extensions: [],
+    max_bytes: 50 * 1024 * 1024,
+    max_files: 20,
+    max_total_bytes: 200 * 1024 * 1024,
+    harnesses: ["claude-native", "codex-native"],
+  };
+  const renderLandingWithPolicy = () =>
+    renderLanding({ filesystem_attachment_policy: videoDisallowedPolicy });
+
   beforeEach(setupLandingMocks);
   afterEach(() => {
     cleanup();
@@ -7788,24 +7800,71 @@ describe("NewChatLandingScreen attachments", () => {
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
-  // An unsupported attachment has to be caught HERE, before the session
-  // exists. Letting it through means the upload only 415s after the session
-  // is created and navigated into — stranding the typed message in a session
-  // the user never wanted.
-  it("rejects an unsupported attachment instead of attaching it", () => {
-    renderLanding();
+  // A file the published policy disallows has to be caught HERE, before the
+  // session exists. Letting it through means the upload only 415s after the
+  // session is created and navigated into — stranding the typed message.
+  it("rejects a file the published policy disallows instead of attaching it", () => {
+    renderLandingWithPolicy();
     const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [clip] },
     });
     expect(screen.queryByText("clip.mp4")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
-      "archives, office documents, and databases are supported",
+      '"clip.mp4" can\'t be attached: this file type is not allowed by server policy.',
     );
   });
 
-  it("keeps the supported files from a mixed drop and names the rejected one", () => {
+  // An older server publishes no policy, so the landing invents no restriction:
+  // the server's verdict decides, and a refusal hands the unfiltered draft back.
+  it("leaves an unpublished-policy file for the server and keeps it when the server refuses", async () => {
+    let rejectCreate: (() => void) | null = null;
+    authenticatedFetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          rejectCreate = () =>
+            resolve({
+              ok: false,
+              status: 400,
+              json: async () => ({ detail: "workspace already in use" }),
+              text: async () => "workspace already in use",
+            } as unknown as Response);
+        }),
+    );
     renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "inspect this video" },
+    });
+    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [clip] },
+    });
+    expect(screen.getByText("clip.mp4")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-file-input").hasAttribute("accept")).toBe(false);
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(rejectCreate).not.toBeNull());
+
+    await act(async () => {
+      rejectCreate!();
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-error").textContent).toContain(
+        "workspace already in use",
+      ),
+    );
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "inspect this video",
+    );
+    expect(screen.getByText("clip.mp4")).toBeTruthy();
+  });
+
+  it("keeps the supported files from a mixed drop and names the rejected one", () => {
+    renderLandingWithPolicy();
     const composer = screen.getByTestId("new-chat-landing-composer");
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
     const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
@@ -7824,7 +7883,7 @@ describe("NewChatLandingScreen attachments", () => {
     // The rejected file is never attached, so there is no chip to remove and
     // nothing else clears the notice. Left sticky it reads as a blocker on a
     // composer that can actually be submitted.
-    renderLanding();
+    renderLandingWithPolicy();
     const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [clip] },
@@ -7903,7 +7962,7 @@ describe("NewChatLandingScreen attachments", () => {
             } as unknown as Response);
         }),
     );
-    renderLanding();
+    renderLandingWithPolicy();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );

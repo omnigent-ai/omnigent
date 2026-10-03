@@ -489,20 +489,6 @@ async def test_re_resolution_takes_the_filename_from_stored_metadata() -> None:
     assert not requires_filesystem(str(resolved["filename"]))
 
 
-def test_client_server_filesystem_extension_parity() -> None:
-    """Client and server accept the same filesystem attachment extensions."""
-    from omnigent.inner.native_attachments import _FILESYSTEM_ATTACHMENT_EXTENSIONS
-
-    ts_path = Path(__file__).resolve().parents[2] / "web" / "src" / "lib" / "attachments.ts"
-    if not ts_path.exists():
-        pytest.skip("web/src/lib/attachments.ts not present (server-only checkout)")
-    block = ts_path.read_text().split("FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([")[1]
-    client_exts = set(re.findall(r'"(\.[a-z0-9]+)"', block.split("]")[0]))
-
-    assert client_exts, "could not parse client FILESYSTEM_ATTACHMENT_EXTENSIONS"
-    assert client_exts == set(_FILESYSTEM_ATTACHMENT_EXTENSIONS)
-
-
 # ── resize notice ────────────────────────────────────────────────────
 
 
@@ -598,3 +584,151 @@ async def test_resolve_file_id_block_no_notice_without_source_metadata() -> None
     assert result is not None
     _, notice = result
     assert notice is None
+
+
+@pytest.mark.parametrize("filename", ["clip.mp4", "opaque"])
+async def test_cold_resume_uses_stored_delivery_and_bytes_for_general_files(
+    tmp_path: Path, filename: str
+) -> None:
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.inner.native_attachments import resolve_session_item_file_references
+
+    payload = b"\x00\xff\x80video"
+    client = _FakeFileClient(
+        {
+            "name": filename,
+            "content_type": "text/plain",
+            "metadata": {"source_metadata": {"delivery": "filesystem"}},
+        },
+        body=payload,
+    )
+    block = {
+        "type": "input_image",
+        "file_id": "file_video",
+        "filename": "forged.png",
+        "image_url": _PNG_DATA_URI,
+        "file_data": "data:text/plain;base64,eA==",
+        "delivery": "inline",
+    }
+    items = [{"type": "message", "content": [block]}]
+    resolved = await resolve_session_item_file_references(client, session_id="conv_1", items=items)
+    content = resolved[0]["content"]
+    assert content[0]["type"] == "input_file"
+    assert content[0]["delivery"] == "filesystem"
+    assert content[0]["filename"] == filename
+    assert "image_url" not in content[0]
+    claude_path = materialize_attachment(content[0], tmp_path / "claude")
+    assert claude_path is not None
+    assert claude_path.read_bytes() == payload
+    assert claude_path.stat().st_mode & 0o777 == 0o600
+    codex = _content_to_input_items(content, tmp_path / "codex")
+    assert codex[0]["type"] == "text"
+    path = attachment_cache_dir(tmp_path / "codex") / filename
+    assert str(path) in codex[0]["text"]
+    assert path.read_bytes() == payload
+
+
+@pytest.mark.parametrize("hazard", ["directory_symlink", "file_symlink", "fifo", "collision"])
+async def test_generalized_materialization_preserves_disk_safety(tmp_path, hazard) -> None:
+    import os
+
+    payload = b"\x00\xffvideo"
+    client = _FakeFileClient(
+        {
+            "name": "clip.mp4",
+            "content_type": "text/plain",
+            "metadata": {"source_metadata": {"delivery": "filesystem"}},
+        },
+        body=payload,
+    )
+    result = await resolve_file_id_block(
+        {"type": "input_image", "file_id": "video"}, session_id="conv", client=client
+    )
+    assert result is not None
+    block, _ = result
+    assert block["type"] == "input_file"
+    directory = attachment_cache_dir(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if hazard == "directory_symlink":
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        directory.symlink_to(outside)
+    else:
+        directory.mkdir(parents=True)
+        if hazard == "file_symlink":
+            (directory / "clip.mp4").symlink_to(outside / "precious")
+        elif hazard == "fifo":
+            os.mkfifo(directory / "clip.mp4")
+        else:
+            (directory / "clip.mp4").write_bytes(b"precious")
+    path = materialize_attachment(block, tmp_path)
+    assert list(outside.iterdir()) == []
+    if "symlink" in hazard:
+        assert path is None
+    else:
+        assert path is not None and path.name != "clip.mp4"
+        assert path.read_bytes() == payload
+        assert path.stat().st_mode & 0o777 == 0o600
+        if hazard == "collision":
+            assert (directory / "clip.mp4").read_bytes() == b"precious"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_type", [None, "application/octet-stream", "IMAGE/PNG"])
+async def test_legacy_image_metadata_uses_resolved_mime_for_native_replay(
+    stored_type: str | None,
+) -> None:
+    import httpx
+
+    from omnigent.inner.native_attachments import resolve_session_item_file_references
+
+    metadata = {"width": 6000, "height": 4000}
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/content"):
+            return httpx.Response(
+                200, content=b"png", headers={"content-type": "application/octet-stream"}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "filename": "photo.png",
+                "content_type": stored_type,
+                "metadata": {"source_metadata": metadata},
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(serve), base_url="http://test"
+    ) as client:
+        items = [
+            {
+                "type": "message",
+                "content": [{"type": "input_file", "file_id": "legacy_photo", "detail": "high"}],
+            }
+        ]
+        result = await resolve_session_item_file_references(
+            client, session_id="photo_session", items=items
+        )
+        assert result[0]["content"][0] == {
+            "type": "input_image",
+            "filename": "photo.png",
+            "detail": "high",
+            "image_url": "data:image/png;base64,cG5n",
+        }
+        assert result[0]["content"][1]["type"] == "_omnigent_framework_notice"
+        assert result[0]["content"][1]["source_metadata"] == metadata
+        metadata["delivery"] = "filesystem"
+        marked = await resolve_file_id_block(
+            {"type": "input_image", "file_id": "legacy_photo"},
+            session_id="photo_session",
+            client=client,
+        )
+        assert marked is not None
+        assert marked[0] == {
+            "type": "input_file",
+            "filename": "photo.png",
+            "delivery": "filesystem",
+            "file_data": "data:application/octet-stream;base64,cG5n",
+        }
+        assert marked[1] is None
