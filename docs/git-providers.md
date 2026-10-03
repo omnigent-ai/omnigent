@@ -23,7 +23,8 @@ one. Use the `GitProvider` protocol in `omnigent.git_providers` as the contract:
 - A `FacetModules` value containing optional module paths. Only a caller that
   needs a facet imports it; unset facets mean that capability is unavailable.
 
-Descriptors should use only the standard library and perform no network calls.
+Keep descriptor imports lightweight and perform no network calls. Load local
+configuration parsers only when reading the CLI's saved hosts.
 A provider can supply `request_name` (such as `"merge request"`) and
 `number_prefix` (such as `"!"`) for shared UI labels. The defaults are
 `"pull request"` and `"#"`.
@@ -34,7 +35,14 @@ broken imports are logged and skipped so other providers remain available.
 
 ## Host configuration and identity
 
-`OMNIGENT_GIT_PROVIDER_<ID>_HOSTS` supplies comma-separated configured instances.
+The session panel discovers requests from every provider represented by the
+checkout's remotes. A tracked request from one provider does not disable the
+others. Selecting a particular request reads that request independently of the
+checkout, and removing a request prevents discovery from adding it again.
+
+Providers should recognize their public hosts and the instances in their CLI's
+existing login configuration without requiring Omnigent settings.
+`OMNIGENT_GIT_PROVIDER_<ID>_HOSTS` optionally adds comma-separated instances.
 Providers decide how those instances map to their URLs and authentication.
 GitHub also recognizes `GH_HOST` and the signed-in hosts in the gh CLI config.
 Existing GitHub Enterprise pull request URLs retain their parsing behavior.

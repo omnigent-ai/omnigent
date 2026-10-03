@@ -13,7 +13,7 @@
  *   `NewProjectButton`, so creating a project here is the same
  *   `POST /v1/projects` the sidebar performs.
  * - Pull requests come through the GitHub panel's query cache
- *   (`fetchGithubInfo`), throttled per session by `usePullRequests`.
+ *   (`fetchPullRequestInfo`), throttled per session by `usePullRequests`.
  * - Card positions live in localStorage (`canvasStorage.ts`), keyed by server
  *   identity and viewer; the server never learns the layout. Every card's spot
  *   is saved once the full list is known — grid slots included — so nothing

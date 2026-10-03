@@ -44,7 +44,7 @@ from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPat
 from omnigent.entities.pagination import paginate_in_memory
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
-from omnigent.runner import github_resource
+from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
     _glob_to_regex,
@@ -567,21 +567,20 @@ class WorkspaceReader:
             "after": after,
         }
 
-    # ── GitHub integration (read-only) ────────────────────────────
+    # ── Pull request panel (read-only) ────────────────────────────
     # Serve the same read-only PR metadata + the PR's files / diff the runner's
-    # GitHub endpoints do, so the tab keeps working when the runner is offline
-    # but the host still holds the workspace. Delegates to the shared
-    # ``github_resource`` helpers against this reader's confined root; the list
-    # and patch come from ``gh`` (the developer's authenticated CLI) and only the
-    # per-file reader shells out to a read-only ``git show``.
+    # pull request endpoints do, so the tab keeps working when the runner is
+    # offline but the host still holds the workspace. Delegates to the shared
+    # ``pr_resource`` dispatcher against this reader's confined root, which runs
+    # the git provider's CLI or API (``gh`` for GitHub).
 
     def github_info(
         self, session_id: str | None = None, pr_url: str | None = None
     ) -> _WorkspacePayload:
-        """GitHub context for an explicit session PR or the workspace branch."""
+        """PR context for an explicit session PR or the workspace branch."""
         return cast(
             "_WorkspacePayload",
-            github_resource.github_info(
+            pr_resource.pr_info(
                 str(self._root),
                 session_id=session_id,
                 pr_url=pr_url,
@@ -594,7 +593,7 @@ class WorkspaceReader:
         """The selected PR's changed files."""
         return cast(
             "_WorkspacePayload",
-            github_resource.github_changed_files(
+            pr_resource.pr_changed_files(
                 str(self._root),
                 session_id=session_id,
                 pr_url=pr_url,
@@ -614,7 +613,7 @@ class WorkspaceReader:
         """Before/after content for the selected PR's revisions."""
         return cast(
             "_WorkspacePayload",
-            github_resource.github_file_diff(
+            pr_resource.pr_file_diff(
                 str(self._root),
                 base or "",
                 relative_path,
@@ -632,7 +631,7 @@ class WorkspaceReader:
         """The selected PR's unified diff patch."""
         return cast(
             "_WorkspacePayload",
-            github_resource.github_pr_diff(
+            pr_resource.pr_diff(
                 str(self._root),
                 session_id=session_id,
                 pr_url=pr_url,

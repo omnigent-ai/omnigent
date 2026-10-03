@@ -76,8 +76,14 @@ class SessionPrRegistry:
             return _Registry()
 
     def list(self) -> list[SessionPullRequest]:
-        """Read an atomic snapshot; corruption is reported without overwriting it."""
-        return sorted(self._read().prs, key=lambda pr: pr.last_seen_at, reverse=True)
+        """Keep explicit activity first; later discovery must not change the default PR."""
+        return sorted(
+            self._read().prs,
+            key=lambda pr: (
+                pr.relationship == "inferred",
+                pr.first_seen_at if pr.relationship == "inferred" else -pr.last_seen_at,
+            ),
+        )
 
     def _write(self, state: _Registry) -> None:
         fd, temporary = tempfile.mkstemp(prefix=".session-prs-", dir=self.path.parent)
