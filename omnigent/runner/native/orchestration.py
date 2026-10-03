@@ -7827,6 +7827,10 @@ class _ClaudeSessionLaunchMetadata:
     external_session_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
+    #: Launch Claude Code on its own native ``~/.claude`` config: skip
+    #: provider/ucode resolution and the catalog-derived launch model.
+    #: Persisted as a session label by ``omnigent claude --use-native-config``.
+    use_native_config: bool = False
     #: Both routing fields come from ``routing_class_from_snapshot``, so an
     #: auto-harness session always reads as routing-enabled too. Deriving them
     #: separately was the bug: a sub-agent child of a routed parent carries the
@@ -7851,6 +7855,7 @@ def _claude_launch_metadata_from_envelope(
     """Project Claude launch metadata without server callbacks."""
     from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
+        CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     )
@@ -7874,6 +7879,7 @@ def _claude_launch_metadata_from_envelope(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        use_native_config=snapshot.labels.get(CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY) == "1",
     )
 
 
@@ -7884,6 +7890,7 @@ async def _load_legacy_claude_launch_metadata(
     """Fetch Claude launch metadata for servers predating the init envelope."""
     from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
+        CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     )
@@ -7940,6 +7947,7 @@ async def _load_legacy_claude_launch_metadata(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        use_native_config=labels.get(CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY) == "1",
     )
     permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
     _logger.info(
@@ -8451,28 +8459,41 @@ async def _auto_create_claude_terminal(
 
     inference_config = load_runtime_inference_config()
     claude_binding = binding_for_harness(inference_config, "claude-native")
-    try:
-        if resolve_launch_config is not None:
-            claude_config = await resolve_launch_config()
-        else:
-            claude_config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
-    except click.ClickException:
-        # An authoritative Databricks response with no Claude models is a
-        # configuration failure, not permission to bypass the gateway.
-        raise
-    except Exception:
-        if claude_binding is not None:
-            raise
-        _logger.warning(
-            "native-claude: could not derive a provider/ucode launch config "
-            "— FALLING BACK to Claude Code's own login; "
-            "your configured provider will NOT be used. Check "
-            "`omnigent setup --no-internal-beta` "
-            "and that the secret resolves in this process.",
-            exc_info=True,
+    if launch_metadata.use_native_config:
+        # The session was launched with ``--use-native-config``: the user chose
+        # Claude Code's own ~/.claude config, so no provider/ucode config is
+        # derived and any configured binding is ignored — mirroring the
+        # CLI-launched path's ``use_claude_config``.
+        _logger.info(
+            "native-claude: session=%s uses Claude Code's own native config "
+            "(--use-native-config); skipping provider/ucode resolution",
+            session_id,
             extra={"session_id": session_id},
         )
-        _launch_config_resolution_failed = True
+        claude_binding = None
+    else:
+        try:
+            if resolve_launch_config is not None:
+                claude_config = await resolve_launch_config()
+            else:
+                claude_config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
+        except click.ClickException:
+            # An authoritative Databricks response with no Claude models is a
+            # configuration failure, not permission to bypass the gateway.
+            raise
+        except Exception:
+            if claude_binding is not None:
+                raise
+            _logger.warning(
+                "native-claude: could not derive a provider/ucode launch config "
+                "— FALLING BACK to Claude Code's own login; "
+                "your configured provider will NOT be used. Check "
+                "`omnigent setup --no-internal-beta` "
+                "and that the secret resolves in this process.",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            _launch_config_resolution_failed = True
     # A transient resolver failure must not be cached as "no provider configured".
     # A routed session's turn-1 ``/model`` can only reach ids this launch env
     # spells, so point the family aliases at the router's frozen arms before the
@@ -8511,7 +8532,14 @@ async def _auto_create_claude_terminal(
     # Bound here so the vocabulary record below reads the same rows the
     # launch validated against, whether or not that validation ran.
     launch_catalog: list[dict[str, object]] | None = None
-    if claude_binding is None and (session_model_override or launch_model is None):
+    # A native-config launch passes no catalog-derived ``--model`` — Claude
+    # resolves its own default — and a bound harness resolves its model
+    # without the catalog, so neither consults it here.
+    if (
+        not launch_metadata.use_native_config
+        and claude_binding is None
+        and (session_model_override or launch_model is None)
+    ):
         from omnigent.harnesses.claude_native.main import (
             claude_catalog_launch_spelling,
             claude_catalog_serves_model,
