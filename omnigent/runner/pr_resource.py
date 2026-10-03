@@ -219,9 +219,14 @@ def _title_facets(root: str, entries: list[SessionPullRequest]) -> dict[str, Pul
     """Map each tracked provider whose titles can be looked up now to its facet."""
     facets: dict[str, PullRequestFacet] = {}
     for provider_id in dict.fromkeys(entry.provider for entry in entries):
-        facet = _facet(provider_id)
-        if facet is not None and facet.titles_available(root):
-            facets[provider_id] = facet
+        try:
+            facet = _facet(provider_id)
+            if facet is not None and facet.titles_available(root):
+                facets[provider_id] = facet
+        except Exception:  # noqa: BLE001 — optional titles must not hide the selected PR
+            _logger.warning(
+                "Git provider %s could not prepare PR title lookup", provider_id, exc_info=True
+            )
     return facets
 
 
@@ -260,7 +265,11 @@ def _session_prs_with_titles(
     def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, bool] | None:
         if time.monotonic() >= deadline:
             return None
-        title, timed_out = facets[entry.provider].pr_title(root, entry, deadline)
+        try:
+            title, timed_out = facets[entry.provider].pr_title(root, entry, deadline)
+        except Exception:  # noqa: BLE001 — keep the existing cache when an optional lookup fails
+            _logger.warning("Git provider %s failed in pr_title", entry.provider, exc_info=True)
+            return None
         return entry.url, title, timed_out
 
     may_cache = time.monotonic() < request_deadline

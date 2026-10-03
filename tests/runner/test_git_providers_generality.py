@@ -356,3 +356,128 @@ def test_the_fake_answers_only_for_its_mcp_tool(facet: FakeGitLabFacet) -> None:
 
     assert ([ref.url for ref in refs], created) == ([MR], True)
     assert extract_prs("mcp__gitlab__list_merge_requests", {}, result) == ([], False)
+
+
+def test_legacy_resources_route_a_mixed_provider_session(
+    facet: FakeGitLabFacet, repo: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runner import github_resource as github
+
+    github_url = "https://github.com/example/project/pull/42"
+    registry = SessionPrRegistry("mixed-session")
+    for timestamp, url in enumerate([github_url, MR], start=1):
+        registry.record(
+            [PullRequestRef.from_url(url)],
+            relationship="created",
+            source="test",
+            timestamp=timestamp,
+        )
+    monkeypatch.setattr(github.shutil, "which", lambda _: "/bin/gh")
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _: None)
+    monkeypatch.setattr(github, "_list_accounts", lambda _: (True, []))
+    calls = []
+
+    def gh(args: list[str], **_kwargs) -> tuple[int, str, str]:
+        calls.append(args)
+        assert HOST not in " ".join(args)
+        if args[:2] == ["pr", "view"]:
+            assert args[args.index("-R") + 1] == "github.com/example/project"
+            return 0, json.dumps({"number": 42, "title": "GitHub PR", "state": "OPEN"}), ""
+        if args[:2] == ["pr", "diff"]:
+            assert args[-1] == "github.com/example/project"
+            return 0, "github patch", ""
+        assert args[-1].startswith("repos/example/project/pulls/42/files")
+        return 0, json.dumps([[{"filename": "github.py", "status": "modified"}]]), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    info = github.github_info(repo, session_id="mixed-session")
+    assert (info["provider"], info["selected_pr_url"]) == ("gitlab", MR)
+    assert {entry["url"]: entry["title"] for entry in info["prs"]} == {
+        github_url: "GitHub PR",
+        MR: "MR 7",
+    }
+    info = github.github_info(repo, session_id="mixed-session", pr_url=github_url)
+    assert (info["provider"], info["selected_pr_url"]) == ("github", github_url)
+    assert {entry["url"] for entry in info["prs"]} == {github_url, MR}
+
+    calls.clear()
+    facet.calls.clear()
+    assert github.github_changed_files(repo, session_id="mixed-session")["data"] == []
+    assert (
+        github.github_pr_diff(repo, session_id="mixed-session")["unavailable_reason"]
+        == "pr_outside_workspace"
+    )
+    assert (
+        github.github_file_diff(repo, "", "a.py", session_id="mixed-session", pr_url=MR)["after"]
+        == "new"
+    )
+    assert facet.calls == ["changed_files", "pr_diff", "file_diff"]
+    assert calls == []
+
+    assert (
+        github.github_changed_files(repo, session_id="mixed-session", pr_url=github_url)["data"][
+            0
+        ]["path"]
+        == "github.py"
+    )
+    assert (
+        github.github_pr_diff(repo, session_id="mixed-session", pr_url=github_url)["patch"]
+        == "github patch"
+    )
+    assert len(calls) == 2
+    info = github.update_session_pr(repo, "mixed-session", MR, "remove")
+    assert (info["provider"], info["selected_pr_url"]) == ("github", github_url)
+    assert [entry["url"] for entry in info["prs"]] == [github_url]
+    assert [entry.url for entry in registry.list()] == [github_url]
+
+
+@pytest.mark.parametrize("method", ["load_facet", "titles_available", "pr_title"])
+def test_optional_title_failure_keeps_selected_pr_and_healthy_titles(
+    facet: FakeGitLabFacet, repo: str, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    selected = "https://github.com/example/project/pull/42"
+    healthy = "https://github.com/example/project/pull/43"
+    registry = SessionPrRegistry("mixed-session")
+    registry.record(
+        [PullRequestRef.from_url(url) for url in [selected, healthy, MR]],
+        relationship="created",
+        source="test",
+    )
+    registry.update_titles({MR: "Last known MR title"}, timestamp=1)
+    before = next(entry for entry in registry.list() if entry.url == MR)
+    github = provider_registry.load_facet("github", "pull_requests")
+    monkeypatch.setattr(
+        github,
+        "reference_info",
+        lambda _root, ref: {
+            "provider": "github",
+            "selected_pr_url": ref.url,
+            "pr": {"title": "Selected GitHub PR"},
+        },
+    )
+    monkeypatch.setattr(github, "titles_available", lambda _root: True)
+    monkeypatch.setattr(github, "pr_title", lambda *_args: ("Healthy GitHub title", False))
+
+    def broken(*_args):
+        raise RuntimeError("External forge unavailable")
+
+    if method == "load_facet":
+        original = pr_resource._facet
+
+        def load(provider_id):
+            if provider_id == "gitlab":
+                broken()
+            return original(provider_id)
+
+        monkeypatch.setattr(pr_resource, "_facet", load)
+    else:
+        monkeypatch.setattr(facet, method, broken)
+    info = pr_resource.pr_info(repo, session_id="mixed-session", pr_url=selected)
+
+    assert (info["provider"], info["selected_pr_url"]) == ("github", selected)
+    assert {entry["url"]: entry["title"] for entry in info["prs"]} == {
+        selected: "Selected GitHub PR",
+        healthy: "Healthy GitHub title",
+        MR: "Last known MR title",
+    }
+    assert next(entry for entry in registry.list() if entry.url == MR) == before
