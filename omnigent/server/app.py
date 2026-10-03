@@ -17,6 +17,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -85,6 +86,7 @@ from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_pool import ServerMcpPool
+from omnigent.server.mobile_push_config import FcmConfig, FcmInfo, PushInfo
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
     ServerPerformanceMetrics,
@@ -161,6 +163,7 @@ class BrandingInfo(BaseModel):
 
 
 class ServerInfoResponse(BaseModel):
+    push: PushInfo | None = None
     accounts_enabled: bool
     single_user: bool
     login_url: str | None
@@ -1479,6 +1482,23 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    fcm_config = FcmConfig.from_env(resolved_feature_flags)
+    from omnigent.server.mobile_push import MobilePushService
+    from omnigent.server.mobile_push_sender import FcmSender
+    from omnigent.server.mobile_push_store import MobilePushStore
+    from omnigent.server.server_config import mobile_push_preview
+
+    push_preview = mobile_push_preview(resolved_server_config)
+    mobile_push_store = None
+    push_service = None
+    if fcm_config is not None:
+        mobile_push_store = MobilePushStore(conversation_store.storage_location)
+        push_service = MobilePushService(
+            mobile_push_store,
+            conversation_store,
+            FcmSender(fcm_config, httpx.AsyncClient(timeout=10, follow_redirects=False)),
+            preview=push_preview,
+        )
     resolved_extension_state = _resolve_extension_state(extension_state)
     extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
 
@@ -1624,6 +1644,8 @@ def create_app(
             conversation_store,
             runner_router,
         )
+        if push_service is not None:
+            await push_service.start()
 
         from omnigent.runner.resource_registry import (
             SessionResourceRegistry,
@@ -1793,6 +1815,8 @@ def create_app(
             await cancel_managed_launch_tasks()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
+            if push_service is not None:
+                await push_service.stop()
             set_resource_registry(None)
             set_runner_ws_factory(None)
             set_runner_direct_attach_resolver(None)
@@ -1836,6 +1860,10 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    app.state.mobile_push_store = mobile_push_store
+    from omnigent.server.routes.mobile_push import create_mobile_push_router
+
+    app.include_router(create_mobile_push_router(mobile_push_store, fcm_config, auth_provider))
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -2958,6 +2986,13 @@ def create_app(
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
+                "push": PushInfo(
+                    fcm=FcmInfo(
+                        enabled=fcm_config is not None,
+                        project_id=fcm_config.project_id if fcm_config else None,
+                    ),
+                    preview=push_preview,
+                ),
                 "single_user": single_user,
                 "login_url": login_url,
                 "needs_setup": needs_setup,

@@ -1513,6 +1513,38 @@
         "title": "DailyCost",
         "type": "object"
       },
+      "DeviceRegistration": {
+        "properties": {
+          "fcm_token": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "pattern": "^\\S+$",
+            "title": "Fcm Token",
+            "type": "string"
+          },
+          "firebase_project_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Firebase Project Id",
+            "type": "string"
+          },
+          "platform": {
+            "enum": [
+              "android",
+              "ios"
+            ],
+            "title": "Platform",
+            "type": "string"
+          }
+        },
+        "required": [
+          "platform",
+          "fcm_token",
+          "firebase_project_id"
+        ],
+        "title": "DeviceRegistration",
+        "type": "object"
+      },
       "ElicitationRequestEvent": {
         "description": "Synchronous request for a decision from upstream.\n\nEmitted by Omnigent (or, under the new contract, by a harness)\nwhen the LLM / a tool / a policy needs a verdict before\nproceeding. The consumer replies via\n`POST /v1/sessions/{session_id}/events` with\n`type == \"approval\"` and\n`omnigent.server.schemas.ElicitationResult` fields in\n`data`. This preserves MCP request/reply correlation by id\nwithout threading elicitations through PATCH.\n\nWire shape matches the existing emit at\n`omnigent/runtime/policies/approval.py:175`.",
         "properties": {
@@ -2522,6 +2554,30 @@
           "status"
         ],
         "title": "FailedResponseObject",
+        "type": "object"
+      },
+      "FcmInfo": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "FcmInfo",
         "type": "object"
       },
       "FunctionCallData": {
@@ -4024,6 +4080,23 @@
         "title": "ProjectOrderResponse",
         "type": "object"
       },
+      "PushInfo": {
+        "properties": {
+          "fcm": {
+            "$ref": "#/components/schemas/FcmInfo"
+          },
+          "preview": {
+            "default": false,
+            "title": "Preview",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "fcm"
+        ],
+        "title": "PushInfo",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -4835,6 +4908,16 @@
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
+          },
+          "push": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PushInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "sandbox_provider": {
             "anyOf": [
@@ -10404,6 +10487,90 @@
         "summary": "Me",
         "tags": [
           "system"
+        ]
+      }
+    },
+    "/v1/mobile-push/devices/{installation_id}": {
+      "delete": {
+        "operationId": "unregister_v1_mobile_push_devices__installation_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "installation_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_-]+$",
+              "title": "Installation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unregister",
+        "tags": [
+          "mobile-push"
+        ]
+      },
+      "put": {
+        "operationId": "register_v1_mobile_push_devices__installation_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "installation_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_-]+$",
+              "title": "Installation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceRegistration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register",
+        "tags": [
+          "mobile-push"
         ]
       }
     },

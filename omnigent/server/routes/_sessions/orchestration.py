@@ -6526,7 +6526,7 @@ async def _forward_event_to_runner(
             session_id,
             extra={"session_id": session_id},
         )
-        _publish_status(session_id, "idle")
+        _publish_status(session_id, "idle", push_eligible=False)
         raise OmnigentError(
             "Runner is unreachable; message was persisted but could not be delivered. "
             "The runner may be restarting — retry or spawn a new session.",
@@ -6811,6 +6811,10 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    if body.type == "message" and body.data.get("role") == "user":
+        from omnigent.server.mobile_push import observe_input
+
+        observe_input(session_id)
     if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
@@ -7369,7 +7373,7 @@ async def _relay_runner_stream(
                 # "Error · runner_disconnected". The one-shot marker was
                 # already consumed by the relay teardown, so a genuine later
                 # disconnect surfaces normally.
-                _publish_status(session_id, "idle")
+                _publish_status(session_id, "idle", push_eligible=False)
                 await _persist_session_status_error_labels(
                     session_id,
                     None,
@@ -8850,11 +8854,11 @@ def configure_subagent_block_notifier(
         wake_dispatch=_wake_dispatch,
         loop=loop,
     )
-    _pending_elicitations.set_elicitation_observer(notifier.observe)
+    remove_observer = _pending_elicitations.add_elicitation_observer(notifier.observe)
 
     def _uninstall() -> None:
         """Remove the observer and cancel any outstanding wake futures."""
-        _pending_elicitations.set_elicitation_observer(None)
+        remove_observer()
         notifier.close()
 
     return _uninstall
