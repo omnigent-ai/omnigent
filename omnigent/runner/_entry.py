@@ -514,11 +514,25 @@ class _InitialAuthTokenFactory:
             self._retry_discovery_at = time.monotonic() + _AUTH_DISCOVERY_RETRY_INTERVAL_S
             if not self._no_credential_logged:
                 self._no_credential_logged = True
-                _logger.error(
-                    "host bootstrap bearer expired and no SDK/OIDC credential is available "
-                    "to renew it; run `databricks auth login` to re-authenticate",
-                    extra={"session_id": runner_primary_session_id()},
-                )
+                from omnigent.cli_auth import stored_login_renewal_refusal
+
+                refusal = stored_login_renewal_refusal(self._server_url)
+                if refusal:
+                    from omnigent.util.server_url import display_server_url_without_userinfo
+
+                    _logger.error(
+                        "host bootstrap token expired and the stored login could not "
+                        "renew it (%s); run `omnigent login %s` to re-authenticate",
+                        refusal,
+                        display_server_url_without_userinfo(self._server_url),
+                        extra={"session_id": runner_primary_session_id()},
+                    )
+                else:
+                    _logger.error(
+                        "host bootstrap token expired and no SDK/OIDC credential is available "
+                        "to renew it; run `databricks auth login` to re-authenticate",
+                        extra={"session_id": runner_primary_session_id()},
+                    )
         elif token:
             self._no_credential_logged = False
         return token
@@ -568,7 +582,7 @@ class _InitialAuthTokenFactory:
                 return bool(invalidate()) if callable(invalidate) else False
             self._initial_token = None
             _logger.info(
-                "host bootstrap bearer rejected; resolving runner-local auth",
+                "host bootstrap token rejected; resolving runner-local auth",
                 extra={"session_id": runner_primary_session_id()},
             )
             return True

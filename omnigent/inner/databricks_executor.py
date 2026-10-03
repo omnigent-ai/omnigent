@@ -864,6 +864,12 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     return _DatabricksBearerAuth(host_cfg, failure_message=host_failure), host
 
 
+# Cap distinct resolution-failure reasons remembered for log de-duplication;
+# SDK messages can embed variable detail, so a never-recovering process must
+# not accumulate them without bound.
+_MAX_LOGGED_FAILURES = 32
+
+
 class _ReusedDatabricksTokenSource:
     """Reuse SDK auth, re-resolving it after a token mint fails."""
 
@@ -873,6 +879,7 @@ class _ReusedDatabricksTokenSource:
         self._server_url = server_url
         self._host = host
         self._auth: _DatabricksBearerAuth | None = None
+        self._logged_failures: set[str] = set()
 
     def _resolve(self) -> _DatabricksBearerAuth | None:
         """Resolve fresh SDK auth, returning ``None`` on credential failure."""
@@ -887,7 +894,15 @@ class _ReusedDatabricksTokenSource:
             if workspace_host is not None:
                 return _resolve_databricks_auth(host=workspace_host)[0]
             return _resolve_databricks_auth()[0]
-        except (DatabricksAuthError, ImportError, ValueError):
+        except (DatabricksAuthError, ImportError, ValueError) as exc:
+            # Resolution is retried on every mint while no auth is cached, so
+            # report each distinct reason once rather than on every attempt.
+            reason = str(exc)
+            if reason not in self._logged_failures:
+                if len(self._logged_failures) >= _MAX_LOGGED_FAILURES:
+                    self._logged_failures.clear()
+                self._logged_failures.add(reason)
+                logger.info("Databricks SDK credential resolution failed: %s", reason)
             return None
 
     def current_token(self) -> str | None:
@@ -902,6 +917,7 @@ class _ReusedDatabricksTokenSource:
         if auth is None:
             return None
         self._auth = auth
+        self._logged_failures.clear()
         try:
             return auth.current_token()
         except DatabricksAuthError:

@@ -50,6 +50,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.util.server_url import display_server_url_without_userinfo
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -209,13 +210,16 @@ def test_make_auth_token_factory_returns_factory_when_databricks_creds_available
 
 def test_make_auth_token_factory_returns_none_without_databricks_creds(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Without Databricks credentials the factory is ``None``.
+    """Without Databricks credentials the factory is ``None`` and the
+    resolution failure's reason reaches the log.
 
     Local unauthenticated servers don't need auth — the runner
     connects over loopback without a bearer token.
 
     :param monkeypatch: Pytest environment patch fixture.
+    :param caplog: Pytest log capture fixture.
     :returns: None.
     """
     from omnigent.inner.databricks_executor import DatabricksAuthError
@@ -232,7 +236,14 @@ def test_make_auth_token_factory_returns_none_without_databricks_creds(
         _no_creds,
     )
 
-    assert _make_auth_token_factory() is None
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.databricks_executor"):
+        assert _make_auth_token_factory() is None
+
+    assert any(
+        "Databricks SDK credential resolution failed: no Databricks credentials configured"
+        in record.getMessage()
+        for record in caplog.records
+    ), [r.getMessage() for r in caplog.records]
 
 
 def test_make_auth_token_factory_re_resolves_when_reused_sdk_auth_goes_stale(
@@ -442,6 +453,58 @@ def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
         "Bearer managed-minted-token",
     ]
     assert len(mint_calls) >= 1
+
+
+def test_rejected_bootstrap_diagnosis_names_refused_stored_login_renewal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When fallback resolution fails after the host bearer was invalidated
+    and the stored login's renewal was refused, the failure diagnosis names
+    the refusal instead of claiming no SDK/OIDC credential was available."""
+    monkeypatch.setattr(
+        "omnigent.cli_auth.stored_login_renewal_refusal",
+        lambda _url: "refresh refused with HTTP 403",
+    )
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda *_a, **_kw: None)
+
+    # The server URL carries basic-auth userinfo; the login hint must not echo it.
+    factory = _InitialAuthTokenFactory(
+        "host-bootstrap-token", "https://user:s3cret@srv.example.com"
+    )
+    assert factory.invalidate()
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner._entry"):
+        assert factory() is None
+
+    messages = [record.getMessage() for record in caplog.records]
+    # The hint must name the exact credential-free login command, never userinfo.
+    safe_url = display_server_url_without_userinfo("https://user:s3cret@srv.example.com")
+    assert any(
+        "stored login could not renew it (refresh refused with HTTP 403)" in message
+        and f"`omnigent login {safe_url}`" in message
+        for message in messages
+    ), messages
+    assert not any("no SDK/OIDC credential is available" in m for m in messages), messages
+    assert not any("s3cret" in m or "user:" in m for m in messages), messages
+
+
+def test_rejected_bootstrap_diagnosis_without_stored_login_reports_no_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With no stored login (nothing was refused), the no-credential
+    diagnosis is accurate and stays."""
+    monkeypatch.setattr("omnigent.cli_auth.stored_login_renewal_refusal", lambda _url: None)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda *_a, **_kw: None)
+
+    factory = _InitialAuthTokenFactory("host-bootstrap-token", "https://srv.example.com")
+    assert factory.invalidate()
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner._entry"):
+        assert factory() is None
+
+    assert any(
+        "no SDK/OIDC credential is available" in record.getMessage() for record in caplog.records
+    )
 
 
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(

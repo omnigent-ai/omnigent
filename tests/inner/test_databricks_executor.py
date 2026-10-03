@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import sys
 import threading
 import unittest
@@ -2658,3 +2659,92 @@ def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
     assert source.current_token() is None
     available["ok"] = True
     assert source.current_token() == "tok-late"
+
+
+def test_reused_token_source_logs_each_resolution_failure_reason_once(monkeypatch, caplog):
+    """The failure reason is logged once per distinct failure, not per retried
+    mint, and again when a later-recovered source fails the same way."""
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _DatabricksBearerAuth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    class _Cfg:
+        stale = False
+
+        def authenticate(self):
+            if self.stale:
+                raise DatabricksAuthError("cached token went stale")
+            return {"Authorization": "Bearer tok"}
+
+    state: dict = {"reason": "not logged in", "cfg": None}
+
+    def _fake_resolve(profile=None, *, host=None):
+        if state["cfg"] is None:
+            raise DatabricksAuthError(state["reason"])
+        return _DatabricksBearerAuth(state["cfg"], profile_name=None), "https://ex.test"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    source = _ReusedDatabricksTokenSource()
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.databricks_executor"):
+        assert source.current_token() is None
+        assert source.current_token() is None
+        state["reason"] = "profile 'dev' is not authenticated"
+        assert source.current_token() is None
+        cfg = _Cfg()
+        state["cfg"] = cfg
+        assert source.current_token() == "tok"
+        cfg.stale = True
+        state["cfg"] = None
+        assert source.current_token() is None
+
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if "credential resolution failed" in record.getMessage()
+    ] == [
+        "Databricks SDK credential resolution failed: not logged in",
+        "Databricks SDK credential resolution failed: profile 'dev' is not authenticated",
+        "Databricks SDK credential resolution failed: profile 'dev' is not authenticated",
+    ]
+
+
+def test_reused_token_source_dedups_alternating_failure_reasons(monkeypatch, caplog):
+    """Distinct reasons that alternate across retried mints each log once, not
+    on every attempt, so a flapping failure does not spam the log."""
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _ReusedDatabricksTokenSource,
+    )
+
+    state = {"reason": "reason A"}
+
+    def _fake_resolve(profile=None, *, host=None):
+        raise DatabricksAuthError(state["reason"])
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    source = _ReusedDatabricksTokenSource()
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.databricks_executor"):
+        assert source.current_token() is None
+        state["reason"] = "reason B"
+        assert source.current_token() is None
+        state["reason"] = "reason A"
+        assert source.current_token() is None
+        state["reason"] = "reason B"
+        assert source.current_token() is None
+
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if "credential resolution failed" in record.getMessage()
+    ] == [
+        "Databricks SDK credential resolution failed: reason A",
+        "Databricks SDK credential resolution failed: reason B",
+    ]

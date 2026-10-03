@@ -787,6 +787,247 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
     assert entry["refresh_token"] == "refresh-1"
 
 
+@pytest.mark.parametrize(
+    "status, error",
+    [
+        (400, "invalid_grant"),
+        (400, "expired_token"),
+        (401, "invalid_grant"),
+        (403, "invalid_grant"),
+    ],
+)
+def test_refused_refresh_records_renewal_refusal(token_dir, monkeypatch, status, error) -> None:
+    """A definitive refusal is queryable until a fresh credential is stored."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(status, json={"error": error}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") is None
+    # Lookups normalize the URL, so a trailing-slash variant matches too.
+    assert (
+        stored_login_renewal_refusal("http://localhost:6767/")
+        == f"refresh refused with HTTP {status}"
+    )
+
+    store_token(
+        "http://localhost:6767",
+        token="fresh",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+    )
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
+def test_logout_clears_renewal_refusal(token_dir, monkeypatch) -> None:
+    """Removing the stored login also forgets its recorded refusal."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        clear_token,
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, *, data=None, timeout=None: httpx.Response(
+            403, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+        ),
+    )
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert stored_login_renewal_refusal("http://localhost:6767") == "refresh refused with HTTP 403"
+
+    clear_token("http://localhost:6767")
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_transient_refresh_failure_records_no_renewal_refusal(
+    token_dir, monkeypatch, status
+) -> None:
+    """Rate limits and server errors may clear up on their own, so they must
+    not make later diagnostics blame the stored login."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, *, data=None, timeout=None: httpx.Response(
+            status, request=httpx.Request("POST", url)
+        ),
+    )
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
+def test_store_databricks_auth_clears_renewal_refusal(token_dir, monkeypatch) -> None:
+    """Switching a server to Databricks auth replaces the stored OIDC login, so
+    its recorded renewal refusal must be forgotten."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_databricks_auth,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, *, data=None, timeout=None: httpx.Response(
+            403, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+        ),
+    )
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert stored_login_renewal_refusal("http://localhost:6767") == "refresh refused with HTTP 403"
+
+    store_databricks_auth("http://localhost:6767", "https://example.databricks.com")
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
+def test_valid_token_observed_clears_stale_renewal_refusal(token_dir, monkeypatch) -> None:
+    """A later-observed valid token (another process renewed the login) clears a
+    refusal via refresh's already-renewed early return, without a network call."""
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="fresh",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+    )
+    # Simulate a refusal recorded earlier in this process, before the login was
+    # renewed elsewhere. The stored token is valid and far from expiry, so a
+    # refresh takes the already-renewed early return and never calls the server.
+    normalized = cli_auth._normalize_server_url("http://localhost:6767")
+    cli_auth._renewal_refusals[normalized] = "refresh refused with HTTP 403"
+    assert refresh_stored_token("http://localhost:6767") == "fresh"
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
+def test_non_grant_400_refresh_records_no_renewal_refusal(token_dir, monkeypatch) -> None:
+    """A 400 that is not OAuth ``invalid_grant`` (a malformed request or an
+    incompatible server) is not the stored login's fault, so it must not make
+    later diagnostics blame the login or advise re-authentication."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, *, data=None, timeout=None: httpx.Response(
+            400, json={"error": "invalid_request"}, request=httpx.Request("POST", url)
+        ),
+    )
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
+def test_missing_refresh_endpoint_records_no_renewal_refusal(token_dir, monkeypatch) -> None:
+    """A 404 (server without /oauth/token) is not a credential refusal, so it
+    must not make later diagnostics blame the stored login."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(404, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
 def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> None:
     """A loopback server without /oauth/token is expected and must stay quiet.
 

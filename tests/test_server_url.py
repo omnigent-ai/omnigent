@@ -16,6 +16,7 @@ import pytest
 from omnigent.util.server_url import (
     ServerUrl,
     display_server_url,
+    display_server_url_without_userinfo,
     is_workspace_hosted_url,
     org_id_from_url,
 )
@@ -197,6 +198,35 @@ def test_display_server_url_maps_databricks_api_mount(url: str, expected: str) -
     that stopped mapping would leak the API path back into the banner.
     """
     assert display_server_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        # Basic-auth userinfo is dropped while the workspace selector is kept,
+        # so the login hint stays runnable without leaking the credential.
+        (
+            "https://alice:s3cret@ws.databricks.com/api/2.0/omnigent?o=123",
+            "https://ws.databricks.com/omnigent?o=123",
+        ),
+        ("http://user:pw@127.0.0.1:6767", "http://127.0.0.1:6767"),
+        # No userinfo: identical to the plain display form.
+        ("https://ws.databricks.com/api/2.0/omnigent", "https://ws.databricks.com/omnigent"),
+        # An IPv6 literal keeps its brackets after the userinfo is removed.
+        ("https://user:tok@[2001:db8::1]:6767", "https://[2001:db8::1]:6767"),
+        ("not a url", "<server>"),
+    ],
+)
+def test_display_server_url_without_userinfo_strips_credentials(url: str, expected: str) -> None:
+    """The credential-safe display form drops userinfo but keeps the selector.
+
+    What this proves: a server URL configured with ``user:token@`` never
+    reaches a log or terminal through this helper, while the ``?o=<workspace>``
+    selector that makes an ``omnigent login`` hint runnable is preserved.
+    """
+    result = display_server_url_without_userinfo(url)
+    assert result == expected
+    assert "s3cret" not in result and "@" not in result
 
 
 @pytest.mark.parametrize(

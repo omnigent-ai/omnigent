@@ -180,3 +180,28 @@ def display_server_url(base_url: str) -> str:
         ``"http://127.0.0.1:6767"``.
     """
     return ServerUrl.from_api_base(base_url).display
+
+
+def display_server_url_without_userinfo(base_url: str) -> str:
+    """Like :func:`display_server_url`, but drop any basic-auth userinfo.
+
+    A configured server URL may embed ``user:token@`` that normalization
+    preserves. This keeps the ``?o=<workspace>`` selector so a login hint stays
+    runnable, but strips the authority's userinfo so the credential never
+    reaches a log or terminal.
+
+    :param base_url: Omnigent server base URL.
+    :returns: The display URL without userinfo, or ``"<server>"`` when it
+        cannot be parsed.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(display_server_url(base_url))
+    except ValueError:
+        return "<server>"
+    if not parts.scheme or not parts.hostname:
+        return "<server>"
+    # rpartition keeps an IPv6 literal's brackets (``[::1]:6767``).
+    netloc = parts.netloc.rpartition("@")[2]
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))

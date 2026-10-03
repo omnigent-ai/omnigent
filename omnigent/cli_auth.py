@@ -215,6 +215,9 @@ def store_token(
     if existing_org_id is not None:
         entry["org_id"] = existing_org_id
     _store_entry(server_url, entry)
+    # Drop the recorded refusal only after persisting succeeds, so a failed
+    # write leaves the still-unrenewable login's reason intact.
+    _renewal_refusals.pop(_normalize_server_url(server_url), None)
 
 
 def store_databricks_auth(
@@ -255,6 +258,9 @@ def store_databricks_auth(
         if existing_org_id is not None:
             entry["org_id"] = existing_org_id
     _store_entry(server_url, entry)
+    # Replacing the entry supersedes any stored OIDC login, so forget its
+    # recorded renewal refusal (mirrors store_token / clear_token).
+    _renewal_refusals.pop(_normalize_server_url(server_url), None)
 
 
 def store_databricks_org_id(server_url: str, org_id: str) -> None:
@@ -347,6 +353,23 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
 # Servers already warned about an expired stored token, so a poll/retry
 # loop doesn't repeat the warning every few seconds.
 _warned_expired_servers: set[str] = set()
+
+# Why the stored login's last ``/oauth/token`` renewal was definitively
+# refused, per normalized server URL; transient statuses are not recorded.
+_renewal_refusals: dict[str, str] = {}
+
+
+def stored_login_renewal_refusal(server_url: str) -> str | None:
+    """Return why the stored login's last renewal was refused, or ``None``.
+
+    Tracked per process in memory and cleared when this process stores or
+    removes a credential for that server, so a caller can tell "no credential
+    existed" from "its renewal was rejected".
+
+    :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
+    :returns: A short, token-free reason string, or ``None``.
+    """
+    return _renewal_refusals.get(_normalize_server_url(server_url))
 
 
 def _warn_expired_once(server_url: str, expires_at: float, *, has_refresh: bool) -> None:
@@ -485,6 +508,9 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
         and isinstance(expires_at, (int, float))
         and expires_at - time.time() > REFRESH_MIN_REMAINING_SECONDS
     ):
+        # A valid token (another process renewed) proves the login can renew,
+        # so drop any stale refusal before handing it back.
+        _renewal_refusals.pop(normalized, None)
         return token
     refresh_token = entry.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
@@ -524,6 +550,17 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
             )
         return None
     if resp.status_code != 200:
+        # 401/403 are definitive rejections; a 400 counts only when the body
+        # names an unrenewable grant (invalid_grant / expired_token). Other
+        # 400s (malformed request, incompatible server) are not the login's fault.
+        definitive = resp.status_code in (401, 403)
+        if resp.status_code == 400:
+            with contextlib.suppress(ValueError):
+                body = resp.json()
+                error = body.get("error") if isinstance(body, dict) else None
+                definitive = error in ("invalid_grant", "expired_token")
+        if definitive:
+            _renewal_refusals[normalized] = f"refresh refused with HTTP {resp.status_code}"
         _logger.warning(
             "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
             "to re-authenticate.",
@@ -866,6 +903,7 @@ def clear_token(server_url: str) -> None:
     :param server_url: The server URL, e.g.
         ``"http://localhost:6767"``.
     """
+    _renewal_refusals.pop(_normalize_server_url(server_url), None)
     path = _token_file_path()
     if not path.exists():
         return
