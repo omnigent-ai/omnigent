@@ -69,6 +69,10 @@ and steers messages while the agent is busy.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi), and permission mode before the session exists.
 - Attach files or type `/` before the first send.
+- Open the agent picker's custom agents, then Create custom agent → Import
+  bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
+  selects the agent, which stays listed after a reload. A rejected bundle (for
+  example a server agent's name) keeps the dialog open with the server's reason.
 
 **Mobile** (either composer on a phone-sized viewport): the same controls with
 collapsed labels.
