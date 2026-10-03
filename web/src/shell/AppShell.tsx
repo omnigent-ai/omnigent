@@ -23,6 +23,7 @@ import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
+import { WebUpdateBanner } from "@/components/WebUpdateBanner";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -2255,6 +2256,7 @@ export function AppShell() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
+            {!isEmbedded && <WebUpdateBanner />}
             {/* The Search/Settings/toggle cluster lives HERE on the macOS shell,
           not in the sidebar, so the three icons hold one fixed position beside
           the traffic lights no matter what the sidebar does. Inside the sidebar
