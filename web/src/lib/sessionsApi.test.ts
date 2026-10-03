@@ -20,6 +20,8 @@ import {
   getSession,
   getSessionSlim,
   getSessionUsage,
+  importCodeIsRetryable,
+  importErrorFromException,
   importLocalSessions,
   interrupt,
   listRunners,
@@ -29,6 +31,7 @@ import {
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
+  validationDetailMessage,
 } from "./sessionsApi";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
 import { getSessionHost, setSessionHost } from "./sessionHost";
@@ -55,6 +58,34 @@ function mockNdjsonResponse(lines: string[]): Response {
       if (i < lines.length) {
         controller.enqueue(encoder.encode(lines[i] + "\n"));
         i += 1;
+      } else {
+        controller.close();
+      }
+    },
+  });
+  return { ok: true, status: 200, statusText: "OK", body } as unknown as Response;
+}
+
+// An NDJSON body whose reader rejects (fetch's mid-body "network error"
+// TypeError) after the given lines, or — with `rejectWith: null` — closes
+// mid-line, as a proxy cutting the connection would leave it.
+function mockBrokenNdjsonResponse(
+  lines: string[],
+  { partialTail = "", rejectWith = new TypeError("network error") as Error | null } = {},
+): Response {
+  const encoder = new TextEncoder();
+  let i = 0;
+  let tail = partialTail;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (i < lines.length) {
+        controller.enqueue(encoder.encode(lines[i] + "\n"));
+        i += 1;
+      } else if (tail) {
+        controller.enqueue(encoder.encode(tail));
+        tail = "";
+      } else if (rejectWith !== null) {
+        controller.error(rejectWith);
       } else {
         controller.close();
       }
@@ -102,6 +133,75 @@ describe("apiErrorFromResponse", () => {
     expect(err.message).toBe("Workspace items cannot contain the '/' character");
     expect(err.code).toBe("INVALID_PARAMETER_VALUE");
     expect(err.status).toBe(400);
+  });
+
+  it("reads a FastAPI 422 validation list as its first readable message", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        {
+          detail: [
+            { type: "missing", loc: ["body", "host_id"], msg: "Field required" },
+            { type: "int_parsing", loc: ["body", "limit"], msg: "Input should be an integer" },
+          ],
+        },
+        { ok: false, status: 422, statusText: "Unprocessable Entity" },
+      ),
+    );
+    expect(err.message).toBe("host_id: Field required");
+    expect(err.code).toBeNull();
+    expect(err.status).toBe(422);
+  });
+
+  it("keeps the AP error envelope ahead of a 422 detail list", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        { error: { code: "invalid_input", message: "Too many items." }, detail: [{ msg: "x" }] },
+        { ok: false, status: 422 },
+      ),
+    );
+    expect(err.message).toBe("Too many items.");
+  });
+
+  it("falls back to the status line for a 422 list with no readable message", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        { detail: [{ loc: ["body"] }, null, { msg: "  " }] },
+        { ok: false, status: 422, statusText: "Unprocessable Entity" },
+      ),
+    );
+    expect(err.message).toBe("422 Unprocessable Entity");
+  });
+
+  it("exposes the remaining error-envelope fields as details", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        {
+          error: {
+            code: "conflict",
+            message: "Already imported.",
+            import_code: "already_imported",
+            retryable: false,
+            session_id: "conv_1",
+          },
+        },
+        { ok: false, status: 409 },
+      ),
+    );
+    expect(err.importCode).toBe("already_imported");
+    expect(err.retryable).toBe(false);
+    expect(err.details).toEqual({ session_id: "conv_1" });
+  });
+
+  it("leaves import fields null for an error without them", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        { error: { code: "conflict", message: "Busy." } },
+        { ok: false, status: 409 },
+      ),
+    );
+    expect(err.importCode).toBeNull();
+    expect(err.retryable).toBeNull();
+    expect(err.details).toEqual({});
   });
 
   it("falls back to the status line when the body is not an error shape", async () => {
@@ -1707,6 +1807,10 @@ describe("importLocalSessions", () => {
         { id: "c2", title: null },
       ],
       failures: [],
+      // An older server's `done` (no total / complete) still reads as complete.
+      total: null,
+      complete: true,
+      error: null,
     });
     // Hits the streaming endpoint with the snake_case body.
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -1744,12 +1848,20 @@ describe("importLocalSessions", () => {
 
     expect(result.imported).toBe(1);
     expect(result.failed).toBe(1);
+    // A failure from a server that predates codes: no code, offered for retry.
     expect(result.failures).toEqual([
-      { externalSessionId: "bad-1", source: "codex", reason: "No visible messages to import." },
+      {
+        externalSessionId: "bad-1",
+        source: "codex",
+        reason: "No visible messages to import.",
+        code: null,
+        retryable: true,
+        errorId: null,
+      },
     ]);
   });
 
-  it("throws the server's message on a mid-stream error, keeping delivered sessions", async () => {
+  it("keeps the tally and sessions when an error event arrives (old server: no code)", async () => {
     fetchMock.mockResolvedValueOnce(
       mockNdjsonResponse([
         JSON.stringify({ event: "session", session_id: "c1", title: "First" }),
@@ -1759,11 +1871,410 @@ describe("importLocalSessions", () => {
     );
 
     const seen: string[] = [];
-    await expect(importLocalSessions("h", "claude", 10, (s) => seen.push(s.id))).rejects.toThrow(
-      "host stalled mid-import",
-    );
+    const result = await importLocalSessions("h", "claude", 10, (s) => seen.push(s.id));
+
     // The session that streamed before the error was still handed to the caller.
     expect(seen).toEqual(["c1"]);
+    expect(result.imported).toBe(1);
+    expect(result.sessions).toEqual([{ id: "c1", title: "First" }]);
+    expect(result.complete).toBe(false);
+    expect(result.error).toEqual({
+      code: null,
+      message: "host stalled mid-import",
+      retryable: true,
+      errorId: null,
+      fixCommands: [],
+      hostName: null,
+    });
+  });
+
+  it("reads code, retryable, error id and details from the error event", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "progress", done: 3, total: 10 }),
+        JSON.stringify({ event: "session", session_id: "c1", title: "One" }),
+        JSON.stringify({
+          event: "failed",
+          external_session_id: "big-1",
+          source: "claude",
+          reason: "This session is too large to import.",
+          code: "session_too_large",
+          retryable: false,
+        }),
+        JSON.stringify({
+          event: "error",
+          error_id: "err_abc",
+          message: "mac-laptop disconnected after 3 of 10 sessions.",
+          code: "host_disconnected",
+          retryable: true,
+          host_name: "mac-laptop",
+          processed: 3,
+          total: 10,
+        }),
+        JSON.stringify({
+          event: "done",
+          imported: 1,
+          already_imported: 1,
+          failed: 1,
+          failures: [],
+          total: 10,
+          complete: false,
+        }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result).toMatchObject({
+      imported: 1,
+      alreadyImported: 1,
+      failed: 1,
+      total: 10,
+      complete: false,
+      error: {
+        code: "host_disconnected",
+        message: "mac-laptop disconnected after 3 of 10 sessions.",
+        retryable: true,
+        errorId: "err_abc",
+        hostName: "mac-laptop",
+      },
+    });
+    expect(result.failures).toEqual([
+      {
+        externalSessionId: "big-1",
+        source: "claude",
+        reason: "This session is too large to import.",
+        code: "session_too_large",
+        retryable: false,
+        errorId: null,
+      },
+    ]);
+  });
+
+  it("passes fix_commands through for the missing-SQLite error", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "error",
+          error_id: "err_sql",
+          message: "Your machine's Python was built without SQLite.",
+          code: "host_python_missing_sqlite",
+          retryable: false,
+          fix_commands: [
+            { label: "macOS", command: "brew install sqlite && pyenv install --force 3.12" },
+            "sudo apt-get install libsqlite3-dev",
+            { label: "no command" },
+            { label: "blank", command: " " },
+            7,
+            "",
+          ],
+        }),
+        JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 0 }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.error).toMatchObject({
+      code: "host_python_missing_sqlite",
+      retryable: false,
+      // {label, command} entries; an older server's bare strings have no label;
+      // entries without a command are dropped rather than rendered.
+      fixCommands: [
+        { label: "macOS", command: "brew install sqlite && pyenv install --force 3.12" },
+        { label: null, command: "sudo apt-get install libsqlite3-dev" },
+      ],
+    });
+  });
+
+  it("moves an inline error id out of the reason and message", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "failed",
+          external_session_id: "s1",
+          source: "claude",
+          reason:
+            "This session couldn't be saved because of an internal error. Error ID: err_0a1b.",
+          code: "internal",
+          retryable: true,
+        }),
+        JSON.stringify({
+          event: "error",
+          error_id: "err_ffee",
+          message: "The local session import stopped unexpectedly. Error ID: err_ffee.",
+          code: "internal",
+          retryable: true,
+        }),
+        JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 1 }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.failures[0]).toMatchObject({
+      reason: "This session couldn't be saved because of an internal error.",
+      errorId: "err_0a1b",
+    });
+    expect(result.error).toMatchObject({
+      message: "The local session import stopped unexpectedly.",
+      errorId: "err_ffee",
+    });
+  });
+
+  it("keeps a reason whose trailing id differs from the error_id field", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "failed",
+          reason: "Failed. Error ID: err_aaaa.",
+          error_id: "err_bbbb",
+          code: "internal",
+        }),
+        JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 1 }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.failures[0]).toMatchObject({
+      reason: "Failed. Error ID: err_aaaa.",
+      errorId: "err_bbbb",
+    });
+  });
+
+  it.each([
+    ["session_too_large", false],
+    ["session_unreadable", false],
+    ["session_save_timeout", true],
+    ["encryption_unavailable", true],
+    ["host_python_missing_sqlite", false],
+    ["internal", true],
+    ["some_future_code", true],
+  ])("derives retryable for a failed %s event without the flag", async (code, retryable) => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "failed", external_session_id: "s1", reason: "Nope.", code }),
+        JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 1 }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.failures[0]).toMatchObject({ code, retryable, reason: "Nope." });
+  });
+
+  it.each([
+    ["host_offline", true],
+    ["host_unreachable", true],
+    ["host_disconnected", true],
+    ["host_unresponsive", true],
+    ["time_limit_reached", true],
+    ["host_python_missing_sqlite", false],
+    ["invalid_request", false],
+    ["internal", true],
+  ])("derives retryable for a %s error event without the flag", async (code, retryable) => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "error", message: "Stopped.", code }),
+        JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 0 }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.error).toMatchObject({ code, retryable, message: "Stopped." });
+    expect(result.complete).toBe(false);
+  });
+
+  it("reports progress events and keeps the host's total", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "progress", done: 0, total: 20 }),
+        JSON.stringify({ event: "session", session_id: "c1", title: "One" }),
+        JSON.stringify({ event: "progress", done: 7, total: 20 }),
+        JSON.stringify({ event: "progress", done: "bad" }),
+        JSON.stringify({ event: "progress", done: 8, total: null }),
+        JSON.stringify({ event: "done", imported: 1, already_imported: 7, failed: 0 }),
+      ]),
+    );
+
+    const onProgress = vi.fn();
+    const result = await importLocalSessions("host_1", "all", 25, undefined, undefined, {
+      onProgress,
+    });
+
+    expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+      { done: 0, total: 20 },
+      { done: 7, total: 20 },
+      { done: 8, total: null },
+    ]);
+    // `done` carried no total, so the last progress event's (null) stands.
+    expect(result.total).toBeNull();
+    expect(result.complete).toBe(true);
+  });
+
+  it("maps a body whose reader rejects mid-stream to stream_interrupted, keeping results", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockBrokenNdjsonResponse([
+        JSON.stringify({ event: "progress", done: 2, total: 9 }),
+        JSON.stringify({ event: "session", session_id: "c1", title: "One" }),
+        JSON.stringify({ event: "session", session_id: "c2", title: "Two" }),
+        JSON.stringify({ event: "progress", done: 3, total: 9 }),
+      ]),
+    );
+
+    const seen: string[] = [];
+    const result = await importLocalSessions("host_1", "all", 25, (s) => seen.push(s.id));
+
+    expect(seen).toEqual(["c1", "c2"]);
+    expect(result).toMatchObject({
+      imported: 2,
+      alreadyImported: 0,
+      failed: 0,
+      total: 9,
+      complete: false,
+      error: {
+        code: "stream_interrupted",
+        retryable: true,
+        message:
+          "The connection to Omnigent dropped after 3 sessions. Import again to continue — sessions already imported are skipped.",
+      },
+    });
+  });
+
+  it("maps truncated NDJSON (cut mid-line, no done) to stream_interrupted", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockBrokenNdjsonResponse(
+        [
+          JSON.stringify({ event: "session", session_id: "c1", title: "One" }),
+          JSON.stringify({ event: "failed", external_session_id: "x", reason: "Unreadable." }),
+        ],
+        { partialTail: '{"event":"session","session_id":"c2","ti', rejectWith: null },
+      ),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    // The half line is dropped; what arrived intact is kept.
+    expect(result.sessions).toEqual([{ id: "c1", title: "One" }]);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failed).toBe(1);
+    expect(result.error?.code).toBe("stream_interrupted");
+    expect(result.error?.message).toContain("dropped after 2 sessions");
+  });
+
+  it("maps a stream that ends cleanly but without done to stream_interrupted", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([JSON.stringify({ event: "session", session_id: "c1", title: "One" })]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.error?.code).toBe("stream_interrupted");
+    expect(result.error?.message).toContain("dropped after 1 session.");
+    expect(result.complete).toBe(false);
+  });
+
+  it("prefers the server's error over stream_interrupted when the body breaks after it", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockBrokenNdjsonResponse([
+        JSON.stringify({
+          event: "error",
+          message: "Imported 4 of 9 before the time limit.",
+          code: "time_limit_reached",
+          retryable: true,
+        }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.error?.code).toBe("time_limit_reached");
+  });
+
+  it("reports a fetch that never got a response as stream_interrupted, not a raw TypeError", async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.complete).toBe(false);
+    expect(result.error).toMatchObject({ code: "stream_interrupted", retryable: true });
+    expect(result.error?.message).toContain("before any sessions were imported");
+    expect(result.error?.message).not.toContain("Failed to fetch");
+  });
+
+  it("falls back to done.failures when no failed events streamed", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "done",
+          imported: 0,
+          already_imported: 0,
+          failed: 1,
+          failures: [
+            {
+              external_session_id: "s9",
+              source: "pi",
+              reason: "Saving this session timed out.",
+              code: "session_save_timeout",
+              retryable: true,
+            },
+            "junk",
+          ],
+          complete: true,
+        }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.failures).toEqual([
+      {
+        externalSessionId: "s9",
+        source: "pi",
+        reason: "Saving this session timed out.",
+        code: "session_save_timeout",
+        retryable: true,
+        errorId: null,
+      },
+    ]);
+  });
+
+  it("throws an ApiError carrying import_code, retryable and details for a pre-stream 409", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        {
+          error: {
+            code: "conflict",
+            message: "mac-laptop is offline (last seen 5 minutes ago).",
+            import_code: "host_offline",
+            retryable: true,
+            host_name: "mac-laptop",
+            last_seen_seconds: 300,
+          },
+        },
+        { ok: false, status: 409 },
+      ),
+    );
+
+    const err = await importLocalSessions("host_1", "all", 25).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({
+      status: 409,
+      code: "conflict",
+      importCode: "host_offline",
+      retryable: true,
+      details: { host_name: "mac-laptop", last_seen_seconds: 300 },
+    });
+    expect(importErrorFromException(err)).toEqual({
+      code: "host_offline",
+      message: "mac-laptop is offline (last seen 5 minutes ago).",
+      retryable: true,
+      errorId: null,
+      fixCommands: [],
+      hostName: "mac-laptop",
+    });
   });
 
   it("sends an exact session ID with its harness", async () => {
@@ -1823,9 +2334,162 @@ describe("importLocalSessions", () => {
         { id: "c2", title: null },
       ],
       failures: [],
+      total: null,
+      complete: true,
+      error: null,
     });
     // First the stream endpoint (404), then the buffered fallback.
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/imports/local/stream");
     expect(fetchMock.mock.calls[1][0]).toBe("/v1/imports/local");
+  });
+});
+
+describe("importErrorFromException", () => {
+  function apiError(body: unknown, status: number): Promise<unknown> {
+    return apiErrorFromResponse(mockJsonResponse(body, { ok: false, status, statusText: "Error" }));
+  }
+
+  it("maps a 422 validation error to a non-retryable invalid_request", async () => {
+    const err = await apiError(
+      {
+        detail: [
+          {
+            type: "less_than_equal",
+            loc: ["body", "limit"],
+            msg: "Input should be less than or equal to 100",
+          },
+        ],
+      },
+      422,
+    );
+    expect(importErrorFromException(err)).toMatchObject({
+      code: "invalid_request",
+      message: "limit: Input should be less than or equal to 100",
+      retryable: false,
+    });
+  });
+
+  it("reads error_id and fix_commands from the HTTP error body", async () => {
+    const err = await apiError(
+      {
+        error: {
+          code: "internal_error",
+          message: "Import stopped because of an internal error.",
+          import_code: "internal",
+          retryable: true,
+          error_id: "err_123",
+          fix_commands: [{ label: "Restart the host", command: "omnigent host" }],
+        },
+      },
+      500,
+    );
+    expect(importErrorFromException(err)).toMatchObject({
+      code: "internal",
+      retryable: true,
+      errorId: "err_123",
+      fixCommands: [{ label: "Restart the host", command: "omnigent host" }],
+    });
+  });
+
+  it("gives a wrong_replica from an older server a readable message", async () => {
+    const err = await apiError(
+      { error: { code: "wrong_replica", message: "host is on another replica" } },
+      400,
+    );
+    expect(importErrorFromException(err, { hostName: "studio-mac" })).toMatchObject({
+      code: "host_unreachable",
+      retryable: true,
+      message: "Couldn't reach “studio-mac”'s connection. Try again in a few seconds.",
+      hostName: "studio-mac",
+    });
+    expect(importErrorFromException(err).message).toBe(
+      "Couldn't reach your machine's connection. Try again in a few seconds.",
+    );
+  });
+
+  it("uses a newer server's wrong_replica message and import code", async () => {
+    const err = await apiError(
+      {
+        error: {
+          code: "wrong_replica",
+          message: "Couldn't reach “laptop”'s connection. Try again in a few seconds.",
+          import_code: "host_unreachable",
+          retryable: true,
+          host_name: "laptop",
+        },
+      },
+      400,
+    );
+    expect(importErrorFromException(err, { hostName: "other" })).toMatchObject({
+      code: "host_unreachable",
+      retryable: true,
+      message: "Couldn't reach “laptop”'s connection. Try again in a few seconds.",
+      hostName: "laptop",
+    });
+  });
+
+  it.each([
+    [409, true],
+    [500, true],
+    [503, true],
+    [400, false],
+    [403, false],
+  ])("treats a code-less (old server) %i as retryable=%s", async (status, retryable) => {
+    const err = await apiError(
+      { error: { code: "conflict", message: "Host is offline." } },
+      status,
+    );
+    expect(importErrorFromException(err)).toMatchObject({
+      code: null,
+      message: "Host is offline.",
+      retryable,
+    });
+  });
+
+  it("keeps an unexpected error's message", () => {
+    expect(importErrorFromException(new Error("boom"))).toMatchObject({
+      code: null,
+      message: "boom",
+      retryable: true,
+    });
+    expect(importErrorFromException("nope").message).toBe("Import failed. Try again.");
+  });
+
+  it("knows each contract code's retry semantics", () => {
+    expect(importCodeIsRetryable("session_too_large")).toBe(false);
+    expect(importCodeIsRetryable("already_imported")).toBe(false);
+    expect(importCodeIsRetryable("stream_interrupted")).toBe(true);
+    expect(importCodeIsRetryable(null)).toBe(true);
+  });
+});
+
+describe("validationDetailMessage", () => {
+  it.each([
+    [
+      [{ loc: ["body", "limit"], msg: "Input should be less than or equal to 100" }],
+      "limit: Input should be less than or equal to 100",
+    ],
+    // A model-level validator has no field: no prefix, and pydantic's kind prefix is dropped.
+    [
+      [{ loc: ["body"], msg: "Value error, an exact session import requires a specific harness" }],
+      "an exact session import requires a specific harness",
+    ],
+    [
+      [{ loc: ["query", "source"], msg: "Input should be 'claude' or 'codex'" }],
+      "source: Input should be 'claude' or 'codex'",
+    ],
+    // Nested paths join with dots; an overlong one is dropped rather than shown.
+    [
+      [{ loc: ["body", "items", 3, "type"], msg: "Field required" }],
+      "items.3.type: Field required",
+    ],
+    [[{ loc: ["body", "a_very_long_field_name", "another_long_segment"], msg: "Bad" }], "Bad"],
+    [[{ msg: "No location" }], "No location"],
+  ])("formats %j", (detail, expected) => {
+    expect(validationDetailMessage(detail)).toBe(expected);
+  });
+
+  it.each([null, "text", {}, [], [{ loc: ["body"] }]])("returns null for %j", (detail) => {
+    expect(validationDetailMessage(detail)).toBeNull();
   });
 });

@@ -2722,6 +2722,22 @@
       "ImportFailureRef": {
         "description": "One session that could not be imported, with a user-facing reason.\n\n`external_session_id` / `source` name the source session when known (a\nhost that reports only a count leaves them `None`); `reason` explains the\nfailure so the UI can show it instead of an anonymous \"N failed\". Also the\nshape of each `{\"event\": \"failed\", ...}` line on the stream endpoint.",
         "properties": {
+          "code": {
+            "default": "session_unreadable",
+            "title": "Code",
+            "type": "string"
+          },
+          "error_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Id"
+          },
           "external_session_id": {
             "anyOf": [
               {
@@ -2736,6 +2752,11 @@
           "reason": {
             "title": "Reason",
             "type": "string"
+          },
+          "retryable": {
+            "default": false,
+            "title": "Retryable",
+            "type": "boolean"
           },
           "source": {
             "anyOf": [
@@ -10326,7 +10347,7 @@
     },
     "/v1/imports/local/stream": {
       "post": {
-        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch. Each session that could not be imported\nemits one `{\"event\": \"failed\", \"external_session_id\", \"source\", \"reason\"}` line (after the successes), and a terminal\n`{\"event\": \"done\", ...}` carries the tally plus the full `failures`\nlist. A mid-stream host read failure emits `{\"event\": \"error\", ...}`\nbefore `done` (the sessions read so far are already committed and a\nretry is idempotent). Request validation still fails ahead of the stream\nwith the usual HTTP error.",
+        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch, and `{\"event\": \"progress\", \"done\", \"total\"}` lines as the host works through the batch. Each session that\ncould not be imported emits one `{\"event\": \"failed\", \"external_session_id\", \"source\", \"reason\"}` line (after the successes),\nand a terminal `{\"event\": \"done\", ...}` carries the tally plus the full\n`failures` list. A mid-stream failure emits `{\"event\": \"error\", \"error_id\", \"message\", \"code\", \"retryable\"}` before `done` (the\nsessions read so far are already committed and a retry is idempotent).\nRequest validation still fails ahead of the stream with the usual HTTP\nerror.",
         "operationId": "import_local_sessions_stream_v1_imports_local_stream_post",
         "requestBody": {
           "content": {

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
-import sqlite3
 import subprocess
 from collections.abc import Sequence
 from hashlib import sha256
@@ -37,6 +37,8 @@ from omnigent.session_import.models import (
     LocalSessionImport,
     SessionImportNotFoundError,
 )
+
+_logger = logging.getLogger(__name__)
 
 _PI_IMPORT_SESSION_ID_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 _OPENCODE_IMPORT_SESSION_ID_RE = re.compile(r"ses_[A-Za-z0-9_-]+")
@@ -392,6 +394,11 @@ def list_recent_sessions_across_harnesses(*, limit: int) -> list[tuple[ImportSou
             recent = _recent_local_sessions_with_recency(source, limit=limit)
         except (SessionImportNotFoundError, OSError, ValueError, TypeError):
             continue
+        except Exception:  # noqa: BLE001 — one harness must not hide the rest
+            # One harness's broken reader (a missing optional module, a corrupt
+            # index) must not hide every other harness's sessions.
+            _logger.warning("Skipping %s sessions: listing them failed", source, exc_info=True)
+            continue
         scored.extend((_normalize_recency(recency), source, sid) for sid, recency in recent)
     scored.sort(key=lambda entry: (entry[0], entry[2]), reverse=True)
     return [(source, sid) for _, source, sid in scored[:limit]]
@@ -685,6 +692,13 @@ def _codex_native_title(home: Path, session_id: str) -> str | None:
     indexed = _codex_thread_name_from_index(home, session_id)
     if indexed:
         return indexed
+    try:
+        # Lazy import: some Python builds (pyenv/Homebrew without SQLite
+        # headers) lack ``_sqlite3``; without it the title falls back to the
+        # first user message.
+        import sqlite3
+    except ImportError:
+        return None
 
     def _state_db_version(path: Path) -> int:
         match = re.search(r"state_(\d+)\.sqlite$", path.name)

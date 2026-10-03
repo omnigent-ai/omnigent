@@ -96,15 +96,9 @@ def _fail_pending_imports(conn: HostConnection) -> None:
     """
     while conn.pending_import_local:
         _request_id, queue = conn.pending_import_local.popitem()
-        queue.put_nowait(
-            (
-                "done",
-                {
-                    "status": "failed",
-                    "error": f"host '{conn.host_id}' disconnected mid-import",
-                },
-            )
-        )
+        # A terminal marker, not a failed "done": the import handler reports it
+        # as the machine disconnecting (retryable), with how far the batch got.
+        queue.put_nowait(("disconnected", {}))
 
 
 # How long a runner exit report stays answerable, and how many are kept.
@@ -378,7 +372,8 @@ class HostConnection:
     )
     # Import streams one session per frame, so the tunnel pushes each onto a
     # per-request queue the /imports/local handler drains (vs a single future).
-    # Each item is a ("session", dict) or ("done", dict) tuple.
+    # Each item is a ("session" | "progress" | "done", dict) tuple, or a terminal
+    # ("disconnected", dict) the registry pushes when this connection goes away.
     pending_import_local: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = field(
         default_factory=dict,
     )

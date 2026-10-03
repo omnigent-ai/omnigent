@@ -692,6 +692,8 @@ async def test_local_import_stream_emits_ndjson_session_then_done(
         "already_imported": 0,
         "failed": 0,
         "failures": [],
+        "total": None,
+        "complete": True,
     }
     # Each streamed session was actually persisted.
     for e in session_events:

@@ -8095,6 +8095,7 @@ async def test_handle_import_local_legacy_server_skips_only_unsafe_session(
             "reason": (
                 "This session is too large for the connected server. Upgrade the server and retry."
             ),
+            "code": "session_too_large",
         }
     ]
 

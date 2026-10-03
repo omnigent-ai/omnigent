@@ -14,7 +14,7 @@ from __future__ import annotations
 import errno
 import functools
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from enum import Enum
 from typing import Any, ParamSpec, TypeVar, cast
 
@@ -430,6 +430,7 @@ class OmnigentError(Exception):
         category: ErrorCategory | None = None,
         impact: ErrorImpact | None = None,
         phase: ErrorPhase | None = None,
+        details: Mapping[str, object] | None = None,
     ) -> None:
         """
         Create a new application error.
@@ -448,10 +449,14 @@ class OmnigentError(Exception):
         :param phase: Lifecycle-phase override. Defaults to the mapping for
             ``code`` (see :func:`phase_for_code`); pass it where the raise site
             knows the stage better than the code does.
+        :param details: Extra machine-readable fields for the response's
+            ``error`` object, e.g. ``{"retryable": True}``. Merged next to
+            ``code``/``message`` by the global handler and never overrides them.
         """
         super().__init__(message)
         self.code = code
         self.message = message
+        self.details: dict[str, object] = dict(details or {})
         self._category_override = category
         self._impact_override = impact
         self._phase_override = phase

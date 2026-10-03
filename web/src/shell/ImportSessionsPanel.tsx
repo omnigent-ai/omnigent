@@ -3,6 +3,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useHosts } from "@/hooks/useHosts";
 import { Link } from "@/lib/routing";
 import { HostLabel } from "./HostLabel";
+import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -13,8 +15,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
+  ApiError,
+  importErrorFromException,
   importLocalSessions,
+  type ImportErrorInfo,
+  type ImportFailureRef,
   type ImportedSessionRef,
+  type ImportProgress,
   type ImportSourceSelector,
   type LocalImportResult,
 } from "@/lib/sessionsApi";
@@ -35,6 +42,150 @@ const SOURCES: { value: ImportSourceSelector; label: string }[] = [
 const LIMITS = [25, 50, 100];
 type ImportMode = "recent" | "session";
 
+// Import codes that mean the picker's view of the host is stale: refetch the
+// host list so an offline machine drops out instead of failing again.
+const HOST_STALE_IMPORT_CODES = new Set([
+  "host_offline",
+  "host_unreachable",
+  "host_disconnected",
+  "host_unresponsive",
+]);
+
+/** Whether an import error should refresh the host list. */
+function hostListLooksStale(error: ImportErrorInfo, thrown: unknown): boolean {
+  if (error.code !== null) return HOST_STALE_IMPORT_CODES.has(error.code);
+  // A server that predates import codes sends its "host is offline" as a bare 409.
+  return thrown instanceof ApiError && thrown.status === 409;
+}
+
+/**
+ * "Imported 12 · 3 already imported · 2 failed" (zero parts omitted), or
+ * null when there is nothing to report beside an error. A run that stopped
+ * early (`complete: false`) never reads "Nothing new to import": it leads with
+ * what it imported and says it stopped, e.g. "Imported 0 · 10 already
+ * imported · stopped early".
+ */
+function importSummary(result: LocalImportResult): string | null {
+  const stoppedEarly = !result.complete || result.error !== null;
+  const parts = [
+    result.imported > 0 ? `Imported ${result.imported}` : null,
+    result.alreadyImported > 0 ? `${result.alreadyImported} already imported` : null,
+    result.failed > 0 ? `${result.failed} failed` : null,
+  ].filter((p): p is string => p !== null);
+  if (stoppedEarly) {
+    if (parts.length === 0) return null;
+    if (result.imported === 0) parts.unshift("Imported 0");
+    return [...parts, "stopped early"].join(" · ");
+  }
+  if (result.imported === 0 && result.failed === 0) {
+    if (result.alreadyImported > 0) return `Nothing new to import · ${parts.join(" · ")}`;
+    return result.error === null ? "No sessions to import." : null;
+  }
+  return parts.join(" · ");
+}
+
+/** "Importing 7 of 20…" / "Importing… 7 so far" / "Importing…". */
+function progressText(progress: ImportProgress | null, streamedCount: number): string {
+  if (progress !== null && progress.total !== null) {
+    return `Importing ${Math.min(progress.done, progress.total)} of ${progress.total}…`;
+  }
+  const count = Math.max(progress?.done ?? 0, streamedCount);
+  return count > 0 ? `Importing… ${count} so far` : "Importing…";
+}
+
+function sourceLabel(source: string | null): string | null {
+  if (source === null) return null;
+  return SOURCES.find((s) => s.value === source)?.label ?? source;
+}
+
+/** Code + error id under a collapsed "Details" disclosure; nothing when neither is known. */
+function ImportErrorDetails({
+  code,
+  errorId,
+  testId,
+}: {
+  code: string | null;
+  errorId: string | null;
+  testId: string;
+}) {
+  if (code === null && errorId === null) return null;
+  return (
+    <details className="text-xs text-muted-foreground" data-testid={testId}>
+      <summary className="cursor-pointer select-none hover:text-foreground">Details</summary>
+      <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 font-mono">
+        {code !== null && (
+          <>
+            <dt>code</dt>
+            <dd>{code}</dd>
+          </>
+        )}
+        {errorId !== null && (
+          <>
+            <dt>error id</dt>
+            <dd className="break-all select-all">{errorId}</dd>
+          </>
+        )}
+      </dl>
+    </details>
+  );
+}
+
+/** One session that couldn't be imported: reason, which session, and details. */
+function ImportFailureRow({ failure }: { failure: ImportFailureRef }) {
+  const harness = sourceLabel(failure.source);
+  return (
+    <li
+      className="flex flex-col gap-0.5 text-sm text-muted-foreground"
+      data-testid="import-failure-item"
+    >
+      <span className="text-destructive">{failure.reason}</span>
+      {(failure.externalSessionId !== null || harness !== null) && (
+        <span className="font-mono text-xs">
+          {[harness, failure.externalSessionId].filter((p) => p !== null).join(" · ")}
+        </span>
+      )}
+      <ImportErrorDetails
+        code={failure.code}
+        errorId={failure.errorId}
+        testId="import-failure-details"
+      />
+    </li>
+  );
+}
+
+/** Why the import as a whole stopped, with any fix commands to copy. */
+function ImportErrorBanner({ error }: { error: ImportErrorInfo }) {
+  return (
+    <Alert variant="destructive" data-testid="import-error" data-import-code={error.code ?? ""}>
+      <AlertDescription className="flex flex-col gap-2 text-destructive">
+        <div data-testid="import-error-message">{renderTextWithInlineCode(error.message)}</div>
+        {error.fixCommands.length > 0 && (
+          <div className="flex flex-col gap-1.5" data-testid="import-fix-commands">
+            {error.fixCommands.map((fix, i) => (
+              <div key={`${fix.label ?? ""}:${fix.command}`} className="flex flex-col gap-0.5">
+                {fix.label !== null && (
+                  <span
+                    className="text-xs text-muted-foreground"
+                    data-testid={`import-fix-${i}-label`}
+                  >
+                    {fix.label}
+                  </span>
+                )}
+                <CliCommandBlock command={fix.command} testIdPrefix={`import-fix-${i}`} />
+              </div>
+            ))}
+          </div>
+        )}
+        <ImportErrorDetails
+          code={error.code}
+          errorId={error.errorId}
+          testId="import-error-details"
+        />
+      </AlertDescription>
+    </Alert>
+  );
+}
+
 /**
  * Inline (non-modal) import UI for the Settings "Import sessions" section.
  * Imports recent transcripts or one known harness session through the chosen
@@ -54,8 +205,11 @@ export function ImportSessionsPanel() {
   // Sessions appended as their frames stream in, so the list fills live rather
   // than appearing all at once when the import finishes.
   const [streamed, setStreamed] = useState<ImportedSessionRef[]>([]);
+  const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [result, setResult] = useState<LocalImportResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // Why the whole import stopped: a stream `error`, a dropped connection, or a
+  // pre-stream HTTP error. Shown alongside whatever partial tally arrived.
+  const [error, setError] = useState<ImportErrorInfo | null>(null);
 
   // Default to the caller's current online machine — the transcripts are read
   // on the host, so there's nothing to import without one.
@@ -84,29 +238,131 @@ export function ImportSessionsPanel() {
     setError(null);
     setResult(null);
     setStreamed([]);
+    setProgress(null);
+    let importError: ImportErrorInfo | null = null;
+    let thrown: unknown = null;
     try {
       const onSession = (s: ImportedSessionRef) => setStreamed((prev) => [...prev, s]);
-      const res =
-        mode === "session"
-          ? await importLocalSessions(hostId, source, limit, onSession, exactSessionId)
-          : await importLocalSessions(hostId, source, limit, onSession);
+      const res = await importLocalSessions(
+        hostId,
+        source,
+        limit,
+        onSession,
+        mode === "session" ? exactSessionId : undefined,
+        { onProgress: setProgress },
+      );
       setResult(res);
+      importError = res.error;
       // Newly imported sessions land in the sidebar list.
       await queryClient.invalidateQueries({ queryKey: ["conversations"] });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Import failed. Try again.");
+      thrown = e;
+      const host = (hosts ?? []).find((h) => h.host_id === hostId);
+      importError = importErrorFromException(e, { hostName: host?.name ?? null });
     } finally {
+      setError(importError);
       setSubmitting(false);
+    }
+    if (importError !== null && hostListLooksStale(importError, thrown)) {
+      void queryClient.invalidateQueries({ queryKey: ["hosts"] });
     }
   }
 
-  if (onlineHosts.length === 0) {
+  // "Retry failed (N)" counts only failures a re-run can fix; a retryable
+  // whole-import error (dropped connection, time limit) offers a plain re-run.
+  // Nothing retryable → no button: the messages say what to change first.
+  const retryableFailures = result?.failures.filter((f) => f.retryable).length ?? 0;
+  const retryLabel =
+    retryableFailures > 0
+      ? `Retry failed (${retryableFailures})`
+      : error?.retryable
+        ? "Import again"
+        : null;
+  const summary = result !== null ? importSummary(result) : null;
+  const noHostsOnline = onlineHosts.length === 0;
+  const hasOutcome = result !== null || streamed.length > 0 || submitting || error !== null;
+
+  const noHostsNotice = (
+    <p className="text-sm text-muted-foreground" data-testid="import-no-hosts">
+      None of your machines are online. Start one with{" "}
+      <code className="rounded bg-muted px-1 py-0.5 font-mono">omnigent host</code> from your
+      terminal, then return here.
+    </p>
+  );
+
+  const outcome = hasOutcome && (
+    <div
+      className="mt-4 flex flex-col gap-2 border-t border-border pt-4"
+      data-testid="import-outcome"
+    >
+      {submitting ? (
+        <p className="text-sm text-muted-foreground" data-testid="import-progress">
+          {progressText(progress, streamed.length)}
+        </p>
+      ) : summary !== null ? (
+        <p className="text-sm text-muted-foreground" data-testid="import-result">
+          {summary}
+        </p>
+      ) : null}
+      {error !== null && !submitting && <ImportErrorBanner error={error} />}
+      {streamed.length > 0 && (
+        <ul
+          className="flex max-h-64 flex-col gap-1 overflow-y-auto"
+          data-testid="import-result-sessions"
+        >
+          {streamed.map((s) => (
+            <li key={s.id}>
+              <Link
+                to={`/c/${s.id}`}
+                className="block truncate text-sm text-primary hover:underline"
+                data-testid={`import-result-link-${s.id}`}
+              >
+                {s.title || "Untitled session"}
+              </Link>
+            </li>
+          ))}
+        </ul>
+      )}
+      {result !== null && result.failures.length > 0 && (
+        <div className="flex flex-col gap-2" data-testid="import-failures">
+          <span className="text-sm font-medium text-destructive">
+            {result.failed} couldn't be imported
+          </span>
+          <ul className="flex max-h-48 flex-col gap-2 overflow-y-auto">
+            {result.failures.map((f, i) => (
+              <ImportFailureRow key={f.externalSessionId ?? `failure-${i}`} failure={f} />
+            ))}
+          </ul>
+        </div>
+      )}
+      {/* A re-run needs an online machine; without one the notice says what to do. */}
+      {retryLabel !== null && !submitting && !noHostsOnline && (
+        <div>
+          <Button
+            variant="outline"
+            size="sm"
+            data-testid="import-retry"
+            onClick={() => void handleImport()}
+          >
+            {retryLabel}
+          </Button>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Retrying re-runs the import; sessions already imported are skipped.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+
+  if (noHostsOnline) {
+    // The machine can go offline mid-import (that is often why it stopped);
+    // keep what was imported and why it stopped next to the offline notice.
+    if (!hasOutcome) return noHostsNotice;
     return (
-      <p className="text-sm text-muted-foreground" data-testid="import-no-hosts">
-        None of your machines are online. Start one with{" "}
-        <code className="rounded bg-muted px-1 py-0.5 font-mono">omnigent host</code> from your
-        terminal, then return here.
-      </p>
+      <div className="flex flex-col" data-testid="import-sessions-panel">
+        {noHostsNotice}
+        {outcome}
+      </div>
     );
   }
 
@@ -224,79 +480,7 @@ export function ImportSessionsPanel() {
         </Button>
       </div>
 
-      {(result !== null || streamed.length > 0 || submitting) && (
-        <div className="mt-4 flex flex-col gap-2 border-t border-border pt-4">
-          {result !== null ? (
-            <p className="text-sm text-muted-foreground" data-testid="import-result">
-              Imported {result.imported}
-              {result.alreadyImported > 0 && `, ${result.alreadyImported} already imported`}
-              {result.failed > 0 && `, ${result.failed} failed`}.
-            </p>
-          ) : submitting ? (
-            <p className="text-sm text-muted-foreground" data-testid="import-progress">
-              Importing{streamed.length > 0 ? ` ${streamed.length} so far` : ""}…
-            </p>
-          ) : null}
-          {streamed.length > 0 && (
-            <ul
-              className="flex max-h-64 flex-col gap-1 overflow-y-auto"
-              data-testid="import-result-sessions"
-            >
-              {streamed.map((s) => (
-                <li key={s.id}>
-                  <Link
-                    to={`/c/${s.id}`}
-                    className="block truncate text-sm text-primary hover:underline"
-                    data-testid={`import-result-link-${s.id}`}
-                  >
-                    {s.title || "Untitled session"}
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          )}
-          {result !== null && result.failures.length > 0 && (
-            <div className="flex flex-col gap-2" data-testid="import-failures">
-              <span className="text-sm font-medium text-destructive">
-                {result.failed} couldn't be imported
-              </span>
-              <ul className="flex max-h-48 flex-col gap-1 overflow-y-auto">
-                {result.failures.map((f, i) => (
-                  <li
-                    key={f.externalSessionId ?? `failure-${i}`}
-                    className="text-sm text-muted-foreground"
-                    data-testid="import-failure-item"
-                  >
-                    <span className="text-destructive">{f.reason}</span>
-                    {f.externalSessionId !== null && (
-                      <span className="ml-1 font-mono text-xs">({f.externalSessionId})</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-              <div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  data-testid="import-retry"
-                  loading={submitting}
-                  onClick={() => void handleImport()}
-                >
-                  Retry failed
-                </Button>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Retrying re-runs the import; sessions already imported are skipped.
-                </p>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-      {error !== null && (
-        <p className="text-sm text-destructive" data-testid="import-error">
-          {error}
-        </p>
-      )}
+      {outcome}
     </div>
   );
 }
