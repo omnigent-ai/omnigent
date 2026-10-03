@@ -147,9 +147,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
 
   return (
     <ContextMenu onOpenChange={setContextOpen}>
-      <ContextMenuTrigger asChild>
-        {children(kebab, rowRef as RefObject<HTMLDivElement | null>)}
-      </ContextMenuTrigger>
+      <ContextMenuTrigger asChild>{children(kebab, rowRef)}</ContextMenuTrigger>
       <ContextMenuContent
         onCloseAutoFocus={(event) => {
           event.preventDefault();
