@@ -1,4 +1,4 @@
-"""The Design page lists slide decks from recent sessions and renders the selected one."""
+"""The Design page lists slide decks as cards and opens each one in the studio."""
 
 from __future__ import annotations
 
@@ -75,12 +75,12 @@ def test_design_page_is_absent_while_the_feature_is_off(page: Page, live_server:
     expect(page.get_by_test_id("design-nav")).to_have_count(0)
 
 
-def test_design_page_lists_and_renders_a_seeded_deck(
+def test_design_page_opens_a_seeded_deck_in_the_studio(
     page: Page,
     seeded_deck: tuple[str, str, str],
     tmp_path: Path,
 ) -> None:
-    """The nav opens Design, the seeded deck is listed, and selecting it renders it."""
+    """The nav opens Design, the seeded deck is a card, and the card opens the studio."""
     base_url, session_id, deck_path = seeded_deck
     deck_name = deck_path.removesuffix(".slides.html")
     _stub_server_info(page, design=True)
@@ -91,24 +91,28 @@ def test_design_page_lists_and_renders_a_seeded_deck(
 
     expect(page).to_have_url(re.compile(r"/design$"))
     expect(page.get_by_role("heading", name="Design", exact=True)).to_be_visible()
-    expect(page.get_by_text("Select a deck to view it here.")).to_be_visible()
-    row = page.get_by_role("link", name=re.compile(deck_name))
-    expect(row).to_be_visible(timeout=30_000)
-    row.click()
+    expect(page.get_by_text("Slides your agents made, on brand")).to_be_visible()
+    card = page.get_by_role("link", name=re.compile(deck_name))
+    expect(card).to_be_visible(timeout=30_000)
+    card.click()
 
     expect(page).to_have_url(re.compile(rf"/design\?session=.+&file={re.escape(deck_path)}$"))
-    expect(row).to_have_attribute("aria-current", "true")
-    viewer = page.get_by_role("region", name="Deck viewer")
-    expect(viewer.get_by_text("1 / 2")).to_be_visible(timeout=15_000)
-    deck = viewer.frame_locator('iframe[title="Slide deck"]')
+    preview = page.get_by_role("region", name="Deck preview")
+    expect(preview.get_by_text("1 / 2")).to_be_visible(timeout=15_000)
+    deck = preview.frame_locator('iframe[title="Slide deck"]')
     expect(deck.locator("#s1")).to_be_visible()
-    open_in_session = viewer.get_by_role("link", name="Open in session")
+    expect(page.get_by_role("complementary", name="Design chat")).to_be_visible()
+    open_in_session = page.get_by_role("link", name="Open in session")
     expect(open_in_session).to_have_attribute("href", re.compile(rf"\?file={deck_path}$"))
-    page.screenshot(path=str(tmp_path / "design-desktop.png"))
+    page.screenshot(path=str(tmp_path / "design-studio-desktop.png"))
 
-    # The selection is in the URL, so a reload reopens the same deck.
+    # Full hides the chat, and the view is in the URL, so a reload keeps it.
+    page.get_by_role("button", name="Full", exact=True).click()
+    expect(page).to_have_url(re.compile(r"&view=full$"))
+    expect(page.get_by_role("complementary", name="Design chat")).to_have_count(0)
     page.reload()
-    expect(viewer.get_by_text("1 / 2")).to_be_visible(timeout=15_000)
+    expect(preview.get_by_text("1 / 2")).to_be_visible(timeout=15_000)
+    expect(page.get_by_role("complementary", name="Design chat")).to_have_count(0)
 
 
 def _session(session_id: str, workspace: str, updated_at: int) -> dict[str, object]:
@@ -167,16 +171,7 @@ def _file(route: Route) -> None:
     route.fulfill(status=404, json={"error": {"code": "not_found"}})
 
 
-def test_design_page_on_a_phone_shows_unavailable_and_returns_to_the_list(
-    page: Page,
-    live_server: str,
-    tmp_path: Path,
-) -> None:
-    """Phone: the list fills the screen, a deck opens full screen, and back returns."""
-    sessions = [
-        _session("online", "/work/site", 2),
-        _session("offline", "/work/offline-app", 1),
-    ]
+def _stub_landing(page: Page, sessions: list[dict[str, object]]) -> None:
     _stub_server_info(page, design=True)
     page.route(
         "**/v1/sessions?*",
@@ -184,7 +179,7 @@ def test_design_page_on_a_phone_shows_unavailable_and_returns_to_the_list(
             json={
                 "object": "list",
                 "data": sessions,
-                "first_id": "online",
+                "first_id": sessions[0]["id"],
                 "last_id": None,
                 "has_more": False,
             }
@@ -193,6 +188,18 @@ def test_design_page_on_a_phone_shows_unavailable_and_returns_to_the_list(
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=[]))
     page.route("**/resources/environments/default/search?*", _search)
     page.route("**/resources/environments/default/filesystem/**", _file)
+
+
+def test_design_page_on_a_phone_shows_unavailable_and_returns_to_the_list(
+    page: Page,
+    live_server: str,
+    tmp_path: Path,
+) -> None:
+    """Phone: cards fill the screen, a deck opens full screen, Chat toggles, back returns."""
+    _stub_landing(
+        page,
+        [_session("online", "/work/site", 2), _session("offline", "/work/offline-app", 1)],
+    )
     page.set_viewport_size({"width": 390, "height": 844})
 
     page.goto(f"{live_server}/design")
@@ -206,12 +213,20 @@ def test_design_page_on_a_phone_shows_unavailable_and_returns_to_the_list(
     )
     site = page.get_by_role("region", name="site")
     expect(site.get_by_role("link", name="No kit")).to_be_visible()
-    page.screenshot(path=str(tmp_path / "design-phone-list.png"))
+    page.screenshot(path=str(tmp_path / "design-phone-landing.png"))
 
     site.get_by_role("link", name=re.compile("pitch")).click()
     expect(page.get_by_text("1 / 2")).to_be_visible(timeout=15_000)
     expect(page.get_by_role("region", name="site")).to_have_count(0)
-    page.screenshot(path=str(tmp_path / "design-phone-deck.png"))
+    expect(page.get_by_role("complementary", name="Design chat")).to_have_count(0)
+    page.screenshot(path=str(tmp_path / "design-phone-preview.png"))
+
+    page.get_by_role("button", name="Chat").click()
+    expect(page).to_have_url(re.compile(r"&view=chat$"))
+    expect(page.get_by_role("complementary", name="Design chat")).to_be_visible()
+    expect(page.get_by_role("region", name="Deck preview")).to_have_count(0)
+    page.get_by_role("button", name="Close chat").click()
+    expect(page.get_by_text("1 / 2")).to_be_visible(timeout=15_000)
 
     # SPA history steps fire no load event, so page.go_back() would wait forever.
     page.evaluate("history.back()")
@@ -220,6 +235,100 @@ def test_design_page_on_a_phone_shows_unavailable_and_returns_to_the_list(
 
     page.evaluate("history.forward()")
     expect(page.get_by_text("1 / 2")).to_be_visible(timeout=15_000)
-    page.get_by_role("button", name="Back to decks").click()
+    page.get_by_role("link", name="Back to designs").click()
     expect(page).to_have_url(re.compile(r"/design$"))
     expect(page.get_by_role("region", name="offline-app")).to_be_visible()
+
+
+_HOST = {"host_id": "host_e2e", "name": "e2e-host", "owner": "local", "status": "online"}
+
+
+def _host_listing(route: Route) -> None:
+    path = route.request.url.split("/filesystem", 1)[1].split("?")[0]
+    if path.endswith("/.omnigent/design-kit"):
+        route.fulfill(
+            json={
+                "object": "list",
+                "data": [
+                    {
+                        "name": "kit.json",
+                        "path": f"{path}/kit.json",
+                        "type": "file",
+                        "bytes": 2,
+                        "modified_at": 1,
+                    }
+                ],
+                "has_more": False,
+            }
+        )
+        return
+    route.fulfill(status=404, json={"detail": "not found"})
+
+
+def test_new_design_creates_a_session_and_opens_the_studio(
+    page: Page,
+    live_server: str,
+    tmp_path: Path,
+) -> None:
+    """New design posts the session create then the first message and opens the studio."""
+    _stub_landing(page, [_session("online", "/work/site", 2)])
+    page.route(
+        "**/v1/hosts",
+        lambda route: route.fulfill(json={"hosts": [_HOST]}),
+    )
+    page.route("**/v1/hosts/host_e2e/filesystem/**", _host_listing)
+    posted: dict[str, object] = {}
+
+    def _create(route: Route) -> None:
+        if route.request.method != "POST":
+            route.fallback()
+            return
+        posted["create"] = route.request.post_data_json
+        route.fulfill(
+            json={"id": "conv_design", "agent_id": "ag", "status": "idle", "created_at": 1}
+        )
+
+    def _event(route: Route) -> None:
+        posted["event"] = route.request.post_data_json
+        route.fulfill(status=202, json={"queued": True})
+
+    page.route("**/v1/sessions", _create)
+    page.route("**/v1/sessions/conv_design/events", _event)
+    # The last folder used for a design on this host prefills the dialog.
+    page.add_init_script(
+        "localStorage.setItem('omnigent.design.defaults', JSON.stringify("
+        "{hostId: 'host_e2e', folders: {host_e2e: '/work/site'}}))"
+    )
+    page.set_viewport_size({"width": 1400, "height": 900})
+
+    page.goto(f"{live_server}/design")
+    expect(page.get_by_role("link", name=re.compile("pitch"))).to_be_visible(timeout=30_000)
+    page.get_by_role("button", name="Weekly status update").click()
+
+    dialog = page.get_by_role("dialog", name="New design")
+    expect(dialog.get_by_label("Prompt")).to_have_value("Weekly status update")
+    expect(dialog.get_by_text("/work/site")).to_be_visible()
+    expect(dialog.get_by_text("Kit found")).to_be_visible()
+    page.screenshot(path=str(tmp_path / "design-new-dialog.png"))
+    dialog.get_by_role("button", name="Create").click()
+
+    expect(page).to_have_url(
+        re.compile(
+            r"/design\?session=conv_design&file=decks%2Fweekly-status-update\.slides\.html$"
+        )
+    )
+    expect(page.get_by_text("Waiting for the first slide")).to_be_visible(timeout=15_000)
+    expect(page.get_by_role("complementary", name="Design chat")).to_be_visible()
+    page.screenshot(path=str(tmp_path / "design-studio-waiting.png"))
+
+    create = posted["create"]
+    assert isinstance(create, dict)
+    assert create["host_id"] == "host_e2e"
+    assert create["workspace"] == "/work/site"
+    assert create["agent_id"]
+    event = posted["event"]
+    assert isinstance(event, dict)
+    assert event["type"] == "message"
+    text = event["data"]["content"][0]["text"]
+    assert text.startswith("Weekly status update\n\nUse the slide-decks skill.")
+    assert "`decks/weekly-status-update.slides.html`" in text
