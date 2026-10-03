@@ -48,6 +48,58 @@
         "title": "AddCommentRequest",
         "type": "object"
       },
+      "AgentList": {
+        "description": "The built-in agent list, plus the packaged names this deployment hides.",
+        "properties": {
+          "data": {
+            "items": {},
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          },
+          "suppressed_agent_names": {
+            "description": "Packaged built-ins `OMNIGENT_SEEDED_AGENTS` trimmed from `data`. The web picker also discovers agents from a user's recent sessions, so it needs these names to keep a hidden built-in with prior sessions from resurfacing as a custom agent.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Suppressed Agent Names",
+            "type": "array"
+          }
+        },
+        "title": "AgentList",
+        "type": "object"
+      },
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
@@ -9124,7 +9176,7 @@
     },
     "/v1/agents": {
       "get": {
-        "description": "List built-in agents with cursor-based pagination.\n\nReturns only built-in agents \u2014 `agent_store.list()` filters\n`session_id IS NULL` \u2014 so session-scoped agents never appear.\n\n**Returns:** A `PaginatedList` of built-in agents.",
+        "description": "List built-in agents with cursor-based pagination.\n\nReturns only built-in agents \u2014 `agent_store.list()` filters\n`session_id IS NULL` \u2014 so session-scoped agents never appear.\n\nPackaged built-ins the deployment suppressed via\n`OMNIGENT_SEEDED_AGENTS` are filtered out. The filter runs after\nthe store page is read, so the cursor stays store-based and\n`has_more` / `last_id` remain correct \u2014 a filtered page can\nreturn fewer than `limit` rows, which the paginating client\nalready handles. Suppressing hides a row without deleting it, so a\nsession already bound to one keeps working.\n\n**Returns:** An `AgentList` of built-in agents plus the suppressed names.",
         "operationId": "list_builtin_agents_v1_agents_get",
         "parameters": [
           {
@@ -9192,7 +9244,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PaginatedList"
+                  "$ref": "#/components/schemas/AgentList"
                 }
               }
             },

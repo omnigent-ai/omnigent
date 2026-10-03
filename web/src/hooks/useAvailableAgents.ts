@@ -108,14 +108,26 @@ interface BuiltinAgentsListWire {
   data: BuiltinAgentWire[];
   has_more?: boolean;
   last_id?: string | null;
+  // Packaged built-ins the deployment trimmed via OMNIGENT_SEEDED_AGENTS.
+  // Absent on older servers.
+  suppressed_agent_names?: string[];
+}
+
+/** The built-in catalog plus the packaged names the deployment hides. */
+export interface AgentCatalog {
+  agents: AvailableAgent[];
+  // A hidden built-in with prior sessions must not resurface from session
+  // discovery as a "custom" agent, so the merge drops these names.
+  suppressedNames: ReadonlySet<string>;
 }
 
 /**
  * Fetch the built-in agents from the read-only list `GET /v1/agents`
  * (see designs/BUILTIN_AGENTS.md).
  */
-export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
+export async function fetchAgentCatalog(): Promise<AgentCatalog> {
   const rows: BuiltinAgentWire[] = [];
+  const suppressedNames = new Set<string>();
   let after: string | null = null;
   // Each page provides the cursor for the next request.
   /* oxlint-disable no-await-in-loop */
@@ -127,11 +139,12 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
     rows.push(...body.data);
+    for (const name of body.suppressed_agent_names ?? []) suppressedNames.add(name);
     after = body.has_more === true && body.last_id ? body.last_id : null;
   } while (after != null);
   /* oxlint-enable no-await-in-loop */
 
-  return rows.map((a) => ({
+  const agents = rows.map((a) => ({
     id: a.id,
     name: a.name,
     display_name: displayNameForAgent(a.name, a.harness),
@@ -144,6 +157,7 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
     ...(a.builtin !== undefined ? { builtin: a.builtin } : {}),
     ...(a.created_at !== undefined ? { created_at: a.created_at } : {}),
   }));
+  return { agents, suppressedNames };
 }
 
 interface DiscoveredSessionAgent {
@@ -258,10 +272,10 @@ async function fetchAvailableAgents(
     createdAt: agent.created_at ?? null,
     agent,
   }));
-  const merged = mergeAvailableAgents(catalog, discovered);
+  const merged = mergeAvailableAgents(catalog.agents, discovered, catalog.suppressedNames);
   for (const id of pinnedAgentIds) {
     if (merged.some((agent) => agent.id === id)) continue;
-    const agent = sessionAgents.find((a) => a.id === id) ?? catalog.find((a) => a.id === id);
+    const agent = sessionAgents.find((a) => a.id === id) ?? catalog.agents.find((a) => a.id === id);
     if (agent) merged.push(agent);
   }
   return merged;
@@ -270,6 +284,7 @@ async function fetchAvailableAgents(
 function mergeAvailableAgents(
   catalog: AvailableAgent[],
   discovered: DiscoveredSessionAgent[],
+  suppressedNames: ReadonlySet<string> = new Set(),
 ): AvailableAgent[] {
   // Seeded built-ins are emitted verbatim and protected; user-registered
   // templates seed the newest-wins buckets so an upload can supersede them.
@@ -313,6 +328,8 @@ function mergeAvailableAgents(
     if (catalogIds.has(agent.agentId)) continue;
     // Seeded built-in name (incl. fork/switch clones): the built-in wins.
     if (seededNames.has(base)) continue;
+    // A packaged built-in the deployment trimmed: hidden, not a custom upload.
+    if (suppressedNames.has(base)) continue;
     if (hasKiroBuiltin && kiroLegacyNames.has(base.toLocaleLowerCase())) continue;
     // Genuine custom upload (or a clone of one). Newest same-named row wins,
     // superseding an older user-registered template seeded above. Strict `>`
@@ -424,7 +441,10 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // partial list read isPlaceholderData to tell this state apart.
   //
   const placeholderData = useMemo(
-    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog, [])),
+    () =>
+      catalog === undefined
+        ? undefined
+        : mergeAvailableAgents(catalog.agents, [], catalog.suppressedNames),
     [catalog],
   );
   const query = useQuery({

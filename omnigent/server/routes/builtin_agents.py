@@ -29,7 +29,8 @@ from omnigent.entities import Agent
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user as _require_user
-from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
+from omnigent.server.schemas import AgentList, AgentObject, MCPServerSummary, SkillSummary
+from omnigent.server.seeded_agents import suppressed_agent_names
 from omnigent.stores import AgentStore
 
 _logger = logging.getLogger(__name__)
@@ -147,26 +148,36 @@ def create_builtin_agents_router(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-    ) -> PaginatedList:
+    ) -> AgentList:
         """List built-in agents with cursor-based pagination.
 
         Returns only built-in agents — ``agent_store.list()`` filters
         ``session_id IS NULL`` — so session-scoped agents never appear.
+
+        Packaged built-ins the deployment suppressed via
+        ``OMNIGENT_SEEDED_AGENTS`` are filtered out. The filter runs after
+        the store page is read, so the cursor stays store-based and
+        ``has_more`` / ``last_id`` remain correct — a filtered page can
+        return fewer than ``limit`` rows, which the paginating client
+        already handles. Suppressing hides a row without deleting it, so a
+        session already bound to one keeps working.
 
         :param request: The incoming FastAPI request (for auth).
         :param limit: Maximum number of agents to return (1-1000).
         :param after: Cursor — return agents after this id.
         :param before: Cursor — return agents before this id.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
-        :returns: A :class:`PaginatedList` of built-in agents.
+        :returns: An :class:`AgentList` of built-in agents plus the suppressed names.
         """
         _require_user(request, auth_provider)
         page = agent_store.list(limit=limit, after=after, before=before, order=order)
-        return PaginatedList(
-            data=[_to_agent_object(a, agent_cache) for a in page.data],
+        suppressed = suppressed_agent_names()
+        return AgentList(
+            data=[_to_agent_object(a, agent_cache) for a in page.data if a.name not in suppressed],
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
+            suppressed_agent_names=sorted(suppressed),
         )
 
     return router

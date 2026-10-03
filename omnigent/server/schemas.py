@@ -61,6 +61,19 @@ class PaginatedList(BaseModel):
     has_more: bool = False
 
 
+class AgentList(PaginatedList):
+    """
+    The built-in agent list, plus the packaged names this deployment hides.
+
+    :param suppressed_agent_names: Packaged built-ins ``OMNIGENT_SEEDED_AGENTS``
+        trimmed from ``data``. The web picker also discovers agents from a
+        user's recent sessions, so it needs these names to keep a hidden
+        built-in with prior sessions from resurfacing as a custom agent.
+    """
+
+    suppressed_agent_names: list[str] = Field(default_factory=list)
+
+
 # ── Agents ──────────────────────────────────────────────────────
 
 
