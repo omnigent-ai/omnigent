@@ -13,6 +13,8 @@ import {
   useImportReviewRequest,
   type ImportReviewTarget,
 } from "@/lib/importReviewState";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 
 function InventoryModal({
   hostId,
@@ -78,7 +80,11 @@ export function HostImportsDialog({
  * whose harnesses bring MCPs, skills, or plugins.
  */
 export function ImportReviewGate() {
+  const info = useServerInfo();
   const target = useImportReviewRequest();
+  // Gated behind a release feature: this modal auto-opens for a newly connected
+  // host, so it must stay off on deployments where the feature isn't enabled.
+  if (!isFeatureEnabled(info, "import_review")) return null;
   if (target !== null) {
     return <RequestedImportReview key={target.hostId} target={target} />;
   }

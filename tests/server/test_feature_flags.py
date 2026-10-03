@@ -24,6 +24,7 @@ def test_features_default_off() -> None:
         "harness_install": False,
         "canvas": False,
         "customize": False,
+        "import_review": False,
     }
 
 
