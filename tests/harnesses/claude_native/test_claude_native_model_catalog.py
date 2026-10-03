@@ -13,6 +13,18 @@ import pytest
 from omnigent.harnesses.claude_native import main as claude_native
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ambient_anthropic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the shell's Anthropic endpoint env from reaching a real gateway listing."""
+    for name in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_CUSTOM_HEADERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _stub_picker(
     monkeypatch: pytest.MonkeyPatch,
     models: list[dict[str, Any]] | None,

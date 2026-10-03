@@ -77,6 +77,8 @@ from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from omnigent.onboarding.providers import ModelInfo
     from omnigent.spec.types import AgentSpec
 
@@ -1786,12 +1788,18 @@ def _fetch_openai_compatible_listing(
     provider: ResolvedModelProvider,
     *,
     transport: httpx.BaseTransport | None,
+    params: Mapping[str, str] | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> ModelListing:
     """List models from an OpenAI-compatible ``/v1/models`` endpoint.
 
     :param provider: An inline-family provider descriptor (an OpenAI key
         or an OpenRouter/LiteLLM-style gateway/local endpoint).
     :param transport: Optional httpx transport override for tests.
+    :param params: Extra query parameters, e.g.
+        ``{"return_wildcard_routes": "true"}``; ``None`` sends none.
+    :param headers: Extra request headers sent with the bearer token, e.g.
+        ``{"x-litellm-api-key": "sk-..."}``; ``None`` sends none.
     :returns: A ``source="openai-compatible"`` listing; entries carry
         ``context_window`` when the endpoint reports ``context_length``.
     :raises ValueError: When the provider has no base URL or credential.
@@ -1800,11 +1808,10 @@ def _fetch_openai_compatible_listing(
     if not provider.base_url:
         raise ValueError("provider has no base_url to list models from")
     token = _resolve_bearer_token(provider)
+    request_headers = httpx.Headers(headers)
+    request_headers["Authorization"] = f"Bearer {token}"
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        resp = client.get(
-            _models_url(provider.base_url),
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        resp = client.get(_models_url(provider.base_url), params=params, headers=request_headers)
         resp.raise_for_status()
         payload = resp.json()
     models: list[ModelEntry] = []

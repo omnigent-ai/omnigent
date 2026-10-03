@@ -14,7 +14,7 @@ import os
 import re
 import shlex
 import ssl
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
@@ -64,6 +64,18 @@ def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ambient_anthropic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the shell's Anthropic endpoint env from reaching a real gateway listing."""
+    for name in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_CUSTOM_HEADERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _test_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -10727,6 +10739,282 @@ async def test_claude_model_catalog_marks_the_enumerated_default(
     assert rows[1]["isDefault"] is True
 
 
+# ── live gateway model listing (mirrors pi #7007) ─────────────────────────
+
+
+def _models_transport(ids: list[str]) -> httpx.MockTransport:
+    """A transport whose /v1/models returns *ids* in OpenAI listing shape."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": i} for i in ids]})
+
+    return httpx.MockTransport(handler)
+
+
+def _anthropic_gateway_listing_provider(base_url: str = "https://litellm.example") -> Any:
+    from omnigent.models.model_catalog import ResolvedModelProvider
+
+    return ResolvedModelProvider(
+        kind="gateway", family="anthropic", base_url=base_url, api_key="sk-test"
+    )
+
+
+def _listing_gateway_config(base_url: str = "https://litellm.example") -> Any:
+    # Mirror _provider_config_for_native_claude: the listing provider's base_url
+    # is the same value written to ANTHROPIC_BASE_URL.
+    return claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": base_url},
+        api_key_helper="printf token",
+        listing_provider=_anthropic_gateway_listing_provider(base_url),
+    )
+
+
+def test_gateway_claude_listing_wildcard_serves_canonical() -> None:
+    """A LiteLLM-style ``claude-*`` wildcard marks the gateway canonical."""
+    transport = _models_transport(["claude-*", "gpt-5.6-sol", "ds4"])
+    serves, concrete = claude_native._gateway_claude_listing(
+        _anthropic_gateway_listing_provider(), transport=transport
+    )
+    assert serves is True
+    assert concrete == ()
+
+
+def test_gateway_claude_listing_concrete_ids() -> None:
+    """Concrete bare claude ids are canonical and returned verbatim."""
+    transport = _models_transport(["claude-sonnet-4-5", "claude-opus-4-1", "gpt-5.6"])
+    serves, concrete = claude_native._gateway_claude_listing(
+        _anthropic_gateway_listing_provider(), transport=transport
+    )
+    assert serves is True
+    assert concrete == ("claude-sonnet-4-5", "claude-opus-4-1")
+
+
+def test_gateway_claude_listing_namespaced_is_not_canonical() -> None:
+    """OpenRouter's ``anthropic/claude-*`` ids are NOT bare canonical."""
+    transport = _models_transport(
+        ["anthropic/claude-opus-5", "anthropic/claude-sonnet-5", "openai/gpt-5"]
+    )
+    serves, concrete = claude_native._gateway_claude_listing(
+        _anthropic_gateway_listing_provider(), transport=transport
+    )
+    assert serves is False
+    assert concrete == ()
+
+
+def test_gateway_claude_listing_unreachable_is_undetermined() -> None:
+    """An unreachable endpoint is undetermined (None) so the caller fails open."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    serves, concrete = claude_native._gateway_claude_listing(
+        _anthropic_gateway_listing_provider(), transport=httpx.MockTransport(handler)
+    )
+    assert (serves, concrete) == (None, ())
+
+
+def test_gateway_claude_listing_empty_is_undetermined() -> None:
+    """A 200 with no models proves nothing about namespacing → undetermined."""
+    transport = _models_transport([])
+    serves, concrete = claude_native._gateway_claude_listing(
+        _anthropic_gateway_listing_provider(), transport=transport
+    )
+    assert (serves, concrete) == (None, ())
+
+
+def test_gateway_claude_listing_failure_log_omits_url_and_credentials(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed listing logs its HTTP status, never the URL or its userinfo."""
+    from omnigent.models.model_catalog import ResolvedModelProvider
+
+    provider = ResolvedModelProvider(
+        kind="gateway",
+        family="anthropic",
+        base_url="http://user:SECRETPW@litellm.local",
+        api_key="sk-test",
+        detail="ambient ANTHROPIC_BASE_URL",
+    )
+    transport = httpx.MockTransport(lambda request: httpx.Response(401))
+    with caplog.at_level(logging.DEBUG, logger=claude_native._logger.name):
+        serves, _ = claude_native._gateway_claude_listing(provider, transport=transport)
+
+    assert serves is None
+    assert caplog.records
+    assert "401" in caplog.text
+    assert "SECRETPW" not in caplog.text
+    assert "litellm.local" not in caplog.text
+
+
+def test_gateway_claude_listing_is_case_sensitive() -> None:
+    """A differently-cased id doesn't prove the lowercase claude-* rows work."""
+    transport = _models_transport(["CLAUDE-SONNET-5", "openai/gpt-5"])
+    serves, concrete = claude_native._gateway_claude_listing(
+        _anthropic_gateway_listing_provider(), transport=transport
+    )
+    assert serves is False
+    assert concrete == ()
+
+
+def test_provider_config_for_native_claude_records_listing_provider() -> None:
+    """The gateway provider config carries an enumeration descriptor (no I/O)."""
+    from omnigent.onboarding.provider_config import load_providers
+
+    entry = load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": "https://litellm.example",
+                        "auth_command": "my-cli print-token",
+                    },
+                }
+            }
+        }
+    )["gw"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry)
+    assert cfg is not None
+    lp = cfg.listing_provider
+    assert lp is not None
+    assert (lp.kind, lp.family, lp.base_url) == ("gateway", "anthropic", "https://litellm.example")
+    assert lp.auth_command == "my-cli print-token"
+    # The listing endpoint is exactly the launch endpoint (what production hits).
+    assert lp.base_url == cfg.env["ANTHROPIC_BASE_URL"]
+
+
+async def test_claude_model_catalog_keeps_rows_when_gateway_lists_canonical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway whose live listing serves canonical ids keeps its claude-* rows.
+
+    The "Models unavailable" regression: without the live listing the hostname
+    heuristic would drop every claude-* row on a non-anthropic.com gateway.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-4-5", "displayName": "Sonnet 4.5"},
+                {"id": "opus", "model": "claude-opus-4-8", "displayName": "Opus 4.8"},
+            ],
+            default_model="claude-opus-4-8",
+            default_label="Opus 4.8",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setattr(
+        claude_native, "_gateway_claude_listing", lambda lp, *, transport=None: (True, ())
+    )
+    rows = await claude_native.claude_model_catalog(_listing_gateway_config())
+    assert rows is not None
+    assert [row["id"] for row in rows] == ["sonnet", "opus"]
+    assert rows[1]["isDefault"] is True
+
+
+async def test_claude_model_catalog_keeps_rows_when_listing_undetermined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient listing failure (None) fails OPEN — the probe rows survive.
+
+    Regression for the fail-open contract: a configured gateway provider must
+    not blank the picker (and cache it empty) on a momentary /v1/models blip.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-4-5", "displayName": "Sonnet 4.5"},
+                {"id": "opus", "model": "claude-opus-4-8", "displayName": "Opus 4.8"},
+            ],
+            default_model="claude-opus-4-8",
+            default_label="Opus 4.8",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setattr(
+        claude_native, "_gateway_claude_listing", lambda lp, *, transport=None: (None, ())
+    )
+    rows = await claude_native.claude_model_catalog(_listing_gateway_config())
+    assert [row["id"] for row in rows] == ["sonnet", "opus"]
+    assert rows[1]["isDefault"] is True
+
+
+async def test_claude_model_catalog_drops_rows_when_gateway_is_namespaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway whose listing has no bare claude-* (OpenRouter) drops the rows."""
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-4-5", "displayName": "Sonnet 4.5"},
+            ],
+            default_model="claude-sonnet-4-5",
+            default_label="Sonnet 4.5",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setattr(
+        claude_native, "_gateway_claude_listing", lambda lp, *, transport=None: (False, ())
+    )
+    rows = await claude_native.claude_model_catalog(
+        _listing_gateway_config("https://openrouter.example")
+    )
+    assert rows == []
+
+
+async def test_claude_model_catalog_surfaces_concrete_gateway_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concrete claude ids the gateway lists are added, deduped against the probe."""
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-4-5", "displayName": "Sonnet 4.5"},
+            ],
+            default_model="claude-sonnet-4-5",
+            default_label="Sonnet 4.5",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setattr(
+        claude_native,
+        "_gateway_claude_listing",
+        lambda lp, *, transport=None: (True, ("claude-sonnet-4-5", "claude-haiku-4-5")),
+    )
+    rows = await claude_native.claude_model_catalog(_listing_gateway_config())
+    ids = [row["model"] for row in rows]
+    assert "claude-haiku-4-5" in ids
+    assert ids.count("claude-sonnet-4-5") == 1
+
+
+def test_catalog_fingerprint_includes_listing_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config carrying a listing endpoint fingerprints distinctly from one without."""
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    base_env = {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}
+    cfg_plain = claude_native.ClaudeNativeUcodeConfig(
+        env=dict(base_env), api_key_helper="printf t"
+    )
+    cfg_listing = claude_native.ClaudeNativeUcodeConfig(
+        env=dict(base_env),
+        api_key_helper="printf t",
+        listing_provider=_anthropic_gateway_listing_provider("https://gw.example"),
+    )
+    assert claude_native.claude_catalog_fingerprint(
+        cfg_plain
+    ) != claude_native.claude_catalog_fingerprint(cfg_listing)
+
+
 async def test_claude_model_catalog_appends_an_off_list_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11371,11 +11659,10 @@ def test_catalog_fingerprint_includes_ambient_gateway_url(
 async def test_claude_model_catalog_filters_canonical_ids_for_ambient_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When claude_config is None but ANTHROPIC_BASE_URL is a gateway, filter canonical IDs.
+    """An ambient gateway whose reachable listing is namespaced-only drops bare rows.
 
-    Managed settings (e.g. Isaac) may set ANTHROPIC_BASE_URL to a Databricks
-    gateway. The catalog must filter canonical claude-* IDs even when
-    claude_config is None.
+    With claude_config None, the gateway's own listing (no bare claude-*) is
+    what drops the canonical rows, not the hostname; namespaced rows survive.
     """
 
     async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
@@ -11396,10 +11683,17 @@ async def test_claude_model_catalog_filters_canonical_ids_for_ambient_gateway(
 
     monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.com/anthropic")
+    listed: list[object] = []
+    monkeypatch.setattr(
+        claude_native,
+        "_gateway_claude_listing",
+        lambda lp, **kwargs: (listed.append(lp), (False, ()))[1],
+    )
 
     rows = await claude_native.claude_model_catalog(None)
 
     assert rows is not None
+    assert len(listed) == 1
     # Only the gateway-namespaced model should remain
     assert [row["id"] for row in rows] == ["sonnet-gateway"]
     # No canonical claude-* models
@@ -11431,6 +11725,186 @@ async def test_claude_model_catalog_keeps_canonical_ids_without_ambient_gateway(
     # Both canonical models should be present
     assert [row["id"] for row in rows] == ["sonnet", "opus"]
     assert rows[1]["isDefault"] is True
+
+
+# ── ambient gateway live listing ─────────────────────────────
+
+
+async def _litellm_alias_probe(config: object) -> claude_native.ClaudeModelProbe:
+    del config
+    return claude_native.ClaudeModelProbe(
+        alias_rows=[
+            {"id": "opus[1m]", "model": "claude-opus-5-5[1m]", "displayName": "Opus 5.5 (1M)"},
+            {"id": "sonnet", "model": "claude-sonnet-5-5", "displayName": "Sonnet 5.5"},
+            {"id": "haiku", "model": "claude-haiku-4-5-20251001", "displayName": "Haiku 4.5"},
+        ],
+        default_model="claude-opus-5-5[1m]",
+        default_label="Opus 5.5 (1M)",
+    )
+
+
+def _ambient_litellm_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Claude Code pointed at a LiteLLM passthrough purely through the env."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.local")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ambient-token")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "x-litellm-api-key: sk-litellm-key")
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _litellm_alias_probe)
+
+
+def _litellm_models_handler(request: httpx.Request) -> httpx.Response:
+    """LiteLLM hides a ``claude-*`` wildcard route unless asked for it."""
+    if request.url.params.get("return_wildcard_routes") == "true":
+        return httpx.Response(200, json={"data": [{"id": "claude-*"}]})
+    return httpx.Response(200, json={"data": []})
+
+
+def _route_gateway_listing(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> list[httpx.Request]:
+    """Run the real listing through *handler*; returns the requests it saw."""
+    seen: list[httpx.Request] = []
+    real_listing = claude_native._gateway_claude_listing
+
+    def _recording(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
+
+    monkeypatch.setattr(
+        claude_native,
+        "_gateway_claude_listing",
+        lambda lp, **kwargs: real_listing(lp, transport=httpx.MockTransport(_recording), **kwargs),
+    )
+    return seen
+
+
+def test_gateway_claude_listing_requests_wildcard_routes() -> None:
+    """The listing asks LiteLLM to report its ``claude-*`` wildcard route."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return _litellm_models_handler(request)
+
+    serves, concrete = claude_native._gateway_claude_listing(
+        _anthropic_gateway_listing_provider(), transport=httpx.MockTransport(handler)
+    )
+    assert [r.url.params.get("return_wildcard_routes") for r in seen] == ["true"]
+    assert (serves, concrete) == (True, ())
+
+
+async def test_claude_model_catalog_keeps_rows_when_ambient_gateway_lists_wildcard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An env-only LiteLLM passthrough listing ``claude-*`` keeps the probe rows."""
+    _ambient_litellm_env(monkeypatch)
+    seen = _route_gateway_listing(monkeypatch, _litellm_models_handler)
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows is not None
+    assert [row["id"] for row in rows] == ["opus[1m]", "sonnet", "haiku"]
+    assert rows[0]["isDefault"] is True
+    # Listed with the credential and custom headers Claude Code sends there.
+    assert [str(r.url) for r in seen] == [
+        "http://litellm.local/v1/models?return_wildcard_routes=true"
+    ]
+    assert seen[0].headers["authorization"] == "Bearer sk-ambient-token"
+    assert seen[0].headers["x-litellm-api-key"] == "sk-litellm-key"
+
+
+def _unreachable_handler(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("gateway down", request=request)
+
+
+def _empty_listing_handler(request: httpx.Request) -> httpx.Response:
+    del request
+    return httpx.Response(200, json={"data": []})
+
+
+@pytest.mark.parametrize(
+    ("handler", "auth_token"),
+    [
+        pytest.param(_unreachable_handler, "sk-ambient-token", id="unreachable"),
+        pytest.param(_empty_listing_handler, "sk-ambient-token", id="empty"),
+        pytest.param(lambda r: httpx.Response(401), "sk-ambient-token", id="http-401"),
+        pytest.param(lambda r: httpx.Response(429), "sk-ambient-token", id="http-429"),
+        pytest.param(lambda r: httpx.Response(500), "sk-ambient-token", id="http-500"),
+        pytest.param(
+            lambda r: httpx.Response(200, text="<html>not json</html>"),
+            "sk-ambient-token",
+            id="non-json-200",
+        ),
+        pytest.param(_litellm_models_handler, None, id="no-credential"),
+    ],
+)
+async def test_claude_model_catalog_keeps_rows_when_ambient_listing_undetermined(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response],
+    auth_token: str | None,
+) -> None:
+    """An undetermined ambient listing fails OPEN instead of blanking the picker."""
+    _ambient_litellm_env(monkeypatch)
+    if auth_token is None:
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN")
+    seen = _route_gateway_listing(monkeypatch, handler)
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows is not None
+    assert [row["id"] for row in rows] == ["opus[1m]", "sonnet", "haiku"]
+    assert rows[0]["isDefault"] is True
+    if auth_token is None:
+        # No credential: undetermined without sending an unauthenticated request.
+        assert seen == []
+
+
+async def test_claude_model_catalog_drops_rows_when_ambient_gateway_is_namespaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambient gateway listing only ``anthropic/claude-*`` drops bare rows."""
+    _ambient_litellm_env(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200, json={"data": [{"id": "anthropic/claude-*"}, {"id": "anthropic/claude-opus-5"}]}
+        )
+
+    seen = _route_gateway_listing(monkeypatch, handler)
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows == []
+    # The listing, not the hostname, is what decided the drop.
+    assert len(seen) == 1
+
+
+def test_catalog_fingerprint_retires_pre_ambient_listing_empty_catalogs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty catalog persisted by the hostname-only filter is not served."""
+    from omnigent.models import model_catalog_store
+
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.local")
+    parts: list[tuple[object, ...]] = []
+    real_fingerprint_of = model_catalog_store.fingerprint_of
+
+    def _recording_fingerprint_of(*args: object) -> str:
+        parts.append(args)
+        return real_fingerprint_of(*args)
+
+    monkeypatch.setattr(model_catalog_store, "fingerprint_of", _recording_fingerprint_of)
+    claude_native.claude_catalog_fingerprint(None)
+    # The same ambient launch keyed under the hostname-only catalog version.
+    legacy = real_fingerprint_of(parts[0][0], "control-picker-v3", *parts[0][2:])
+    model_catalog_store.write_catalog("claude-native", legacy, [])
+
+    assert claude_native.stored_claude_catalog_rows(None) is None
 
 
 def _isolate_to_connect_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
