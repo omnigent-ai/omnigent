@@ -6419,6 +6419,10 @@ def _claude_terminal_request(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
+        # Local wrapper: it never pre-seeds trust, so Claude's own first-run
+        # dialog normally still gates workspace settings. (Residual: a shared
+        # HOME already trusted by a host-spawned launch won't re-prompt here.)
+        include_workspace_settings=True,
     )
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by

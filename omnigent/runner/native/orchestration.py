@@ -8745,6 +8745,9 @@ async def _auto_create_claude_terminal(
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=skills_filter,
+        # Trust was pre-accepted above, so keep workspace-scoped settings
+        # disabled: an unreviewed workspace's hooks must not run without a user decision.
+        include_workspace_settings=False,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
