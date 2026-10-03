@@ -55,6 +55,7 @@ const {
   isDatabricksManagedServerUrl,
   databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
+  parseManifestAuth,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { parseServerLabels, serverLabel, withConnectLabel } = require("./server_labels");
@@ -81,6 +82,8 @@ const { createArcaAutoConnect } = require("./arca_autoconnect");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { ensureDatabricksSession } = require("./databricks-session");
 const { expireStoredAccessToken, removeStoredRefreshToken } = require("./databricks-oauth");
+const oidcCredentials = require("./oidc-credentials");
+const { createOidcAuth } = require("./oidc-auth");
 const {
   readDatabricksAuthMode,
   usesDatabricksBrowserAuth,
@@ -743,6 +746,7 @@ const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
 // Read the rollback preference once: a running connection must never change auth modes.
 let databricksAuthMode;
 let databricksAuth;
+let oidcAuth;
 const connectionAttempts = new WeakMap();
 
 function abortConnectionAttempt(win, message = "Connection superseded") {
@@ -814,11 +818,121 @@ function getDatabricksAuth() {
   return databricksAuth;
 }
 
+/** Whether a window signs in to its OIDC server through the system browser. */
+function usesOidcBrowserAuth(win) {
+  return windows.get(win)?.authKind === "oidc";
+}
+
+/** The connect-screen message for an OIDC session that can't continue. */
+function oidcSignInMessage(serverUrl, error) {
+  const server = originOf(serverUrl) ? new URL(serverUrl).host : serverUrl;
+  switch (error?.code) {
+    case "SIGNED_OUT":
+      return `You're signed out of ${server}.`;
+    case "expired_token":
+      return `Your sign-in to ${server} has expired. Select Connect to sign in again in your browser.`;
+    case "invalid_grant":
+      return `${server} ended your session. Select Connect to sign in again in your browser.`;
+    case "NO_STORED_TOKEN":
+      return `Sign in to ${server} to continue. Select Connect to open your browser.`;
+    case "SESSION_REJECTED":
+      return `${server} didn't accept the session. Select Connect to sign in again in your browser.`;
+    case "network":
+      return `Couldn't reach ${server}. Check your connection and try again.`;
+    case "timed_out":
+      return `Sign-in to ${server} timed out. Select Connect to try again.`;
+    case "browser_unavailable":
+      return `Couldn't open your browser to sign in to ${server}.`;
+    default: {
+      // The server's own reason (e.g. a disallowed email domain), kept short.
+      const reason =
+        typeof error?.description === "string" ? error.description.trim().slice(0, 200) : "";
+      return reason
+        ? `Couldn't sign in to ${server}: ${reason}`
+        : `Couldn't sign in to ${server}. Select Connect to try again.`;
+    }
+  }
+}
+
+/** Return an OIDC window to the connect screen, explaining why. */
+function showOidcAuthRequired(win, serverUrl, error) {
+  if (win.isDestroyed()) return;
+  console.warn("[omnigent] oidc auth: connection requires sign-in", {
+    origin: originOf(serverUrl),
+    code: error?.code,
+  });
+  const params = new URLSearchParams({
+    error: oidcSignInMessage(serverUrl, error),
+    url: serverUrl,
+  });
+  if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
+  oidcAuth?.detach(win);
+  pinWindow(win, null);
+  setWindowServerUrl(win, null);
+  win.webContents.stop();
+  void loadSetupPage(win, params.toString());
+}
+
+function getOidcAuth() {
+  oidcAuth ??= createOidcAuth({
+    session: session.defaultSession,
+    credentials: oidcCredentials,
+    getOrigin: (win) => (usesOidcBrowserAuth(win) ? pinnedOrigin(win) : null),
+    onAuthRequired: showOidcAuthRequired,
+    onSignedOut: (win, serverUrl) => showOidcAuthRequired(win, serverUrl, { code: "SIGNED_OUT" }),
+  });
+  return oidcAuth;
+}
+
+/**
+ * The OIDC session cookie to sign in with, or null for in-window sign-in. Read
+ * from the manifest; when it couldn't be fetched, the server's last known OIDC
+ * setup is used so a network blip never loads its IdP inside the window.
+ */
+function oidcSessionCookie(serverUrl, manifest, ephemeral) {
+  const origin = originOf(serverUrl);
+  if (manifest.manifestVersion >= 1) {
+    const cookie = manifest.auth?.mode === "oidc" ? manifest.auth.sessionCookie : null;
+    if (!cookie && !ephemeral) rememberOidcServer(serverUrl, null);
+    return cookie;
+  }
+  const known = loadSettings().oidc_servers?.[origin];
+  return (
+    parseManifestAuth({ mode: "oidc", session_cookie: known }, serverUrl)?.sessionCookie ?? null
+  );
+}
+
+/** Record (or clear) a server's OIDC session cookie, as settings.oidc_servers. */
+function rememberOidcServer(serverUrl, cookieName) {
+  const origin = originOf(serverUrl);
+  if (!origin) return;
+  const settings = loadSettings();
+  const raw = settings.oidc_servers;
+  const known = raw && typeof raw === "object" && !Array.isArray(raw) ? { ...raw } : {};
+  if ((known[origin] ?? null) === cookieName) return;
+  if (cookieName) known[origin] = cookieName;
+  else Reflect.deleteProperty(known, origin);
+  settings.oidc_servers = known;
+  saveSettings(settings);
+}
+
+/** Bring a window back to the front after the user signed in in their browser. */
+function focusAfterBrowserSignIn(win) {
+  if (win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  if (process.platform === "darwin") app.focus({ steal: true });
+}
+
 /** Embedded-auth connections retain their existing reload-to-sign-in recovery. */
 function registerSessionExpiryAccess() {
   registerSessionExpiryReload(
     session.defaultSession,
-    (origin) => !usesBrowserAuth(origin) && isPinnedServerUrl(origin),
+    (origin) =>
+      !usesBrowserAuth(origin) &&
+      ![...windows].some(([win, state]) => state.origin === origin && usesOidcBrowserAuth(win)) &&
+      isPinnedServerUrl(origin),
     (origin) => {
       const now = Date.now();
       for (const [win, state] of windows) {
@@ -994,6 +1108,8 @@ function pinWindow(win, origin, attemptToKeep) {
     if (connectionAttempts.get(win) !== attemptToKeep) abortConnectionAttempt(win);
     if (origin === null && usesBrowserAuth(state.origin)) databricksAuth?.rejectConnection(win);
     else databricksAuth?.detach(win);
+    oidcAuth?.detach(win);
+    state.authKind = null;
     // Leaving a server: this window's unread contribution goes with it.
     state.badgeCount = 0;
     updateBadge();
@@ -1635,10 +1751,12 @@ async function loadServerUrl(
     assertCurrent();
     let serverUrl = requestedServerUrl;
     databricksAuth?.reset(win);
+    oidcAuth?.detach(win);
     pinWindow(win, originOf(serverUrl), attempt);
     setWindowServerUrl(win, serverUrl);
     const windowState = windows.get(win);
     if (windowState) {
+      windowState.authKind = null;
       // An explicit connect targets what was typed; a restore or switch lands on
       // the workspace host and maps back to the URL picked for it.
       windowState.arcaServerUrl =
@@ -1647,6 +1765,7 @@ async function loadServerUrl(
         requestedServerUrl;
     }
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
+    let manifest = null;
     if (usesBrowserAuth(serverUrl)) {
       reportConnectionProgress(win, attempt, "authenticating");
       const auth = getDatabricksAuth();
@@ -1689,13 +1808,52 @@ async function loadServerUrl(
         }
         throw error;
       }
+    } else if (!isDatabricksManagedServerUrl(serverUrl)) {
+      // The manifest says how this server signs in, so read it before loading.
+      // Databricks hosts keep their URL-based detection above (no manifest).
+      manifest = await fetchServerManifest(serverUrl, { signal });
+      assertCurrent();
+      const cookieName = oidcSessionCookie(serverUrl, manifest, windowState?.ephemeral);
+      if (cookieName) {
+        if (windowState) {
+          windowState.authKind = "oidc";
+          windowState.oidcCookie = cookieName;
+        }
+        if (!isSetupPageUrl(win.webContents.getURL())) {
+          connectionLoading.show(win, attempt, "Signing in…");
+        }
+        const auth = getOidcAuth();
+        try {
+          const outcome = await auth.ensureSession(serverUrl, cookieName, {
+            interactive,
+            signal,
+            onBrowserSignIn: () => reportConnectionProgress(win, attempt, "authenticating"),
+          });
+          assertCurrent();
+          if (outcome === "signed-in") focusAfterBrowserSignIn(win);
+          auth.attach(win, { serverUrl, cookieName, loadUrl: target });
+          if (!windowState?.ephemeral) rememberOidcServer(serverUrl, cookieName);
+        } catch (error) {
+          if (current()) {
+            if (error.name === "AbortError") {
+              pinWindow(win, null);
+              setWindowServerUrl(win, null);
+            } else showOidcAuthRequired(win, serverUrl, error);
+          }
+          throw error;
+        }
+      }
     }
     assertCurrent();
     reportConnectionProgress(win, attempt, "connecting");
-    setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
-    void fetchServerManifest(serverUrl).then((manifest) => {
-      if (current()) setWindowServerManifest(win, manifest);
-    });
+    if (manifest) {
+      setWindowServerManifest(win, manifest);
+    } else {
+      setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
+      void fetchServerManifest(serverUrl).then((nextManifest) => {
+        if (current()) setWindowServerManifest(win, nextManifest);
+      });
+    }
     connectionLoading.show(win, attempt, "Opening Omnigent…");
     await win.loadURL(target);
     assertCurrent();
@@ -2006,6 +2164,7 @@ function createWindow(targetUrl, opts = {}) {
   win.on("closed", () => {
     abortConnectionAttempt(win);
     databricksAuth?.reset(win);
+    oidcAuth?.detach(win);
     // Destroy this window's embedded-browser views, else they leak webContents.
     try {
       windows.get(win)?.browserRegistry?.closeAll("window-closed");
@@ -2252,15 +2411,16 @@ function newWindow() {
 }
 
 /**
- * Dev-only: clear DBAUTH for the focused window without forcing navigation.
- * Browser mode's existing cookie lifecycle handles renewal.
+ * Dev-only: clear the focused window's session cookie (DBAUTH, or the OIDC
+ * session cookie) without forcing navigation. The cookie lifecycle renews it.
  */
 async function simulateSessionExpiry() {
   const win = activeWindow();
   const origin = win ? pinnedOrigin(win) : null;
   if (!origin) return;
   const ses = session.defaultSession;
-  const cookies = await ses.cookies.get({ url: origin, name: "DBAUTH" });
+  const name = usesOidcBrowserAuth(win) ? windows.get(win).oidcCookie : "DBAUTH";
+  const cookies = await ses.cookies.get({ url: origin, name });
   await Promise.all(
     cookies.map((c) => {
       const scheme = c.secure ? "https" : "http";
@@ -2271,13 +2431,34 @@ async function simulateSessionExpiry() {
       return ses.cookies.remove(`${scheme}://${host}${c.path || "/"}`, c.name);
     }),
   );
-  console.log(`[omnigent] dev: cleared ${cookies.length} DBAUTH cookie(s) for ${origin}`);
+  console.log(`[omnigent] dev: cleared ${cookies.length} ${name} cookie(s) for ${origin}`);
 }
 
 /** Dev-only: mutate cached credentials without initiating renewal or navigation. */
 async function changeCachedOAuthToken(tokenType) {
   const win = activeWindow();
   const origin = win ? pinnedOrigin(win) : null;
+  if (win && origin && usesOidcBrowserAuth(win)) {
+    // An OIDC window's access token is its session cookie (Simulate Session
+    // Expiry); only the refresh grant is cached separately.
+    const removed =
+      tokenType === "refresh" && oidcCredentials.removeStoredGrant(windows.get(win).serverUrl);
+    if (removed) {
+      console.log(
+        `[omnigent] dev: removed the cached refresh token for ${origin}; no refresh requested`,
+      );
+    } else {
+      await dialog.showMessageBox(win, {
+        type: "info",
+        message:
+          tokenType === "refresh"
+            ? "No cached refresh token for this server."
+            : "OIDC sessions cache no separate access token. Use Simulate Session Expiry.",
+        buttons: ["OK"],
+      });
+    }
+    return;
+  }
   if (!origin || !usesBrowserAuth(origin) || originOf(win.webContents.getURL()) !== origin) {
     await dialog.showMessageBox({
       type: "info",
