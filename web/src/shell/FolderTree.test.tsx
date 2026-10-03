@@ -43,6 +43,7 @@ import { FolderTree } from "./FolderTree";
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 beforeEach(() => copyTextMock.mockClear());
 
@@ -165,6 +166,14 @@ describe("FolderTree sorting", () => {
 });
 
 describe("FolderTree file size / download alignment", () => {
+  it("shows compact edited time for files when sorted by Last edited", () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_240_000);
+    renderTree({ files: [file("readme.md", 2048, 1_700_000_000)], sort: "recent" });
+
+    expect(screen.getByText("4m")).toHaveClass("text-muted-foreground");
+    expect(screen.queryByText("2.0 KB")).not.toBeInTheDocument();
+  });
+
   it("overlays the download button on the file size so both share one slot", () => {
     // The size label and the hover download button must occupy the same
     // relative container: the size reserves the width and the button overlays
