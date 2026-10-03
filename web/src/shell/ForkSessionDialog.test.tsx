@@ -715,6 +715,17 @@ describe("ForkSessionDialog", () => {
       expect(screen.queryByTestId("fork-session-advanced-content")).not.toBeInTheDocument();
     });
 
+    it("neither warns about nor polls an idle session parked in the source directory", () => {
+      useDirectorySessionsMock.mockReturnValue({
+        data: [{ id: "conv_other", host_id: "host_1", workspace: "/repo", status: "idle" }],
+      } as unknown as ReturnType<typeof useDirectorySessions>);
+      useRunnerHealthMock.mockReturnValue(new Map([["conv_other", true]]));
+      renderDialog(CODING);
+
+      expect(screen.queryByTestId("fork-session-conflict-hint")).not.toBeInTheDocument();
+      expect(useRunnerHealthMock).toHaveBeenLastCalledWith([]);
+    });
+
     it("forks, navigates immediately, and fires the runner launch in the background", async () => {
       forkSessionMock.mockResolvedValue({
         id: "conv_fork",

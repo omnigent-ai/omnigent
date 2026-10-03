@@ -181,6 +181,34 @@ describe("ResumeWithDirectoryDialog", () => {
     );
   });
 
+  it("warns about a working session in the source directory but ignores an idle one", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_src", name: "laptop", owner: "me", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    getSessionMock.mockResolvedValue(sourceSession({ workspace: "/Users/alice/repo" }));
+    useDirectorySessionsMock.mockReturnValue({
+      data: [
+        { id: "conv_busy", host_id: "host_src", workspace: "/Users/alice/repo", status: "running" },
+        { id: "conv_idle", host_id: "host_src", workspace: "/Users/alice/repo", status: "idle" },
+      ],
+    } as unknown as ReturnType<typeof useDirectorySessions>);
+    useRunnerHealthMock.mockReturnValue(
+      new Map([
+        ["conv_busy", true],
+        ["conv_idle", true],
+      ]),
+    );
+
+    renderDialog();
+
+    // Only the working session counts, and only it is registered for polling.
+    const hint = await screen.findByTestId("resume-dir-conflict-hint");
+    expect(hint.textContent).toContain("1 other agent is");
+    expect(useRunnerHealthMock).toHaveBeenLastCalledWith([
+      expect.objectContaining({ id: "conv_busy" }),
+    ]);
+  });
+
   it("binds the source directory directly when no branch is named", async () => {
     useHostsMock.mockReturnValue({
       data: [{ host_id: "host_src", name: "laptop", owner: "me", status: "online" }],

@@ -23,7 +23,11 @@ import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { HostLabel } from "./HostLabel";
 import { buildReconnectCommand } from "./ReconnectSessionDialog";
-import { normalizeWorkspacePath, sessionsSharingDirectory } from "./NewChatDialog";
+import {
+  directoryConflictCandidates,
+  normalizeWorkspacePath,
+  sessionsSharingDirectory,
+} from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -180,12 +184,7 @@ export function ResumeWithDirectoryDialog({
   // picked directory on this host (same wiring as NewChatDialog).
   const { data: directorySessions } = useDirectorySessions(open && Boolean(selectedHostId));
   const conflictCandidates = useMemo(
-    () =>
-      open
-        ? (directorySessions ?? []).filter(
-            (s) => s.host_id === selectedHostId && s.workspace != null,
-          )
-        : [],
+    () => (open ? directoryConflictCandidates(directorySessions, selectedHostId) : []),
     [open, directorySessions, selectedHostId],
   );
   const runnerHealth = useRunnerHealthRegistration(conflictCandidates);
