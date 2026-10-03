@@ -164,6 +164,7 @@ class TestSetupHermesHome:
             lambda: "conv_test123",
         )
         monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path / "nohome"))
+        monkeypatch.delenv("HERMES_HOME", raising=False)
         executor = HermesExecutor(hermes_path="/usr/bin/hermes-fake", cwd="/tmp")
         assert executor._hermes_home is not None
         bridge_dir = hnb.bridge_dir_for_session_id("conv_test123")
@@ -195,10 +196,12 @@ class TestSetupHermesHome:
 
     def test_credentials_stay_off_the_predictable_bridge_path(self, setup, tmp_path) -> None:
         """The HERMES_HOME holding .env/auth.json/the token-bearing wrapper is a
-        private tempdir, NOT under the deterministic bridge dir — so credentials never
-        land on a predictable path another local user could pre-create."""
+        profile under the user's own Hermes root, NOT under the deterministic bridge
+        dir — so credentials never land on a predictable path another local user
+        could pre-create, and Hermes shares the user's install instead of rebuilding it."""
         home, bridge_dir = setup
-        assert not home.is_relative_to(tmp_path)  # bridge root is tmp_path; home is elsewhere
+        assert not home.is_relative_to(bridge_dir)
+        assert home.parent == pathlib.Path.home() / ".hermes" / "profiles"
         assert (home / "omnigent-policy-hook.sh").is_file()
         assert not (bridge_dir / "hermes_home").exists()  # no creds under the bridge dir
 
