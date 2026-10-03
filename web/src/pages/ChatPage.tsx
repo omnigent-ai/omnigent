@@ -241,7 +241,11 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
-import { ComposerAgentIcon, NewChatLandingScreen } from "@/shell/NewChatDialog";
+import {
+  ComposerAgentIcon,
+  NewChatLandingScreen,
+  sandboxReposFromLabels,
+} from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
@@ -2551,6 +2555,13 @@ function ComposerImpl(
     () => composerContextFromLabels(composerSession?.labels),
     [composerSession?.labels],
   );
+  // A managed launch records the repositories it clones before any workspace
+  // is bound, so the chip can name them while the sandbox launches and after a
+  // launch that failed before binding one.
+  const composerSandboxRepos = useMemo(
+    () => sandboxReposFromLabels(composerSession?.labels),
+    [composerSession?.labels],
+  );
   const sessionWorkspace = composerSession?.workspace;
   const composerWorkspace = sessionWorkspace?.trim()
     ? sessionWorkspace
@@ -3679,6 +3690,7 @@ function ComposerImpl(
         >
           <ComposerWorkspaceStatus
             workspacePath={composerWorkspace ?? null}
+            sandboxRepos={composerSandboxRepos}
             worktreePath={composerGit.worktreePath}
             isWorktree={composerGit.isWorktree}
             branch={composerGit.branch}

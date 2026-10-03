@@ -1,16 +1,11 @@
-// Persisted, app-global preference for the last GitHub repos (and branches) the
-// user launched a sandbox session with.
+// Per-agent preference for the last GitHub repos (and branches) the user
+// launched a sandbox session with; written on create, read by the landing.
 //
-// Mirrors baseBranchPreferences: the landing composer reads this to seed the
-// repo list when there's no in-session draft, so returning users don't re-pick
-// the same repos every time. The stored URLs are the source of truth; the repo
-// combobox derives its selection from them, so a stored repo the account can no
-// longer access simply shows unselected (no stale entry is forced into the
-// picker). Written on session create.
+// Seeding from the agent's own entry lets returning users skip re-picking
+// without a repo picked for one agent riding into another agent's launch;
+// a stored repo the account can no longer access simply shows unselected.
 
 const STORAGE_KEY = "omnigent:last-sandbox-repos";
-// Single-repo key written by builds before multi-repo; read once for migration.
-const LEGACY_STORAGE_KEY = "omnigent:last-sandbox-repo";
 
 /**
  * Strip any userinfo (`user[:secret]@`) from an http(s) URL, so a pasted
@@ -38,50 +33,51 @@ function normalizeEntry(value: unknown): LastSandboxRepo | null {
   return url === "" ? null : { url, branch };
 }
 
-/**
- * Read the last repos the user launched a sandbox with: the stored list, or
- * ``[]`` when nothing is stored, on a server render (no ``window``), when
- * storage is inaccessible, or when the stored value is malformed — never
- * throws. Trims on read so a hand-edited or stale entry can't seed an
- * un-normalized value. Falls back once to the single-repo key an older build
- * wrote, so a returning user's last repo still seeds the picker.
- */
-export function readLastSandboxRepos(): LastSandboxRepo[] {
-  if (typeof window === "undefined") return [];
+// The stored agent-id → repos map; ``{}`` when nothing is stored or the value is
+// malformed. Older builds stored one browser-wide array whose agent is unknown,
+// so it is ignored rather than attributed to anyone.
+function readMap(): Record<string, unknown> {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as unknown;
-      if (!Array.isArray(parsed)) return [];
-      return parsed.map(normalizeEntry).filter((r): r is LastSandboxRepo => r !== null);
-    }
-    const legacy = window.localStorage.getItem(LEGACY_STORAGE_KEY);
-    if (legacy) {
-      const one = normalizeEntry(JSON.parse(legacy) as unknown);
-      return one ? [one] : [];
-    }
-    return [];
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
   } catch {
-    return [];
+    return {};
   }
 }
 
 /**
- * Persist ``repos`` as the last repos launched with. Entries with a blank
- * (or whitespace-only) URL are dropped; an empty result clears the preference.
- * Swallows quota/access errors so a failed write can't break session creation.
+ * Repos ``agentId`` last launched a sandbox with; ``[]`` when none, no agent, or storage is unusable.
  */
-export function writeLastSandboxRepos(repos: LastSandboxRepo[]): void {
-  if (typeof window === "undefined") return;
+export function readLastSandboxRepos(agentId: string | null | undefined): LastSandboxRepo[] {
+  if (typeof window === "undefined" || !agentId) return [];
+  const entry = readMap()[agentId];
+  if (!Array.isArray(entry)) return [];
+  return entry.map(normalizeEntry).filter((r): r is LastSandboxRepo => r !== null);
+}
+
+/**
+ * Store ``repos`` as ``agentId``'s last launch (blank URLs dropped, empty clears it); never throws.
+ */
+export function writeLastSandboxRepos(
+  agentId: string | null | undefined,
+  repos: LastSandboxRepo[],
+): void {
+  if (typeof window === "undefined" || !agentId) return;
   try {
     const cleaned = repos
       .map((r) => ({ url: stripUrlUserinfo(r.url.trim()), branch: r.branch.trim() }))
       .filter((r) => r.url !== "");
-    if (cleaned.length === 0) {
+    const { [agentId]: _previous, ...others } = readMap();
+    const map = cleaned.length === 0 ? others : { ...others, [agentId]: cleaned };
+    if (Object.keys(map).length === 0) {
       window.localStorage.removeItem(STORAGE_KEY);
       return;
     }
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(cleaned));
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
   } catch {
     // localStorage quota or access errors shouldn't break session creation.
   }

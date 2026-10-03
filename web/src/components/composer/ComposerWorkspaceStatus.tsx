@@ -9,6 +9,42 @@ function pathTail(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
 }
 
+/**
+ * Repo name[#branch] of one ``<url>[#<branch>]`` sandbox workspace, matching the landing chip.
+ */
+function sandboxRepoTail(workspace: string): string {
+  const hash = workspace.indexOf("#");
+  const url = (hash === -1 ? workspace : workspace.slice(0, hash)).replace(/\/+$/, "");
+  const last = url.split(/[/:]/).pop() ?? url;
+  const name = last.endsWith(".git") ? last.slice(0, -4) : last;
+  return hash === -1 ? name : `${name}#${workspace.slice(hash + 1)}`;
+}
+
+// Folder item texts: the bound directory; else the repos a managed launch clones, named while
+// no workspace is bound (including after a launch that failed before binding one); else none.
+function workspaceItem(
+  workspacePath: string | null,
+  sandboxRepos: string[],
+): { label: string; title: string; ariaLabel: string } {
+  if (workspacePath) {
+    const title = `Working directory: ${workspacePath}`;
+    return { label: pathTail(workspacePath), title, ariaLabel: title };
+  }
+  if (sandboxRepos.length === 1) {
+    const title = `Sandbox repository: ${sandboxRepos[0]}`;
+    return { label: sandboxRepoTail(sandboxRepos[0]), title, ariaLabel: title };
+  }
+  if (sandboxRepos.length > 1) {
+    const title = `Sandbox repositories: ${sandboxRepos.join(", ")}`;
+    return { label: `${sandboxRepos.length} repositories`, title, ariaLabel: title };
+  }
+  return {
+    label: "No workspace",
+    title: "No working directory bound",
+    ariaLabel: "Working directory: Not selected",
+  };
+}
+
 /** Trigger label for each branch state — no state is dressed up as another. */
 function branchLabel(state: ComposerBranchState, branch: string | null): string {
   switch (state) {
@@ -28,6 +64,7 @@ function branchLabel(state: ComposerBranchState, branch: string | null): string 
 /** Read-only workspace identity for an existing session's composer bar. */
 export function ComposerWorkspaceStatus({
   workspacePath,
+  sandboxRepos,
   worktreePath,
   isWorktree,
   branch,
@@ -36,6 +73,8 @@ export function ComposerWorkspaceStatus({
   showWorktree,
 }: {
   workspacePath: string | null;
+  /** ``<url>[#<branch>]`` repositories the managed launch was asked to clone. */
+  sandboxRepos: string[];
   worktreePath: string | null;
   isWorktree: boolean | null;
   branch: string | null;
@@ -43,6 +82,7 @@ export function ComposerWorkspaceStatus({
   creationBranch: string | null;
   showWorktree: boolean;
 }) {
+  const directory = workspaceItem(workspacePath, sandboxRepos);
   const branchText = branchLabel(branchState, branch);
   const branchTitle =
     creationBranch && (branchState !== "branch" || creationBranch !== branch)
@@ -53,11 +93,9 @@ export function ComposerWorkspaceStatus({
     <>
       <WorkspaceStatusItem
         icon={FolderIcon}
-        label={workspacePath ? pathTail(workspacePath) : "No workspace"}
-        title={workspacePath ? `Working directory: ${workspacePath}` : "No working directory bound"}
-        ariaLabel={
-          workspacePath ? `Working directory: ${workspacePath}` : "Working directory: Not selected"
-        }
+        label={directory.label}
+        title={directory.title}
+        ariaLabel={directory.ariaLabel}
         testId="composer-workspace-dir"
       />
       {showWorktree ? (

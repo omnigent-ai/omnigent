@@ -2584,6 +2584,28 @@ describe("Composer shared visible controls", () => {
     );
   });
 
+  it("names the sandbox repository when the launch never bound a workspace", () => {
+    composerGitStatusArgsSpy.mockClear();
+    Object.assign(composerSessionSnapshot, {
+      workspace: null,
+      labels: { "omnigent.sandbox.repo": "https://github.com/org/fixture-repo.git#main" },
+    });
+    useChatStore.setState({ conversationId: "conv_failed_sandbox_launch", gitBranch: null });
+
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    const directory = screen.getByTestId("composer-workspace-dir");
+    expect(directory).toHaveTextContent("fixture-repo#main");
+    expect(directory).toHaveAccessibleName(
+      "Sandbox repository: https://github.com/org/fixture-repo.git#main",
+    );
+    // The repository is not a path on any host, so git status still sees no
+    // workspace to inspect.
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ workspace: null }),
+    );
+  });
+
   it("dispatches the shared permission picker to the session setter", async () => {
     useChatStore.setState({
       conversationId: "shared-permissions",
