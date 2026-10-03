@@ -97,6 +97,7 @@
       "entitlementsInherit": "signing/entitlements.mac.inherit.plist",
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Omnigent uses the microphone for voice dictation in the message composer.",
+        "NSPhotoLibraryAddUsageDescription": "Omnigent saves generated images to your photo library when you choose Save to Photos.",
         "CFBundleIconName": "AppIcon",
         "NSPrefersDisplaySafeAreaCompatibilityMode": false
       },
