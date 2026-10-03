@@ -85,8 +85,10 @@ _pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default
 # ``gh pr view`` opens an interactive/pager view and misbehaves in a
 # non-interactive subprocess. ``body`` + ``comments`` feed the Summary tab;
 # both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
+# ``reviews`` + ``reviewDecision`` feed the Reviews section.
 _PR_VIEW_FIELDS = (
-    "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
+    "number,title,state,url,isDraft,author,baseRefName,headRefName,"
+    "statusCheckRollup,body,comments,reviews,reviewDecision"
 )
 
 
@@ -430,6 +432,41 @@ def _shape_comments(raw: Any) -> list[dict[str, Any]]:
     return shaped
 
 
+# Cap review bodies so a wall-of-text review doesn't bloat the payload.
+_MAX_REVIEWS = 50
+_MAX_REVIEW_BODY = 4000
+
+
+def _shape_reviews(raw: Any) -> list[dict[str, Any]]:
+    """Shape ``gh``'s PR ``reviews`` into the Reviews section list.
+
+    Includes all review states (APPROVED, CHANGES_REQUESTED, COMMENTED,
+    DISMISSED, PENDING). Each entry is ``{author, state, body, submitted_at,
+    url}``; bodies are capped at ``_MAX_REVIEW_BODY`` characters and the list
+    is capped at ``_MAX_REVIEWS``.
+    """
+    shaped: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return shaped
+    for review in raw:
+        if not isinstance(review, dict):
+            continue
+        author = review.get("author")
+        body = str(review.get("body") or "")
+        shaped.append(
+            {
+                "author": author.get("login") if isinstance(author, dict) else None,
+                "state": review.get("state") or None,
+                "body": body[:_MAX_REVIEW_BODY] if body else "",
+                "submitted_at": review.get("submittedAt") or None,
+                "url": review.get("url") or None,
+            }
+        )
+        if len(shaped) >= _MAX_REVIEWS:
+            break
+    return shaped
+
+
 def _head_commit_shas(root: str) -> list[str]:
     """Candidate commit SHAs to resolve the PR by identity, most-pushed first.
 
@@ -647,6 +684,8 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             # empty body is null so the UI shows its "no description" state.
             "body": body if isinstance(body, str) and body.strip() else None,
             "comments": _shape_comments(data.get("comments")),
+            "review_decision": data.get("reviewDecision") or None,
+            "reviews": _shape_reviews(data.get("reviews")),
         }
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
@@ -760,6 +799,8 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "checks": _summarize_checks(data.get("statusCheckRollup")),
         "body": data.get("body") or None,
         "comments": _shape_comments(data.get("comments")),
+        "review_decision": data.get("reviewDecision") or None,
+        "reviews": _shape_reviews(data.get("reviews")),
     }
     return info
 

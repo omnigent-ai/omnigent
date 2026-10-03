@@ -1114,3 +1114,142 @@ def test_gh_applies_account_token(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(env, dict)
     assert env["GH_TOKEN"] == "chosen-tok"
     assert "GITHUB_TOKEN" not in env
+
+
+def test_github_info_includes_review_decision_and_reviews(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The PR carries its review decision and shaped review list.
+
+    ``review_decision`` is the overall verdict; ``reviews`` lists each
+    reviewer's state, body, and timestamps.  A PENDING review (no submittedAt)
+    and an author-less review both normalise cleanly.
+    """
+    view = {
+        "number": 12,
+        "title": "t",
+        "state": "OPEN",
+        "url": "u",
+        "isDraft": False,
+        "author": {"login": "alice"},
+        "baseRefName": "main",
+        "headRefName": "feature",
+        "statusCheckRollup": [],
+        "body": None,
+        "comments": [],
+        "reviewDecision": "APPROVED",
+        "reviews": [
+            {
+                "author": {"login": "bob"},
+                "state": "APPROVED",
+                "body": "LGTM!",
+                "submittedAt": "2026-09-10T10:00:00Z",
+                "url": "https://github.com/r/1#pullrequestreview-1",
+            },
+            {
+                "author": {"login": "carol"},
+                "state": "CHANGES_REQUESTED",
+                "body": "Needs work.",
+                "submittedAt": "2026-09-10T11:00:00Z",
+                "url": None,
+            },
+        ],
+    }
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        head = tuple(argv[:2])
+        if head == ("auth", "status"):
+            return (0, "", "")
+        if head == ("repo", "view"):
+            return (0, json.dumps({"nameWithOwner": "o/r"}), "")
+        if head == ("pr", "view"):
+            return (0, json.dumps(view), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"]["review_decision"] == "APPROVED"
+    assert info["pr"]["reviews"] == [
+        {
+            "author": "bob",
+            "state": "APPROVED",
+            "body": "LGTM!",
+            "submitted_at": "2026-09-10T10:00:00Z",
+            "url": "https://github.com/r/1#pullrequestreview-1",
+        },
+        {
+            "author": "carol",
+            "state": "CHANGES_REQUESTED",
+            "body": "Needs work.",
+            "submitted_at": "2026-09-10T11:00:00Z",
+            "url": None,
+        },
+    ]
+
+
+def test_github_info_no_reviews_is_empty(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the PR has no reviews, ``reviews`` is [] and ``review_decision`` is null."""
+    view = {
+        "number": 13,
+        "title": "t",
+        "state": "OPEN",
+        "url": "u",
+        "isDraft": False,
+        "author": {"login": "alice"},
+        "baseRefName": "main",
+        "headRefName": "feature",
+        "statusCheckRollup": [],
+        "body": None,
+        "comments": [],
+        "reviewDecision": None,
+        "reviews": [],
+    }
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        head = tuple(argv[:2])
+        if head == ("auth", "status"):
+            return (0, "", "")
+        if head == ("repo", "view"):
+            return (0, json.dumps({"nameWithOwner": "o/r"}), "")
+        if head == ("pr", "view"):
+            return (0, json.dumps(view), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"]["review_decision"] is None
+    assert info["pr"]["reviews"] == []
+
+
+def test_shape_reviews_caps_and_truncates() -> None:
+    """Reviews cap at ``_MAX_REVIEWS`` and bodies are capped at ``_MAX_REVIEW_BODY``."""
+    long_body = "x" * (github_resource._MAX_REVIEW_BODY + 100)
+    raw: list[dict[str, object]] = [
+        {"author": {"login": "u0"}, "state": "APPROVED", "body": long_body, "submittedAt": "t"},
+    ]
+    raw += [
+        {
+            "author": {"login": f"u{i}"},
+            "state": "COMMENTED",
+            "body": f"c{i}",
+            "submittedAt": "t",
+            "url": None,
+        }
+        for i in range(1, github_resource._MAX_REVIEWS + 5)
+    ]
+    shaped = github_resource._shape_reviews(raw)
+    assert len(shaped) == github_resource._MAX_REVIEWS
+    assert len(shaped[0]["body"]) == github_resource._MAX_REVIEW_BODY
+    # Missing author flattens to None; non-list input is an empty list.
+    assert github_resource._shape_reviews([{"state": "APPROVED", "body": "ok"}]) == [
+        {"author": None, "state": "APPROVED", "body": "ok", "submitted_at": None, "url": None}
+    ]
+    assert github_resource._shape_reviews(None) == []
