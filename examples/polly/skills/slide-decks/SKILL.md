@@ -64,10 +64,11 @@ folder).
 - No kit: style the deck yourself with a restrained palette, and tell the user
   they can brand future decks by copying `examples/design-kits/sample` to
   `.omnigent/design-kit/` and editing it.
-- A "Design kit not applied: reason" notice means the kit (`kit.json` or one
-  of its files) is invalid, and the notice gives the reason. Fix the kit, not
-  the deck. The viewer reads the kit when a deck opens or its content
-  changes, so reopen the deck after editing only the kit.
+- A "Design kit not applied: reason" notice means the kit could not be
+  applied (an invalid `kit.json` or kit file, a failed read, or a timeout);
+  the notice gives the reason. Report it to the user (or polly) rather than
+  restyling the deck to match. The viewer reads the kit when a deck opens or
+  its content changes, so reopen the deck after editing only the kit.
 
 ## Workflow
 
