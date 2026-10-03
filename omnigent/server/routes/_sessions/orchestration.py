@@ -11433,7 +11433,7 @@ async def _probe_runner_live_status(
     """
     Ask a session's bound runner for its live status, bounded, shared, and backed off.
 
-    Concurrent snapshots of one session await the same in-flight probe. A 200
+    Concurrent snapshots bound to the same runner await one in-flight probe. A 200
     records the status in ``_session_status_cache``; a probe that timed out,
     failed in transport, or answered slowly without a status puts the session
     in a skip window that doubles per consecutive slow probe.
@@ -11442,19 +11442,22 @@ async def _probe_runner_live_status(
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param runner_id: The session's bound runner, e.g.
         ``"runner_0123456789abcdef"``. A skip window recorded against a
-        different runner is discarded so a rebound session is probed at once.
+        different runner is discarded and its pending probe superseded so a
+        rebound session is probed at once.
     :returns: The runner's raw status, e.g. ``"running"``, or ``None`` when the
         probe is in backoff, timed out, failed, or returned a non-200.
     """
-    probe = _runner_status_probe_inflight.get(session_id)
-    if probe is None:
+    inflight = _runner_status_probe_inflight.get(session_id)
+    if inflight is None or inflight[0] != runner_id:
         backoff = _runner_status_probe_backoff.get(session_id)
         if backoff is not None and backoff.runner_id != runner_id:
             _runner_status_probe_backoff.pop(session_id, None)
         elif backoff is not None and time.monotonic() < backoff.skip_until:
             return None
         probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id, runner_id))
-        _runner_status_probe_inflight[session_id] = probe
+        _runner_status_probe_inflight[session_id] = (runner_id, probe)
+    else:
+        probe = inflight[1]
     # Shielded so one cancelled snapshot request does not abort the probe the
     # other waiters share.
     return await asyncio.shield(probe)
@@ -11472,6 +11475,7 @@ async def _run_runner_status_probe(
     :returns: The runner's raw status on a 200, else ``None``.
     """
     started = time.monotonic()
+    current_probe = (runner_id, asyncio.current_task())
     try:
         try:
             resp = await asyncio.wait_for(
@@ -11485,6 +11489,10 @@ async def _run_runner_status_probe(
         except (httpx.HTTPError, ConnectionError) as exc:
             failure = f"{type(exc).__name__}: {exc}"
         else:
+            # A rebind may have superseded this probe mid-flight: still return the
+            # observed status to this probe's caller, but leave the shared caches
+            # to the replacement that now owns them.
+            owns_session = _runner_status_probe_inflight.get(session_id) == current_probe
             elapsed = time.monotonic() - started
             if resp.status_code == 200:
                 try:
@@ -11493,14 +11501,16 @@ async def _run_runner_status_probe(
                     payload = None
                 if isinstance(payload, dict):
                     raw = str(payload.get("status", "idle"))
-                    _session_status_cache[session_id] = raw
-                    if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
-                    _runner_status_probe_backoff.pop(session_id, None)
+                    if owns_session:
+                        _session_status_cache[session_id] = raw
+                        if raw in ("idle", "running", "waiting", "failed"):
+                            session_live_state.persist_live_status(session_id, raw)
+                        _runner_status_probe_backoff.pop(session_id, None)
                     return raw
                 failure = "HTTP 200 with a malformed body"
             elif elapsed < _RUNNER_STATUS_PROBE_SLOW_S:
-                _runner_status_probe_backoff.pop(session_id, None)
+                if owns_session:
+                    _runner_status_probe_backoff.pop(session_id, None)
                 _logger.debug(
                     "Runner status probe for session=%s answered HTTP %s",
                     session_id,
@@ -11510,6 +11520,14 @@ async def _run_runner_status_probe(
                 return None
             else:
                 failure = f"HTTP {resp.status_code} after {elapsed:.1f}s"
+        if _runner_status_probe_inflight.get(session_id) != current_probe:
+            _logger.debug(
+                "Superseded runner status probe for session=%s failed (%s)",
+                session_id,
+                failure,
+                extra={"session_id": session_id},
+            )
+            return None
         previous = _runner_status_probe_backoff.get(session_id)
         failures = (previous.failures if previous is not None else 0) + 1
         window = _runner_status_probe_window_s(failures)
@@ -11525,7 +11543,8 @@ async def _run_runner_status_probe(
         )
         return None
     finally:
-        _runner_status_probe_inflight.pop(session_id, None)
+        if _runner_status_probe_inflight.get(session_id) == current_probe:
+            _runner_status_probe_inflight.pop(session_id, None)
 
 
 async def _get_session_snapshot(
