@@ -213,9 +213,11 @@ interface ChangedFilesResponse {
 
 async function fetchWorkspaceChangedFiles(
   conversationId: string,
+  signal?: AbortSignal,
 ): Promise<WorkspaceChangedFilesResult> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/changes`,
+    { signal },
   );
   if (res.status === 404) {
     return { available: false, data: [] };
@@ -275,7 +277,7 @@ export function useWorkspaceChangedFiles(
   useTrailingInvalidate(conversationId, sessionActive, "workspace-changed-files");
   return useQuery({
     queryKey: ["workspace-changed-files", conversationId],
-    queryFn: () => fetchWorkspaceChangedFiles(conversationId!),
+    queryFn: ({ signal }) => fetchWorkspaceChangedFiles(conversationId!, signal),
     enabled:
       queryEnabled &&
       !!conversationId &&
