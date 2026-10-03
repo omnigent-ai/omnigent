@@ -701,6 +701,18 @@
             "description": "Sub-agent instance name, the suffix of `title` after the first `\":\"`, e.g. `\"auth\"`. `None` if `title` is `None` or missing a colon.",
             "title": "Session Name"
           },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Child live state (idle, running, waiting, failed), or None when unknown. The relay cache takes precedence over the durable row; a durable task error forces failed.",
+            "title": "Status"
+          },
           "task_summary": {
             "anyOf": [
               {
