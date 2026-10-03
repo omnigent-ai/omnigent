@@ -333,8 +333,9 @@ from the user's chosen source.
 
 ## Later phases
 
-Designed for the same `design` flag and pending approval. Each item is its
-own PR, in the build order at the end of this section.
+Designed and approved for the same `design` flag, including the new server
+surface listed in the build order. Each item is its own PR, in the build order
+at the end of this section.
 
 ### Server deck index
 
