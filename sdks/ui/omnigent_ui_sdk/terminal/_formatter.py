@@ -35,6 +35,7 @@ from rich.console import Console, ConsoleOptions, RenderableType, RenderResult
 from rich.markdown import Heading as _RichHeading
 from rich.markdown import ListItem as _RichListItem
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.segment import Segment
@@ -833,9 +834,12 @@ class RichBlockFormatter:
         color = self.accent
         prefix = ""
         if "." in ex.agent_name:
-            prefix = f"[{self.muted}]{ex.agent_name} → [/{self.muted}]"
-        args = ex.args_summary
-        return Text.from_markup(f"   {prefix}[{color}]⏵ {ex.name}[/{color}][dim]({args})[/dim]")
+            prefix = f"[{self.muted}]{escape(ex.agent_name)} → [/{self.muted}]"
+        # Tool names and args are model/user content and may contain ``[...]``.
+        args = escape(ex.args_summary)
+        return Text.from_markup(
+            f"   {prefix}[{color}]⏵ {escape(ex.name)}[/{color}][dim]({args})[/dim]"
+        )
 
     def _tool_result_panel(self, ex: ToolExecution) -> FormattedItem:
         raw = ex.output or ""

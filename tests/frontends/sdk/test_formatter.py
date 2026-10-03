@@ -381,6 +381,30 @@ def test_format_tool_group_no_output() -> None:
     assert len(items) == 1
 
 
+@pytest.mark.parametrize("args_summary", ["echo '[/dim]'", "printf '[bold]x[/bold]'"])
+def test_format_tool_group_renders_markup_like_args_literally(args_summary: str) -> None:
+    """Bracketed tool args on the ``⏵`` line are text, not Rich markup."""
+    fmt = RichBlockFormatter()
+    group = ToolGroup(
+        executions=[
+            ToolExecution(
+                name="Bash",
+                arguments={"command": args_summary},
+                args_summary=args_summary,
+                call_id="c1",
+                agent_name="coder.worker",
+                executed_by="server",
+                output=None,
+            ),
+        ]
+    )
+    (line,) = fmt.format(group)
+    assert isinstance(line, Text)
+    assert line.plain == f"   coder.worker → ⏵ Bash({args_summary})", (
+        f"tool args must survive rendering unchanged; got {line.plain!r}"
+    )
+
+
 def test_duplicate_tool_call_renders_call_line_once() -> None:
     """
     Regression: sessions API emits ``function_call`` twice per tool —
