@@ -1908,7 +1908,7 @@ def test_list_conversations_search_content_match_is_correlated(
 
     statements = _captured_sql(
         conversation_store,
-        lambda: conversation_store.list_conversations(search_query="deployment"),
+        lambda: conversation_store.list_conversations(search_query="de"),
     )
     select_sql = " ".join(s for s in statements if "conversation_items" in s).lower()
     assert "exists" in select_sql, select_sql
