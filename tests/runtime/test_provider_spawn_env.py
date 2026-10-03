@@ -44,6 +44,7 @@ from omnigent.runtime.workflow import (
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
     _build_qwen_spawn_env,
+    _build_zcode_spawn_env,
     _resolve_catalog_default_model,
     _resolve_provider_for_build,
 )
@@ -1925,6 +1926,7 @@ def _call_builder(builder: object, spec: AgentSpec) -> dict[str, str]:  # type: 
         ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
         ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
         ("hermes", _build_hermes_spawn_env, "OMNIGENT_HERMES_PATH"),
+        ("zcode", _build_zcode_spawn_env, "OMNIGENT_ZCODE_PATH"),
     ],
 )
 def test_spawn_env_threads_config_command_to_path(
@@ -1953,6 +1955,7 @@ def test_spawn_env_threads_config_command_to_path(
         ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
         ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
         ("hermes", _build_hermes_spawn_env, "OMNIGENT_HERMES_PATH"),
+        ("zcode", _build_zcode_spawn_env, "OMNIGENT_ZCODE_PATH"),
     ],
 )
 def test_spawn_env_ambient_env_wins_over_config_command(

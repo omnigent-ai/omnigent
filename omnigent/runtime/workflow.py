@@ -2362,6 +2362,51 @@ def _build_hermes_spawn_env(
     return env
 
 
+def _build_zcode_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the env-var dict the ZCode harness wrap reads.
+
+    ZCode authenticates from its own OAuth or Coding Plan API-key store, not
+    from an Omnigent provider block. A spec that sets ``executor.auth`` cannot
+    be honored, so this fails instead of launching against an unrelated key.
+
+    :param spec: The agent spec.
+    :param cwd: Session workspace, threaded as ``HARNESS_ZCODE_CWD``.
+    :param workdir: Bundle directory. Accepted for signature parity and ignored.
+    :returns: Env-var overrides for the wrap.
+    :raises OmnigentError: ``executor.auth`` is set.
+    """
+    del workdir
+    if spec.executor.auth is not None:
+        raise OmnigentError(
+            "The 'zcode' harness does not accept executor.auth. "
+            "Use `zcode login` for browser OAuth, or enter a Coding Plan API key "
+            "in the ZCode TUI with `/login zai-coding-plan-api-key <key>`.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_ZCODE_MODEL"] = model
+    if cwd is not None:
+        env["HARNESS_ZCODE_CWD"] = str(cwd)
+    mode = spec.executor.config.get("mode") or spec.executor.config.get("permission_mode")
+    if mode is not None:
+        env["HARNESS_ZCODE_MODE"] = str(mode)
+    disallowed = spec.executor.config.get("disallowed_tools")
+    if isinstance(disallowed, list) and disallowed:
+        env["HARNESS_ZCODE_DISALLOWED_TOOLS"] = json.dumps(disallowed)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_ZCODE_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "zcode")
+    return env
+
+
 def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
     """
     Map ``spec.executor`` fields → the ``HARNESS_ANTIGRAVITY_*`` env vars the

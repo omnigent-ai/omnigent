@@ -638,6 +638,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        images=True,
         instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "antigravity": _C(
@@ -715,6 +716,20 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=True,
         instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
+    # Print mode reattaches with the vendor's --resume id between processes,
+    # but Omnigent retains that id only for the executor's lifetime.
+    "zcode": _C(
+        _IM.CLI_SUBPROCESS,
+        _EL.NONE,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
+    ),
     "copilot": _C(
         _IM.SDK_IN_PROCESS,
         _EL.NONE,
@@ -781,6 +796,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "pi-native",
             "qwen",
             "qwen-native",
+            "zcode",
         }
         # Builtin ACP CLI harnesses derive from the declarative catalog; a new
         # vendor CLI is one row there, not another entry in each set below.
@@ -813,6 +829,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "pi-native": "omnigent.inner.pi_native_harness",
         "qwen": "omnigent.inner.qwen_harness",
         "qwen-native": "omnigent.inner.qwen_native_harness",
+        "zcode": "omnigent.inner.zcode_harness",
     },
     aliases={
         **{alias: name for name, row in ACP_CLI_HARNESSES.items() for alias in row.aliases},
@@ -845,6 +862,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "opencode": "opencode-native",
         "openai-agents-sdk": "openai-agents",
         "qwen-code": "qwen",
+        "z-code": "zcode",
     },
     native_harnesses=frozenset(
         {
@@ -940,6 +958,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
         "pi": "Pi",
+        "zcode": "ZCode",
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,

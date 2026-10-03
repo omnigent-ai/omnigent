@@ -148,6 +148,11 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   `devin auth login`. Devin tool approvals appear as Chat approval cards
   (its `PermissionRequest` hook is mirrored to the web UI) and stay
   answerable in the embedded Terminal. See `docs/devin-native.md`.
+- **ZCode CLI** (optional), for `omnigent run --harness zcode`: install
+  [ZCode](https://github.com/zai-org/zcode) so `zcode` is on `PATH`, then
+  use `zcode login` or configure a Coding Plan API key in the ZCode TUI.
+  Omnigent drives `zcode -p --output-format stream-json` in `yolo` mode and
+  stores no credential. Model overrides are not supported. See `docs/zcode.md`.
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
   Kiro tool approvals stay answerable in the embedded Terminal; supported
@@ -598,7 +603,7 @@ prompt: You are a helpful data analyst.
 executor:
   harness: claude-sdk          # or: claude-native, codex, codex-native, cursor,
                                # cursor-native, hermes, hermes-native, opencode,
-                               # pi, pi-native, openai-agents
+                                # pi, pi-native, openai-agents, zcode
 
 tools:
   # A local Python function (schema auto-generated from the signature)
