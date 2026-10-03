@@ -245,6 +245,7 @@ def test_keepalive_interval_is_provider_scoped(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.delenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", raising=False)
     assert resolve_managed_keepalive_interval_s("agent_sandbox") == 60.0
+    assert resolve_managed_keepalive_interval_s("e2b") == 60.0
     assert resolve_managed_keepalive_interval_s("modal") == 600.0
     assert resolve_managed_keepalive_interval_s() == 600.0
     monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "15")
