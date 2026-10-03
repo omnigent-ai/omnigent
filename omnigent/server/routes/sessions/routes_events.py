@@ -2934,7 +2934,7 @@ def register_events_routes(
             is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
             if not is_admin:
                 grant = await asyncio.to_thread(permission_store.get, user_id, session_id)
-                if grant is None or grant.level < LEVEL_OWNER:
+                if grant is None or grant.level != LEVEL_OWNER:
                     if grant is not None:
                         raise OmnigentError(
                             "Only the session owner can delete this session",

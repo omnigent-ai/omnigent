@@ -48,6 +48,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
     AuthProvider,
+    level_satisfies,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -658,7 +659,7 @@ def register_hooks_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        is_read_only = access.level is not None and access.level < LEVEL_EDIT
+        is_read_only = access.level is not None and not level_satisfies(access.level, LEVEL_EDIT)
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:

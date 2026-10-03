@@ -29,6 +29,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
+    level_satisfies,
 )
 from omnigent.stores.permission_store import PermissionStore
 
@@ -515,11 +516,11 @@ class SqlAlchemyPermissionStore(PermissionStore):
             return False
 
         grant = self.get(user_id, conversation_id)
-        if grant is not None and grant.level >= required_level:
+        if grant is not None and level_satisfies(grant.level, required_level):
             return True
 
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None and public_grant.level >= required_level:
+        if public_grant is not None and level_satisfies(public_grant.level, required_level):
             return True
 
         return False
