@@ -61,6 +61,44 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.getByText(/wants to call/)).toBeDefined();
   });
 
+  it("names the sub-agent on a prompt mirrored from a child session", () => {
+    // A Codex parent showing a child Claude Code prompt must not read as its own.
+    render(
+      <ApprovalCard
+        elicitationId="elic_sub"
+        message="Claude Code wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        targetSessionName="verify-benchmarks"
+      />,
+    );
+    expect(screen.getByText(/Claude Code sub-agent · verify-benchmarks/)).toBeDefined();
+    expect(screen.queryByText(/^Claude Code$/)).toBeNull();
+  });
+
+  it("truncates a long sub-agent title in the header tag", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_sub_long"
+        message="Claude Code wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        targetSessionName={"Review Ocean benchmark validity contract and report every gap found"}
+      />,
+    );
+    expect(
+      screen.getByText(/Claude Code sub-agent · Review Ocean benchmark validity contract and re…/),
+    ).toBeDefined();
+  });
+
   it("names every native vendor, and shows no tag when the stamp names none", () => {
     // The prefix table is derived from NATIVE_CODING_AGENTS, so vendors that
     // stamp `<key>_native_permission` are covered without a per-vendor entry.

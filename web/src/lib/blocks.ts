@@ -601,6 +601,12 @@ export interface ElicitationBlock {
    * ancestor chat; null/undefined means use the active session.
    */
   targetSessionId?: string | null;
+  /**
+   * Display title of the child session that owns the elicitation.
+   * Set alongside ``targetSessionId`` when the server includes it;
+   * absent for own-session prompts or older server builds.
+   */
+  targetSessionName?: string | null;
   /** Human-readable message describing what's being gated. */
   message: string;
   /** "input" | "tool_call" | "tool_result" | "output". */

@@ -181,6 +181,8 @@ interface ApprovalCardProps {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP persistence scopes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
+  /** Title of the child session this prompt was mirrored from, when it came from a sub-agent. */
+  targetSessionName?: string | null;
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
@@ -209,6 +211,7 @@ export function ApprovalCard({
   allowAutoMode,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
+  targetSessionName,
   onSubmit,
 }: ApprovalCardProps) {
   // In a side-chat pane this resolves to the child id, so the verdict targets
@@ -310,10 +313,19 @@ export function ApprovalCard({
   // `policy_name` (provenance, not a policy anyone wrote), so name the product
   // that asked — and show nothing when the stamp names no vendor. A real policy
   // name renders verbatim so users can tell which of their policies asked.
+  // A prompt mirrored from a sub-agent names that sub-agent, so a parent on a
+  // different harness doesn't look like it is asking.
   const isNativePolicy = isNativePolicyName(policyName);
-  const policyLabel = isNativePolicy
+  const agentDisplayName = isNativePolicy
     ? (nativeCodingAgentForPolicyName(policyName)?.displayName ?? "")
     : policyName;
+  const subAgentName =
+    targetSessionName && targetSessionName.length > 48
+      ? `${targetSessionName.slice(0, 47)}…`
+      : targetSessionName;
+  const policyLabel = subAgentName
+    ? `${agentDisplayName} sub-agent · ${subAgentName}`
+    : agentDisplayName;
   // Native prompts also stamp a constant, internal-sounding phase
   // ("pre_tool_use", "codex_command_approval", ...). It carries no
   // information the card doesn't already show, so hide it for them.
@@ -766,6 +778,7 @@ export function ElicitationCard({
       allowAutoMode={item.allowAutoMode}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
+      targetSessionName={item.targetSessionName}
       onSubmit={onSubmit}
     />
   );

@@ -187,6 +187,14 @@ export interface ElicitationRequest {
    * a sub-agent prompt into its parent chat.
    */
   targetSessionId?: string | null;
+  /**
+   * Display title of the child session that owns the elicitation,
+   * set when the server mirrors a sub-agent prompt into a parent chat.
+   * Used to label the card "… sub-agent: <name>" in the UI.
+   * Absent for own-session prompts and for older server builds that
+   * did not stamp this field.
+   */
+  targetSessionName?: string | null;
   message: string;
   /** A restricted subset of JSON Schema. Empty `{}` for binary approve/reject. */
   requestedSchema: Record<string, unknown>;

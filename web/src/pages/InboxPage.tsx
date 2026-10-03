@@ -56,6 +56,7 @@ import { approve, getSession } from "@/lib/sessionsApi";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
+import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
 type RespondedMap = Record<
@@ -146,8 +147,9 @@ export function InboxPage() {
     failedSnapshots.length + commentInbox.failedCount + Number(Boolean(conversationsQuery.isError));
 
   // Mirrors `chatStore.submitApproval`: optimistic flip → resolve POST →
-  // rollback on error. Success invalidates the session list so the row's
-  // count (and the sidebar badge) drop without waiting for the socket.
+  // rollback on error. Success optimistically clears the session's pending
+  // count in the cache so the badge and card vanish immediately without
+  // waiting for the server's async DB write and the next WS tick.
   const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
     return (elicitationId, action, content, meta) => {
       setResponded((prev) => ({
@@ -164,6 +166,31 @@ export function InboxPage() {
         ...(meta === undefined ? {} : { _meta: meta }),
       }).then(
         () => {
+          // Optimistically drop the pending-elicitations count for this
+          // session in every cached conversation list. The server's async
+          // DB write (and the next WS tick) will confirm; this closes the
+          // window where the badge stays at 1 while the write is in-flight.
+          const sessionId = item.row.id;
+          for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+            queryKey: ["conversations"],
+          })) {
+            if (!data) continue;
+            const next: ConversationsInfiniteData = {
+              ...data,
+              pages: data.pages.map((page) => ({
+                ...page,
+                data: page.data.map((row) =>
+                  row.id === sessionId && (row.pending_elicitations_count ?? 0) > 0
+                    ? {
+                        ...row,
+                        pending_elicitations_count: (row.pending_elicitations_count ?? 1) - 1,
+                      }
+                    : row,
+                ),
+              })),
+            };
+            queryClient.setQueryData(key, next);
+          }
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
         },
         () => {
@@ -328,6 +355,7 @@ export function InboxPage() {
                   allowAutoMode={item.elicitation.allowAutoMode}
                   rememberScope={item.elicitation.rememberScope}
                   codexPersistModes={item.elicitation.codexPersistModes}
+                  targetSessionName={item.elicitation.targetSessionName}
                   onSubmit={makeSubmit(item)}
                 />
               )}

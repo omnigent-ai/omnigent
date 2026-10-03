@@ -276,6 +276,33 @@ function removeConvRow(tempId: string): void {
 }
 
 /**
+ * Optimistically decrement ``pending_elicitations_count`` for one session in
+ * every cached conversation list. Bridges the gap between an approve POST
+ * returning and the server's async DB write completing (the next WS tick
+ * confirms the true value). No-op when no cached row has a positive count.
+ */
+function decrementPendingElicitationCount(sessionId: string): void {
+  if (queryClient === null) return;
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    if (!data) continue;
+    const next: ConversationsInfiniteData = {
+      ...data,
+      pages: data.pages.map((page) => ({
+        ...page,
+        data: page.data.map((row) =>
+          row.id === sessionId && (row.pending_elicitations_count ?? 0) > 0
+            ? { ...row, pending_elicitations_count: (row.pending_elicitations_count ?? 1) - 1 }
+            : row,
+        ),
+      })),
+    };
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+/**
  * Start a client-only conversation synchronously, before `createSession` runs:
  * one temp id (`temp:*`) shared by the sidebar row, the registry entry, and the
  * URL; the optimistic first message pushed into the entry; made active so the
@@ -2951,6 +2978,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
+      // Optimistically clear the pending count for the parent session so the
+      // sidebar badge and Inbox clear immediately, without waiting for the WS
+      // tick. The "Needs response" badge uses the session row's
+      // pending_elicitations_count; the server's DB write is async, so the
+      // next tick may arrive before it completes. The WS push confirms.
+      decrementPendingElicitationCount(sessionId);
     } catch {
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons

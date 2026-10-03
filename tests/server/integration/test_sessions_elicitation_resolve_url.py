@@ -1504,3 +1504,121 @@ def test_mrtr_response_no_session_id_stays_form(monkeypatch: pytest.MonkeyPatch)
     params = body["result"]["inputRequests"]["elicit_abc"]["params"]
     assert params["mode"] == "form"
     assert "url" not in params
+
+
+async def test_mirrored_child_approval_clears_parent_and_child_counts(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Resolving a mirrored child approval clears both sessions' pending counts.
+
+    The inbox page approves via
+    ``POST /v1/sessions/{child}/elicitations/{eid}/resolve`` (using
+    ``target_session_id`` from the mirrored event). Both the child's OWN
+    count and the parent's MIRRORED count must drop to 0 in the
+    in-memory index so the sidebar badge and Inbox clear.
+
+    Regression probe: if ``_publish_elicitation_resolved_to_ancestors``
+    is not called (or fails to walk the parent chain), the parent's count
+    stays at 1 indefinitely — the badge never clears even though the
+    agent resumes.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    agent = await create_test_agent(
+        client,
+        "test-mirrored-resolve-counts",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    parent_id = await _create_session(client, agent["id"])
+    child_id = _create_child_session(
+        db_uri,
+        parent_id=parent_id,
+        agent_id=agent["id"],
+        title="claude-code-subagent:verify",
+    )
+
+    hook_task: asyncio.Task[httpx.Response] | None = None
+    parent_resolved: asyncio.Task[dict[str, Any]] | None = None
+    parent_subscribed = asyncio.Event()
+    parent_drain = asyncio.create_task(
+        _drain_until_elicitation_event(parent_id, subscribed=parent_subscribed)
+    )
+
+    try:
+        await parent_subscribed.wait()
+        hook_task = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{child_id}/hooks/permission-request",
+                json=_claude_permission_payload("Bash"),
+            )
+        )
+
+        # The parent receives the mirrored elicitation.
+        mirrored_event = await parent_drain
+        elicitation_id = mirrored_event.get("elicitation_id")
+        assert isinstance(elicitation_id, str) and elicitation_id
+        assert mirrored_event["params"]["target_session_id"] == child_id
+
+        # Both the child and parent should now have count = 1 in the index.
+        assert pending_elicitations.count_for(child_id) == 1
+        assert pending_elicitations.count_for(parent_id) == 1
+
+        # The mirrored event must carry the child session's name so the UI
+        # can label it "Claude Code sub-agent: <name>".
+        assert mirrored_event["params"].get("target_session_name") == "claude-code-subagent:verify"
+
+        # Subscribe for the parent resolved signal before approving.
+        parent_resolved_subscribed = asyncio.Event()
+        parent_resolved = asyncio.create_task(
+            _drain_until_elicitation_resolved(
+                parent_id,
+                elicitation_id,
+                subscribed=parent_resolved_subscribed,
+            )
+        )
+        await parent_resolved_subscribed.wait()
+
+        # Resolve via the child's resolve endpoint — exactly what the Inbox
+        # page does (it uses the mirrored event's target_session_id).
+        verdict = await client.post(
+            f"/v1/sessions/{child_id}/elicitations/{elicitation_id}/resolve",
+            json={"action": "accept"},
+        )
+        assert verdict.status_code == 202, verdict.text
+
+        # Both counts must drop to 0 in the in-memory index immediately.
+        assert pending_elicitations.count_for(child_id) == 0, (
+            "child count did not clear — the resolve path has a bug"
+        )
+        assert pending_elicitations.count_for(parent_id) == 0, (
+            "parent count did not clear — _publish_elicitation_resolved_to_ancestors "
+            "was not called or failed to traverse the parent chain"
+        )
+
+        # The sessions list must reflect count = 0 for the parent.
+        list_resp = await client.get("/v1/sessions")
+        assert list_resp.status_code == 200, list_resp.text
+        sessions_by_id = {s["id"]: s for s in list_resp.json()["data"]}
+        parent_row = sessions_by_id.get(parent_id)
+        assert parent_row is not None
+        assert parent_row.get("pending_elicitations_count", 0) == 0, (
+            f"parent list row still shows {parent_row.get('pending_elicitations_count')} "
+            "pending elicitations after the resolve"
+        )
+
+        # Resolved signal mirrors to the parent.
+        resolved_event = await parent_resolved
+        assert resolved_event["elicitation_id"] == elicitation_id
+        assert resolved_event.get("action") == "accept"
+
+        resp = await hook_task
+        assert resp.status_code == 200, resp.text
+    finally:
+        for task in [parent_drain, parent_resolved, hook_task]:
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        pending_elicitations.reset_for_tests()

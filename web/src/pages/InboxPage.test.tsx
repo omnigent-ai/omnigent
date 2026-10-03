@@ -368,6 +368,50 @@ describe("InboxPage approval items", () => {
       expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_child", { action: "accept" }),
     );
   });
+
+  it("optimistically clears the pending count in the conversations cache after approval", async () => {
+    // WHY: the server's DB write (that persists the decremented count) is async
+    // and completes AFTER the approve POST returns. Without an optimistic cache
+    // patch the badge stays at 1 until the next WS tick (~4 s). Patching the
+    // cache immediately lets the badge and sidebar badge clear without waiting.
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    // Seed a conversations cache entry so the patch has something to update.
+    const cacheKey = ["conversations", "", false, null, "mine"];
+    queryClient.setQueryData(cacheKey, {
+      pages: [{ data: [row], last_id: null }],
+      pageParams: [undefined],
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+          </MemoryRouter>
+        </SidebarDataProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+    await waitFor(() => expect(sessionsApi.approve).toHaveBeenCalled());
+
+    // After the approve POST resolves, the cache should have the count at 0.
+    await waitFor(() => {
+      const cached = queryClient.getQueryData<{
+        pages: { data: { id: string; pending_elicitations_count?: number }[] }[];
+      }>(cacheKey);
+      const patched = cached?.pages[0]?.data.find((r) => r.id === "sess_1");
+      expect(patched?.pending_elicitations_count).toBe(0);
+    });
+  });
 });
 
 describe("InboxPage comments and errors", () => {
