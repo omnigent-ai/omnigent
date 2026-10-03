@@ -16,7 +16,9 @@ uses the first one it finds:
    It is the variable that the `az devops` extension also reads.
 2. An `az login` session. The host runs `az account get-access-token` for the
    Azure DevOps resource and reuses the token until five minutes before it
-   expires. When no one is signed in, it tries again after a minute.
+   expires. If `az` returns a token close to expiry, it is reused for up to one
+   minute, capped at its actual expiry. Expired tokens are rejected. When no
+   one is signed in, it tries again after a minute.
 
 Before either of these, `resolve_token` reads
 `~/.config/omnigent/azure-devops/token.json` (`access_token` and `expires_at`,
@@ -28,9 +30,10 @@ The host looks for `az` on `PATH`, then at `/opt/homebrew/bin/az` and
 often run without Homebrew on `PATH`.
 
 Requests and the `az` call time out after 15 seconds. Set
-`OMNIGENT_AZURE_DEVOPS_TIMEOUT_SECONDS` to change that. One panel request also
-stops its REST calls after 8 seconds in total, under the server's 10-second
-limit for runner reads, and shows what it read in that time.
+`OMNIGENT_AZURE_DEVOPS_TIMEOUT_SECONDS` to change that. Panel requests use an
+eight-second budget when starting REST calls and waiting for background fetches,
+and show the data loaded within that budget. Individual network phases and local
+Git commands can outlast it, so slow requests may reach the runner proxy's timeout.
 
 The panel labels Azure requests with `!`, such as `!42`, using the provider's
 display metadata. Failed lookups show a warning. Partially loaded checks and
@@ -86,6 +89,9 @@ or `az repos`.
   minute.
 - **No line counts.** Azure DevOps does not return added and removed line
   counts for changed files.
+- **Slow local diffs.** Local Git commands have separate 30-second timeouts.
+  Large or slow checkouts can exceed the runner proxy's request limit even
+  when REST calls and background-fetch waits stay within their budget.
 - **Azure DevOps Services only.** Azure DevOps Server (on premises) is not
   supported.
 

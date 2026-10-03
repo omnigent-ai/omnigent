@@ -38,7 +38,7 @@ _SUBGROUPS = frozenset({"policy", "reviewer", "work-item"})
 _GLOBAL_VALUE_OPTIONS = frozenset({"--output", "-o", "--query"})
 # Fields that hold PR content, whose text never identifies the PR.
 _CONTENT_FIELDS = frozenset({"description", "title"})
-# Pull request ids are 32-bit integers.
+# Bound CLI PR ids to ten decimal digits.
 _PR_ID = re.compile(r"[1-9][0-9]{0,9}")
 
 
@@ -143,7 +143,9 @@ def _org_url(api_url: str) -> str | None:
         return None
     if host == "dev.azure.com":
         # The organization is the first path segment, before ``_apis``.
-        return f"https://{host}/{segments[0]}" if segments.index("_apis") > 0 else None
+        if not segments[0] or segments.index("_apis") == 0:
+            return None
+        return f"https://{host}/{segments[0]}"
     return f"https://{host}" if host.endswith(".visualstudio.com") else None
 
 

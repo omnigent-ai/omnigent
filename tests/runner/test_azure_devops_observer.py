@@ -326,6 +326,8 @@ def test_the_first_repository_match_wins(repository: dict[str, Any]) -> None:
         {"name": "app", "project": {"name": "web"}, "url": 7},
         {"name": "app", "project": {"name": "web"}, "url": WEB_URL},
         {"name": "app", "project": {"name": "web"}, "url": "https://dev.azure.com/_apis/git"},
+        {"name": "app", "project": {"name": "web"}, "url": "https://dev.azure.com//_apis/git"},
+        {"name": "app", "project": {"name": "web"}, "url": "https://dev.azure.com///_apis/git"},
         {"name": "app", "project": {"name": "web"}, "url": "http://dev.azure.com/contoso/_apis"},
         {"name": "app", "project": {"name": "web"}, "url": "https://ghe.example/o/_apis/r"},
     ],

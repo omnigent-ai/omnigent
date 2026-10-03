@@ -280,6 +280,36 @@ def test_az_token_without_expiry_is_reused_for_five_minutes(clock: Clock, fake_a
     assert len(fake_az.calls) == 2
 
 
+@pytest.mark.parametrize("remaining", [30, 100, 300])
+def test_near_expiry_az_token_is_reused_without_passing_its_expiry(
+    clock: Clock, fake_az: FakeAz, remaining: int
+) -> None:
+    expiry = NOW + remaining
+    fake_az.outcome = az_ok(accessToken="az-token", expires_on=expiry)
+    token = AzureToken("az-token", "bearer", expiry)
+    assert resolve_token() == token
+    retry = min(expiry, NOW + 60)
+    clock.now = retry - 1
+    assert resolve_token() == token
+    assert resolve_token() == token
+    assert len(fake_az.calls) == 1
+
+    clock.now = retry
+    assert resolve_token() == (token if retry < expiry else None)
+    assert len(fake_az.calls) == 2
+    clock.now = expiry
+    assert resolve_token() is None
+
+    failed_probes = len(fake_az.calls)
+    clock.now = expiry + 59
+    assert resolve_token() is None
+    assert len(fake_az.calls) == failed_probes
+    fake_az.outcome = az_ok(accessToken="renewed-token", expires_on=expiry + 3600)
+    clock.now = expiry + 60
+    assert resolve_token() == AzureToken("renewed-token", "bearer", expiry + 3600)
+    assert len(fake_az.calls) == failed_probes + 1
+
+
 def test_az_failure_is_cached_for_a_minute_then_retried(clock: Clock, fake_az: FakeAz) -> None:
     fake_az.outcome = az_failed()
     assert resolve_token() is None
@@ -305,6 +335,8 @@ def test_az_failure_is_cached_for_a_minute_then_retried(clock: Clock, fake_az: F
         az_ok(expires_on=NOW + 3600),
         az_ok(accessToken="", expires_on=NOW + 3600),
         az_ok(accessToken=5, expires_on=NOW + 3600),
+        az_ok(accessToken="expired-token", expires_on=NOW - 1),
+        az_ok(accessToken="expired-token", expires_on=NOW),
     ],
     ids=[
         "non-zero-exit",
@@ -315,6 +347,8 @@ def test_az_failure_is_cached_for_a_minute_then_retried(clock: Clock, fake_az: F
         "no-access-token",
         "empty-access-token",
         "access-token-not-a-string",
+        "expired-access-token",
+        "access-token-expiring-now",
     ],
 )
 def test_az_failures_yield_no_token(

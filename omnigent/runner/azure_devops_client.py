@@ -174,7 +174,10 @@ def _token_from_az_cli() -> AzureToken | None:
     value = payload.get("accessToken") if isinstance(payload, dict) else None
     if not isinstance(value, str) or not value:
         return None
-    return AzureToken(value, "bearer", _az_expiry(payload))
+    expires_at = _az_expiry(payload)
+    if expires_at is not None and expires_at <= time.time():
+        return None
+    return AzureToken(value, "bearer", expires_at)
 
 
 @dataclass(frozen=True)
@@ -195,7 +198,10 @@ def _probe_valid_until(token: AzureToken | None, now: float) -> float:
         return now + _FAILURE_TTL_SECONDS
     if token.expires_at is None:
         return now + _UNKNOWN_EXPIRY_TTL_SECONDS
-    return token.expires_at - _EXPIRY_SKEW_SECONDS
+    return min(
+        token.expires_at,
+        max(token.expires_at - _EXPIRY_SKEW_SECONDS, now + _FAILURE_TTL_SECONDS),
+    )
 
 
 def _cached_az_token() -> AzureToken | None:
@@ -226,9 +232,9 @@ def resolve_token() -> AzureToken | None:
     2. The ``AZURE_DEVOPS_EXT_PAT`` environment variable (a personal access token).
     3. ``az account get-access-token`` for the Azure DevOps resource (a bearer token).
 
-    The file and the variable are read on every call. The ``az`` result is reused until
-    5 minutes before its expiry, and a failed probe is not repeated for 60 seconds.
-    Blocks while ``az`` runs.
+    The file and the variable are read on every call. The ``az`` result is refreshed
+    5 minutes before expiry, with retries a minute apart or at expiry. Failed probes
+    are retried after 60 seconds. Blocks while ``az`` runs.
 
     :returns: The credential, or ``None`` when no source has one.
     """

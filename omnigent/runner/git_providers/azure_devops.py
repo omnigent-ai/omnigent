@@ -3,8 +3,8 @@
 PR metadata, checks, comments, and changed files come from the Azure DevOps REST
 API through :mod:`omnigent.runner.azure_devops_client`, which contacts only
 ``dev.azure.com``. The whole-PR diff and file contents come from local git when
-the PR's commits are in the workspace. An info or whole-PR diff request stays
-within one time budget, under the server's limit for proxied runner reads. The
+the PR's commits are in the workspace. REST calls and waiting for background
+fetches share a request budget; local git commands have separate timeouts. The
 observer imports this module on every tool completion, so the REST client and
 ``httpx`` load inside the functions that use them.
 """
@@ -67,7 +67,7 @@ _UNEXPECTED_RESPONSE = "Azure DevOps returned an unexpected file response"
 _REVISION_LOAD_FAILED = "Azure DevOps could not load the selected file revision"
 _NO_CONTEXT = "Expanded context is unavailable for this file"
 _GIT_TIMEOUT_SECONDS = 30.0
-# One panel request's time budget, under the runner proxy's ten-second limit.
+# REST and background-fetch wait budget, under the runner proxy's ten-second limit.
 _REQUEST_BUDGET_SECONDS = 8.0
 # A PR's fetch runs in the background for up to this long, past the request that started it.
 _FETCH_TIMEOUT_SECONDS = 120.0
