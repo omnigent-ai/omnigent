@@ -4587,9 +4587,11 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
     try:
         if launch_fails:
             with pytest.raises(RuntimeError, match="TUI launch failed"):
-                await _auto_create_codex_terminal(session_id, cast(Any, None), lambda *_: None)
+                await native._auto_create_codex_terminal(
+                    session_id, cast(Any, None), lambda *_: None
+                )
         else:
-            result = await _auto_create_codex_terminal(
+            result = await native._auto_create_codex_terminal(
                 session_id, cast(Any, None), lambda *_: None
             )
             assert result is fake_view
