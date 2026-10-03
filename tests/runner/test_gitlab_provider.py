@@ -434,11 +434,23 @@ def test_upstream_remote_precedence_preserves_other_gitlab_remotes(root: str) ->
     ]
 
 
-@pytest.mark.parametrize("patch", ["", None])
+@pytest.mark.parametrize(
+    "patch",
+    [
+        "",
+        None,
+        "Binary files /dev/null and b/assets/sample.bin differ\n",
+        "old mode 100644\nnew mode 100755\n",
+    ],
+)
 def test_binary_or_metadata_only_patch_is_not_shown_as_complete(
     root: str, api: Mock, change: dict, patch: object
 ) -> None:
     change["diff"] = patch
+    files = module.PULL_REQUESTS.changed_files(root, ref())
+    assert files["warning"]
+    assert files["data"][0]["lines_added"] is None
+    assert files["data"][0]["lines_removed"] is None
     result = module.PULL_REQUESTS.pr_diff(root, ref())
     assert result["patch"] == "" and result["unavailable_reason"] == "patch_unavailable"
 

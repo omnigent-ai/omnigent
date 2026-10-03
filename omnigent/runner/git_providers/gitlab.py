@@ -338,6 +338,18 @@ def _file_status(change: dict[str, Any]) -> str:
     )
 
 
+def _text_patch(change: dict[str, Any]) -> str | None:
+    patch = change.get("diff")
+    if (
+        change.get("too_large")
+        or change.get("collapsed")
+        or not isinstance(patch, str)
+        or not patch.startswith("@@ ")
+    ):
+        return None
+    return patch
+
+
 def _patch_path(prefix: str, path: str) -> str:
     name = prefix + path
     return (
@@ -405,15 +417,10 @@ class GitLabPullRequests:
         changes, partial = _changes(*resolved)
         data, limited = [], False
         for change in changes:
-            patch = change.get("diff")
-            unavailable = (
-                change.get("too_large")
-                or change.get("collapsed")
-                or not isinstance(patch, str)
-                or not patch
-            )
-            limited |= bool(unavailable)
-            lines = patch.splitlines() if not unavailable else []
+            patch = _text_patch(change)
+            unavailable = patch is None
+            limited |= unavailable
+            lines = patch.splitlines() if patch is not None else []
             data.append(
                 {
                     "object": CHANGED_FILE_OBJECT,
@@ -453,13 +460,8 @@ class GitLabPullRequests:
             }
         patches = []
         for change in changes:
-            patch = change.get("diff")
-            if (
-                change.get("too_large")
-                or change.get("collapsed")
-                or not isinstance(patch, str)
-                or not patch
-            ):
+            patch = _text_patch(change)
+            if patch is None:
                 return {
                     "object": PR_DIFF_OBJECT,
                     "patch": "",
