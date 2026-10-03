@@ -1524,9 +1524,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Claude's hand menu stays on Manual and never offers Codex approval presets.
+    // Claude's hand menu starts on Default (its no-flag default) and never
+    // offers Codex approval presets; Manual is still a selectable option.
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
-      "Permission mode: Manual",
+      "Permission mode: Default",
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-chip"), { button: 0 });
     expect(screen.getByTestId("new-chat-landing-permission-option-default")).toHaveTextContent(
@@ -1637,9 +1638,31 @@ describe("NewChatLandingScreen create flow", () => {
     // Anchor on the wrapper label so the absence check below isn't vacuous
     // against a malformed body.
     expect(body.labels?.["omnigent.wrapper"]).toBe("claude-code-native-ui");
-    // "Default" → no flag persisted (undefined is dropped by JSON.stringify),
-    // so the runner launches claude with its own default.
+    // "Default" sends no flag (undefined is dropped by JSON.stringify), so
+    // the runner launches claude with the user's configured default mode.
     expect(body.terminal_launch_args).toBeUndefined();
+  });
+
+  it("posts --permission-mode default when Manual is picked for claude-native", async () => {
+    // "Manual" (wire value "default") must explicitly prompt, so it sends the
+    // flag instead of falling through to the user's configured mode like the
+    // pre-selected no-flag "Default" entry.
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native_manual" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    pickPermissionOption("default");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.terminal_launch_args).toEqual(["--permission-mode", "default"]);
   });
 
   it("posts --dangerously-skip-permissions when the bypass is picked for antigravity-native", async () => {
