@@ -53,9 +53,10 @@ function deckFile(content: string): FileContentResponse {
   };
 }
 
-function renderStudio(
-  props: { view?: StudioView; fresh?: boolean } = {},
-): { onView: ReturnType<typeof vi.fn>; onBack: ReturnType<typeof vi.fn> } {
+function renderStudio(props: { view?: StudioView; fresh?: boolean } = {}): {
+  onView: ReturnType<typeof vi.fn>;
+  onBack: ReturnType<typeof vi.fn>;
+} {
   const onView = vi.fn();
   const onBack = vi.fn();
   render(
@@ -75,7 +76,9 @@ function renderStudio(
   return { onView, onBack };
 }
 
-function setSession(patch: Parameters<ReturnType<typeof conversationRegistry.acquire>["setState"]>[0]) {
+function setSession(
+  patch: Parameters<ReturnType<typeof conversationRegistry.acquire>["setState"]>[0],
+) {
   act(() => conversationRegistry.acquire(SESSION).setState(patch));
 }
 
@@ -95,7 +98,9 @@ afterEach(() => {
 describe("DesignStudio on desktop", () => {
   it("shows the full-history chat beside the preview and keeps the stream bound", async () => {
     renderStudio();
-    expect(await screen.findByTestId("slides-viewer")).toHaveTextContent("<section>Title</section>");
+    expect(await screen.findByTestId("slides-viewer")).toHaveTextContent(
+      "<section>Title</section>",
+    );
     const chat = screen.getByTestId("side-chat");
     expect(chat).toHaveAttribute("data-session", SESSION);
     expect(chat).toHaveAttribute("data-full", "true");
@@ -147,7 +152,8 @@ describe("DesignStudio waiting states", () => {
 
     expect(
       await screen.findByText(
-        (_, el) => el?.tagName === "P" && el.textContent === `The agent has not written ${PATH} yet`,
+        (_, el) =>
+          el?.tagName === "P" && el.textContent === `The agent has not written ${PATH} yet`,
       ),
     ).toBeInTheDocument();
     expect(screen.getByTestId("side-chat")).toBeInTheDocument();

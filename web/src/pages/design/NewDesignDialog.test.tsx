@@ -181,7 +181,10 @@ describe("NewDesignDialog create", () => {
     create();
 
     await waitFor(() =>
-      expect(onCreated).toHaveBeenCalledWith("conv_new", "decks/pitch-deck-from-my-notes.slides.html"),
+      expect(onCreated).toHaveBeenCalledWith(
+        "conv_new",
+        "decks/pitch-deck-from-my-notes.slides.html",
+      ),
     );
     expect(createMock).toHaveBeenCalledWith("ag_claude", [], {
       hostId: "host_1",

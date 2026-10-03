@@ -10,7 +10,13 @@
 
 import { useMemo, useState } from "react";
 import { useQueries, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
-import { AlertTriangleIcon, PaletteIcon, PresentationIcon, RefreshCwIcon, SearchIcon } from "lucide-react";
+import {
+  AlertTriangleIcon,
+  PaletteIcon,
+  PresentationIcon,
+  RefreshCwIcon,
+  SearchIcon,
+} from "lucide-react";
 import { useCanvasSessions } from "@/canvas/canvasSessions";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -270,7 +276,10 @@ function DeckGroup({
           </Link>
         </div>
       ) : group.status === "error" ? (
-        <ErrorRow message={`Search failed: ${group.error ?? ""}`} onRetry={() => onRetry(sessionId)} />
+        <ErrorRow
+          message={`Search failed: ${group.error ?? ""}`}
+          onRetry={() => onRetry(sessionId)}
+        />
       ) : (
         <>
           {group.decks.length > 0 && (

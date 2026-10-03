@@ -255,7 +255,11 @@ export function NewDesignDialog({
                 }}
                 onOpenChange={handleSelectOpenChange}
               >
-                <SelectTrigger id="design-host" data-testid="design-host-trigger" className="w-full">
+                <SelectTrigger
+                  id="design-host"
+                  data-testid="design-host-trigger"
+                  className="w-full"
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
