@@ -49,10 +49,14 @@ class FcmSender:
                 _logger.warning("Mobile push authorization failed: status=%s", status)
             self._warning_at[failure_class] = stamp
 
+    def _backoff(self, status: int, retry_after: int) -> None:
+        deadline = monotonic() + retry_after
+        if deadline > self._blocked_until:
+            self._blocked_status = status
+        self._blocked_until = max(self._blocked_until, deadline)
+
     def _auth_failure(self, status: int, retry_after: int = 60) -> None:
-        stamp = monotonic()
-        self._blocked_until = stamp + retry_after
-        self._blocked_status = status
+        self._backoff(status, retry_after)
         self._cached_token = ""
         self.warn_auth_failure(status)
 
@@ -71,9 +75,14 @@ class FcmSender:
                 follow_redirects=False,
             )
             if response.status_code != 200:
+                retry_after = _retry_after(response)
                 if response.status_code in {400, 401, 403}:
-                    self._auth_failure(response.status_code)
-                raise _OAuthFailure(response.status_code, _retry_after(response))
+                    self._auth_failure(response.status_code, max(60, retry_after))
+                elif (
+                    response.status_code == 429 or response.status_code >= 500
+                ) and retry_after > 0:
+                    self._backoff(response.status_code, retry_after)
+                raise _OAuthFailure(response.status_code, retry_after)
             body = response.json()
             token = body.get("access_token")
             expires = body.get("expires_in")
@@ -122,7 +131,10 @@ class FcmSender:
         if response.is_success:
             return SendResult("sent")
         if response.status_code == 429 or response.status_code >= 500:
-            return SendResult("retry", _retry_after(response))
+            retry_after = _retry_after(response)
+            if retry_after > 0:
+                self._backoff(response.status_code, retry_after)
+            return SendResult("retry", retry_after)
         try:
             provider_error = response.json().get("error", {})
             details = provider_error.get("details", [])

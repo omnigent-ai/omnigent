@@ -468,6 +468,162 @@ async def test_permission_denied_retry_after_controls_outbox_and_shared_cooldown
         ]
 
 
+@pytest.mark.parametrize("long_status", [403, 429, 503])
+async def test_inflight_shorter_failure_preserves_longest_cooldown(
+    credentials, monkeypatch, long_status
+):
+    from omnigent.server import mobile_push_sender
+    from omnigent.server.mobile_push_config import FcmConfig
+
+    path, _ = credentials
+    config = FcmConfig.from_env(
+        resolve_feature_flags({"OMNIGENT_FEATURES": "mobile_push"}),
+        {"OMNIGENT_FCM_CREDENTIALS_FILE": str(path)},
+    )
+    assert config is not None
+    clock = [110.0]
+    monkeypatch.setattr(mobile_push_sender, "monotonic", lambda: clock[0])
+    both_inflight = asyncio.Event()
+    release_short = asyncio.Event()
+    calls = []
+    inflight = []
+
+    async def google(request):
+        calls.append(request.url.host)
+        if request.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "access", "expires_in": 3600})
+        label = json.loads(request.content)["message"]["data"]["label"]
+        if label == "probe":
+            return httpx.Response(200)
+        inflight.append(label)
+        if len(inflight) == 2:
+            both_inflight.set()
+        await both_inflight.wait()
+        if label == "short":
+            await release_short.wait()
+        return httpx.Response(
+            long_status if label == "long" else 403,
+            headers={"Retry-After": "300" if label == "long" else "60"},
+            json={"error": {"status": "PERMISSION_DENIED"}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(google)) as client:
+        sender = mobile_push_sender.FcmSender(config, client)
+        token = await sender.authorization()
+        assert isinstance(token, str)
+        async with asyncio.TaskGroup() as group:
+            long_request = group.create_task(
+                sender.post({"message": {"data": {"label": "long"}}}, token)
+            )
+            group.create_task(sender.post({"message": {"data": {"label": "short"}}}, token))
+            await both_inflight.wait()
+            try:
+                assert (await long_request).outcome == "retry"
+                assert sender._blocked_until == 410
+                clock[0] = 111
+            finally:
+                release_short.set()
+        assert set(inflight) == {"long", "short"}
+        assert sender._blocked_until == 410
+        assert sender._blocked_status == long_status
+        for stamp in (171, 409, 409.75):
+            clock[0] = stamp
+            result = await sender.authorization()
+            assert isinstance(result, mobile_push_sender.SendResult)
+            assert result.outcome == "retry"
+            assert calls == ["oauth2.googleapis.com", "fcm.googleapis.com", "fcm.googleapis.com"]
+        clock[0] = 410
+        token = await sender.authorization()
+        assert isinstance(token, str)
+        assert (
+            await sender.post({"message": {"data": {"label": "probe"}}}, token)
+        ).outcome == "sent"
+        assert calls.count("oauth2.googleapis.com") == 2
+        assert calls.count("fcm.googleapis.com") == 3
+
+
+@pytest.mark.parametrize(
+    "endpoint,status",
+    [
+        ("oauth", 400),
+        ("oauth", 401),
+        ("oauth", 403),
+        ("oauth", 429),
+        ("oauth", 500),
+        ("oauth", 503),
+        ("fcm", 429),
+        ("fcm", 500),
+        ("fcm", 503),
+    ],
+)
+async def test_provider_retry_after_blocks_other_deliveries(
+    credentials, monkeypatch, caplog, deliver, endpoint, status
+):
+    from omnigent.server import mobile_push_sender
+    from omnigent.server.mobile_push_config import FcmConfig
+
+    path, _ = credentials
+    config = FcmConfig.from_env(
+        resolve_feature_flags({"OMNIGENT_FEATURES": "mobile_push"}),
+        {"OMNIGENT_FCM_CREDENTIALS_FILE": str(path)},
+    )
+    assert config is not None
+    clock = [110.0]
+    monkeypatch.setattr(mobile_push_sender, "monotonic", lambda: clock[0])
+    calls = []
+
+    def google(request):
+        calls.append(request.url.host)
+        if endpoint == "fcm" and request.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "access", "expires_in": 3600})
+        return httpx.Response(status, headers={"Retry-After": "300"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(google)) as client:
+        sender = mobile_push_sender.FcmSender(config, client)
+        sender._cached_token = "previous-access"
+        first = await deliver(sender, token="device-token")
+        assert first.outcome == "retry" and first.retry_after == 300
+        assert sender._blocked_until == 410
+        assert sender._blocked_status == status
+        cache = sender._cached_token
+        assert cache == (
+            ""
+            if status in {400, 401, 403}
+            else "access"
+            if endpoint == "fcm"
+            else "previous-access"
+        )
+        initial_calls = list(calls)
+        assert len(calls) == (1 if endpoint == "oauth" else 2)
+        clock[0] = 140
+        second = await deliver(sender, token="device-token")
+        assert second.outcome == "retry" and second.retry_after == 270
+        assert calls == initial_calls
+        clock[0] = 409.75
+        blocked = await sender.authorization()
+        assert isinstance(blocked, mobile_push_sender.SendResult)
+        assert blocked.outcome == "retry" and blocked.retry_after == 1
+        assert calls == initial_calls
+        assert sender._cached_token == cache
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name.endswith("mobile_push_sender") and record.levelname == "WARNING"
+        ]
+        assert len(warnings) == (1 if status in {400, 401, 403} else 0)
+        clock[0] = 410
+        if endpoint == "fcm":
+            token = await sender.authorization()
+            assert isinstance(token, str) and token == cache
+            assert calls == initial_calls
+            assert (
+                await sender.post({"message": {"token": "device-token"}}, token)
+            ).outcome == "retry"
+        else:
+            assert isinstance(await sender.authorization(), mobile_push_sender.SendResult)
+        assert len(calls) == len(initial_calls) + 1
+
+
 @pytest.mark.parametrize("third_party", [True, False])
 async def test_fcm_third_party_and_persistent_401_warn_without_pruning(
     credentials, caplog, deliver, third_party
