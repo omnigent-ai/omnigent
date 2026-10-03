@@ -22,12 +22,14 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
+import { ProjectLabel } from "@/components/ProjectLabel";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
+import { useProjects } from "@/hooks/useConversations";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
@@ -57,6 +59,7 @@ export function CreateScheduledTaskDialog({
   onOpenChange,
   initialName,
   initialPrompt,
+  initialProjectId,
   editingTask = null,
 }: {
   open: boolean;
@@ -65,10 +68,18 @@ export function CreateScheduledTaskDialog({
    *  "Suggestions" suggestion chip). Omitted → the fields start empty. */
   initialName?: string;
   initialPrompt?: string;
+  /** First-class Project preselected by the Automations page on create. */
+  initialProjectId?: string;
   editingTask?: ScheduledTask | null;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: hosts } = useHosts({ enabled: open });
+  const {
+    data: projects,
+    isLoading: projectsLoading,
+    isError: projectsError,
+    refetch: refetchProjects,
+  } = useProjects();
   const info = useServerInfo();
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
@@ -84,6 +95,13 @@ export function CreateScheduledTaskDialog({
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
+  const [pickedProject, setPickedProject] = useState(NO_PROJECT);
+  const initialProjectSelectionRef = useRef(NO_PROJECT);
+  const projectSelectionInitializedRef = useRef(false);
+  const assignableProjects = useMemo(
+    () => (projects ?? []).filter((project) => project.id !== null),
+    [projects],
+  );
 
   // ── Agent / harness picker (shared with NewChatDialog) ─────────────────────
   // The picker's "Harnesses" (Claude Code / Codex / Pi …) and "Agents"
@@ -251,9 +269,25 @@ export function CreateScheduledTaskDialog({
         setSandboxMode(false);
       }
       setError(null);
+      setPickedProject(NO_PROJECT);
+      initialProjectSelectionRef.current = NO_PROJECT;
+      projectSelectionInitializedRef.current = false;
     }
+    if (!open) projectSelectionInitializedRef.current = false;
     wasOpen.current = open;
   }, [open, initialName, initialPrompt, editingTask]);
+
+  useEffect(() => {
+    if (!open || projects === undefined) return;
+    if (projectSelectionInitializedRef.current) return;
+    const requested = editingTask?.projectId ?? initialProjectId ?? null;
+    const selection = assignableProjects.some((project) => project.id === requested)
+      ? (requested ?? NO_PROJECT)
+      : NO_PROJECT;
+    setPickedProject(selection);
+    initialProjectSelectionRef.current = selection;
+    projectSelectionInitializedRef.current = true;
+  }, [assignableProjects, editingTask, initialProjectId, open, projects]);
 
   const hostOptions = hosts ?? [];
   const preservePinnedHost = isEdit && editingTask?.hostId != null;
@@ -294,6 +328,9 @@ export function CreateScheduledTaskDialog({
     setPickedEffort("");
     setPickedPermission("");
     setSchedule(DEFAULT_SCHEDULE_MODEL);
+    setPickedProject(NO_PROJECT);
+    initialProjectSelectionRef.current = NO_PROJECT;
+    projectSelectionInitializedRef.current = false;
     setHostId("");
     setWorkspace("");
     setWorkspaceBrowserOpen(false);
@@ -351,6 +388,11 @@ export function CreateScheduledTaskDialog({
             // Only on a real switch: sending the unchanged agent is a server-side
             // no-op, but omitting it keeps the PATCH honest about what changed.
             ...(agentChanged && effectiveAgentId !== null ? { agentId: effectiveAgentId } : {}),
+            ...(pickedProject === initialProjectSelectionRef.current
+              ? {}
+              : pickedProject === NO_PROJECT
+                ? { projectId: "" }
+                : { projectId: pickedProject }),
           },
         });
       } else {
@@ -366,6 +408,7 @@ export function CreateScheduledTaskDialog({
           ...(showModelEffort && pickedPermission !== ""
             ? { permissionMode: pickedPermission }
             : {}),
+          ...(pickedProject === NO_PROJECT ? {} : { projectId: pickedProject }),
         });
       }
       handleOpenChange(false);
@@ -418,6 +461,51 @@ export function CreateScheduledTaskDialog({
               className="text-ui"
               onChange={(e) => setName(e.target.value)}
             />
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="task-project">Project (optional)</Label>
+            <Select
+              value={pickedProject}
+              onValueChange={setPickedProject}
+              onOpenChange={handleSelectOpenChange}
+            >
+              <SelectTrigger
+                id="task-project"
+                data-testid="task-project-trigger"
+                className="w-full"
+                disabled={projectsLoading}
+              >
+                {projectsLoading ? "Loading projects…" : <SelectValue />}
+              </SelectTrigger>
+              <SelectContent position="popper" align="start">
+                <SelectItem value={NO_PROJECT}>No project</SelectItem>
+                {assignableProjects.map((project) => (
+                  <SelectItem
+                    key={project.id}
+                    value={project.id as string}
+                    data-testid={`task-project-option-${project.id}`}
+                  >
+                    <ProjectLabel name={project.name} icon={project.icon} />
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {projectsLoading && <p className="text-sm text-muted-foreground">Loading projects…</p>}
+            {!projectsLoading && projectsError && (
+              <p className="text-sm text-destructive">
+                Couldn&apos;t load projects.{" "}
+                <button type="button" className="underline" onClick={() => void refetchProjects()}>
+                  Retry
+                </button>
+              </p>
+            )}
+            {!projectsLoading && !projectsError && assignableProjects.length === 0 && (
+              <p className="text-sm text-muted-foreground">
+                No assignable Projects. Legacy label-only folders can’t be assigned; create a
+                Project from the sidebar.
+              </p>
+            )}
           </div>
 
           <div className="flex flex-col gap-1.5">
@@ -663,6 +751,7 @@ export function CreateScheduledTaskDialog({
 
 /** Sentinel Select value for "no pinned host" — Radix Select disallows "". */
 const UNSET_HOST = "__unset_host__";
+const NO_PROJECT = "__no_project__";
 
 /** Sentinel Select value for the "New Sandbox" option (execution_target=managed_sandbox). */
 const SANDBOX_HOST = "__sandbox__";

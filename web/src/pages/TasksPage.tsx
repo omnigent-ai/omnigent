@@ -10,12 +10,20 @@
  * endpoint.
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useOmnigentAnalytics } from "@/lib/analytics";
+import { ProjectLabel } from "@/components/ProjectLabel";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import {
@@ -29,7 +37,12 @@ import {
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
-import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { useProjects } from "@/hooks/useConversations";
+import {
+  ScheduledTaskApiError,
+  type ScheduledTask,
+  type ScheduledTaskProjectFilter,
+} from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 
@@ -42,7 +55,38 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
 ];
 
 export function TasksPage() {
-  const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
+  const [projectFilterValue, setProjectFilterValue] = useState("all");
+  const projectFilter = useMemo<ScheduledTaskProjectFilter>(() => {
+    if (projectFilterValue === "unfiled") return { kind: "unfiled" };
+    if (projectFilterValue.startsWith("project:")) {
+      const projectId = projectFilterValue.slice("project:".length);
+      if (projectId) return { kind: "project", projectId };
+    }
+    return { kind: "all" };
+  }, [projectFilterValue]);
+  const taskQuery = useScheduledTasks(projectFilter);
+  const lastAllTasks = useRef<ScheduledTask[] | undefined>(undefined);
+  if (projectFilter.kind === "all" && taskQuery.data !== undefined) {
+    lastAllTasks.current = taskQuery.data;
+  }
+  const refetchAllAfterProjectReset = useRef(false);
+  const {
+    data: projects,
+    isLoading: projectsLoading,
+    isError: projectsError,
+    refetch: refetchProjects,
+  } = useProjects();
+  const assignableProjects = useMemo(
+    () => (projects ?? []).filter((project) => project.id !== null),
+    [projects],
+  );
+  // Keyed by id to the WHOLE summary (not just the name) so consumers can
+  // render the project's emoji icon alongside its name.
+  const projectsById = useMemo(
+    () => new Map(assignableProjects.map((project) => [project.id as string, project])),
+    [assignableProjects],
+  );
+  const tasks = taskQuery.data;
   const { trackClick } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
   // each row (rather than each row owning a timer) keeps the relative next-run
@@ -60,6 +104,30 @@ export function TasksPage() {
   // Null → the normal manual path (empty fields). Cleared on dialog close so a
   // stale prefill never leaks into a subsequent plain "New task" open.
   const [prefill, setPrefill] = useState<ScheduledTaskSuggestion["prefill"] | null>(null);
+
+  useEffect(() => {
+    if (projectFilter.kind !== "project" || projects === undefined || projectsError) return;
+    if (!assignableProjects.some((project) => project.id === projectFilter.projectId)) {
+      setProjectFilterValue("all");
+    }
+  }, [assignableProjects, projectFilter, projects, projectsError]);
+
+  useEffect(() => {
+    if (
+      projectFilter.kind === "project" &&
+      taskQuery.error instanceof ScheduledTaskApiError &&
+      taskQuery.error.status === 404
+    ) {
+      refetchAllAfterProjectReset.current = true;
+      setProjectFilterValue("all");
+    }
+  }, [projectFilter, taskQuery.error]);
+
+  useEffect(() => {
+    if (projectFilter.kind !== "all" || !refetchAllAfterProjectReset.current) return;
+    refetchAllAfterProjectReset.current = false;
+    void taskQuery.refetch();
+  }, [projectFilter.kind, taskQuery]);
 
   function openManual() {
     setPrefill(null);
@@ -146,7 +214,22 @@ export function TasksPage() {
     setManualOpen(true);
   }
 
-  const hasAnyTasks = (tasks ?? []).length > 0;
+  const rawSlice = tasks ?? [];
+  const allTasks = projectFilter.kind === "all" ? taskQuery.data : lastAllTasks.current;
+  const hasAnyGlobally = rawSlice.length > 0 || (allTasks ?? []).length > 0;
+  const taskError = taskQuery.isError && taskQuery.data === undefined;
+  const taskLoading = taskQuery.isLoading && taskQuery.data === undefined;
+  const allSucceeded =
+    projectFilter.kind === "all" &&
+    !taskQuery.isError &&
+    !taskQuery.isLoading &&
+    taskQuery.data !== undefined;
+  const showSuggestions =
+    projectFilter.kind === "all" && filter === "all" && search.trim() === "" && allSucceeded;
+
+  function retryTasks() {
+    void taskQuery.refetch();
+  }
 
   return (
     <PageScroll contentClassName="px-6">
@@ -182,33 +265,76 @@ export function TasksPage() {
             className="pl-9"
           />
         </div>
-        {hasAnyTasks && (
-          <div aria-label="Filter tasks" className="flex items-center gap-1">
-            {FILTER_TABS.map((tab) => (
-              <button
-                key={tab.value}
-                type="button"
-                aria-pressed={filter === tab.value}
-                data-testid={`tasks-filter-${tab.value}`}
-                onClick={() => {
-                  trackClick(`tasks.filter_${tab.value}`, "button");
-                  setFilter(tab.value);
-                }}
-                className={cn(
-                  "rounded-md px-3 py-1 text-ui font-medium transition-colors",
-                  filter === tab.value
-                    ? "bg-muted text-foreground"
-                    : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-                )}
-              >
-                {tab.label}
+        <div className="flex flex-wrap items-center gap-3">
+          {hasAnyGlobally && (
+            <div aria-label="Filter tasks" className="flex items-center gap-1">
+              {FILTER_TABS.map((tab) => (
+                <button
+                  key={tab.value}
+                  type="button"
+                  aria-pressed={filter === tab.value}
+                  data-testid={`tasks-filter-${tab.value}`}
+                  onClick={() => {
+                    trackClick(`tasks.filter_${tab.value}`, "button");
+                    setFilter(tab.value);
+                  }}
+                  className={cn(
+                    "rounded-md px-3 py-1 text-ui font-medium transition-colors",
+                    filter === tab.value
+                      ? "bg-muted text-foreground"
+                      : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                  )}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          )}
+          <Select
+            value={projectFilterValue}
+            onValueChange={(value) => {
+              const normalized =
+                value === "all" ||
+                value === "unfiled" ||
+                (value.startsWith("project:") && value.slice("project:".length) !== "")
+                  ? value
+                  : "all";
+              setProjectFilterValue(normalized);
+            }}
+          >
+            <SelectTrigger
+              data-testid="tasks-project-filter"
+              className="min-w-40"
+              disabled={projectsLoading}
+            >
+              {projectsLoading ? "Loading projects…" : <SelectValue />}
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              <SelectItem value="all">All projects</SelectItem>
+              <SelectItem value="unfiled">Unfiled</SelectItem>
+              {assignableProjects.map((project) => (
+                <SelectItem
+                  key={project.id}
+                  value={`project:${project.id}`}
+                  disabled={projectsError}
+                >
+                  <ProjectLabel name={project.name} icon={project.icon} />
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {projectsError && (
+            <p className="text-sm text-destructive">
+              Couldn&apos;t load projects.{" "}
+              <button type="button" className="underline" onClick={() => void refetchProjects()}>
+                Retry
               </button>
-            ))}
-          </div>
-        )}
+            </p>
+          )}
+        </div>
       </div>
 
-      {isError ? (
+      {taskError ? (
         <div
           role="alert"
           data-testid="tasks-load-error"
@@ -216,24 +342,41 @@ export function TasksPage() {
         >
           <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
           <span className="flex-1">Couldn’t load automations.</span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void refetch()}
-            componentId="tasks.retry"
-          >
+          <Button variant="outline" size="sm" onClick={retryTasks} componentId="tasks.retry">
             Retry
           </Button>
         </div>
-      ) : isLoading ? (
+      ) : taskLoading ? (
         <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           Loading automations…
         </div>
+      ) : rawSlice.length === 0 && allTasks !== undefined && !hasAnyGlobally ? (
+        <EmptyState
+          variant="global"
+          message="No automations yet"
+          showSuggestions={showSuggestions}
+          onPickSuggestion={openFromSuggestion}
+        />
+      ) : rawSlice.length === 0 && projectFilter.kind === "project" ? (
+        <EmptyState
+          variant="narrowed"
+          message={`No automations in ${projectsById.get(projectFilter.projectId)?.name ?? "this Project"}`}
+          showSuggestions={false}
+          onPickSuggestion={openFromSuggestion}
+        />
+      ) : rawSlice.length === 0 && projectFilter.kind === "unfiled" ? (
+        <EmptyState
+          variant="narrowed"
+          message="No unfiled automations"
+          showSuggestions={false}
+          onPickSuggestion={openFromSuggestion}
+        />
       ) : filtered.length === 0 ? (
         <EmptyState
-          hasAny={hasAnyTasks}
-          showSuggestions={filter === "all"}
+          variant="narrowed"
+          message="No automations found"
+          showSuggestions={false}
           onPickSuggestion={openFromSuggestion}
         />
       ) : (
@@ -245,6 +388,11 @@ export function TasksPage() {
             <ScheduledTaskRow
               key={task.id}
               task={task}
+              project={
+                projectFilter.kind === "all" && task.projectId
+                  ? projectsById.get(task.projectId)
+                  : undefined
+              }
               now={now}
               busy={busyId === task.id}
               onEdit={handleEdit}
@@ -260,39 +408,38 @@ export function TasksPage() {
           filter ("Active" / "Paused") is selected, per the product spec ("when
           all isn't selected, suggestions should disappear"). Driven by the same
           `filter` state as the list, so switching tabs toggles it live. */}
-      {filter === "all" && filtered.length > 0 && (
-        <SuggestionsSection onPick={openFromSuggestion} />
-      )}
+      {showSuggestions && filtered.length > 0 && <SuggestionsSection onPick={openFromSuggestion} />}
 
       <CreateScheduledTaskDialog
         open={manualOpen}
         onOpenChange={handleManualOpenChange}
         initialName={prefill?.name}
         initialPrompt={prefill?.prompt}
+        initialProjectId={projectFilter.kind === "project" ? projectFilter.projectId : undefined}
         editingTask={editingTask}
       />
     </PageScroll>
   );
 }
 
-function EmptyState({
-  hasAny,
+export function EmptyState({
+  variant,
+  message,
   showSuggestions,
   onPickSuggestion,
 }: {
-  hasAny: boolean;
+  variant: "global" | "narrowed";
+  message: string;
   showSuggestions: boolean;
   onPickSuggestion: (s: ScheduledTaskSuggestion) => void;
 }) {
+  const globalEmpty = variant === "global";
   return (
     <div className="py-8" data-testid="tasks-empty-state">
-      {hasAny && (
-        <div className="py-10 text-center text-ui text-muted-foreground">No automations found</div>
-      )}
-      {!hasAny && (
+      {globalEmpty ? (
         <div className="flex flex-col items-center gap-2 py-12 text-center">
           <ClockIcon className="size-8 text-muted-foreground/50" />
-          <p className="text-ui font-medium">No automations yet</p>
+          <p className="text-ui font-medium">{message}</p>
           <p className="max-w-sm text-sm text-muted-foreground">
             Create a task to run an agent session automatically on a recurring schedule.
           </p>
@@ -304,6 +451,8 @@ function EmptyState({
             />
           )}
         </div>
+      ) : (
+        <div className="py-10 text-center text-ui text-muted-foreground">{message}</div>
       )}
     </div>
   );
