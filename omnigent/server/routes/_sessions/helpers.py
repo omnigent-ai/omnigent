@@ -4663,6 +4663,7 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
             parent_id,
             _latest_message_preview(items_by_child.get(conv.id, [])),
             cached_status=status,
+            agent_names=_bound_agent_names([conv]) if conv.sub_agent_name is None else None,
         )
         event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
@@ -10430,12 +10431,57 @@ def _child_session_current_task_status_from_cached_status(status: object) -> str
     return None
 
 
+def _is_ui_added_title(title: str | None) -> bool:
+    """
+    Whether ``title`` is the Web UI "Add agent" sentinel ``"ui:<agent>:<label>"``.
+
+    :param title: Display title, e.g. ``"ui:codex:reviewer"``.
+    :returns: ``True`` only for the 3-segment reserved form.
+    """
+    head, _, tail = (title or "").partition(":")
+    return head == _UI_ADDED_AGENT_TITLE_PREFIX and ":" in tail
+
+
+def _bound_agent_names(convs: list[Conversation]) -> dict[str, str]:
+    """
+    Resolve the bound agent name for each distinct ``agent_id`` in ``convs``.
+
+    Only a child whose title is verbatim (no ``sub_agent_name`` stamp and
+    not the ``ui:`` sentinel) takes its ``tool`` from this binding, so other
+    rows are skipped. One batched store read; unresolvable ids are omitted,
+    and an uninitialized runtime or a failing store yields an empty map so
+    the summary still publishes with ``tool`` unset.
+
+    :param convs: Child conversation rows about to be summarised.
+    :returns: ``{agent_id: agent.name}`` for every binding that resolves.
+    """
+    from omnigent.runtime import get_agent_store
+
+    agent_ids = {
+        conv.agent_id
+        for conv in convs
+        if conv.agent_id
+        and conv.sub_agent_name is None
+        and not _is_ui_added_title(title_without_closed_marker(conv.title))
+    }
+    if not agent_ids:
+        return {}
+    try:
+        return get_agent_store().get_names(sorted(agent_ids))
+    except RuntimeError:
+        return {}
+    except StatementError:
+        _logger.warning("Could not resolve bound agent names for child summaries", exc_info=True)
+        return {}
+
+
 def _child_session_summary_from_conversation(
     conv: Conversation,
     parent_session_id: str,
     last_message_preview: str | None,
     *,
     cached_status: str | None = None,
+    agent_names: dict[str, str] | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -10445,10 +10491,13 @@ def _child_session_summary_from_conversation(
     :func:`omnigent.tools.builtins.spawn._spawn_one`, plus the
     3-segment ``"ui:{agent_name}:{user_label}"`` form written by the
     Web UI "Add agent" flow (surfaced as ``tool={agent_name}`` and
-    ``session_name={user_label}``). Tolerates malformed/legacy rows:
-    if the title is ``None`` or has no colon, ``tool`` falls back to
-    the raw title and ``session_name`` is ``None`` — the row is still
-    surfaced so debug views can investigate.
+    ``session_name={user_label}``). The split applies only to rows
+    stamped with ``conv.sub_agent_name``; an unstamped non-UI title is
+    the caller's verbatim ``sys_session_create`` title, kept whole in
+    ``session_name`` with ``tool`` resolved from the agent binding via
+    ``agent_names``. A stamped title without a colon is tolerated as
+    legacy: ``tool`` falls back to the raw title and ``session_name``
+    is ``None`` so the row still surfaces for debugging.
 
     Native-harness children are the exception: their titles are
     uniqueness keys built from opaque runtime ids, so Codex and Claude
@@ -10473,6 +10522,9 @@ def _child_session_summary_from_conversation(
         live ``_session_status_cache``; a status-edge publisher passes the
         edge's own value so a burst of transitions fans out one summary per
         edge instead of the latest status repeated.
+    :param agent_names: Bound agent names keyed by ``agent_id`` (see
+        :func:`_bound_agent_names`); supplies ``tool`` for a child whose
+        title is verbatim. ``None`` leaves such a child's ``tool`` unset.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -10503,6 +10555,11 @@ def _child_session_summary_from_conversation(
         # the raw Devin agent_id as ``session_name`` for correlation.
         tool = _devin_subagent_display_tool(labels)
         session_name = labels.get(_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY)
+    elif conv.sub_agent_name is None and not _is_ui_added_title(display_title):
+        # Verbatim caller title (``sys_session_create``): any colon is
+        # punctuation, so identity comes from the agent binding.
+        tool = agent_names.get(conv.agent_id) if agent_names and conv.agent_id else None
+        session_name = display_title
     elif display_title and ":" in display_title:
         head, _, tail = display_title.partition(":")
         if head == _UI_ADDED_AGENT_TITLE_PREFIX and ":" in tail:
@@ -10513,6 +10570,8 @@ def _child_session_summary_from_conversation(
             tool = agent_name
             session_name = user_label
         else:
+            # Framework-named child: every spawn path stamps
+            # ``sub_agent_name`` alongside its "<agent>:<title>" title.
             tool = head
             session_name = tail
     else:
@@ -11467,6 +11526,7 @@ __all__ = [
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",
     "_background_task_delivery_status",
+    "_bound_agent_names",
     "_build_actor",
     "_build_evaluation_context",
     "_build_new_item",
