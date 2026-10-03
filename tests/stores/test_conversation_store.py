@@ -35,6 +35,7 @@ from omnigent.session_import import (
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
+    _fetch_search_snippets,
 )
 from omnigent.stores.host_store import HostStore
 
@@ -2010,6 +2011,161 @@ def test_list_conversations_search_snippet_uses_earliest_match(
     assert snippet is not None
     assert "first mention" in snippet
     assert "second mention" not in snippet
+
+
+@pytest.mark.parametrize(
+    ("dialect", "uses_probe"),
+    [("postgresql", True), ("cockroachdb", False), ("sqlite", False), ("mysql", False)],
+)
+def test_search_snippet_query_form_follows_dialect(dialect: str, uses_probe: bool) -> None:
+    """
+    Only the literal ``postgresql`` dialect takes the ordered LATERAL probe.
+
+    CockroachDB is PostgreSQL-family but keeps the ``MIN(position)`` aggregate,
+    as do SQLite and MySQL.
+    """
+    from sqlalchemy.dialects import postgresql
+
+    session = MagicMock()
+    session.bind.dialect.name = dialect
+    session.execute.return_value.all.return_value = []
+
+    assert _fetch_search_snippets(session, ["ab" * 16], "deploy") == {}
+
+    sql = str(session.execute.call_args.args[0].compile(dialect=postgresql.dialect())).lower()
+    assert ("lateral" in sql) is uses_probe, sql
+    assert ("min(conversation_items.position)" in sql) is not uses_probe, sql
+
+
+def test_search_snippet_probe_matches_min_position_on_postgres(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The PostgreSQL probe returns byte-identical snippets, including absence,
+    to the ``MIN(position)`` aggregate, with today's unescaped LIKE semantics.
+    """
+    if conversation_store._conv_engine.dialect.name != "postgresql":
+        pytest.skip("the ordered probe is the PostgreSQL path")
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    corpora = [
+        ["deploy first mention", "deploy second mention", "zebra crossing"],
+        ["Café ÉCOLE notes", "two  spaces here", "Deployment later"],
+        ["50% done a_b c\\d", "nothing to see"],
+        ["no match here"],
+        [f"filler {n}" for n in range(30)] + ["deploy at the end"],
+        [],
+    ]
+    ids = []
+    for texts in corpora:
+        conv = conversation_store.create_conversation()
+        if texts:
+            conversation_store.append(conv.id, [_user_message(t) for t in texts])
+        ids.append(conv.id)
+    terms = [
+        "deploy",
+        "DePlOy",
+        "zebra",
+        "nomatchterm",
+        "café",
+        "école",
+        "mention",
+        "two  spaces",
+        "%",
+        "_",
+        "\\",
+        "50%",
+        "a_b",
+        "d%y",
+    ]
+
+    with conversation_store._conv_session("test_snippet_parity") as session:
+        actual = {term: _fetch_search_snippets(session, ids, term) for term in terms}
+        with monkeypatch.context() as patch:
+            patch.setattr(store_mod, "_earliest_match_by_probe", store_mod._earliest_match_by_min)
+            expected = {term: _fetch_search_snippets(session, ids, term) for term in terms}
+
+    assert actual == expected
+    assert "first mention" in actual["deploy"][ids[0]]
+    assert "at the end" in actual["deploy"][ids[4]]
+    assert actual["nomatchterm"] == {}
+    # The whitespace run matches in SQL but not after snippet collapsing.
+    assert actual["two  spaces"] == {}
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deploy"),
+    )
+    assert any("lateral" in s.lower() for s in statements), statements
+
+
+def test_search_snippet_probe_breaks_position_ties_by_item_id(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Duplicate positions (never allocated, but allowed by the schema) resolve
+    to the matching item with the smallest id, whatever the row order.
+    """
+    if conversation_store._conv_engine.dialect.name != "postgresql":
+        pytest.skip("the ordered probe is the PostgreSQL path")
+    from sqlalchemy import select, update
+
+    from omnigent.db.db_models import SqlConversationItem, current_workspace_id
+
+    expected: dict[str, str] = {}
+    for later_id, winner in (("f" * 32, "earlier row"), ("0" * 31 + "1", "later row")):
+        conv = conversation_store.create_conversation()
+        first, second = conversation_store.append(
+            conv.id,
+            [_user_message("deployment earlier row"), _user_message("deployment later row")],
+        )
+        with conversation_store._conv_session("test_setup") as session:
+            item = SqlConversationItem
+            scope = (item.workspace_id == current_workspace_id(), item.conversation_id == conv.id)
+            position = session.execute(
+                select(item.position).where(*scope, item.id == first.id)
+            ).scalar_one()
+            session.execute(
+                update(item)
+                .where(*scope, item.id == second.id)
+                .values(id=later_id, position=position)
+            )
+        expected[conv.id] = winner
+
+    by_id = {
+        c.id: c.search_snippet
+        for c in conversation_store.list_conversations(search_query="deployment").data
+    }
+    for conv_id, winner in expected.items():
+        assert by_id[conv_id] == f"deployment {winner}"
+
+
+def test_search_snippet_ignores_items_from_another_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A conversation id reused in another workspace never lends that
+    workspace's matching item to this workspace's snippet.
+    """
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.db.utils import generate_conversation_id
+
+    shared_id = generate_conversation_id()
+    with workspace_scope(43):
+        conversation_store.create_conversation(conversation_id=shared_id)
+        conversation_store.append(shared_id, [_user_message("deployment in the other workspace")])
+        other = conversation_store.list_conversations(search_query="deployment").data
+    assert [c.search_snippet for c in other] == ["deployment in the other workspace"]
+
+    with workspace_scope(42):
+        conversation_store.create_conversation(
+            conversation_id=shared_id, title="deployment runbook"
+        )
+        conversation_store.append(shared_id, [_user_message("unrelated chatter")])
+        page = conversation_store.list_conversations(search_query="deployment").data
+
+    assert [(c.id, c.search_snippet) for c in page] == [(shared_id, None)]
 
 
 def test_list_conversations_excludes_archived_by_default(
