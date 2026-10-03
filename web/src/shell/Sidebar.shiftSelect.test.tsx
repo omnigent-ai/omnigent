@@ -294,6 +294,7 @@ describe("Sidebar shift-click selection", () => {
       ctrlKey: false,
       pointerType: "mouse",
     });
+    fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
     fireEvent.click(screen.getByTestId("session-filter-all"));
 
     fireEvent.click(screen.getByRole("button", { name: /select/i }));

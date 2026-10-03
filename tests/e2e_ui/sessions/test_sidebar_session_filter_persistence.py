@@ -35,7 +35,7 @@ from tests.e2e_ui.collaboration._multi_user_server import (
     MultiUserServer,
     spawn_multi_user_server,
 )
-from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.conftest import _build_hello_world_bundle, open_session_display_menu
 
 # Edit access (2): enough to share a session with a non-owner. Mirrors
 # LEVEL_EDIT in omnigent/server/auth.py.
@@ -92,13 +92,13 @@ def _row(page: Page, session_id: str) -> Locator:
 
 def _set_filter(page: Page, value: str) -> None:
     """Open the filter funnel and pick *value* (all/mine/shared/archived)."""
-    page.locator(_FILTER).click()
+    open_session_display_menu(page)
     page.locator(f'[data-testid="session-filter-{value}"]').click()
 
 
 def _expect_checked_filter(page: Page, value: str) -> None:
     """Open the funnel and assert *value* is the checked radio item."""
-    page.locator(_FILTER).click()
+    open_session_display_menu(page)
     expect(page.locator(f'[data-testid="session-filter-{value}"]')).to_have_attribute(
         "aria-checked", "true", timeout=15_000
     )
@@ -238,7 +238,7 @@ def test_stored_shared_filter_is_dropped_on_a_single_user_server(
     # the menu falls back to the "My sessions" default with no Shared option to
     # have selected.
     expect(_row(page, session_id)).to_be_visible(timeout=30_000)
-    page.locator(_FILTER).click()
+    open_session_display_menu(page)
     expect(page.locator('[data-testid="session-filter-mine"]')).to_have_attribute(
         "aria-checked", "true", timeout=15_000
     )

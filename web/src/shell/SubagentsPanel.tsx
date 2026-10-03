@@ -488,7 +488,7 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
  * ``omni --harness kimi``, whose ``harness: "kimi"`` would otherwise fall
  * through to the generic bot. Mirrors ``iconForAgent`` in ``AgentCard.tsx``.
  */
-function iconForWrapperOrHarness(
+export function iconForWrapperOrHarness(
   iconKind: string | undefined,
   harness: string | null | undefined,
   isNessie: boolean,

@@ -94,7 +94,7 @@ def test_session_header_action_visibility(
     expect(page.get_by_role("button", name="Exit selection mode")).to_be_visible()
     expect(filter_sessions).to_be_visible()
     filter_sessions.click()
-    expect(page.get_by_test_id("session-filter-all")).to_be_visible()
+    expect(page.get_by_test_id("session-display-menu")).to_be_visible()
 
 
 def test_bulk_archive_moves_session_to_archived(

@@ -40,6 +40,7 @@ from tests.e2e_ui.collaboration._multi_user_server import (
     MultiUserServer,
     spawn_multi_user_server,
 )
+from tests.e2e_ui.conftest import open_session_display_menu
 
 # Read access is the minimum a grantee can hold, and leaving must work from it
 # — the route gates on read, not manage. Mirrors LEVEL_READ in
@@ -127,7 +128,7 @@ def test_shared_viewer_leaves_session_and_row_disappears(
         # (it isn't the viewer's own); it shows under the "Shared sessions"
         # filter, where the viewer leaves it from.
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
-        page.locator(_FILTER).click()
+        open_session_display_menu(page)
         page.locator(_FILTER_SHARED).click()
         expect(_row(page, sid)).to_be_visible(timeout=30_000)
 

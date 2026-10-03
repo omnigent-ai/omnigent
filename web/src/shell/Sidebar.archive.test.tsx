@@ -161,6 +161,7 @@ describe("archive flow", () => {
     renderSidebar();
     // Radix menu opens on pointerdown; pick the Archived filter.
     fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0 });
+    fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
     fireEvent.click(screen.getByTestId("session-filter-archived"));
 
     fireEvent.click(screen.getByTestId("quick-archive-conversation"));

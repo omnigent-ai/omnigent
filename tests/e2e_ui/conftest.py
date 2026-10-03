@@ -174,6 +174,19 @@ def open_right_rail(page: Page) -> None:
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
 
 
+def open_session_display_menu(page: Page) -> None:
+    """Open the Sessions filter menu and its Display submenu.
+
+    The All / My / Shared / Archived options sit one level down, beside the
+    Grouping, Ordering and Show submenus, so picking a slice takes two clicks.
+
+    :param page: Playwright page with the home sidebar rendered.
+    :returns: None. Leaves the Display submenu open.
+    """
+    page.get_by_test_id("session-filter").click()
+    page.get_by_test_id("session-display-menu").click()
+
+
 def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> None:
     """Switch a markdown FileViewer to Preview / Edit / Source via the toolbar.
 
