@@ -6,7 +6,8 @@ Loads the bundle and asserts the distinctive wiring stays intact: the
 claude-sdk orchestrator brain, the seven cross-vendor coding sub-agents
 (claude_code / codex / opencode / cursor / hermes / agy / pi, which implement,
 review, and explore),
-the three spine skills, and the bounds/blast-radius guardrails. Pure spec-load
+the three spine skills plus the slide-decks task skill, and the
+bounds/blast-radius guardrails. Pure spec-load
 — no LLM, no credentials.
 
 What breaks if this fails:
@@ -144,11 +145,12 @@ def test_pi_subagent_is_headless_scaffold_worker(polly_spec: AgentSpec) -> None:
 
 
 def test_spine_skills_present(polly_spec: AgentSpec) -> None:
-    """All spine skills are discovered from skills/<dir>/SKILL.md."""
+    """All spine skills and task skills are discovered from skills/<dir>/SKILL.md."""
     assert sorted(s.name for s in polly_spec.skills) == [
         "cross-review",
         "fanout",
         "investigate",
+        "slide-decks",
     ]
 
 
