@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import sys
 import tempfile
@@ -49,6 +50,7 @@ from tests.e2e.resilience.lab.processes import (
     frozen,
     process_tree,
     processes_mentioning,
+    processes_with_home,
 )
 from tests.e2e.resilience.lab.proxy import (
     Fault,
@@ -64,9 +66,11 @@ T = TypeVar("T")
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _WEB_UI_DIST = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
-_CLAUDE_MODEL = json.loads(
+_MODELS = json.loads(
     (_REPO_ROOT / "tests" / "server" / "integration" / "repro_models.json").read_text()
-)["claude-native"]
+)
+_CLAUDE_MODEL = _MODELS["claude-native"]
+_CODEX_MODEL = _MODELS["codex-native"]
 _POLICY_MODEL = "_policy_llm_"
 _LAUNCHED_RUNNER = re.compile(r"Launched runner \S+ for workspace .*? \(pid=(\d+)\)")
 _POLL_S = 0.25
@@ -101,6 +105,11 @@ _RUNNER_PASSTHROUGH = (
 )
 
 LabMode = Literal["host", "runner"]
+#: Native harnesses the lab can drive.
+Harness = Literal["claude", "codex"]
+#: The tool each harness's main loop always advertises; scripted turns require
+#: it so side requests (titles, summaries, reviewers) cannot consume them.
+MAIN_LOOP_TOOL: dict[str, str] = {"claude": "Bash", "codex": "exec_command"}
 #: How a stopped server looks to clients: ``ingress`` answers 502 like a load
 #: balancer (Databricks Apps); ``direct`` refuses connections like a bare port.
 LabFront = Literal["ingress", "direct"]
@@ -248,7 +257,12 @@ class Lab:
 
     def remove(self) -> None:
         """Delete :attr:`root`; call after :meth:`stop` when the run passed."""
-        shutil.rmtree(self.root, ignore_errors=True)
+        # A harness that is still exiting can write one last file mid-delete.
+        for _ in range(3):
+            shutil.rmtree(self.root, ignore_errors=True)
+            if not self.root.exists():
+                return
+            time.sleep(1.0)
 
     def describe(self) -> str:
         """Human-readable URLs and paths for manual poking."""
@@ -334,8 +348,9 @@ class Lab:
     def host_side_processes(self) -> list[psutil.Process]:
         """Every process that lives on the user's machine: daemon, runners, tmux, harnesses."""
         roots = [p.pid for p in (self._host, self._runner) if p is not None and p.running]
-        tmux = [proc.pid for proc in processes_mentioning(f"{self._host_tmp}{os.sep}")]
-        return process_tree([*roots, *tmux])
+        strays = processes_mentioning(f"{self._host_tmp}{os.sep}")
+        strays += processes_with_home(self._host_home())
+        return process_tree([*roots, *(proc.pid for proc in strays)])
 
     @contextlib.contextmanager
     def sleep_host(self, *, wake_network_delay_s: float = 0.0) -> Iterator[None]:
@@ -363,18 +378,31 @@ class Lab:
     # ── sessions ─────────────────────────────────────────────────
 
     def create_claude_session(self) -> str:
-        """Create a claude-native session the way the web's new-chat flow does.
+        """Create a claude-native session; see :meth:`create_session`."""
+        return self.create_session("claude")
 
+    def create_session(self, harness: Harness, *, launch_args: list[str] | None = None) -> str:
+        """Create a native session the way the web's new-chat flow does.
+
+        :param harness: ``"claude"`` or ``"codex"``.
+        :param launch_args: Harness CLI args the new-chat dialog would send,
+            e.g. ``["--ask-for-approval", "on-request"]``.
         :returns: The session id, e.g. ``"conv_abc123"``.
         """
+        import pytest
+
         from tests._helpers.native_session import create_native_session
 
+        if shutil.which(harness) is None:
+            pytest.skip(f"{harness!r} is not on PATH; {harness}-native sessions need it")
         assert self.client is not None
         metadata: dict[str, Any] = {"workspace": str(self.workspace)}
+        if launch_args:
+            metadata["terminal_launch_args"] = list(launch_args)
         if self.config.mode == "host":
             metadata["host_id"] = self.host_id
         created = create_native_session(
-            self.client, self.proxies.client.url, harness="claude", metadata=metadata
+            self.client, self.proxies.client.url, harness=harness, metadata=metadata
         )
         session_id = str(created["session_id"])
         if self.config.mode == "runner":
@@ -383,20 +411,24 @@ class Lab:
                 f"/v1/sessions/{session_id}", json={"runner_id": self.runner_id}, timeout=60.0
             )
             response.raise_for_status()
-        self.events.emit("lab", "session_created", session_id=session_id)
+        self.events.emit("lab", "session_created", session_id=session_id, harness=harness)
         return session_id
 
-    def script_turn(self, marker: str, responses: list[dict[str, Any]]) -> None:
-        """Queue Claude's replies for the next user message containing *marker*.
+    def script_turn(
+        self, marker: str, responses: list[dict[str, Any]], *, harness: Harness = "claude"
+    ) -> None:
+        """Queue the harness's replies for the next user message containing *marker*.
 
-        Claude Code also sends title and summary requests that quote the user's
-        message; requiring the ``Bash`` tool keeps those from consuming the queue.
+        Harnesses also send title, summary and reviewer requests that quote the
+        user's message; requiring the main loop's tool keeps those from
+        consuming the queue.
 
         :param marker: Unique token the scenario puts in its user message.
         :param responses: Mock replies, e.g. ``[{"text": "done"}]``.
+        :param harness: Whose main loop the replies are for.
         """
         assert self.model is not None
-        self.model.reply(responses, match=marker, required_tools=["Bash"])
+        self.model.reply(responses, match=marker, required_tools=[MAIN_LOOP_TOOL[harness]])
 
     def send_message(self, session_id: str, text: str, *, timeout: float = 90.0) -> httpx.Response:
         """Send *text* as the user, through the client link.
@@ -638,7 +670,17 @@ class Lab:
                         "api_key": "mock-key",
                         "models": {"default": _CLAUDE_MODEL},
                     },
-                }
+                },
+                "lab-codex": {
+                    "kind": "key",
+                    "default": ["openai"],
+                    "openai": {
+                        "base_url": f"{self.proxies.model.url}/v1",
+                        "api_key": "mock-key",
+                        "wire_api": "responses",
+                        "models": {"default": _CODEX_MODEL},
+                    },
+                },
             },
         }
         if self.config.mode == "host":
@@ -736,11 +778,17 @@ class Lab:
         wait_for(_online, timeout=_STARTUP_TIMEOUT_S, what="the runner to come online")
 
     def _kill_stray_host_processes(self) -> None:
-        """Reap tmux servers and harnesses that outlived their runner."""
-        for proc in processes_mentioning(f"{self._host_tmp}{os.sep}"):
-            for member in process_tree([proc.pid]):
-                with contextlib.suppress(psutil.NoSuchProcess):
-                    member.kill()
+        """Reap tmux servers and harnesses that outlived their runner.
+
+        Matches by command line and by the lab's ``HOME``, and resumes each
+        process first in case an interrupted :meth:`sleep_host` left it stopped.
+        """
+        strays = processes_mentioning(f"{self._host_tmp}{os.sep}")
+        strays += processes_with_home(self._host_home())
+        for member in process_tree(proc.pid for proc in strays):
+            with contextlib.suppress(psutil.NoSuchProcess):
+                member.send_signal(signal.SIGCONT)
+                member.kill()
 
 
 def message_text(item: dict[str, Any]) -> str:

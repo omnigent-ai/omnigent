@@ -13,8 +13,8 @@ from collections.abc import Callable
 
 import pytest
 
-from tests.e2e.resilience.lab.driver import ClaudeDriver
-from tests.e2e.resilience.lab.lab import Lab
+from tests.e2e.resilience.lab.driver import SessionDriver
+from tests.e2e.resilience.lab.lab import Harness, Lab
 from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.report import ScenarioReport
 from tests.e2e.resilience.scenarios import _contract as contract
@@ -25,13 +25,17 @@ _WAKE_NETWORK_DELAY_S = 2.0
 
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
-    ("phase", "outage_s"), contract.cases(_PHASES, contract.outages([10], [60, 300]))
+    ("harness", "phase", "outage_s"), contract.cases(_PHASES, contract.outages([10], [60, 300]))
 )
-def test_s4_host_sleep(lab_factory: Callable[..., Lab], phase: str, outage_s: int) -> None:
+def test_s4_host_sleep(
+    lab_factory: Callable[..., Lab], harness: Harness, phase: str, outage_s: int
+) -> None:
     lab = lab_factory()
-    session_id = lab.create_claude_session()
-    driver = ClaudeDriver(lab, session_id)
-    report = ScenarioReport("S4 host sleep", {"phase": phase, "outage_s": outage_s})
+    driver = SessionDriver.create(lab, harness)
+    session_id = driver.session_id
+    report = ScenarioReport(
+        "S4 host sleep", {"harness": harness, "phase": phase, "outage_s": outage_s}
+    )
     with SessionWatcher(lab.server_url, session_id) as watcher:
         entered = contract.enter(driver, phase, outage_s=outage_s)
         started = time.time()

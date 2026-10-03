@@ -14,8 +14,8 @@ from collections.abc import Callable
 
 import pytest
 
-from tests.e2e.resilience.lab.driver import ClaudeDriver, Turn
-from tests.e2e.resilience.lab.lab import Lab
+from tests.e2e.resilience.lab.driver import SessionDriver, Turn
+from tests.e2e.resilience.lab.lab import Harness, Lab
 from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.report import ScenarioReport
 from tests.e2e.resilience.scenarios import _contract as contract
@@ -30,13 +30,17 @@ _PHASES = ["turn_start", "mid_stream"]
 
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
-    ("phase", "outage_s"), contract.cases(_PHASES, contract.outages([10], [60, 180]))
+    ("harness", "phase", "outage_s"), contract.cases(_PHASES, contract.outages([10], [60, 180]))
 )
-def test_s7_model_loss(lab_factory: Callable[..., Lab], phase: str, outage_s: int) -> None:
+def test_s7_model_loss(
+    lab_factory: Callable[..., Lab], harness: Harness, phase: str, outage_s: int
+) -> None:
     lab = lab_factory()
-    session_id = lab.create_claude_session()
-    driver = ClaudeDriver(lab, session_id)
-    report = ScenarioReport("S7 model loss", {"phase": phase, "outage_s": outage_s})
+    driver = SessionDriver.create(lab, harness)
+    session_id = driver.session_id
+    report = ScenarioReport(
+        "S7 model loss", {"harness": harness, "phase": phase, "outage_s": outage_s}
+    )
     model = lab.proxies.model
     with SessionWatcher(lab.server_url, session_id) as watcher:
         driver.round_trip()
@@ -69,7 +73,7 @@ def test_s7_model_loss(lab_factory: Callable[..., Lab], phase: str, outage_s: in
                 "failure_is_retryable",
                 code in _RETRYABLE,
                 f"error code {code!r}",
-                known_gap="R7",
+                known_gap="R7" if harness == "claude" else None,
             )
         if outage_s <= 10:
             report.check("short_loss_is_retried", outcome == "completed", f"outcome={outcome}")
@@ -85,7 +89,7 @@ def test_s7_model_loss(lab_factory: Callable[..., Lab], phase: str, outage_s: in
     report.require()
 
 
-def _wait_outcome(lab: Lab, driver: ClaudeDriver, turn: Turn) -> str | None:
+def _wait_outcome(lab: Lab, driver: SessionDriver, turn: Turn) -> str | None:
     """``completed``, ``failed``, or ``None`` if the turn neither finished nor failed."""
 
     def _outcome() -> str | None:

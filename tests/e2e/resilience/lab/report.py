@@ -33,12 +33,15 @@ class Check:
     :param known_gap: Finding id this check is known to fail on, e.g. ``"R5"``.
         A failing known-gap check is reported but does not fail the run; a
         passing one does, so the stale marker gets removed with the fix.
+    :param intermittent: The known gap shows up only on some runs (a race), so
+        passing does not make its marker stale.
     """
 
     name: str
     passed: bool
     detail: str = ""
     known_gap: str | None = None
+    intermittent: bool = False
 
 
 @dataclass
@@ -57,13 +60,20 @@ class ScenarioReport:
     started: float = field(default_factory=time.time)
 
     def check(
-        self, name: str, passed: bool, detail: str = "", *, known_gap: str | None = None
+        self,
+        name: str,
+        passed: bool,
+        detail: str = "",
+        *,
+        known_gap: str | None = None,
+        intermittent: bool = False,
     ) -> bool:
         """Record one expectation; returns *passed* for chaining.
 
         :param known_gap: Finding id when this check is expected to fail today.
+        :param intermittent: The known gap is a race that fails only on some runs.
         """
-        self.checks.append(Check(name, bool(passed), detail, known_gap))
+        self.checks.append(Check(name, bool(passed), detail, known_gap, intermittent))
         return bool(passed)
 
     def attach(self, watcher: SessionWatcher, lab_root: Path) -> None:
@@ -84,7 +94,9 @@ class ScenarioReport:
     @property
     def stale_gaps(self) -> list[Check]:
         """Known-gap checks that now pass; their markers must be removed."""
-        return [c for c in self.checks if c.passed and c.known_gap is not None]
+        return [
+            c for c in self.checks if c.passed and c.known_gap is not None and not c.intermittent
+        ]
 
     def markdown_row(self) -> str:
         """One matrix row: scenario, parameters, verdict, failed checks."""

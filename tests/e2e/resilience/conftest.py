@@ -22,11 +22,13 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) ->
     setattr(item, f"_resilience_{report.when}", report)
 
 
-def require_claude_native() -> None:
-    """Skip unless the real Claude Code CLI and tmux are installed."""
-    for binary in ("claude", "tmux"):
-        if shutil.which(binary) is None:
-            pytest.skip(f"{binary!r} is not on PATH; claude-native labs need it")
+def require_tmux() -> None:
+    """Skip unless tmux is installed; native harness terminals need it.
+
+    Each harness CLI is checked when a session for it is created.
+    """
+    if shutil.which("tmux") is None:
+        pytest.skip("'tmux' is not on PATH; native harness labs need it")
 
 
 @pytest.fixture
@@ -39,7 +41,7 @@ def lab_factory(request: pytest.FixtureRequest) -> Iterator[Callable[..., Lab]]:
     labs: list[Lab] = []
 
     def _start(mode: LabMode = "host", **options: object) -> Lab:
-        require_claude_native()
+        require_tmux()
         lab = Lab(LabConfig(mode=mode, **options))  # type: ignore[arg-type]
         labs.append(lab)
         return lab.start()

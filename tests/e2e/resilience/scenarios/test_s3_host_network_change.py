@@ -16,8 +16,8 @@ from collections.abc import Callable
 
 import pytest
 
-from tests.e2e.resilience.lab.driver import ClaudeDriver
-from tests.e2e.resilience.lab.lab import Lab
+from tests.e2e.resilience.lab.driver import SessionDriver
+from tests.e2e.resilience.lab.lab import Harness, Lab
 from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.proxy import Fault
 from tests.e2e.resilience.lab.report import ScenarioReport
@@ -33,15 +33,21 @@ _R6 = (
     "and flash runner_disconnected over the running turn"
 )
 _KNOWN_GAPS_BY_MODE = {
-    "flap": {(contract.TOOL_RUNNING, 120): _R6, (contract.APPROVAL_PENDING, 120): _R6},
+    "flap": contract.gaps(
+        _R6,
+        [(contract.TOOL_RUNNING, 120), (contract.APPROVAL_PENDING, 120)],
+        harnesses=("claude", "codex"),
+    ),
     "reset": {
-        (contract.APPROVAL_PENDING, 45): (
+        **contract.gaps(
             "R1: refused re-POSTs back off to 30s, so the approval card returns late and an "
-            "approval in the gap is lost"
+            "approval in the gap is lost",
+            [(contract.APPROVAL_PENDING, 45)],
         ),
-        (contract.APPROVAL_PENDING, 120): (
+        **contract.gaps(
             "R2: the permission hook gives up after 8 failed re-POSTs and moves the prompt "
-            "to the terminal"
+            "to the terminal",
+            [(contract.APPROVAL_PENDING, 120)],
         ),
     },
 }
@@ -61,25 +67,29 @@ def _cut(lab: Lab, mode: str) -> list[Fault]:
 
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize(
-    ("mode", "phase", "outage_s"),
+    ("mode", "harness", "phase", "outage_s"),
     [
         pytest.param(mode, *case.values, marks=case.marks, id=f"{mode}-{case.id}")
         for mode in ("blackhole", "reset", "flap")
         for case in contract.cases(
             _PHASES,
-            contract.outages([40], [120]) if mode == "flap" else contract.outages([10], [45, 120]),
+            # Flapping takes a while to mean anything; it runs only in full mode.
+            contract.outages([], [40, 120])
+            if mode == "flap"
+            else contract.outages([10], [45, 120]),
             _KNOWN_GAPS_BY_MODE.get(mode),
         )
     ],
 )
 def test_s3_host_network_change(
-    lab_factory: Callable[..., Lab], mode: str, phase: str, outage_s: int
+    lab_factory: Callable[..., Lab], mode: str, harness: Harness, phase: str, outage_s: int
 ) -> None:
     lab = lab_factory()
-    session_id = lab.create_claude_session()
-    driver = ClaudeDriver(lab, session_id)
+    driver = SessionDriver.create(lab, harness)
+    session_id = driver.session_id
     report = ScenarioReport(
-        "S3 host network change", {"mode": mode, "phase": phase, "outage_s": outage_s}
+        "S3 host network change",
+        {"mode": mode, "harness": harness, "phase": phase, "outage_s": outage_s},
     )
     with SessionWatcher(lab.server_url, session_id) as watcher:
         entered = contract.enter(driver, phase, outage_s=outage_s)
@@ -100,6 +110,7 @@ def test_s3_host_network_change(
             fault_start=started,
             fault_end=ended,
             outage_s=_FLAP_DOWN_S if mode == "flap" else outage_s,
+            racy_gaps={"status_settles_idle": "R8"} if harness == "codex" else None,
         )
     report.attach(watcher, lab.root)
     report.require()

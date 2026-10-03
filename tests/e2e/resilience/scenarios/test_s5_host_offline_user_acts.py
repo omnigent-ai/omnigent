@@ -15,8 +15,8 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from tests.e2e.resilience.lab.driver import ClaudeDriver
-from tests.e2e.resilience.lab.lab import Lab
+from tests.e2e.resilience.lab.driver import SessionDriver
+from tests.e2e.resilience.lab.lab import Harness, Lab
 from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.proxy import Fault
 from tests.e2e.resilience.lab.report import ScenarioReport
@@ -28,20 +28,24 @@ _ACTIONS = {
     "stop": contract.TOOL_RUNNING,
 }
 _KNOWN_GAPS = {
-    ("approve", 150): (
+    **contract.gaps(
         "R2: the permission hook gives up after ~90s of failed re-POSTs, so an approval "
-        "given while the host was offline never reaches Claude"
+        "given while the host was offline never reaches Claude",
+        [("approve", 150)],
     ),
-    ("send", 150): "R3: the message is accepted, then dropped when the relaunch fails",
-    ("stop", 150): "R4: Stop reports success while the turn keeps running on the host",
-    ("send", 20): (
+    **contract.gaps(
         "R3: a message sent while the host is unreachable is accepted (202), then the "
         "relaunch fails with runner_failed_to_start; the message is never delivered and "
-        "the failure stays after the host returns"
+        "the failure stays after the host returns",
+        [("send", 20), ("send", 150)],
+        harnesses=("claude", "codex"),
     ),
-    ("stop", 20): (
+    **contract.gaps(
         "R4: Stop with the host unreachable reports success and shows idle, but the turn "
-        "keeps running on the host; the next message is typed into the busy TUI and lost"
+        "keeps running on the host and finishes once it returns (claude also loses the "
+        "next message in the busy TUI)",
+        [("stop", 20), ("stop", 150)],
+        harnesses=("claude", "codex"),
     ),
 }
 #: A refusal slower than this is not "at once" for a user waiting on a button.
@@ -58,15 +62,18 @@ def _host_offline(lab: Lab) -> list[Fault]:
 
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
-    ("action", "outage_s"), contract.cases(_ACTIONS, contract.outages([20], [150]), _KNOWN_GAPS)
+    ("harness", "action", "outage_s"),
+    contract.cases(_ACTIONS, contract.outages([20], [150]), _KNOWN_GAPS),
 )
 def test_s5_host_offline_user_acts(
-    lab_factory: Callable[..., Lab], action: str, outage_s: int
+    lab_factory: Callable[..., Lab], harness: Harness, action: str, outage_s: int
 ) -> None:
     lab = lab_factory()
-    session_id = lab.create_claude_session()
-    driver = ClaudeDriver(lab, session_id)
-    report = ScenarioReport("S5 host offline, user acts", {"action": action, "outage_s": outage_s})
+    driver = SessionDriver.create(lab, harness)
+    session_id = driver.session_id
+    report = ScenarioReport(
+        "S5 host offline, user acts", {"harness": harness, "action": action, "outage_s": outage_s}
+    )
     with SessionWatcher(lab.server_url, session_id) as watcher:
         entered = contract.enter(driver, _ACTIONS[action], outage_s=outage_s)
         started = time.time()
@@ -101,7 +108,7 @@ def test_s5_host_offline_user_acts(
 
 
 def _act(
-    driver: ClaudeDriver, entered: contract.Phase, action: str
+    driver: SessionDriver, entered: contract.Phase, action: str
 ) -> tuple[httpx.Response | None, float]:
     started = time.monotonic()
     try:
@@ -126,7 +133,7 @@ def _act(
 def _check_outcome(
     report: ScenarioReport,
     lab: Lab,
-    driver: ClaudeDriver,
+    driver: SessionDriver,
     entered: contract.Phase,
     action: str,
     accepted: bool,
@@ -143,6 +150,24 @@ def _check_outcome(
             bool(stopped) if accepted else True,
             f"status={lab.snapshot(driver.session_id).get('status')}",
         )
+        if accepted:
+            # Give the tool as long as it would have needed had it kept running;
+            # finishing at any point proves it was only shown as stopped.
+            assert turn.done is not None
+            done = turn.done
+            ran_on = contract.eventually(
+                lambda: (
+                    True
+                    if done.exists() or driver.count_text(turn.reply, role="assistant")
+                    else None
+                ),
+                timeout=contract.RECOVERY_S + turn.tool_s,
+            )
+            report.check(
+                "stopped_turn_does_not_finish",
+                not ran_on,
+                "the stopped turn finished on the host after it returned" if ran_on else "",
+            )
         return
     if action == "send" and not accepted:
         copies = driver.count_text(turn.marker, role="user")

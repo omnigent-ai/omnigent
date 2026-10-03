@@ -2,7 +2,7 @@
 
 A disposable Omnigent topology for testing what users see when the network
 misbehaves. It runs a real server, the real `omnigent host` daemon (or a bare
-runner), the real Claude Code TUI and the shared mock model. Every network link
+runner), the real Claude Code or Codex TUI and the shared mock model. Every network link
 goes through a fault proxy that a test or a person can break on demand.
 
 ```text
@@ -22,7 +22,7 @@ state being asserted.
 
 ## Run it
 
-Requires `claude` and `tmux` on `PATH`. Tests skip without them.
+Requires `claude`, `codex` and `tmux` on `PATH`. Tests skip without them.
 
 ```sh
 uv run --no-sync pytest tests/e2e/resilience -v
@@ -45,7 +45,7 @@ Scenario scripts live in `scenarios/`. Each one implements a row family of
 the matrix in [`docs/network-resilience.md`](../../../docs/network-resilience.md).
 They are built from four pieces:
 
-- `ClaudeDriver` (`lab/driver.py`) sends user turns through the client link.
+- `SessionDriver` (`lab/driver.py`) sends user turns through the client link.
   It scripts Claude's replies by a unique marker and leaves marker-named files
   in the workspace, so a scenario can tell which tool side effects ran.
   `start_tool_turn`, `start_approval_turn` and `round_trip` put a session into
@@ -125,5 +125,8 @@ path, logs and URLs.
   half-open path, the same path a network change without sleep takes.
 - A blackholed new connection is accepted instead of hanging in SYN-SENT.
   Clients see a read timeout rather than a connect timeout.
-- Only claude-native is wired so far. Other harnesses need their own model
-  routing and turn scripting.
+- claude-native and codex-native are wired. Other harnesses need their own
+  model routing and turn scripting in `lab/driver.py`.
+- Codex's `exec_command` yields after at most 30 s, so a long Codex tool phase
+  is a chain of shorter calls. Each call is a model round trip and a policy
+  hook, which matters during server outages.

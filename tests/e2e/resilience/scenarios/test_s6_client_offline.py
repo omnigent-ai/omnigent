@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.resilience.lab.driver import ClaudeDriver
-from tests.e2e.resilience.lab.lab import Lab
+from tests.e2e.resilience.lab.driver import SessionDriver
+from tests.e2e.resilience.lab.lab import Harness, Lab
 from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.proxy import Fault
 from tests.e2e.resilience.lab.report import ScenarioReport, report_dir
@@ -61,22 +61,28 @@ def _offline(lab: Lab, mode: str) -> list[Fault]:
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("mode", ["blackhole", "offline"])
 @pytest.mark.parametrize(
-    ("phase", "outage_s"), contract.cases(_PHASES, contract.outages([20], [120]))
+    ("harness", "phase", "outage_s"), contract.cases(_PHASES, contract.outages([20], [120]))
 )
 def test_s6_client_offline(
-    lab_factory: Callable[..., Lab], browser_page: object, mode: str, phase: str, outage_s: int
+    lab_factory: Callable[..., Lab],
+    browser_page: object,
+    mode: str,
+    harness: Harness,
+    phase: str,
+    outage_s: int,
 ) -> None:
     page = browser_page
     expect = sync_api.expect
     lab = lab_factory()
-    session_id = lab.create_claude_session()
-    driver = ClaudeDriver(lab, session_id)
+    driver = SessionDriver.create(lab, harness)
+    session_id = driver.session_id
     report = ScenarioReport(
-        "S6 client offline", {"mode": mode, "phase": phase, "outage_s": outage_s}
+        "S6 client offline",
+        {"mode": mode, "harness": harness, "phase": phase, "outage_s": outage_s},
     )
     shots = report_dir() / "screenshots"
     shots.mkdir(parents=True, exist_ok=True)
-    stem = f"S6-{mode}-{phase}-{outage_s}s"
+    stem = f"S6-{mode}-{harness}-{phase}-{outage_s}s"
     with SessionWatcher(lab.server_url, session_id) as watcher:
         warmup = driver.round_trip()
         page.goto(f"{lab.proxies.client.url}/c/{session_id}")  # type: ignore[attr-defined]

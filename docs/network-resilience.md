@@ -4,7 +4,11 @@ What a user should see when the network between Omnigent's pieces breaks, and
 which scenarios currently meet that bar. Every row comes from a script in
 `tests/e2e/resilience/scenarios/` that runs against the
 [resilience lab](../tests/e2e/resilience/README.md). The lab is a real server,
-host daemon, runner and harness with each network link behind a fault proxy.
+host daemon, runner and harness (the real Claude Code and Codex CLIs against
+a scripted mock model) with each network link behind a fault proxy. Every
+scenario runs against both claude-native and codex-native. Codex sessions are
+launched in "Ask for approval" mode, so escalated commands reach the user
+instead of Codex's automatic reviewer.
 
 ## Contract
 
@@ -33,53 +37,58 @@ during an outage is best-effort.
 | S7 | Model or gateway outage | Model link refused, before the first model call or mid-stream | [`test_s7_model_loss.py`](../tests/e2e/resilience/scenarios/test_s7_model_loss.py) |
 | S8 | Credentials expire during the outage | Not yet: needs an authenticated lab mode | — |
 
-## Matrix: claude-native
+## Matrix
 
 A **pass** row held every check. A **gap** row fails a check today. Each gap
 is pinned as a strict expected failure (`xfail(strict=True)`, or `known_gap` on
 the single check), so a fix that makes it pass must also remove the marker.
-Outages beyond the short default run only with `OMNIGENT_E2E_RESILIENCE_FULL=1`.
+The one exception is R8: it is a race, so its marker does not turn stale when
+a run happens to pass. Outages beyond the short default run only with
+`OMNIGENT_E2E_RESILIENCE_FULL=1`.
 
-| Scenario | Phase / action | Outage | Result |
-| --- | --- | --- | --- |
-| S1 | tool running, approval pending | 40 s / 180 s window | pass |
-| S2 | idle; tool running; tool ends during outage | 5 s / 60 s / 120 s | pass |
-| S2 | approval pending | 5 s | pass |
-| S2 | approval pending | 60 s | gap: [R1](#r1-approval-card-missing-after-the-server-returns) |
-| S2 | approval pending | 120 s | gap: [R2](#r2-long-outage-moves-the-approval-to-the-terminal) |
-| S3 blackhole | idle, tool running, approval pending | 10 s / 45 s / 120 s | pass |
-| S3 reset | idle, tool running | 10 s / 45 s / 120 s | pass |
-| S3 reset | approval pending | 10 s | pass |
-| S3 reset | approval pending | 45 s / 120 s | gap: [R1](#r1-approval-card-missing-after-the-server-returns) / [R2](#r2-long-outage-moves-the-approval-to-the-terminal) |
-| S3 flap | idle | 40 s / 120 s | pass |
-| S3 flap | tool running, approval pending | 40 s | pass |
-| S3 flap | tool running, approval pending | 120 s | gap: [R6](#r6-repeated-blips-add-up-to-a-disconnect-failure) |
-| S4 | idle, tool running, approval pending | 10 s / 60 s / 300 s | pass |
-| S5 | approve | 20 s | pass |
-| S5 | approve | 150 s | gap: [R2](#r2-long-outage-moves-the-approval-to-the-terminal) |
-| S5 | send | 20 s / 150 s | gap: [R3](#r3-a-message-sent-while-the-host-is-unreachable-is-lost) |
-| S5 | stop | 20 s / 150 s | gap: [R4](#r4-stop-reports-success-while-the-host-is-unreachable) |
-| S6 | tool ends during outage, approval pending (half-open and refused) | 20 s | gap: [R5](#r5-the-page-never-says-it-is-offline) (catches up, shows the reply once, and the next message works) |
-| S7 | before the first call, mid-stream | 10 s / 60 s | pass (Claude retries) |
-| S7 | before the first call | 180 s | pass |
-| S7 | mid-stream | 180 s | gap: [R7](#r7-a-turn-that-lost-the-model-has-no-retry) |
+| Scenario | Phase / action | Outage | claude-native | codex-native |
+| --- | --- | --- | --- | --- |
+| S1 | tool running, approval pending | 40 s / 180 s window | pass | pass |
+| S2 | idle; tool running; tool ends during outage | 5 s / 60 s / 120 s | pass | pass |
+| S2 | approval pending | 5 s | pass | pass |
+| S2 | approval pending | 60 s | gap: [R1](#r1-approval-card-missing-after-the-link-returns) | gap: [R1](#r1-approval-card-missing-after-the-link-returns) |
+| S2 | approval pending | 120 s | gap: [R2](#r2-long-outage-moves-the-approval-to-the-terminal) | gap: [R1](#r1-approval-card-missing-after-the-link-returns) |
+| S3 blackhole | idle, tool running, approval pending | 10 s / 45 s / 120 s | pass | pass, [R8](#r8-codex-status-sticks-on-running-after-a-reconnect) intermittent |
+| S3 reset | idle, tool running | 10 s / 45 s / 120 s | pass | pass, R8 intermittent |
+| S3 reset | approval pending | 10 s | pass | pass, R8 intermittent |
+| S3 reset | approval pending | 45 s / 120 s | gap: R1 / R2 | pass, R8 intermittent |
+| S3 flap | idle; tool running, approval pending | 40 s | pass | pass, R8 intermittent |
+| S3 flap | idle | 120 s | pass | pass, R8 intermittent |
+| S3 flap | tool running, approval pending | 120 s | gap: [R6](#r6-repeated-blips-add-up-to-a-disconnect-failure) | gap: R6 |
+| S4 | idle, tool running, approval pending | 10 s / 60 s / 300 s | pass | pass |
+| S5 | approve | 20 s | pass | pass |
+| S5 | approve | 150 s | gap: R2 | pass |
+| S5 | send | 20 s / 150 s | gap: [R3](#r3-a-message-sent-while-the-host-is-unreachable-is-lost) | gap: R3 |
+| S5 | stop | 20 s / 150 s | gap: [R4](#r4-stop-reports-success-while-the-host-is-unreachable) | gap: R4 |
+| S6 | tool ends during outage, approval pending (half-open and refused) | 20 s / 120 s | gap: [R5](#r5-the-page-never-says-it-is-offline) | gap: R5 |
+| S7 | before the first call, mid-stream | 10 s / 60 s | pass | pass |
+| S7 | before the first call | 180 s | pass | pass |
+| S7 | mid-stream | 180 s | gap: [R7](#r7-a-turn-that-lost-the-model-has-no-retry) | pass |
 
 ## Findings
 
-### R1: Approval card missing after the server returns
+### R1: Approval card missing after the link returns
 
-The Claude permission hook re-POSTs its held approval with exponential backoff
-capped at 30 s (`_post_hook_with_reattach` in
-`omnigent/harnesses/claude_native/hook.py`). The server keeps pending approvals
-in memory, so a restart or a refused host link loses the card until the hook's
-next attempt. That can be up to 30 s after the link is back. In the lab, the
-card returned 30 s after the server did. An approval sent from the stale card
-in that gap was accepted with `202` but had no effect, and the turn stayed
-blocked.
+Both harnesses re-POST a held approval with backoff capped at 30 s. Claude
+does this in `_post_hook_with_reattach` in
+`omnigent/harnesses/claude_native/hook.py`. Codex does it in
+`_post_codex_elicitation_request` in
+`omnigent/harnesses/codex_native/forwarder.py`. The server keeps pending
+approvals in memory, so a restart or a refused host link loses the card until
+the harness's next attempt, which can be up to 30 s after the link is back.
+In the lab the card returned 28–30 s after the server did. An approval sent
+from the stale card in that gap was accepted with `202` but had no effect, and
+the turn stayed blocked until the user answered the returned card. Codex
+never gives up retrying, so for Codex this is also the 120 s outcome.
 
 ### R2: Long outage moves the approval to the terminal
 
-After `OMNIGENT_HOOK_MAX_RETRIES` (8) consecutive failed re-POSTs, about 90 s
+Claude only. After `OMNIGENT_HOOK_MAX_RETRIES` (8) consecutive failed re-POSTs, about 90 s
 of backoff, the hook gives up and Claude Code falls back to its own terminal
 prompt. When the link returns, the web never shows the card again, and an
 approval the user already gave while the host was offline never reaches
@@ -88,7 +97,7 @@ that only the terminal can answer.
 
 ### R3: A message sent while the host is unreachable is lost
 
-With the host's links down for 20 s, a message sent from the browser returned
+Both harnesses; this is server behavior. With the host's links down for 20 s, a message sent from the browser returned
 `202` after about 10 s. The server then tried to relaunch the runner through
 the unreachable host and published `failed` with `runner_failed_to_start`. The
 message never reached the runner. The failure stayed after the host
@@ -96,11 +105,12 @@ reconnected, because passive recovery clears only `runner_disconnected`.
 
 ### R4: Stop reports success while the host is unreachable
 
-With no live tunnel the server finds no runner to stop. It treats the Stop as
-done and shows the session idle. The turn keeps running on the host and
-finishes after the host returns. The next message is delivered while Claude
-is still busy with the "stopped" turn, and it never appears in Claude's
-transcript.
+Both harnesses. With no live tunnel the server finds no runner to stop. It
+treats the Stop as done and shows the session idle. The turn keeps running on
+the host and finishes once the host returns. With Claude, the next message is
+delivered while Claude is still busy with the "stopped" turn, and it never
+appears in Claude's transcript. With Codex, the next message is processed
+after the "stopped" turn completes.
 
 ### R5: The page never says it is offline
 
@@ -113,7 +123,7 @@ message works.
 
 ### R6: Repeated blips add up to a disconnect failure
 
-With the host link dropping for 2 s every 15 s, each drop reconnected within
+Both harnesses; this is server behavior. With the host link dropping for 2 s every 15 s, each drop reconnected within
 seconds. About 100 s after the first drop the session published `failed`
 (`runner_disconnected`) over the running turn, then recovered 4 s later. The
 relay supervisor (`_relay_runner_stream` in
@@ -123,12 +133,35 @@ healthy stretches keep counting against the first drop's 90 s deadline.
 
 ### R7: A turn that lost the model has no Retry
 
-When Claude Code exhausted its retries against an unreachable model (about
+Claude only. When Claude Code exhausted its retries against an unreachable model (about
 150 s), it ended the turn with "API Error: Connection refused — a firewall or
 proxy may be blocking it (ECONNREFUSED)". `classify_native_turn_error` labels
 that `native_turn_error`, which the web UI does not offer Retry for. Shorter
 model outages of up to 60 s were retried and completed. Claude's retrying is
 not surfaced anywhere in the session while it happens.
+
+### R8: Codex status sticks on running after a reconnect
+
+Codex only, and intermittent. After the host's links drop and return, the next
+turn's status edges arrive as `running`, `idle`, `running`, and the last one
+sticks. The session shows "working" indefinitely, even though the reply was
+committed. In the lab logs the Codex forwarder posts exactly one `running` and
+one `idle`. The extra `running` lands just as the server's relay reconnects to
+the runner's session stream. The likely cause is that the relay receives
+events the runner buffered during the outage: the stream has no cursor, so
+they replay late and out of order. The race hit 4 of 30 short S3 Codex runs,
+plus the blackhole and flap idle rows at 120 s.
+
+### Other observations
+
+- Each Codex tool call made while the server is down waits on the
+  evaluate-policy hook's 30 s retry budget before proceeding. A chained tool
+  turn therefore slows down during an outage, but it completes.
+- In "Approve for me" (the default Codex mode), escalated commands go to
+  Codex's automatic reviewer, which makes its own model call. When that call
+  returned an unusable verdict, Codex rejected the command rather than asking
+  the user. A model outage at that moment would likely do the same. This is
+  not yet a scenario row.
 
 ## Running and reading results
 

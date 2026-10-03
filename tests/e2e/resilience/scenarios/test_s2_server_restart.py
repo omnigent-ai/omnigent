@@ -16,8 +16,8 @@ from collections.abc import Callable
 
 import pytest
 
-from tests.e2e.resilience.lab.driver import ClaudeDriver
-from tests.e2e.resilience.lab.lab import Lab
+from tests.e2e.resilience.lab.driver import SessionDriver
+from tests.e2e.resilience.lab.lab import Harness, Lab
 from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.report import ScenarioReport
 from tests.e2e.resilience.scenarios import _contract as contract
@@ -29,27 +29,39 @@ _PHASES = [
     contract.APPROVAL_PENDING,
 ]
 _KNOWN_GAPS = {
-    (contract.APPROVAL_PENDING, 60): (
+    **contract.gaps(
         "R1: the permission hook retries at most every 30s, so the card is gone for up "
-        "to 30s after the server returns and an approval in that gap is lost"
+        "to 30s after the server returns and an approval in that gap is lost",
+        [(contract.APPROVAL_PENDING, 60)],
     ),
-    (contract.APPROVAL_PENDING, 120): (
+    **contract.gaps(
+        "R1: Codex re-POSTs its approval at most every 30s, so the card returns up to 30s "
+        "after the server and an approval in that gap is lost",
+        [(contract.APPROVAL_PENDING, 60), (contract.APPROVAL_PENDING, 120)],
+        harnesses=("codex",),
+    ),
+    **contract.gaps(
         "R2: after 8 consecutive failed re-POSTs (~90s) the permission hook falls back "
-        "to the terminal prompt; the web card never returns and the turn stays blocked"
+        "to the terminal prompt; the web card never returns and the turn stays blocked",
+        [(contract.APPROVAL_PENDING, 120)],
     ),
 }
 
 
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize(
-    ("phase", "outage_s"),
+    ("harness", "phase", "outage_s"),
     contract.cases(_PHASES, contract.outages([5], [60, 120]), _KNOWN_GAPS),
 )
-def test_s2_server_restart(lab_factory: Callable[..., Lab], phase: str, outage_s: int) -> None:
+def test_s2_server_restart(
+    lab_factory: Callable[..., Lab], harness: Harness, phase: str, outage_s: int
+) -> None:
     lab = lab_factory()
-    session_id = lab.create_claude_session()
-    driver = ClaudeDriver(lab, session_id)
-    report = ScenarioReport("S2 server restart", {"phase": phase, "outage_s": outage_s})
+    driver = SessionDriver.create(lab, harness)
+    session_id = driver.session_id
+    report = ScenarioReport(
+        "S2 server restart", {"harness": harness, "phase": phase, "outage_s": outage_s}
+    )
     with SessionWatcher(lab.server_url, session_id) as watcher:
         entered = contract.enter(driver, phase, outage_s=outage_s)
         down_at = time.time()
