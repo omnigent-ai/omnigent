@@ -22,6 +22,7 @@ import {
   getSessionUsage,
   importLocalSessions,
   interrupt,
+  launchRunner,
   listRunners,
   openSessionStream,
   postEvent,
@@ -31,6 +32,11 @@ import {
   updateSession,
 } from "./sessionsApi";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
+import {
+  ApiTimeoutError,
+  DEFAULT_API_TIMEOUT_MS,
+  SESSION_MUTATION_TIMEOUT_MS,
+} from "./fetchTimeout";
 import { getSessionHost, setSessionHost } from "./sessionHost";
 
 function mockJsonResponse(
@@ -72,6 +78,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Restore real timers even when an assertion throws mid-test, so fake
+  // timers can't leak into the next one.
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   localStorage.clear();
 });
@@ -292,6 +301,25 @@ describe("createSession", () => {
   it("throws when the response is not ok", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
     await expect(createSession("missing")).rejects.toThrow(/404/);
+  });
+
+  it("rejects with ApiTimeoutError when the create POST never settles", async () => {
+    // A backend that accepts the create but never answers must reject so the
+    // "Starting session" spinner clears instead of spinning forever. The
+    // deadline is the session-mutation one (above the server's worst
+    // legitimate create), not the 30 s read default.
+    vi.useFakeTimers();
+    fetchMock.mockReturnValueOnce(new Promise<Response>(() => {}));
+    const promise = createSession("agent_xyz");
+    const assertion = expect(promise).rejects.toBeInstanceOf(ApiTimeoutError);
+    await vi.advanceTimersByTimeAsync(DEFAULT_API_TIMEOUT_MS + 1);
+    // Still pending at the read deadline — a slow-but-valid create must
+    // not be aborted at 30 s.
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(SESSION_MUTATION_TIMEOUT_MS + 1);
+    await assertion;
+    vi.useRealTimers();
   });
 
   it("forward-compat: reads queued_items from the snapshot when present", async () => {
@@ -920,6 +948,24 @@ describe("runner binding", () => {
       model_override: "claude-opus-4-7",
       silent: true,
     });
+  });
+});
+
+describe("launchRunner", () => {
+  it("rejects with ApiTimeoutError when the launch POST never settles", async () => {
+    // The launch can synchronously build a host worktree, so the deadline
+    // is the session-mutation one — a slow-but-valid launch must not be
+    // aborted at the 30 s read default, only a wedged backend rejected.
+    vi.useFakeTimers();
+    fetchMock.mockReturnValueOnce(new Promise<Response>(() => {}));
+    const promise = launchRunner("host_a1b2", "conv_abc", "/repo");
+    const assertion = expect(promise).rejects.toBeInstanceOf(ApiTimeoutError);
+    await vi.advanceTimersByTimeAsync(DEFAULT_API_TIMEOUT_MS + 1);
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(SESSION_MUTATION_TIMEOUT_MS + 1);
+    await assertion;
+    vi.useRealTimers();
   });
 });
 

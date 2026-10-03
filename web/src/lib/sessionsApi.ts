@@ -14,6 +14,7 @@ import type { ConversationItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
+import { fetchWithTimeout, SESSION_MUTATION_TIMEOUT_MS } from "./fetchTimeout";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
@@ -516,15 +517,25 @@ export async function createSession(
   if (options.title !== undefined) {
     body.title = options.title;
   }
-  const res = await authenticatedFetch("/v1/sessions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Omnigent-Client": getClientSurface(),
-      ...backgroundSessionTitlesRequestHeaders(),
-    },
-    body: JSON.stringify(body),
-  });
+  // One-shot create with a wall-clock deadline: a backend that accepts the
+  // create but never answers must not leave the "Starting session" spinner
+  // up forever. The deadline sits above the server's worst legitimate
+  // create (worktree + launch + runner init), so it only fires on a
+  // genuinely wedged backend.
+  const res = await fetchWithTimeout(
+    (signal) =>
+      authenticatedFetch("/v1/sessions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Omnigent-Client": getClientSurface(),
+          ...backgroundSessionTitlesRequestHeaders(),
+        },
+        body: JSON.stringify(body),
+        signal,
+      }),
+    SESSION_MUTATION_TIMEOUT_MS,
+  );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
@@ -977,11 +988,19 @@ export async function launchRunner(
             : {}),
     };
   }
-  const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/runners`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  // Bounded like the create: the launch can synchronously build a worktree
+  // on the host, so the deadline sits above that worst case — it fires only
+  // on a genuinely wedged backend, never on a slow-but-valid launch.
+  const res = await fetchWithTimeout(
+    (signal) =>
+      authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/runners`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      }),
+    SESSION_MUTATION_TIMEOUT_MS,
+  );
   if (!res.ok) {
     // hosts.py raises HTTPException → ``{"detail": "..."}``. Surface the
     // server's reason (bad branch, offline host, already-bound) verbatim.

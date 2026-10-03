@@ -60,6 +60,7 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import { ApiTimeoutError } from "@/lib/fetchTimeout";
 import {
   ApiError,
   approve as approveElicitation,
@@ -7943,6 +7944,15 @@ const RUNNER_UNAVAILABLE_TERSE_MESSAGE = "No runner bound for session";
  * only the server's no-context message with friendly copy.
  */
 function describeSendFailure(err: unknown): { message: string; code: string } {
+  // A bounded create/launch (session-mutation deadline) that never got an
+  // answer — replace the raw "Request timed out after 240000ms" with copy
+  // that tells the user what to do about it.
+  if (err instanceof ApiTimeoutError) {
+    return {
+      message: "The server didn't respond in time. Please try again.",
+      code: "api_timeout",
+    };
+  }
   if (err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE) {
     const informative = err.message && err.message !== RUNNER_UNAVAILABLE_TERSE_MESSAGE;
     return {

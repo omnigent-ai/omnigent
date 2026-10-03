@@ -315,6 +315,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
+import { fetchWithTimeout, SESSION_MUTATION_TIMEOUT_MS } from "@/lib/fetchTimeout";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
 
@@ -5426,7 +5427,9 @@ export function NewChatLandingScreen() {
         const matchOwnCreate = (item: SessionListWireItem) =>
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
-        const createRequest = authenticatedFetch("/v1/sessions", {
+        // Hoisted so only the HTTP leg gets the deadline below — the
+        // navigate-first jump and the pushed-row listener race unchanged.
+        const createInit: RequestInit = {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -5524,7 +5527,18 @@ export function NewChatLandingScreen() {
             smart_routing_message:
               smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
           }),
-        });
+        };
+        // Bound the HTTP leg only, with the session-mutation deadline (the
+        // create can synchronously build a host worktree, so 30 s would
+        // abort a slow-but-valid create): a backend that accepts the create
+        // but never answers rejects here so the "Starting session" spinner
+        // clears via the surrounding finally, instead of hanging forever.
+        // The WebSocket pushed-row race keeps racing the same promise —
+        // only its HTTP contender can now reject.
+        const createRequest = fetchWithTimeout(
+          (signal) => authenticatedFetch("/v1/sessions", { ...createInit, signal }),
+          SESSION_MUTATION_TIMEOUT_MS,
+        );
         // Managed launch validation continues after the row is announced, so
         // only its HTTP response can resolve the temp chat.
         const abortPush = new AbortController();

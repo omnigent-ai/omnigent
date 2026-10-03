@@ -2,6 +2,7 @@ import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-quer
 import { useMemo } from "react";
 import { useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
+import { fetchWithTimeout } from "@/lib/fetchTimeout";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import {
@@ -123,7 +124,9 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
     const params = new URLSearchParams();
     if (after !== null) params.set("after", after);
     const url = params.size ? `/v1/agents?${params}` : "/v1/agents";
-    const res = await authenticatedFetch(url);
+    // Bounded like the other one-shot reads so a hung catalog page can't
+    // keep the agent picker (and its placeholder rows) loading forever.
+    const res = await fetchWithTimeout((signal) => authenticatedFetch(url, { signal }));
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
     rows.push(...body.data);

@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // test starts from a fresh module cache; only the pure helpers are static.
 import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
 import type { ServerInfo } from "./capabilities";
+import { DEFAULT_API_TIMEOUT_MS } from "./fetchTimeout";
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
 function info(overrides: Partial<ServerInfo>): ServerInfo {
@@ -221,5 +222,21 @@ describe("resolveServerInfo branding", () => {
     vi.resetModules();
     const malformed = await probe({ branding: "Acme" });
     expect(malformed.branding).toBeNull();
+  });
+});
+
+describe("resolveServerInfo fetch timeout", () => {
+  it("returns FALLBACK_SERVER_INFO when the fetch never resolves", async () => {
+    // A hung /v1/info probe (wedged proxy / stuck tunnel) must not leave the
+    // boot capabilities gate suspended forever — the timeout settles it with the
+    // fallback so the rest of the app can render.
+    vi.useFakeTimers();
+    fetchMock.mockReturnValueOnce(new Promise<Response>(() => {}));
+    const { resolveServerInfo, FALLBACK_SERVER_INFO } = await import("./capabilities");
+    const promise = resolveServerInfo();
+    await vi.advanceTimersByTimeAsync(DEFAULT_API_TIMEOUT_MS + 1);
+    const result = await promise;
+    expect(result).toEqual(FALLBACK_SERVER_INFO);
+    vi.useRealTimers();
   });
 });

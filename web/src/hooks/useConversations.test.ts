@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { ApiError } from "@/lib/sessionsApi";
+import { ApiTimeoutError } from "@/lib/fetchTimeout";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
@@ -304,15 +305,15 @@ describe("useConversations search timeout", () => {
     expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it("does not bound an ordinary (non-search) list fetch", async () => {
+  it("bounds an ordinary (non-search) list fetch too", async () => {
     renderSearch("");
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
-    // Plain pagination is indexed/fast; adding a deadline could abort a
-    // legitimately larger page, so no signal is attached.
+    // A wedged backend must not spin the sidebar forever, so plain pagination
+    // also carries a deadline signal (the general API timeout).
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).not.toContain("search_query=");
-    expect(init.signal).toBeUndefined();
+    expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
   it("does not retry a client-side search timeout, but retries other errors", () => {
@@ -326,10 +327,11 @@ describe("useConversations search timeout", () => {
     ) => boolean;
     expect(typeof retry).toBe("function");
 
-    // A fired AbortSignal.timeout rejects with a TimeoutError DOMException —
-    // terminal, so retrying would only re-arm the same slow request.
-    const timeoutError = new DOMException("timeout", "TimeoutError");
-    expect(retry(0, timeoutError)).toBe(false);
+    // A client-side timeout is terminal, so retrying would only re-arm the same
+    // slow request: fetchWithTimeout raises ApiTimeoutError, and a bare
+    // AbortSignal.timeout raises a TimeoutError DOMException.
+    expect(retry(0, new ApiTimeoutError(10_000))).toBe(false);
+    expect(retry(0, new DOMException("timeout", "TimeoutError"))).toBe(false);
 
     // A genuine server/network error still retries (up to the default cap).
     expect(retry(0, new Error("500 Internal Server Error"))).toBe(true);

@@ -29,6 +29,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
+import { ApiTimeoutError, DEFAULT_API_TIMEOUT_MS, fetchWithTimeout } from "@/lib/fetchTimeout";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
@@ -89,14 +90,18 @@ export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
 export const SEARCH_FETCH_TIMEOUT_MS = 10_000;
 
 /**
- * True for the DOMException a fetch raises when its `AbortSignal.timeout`
- * fires. Used to keep the query layer from retrying a client-side search
- * timeout: retrying would just re-arm the same slow request three more times
- * (React Query's default), turning one hung spinner into a retry storm. A real
- * server/network error still retries normally.
+ * True for a client-side fetch timeout — the `ApiTimeoutError` raised by
+ * `fetchWithTimeout` or the DOMException a bare `AbortSignal.timeout` raises.
+ * Used to keep the query layer from retrying a client-side timeout: retrying
+ * would just re-arm the same slow request three more times (React Query's
+ * default), turning one hung spinner into a retry storm. A real server/network
+ * error still retries normally.
  */
-function isAbortTimeout(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "TimeoutError";
+function isClientTimeout(error: unknown): boolean {
+  return (
+    error instanceof ApiTimeoutError ||
+    (error instanceof DOMException && error.name === "TimeoutError")
+  );
 }
 
 /**
@@ -541,12 +546,16 @@ export async function fetchConversationsPage({
   // query key (which drops `project`) and the cache-membership check. This
   // list never requests the server's "unfiled" (`project=`) slice.
   if (project) params.set("project", project);
-  // Bound search fetches with a client-side deadline (see
-  // SEARCH_FETCH_TIMEOUT_MS): a search whose server-side index is missing can
-  // hang, and the palette shows "Searching…" for the whole in-flight window.
-  // Plain list pagination is indexed/fast, so it keeps no timeout.
-  const signal = searchQuery ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS) : requestSignal;
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
+  // Bound the list fetch with a client-side deadline so a wedged backend can't
+  // leave the sidebar (or the command palette's "Searching…") spinning forever.
+  // Search can hang on a missing server-side index, so it keeps a shorter
+  // dedicated deadline; plain pagination uses the general API timeout and honors
+  // react-query's per-query cancellation signal.
+  const res = await fetchWithTimeout(
+    (signal) => authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal }),
+    searchQuery ? SEARCH_FETCH_TIMEOUT_MS : DEFAULT_API_TIMEOUT_MS,
+    searchQuery ? undefined : requestSignal,
+  );
   // Carries the server's `code`, so a dead cursor stays recognizable as
   // `stale_cursor` instead of an opaque "400 Bad Request".
   if (!res.ok) throw await apiErrorFromResponse(res);
@@ -692,7 +701,7 @@ export function useConversations(
     // gone, so a retry reissues the same doomed cursor. The restart below
     // recovers it instead.
     retry: (failureCount, error) =>
-      !isAbortTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
+      !isClientTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
     refetchInterval: options.snapshot
       ? false
       : (options.refreshIntervalMs ??

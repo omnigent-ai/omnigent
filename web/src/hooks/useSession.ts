@@ -12,6 +12,7 @@
 // gets the user's actual level for any conversation they navigate to.
 
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
+import { fetchWithTimeout } from "@/lib/fetchTimeout";
 import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -57,7 +58,10 @@ export function useSession(conversationId: string | null | undefined): UseSessio
   const serverId = isTempConvId(conversationId) ? null : (conversationId ?? null);
   const { data, isLoading, error } = useQuery({
     queryKey: serverId ? ["session", serverId] : ["session", null],
-    queryFn: () => getSessionSlim(serverId as string, { refreshState: true }),
+    queryFn: () =>
+      fetchWithTimeout((signal) =>
+        getSessionSlim(serverId as string, { refreshState: true, signal }),
+      ),
     enabled: serverId !== null,
     staleTime: Infinity,
     retry: false,
@@ -109,7 +113,7 @@ export function useRootSessionId(
         // oxlint-disable-next-line no-await-in-loop
         const session = await queryClient.fetchQuery({
           queryKey: ["session", hopId],
-          queryFn: () => getSessionSlim(hopId),
+          queryFn: () => fetchWithTimeout((signal) => getSessionSlim(hopId, { signal })),
           staleTime: Infinity,
           retry: false,
         });
@@ -183,7 +187,7 @@ export async function prefetchSessionHostChain(
     // oxlint-disable-next-line no-await-in-loop
     const session: Session = await queryClient.fetchQuery({
       queryKey: ["session", hopId],
-      queryFn: () => getSessionSlim(hopId),
+      queryFn: () => fetchWithTimeout((signal) => getSessionSlim(hopId, { signal })),
       staleTime: Infinity,
       retry: false,
     });

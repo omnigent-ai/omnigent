@@ -7,6 +7,7 @@
 // state into each other through the cached `currentUserId`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_API_TIMEOUT_MS } from "./fetchTimeout";
 
 function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
@@ -622,5 +623,21 @@ describe("login redirect", () => {
 
     expect(isLoginRedirectPending()).toBe(false);
     expect(hrefWrites).toEqual([]);
+  });
+});
+
+describe("resolveIdentity fetch timeout", () => {
+  it("resolves to null when the /v1/me fetch never settles", async () => {
+    // A hung /v1/me probe must not leave the boot identity gate suspended
+    // forever — the timeout settles it with null so the app can continue.
+    vi.useFakeTimers();
+    fetchMock.mockReturnValueOnce(new Promise<Response>(() => {}));
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+    const promise = resolveIdentity();
+    await vi.advanceTimersByTimeAsync(DEFAULT_API_TIMEOUT_MS + 1);
+    const result = await promise;
+    expect(result).toBeNull();
+    expect(getCurrentUserId()).toBeNull();
+    vi.useRealTimers();
   });
 });

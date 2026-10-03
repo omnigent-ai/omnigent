@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { fetchWithTimeout } from "@/lib/fetchTimeout";
 import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
@@ -42,7 +43,9 @@ interface HostsResponse {
 }
 
 export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
-  const res = await authenticatedFetch("/v1/hosts");
+  // Bounded like the other one-shot reads so a hung backend can't leave the
+  // host picker loading forever.
+  const res = await fetchWithTimeout((signal) => authenticatedFetch("/v1/hosts", { signal }));
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
   // Hide server-managed sandbox hosts from every host picker: they
