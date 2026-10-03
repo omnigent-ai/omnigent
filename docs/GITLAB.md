@@ -20,10 +20,12 @@ Sign in to each private GitLab instance with `glab` on the execution host:
 glab auth login --hostname git.example.com
 ```
 
-Omnigent discovers signed-in hosts from the CLI's config file. No Omnigent host
+Omnigent discovers hosts from the CLI's config file. No Omnigent host
 setting or OAuth connection is needed. It follows `GLAB_CONFIG_DIR`, the legacy
 `~/.config/glab-cli` directory, and glab's platform-specific XDG config search
-order. Login and logout changes take effect without restarting the runner.
+order. Host changes take effect without restarting the runner. After logout,
+the host stays recognizable so existing MRs can still be selected or removed;
+API reads show the sign-in hint until credentials are restored.
 GitHub, GitLab, and Azure DevOps remotes can coexist in one checkout.
 
 For a web origin with a nondefault HTTPS port, include that port when signing in:

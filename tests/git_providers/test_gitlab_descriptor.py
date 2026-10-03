@@ -187,7 +187,10 @@ def test_login_logout_and_new_config_dir_refresh_discovery(
     path.write_text("hosts:\n  private.test:\n    token: example\n", encoding="utf-8")
     assert provider.matches_host("private.test", EnvInstances())
     path.write_text("hosts:\n  private.test:\n    user: alice\n    token: \n", encoding="utf-8")
-    assert not provider.matches_host("private.test", EnvInstances())
+    assert provider.matches_host("private.test", EnvInstances())
+    assert provider.parse_pr_url(
+        "https://private.test/team/repo/-/merge_requests/7", EnvInstances()
+    )
     path.write_text("hosts:\n  private.test:\n    token: example\n", encoding="utf-8")
     assert provider.matches_host("private.test", EnvInstances())
     monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path / "other"))
@@ -202,28 +205,20 @@ def test_login_logout_and_new_config_dir_refresh_discovery(
     [
         "hosts: [private.test]",
         "hosts: [",
-        "hosts: {private.test: {token: [not, a, token]}}",
         "hosts: {private.test: invalid}",
         "hosts:\n\tprivate.test:\n\t\ttoken: example\n",
         "other:\n  private.test:\n    token: example\n",
         "hosts:\n  private.test:\n    api_protocol: http\n    token: example\n",
-        "hosts:\n  private.test:\n    user: alice\n    token: \n    use_keyring: false\n",
-        "hosts:\n  private.test:\n    custom_headers:\n      token: example\n",
-        "hosts:\n  private.test:\n    token: example\n    token: ''\n",
-        "hosts:\n  private.test:\n    use_keyring: true\n    use_keyring: false\n",
-        "hosts:\n  private.test:\n    token: example\n  private.test:\n    token: ''\n",
     ],
 )
-def test_malformed_or_logged_out_config_does_not_claim_a_host(
-    tmp_path: Path, content: str
-) -> None:
+def test_malformed_host_config_does_not_claim_a_host(tmp_path: Path, content: str) -> None:
     (tmp_path / "config.yml").write_text(content, encoding="utf-8")
     assert not GitLabProvider().matches_host("private.test", EnvInstances())
 
 
 def test_unreadable_config_is_ignored(tmp_path: Path) -> None:
     (tmp_path / "config.yml").mkdir()
-    assert descriptor._glab_signed_in_hosts() == frozenset()
+    assert descriptor._glab_configured_hosts() == frozenset()
 
 
 @pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
@@ -247,14 +242,14 @@ def test_glab_config_precedence_matches_cli(
     for path, host in [(system, "system.test"), (user, "user.test"), (legacy, "legacy.test")]:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"hosts:\n  {host}:\n    token: example\n", encoding="utf-8")
-    assert descriptor._glab_signed_in_hosts() == {"legacy.test"}
+    assert descriptor._glab_configured_hosts() == {"legacy.test"}
     legacy.unlink()
     expected = "system.test" if platform == "linux" else "user.test"
-    assert descriptor._glab_signed_in_hosts() == {expected}
+    assert descriptor._glab_configured_hosts() == {expected}
     xdg = tmp_path / "xdg/glab-cli/config.yml"
     xdg.parent.mkdir(parents=True)
     xdg.write_text("hosts:\n  xdg.test:\n    token: example\n", encoding="utf-8")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg.parent.parent))
-    assert descriptor._glab_signed_in_hosts() == {"xdg.test"}
+    assert descriptor._glab_configured_hosts() == {"xdg.test"}
     monkeypatch.setenv("GLAB_CONFIG_DIR", str(tmp_path / "missing"))
-    assert descriptor._glab_signed_in_hosts() == frozenset()
+    assert descriptor._glab_configured_hosts() == frozenset()

@@ -11,7 +11,7 @@ reads the MR; agent CLI and MCP writes associate it with the session.
 - `associations`: link, select, and unlink MRs across projects.
 - `partial`: incomplete comments, checks, files, and omitted diff explanations.
 - `auth`: missing CLI or denied access retains checkout context and a useful hint.
-- `discovery`: signed-in glab hosts are recognized without Omnigent configuration,
+- `discovery`: glab-configured hosts are recognized without Omnigent configuration,
   including alongside GitHub and Azure DevOps remotes.
 - `tracking`: successful mutations persist; reads, comments, failures, and replay
   do not create extra associations.

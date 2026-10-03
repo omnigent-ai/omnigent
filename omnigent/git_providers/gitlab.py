@@ -1,4 +1,4 @@
-"""GitLab URLs, including nested projects on authenticated private instances."""
+"""GitLab URLs, including nested projects on CLI-configured private instances."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def _glab_config_paths() -> list[Path]:
 
 @lru_cache(maxsize=1)
 def _read_glab_hosts(path: Path, mtime_ns: int, size: int) -> frozenset[str]:
-    """Read glab's host config, retaining only signed-in HTTPS authorities."""
+    """Read glab's host identities, retaining only HTTPS authorities."""
     import yaml
 
     del mtime_ns, size  # File metadata invalidates the cache after login/logout.
@@ -73,22 +73,13 @@ def _read_glab_hosts(path: Path, mtime_ns: int, size: int) -> frozenset[str]:
         if not isinstance(host, str) or not isinstance(values, dict):
             continue
         protocol = values.get("api_protocol") or "https"
-        keyring = values.get("use_keyring")
-        authenticated = (
-            keyring is True
-            or keyring == "true"
-            or any(
-                isinstance(values.get(key), str) and values[key].strip()
-                for key in ("token", "job_token")
-            )
-        )
-        if authenticated and protocol == "https" and (authority := instance_authority(host)):
+        if protocol == "https" and (authority := instance_authority(host)):
             hosts.add(authority)
     return frozenset(hosts)
 
 
-def _glab_signed_in_hosts() -> frozenset[str]:
-    """Pick up CLI login/logout changes without a subprocess or network request."""
+def _glab_configured_hosts() -> frozenset[str]:
+    """Follow CLI host changes without confusing a logout with an unknown forge."""
     try:
         for path in _glab_config_paths():
             try:
@@ -140,7 +131,7 @@ def _valid_project(path: str) -> bool:
 
 
 class GitLabProvider:
-    """GitLab.com and CLI-authenticated instances; OAuth configuration is unnecessary."""
+    """GitLab.com and CLI-configured instances; OAuth configuration is unnecessary."""
 
     id = "gitlab"
     display_name = "GitLab"
@@ -150,10 +141,10 @@ class GitLabProvider:
     facets = FacetModules(pull_requests="omnigent.runner.git_providers.gitlab")
 
     def authorities(self, instances: Instances) -> frozenset[str]:
-        """Return configured and CLI-authenticated origins without retaining credentials."""
+        """Return configured origins without retaining credentials."""
         values = [*self.default_hosts, *instances.hosts_for(self.id)]
         values.extend(os.environ.get(name, "") for name in ("GITLAB_HOST", "GLAB_HOST"))
-        values.extend(_glab_signed_in_hosts())
+        values.extend(_glab_configured_hosts())
         return frozenset(host for value in values if value and (host := instance_authority(value)))
 
     def matches_host(self, host: str, instances: Instances) -> bool:
