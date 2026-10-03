@@ -238,7 +238,7 @@ async def run_harness(
     resolved_transport = driver_cls.transport
     unavailable = driver_cls.unavailable(profile, databricks_profile=databricks_profile)
     if unavailable is not None:
-        _emit(sink, HarnessSkipped(profile.harness, unavailable, resolved_transport))
+        _emit(sink, HarnessSkipped(profile.display_name, unavailable, resolved_transport))
         return _uniform_report(
             profile,
             probes,
@@ -247,7 +247,7 @@ async def run_harness(
             transport=resolved_transport,
         )
 
-    _emit(sink, HarnessStarted(profile.harness, driver_cls.transport, profile.model))
+    _emit(sink, HarnessStarted(profile.display_name, driver_cls.transport, profile.model))
     cells: list[CellResult] = []
     if shared_full_server is not None and driver_cls.transport == "full-server":
         driver_cm = driver_cls(
@@ -266,7 +266,7 @@ async def run_harness(
         with contextlib.suppress(Exception):
             await driver_cm.__aexit__(type(exc), exc, exc.__traceback__)
         reason = f"provisioning failed: {exc}"
-        _emit(sink, HarnessSkipped(profile.harness, reason, resolved_transport))
+        _emit(sink, HarnessSkipped(profile.display_name, reason, resolved_transport))
         return _uniform_report(
             profile,
             probes,
@@ -284,7 +284,7 @@ async def run_harness(
                 _emit(
                     sink,
                     ProbeFinished(
-                        profile.harness,
+                        profile.display_name,
                         probe.name,
                         probe.title,
                         observed.verdict,
@@ -295,7 +295,7 @@ async def run_harness(
             if prereq_skip is not None:
                 observed = ProbeResult.skipped(prereq_skip)
             else:
-                _emit(sink, ProbeStarted(profile.harness, probe.name, probe.title))
+                _emit(sink, ProbeStarted(profile.display_name, probe.name, probe.title))
                 try:
                     observed = await probe.run(driver, profile)
                 except Exception as exc:
@@ -303,7 +303,7 @@ async def run_harness(
             _emit(
                 sink,
                 ProbeFinished(
-                    profile.harness, probe.name, probe.title, observed.verdict, observed.note
+                    profile.display_name, probe.name, probe.title, observed.verdict, observed.note
                 ),
             )
             cell = _cell(probe, profile, observed)
@@ -312,7 +312,7 @@ async def run_harness(
                 prereq_skip = f"prerequisite '{probe.title}' did not pass ({observed.note})"
     finally:
         await driver_cm.__aexit__(None, None, None)
-    _emit(sink, HarnessFinished(profile.harness))
+    _emit(sink, HarnessFinished(profile.display_name))
     return HarnessReport(profile=profile, cells=cells, transport=resolved_transport)
 
 
