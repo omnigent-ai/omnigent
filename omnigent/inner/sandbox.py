@@ -188,18 +188,8 @@ class SandboxPolicy:
     # non-secret synthetic payload over the config FD, and resolved
     # secrets never touch the policy that serialises into logs / dumps.
     credential_proxy: CredentialProxySpec | None = None
-    # Parent-side only: write roots the dotfile / escaping-symlink mask
-    # scan must NOT walk. Framework code adds the sandbox's own runtime
-    # scaffolding to ``write_roots`` via
-    # :func:`with_additional_write_roots` (the per-helper scratch tmpdir
-    # holding the egress ``.egress.sock``, the CA bundle, credential-proxy
-    # files, harness state dirs). Those are created fresh by the framework
-    # and never hold pre-existing user secrets, so scanning them is
-    # pointless — and actively harmful: the scan would ``--bind-try
-    # /dev/null`` the dotfile ``.egress.sock``, breaking the egress relay.
-    # Every root recorded here is dropped from the scan set (along with
-    # anything nested under it). Built parent-side during arg emission;
-    # like ``credential_proxy`` it is intentionally NOT serialised.
+    # Framework-owned roots excluded from mask scans. Serialised because exec
+    # launchers rebuild the spawn-time wrap from the decoded policy.
     mask_scan_skip_roots: list[Path] | None = None
 
     def to_jsonable(self) -> dict[str, JsonValue]:
@@ -249,6 +239,11 @@ class SandboxPolicy:
             "credential_source_paths": (
                 _json_string_list(self.credential_source_paths)
                 if self.credential_source_paths is not None
+                else None
+            ),
+            "mask_scan_skip_roots": (
+                _json_string_list(self.mask_scan_skip_roots)
+                if self.mask_scan_skip_roots is not None
                 else None
             ),
         }
@@ -311,6 +306,12 @@ class SandboxPolicy:
             if isinstance(credential_source_paths_data, list)
             else None
         )
+        mask_scan_skip_roots_data = data.get("mask_scan_skip_roots")
+        mask_scan_skip_roots = (
+            [Path(str(path)) for path in mask_scan_skip_roots_data]
+            if isinstance(mask_scan_skip_roots_data, list)
+            else None
+        )
         cow_roots = data.get("copy_on_write_roots", [])
         if not isinstance(cow_roots, list) or any(not isinstance(p, str) for p in cow_roots):
             raise ValueError("Invalid copy_on_write_roots")
@@ -340,6 +341,7 @@ class SandboxPolicy:
             egress_socket_path=egress_socket_path,
             deny_unix_socket_paths=deny_unix_socket_paths,
             credential_source_paths=credential_source_paths,
+            mask_scan_skip_roots=mask_scan_skip_roots,
         )
 
 

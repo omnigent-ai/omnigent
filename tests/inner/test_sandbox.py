@@ -326,6 +326,29 @@ def test_with_additional_write_roots_records_mask_scan_skip_roots() -> None:
     assert augmented is not policy
 
 
+def test_sandbox_policy_round_trips_mask_scan_skip_roots() -> None:
+    """``mask_scan_skip_roots`` survives the launcher wire encoding.
+
+    Exec launchers build the bwrap mount plan in ``run_launcher`` from the
+    decoded policy; a dropped field would mask the egress ``.egress.sock``
+    the parent registered and reset every relayed request.
+    """
+    from pathlib import Path
+
+    policy = _noop_policy()
+    policy.mask_scan_skip_roots = [Path("/tmp/omnigent-osenv-ab12")]
+
+    decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
+
+    assert decoded.mask_scan_skip_roots == [Path("/tmp/omnigent-osenv-ab12")]
+    # Old payloads (no key) and unset policies decode to None — "skip
+    # nothing", not an empty-but-present list.
+    old_payload = _noop_policy().to_jsonable()
+    del old_payload["mask_scan_skip_roots"]
+    assert SandboxPolicy.from_jsonable(old_payload).mask_scan_skip_roots is None
+    assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).mask_scan_skip_roots is None
+
+
 def test_with_denied_unix_sockets_resolves_dedupes_and_is_pure() -> None:
     """``with_denied_unix_sockets`` resolves + de-duplicates the socket
     paths and never mutates the input policy.
