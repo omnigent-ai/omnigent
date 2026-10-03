@@ -1,0 +1,23 @@
+#!/usr/bin/env node
+// Scripted system browser for the desktop e2e lane. Electron opens external
+// links through xdg-open on Linux; this stand-in follows the ticket login to
+// the IdP's authorize step and completes the callback as a signed-in user.
+"use strict";
+
+const [loginUrl] = process.argv.slice(2);
+
+async function completeSignIn(url) {
+  const login = await fetch(url, { redirect: "manual" });
+  const cookies = (login.headers.getSetCookie?.() ?? []).map((c) => c.split(";")[0]).join("; ");
+  const authorize = new URL(login.headers.get("location"), url);
+  const callback = new URL(authorize.searchParams.get("redirect_uri"));
+  callback.searchParams.set("code", "fake-auth-code");
+  callback.searchParams.set("state", authorize.searchParams.get("state"));
+  const done = await fetch(callback, { headers: { cookie: cookies }, redirect: "manual" });
+  if (!done.ok) throw new Error(`callback returned HTTP ${done.status}`);
+}
+
+completeSignIn(loginUrl).catch((error) => {
+  process.stderr.write(`fake system browser: ${error.message}\n`);
+  process.exitCode = 1;
+});

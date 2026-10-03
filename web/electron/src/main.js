@@ -78,7 +78,18 @@ const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
-const { registerSessionExpiryReload } = require("./session-expiry");
+const {
+  registerSessionExpiryReload,
+  registerOidcSessionExpiryHandoff,
+} = require("./session-expiry");
+const {
+  OIDC_LOGIN_TIMEOUT_MS,
+  installAndVerifySessionCookie,
+  oidcServerUrlError,
+  probeServerAuth,
+  runOidcBrowserLogin,
+} = require("./oidc_auth");
+const { runOidcLoginDialog } = require("./oidc_login_dialog");
 const { ensureDatabricksSession } = require("./databricks-session");
 const { expireStoredAccessToken, removeStoredRefreshToken } = require("./databricks-oauth");
 const {
@@ -220,6 +231,8 @@ function loadSetupPage(win, search = "") {
 
 /** Absolute path to the bundled find-in-page bar page. */
 const FIND_PAGE = path.join(__dirname, "..", "find", "index.html");
+const OIDC_LOGIN_PAGE = path.join(__dirname, "oidc_login.html");
+const OIDC_LOGIN_PRELOAD = path.join(__dirname, "oidc_login_preload.js");
 // Built by web's `build:overlay` into electron/overlay/ (shipped by
 // electron-builder). Shell-owned so the update UI is independent of the
 // connected server's web-bundle version.
@@ -744,6 +757,97 @@ const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
 let databricksAuthMode;
 let databricksAuth;
 const connectionAttempts = new WeakMap();
+
+/**
+ * Make sure a self-hosted OIDC server has a session before its page loads, so
+ * the IdP opens in the system browser instead of inside the window. Servers
+ * that aren't OIDC (no auth, accounts mode) or can't be probed load as before.
+ * Plain-HTTP remote OIDC servers are probed too, so the dialog can refuse them
+ * with the HTTPS requirement instead of the window reloading forever.
+ *
+ * @returns {Promise<boolean>} false when the user cancelled or sign-in failed.
+ */
+async function ensureWindowOidcSession(win, serverUrl, attempt) {
+  if (oidcServerUrlError(serverUrl) === "invalid_server_url") return true;
+  let probe;
+  try {
+    probe = await probeServerAuth(session.defaultSession, serverUrl, {
+      signal: attempt.controller.signal,
+    });
+  } catch {
+    // Unreachable or unknown: let the normal load surface the connection error.
+    return true;
+  }
+  if (probe.kind !== "oidc") return true;
+  reportConnectionProgress(win, attempt, "authenticating");
+  return runWindowOidcBrowserHandoff(win, serverUrl, attempt.controller.signal);
+}
+
+/** Sign in through the system browser behind a cancellable status dialog. */
+function runWindowOidcBrowserHandoff(win, serverUrl, attemptSignal) {
+  const host = new URL(serverUrl).host;
+  return runOidcLoginDialog({
+    BrowserWindow,
+    ipcMain,
+    parent: win,
+    serverUrl,
+    pagePath: OIDC_LOGIN_PAGE,
+    preloadPath: OIDC_LOGIN_PRELOAD,
+    signal: attemptSignal,
+    runAttempt: async ({ signal, updateMessage }) => {
+      const result = await runOidcBrowserLogin(
+        session.defaultSession,
+        serverUrl,
+        (url) => shell.openExternal(url),
+        {
+          timeoutMs: OIDC_LOGIN_TIMEOUT_MS,
+          signal,
+          onPollError: (status) => {
+            updateMessage(
+              status
+                ? `Still waiting — ${host} answered ${status}. Retrying…`
+                : `Still waiting — the last attempt failed to reach ${host}. Retrying…`,
+            );
+          },
+        },
+      );
+      if (signal.aborted || (!result.ok && result.reason === "cancelled")) {
+        return { ok: false, error: "Sign-in was cancelled." };
+      }
+      if (!result.ok) return { ok: false, error: oidcLoginErrorMessage(result.reason) };
+      try {
+        await installAndVerifySessionCookie(session.defaultSession, serverUrl, result.token, {
+          signal,
+          assertCanCommit: () => signal.throwIfAborted(),
+          expiresInSeconds: result.expiresIn,
+        });
+      } catch (error) {
+        if (signal.aborted) return { ok: false, error: "Sign-in was cancelled." };
+        console.error("[omnigent] oidc sign-in: could not install the session cookie", error);
+        return {
+          ok: false,
+          error: "Sign-in completed, but the app could not install and verify the session cookie.",
+        };
+      }
+      return { ok: true };
+    },
+  });
+}
+
+function oidcLoginErrorMessage(reason) {
+  switch (reason) {
+    case "insecure_transport":
+      return "Browser sign-in requires HTTPS for remote servers. Update the server URL and retry.";
+    case "invalid_server_url":
+      return "The server address is invalid. Return to setup, correct it, and retry.";
+    case "timed_out":
+      return `Sign-in timed out after ${Math.round(OIDC_LOGIN_TIMEOUT_MS / 60_000)} minutes. Complete the browser flow, then retry.`;
+    case "expired":
+      return "The sign-in ticket expired. Retry to open a fresh browser sign-in.";
+    default:
+      return "The browser sign-in did not complete. Check the server and try again.";
+  }
+}
 
 function abortConnectionAttempt(win, message = "Connection superseded") {
   const attempt = connectionAttempts.get(win);
@@ -1689,6 +1793,24 @@ async function loadServerUrl(
         }
         throw error;
       }
+    } else if (!isDatabricksManagedServerUrl(serverUrl)) {
+      const signedIn = await ensureWindowOidcSession(win, serverUrl, attempt);
+      assertCurrent();
+      if (!signedIn) {
+        pinWindow(win, null);
+        setWindowServerUrl(win, null);
+        // Nothing was navigated, so the load-failure fallbacks never fire: a
+        // window that is not already on setup goes back there itself.
+        if (!isSetupPageUrl(win.webContents.getURL())) {
+          const params = new URLSearchParams({
+            error: "Sign-in did not complete.",
+            url: serverUrl,
+          });
+          if (windowState?.ephemeral) params.set("ephemeral", "1");
+          void loadSetupPage(win, params.toString());
+        }
+        throw Object.assign(new Error("Sign-in was cancelled"), { name: "AbortError" });
+      }
     }
     assertCurrent();
     reportConnectionProgress(win, attempt, "connecting");
@@ -1992,6 +2114,34 @@ function createWindow(targetUrl, opts = {}) {
   win.webContents.on("did-create-window", (child) => hardenOauthPopup(child));
 
   registerNavigationFallbacks(win);
+  // The SPA's own /auth/login (session expiry, sign-out) signs in again
+  // through the system browser and returns to the page the user was on.
+  registerOidcSessionExpiryHandoff(
+    win.webContents,
+    () => {
+      const connectedUrl = windows.get(win)?.serverUrl ?? null;
+      const handsOff =
+        connectedUrl &&
+        !usesBrowserAuth(connectedUrl) &&
+        !isDatabricksManagedServerUrl(connectedUrl);
+      return handsOff ? connectedUrl : null;
+    },
+    async ({ serverUrl: expiredUrl, returnUrl }) => {
+      // The redirect can arrive while the initial load is still pending (the
+      // probe fell back to loading the page); the handoff supersedes that load.
+      try {
+        await loadServerUrl(win, expiredUrl, undefined, { loadUrl: returnUrl, interactive: true });
+      } catch (error) {
+        // A cancelled sign-in already returned the window to setup. Only the host is
+        // logged: error messages can echo request URLs and credentials.
+        if (error?.name !== "AbortError") {
+          console.error(
+            `[omnigent] oidc session expiry: sign-in handoff failed for ${new URL(expiredUrl).host}`,
+          );
+        }
+      }
+    },
+  );
   registerBrowserViewDetachOnNavigate(win);
 
   // Databricks workspace-hosted Omnigent renders inside the workspace's

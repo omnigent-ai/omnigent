@@ -151,9 +151,13 @@ async function waitForHealthy(url, label, logPath) {
  * not a blank window.
  *
  * @param {string} tmpDir A scratch dir for the db, artifacts, agent, and logs.
+ * @param {object} [opts]
+ * @param {Record<string, string> | ((ctx: { serverUrl: string, mockUrl: string }) => Record<string, string>)} [opts.env]
+ *   Extra server env (e.g. an auth-provider configuration), applied last. A
+ *   function form receives the server and mock URLs, for env that must name them.
  * @returns {Promise<{ serverUrl: string, close: () => Promise<void> }>}
  */
-async function spawnServer(tmpDir) {
+async function spawnServer(tmpDir, opts = {}) {
   if (!fs.existsSync(path.join(WEB_UI_DIST, "index.html"))) {
     throw new Error(
       `SPA bundle missing at ${WEB_UI_DIST}. Build it first:\n` +
@@ -196,6 +200,9 @@ async function spawnServer(tmpDir) {
     throw mockSpawnError ?? err;
   }
 
+  const serverUrl = `http://127.0.0.1:${serverPort}`;
+  const extraEnv =
+    typeof opts.env === "function" ? opts.env({ serverUrl, mockUrl }) : (opts.env ?? {});
   const serverOut = fs.openSync(serverLog, "w");
   // Strip ambient runner/host env so a nested runner (if the journey starts a
   // host) boots clean rather than taking the zygote-fork path and hanging —
@@ -231,6 +238,7 @@ async function spawnServer(tmpDir) {
         OPENAI_API_KEY: "mock-key",
         ANTHROPIC_API_KEY: "",
         OMNIGENT_WEB_UI_DIST: WEB_UI_DIST,
+        ...extraEnv,
       },
       stdio: ["ignore", serverOut, serverOut],
     },
@@ -239,7 +247,6 @@ async function spawnServer(tmpDir) {
   serverProc.on("error", (err) => {
     serverSpawnError = err;
   });
-  const serverUrl = `http://127.0.0.1:${serverPort}`;
 
   const close = async () => {
     for (const proc of [serverProc, mockProc]) {
@@ -354,6 +361,7 @@ function startDisplayCapture(recordDir, display) {
  *
  * @param {object} opts
  * @param {string} opts.recordDir Directory the .webm video is written into.
+ * @param {Record<string, string>} [opts.env] Extra environment for the shell process.
  * @param {string} [opts.serverUrl] Pre-seed settings.json's server_url with
  *   this, so the shell auto-connects on launch.
  * @param {string} [opts.userDataDir] Override the isolated userData dir
@@ -416,7 +424,7 @@ async function launchDesktop(opts) {
       recordVideo: { dir: opts.recordDir },
       // Dev builds read dev-app-update.yml and would try to reach the update
       // endpoint; a version override keeps the app off the update path.
-      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
+      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0", ...(opts.env ?? {}) },
     });
   } catch (err) {
     await stopDisplayCapture();
