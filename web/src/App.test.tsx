@@ -20,6 +20,7 @@ vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas page</div> }));
+vi.mock("@/pages/DesignPage", () => ({ DesignPage: () => <div>design page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation } = await import("react-router-dom");
   return {
@@ -167,6 +168,27 @@ describe("Canvas route", () => {
   it("renders the native Canvas page inside the shell when the feature is on", async () => {
     renderRoute("/canvas", { canvas: true });
     expect(await screen.findByText("canvas page")).toBeInTheDocument();
+    expect(screen.getByText("app shell")).toBeInTheDocument();
+  });
+});
+
+describe("Design route", () => {
+  it("shows a spinner, not 'not found', while server info is still loading", () => {
+    renderRoute("/design", {}, "loading");
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+    expect(screen.queryByText("not found")).toBeNull();
+    expect(screen.queryByText("design page")).toBeNull();
+  });
+
+  it("renders not found once server info says the design feature is off", async () => {
+    renderRoute("/design", { canvas: true });
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("design page")).toBeNull();
+  });
+
+  it("renders the Design page inside the shell when the feature is on", async () => {
+    renderRoute("/design?session=conv_a&file=deck.slides.html", { design: true });
+    expect(await screen.findByText("design page")).toBeInTheDocument();
     expect(screen.getByText("app shell")).toBeInTheDocument();
   });
 });
