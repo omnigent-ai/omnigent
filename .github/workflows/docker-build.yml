@@ -37,6 +37,7 @@ on:
       - 'uv.lock'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
+      - 'patches/**'
       - '.github/workflows/docker-build.yml'
 
 permissions:
@@ -74,7 +75,7 @@ jobs:
           changed=false
           while IFS= read -r file; do
             case "$file" in
-              deploy/cloudflare/*|pnpm-lock.yaml|pnpm-workspace.yaml|.github/workflows/docker-build.yml)
+              deploy/cloudflare/*|pnpm-lock.yaml|pnpm-workspace.yaml|patches/*|.github/workflows/docker-build.yml)
                 changed=true
                 break
                 ;;

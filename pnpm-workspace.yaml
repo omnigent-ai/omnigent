@@ -120,3 +120,6 @@ allowBuilds:
   protobufjs: true
   sharp: true
   workerd: true
+
+patchedDependencies:
+  '@xterm/addon-webgl@0.19.0': patches/@xterm__addon-webgl@0.19.0.patch
