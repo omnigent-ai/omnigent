@@ -1670,6 +1670,12 @@ def test_client_server_attachment_extension_parity() -> None:
     ]
     assert not rejected, f"client accepts but server would 415: {rejected}"
 
+    # Server-supported extensions must also pass the composer's upload gate.
+    from omnigent.runtime.content_resolver import _TEXT_CODE_EXTENSIONS
+
+    server_only = sorted(_TEXT_CODE_EXTENSIONS - set(client_exts))
+    assert not server_only, f"server accepts but the client gate rejects: {server_only}"
+
 
 # ── extract_text_attachments (request-phase PII scanning) ─────────
 
