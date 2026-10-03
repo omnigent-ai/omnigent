@@ -12,7 +12,8 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
 
 1. **Check out the PR head** into your worktree (`gh pr checkout <number>`), then
    ensure the repro test at `test_path` is present on top of it (it is your
-   artifact, not theirs — re-apply it if the checkout doesn't carry it). If a test
+   scratch artifact, not theirs — re-apply it if the checkout doesn't carry it,
+   and archive and remove it again in 2A.7 before the final handoff). If a test
    you keep — the repro test, or one the PR adds — names a ticket/issue in its
    filename or code, rename it and strip the reference per the "name by the
    problem, never the ticket" rule in 2B.4.
@@ -150,6 +151,28 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    Record `mode: "reviewed_existing_pr"`
    and its `pr_url` when you keep it; if a fork takeover made you open your own,
    record `mode: "authored_fix"` with the fork PR in `reviewed_pr_url`.
+7. **Archive the copied repro test and clean the worktree before the final
+   handoff.** The test at `test_path` — copied from the repro session,
+   materialized from the CI bundle, or restored by CI before your session
+   started — is scratch source: usually a new untracked file, sometimes a
+   reused repository test the repro modified in place. In comment-only review
+   it never becomes part of the PR, and the workflow's delivery check treats
+   any untracked or modified test file as uncommitted source, so leaving it
+   behind costs a dirty-checkpoint correction turn whose only work is removing
+   it. Once Step 4 has settled and you no longer need to run it:
+   - Retain it under `.omnigent/repro-evidence/` with its original path,
+     sha256, the exact command, the tested base and PR head SHAs, and the
+     result, following the evidence retention rules in 2B.4.
+   - Then delete an untracked copy or restore a modified tracked test to the
+     PR's checked-out version (`git checkout -- <path>`); do the same for any
+     other reproduction-only files you added, confirm `git status` reports a
+     clean tree, and record the archive location in `test_audit`.
+   - If a later turn needs the test again, restore it from the archive, rerun
+     it, and remove it again before the next handoff.
+
+   A test you deliberately selected as permanent coverage while pushing a fix to
+   an in-repo PR (2B.4) is committed on the PR branch instead, not left
+   uncommitted.
 
 **When the existing PR's *approach* is wrong, open your own fix instead.** The
 default above is for a sound PR. But if reviewing shows the PR is not a viable

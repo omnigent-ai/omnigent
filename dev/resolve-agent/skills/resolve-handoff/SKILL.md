@@ -164,7 +164,10 @@ readiness; name pending publication/review steps in `remaining_work`.
   `test_audit`. Before handing off, check the file portion of every reference
   against the committed tree and use the same node IDs as the executed checks.
   Do not list artifact-only reproduction paths here. In comment-only review,
-  keep the existing review procedure and do not commit temporary test source.
+  keep the existing review procedure and do not commit temporary test source:
+  archive the copied repro test under `.omnigent/repro-evidence/`, then delete
+  an untracked copy or restore a modified tracked test before this handoff
+  (2A.7) so the tree is clean.
   Use `test_audit` for brief selection reasoning: reused/retained tests, why any
   new permanent e2e is necessary, and gaps. For reproduction-only evidence, give
   the run URL/artifact/path or verified persistent local path from 2B.4, plus

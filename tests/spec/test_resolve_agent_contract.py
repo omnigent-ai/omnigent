@@ -217,6 +217,30 @@ def test_both_resolution_paths_require_audited_evidence() -> None:
     assert "`test_audit` — required in both author and review modes" in instructions
 
 
+def test_review_path_archives_and_removes_the_copied_repro_test_before_handoff() -> None:
+    instructions = _normalized_resolve_instructions()
+    recovery = instructions.split("### Recovering the handoff", 1)[1].split(
+        "## Shared impact assessment", 1
+    )[0]
+    reviewer = instructions.split("## Step 2A", 1)[1].split("## Step 2B", 1)[0]
+    handoff = instructions.split("## Output —", 1)[1]
+
+    for section in (recovery, reviewer, handoff):
+        assert ".omnigent/repro-evidence/" in section
+        assert "delete an untracked copy or restore a modified tracked test" in section
+    assert "scratch source, not a deliverable" in recovery
+    for requirement in (
+        "restored by CI before your session",
+        "reused repository test the repro modified in place",
+        "original path, sha256, the exact command, the tested base and PR head SHAs",
+        "`git checkout -- <path>`",
+        "confirm `git status` reports a clean tree",
+        "restore it from the archive, rerun it, and remove it again",
+    ):
+        assert requirement in reviewer
+    assert "before this handoff (2A.7)" in handoff
+
+
 def test_repro_audit_repeats_baseline_when_assertions_or_retry_context_change() -> None:
     audit = _shared_repro_audit()
     for requirement in (
