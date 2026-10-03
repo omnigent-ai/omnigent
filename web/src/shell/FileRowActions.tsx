@@ -1,4 +1,12 @@
-import { useRef, useState, type ReactElement, type ReactNode, type RefObject } from "react";
+import {
+  createContext,
+  useContext,
+  useRef,
+  useState,
+  type ReactElement,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { CopyIcon, DownloadIcon, FolderOpenIcon, InfoIcon, MoreHorizontalIcon } from "lucide-react";
 import { downloadWorkspaceFile } from "@/hooks/useFileContent";
 import type { WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -42,6 +50,18 @@ interface FileRowActionItem {
 
 export const ROW_MENU_SLOT_CLASS =
   "transition-[width] group-hover:w-20 group-focus-within:w-20 group-data-[state=open]:w-20 group-data-[actions-open=true]:w-20 pointer-coarse:w-20";
+export const ROW_MENU_SIZE_SLOT_CLASS =
+  "transition-[width] group-hover:w-20 group-focus-within:w-20 group-data-[state=open]:w-20 group-data-[actions-open=true]:w-20 pointer-coarse:w-[76px]";
+
+export const FilesPanelFocusContext = createContext<RefObject<HTMLElement | null> | null>(null);
+
+function canReceiveFocus(target: HTMLElement | null): target is HTMLElement {
+  return Boolean(
+    target?.isConnected &&
+    !target.matches(":disabled") &&
+    !target.closest("[inert], [aria-hidden='true']"),
+  );
+}
 
 interface FileRowActionsProps extends FileRowInfo {
   revealPath: string | null;
@@ -64,6 +84,8 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
   const primaryActionRef = useRef<HTMLButtonElement>(null);
   const kebabRef = useRef<HTMLButtonElement>(null);
   const focusReturnRef = useRef<HTMLElement | null>(null);
+  const contextFocusRef = useRef<HTMLElement | null>(null);
+  const panelFocusRef = useContext(FilesPanelFocusContext);
   const [contextOpen, setContextOpen] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const isCoarsePointer = useIsCoarsePointer();
@@ -168,25 +190,50 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
     <ContextMenu
       onOpenChange={(open) => {
         setContextOpen(open);
-        if (open) focusReturnRef.current = primaryActionRef.current;
+        if (open) {
+          const active = document.activeElement;
+          const target =
+            contextFocusRef.current ??
+            (active instanceof HTMLElement &&
+            active !== rowRef.current &&
+            rowRef.current?.contains(active) &&
+            canReceiveFocus(active)
+              ? active
+              : null);
+          focusReturnRef.current = target
+            ? target
+            : canReceiveFocus(primaryActionRef.current)
+              ? primaryActionRef.current
+              : kebabRef.current;
+          contextFocusRef.current = null;
+        }
       }}
     >
-      <ContextMenuTrigger asChild>
-        {children(kebab, rowRef, primaryActionRef, isCoarsePointer || contextOpen || dropdownOpen)}
+      <ContextMenuTrigger
+        asChild
+        onContextMenuCapture={() => {
+          const active = document.activeElement;
+          contextFocusRef.current =
+            active instanceof HTMLElement &&
+            active !== rowRef.current &&
+            rowRef.current?.contains(active) &&
+            canReceiveFocus(active)
+              ? active
+              : null;
+        }}
+      >
+        {children(kebab, rowRef, primaryActionRef, contextOpen || dropdownOpen)}
       </ContextMenuTrigger>
       <ContextMenuContent
         onEscapeKeyDown={(event) => event.stopPropagation()}
         onCloseAutoFocus={(event) => {
           event.preventDefault();
           const target = focusReturnRef.current;
-          if (target?.isConnected) {
+          const fallback = panelFocusRef?.current ?? null;
+          if (canReceiveFocus(target)) {
             target.focus();
-          } else {
-            document
-              .querySelector<HTMLElement>(
-                '[role="tab"][aria-selected="true"], [data-testid="files-panel-drawer"] button',
-              )
-              ?.focus();
+          } else if (canReceiveFocus(fallback)) {
+            fallback.focus();
           }
         }}
       >
