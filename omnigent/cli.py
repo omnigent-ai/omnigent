@@ -114,7 +114,7 @@ if TYPE_CHECKING:
     from omnigent.server.smart_routing import LLMRoutingClient
     from omnigent.smart_routing_cli import ArmedSession
     from omnigent.spec.types import LLMConfig
-    from omnigent.update_check import _InstalledWheelInfo
+    from omnigent.update_check import _InstalledWheelInfo, _UpgradeSuggestion
 
 
 # Any: YAML configs have heterogeneous value types (str, int, list, etc.)
@@ -5441,6 +5441,20 @@ def _drain_and_stop_local_server(*, force: bool) -> None:
         click.echo("Stopped the background server before upgrading.")
 
 
+def _echo_upgrade_plan(
+    info: _InstalledWheelInfo,
+    suggestion: _UpgradeSuggestion,
+    extra_overrides: tuple[str, ...],
+) -> None:
+    """Print the ``--dry-run`` plan shared by every ``omni upgrade`` path."""
+    extras = sorted(set(extra_overrides or info.extras))
+    click.echo(
+        f"Detected installer: {info.detected_installer or info.installer}\n"
+        f"Detected extras: {', '.join(extras) if extras else '(none)'}\n"
+        f"Would run: {suggestion.command}"
+    )
+
+
 def _upgrade_vcs_install(
     info: _InstalledWheelInfo,
     *,
@@ -5448,6 +5462,7 @@ def _upgrade_vcs_install(
     force: bool,
     pre: bool,
     extra_overrides: tuple[str, ...],
+    dry_run: bool,
 ) -> None:
     """Update a git/VCS ``omni`` install by re-pulling its tracked ref.
 
@@ -5465,6 +5480,7 @@ def _upgrade_vcs_install(
     :param force: Stop in-flight sessions immediately instead of draining.
     :param pre: Pass the installer's allow-pre-releases flag (no-op for git).
     :param extra_overrides: Extras supplied by ``omni upgrade --extra``.
+    :param dry_run: Print the command and exit without running it.
     """
     from omnigent.update_check import (
         _build_upgrade_suggestion,
@@ -5519,6 +5535,10 @@ def _upgrade_vcs_install(
         raise click.ClickException(
             f"No automatic upgrade command is known for this install. {suggestion.command}."
         )
+
+    if dry_run:
+        _echo_upgrade_plan(info, suggestion, extra_overrides)
+        return
 
     _drain_and_stop_local_server(force=force)
 
@@ -5660,12 +5680,7 @@ def _upgrade_to_nightly(
         )
 
     if dry_run:
-        extras = sorted(set(extra_overrides or info.extras))
-        click.echo(
-            f"Detected installer: {info.detected_installer or info.installer}\n"
-            f"Detected extras: {', '.join(extras) if extras else '(none)'}\n"
-            f"Would run: {suggestion.command}"
-        )
+        _echo_upgrade_plan(info, suggestion, extra_overrides)
         return
 
     _drain_and_stop_local_server(force=force)
@@ -5855,6 +5870,7 @@ def upgrade(
             force=force,
             pre=pre,
             extra_overrides=extra_overrides,
+            dry_run=dry_run,
         )
         return
 
@@ -5931,12 +5947,7 @@ def upgrade(
         )
 
     if dry_run:
-        extras = sorted(set(extra_overrides or info.extras))
-        click.echo(
-            f"Detected installer: {info.detected_installer or info.installer}\n"
-            f"Detected extras: {', '.join(extras) if extras else '(none)'}\n"
-            f"Would run: {suggestion.command}"
-        )
+        _echo_upgrade_plan(info, suggestion, extra_overrides)
         return
 
     _drain_and_stop_local_server(force=force)
