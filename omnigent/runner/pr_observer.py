@@ -245,7 +245,11 @@ def extract_prs(
         if any(op.creates for op in commands) and (ref := _created_pr_metadata(result)):
             references.append(ref)
         # Shared stdout cannot attribute a result to a write when reads/comments also ran.
-        if len(commands) == len(ops) and (len(commands) > 1 or not commands[0].content_only):
+        if (
+            len(commands) == len(ops)
+            and any(op.target is None for op in commands)
+            and (len(commands) > 1 or not commands[0].content_only)
+        ):
             for obj in result_objects(result):
                 if ref := _object_pr(obj, facets):
                     references.append(ref)
