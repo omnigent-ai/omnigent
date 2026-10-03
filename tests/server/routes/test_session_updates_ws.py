@@ -886,3 +886,24 @@ def test_projects_changed_event_forwards_to_client(
         sessions_routes.user_session_stream.publish(ALICE, {"type": "projects_changed"})
         frame = _recv_until(ws, {"projects_changed"})
         assert frame["type"] == "projects_changed"
+
+
+def test_conv_prefixed_watch_streams_grant_fields(app: FastAPI, stores) -> None:
+    """A watch by the legacy ``conv_``-prefixed spelling streams the same
+    ``permission_level`` / ``owner`` a bare-hex watch does.
+
+    Grants are batched under the watched spelling, but each item is built
+    from an entity whose id reads back as bare hex; indexing the grant map
+    with the entity id drops the grants, presenting an owned session as
+    ownerless over the stream while ``GET /v1/sessions`` reports it owned.
+    """
+    s1 = _seed_session(stores, owner=ALICE, title="prefixed")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [f"conv_{s1}"]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        items = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
+        assert set(items) == {s1}
+        assert items[s1]["permission_level"] == LEVEL_OWNER
+        assert items[s1]["owner"] == ALICE

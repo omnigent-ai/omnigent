@@ -28,14 +28,24 @@ viewport (1280×720) is desktop, so the sidebar is shown without a toggle.
 
 from __future__ import annotations
 
+import json
+import time
 import uuid
+from collections.abc import Iterator
+from typing import Any
 
 import httpx
 import pytest
-from playwright.sync_api import Browser, Page, Request, expect
+from playwright.sync_api import Browser, Page, Request, WebSocket, expect
 
-from tests._helpers.session import post_session_bundle
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
+
+# The sidebar watches its loaded first page plus the route id, so a session must
+# lie beyond that page for its bare id to be absent from the watch-set.
+SIDEBAR_PAGE_SIZE = 30
+UPDATES_WS_PATH = "/v1/sessions/updates"
+PUSH_DELIVERY_TIMEOUT_MS = 20_000
 
 
 @pytest.mark.compat_smoke
@@ -216,3 +226,134 @@ def test_session_created_elsewhere_appears_via_push(
         expect(page.locator(f'a[href="/c/{new_id}"]')).to_be_visible(timeout=20_000)
     finally:
         httpx.delete(f"{base_url}/v1/sessions/{new_id}", timeout=10.0)
+
+
+@pytest.fixture
+def off_list_session(live_server: str, runner_id: str) -> Iterator[tuple[str, str, str]]:
+    """Yield ``(base_url, target_id, visible_id)``: ``target_id`` is older than a
+    full sidebar page of fillers, so the sidebar's first page omits it;
+    ``visible_id`` is the newest filler, shown at the top."""
+    bundle = _build_hello_world_bundle()
+
+    def _create(title: str) -> str:
+        resp = post_session_bundle(httpx.post, f"{live_server}/v1/sessions", bundle, timeout=30.0)
+        resp.raise_for_status()
+        session_id = resp.json()["session_id"]
+        httpx.patch(
+            f"{live_server}/v1/sessions/{session_id}", json={"title": title}, timeout=10.0
+        ).raise_for_status()
+        return session_id
+
+    created: list[str] = []
+    try:
+        target = _create("off-list target")
+        created.append(target)
+        bind_session_runner(httpx.patch, live_server, target, runner_id, timeout=10.0)
+        # The list sorts at second resolution; the fillers must sort newer.
+        time.sleep(1.2)
+        for index in range(SIDEBAR_PAGE_SIZE):
+            created.append(_create(f"sidebar filler {index + 1:02d}"))
+        visible = created[-1]
+        bind_session_runner(httpx.patch, live_server, visible, runner_id, timeout=10.0)
+
+        page1 = httpx.get(
+            f"{live_server}/v1/sessions?visibility=all&limit={SIDEBAR_PAGE_SIZE}", timeout=10.0
+        ).json()
+        page1_ids = {row["id"] for row in page1["data"]}
+        assert target not in page1_ids and visible in page1_ids, (
+            "precondition: target must be off the sidebar's first page and the renamed row on it"
+        )
+        yield live_server, target, visible
+    finally:
+        for session_id in created:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+
+
+def _watch_updates_socket(page: Page) -> dict[str, Any]:
+    """Count opens/closes of the sidebar's updates WebSocket and record its frames."""
+    events: dict[str, Any] = {"opens": 0, "closes": 0, "watch_frames": [], "received_types": []}
+
+    def _frame(payload: object) -> dict[str, Any]:
+        if isinstance(payload, dict):
+            payload = payload.get("payload", "")
+        try:
+            parsed = json.loads(payload)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _on_websocket(ws: WebSocket) -> None:
+        if UPDATES_WS_PATH not in ws.url:
+            return
+        events["opens"] += 1
+        ws.on("framesent", lambda payload: events["watch_frames"].append(_frame(payload)))
+        ws.on(
+            "framereceived",
+            lambda payload: events["received_types"].append(_frame(payload).get("type")),
+        )
+        ws.on("close", lambda _ws: events.__setitem__("closes", events["closes"] + 1))
+
+    page.on("websocket", _on_websocket)
+    return events
+
+
+@pytest.mark.compat_smoke
+def test_conv_prefixed_link_keeps_sidebar_updates_live(
+    browser: Browser,
+    off_list_session: tuple[str, str, str],
+) -> None:
+    """Opening an off-list session by its legacy ``conv_<hex>`` link keeps the
+    sidebar's updates stream alive, so another client's rename still streams in.
+
+    The CLI prints links as ``/c/conv_<hex>`` and the SPA puts that spelling
+    into its watch-set verbatim; with the session off the first page, no bare
+    twin accompanies it. A server that files watched rows under the bare id
+    read back from the database crash-loops the stream, and the rename only
+    arrives via the 45-60 s HTTP fallback.
+    """
+    base_url, target, visible = off_list_session
+    link_id = f"conv_{target}"
+    marker = f"renamed-{uuid.uuid4().hex[:8]}"
+    row = f'a[href="/c/{visible}"]'
+
+    context = browser.new_context()
+    try:
+        page = context.new_page()
+        events = _watch_updates_socket(page)
+        page.goto(f"{base_url}/c/{link_id}")
+        expect(page.locator(row)).to_be_visible()
+        # Let a crash-looping stream show itself before the rename.
+        page.wait_for_timeout(5_000)
+
+        httpx.patch(
+            f"{base_url}/v1/sessions/{visible}", json={"title": marker}, timeout=10.0
+        ).raise_for_status()
+
+        def _summary() -> str:
+            watched = [
+                set(frame.get("session_ids", []))
+                for frame in events["watch_frames"]
+                if frame.get("type") == "watch"
+            ]
+            in_every_watch = bool(watched) and all(link_id in ids for ids in watched)
+            return (
+                f"opens={events['opens']} closes={events['closes']} "
+                f"received={events['received_types']} watch_frames={len(watched)} "
+                f"link_id_in_every_watch={in_every_watch}"
+            )
+
+        try:
+            expect(page.locator(row)).to_contain_text(marker, timeout=PUSH_DELIVERY_TIMEOUT_MS)
+        except AssertionError as exc:
+            raise AssertionError(
+                f"rename never reached the sidebar row over the stream; {_summary()}"
+            ) from exc
+        assert "snapshot" in events["received_types"], _summary()
+        assert events["closes"] == 0, _summary()
+        assert any(link_id in frame.get("session_ids", []) for frame in events["watch_frames"]), (
+            f"the SPA never watched the conv_-prefixed id; {_summary()}"
+        )
+        # Hold the delivered title so a recording of this journey shows it.
+        page.wait_for_timeout(1_500)
+    finally:
+        context.close()
