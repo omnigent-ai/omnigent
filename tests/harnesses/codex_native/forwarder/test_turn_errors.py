@@ -81,7 +81,7 @@ def test_classify_codex_error_budget_exhausted_not_auth() -> None:
     generic = fwd._CODEX_ERROR_KIND_GENERIC
     auth = fwd._CODEX_ERROR_KIND_AUTH
 
-    # Realistic message shape from the AI gateway (budget name and id are
+    # Realistic message shape from the Unity Gateway (budget name and id are
     # synthetic; see prod samples for the real shape).
     budget_msg = (
         'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'

@@ -4921,7 +4921,7 @@ def run_host_process(
 
     # Executor-agnostic Databricks setup: when the owner has linked a workspace,
     # materialize their per-user token as a ``~/.databrickscfg`` profile so the
-    # agent's model serving + MCP route through their Databricks AI Gateway.
+    # agent's model serving + MCP route through their Databricks Unity Gateway.
     # Best-effort; a no-op when Databricks isn't connected/configured.
     from omnigent.host.databricks_credential import configure_host_databricks
 

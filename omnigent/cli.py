@@ -237,7 +237,7 @@ def _build_default_databricks_routing_client(
     cfg: Any,  # type: ignore[explicit-any]  # parsed server config
     settings: Any,  # type: ignore[explicit-any]  # RoutingSettings
 ) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
-    """Route through the workspace's AI Gateway when no ``routing:`` block exists.
+    """Route through the workspace's Unity Gateway when no ``routing:`` block exists.
 
     A Databricks-backed deployment gets smart routing without extra
     config: the client points at that workspace's routing API and authenticates
@@ -388,7 +388,7 @@ def _build_routing_backends(
 ) -> Any:  # type: ignore[explicit-any]  # RoutingBackends
     """Build BOTH routing backends from configuration alone — no opt-in env needed.
 
-    They are not alternatives. The external client's picks are AI Gateway catalog
+    They are not alternatives. The external client's picks are Unity Gateway catalog
     ids, so a harness whose inference runs off something else is served by the
     built-in judge instead (see :mod:`omnigent.server.routing_backend`).
 
@@ -399,7 +399,7 @@ def _build_routing_backends(
     * anything else — no external side, the built-in judge only.
 
     With no ``routing:`` block at all, a Databricks-backed deployment gets its
-    own workspace AI Gateway as the external side. Managed deployments override
+    own workspace Unity Gateway as the external side. Managed deployments override
     ``RuntimeCaps.routing_backends`` themselves.
 
     :param cfg: The parsed server ``--config`` mapping.

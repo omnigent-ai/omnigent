@@ -9,8 +9,8 @@ describe("modelConfigurationSourceRows", () => {
       "Databricks · production-west",
     ],
     [
-      { kind: "gateway", label: "AI Gateway", name: "production", host: "gw.example.com" },
-      "AI Gateway · production",
+      { kind: "gateway", label: "Unity Gateway", name: "production", host: "gw.example.com" },
+      "Unity Gateway · production",
     ],
     [
       { kind: "key", label: "API key", name: "anthropic", host: "api.anthropic.com" },

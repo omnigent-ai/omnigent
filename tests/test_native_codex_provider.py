@@ -255,7 +255,7 @@ def test_resolve_native_codex_launch_subscription_logged_in_uses_cli_login(
     When Codex actually has a stored login, deferring to its own auth is
     correct — the bridged ``auth.json`` authenticates it. The launch still
     pins the built-in ``openai`` provider: the bridged config.toml may set a
-    custom default ``model_provider`` (e.g. isaac's Databricks AI Gateway),
+    custom default ``model_provider`` (e.g. isaac's Databricks Unity Gateway),
     which would otherwise silently hijack the Subscription selection. Failure
     with extra overrides means we synthesized a provider route over a working
     subscription; failure with NO overrides means the pin regressed and a
@@ -445,7 +445,7 @@ def test_resolve_native_codex_launch_cli_config_default_pins_provider(
                 "kind": "cli-config",
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
                 "default": True,
             }
         },
@@ -462,7 +462,7 @@ _DISMISSIBLE_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 
 [model_providers.Databricks.auth]
@@ -538,7 +538,7 @@ def test_config_provider_shadowed_by_nondefault_explicit_entry_still_pins(
                 "kind": "cli-config",
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
             }
         },
     )
@@ -563,7 +563,7 @@ def test_shadowed_config_detection_uses_active_profile_provider(
         "[profiles.work]\n"
         'model_provider = "Databricks"\n'
         "[model_providers.Databricks]\n"
-        'name = "Databricks AI Gateway"\n'
+        'name = "Databricks Unity Gateway"\n'
         'base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"\n'
         "[model_providers.Databricks.auth]\n"
         'command = "jq"\n'
@@ -575,7 +575,7 @@ def test_shadowed_config_detection_uses_active_profile_provider(
                 "kind": "cli-config",
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
             }
         },
     )

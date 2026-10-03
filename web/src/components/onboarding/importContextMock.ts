@@ -19,7 +19,7 @@ const CODEX_SKILLS = ["code-review", "fix-lint", "ship"];
 
 export const MOCK_IMPORT_CONTEXT: ImportContext = {
   credentials: [
-    { harness: "claude", source: "Databricks AI Gateway" },
+    { harness: "claude", source: "Databricks Unity Gateway" },
     { harness: "codex", source: "Databricks (dbc-a5d4177a-49dc)" },
     { harness: "cursor", source: "Signed in" },
   ],

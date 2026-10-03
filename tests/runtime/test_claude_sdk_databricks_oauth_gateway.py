@@ -178,7 +178,7 @@ def test_oauth_profile_resolves_gateway_credentials(
     )
     assert gateway_env["ANTHROPIC_BASE_URL"] == f"{WORKSPACE_HOST}/ai-gateway/anthropic", (
         "ANTHROPIC_BASE_URL must route the Claude CLI to the profile "
-        "workspace's Databricks AI Gateway"
+        "workspace's Databricks Unity Gateway"
     )
 
 
@@ -232,7 +232,7 @@ def test_executor_constructs_with_oauth_profile(
     )
     assert executor._extra_env["ANTHROPIC_BASE_URL"] == (
         f"{WORKSPACE_HOST}/ai-gateway/anthropic"
-    ), "The executor must route to the profile workspace's AI Gateway"
+    ), "The executor must route to the profile workspace's Unity Gateway"
 
 
 def test_openai_agents_databricks_auth_works_for_contrast(

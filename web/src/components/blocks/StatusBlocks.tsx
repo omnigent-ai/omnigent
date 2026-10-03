@@ -94,7 +94,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   transient_upstream_error:
     "The model service hit a temporary error mid-response; retrying usually continues the turn.",
   budget_exhausted:
-    "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
+    "The Unity Gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
@@ -908,8 +908,8 @@ export function RoutingDecisionCard({
         {routerSource === "databricks-aigw" ? (
           <span
             className="text-muted-foreground"
-            title="Routed by the Databricks AI Gateway"
-            aria-label="Routed by the Databricks AI Gateway"
+            title="Routed by the Databricks Unity Gateway"
+            aria-label="Routed by the Databricks Unity Gateway"
             role="img"
             data-testid="routing-decision-source-databricks"
           >

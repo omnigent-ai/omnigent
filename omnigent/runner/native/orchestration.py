@@ -1508,7 +1508,7 @@ async def _auto_create_opencode_terminal(
     clear_bridge_state(bridge_dir)
 
     model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
-    # Route opencode through the Databricks AI gateway when the spec names a
+    # Route opencode through the Databricks Unity Gateway when the spec names a
     # profile. Unlike codex/claude/pi (which consume HARNESS_*_GATEWAY_* env the
     # CLI translates), opencode reads provider/auth from its own config file, so
     # synthesize an opencode.json into the per-session XDG config dir BEFORE the
@@ -7001,7 +7001,7 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     Reads the canonical ``spec.executor.model`` field (the same field the
     in-process claude-sdk harness consumes via ``_resolve_spec_model``). Unlike
     cursor-native, gateway-routed ``databricks-*`` ids are valid Claude Code
-    models when the launch is wired through the Databricks AI gateway, so they
+    models when the launch is wired through the Databricks Unity Gateway, so they
     are passed through.
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
@@ -7084,7 +7084,7 @@ def _pi_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> s
     Reads the canonical ``spec.executor.model`` field (the same field the
     in-process harnesses and cursor-native consume). Unlike cursor-native,
     a gateway-routed id (``databricks-*``) IS usable here: the runner-owned
-    Pi process routes through the Databricks AI Gateway, whose ``models.json``
+    Pi process routes through the Databricks Unity Gateway, whose ``models.json``
     selects the model by its gateway id (see
     :func:`omnigent.harnesses.pi_native.credentials.resolve_pi_native_provider`). The
     resolved model is threaded into ``resolve_pi_native_provider(model=...)``

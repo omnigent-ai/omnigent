@@ -299,7 +299,7 @@ def model_configuration_source(
     elif provider.kind == DATABRICKS_KIND:
         source.update(label="Workspace", name=provider.profile or "DEFAULT")
     elif provider.kind in {"gateway", "local"}:
-        source["label"] = "AI Gateway" if provider.kind == "gateway" else "Local"
+        source["label"] = "Unity Gateway" if provider.kind == "gateway" else "Local"
         name = provider.detail.removeprefix("provider '").removesuffix("'")
         if name:
             source["name"] = name
@@ -1525,7 +1525,7 @@ def _fetch_databricks_uc_listing(
     """List LLM model services via the Unity Catalog model-services API.
 
     Returns ``system.ai.*`` model ids directly — the ids that work with the
-    AI Gateway — avoiding the ``databricks-*`` → ``system.ai.*`` translation.
+    Unity Gateway — avoiding the ``databricks-*`` → ``system.ai.*`` translation.
 
     :param provider: A ``kind="databricks"`` provider descriptor.
     :param transport: Optional httpx transport override for tests.

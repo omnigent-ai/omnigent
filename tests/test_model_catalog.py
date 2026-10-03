@@ -126,7 +126,7 @@ def _worker_spec(harness: str, **executor_kwargs: object) -> AgentSpec:
             ),
             {
                 "kind": "gateway",
-                "label": "AI Gateway",
+                "label": "Unity Gateway",
                 "name": "production",
                 "host": "gateway.example.com",
             },
@@ -187,7 +187,7 @@ def _worker_spec(harness: str, **executor_kwargs: object) -> AgentSpec:
                 detail="provider 'production'",
                 base_url="https://[malformed/v1",
             ),
-            {"kind": "gateway", "label": "AI Gateway", "name": "production"},
+            {"kind": "gateway", "label": "Unity Gateway", "name": "production"},
             id="malformed-url",
         ),
     ],

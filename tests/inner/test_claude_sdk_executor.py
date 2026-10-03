@@ -1642,7 +1642,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
 
     def test_databricks_gateway_negotiates_betas(self):
-        """A real Databricks AI Gateway base URL negotiates betas, not disables them.
+        """A real Databricks Unity Gateway base URL negotiates betas, not disables them.
 
         Blanket-disabling betas makes Claude Code strip ``interleaved-thinking``,
         which the Databricks gateway then rejects with a thinking-block 400. On a

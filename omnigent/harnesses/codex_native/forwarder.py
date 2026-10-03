@@ -258,7 +258,7 @@ _CODEX_AUTH_ERROR_FRAGMENTS = (
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
-# Budget/quota exhaustion from the AI gateway: the gateway returns HTTP 403 +
+# Budget/quota exhaustion from the Unity Gateway: the gateway returns HTTP 403 +
 # PERMISSION_DENIED for these, which looks like auth to the generic checks —
 # it isn't. Re-authenticating cannot resolve a spending limit.
 _CODEX_BUDGET_EXHAUSTED_FRAGMENTS = (
@@ -969,7 +969,7 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
     that omit it.
 
-    Budget/quota exhaustion is checked first: the AI gateway returns HTTP 403
+    Budget/quota exhaustion is checked first: the Unity Gateway returns HTTP 403
     for these, which the auth checks below would otherwise misclassify.
 
     :param error: The ``turn.error`` object.

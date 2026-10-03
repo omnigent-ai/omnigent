@@ -521,7 +521,7 @@ def get_all_providers() -> list[str]:
 
     Popular providers (from :data:`COMMON_PROVIDERS`) are listed first,
     followed by the rest in alphabetical order. This matches the MLflow
-    AI Gateway UI ordering so users see the most common choices at the
+    Unity Gateway UI ordering so users see the most common choices at the
     top. Provider variants are consolidated (e.g. all ``vertex_ai-*``
     become ``vertex_ai``). Excluded providers (e.g. ``bedrock_converse``)
     are filtered out.

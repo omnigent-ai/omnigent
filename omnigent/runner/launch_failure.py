@@ -299,7 +299,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "continues the turn."
     ),
     "budget_exhausted": (
-        "The AI gateway refused this turn because a spending budget or usage limit is "
+        "The Unity Gateway refused this turn because a spending budget or usage limit is "
         "exhausted. Contact an admin to raise it, or use a different budget."
     ),
 }
