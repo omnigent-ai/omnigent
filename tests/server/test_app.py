@@ -2032,34 +2032,49 @@ async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
 
 
 @pytest.mark.asyncio
-async def test_peer_cancelled_rpc_is_booked_upstream_while_real_faults_stay_unhandled(
+@pytest.mark.parametrize(
+    ("status_name", "status_details"),
+    [
+        pytest.param("CANCELLED", None, id="peer-cancelled"),
+        pytest.param("UNAVAILABLE", "Cancelling all calls", id="endpoint-teardown"),
+    ],
+)
+async def test_cancelled_rpc_is_booked_upstream_while_real_faults_stay_unhandled(
     app: FastAPI,
     caplog: pytest.LogCaptureFixture,
+    status_name: str,
+    status_details: str | None,
 ) -> None:
     """
-    A peer-cancelled backing RPC books a coded WARN 499; real faults keep 500.
+    A cancelled backing RPC books exactly one coded WARN 499; real faults keep 500.
 
     Both arms are asserted together because the point is the contrast: the
-    upstream cancelling an in-flight call (a teardown/restart burst) is an
-    expected, retryable condition that must not read as an ERROR-level
-    ``Unhandled exception``, while a genuinely uncoded fault must keep
-    exactly that booking. The cancelled RPC is a structural stand-in (an
-    exception class literally named ``RpcError`` with a ``code()`` status
-    accessor) because the deployed build vendors grpc — the handler must
-    match shape, not class identity.
+    upstream cancelling an in-flight call — a peer cancel (``CANCELLED``) or
+    the endpoint tearing down under it (``UNAVAILABLE`` with the GOAWAY
+    details ``Cancelling all calls``) — is an expected, retryable condition
+    that must not read as an ERROR-level ``Unhandled exception``, while a
+    genuinely uncoded fault must keep exactly that booking. The cancelled RPC
+    is a structural stand-in (an exception class literally named ``RpcError``
+    with ``code()``/``details()`` accessors) because the deployed build vendors
+    grpc — the handler must match shape, not class identity.
 
     :param app: The real application, for its registered handlers.
     :param caplog: Pytest log capture fixture.
+    :param status_name: The gRPC status name the stand-in reports.
+    :param status_details: The status details the stand-in reports.
     :returns: None.
     """
     import json
 
     class _Status:
-        name = "CANCELLED"
+        name = status_name
 
     class RpcError(Exception):
         def code(self) -> object:
             return _Status()
+
+        def details(self) -> str | None:
+            return status_details
 
     handler = app.exception_handlers[Exception]
     request = Request(
@@ -2074,7 +2089,7 @@ async def test_peer_cancelled_rpc_is_booked_upstream_while_real_faults_stay_unha
     )
 
     with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
-        cancelled = await handler(request, RpcError("RPC terminated with CANCELLED"))
+        cancelled = await handler(request, RpcError(f"RPC terminated with {status_name}"))
         fault = await handler(request, RuntimeError("boom"))
 
     # The cancellation answers the coded, retryable 499; the fault keeps 500.
@@ -2083,11 +2098,16 @@ async def test_peer_cancelled_rpc_is_booked_upstream_while_real_faults_stay_unha
     assert fault.status_code == 500
     assert json.loads(fault.body)["error"]["code"] == "internal_error"
 
+    # Exactly one booking per exception: a WARNING attributed upstream/transient
+    # for the cancellation, the unhandled ERROR for the fault.
     records = [r for r in caplog.records if r.name == "omnigent.server.app"]
     assert len(records) == 2, f"expected one record per exception, got {records}"
     upstream, unhandled = records
     assert upstream.levelno == logging.WARNING
-    assert not upstream.getMessage().startswith("Unhandled exception:")
+    assert upstream.getMessage().startswith("Upstream call cancelled by its peer:")
+    attributes = getattr(upstream, "attributes", None) or {}
+    assert attributes.get("error_category") == "upstream"
+    assert attributes.get("error_impact") == "transient"
     assert unhandled.levelno == logging.ERROR
     assert unhandled.getMessage().startswith("Unhandled exception:")
 
