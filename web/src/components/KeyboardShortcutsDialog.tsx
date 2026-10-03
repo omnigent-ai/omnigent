@@ -87,6 +87,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
       { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
+      { label: "Focus chat input", keys: [CTRL_KEY, SHIFT_KEY, "L"] },
       { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
       { label: "Stop response", keys: ["Esc"] },
     ],

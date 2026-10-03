@@ -76,6 +76,7 @@ import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
+import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
@@ -2641,6 +2642,12 @@ function ComposerImpl(
   const preventsKeyboardSubmit = isMobile || isCoarsePointer;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
+
+  // Ctrl+Shift+L focuses the composer input from anywhere in the session view.
+  // No-op on mobile, where programmatic focus would pop the software keyboard.
+  useFocusComposerHotkey(() => {
+    if (!isMobileRef.current) textareaRef.current?.focus({ preventScroll: true });
+  });
 
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the
