@@ -994,6 +994,7 @@ function FileRowItem({
     <li className="list-none">
       <FileRowActions
         name={name}
+        actionName={labelIsPath ? displayLabel : name}
         path={canonicalPath}
         revealPath={isDeleted ? null : path}
         kind="file"
@@ -1007,9 +1008,10 @@ function FileRowItem({
         linesRemoved={fileStatus?.lines_removed}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(moreActions, rowRef) => (
+        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
           <div
             ref={rowRef}
+            data-actions-open={actionsOpen}
             tabIndex={-1}
             className={cn(
               "group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 [-webkit-touch-callout:none]",
@@ -1019,6 +1021,7 @@ function FileRowItem({
           >
             <IndentGuides depth={depth} />
             <button
+              ref={primaryActionRef}
               type="button"
               className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
               onClick={() => !isDeleted && onFileSelect(path)}
@@ -1069,7 +1072,12 @@ function FileRowItem({
               )}
             >
               {bytes !== null && !isDeleted && (
-                <span className="text-muted-foreground text-sm group-hover:invisible">
+                <span
+                  className={cn(
+                    "text-muted-foreground text-sm group-hover:invisible group-focus-within:invisible",
+                    actionsOpen && "invisible",
+                  )}
+                >
                   {formatBytes(bytes)}
                 </span>
               )}
@@ -1171,6 +1179,7 @@ function SearchDirRow({
     <li className="list-none">
       <FileRowActions
         name={file.name}
+        actionName={file.path}
         path={canonicalPath}
         revealPath={file.path}
         kind="folder"
@@ -1179,13 +1188,15 @@ function SearchDirRow({
         onBrowse={() => (onNavigateDir ? onNavigateDir(file.path) : onRevealDir(file.path))}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(moreActions, rowRef) => (
+        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
           <div
             ref={rowRef}
+            data-actions-open={actionsOpen}
             tabIndex={-1}
             className="group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted [-webkit-touch-callout:none]"
           >
             <button
+              ref={primaryActionRef}
               type="button"
               className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
               onClick={() => onRevealDir(file.path)}
@@ -1332,9 +1343,10 @@ const TreeNodeRow = memo(function TreeNodeRow({
       onBrowse={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
       onOpenInfo={onOpenInfo ?? (() => {})}
     >
-      {(moreActions, rowRef) => (
+      {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
         <div
           ref={rowRef}
+          data-actions-open={actionsOpen}
           tabIndex={-1}
           className={cn(
             "group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 hover:bg-muted [-webkit-touch-callout:none]",
@@ -1346,6 +1358,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
         >
           <IndentGuides depth={depth} />
           <button
+            ref={primaryActionRef}
             type="button"
             className="group/folder flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
             onClick={() => onTogglePath(node.path)}

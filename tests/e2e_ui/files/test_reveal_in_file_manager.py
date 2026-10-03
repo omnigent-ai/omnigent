@@ -1,8 +1,8 @@
-"""E2E: right-click a local file or folder to show it in the OS file manager.
+"""E2E: right-click a local file or folder in the shared row actions menu.
 
 The action is desktop-only and local-only: it appears when the SPA runs in the
 desktop shell (an injected ``omnigentDesktop`` bridge) and the session's host is
-this machine. A plain browser tab keeps the browser's own context menu.
+this machine. A plain browser tab has the shared menu without Finder actions.
 """
 
 from __future__ import annotations
@@ -122,6 +122,6 @@ def test_browser_tab_opens_shared_menu_without_finder_action(
     menu = page.get_by_role("menu")
     expect(menu).to_be_visible()
     expect(menu.get_by_role("menuitem", name="Download", exact=True)).to_be_visible()
-    expect(menu.get_by_role("menuitem", name="Copy path", exact=True)).to_be_visible()
+    expect(menu.get_by_role("menuitem", name="Copy relative path", exact=True)).to_be_visible()
     expect(menu.get_by_role("menuitem", name="File info", exact=True)).to_be_visible()
     expect(menu.get_by_role("menuitem", name=re.compile(r"^(Show in|Open in) "))).to_have_count(0)

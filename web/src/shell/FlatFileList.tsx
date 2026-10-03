@@ -124,9 +124,10 @@ function FileListItem({
         linesRemoved={file.lines_removed}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(moreActions, rowRef) => (
+        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
           <div
             ref={rowRef}
+            data-actions-open={actionsOpen}
             tabIndex={-1}
             className={cn(
               "group flex w-full min-w-0 select-none items-center gap-2 rounded-md py-0.5 pr-1 pl-2 [-webkit-touch-callout:none]",
@@ -134,6 +135,7 @@ function FileListItem({
             )}
           >
             <button
+              ref={primaryActionRef}
               type="button"
               className="flex min-w-0 flex-1 cursor-pointer items-baseline gap-1.5 text-left"
               onClick={() => onFileSelect(file.path)}
@@ -196,7 +198,12 @@ function FileListItem({
               )}
             >
               {file.bytes !== null && !isDeleted && (
-                <span className="text-muted-foreground text-sm group-hover:invisible">
+                <span
+                  className={cn(
+                    "text-muted-foreground text-sm group-hover:invisible group-focus-within:invisible",
+                    actionsOpen && "invisible",
+                  )}
+                >
                   {formatBytes(file.bytes)}
                 </span>
               )}

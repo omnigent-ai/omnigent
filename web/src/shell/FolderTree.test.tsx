@@ -150,7 +150,7 @@ describe("FolderTree row action paths", () => {
     renderTree({ files: [file(path)], browseLocation: "packages/app", onOpenInfo });
 
     fireEvent.contextMenu(screen.getByText("same name # % ' Ω.ts"));
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy relative path" }));
     expect(copyTextMock).toHaveBeenCalledWith(`packages/app/${path}`);
 
     fireEvent.contextMenu(screen.getByText("same name # % ' Ω.ts"));
@@ -174,10 +174,13 @@ describe("FolderTree row action paths", () => {
       searchResults: [file(`left/${sameName}`), file(`right/${sameName}`)],
       browseLocation: "packages/app",
     });
-    const kebabs = screen.getAllByRole("button", { name: `More actions for ${sameName}` });
+    const kebabs = [
+      screen.getByRole("button", { name: `More actions for left/${sameName}` }),
+      screen.getByRole("button", { name: `More actions for right/${sameName}` }),
+    ];
     expect(kebabs).toHaveLength(2);
     await user.click(kebabs[1]);
-    await user.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Copy relative path" }));
     expect(copyTextMock).toHaveBeenCalledWith(`packages/app/right/${sameName}`);
 
     cleanup();
@@ -206,12 +209,12 @@ describe("FolderTree row action paths", () => {
     });
     expect(actionRows).toHaveLength(2);
 
-    const exerciseRow = async (index: number, path: string) => {
+    const exerciseRow = async (index: number, relativePath: string, path: string) => {
       const kebab = within(actionRows[index]).getByRole("button", {
-        name: "More actions for x.ts",
+        name: `More actions for ${relativePath}`,
       });
       await user.click(kebab);
-      await user.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+      await user.click(await screen.findByRole("menuitem", { name: "Copy relative path" }));
       expect(copyTextMock).toHaveBeenLastCalledWith(path);
 
       await user.click(kebab);
@@ -229,8 +232,8 @@ describe("FolderTree row action paths", () => {
       await user.click(await screen.findByRole("menuitem", { name: "Show in Finder" }));
       expect(revealMock).toHaveBeenLastCalledWith({ hostId: "local", path: `/workspace/${path}` });
     };
-    await exerciseRow(0, paths[0]);
-    await exerciseRow(1, paths[1]);
+    await exerciseRow(0, "a/x.ts", paths[0]);
+    await exerciseRow(1, "a/b/x.ts", paths[1]);
   });
 });
 
@@ -292,7 +295,7 @@ describe("FolderTree file size / download alignment", () => {
     expect(slot).toHaveClass("relative");
     expect(size).toHaveClass("text-sm");
     // Size hides on hover but keeps its width to avoid a layout shift.
-    expect(size).toHaveClass("group-hover:invisible");
+    expect(size).toHaveClass("group-hover:invisible", "group-focus-within:invisible");
 
     const download = screen.getByRole("button", { name: /download readme\.md/i });
     // Button sits in an absolutely-positioned overlay inside the same slot.
