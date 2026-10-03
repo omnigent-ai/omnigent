@@ -11,6 +11,8 @@ reads the MR; agent CLI and MCP writes associate it with the session.
 - `associations`: link, select, and unlink MRs across projects.
 - `partial`: incomplete comments, checks, files, and omitted diff explanations.
 - `auth`: missing CLI or denied access retains checkout context and a useful hint.
+- `discovery`: signed-in glab hosts are recognized without Omnigent configuration,
+  including alongside GitHub and Azure DevOps remotes.
 - `tracking`: successful mutations persist; reads, comments, failures, and replay
   do not create extra associations.
 
@@ -55,8 +57,9 @@ responses; they exercise the actual shared UI without contacting GitLab.
 - The shared panel tab and link actions retain the generic Pull Requests wording.
   The provider heading, MR number prefix, external links, and Canvas label must
   use GitLab metadata.
-- A private instance needs an allowed HTTPS authority on the execution host.
-  Nondefault ports stay part of that authority. SSH ports are separate.
+- A private instance is discovered from the execution host's `glab auth login`
+  config. Nondefault HTTPS ports stay part of that saved host. SSH ports are separate;
+  `api_host` routing remains owned by glab.
 - Mocked browser responses prove rendering and interaction, not GitLab access.
   The native hook fixture proves transport and persistence, not vendor services.
 - Keep evidence outside the tracked tree. Canvas is gated by its feature flag;

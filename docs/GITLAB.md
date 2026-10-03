@@ -14,18 +14,29 @@ that sandbox runs the session.
 
 ## Private instances and remotes
 
-Set the allowed GitLab HTTPS authorities in the execution host's environment
-before starting its runner:
+Sign in to each private GitLab instance with `glab` on the execution host:
 
 ```sh
-export OMNIGENT_GIT_PROVIDER_GITLAB_HOSTS=git.example.com:8443
+glab auth login --hostname git.example.com
+```
+
+Omnigent discovers signed-in hosts from the CLI's config file. No Omnigent host
+setting or OAuth connection is needed. It follows `GLAB_CONFIG_DIR`, the legacy
+`~/.config/glab-cli` directory, and glab's platform-specific XDG config search
+order. Login and logout changes take effect without restarting the runner.
+GitHub, GitLab, and Azure DevOps remotes can coexist in one checkout.
+
+For a web origin with a nondefault HTTPS port, include that port when signing in:
+
+```sh
 GITLAB_HOST=git.example.com:8443 glab auth login --api-host git.example.com:8443
 ```
 
-The setting accepts comma-separated hostnames, hostnames with ports, or HTTPS
-origins. `GITLAB_HOST` also selects the instance used by `glab`; `GLAB_HOST`
-only identifies a trusted instance for Omnigent. GitLab.com is supported by
-default. Nested groups and project-local MR numbers are preserved:
+The host selection above applies only to the login command. `glab` saves the
+authority including its port; Omnigent reads it on subsequent requests. A
+separate `api_host` remains glab's API routing setting, not an additional web
+origin. GitLab.com is supported by default. Nested groups and project-local MR
+numbers are preserved:
 
 ```text
 https://git.example.com:8443/company/team/project.git
@@ -33,9 +44,12 @@ git@git.example.com:company/team/project.git
 https://git.example.com:8443/company/team/project/-/merge_requests/42
 ```
 
-An SSH remote maps to the configured HTTPS authority for its hostname. Its SSH
+An SSH remote maps to the discovered HTTPS authority for its hostname. Its SSH
 port does not become the API port. When two allowed authorities share a hostname,
 use an HTTPS remote to select the intended one.
+
+Existing `OMNIGENT_GIT_PROVIDER_GITLAB_HOSTS`, `GITLAB_HOST`, and `GLAB_HOST`
+overrides remain supported when explicit instance configuration is useful.
 
 ## Panel and tracking
 
@@ -76,7 +90,8 @@ credential provisioning are separate features.
 
 To verify manually:
 
-1. Start a session in an authenticated GitLab checkout with an open MR and open
+1. Sign in with `glab auth login`, then start a session in a GitLab checkout with
+   an open MR without setting Omnigent provider hosts. Open
    its Pull Requests tab. Confirm the `!` number, description, comments, and pipeline
    results match GitLab.
 2. Open a changed file, then expand context. For a fork MR, check a renamed file

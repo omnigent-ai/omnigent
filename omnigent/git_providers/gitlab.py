@@ -1,10 +1,13 @@
-"""GitLab URLs, including nested projects on explicitly configured instances."""
+"""GitLab URLs, including nested projects on authenticated private instances."""
 
 from __future__ import annotations
 
 import ipaddress
 import os
 import re
+import sys
+from functools import lru_cache
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from omnigent.git_providers import (
@@ -20,6 +23,82 @@ _MR = re.compile(
     rf"/({_PROJECT})/-/merge_requests/([1-9][0-9]*)(?:/(?:diffs|commits|pipelines))?/?"
 )
 _SCP = re.compile(r"^[\w.-]+@([^:/]+):(.+)$")
+
+
+def _glab_config_paths() -> list[Path]:
+    """Follow glab's override, legacy, platform user, then system config order."""
+    if override := os.environ.get("GLAB_CONFIG_DIR"):
+        return [Path(override) / "config.yml"]
+    home = Path.home()
+    legacy = home / ".config"
+    if sys.platform == "darwin":
+        config_home = home / "Library/Application Support"
+        config_dirs = [
+            home / "Library/Preferences",
+            Path("/Library/Application Support"),
+            Path("/Library/Preferences"),
+            legacy,
+        ]
+    elif sys.platform == "win32":
+        config_home = Path(os.environ.get("LOCALAPPDATA") or home / "AppData/Local")
+        config_dirs = [
+            Path(os.environ.get("PROGRAMDATA") or "C:/ProgramData"),
+            Path(os.environ.get("APPDATA") or home / "AppData/Roaming"),
+        ]
+    else:
+        config_home, config_dirs = legacy, [Path("/etc/xdg")]
+    if override := os.environ.get("XDG_CONFIG_HOME"):
+        if Path(override).is_absolute():
+            config_home = Path(override)
+    if override := os.environ.get("XDG_CONFIG_DIRS"):
+        config_dirs = [Path(p) for p in override.split(os.pathsep) if Path(p).is_absolute()]
+    return [p / "glab-cli/config.yml" for p in dict.fromkeys([legacy, config_home, *config_dirs])]
+
+
+@lru_cache(maxsize=1)
+def _read_glab_hosts(path: Path, mtime_ns: int, size: int) -> frozenset[str]:
+    """Read glab's host config, retaining only signed-in HTTPS authorities."""
+    import yaml
+
+    del mtime_ns, size  # File metadata invalidates the cache after login/logout.
+    try:
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return frozenset()
+    configured_hosts = config.get("hosts") if isinstance(config, dict) else None
+    if not isinstance(configured_hosts, dict):
+        return frozenset()
+    hosts = set()
+    for host, values in configured_hosts.items():
+        if not isinstance(host, str) or not isinstance(values, dict):
+            continue
+        protocol = values.get("api_protocol") or "https"
+        keyring = values.get("use_keyring")
+        authenticated = (
+            keyring is True
+            or keyring == "true"
+            or any(
+                isinstance(values.get(key), str) and values[key].strip()
+                for key in ("token", "job_token")
+            )
+        )
+        if authenticated and protocol == "https" and (authority := instance_authority(host)):
+            hosts.add(authority)
+    return frozenset(hosts)
+
+
+def _glab_signed_in_hosts() -> frozenset[str]:
+    """Pick up CLI login/logout changes without a subprocess or network request."""
+    try:
+        for path in _glab_config_paths():
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            return _read_glab_hosts(path, info.st_mtime_ns, info.st_size)
+    except RuntimeError:
+        pass  # No home directory is available.
+    return frozenset()
 
 
 def instance_authority(value: str) -> str | None:
@@ -61,7 +140,7 @@ def _valid_project(path: str) -> bool:
 
 
 class GitLabProvider:
-    """GitLab.com and configured GitLab authorities; OAuth configuration is unnecessary."""
+    """GitLab.com and CLI-authenticated instances; OAuth configuration is unnecessary."""
 
     id = "gitlab"
     display_name = "GitLab"
@@ -71,9 +150,10 @@ class GitLabProvider:
     facets = FacetModules(pull_requests="omnigent.runner.git_providers.gitlab")
 
     def authorities(self, instances: Instances) -> frozenset[str]:
-        """Return explicitly trusted origins without reading or exposing credentials."""
+        """Return configured and CLI-authenticated origins without retaining credentials."""
         values = [*self.default_hosts, *instances.hosts_for(self.id)]
         values.extend(os.environ.get(name, "") for name in ("GITLAB_HOST", "GLAB_HOST"))
+        values.extend(_glab_signed_in_hosts())
         return frozenset(host for value in values if value and (host := instance_authority(value)))
 
     def matches_host(self, host: str, instances: Instances) -> bool:
