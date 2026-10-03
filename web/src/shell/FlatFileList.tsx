@@ -215,7 +215,7 @@ function FileListItem({
               {file.bytes !== null && !isDeleted && (
                 <span
                   className={cn(
-                    "w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-focus-within:invisible",
+                    "mr-6 w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-has-[:focus-visible]:invisible",
                     actionsOpen && "invisible",
                   )}
                 >

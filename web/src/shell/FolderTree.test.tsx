@@ -58,11 +58,8 @@ import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFi
 import type * as FileContentModule from "@/hooks/useFileContent";
 import type * as RevealInFileManagerModule from "./RevealInFileManager";
 import userEvent from "@testing-library/user-event";
-import {
-  ROW_ACTION_SIZE_CLASS,
-  ROW_META_SLOT_CLASS,
-  ROW_STATUS_SLOT_CLASS,
-} from "./fileStatusUtils";
+import { ROW_ACTION_SIZE_CLASS, ROW_STATUS_SLOT_CLASS } from "./fileStatusUtils";
+import { ROW_MENU_SLOT_CLASS } from "./FileRowActions";
 import { FolderTree } from "./FolderTree";
 
 afterEach(() => {
@@ -295,7 +292,7 @@ describe("FolderTree file size / download alignment", () => {
     expect(slot).toHaveClass("relative");
     expect(size).toHaveClass("text-sm");
     // Size hides on hover but keeps its width to avoid a layout shift.
-    expect(size).toHaveClass("group-hover:invisible", "group-focus-within:invisible");
+    expect(size).toHaveClass("group-hover:invisible", "group-has-[:focus-visible]:invisible");
 
     const download = screen.getByRole("button", { name: /download readme\.md/i });
     // Button sits in an absolutely-positioned overlay inside the same slot.
@@ -364,8 +361,9 @@ describe("FolderTree trailing column", () => {
     for (const button of copyButtons) {
       expect(button).toHaveAttribute("data-size", "icon-sm");
       // The copy button lives inside the fixed-width trailing column...
-      const slot = button.closest(`.${ROW_META_SLOT_CLASS}`);
+      const slot = button.closest(`.${ROW_MENU_SLOT_CLASS.replaceAll(" ", ".")}`);
       expect(slot, "every row's copy button must sit in the trailing column").not.toBeNull();
+      expect(slot).toHaveClass("w-20");
       // ...paired with the download button on its LEFT (copy is the rightmost
       // control), or with a spacer standing in for the download where there is
       // none (folders, deleted files) so the pair keeps one x on every row.
