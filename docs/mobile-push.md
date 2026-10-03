@@ -43,8 +43,8 @@ read at send time, limited to 120 characters, and never saved in the outbox.
 Raw errors, prompts, remediation text, and provider responses are never sent.
 
 Completion/error notifications settle for 10 seconds and are cancelled on new
-input or resumed activity. Leased delivery is at-least-once: crashes after a
-successful send can duplicate a notification, and crashes before an intent is
+input or resumed activity. Leased delivery is at-least-once: a crash or lease
+expiry after a successful send can duplicate a notification, and crashes before an intent is
 committed can lose it. Notifications expire after one hour; transient failures
 retry at most five times, respecting bounded `Retry-After` delays. Clients
 collapse notifications by session and use the shared golden content fixture at
@@ -54,7 +54,12 @@ collapse notifications by session and use the shared golden content fixture at
 `OMNIGENT_FEATURES`. Routes return 404 and no Google calls are made.
 Existing device registrations are kept while the flag is off. Expired rows are
 filtered out but not deleted until the feature is re-enabled; downgrading the
-migration removes them as well. Deleting a user still erases that user's rows.
+migration removes them as well. Deleting a user with the feature code deployed
+still erases that user's rows. Schema-only or older replicas, or code rolled
+back while retaining the schema, do not perform push cleanup on `delete_user`.
+For a deleted user, run this tenant-scoped cleanup against the retained tables:
+`DELETE FROM mobile_push_outbox WHERE workspace_id = :workspace_id AND user_id = :user_id; DELETE FROM mobile_push_devices WHERE workspace_id = :workspace_id AND user_id = :user_id;`
+Do not enable expired-row purging while the flag is off.
 Clients cannot unregister while the flag is off because the routes return 404.
 This flag-off roll-forward is the preferred rollback. The server automatically
 migrates at startup; deploy the schema release first, then the feature code. Additive

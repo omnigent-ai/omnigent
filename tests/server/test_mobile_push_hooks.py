@@ -15,6 +15,186 @@ from tests.server.test_mobile_push_store import register
 from tests.server.test_mobile_push_store import session_id as session_id
 
 
+@pytest.mark.parametrize("handover", [False, True])
+async def test_repeated_running_publish_cancels_once_across_replica_handover(
+    push_store, session_id, monkeypatch, handover
+):
+    from concurrent.futures import Future
+
+    from sqlalchemy import event
+
+    from omnigent.server import mobile_push, mobile_push_store, session_live_state
+    from omnigent.server.routes._sessions import helpers
+
+    register(push_store)
+    push_store.enqueue(session_id, "completed", now=100)
+    service = mobile_push.MobilePushService(push_store, Mock(), Mock(), preview=False)
+    monkeypatch.setattr(mobile_push, "_service", service)
+    writes = []
+    statements = []
+    run = mobile_push_store.run_write_transaction
+
+    def record_write(factory, name, callback):
+        writes.append(name)
+        return run(factory, name, callback)
+
+    def record_sql(connection, cursor, statement, parameters, context, executemany):
+        if "FROM mobile_push_outbox" in statement and statement.startswith("SELECT"):
+            statements.append((statement, parameters))
+
+    monkeypatch.setattr(mobile_push_store, "run_write_transaction", record_write)
+    monkeypatch.setattr(session_live_state, "persist_live_status", Mock())
+    helpers._session_status_cache[session_id] = "running" if handover else "idle"
+    event.listen(push_store._engine, "before_cursor_execute", record_sql)
+    try:
+        for _ in range(8):
+            helpers._publish_status(session_id, "running")
+        barrier = Future()
+        session_live_state.submit("test_repeated_push_cancel_barrier", barrier.set_result, None)
+        await asyncio.wait_for(asyncio.wrap_future(barrier), 5)
+        assert writes == ["cancel_obsolete_notification_intents"]
+        existence = [
+            (statement, parameters) for statement, parameters in statements if "LIMIT" in statement
+        ]
+        assert len(existence) == 8
+        with push_store._engine.connect() as connection:
+            plans = [
+                row[3]
+                for statement, parameters in existence
+                for row in connection.exec_driver_sql(
+                    "EXPLAIN QUERY PLAN " + statement, parameters
+                )
+            ]
+        assert all("SEARCH" in plan and "ix_mobile_push_outbox_activity" in plan for plan in plans)
+        assert not any("SCAN" in plan or "TEMP B-TREE" in plan for plan in plans)
+        assert push_store.claim(now=110) == []
+    finally:
+        event.remove(push_store._engine, "before_cursor_execute", record_sql)
+        helpers._session_status_cache.pop(session_id, None)
+
+
+def test_preview_is_bounded_to_two_pages():
+    from omnigent.entities.conversation import MessageData
+    from omnigent.server.mobile_push import MobilePushService
+
+    conversation_store = Mock()
+    assistant = Mock(
+        data=MessageData(
+            role="assistant", agent="agent", content=[{"type": "text", "text": "too old"}]
+        )
+    )
+    conversation_store.list_items.side_effect = [
+        Mock(data=[], has_more=True, last_id="page1"),
+        Mock(data=[], has_more=True, last_id="page2"),
+        Mock(data=[assistant], has_more=False),
+    ]
+    service = MobilePushService(Mock(), conversation_store, Mock(), preview=True)
+    assert service._preview("session") is None
+    assert conversation_store.list_items.call_count == 2
+    assert conversation_store.list_items.call_args.kwargs == {
+        "limit": 100,
+        "after": "page1",
+        "order": "desc",
+        "type": "message",
+    }
+    conversation_store.list_items.reset_mock()
+    conversation_store.list_items.side_effect = [
+        Mock(data=[], has_more=True, last_id="page1"),
+        Mock(data=[assistant], has_more=True, last_id="page2"),
+    ]
+    assert service._preview("session") == "too old"
+    assert conversation_store.list_items.call_count == 2
+
+
+@pytest.mark.parametrize("stage", ["oauth", "preview", "fcm"])
+async def test_delivery_timeout_retries_before_lease_expiry(
+    push_store, session_id, monkeypatch, stage
+):
+    import threading
+    from dataclasses import replace
+    from time import monotonic
+    from unittest.mock import AsyncMock
+
+    from omnigent.db.db_models import SqlMobilePushOutbox
+    from omnigent.server.mobile_push import MobilePushService
+    from omnigent.server.mobile_push_sender import SendResult
+
+    register(push_store)
+    push_store.enqueue(session_id, "completed", now=100)
+    delivery = push_store.claim(now=110)[0]
+    assert 29 <= delivery.lease_deadline - monotonic() <= 30
+    delivery = replace(delivery, lease_deadline=monotonic() + 1.2)
+    blocked = asyncio.Event()
+    release = threading.Event()
+    cancelled = []
+
+    async def slow_google(*args):
+        blocked.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(stage)
+            raise
+
+    sender = Mock()
+    sender.authorization = (
+        AsyncMock(side_effect=slow_google)
+        if stage == "oauth"
+        else AsyncMock(return_value="access")
+    )
+    sender.post = (
+        AsyncMock(side_effect=slow_google)
+        if stage == "fcm"
+        else AsyncMock(return_value=SendResult("sent"))
+    )
+    service = MobilePushService(push_store, Mock(), sender, preview=stage == "preview")
+
+    def slow_preview(identifier):
+        release.wait(2)
+        return "preview"
+
+    monkeypatch.setattr(service, "_preview", slow_preview)
+    try:
+        await asyncio.wait_for(service._deliver_safely(delivery, now=110), 1)
+    finally:
+        release.set()
+    assert delivery.lease_deadline > monotonic()
+    if stage != "preview":
+        assert blocked.is_set() and cancelled == [stage]
+    if stage != "fcm":
+        sender.post.assert_not_called()
+    with push_store._session("verify_lease_timeout_is_a_retry") as transaction:
+        row = transaction.get(SqlMobilePushOutbox, (0, delivery.id))
+        assert row is not None and not row.delivered
+        assert row.lease is None and row.lease_until == 0
+        assert row.not_before == 120
+    assert push_store.claim(now=119) == []
+    assert len(push_store.claim(now=120)) == 1
+
+
+async def test_expired_delivery_budget_never_starts_google_call(push_store, session_id):
+    from dataclasses import replace
+    from time import monotonic
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.mobile_push import MobilePushService
+    from omnigent.server.mobile_push_sender import SendResult
+
+    register(push_store)
+    push_store.enqueue(session_id, "completed", now=100)
+    delivery = replace(push_store.claim(now=110)[0], lease_deadline=monotonic() + 0.5)
+    sender = Mock(
+        authorization=AsyncMock(return_value="access"),
+        post=AsyncMock(return_value=SendResult("sent")),
+    )
+    service = MobilePushService(push_store, Mock(), sender, preview=False)
+    await service._deliver_safely(delivery, now=110)
+    sender.authorization.assert_not_called()
+    sender.post.assert_not_called()
+    assert push_store.claim(now=119) == []
+    assert len(push_store.claim(now=120)) == 1
+
+
 @pytest.fixture(autouse=True)
 def isolated_hooks(monkeypatch):
     from omnigent.server import session_live_state
@@ -531,7 +711,11 @@ async def test_failed_delivery_does_not_cancel_or_resend_healthy_sibling(
         service._deliver = shutdown
         acknowledge = AsyncMock()
         service.store = Mock(acknowledge=acknowledge)
-        task = asyncio.create_task(service._deliver_safely(Mock(), now=730))
+        from time import monotonic
+
+        task = asyncio.create_task(
+            service._deliver_safely(Mock(lease_deadline=monotonic() + 30), now=730)
+        )
         await asyncio.wait_for(blocked.wait(), 5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

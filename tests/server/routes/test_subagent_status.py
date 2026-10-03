@@ -821,6 +821,7 @@ async def test_transcript_lull_does_not_enqueue_completed_push(
     from sqlalchemy import select
 
     from omnigent.db.db_models import SqlMobilePushOutbox, SqlSessionPermission
+    from omnigent.db.enum_codecs import encode_mobile_push_kind
     from omnigent.server import mobile_push
     from omnigent.server.mobile_push_store import MobilePushStore
 
@@ -869,4 +870,4 @@ async def test_transcript_lull_does_not_enqueue_completed_push(
                     SqlMobilePushOutbox.session_id == route.child_id
                 )
             )
-        ) == ["completed"]
+        ) == [encode_mobile_push_kind("completed")]
