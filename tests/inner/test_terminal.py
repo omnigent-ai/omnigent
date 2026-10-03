@@ -2145,8 +2145,7 @@ async def _capture_launch_argv(
         terminal_mod,
         "asyncio",
         SimpleNamespace(
-            create_subprocess_exec=fake_create_subprocess_exec,
-            subprocess=terminal_mod.asyncio.subprocess,
+            **{**vars(asyncio), "create_subprocess_exec": fake_create_subprocess_exec}
         ),
     )
 
@@ -2183,7 +2182,7 @@ async def test_launch_discards_previous_exit_diagnostics_before_starting(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
     )
     if launch_fails:
         with pytest.raises(RuntimeError, match="tmux launch failed"):
@@ -2400,8 +2399,7 @@ async def test_launch_enables_csi_u_extended_keys_quietly(
         terminal_mod,
         "asyncio",
         SimpleNamespace(
-            create_subprocess_exec=fake_create_subprocess_exec,
-            subprocess=terminal_mod.asyncio.subprocess,
+            **{**vars(asyncio), "create_subprocess_exec": fake_create_subprocess_exec}
         ),
     )
 
@@ -2474,8 +2472,7 @@ async def test_launch_does_not_force_terminal_feature_patterns(
         terminal_mod,
         "asyncio",
         SimpleNamespace(
-            create_subprocess_exec=fake_create_subprocess_exec,
-            subprocess=terminal_mod.asyncio.subprocess,
+            **{**vars(asyncio), "create_subprocess_exec": fake_create_subprocess_exec}
         ),
     )
 
@@ -2536,8 +2533,7 @@ async def test_launch_disables_tmux_pane_and_window_creation_controls(
         terminal_mod,
         "asyncio",
         SimpleNamespace(
-            create_subprocess_exec=fake_create_subprocess_exec,
-            subprocess=terminal_mod.asyncio.subprocess,
+            **{**vars(asyncio), "create_subprocess_exec": fake_create_subprocess_exec}
         ),
     )
 
@@ -2624,8 +2620,7 @@ async def test_launch_strips_env_unset_keys_from_inherited_environment(
         terminal_mod,
         "asyncio",
         SimpleNamespace(
-            create_subprocess_exec=fake_create_subprocess_exec,
-            subprocess=terminal_mod.asyncio.subprocess,
+            **{**vars(asyncio), "create_subprocess_exec": fake_create_subprocess_exec}
         ),
     )
 
@@ -2736,8 +2731,7 @@ async def test_launch_default_env_unset_leaks_databricks_profile(
         terminal_mod,
         "asyncio",
         SimpleNamespace(
-            create_subprocess_exec=fake_create_subprocess_exec,
-            subprocess=terminal_mod.asyncio.subprocess,
+            **{**vars(asyncio), "create_subprocess_exec": fake_create_subprocess_exec}
         ),
     )
 
@@ -2812,8 +2806,7 @@ async def test_launch_strips_runner_binding_token_from_tmux_child(
         terminal_mod,
         "asyncio",
         SimpleNamespace(
-            create_subprocess_exec=fake_create_subprocess_exec,
-            subprocess=terminal_mod.asyncio.subprocess,
+            **{**vars(asyncio), "create_subprocess_exec": fake_create_subprocess_exec}
         ),
     )
 
@@ -2876,7 +2869,7 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=terminal_mod.asyncio.subprocess),
+        SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
     )
     monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
     instance = TerminalInstance(

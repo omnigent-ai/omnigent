@@ -6,10 +6,12 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import shutil
 import socket
 import subprocess
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -123,6 +125,8 @@ async def test_unavailable_error_retains_both_probes_before_cleanup(
     attrs = record.attributes
     assert attrs["socket_state"] == "socket"
     assert attrs["private_dir_state"] == "directory"
+    assert attrs["socket_path_exists"] is True
+    assert attrs["socket_dir_exists"] is True
     assert attrs["consecutive_probe_failures"] == 3
     assert attrs["shutdown_requested"] is False
     failures = json.loads(attrs["probe_failures_json"])
@@ -202,6 +206,7 @@ async def test_probe_history_resets_on_recovery(
     assert {failure["error"] for failure in failures} == {"can't find session: after recovery"}
     assert record.attributes["socket_state"] == "missing"
     assert record.attributes["socket_stat_errno"] == errno.ENOENT
+    assert record.attributes["socket_path_exists"] is False
 
 
 def test_probe_evidence_is_bounded_and_redacted(
@@ -253,3 +258,199 @@ def test_socket_stat_failure_does_not_hide_probe_error(
     record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
     assert record.attributes["socket_state"] == "stat_failed"
     assert record.attributes["socket_stat_errno"] == errno.EACCES
+    # Existence is unknown when stat raises a non-ENOENT error; field must be absent.
+    assert "socket_path_exists" not in record.attributes
+
+
+def test_socket_path_exists_absent_when_stat_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """socket_path_exists is omitted (not True) when stat raises EACCES."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+
+    def stat(path, *args, **kwargs):
+        # Fail stat on both paths to verify both boolean fields are omitted.
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(Path, "stat", stat)
+    instance._log_tmux_unavailable(3, exit_callback_present=False)
+    record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
+    attrs = record.attributes
+    assert attrs["socket_state"] == "stat_failed"
+    assert attrs["private_dir_state"] == "stat_failed"
+    # Both existence booleans must be absent — existence is unknown, not True.
+    assert "socket_path_exists" not in attrs
+    assert "socket_dir_exists" not in attrs
+
+
+def test_unavailable_boolean_existence_fields_when_socket_dir_deleted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Deleted socket dir → both existence booleans False and diagnostic message says missing."""
+    sock_path = tmp_path / "tmux.sock"
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=sock_path,
+        private_dir=tmp_path,
+    )
+    # Simulate a tmp-cleaner that removed the whole socket dir while the server was live.
+    instance._private_dir_inode_at_launch = tmp_path.stat().st_ino
+    shutil.rmtree(tmp_path)
+
+    instance._log_tmux_unavailable(3, exit_callback_present=False)
+    record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
+    attrs = record.attributes
+    assert attrs["socket_state"] == "missing"
+    assert attrs["private_dir_state"] == "missing"
+    # New boolean fields: both should be False when the dir is gone.
+    assert attrs["socket_path_exists"] is False
+    assert attrs["socket_dir_exists"] is False
+    # Inode comparison is skipped when the dir is missing (private_dir_info is None).
+    assert "socket_dir_inode_changed" not in attrs
+    # Human-readable part must mention the missing dir.
+    assert "socket dir: missing" in record.getMessage()
+
+
+def test_unavailable_boolean_existence_fields_when_socket_missing_dir_present(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Dir present but socket gone → socket_path_exists False, socket_dir_exists True."""
+    # The dir exists but the socket file was never created (server crashed before bind).
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._log_tmux_unavailable(3, exit_callback_present=False)
+    record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
+    attrs = record.attributes
+    assert attrs["socket_state"] == "missing"
+    assert attrs["private_dir_state"] == "directory"
+    assert attrs["socket_path_exists"] is False
+    assert attrs["socket_dir_exists"] is True
+    # Human-readable part must mention the missing socket (not the dir).
+    msg = record.getMessage()
+    assert "socket: missing" in msg
+    assert "socket dir: missing" not in msg
+
+
+def test_unavailable_inode_change_detected(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A changed dir inode is flagged when the socket dir was recreated (tmp-cleaner cycle)."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    # Pretend the dir had a different inode at launch time (simulating recreation).
+    instance._private_dir_inode_at_launch = tmp_path.stat().st_ino + 999
+    instance._log_tmux_unavailable(3, exit_callback_present=False)
+    record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
+    assert record.attributes["socket_dir_inode_changed"] is True
+
+
+def test_unavailable_inode_unchanged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """An unchanged dir inode confirms the same dir that was alive at launch."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance._private_dir_inode_at_launch = tmp_path.stat().st_ino
+    instance._log_tmux_unavailable(3, exit_callback_present=False)
+    record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
+    assert record.attributes["socket_dir_inode_changed"] is False
+
+
+def test_unavailable_terminal_age_and_process_fields(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """terminal_age_s, tmux_server_pid_alive, and pane_pid_alive appear when data is set."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    # Use the test runner's own pid as a known-alive process.
+    alive_pid = os.getpid()
+    # Pick a pid near the Linux max that is almost certainly not running.
+    dead_pid = 2**22 - 1
+
+    instance._started_at = time.monotonic() - 5.0
+    instance._tmux_server_pid = alive_pid
+    instance._last_pane_pid = dead_pid
+
+    instance._log_tmux_unavailable(3, exit_callback_present=False)
+    record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
+    attrs = record.attributes
+    assert attrs["terminal_age_s"] >= 5
+    assert attrs["tmux_server_pid"] == alive_pid
+    assert attrs["tmux_server_pid_alive"] is True
+    assert attrs["pane_pid"] == dead_pid
+    # dead_pid is almost certainly not alive; at minimum the bool field is present.
+    assert isinstance(attrs["pane_pid_alive"], bool)
+
+
+def test_unavailable_dedupe_single_log_row(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Calling _log_tmux_unavailable twice produces exactly one log record."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        instance._log_tmux_unavailable(3, exit_callback_present=False)
+        instance._log_tmux_unavailable(3, exit_callback_present=False)
+
+    unavailable_records = [r for r in caplog.records if "tmux unavailable after" in r.getMessage()]
+    assert len(unavailable_records) == 1
+
+
+@pytest.mark.parametrize("threaded", [False, True], ids=["async", "threaded"])
+async def test_watcher_logs_exactly_one_unavailable_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    threaded: bool,
+) -> None:
+    """A complete failure streak through a watcher produces exactly one 'unavailable' row."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    def run(cmd, **kwargs):
+        if cmd[5] == "has-session":
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", "tmux")
+        return subprocess.CompletedProcess(cmd, 1, b"", b"no server running")
+
+    _patch_tmux(monkeypatch, run)
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        await _run_watcher(instance, threaded, None)
+
+    unavailable_records = [r for r in caplog.records if "tmux unavailable after" in r.getMessage()]
+    assert len(unavailable_records) == 1
+    # The dedupe flag is set so a second call is ignored.
+    assert instance._tmux_unavailable_logged is True
+    instance._log_tmux_unavailable(3, exit_callback_present=False)
+    unavailable_after_second = [
+        r for r in caplog.records if "tmux unavailable after" in r.getMessage()
+    ]
+    assert len(unavailable_after_second) == 1
