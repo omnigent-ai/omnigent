@@ -71,6 +71,10 @@ from omnigent.errors import (
     restart_on_stale_cursor,
 )
 from omnigent.harness_plugins import (
+    ANTIGRAVITY_NATIVE_CODING_AGENT,
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+    DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
 from omnigent.models.model_metadata import concrete_reported_model
@@ -3444,6 +3448,9 @@ async def _persist_external_acp_subagent_start(
     :func:`_resolve_harness_impl` to the parent's (e.g. ``devin``) and the UI
     labels it from the harness catalog.
 
+    The shared ACP event does not identify a concrete harness, so creation
+    telemetry leaves it unresolved for both new and adopted children.
+
     Idempotent: a redelivery with the same ``subagent_id`` returns the existing
     child id, with a title-collision recovery path matching the native helpers.
 
@@ -3522,7 +3529,6 @@ async def _persist_external_acp_subagent_start(
         )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    # The shared ACP event identifies a transport, not the concrete harness.
     await _publish_session_created(
         parent_id, child.id, parent_conv.agent_id, conversation_store, harness=None
     )
@@ -3785,12 +3791,16 @@ async def _persist_external_subagent_start(
             adopted.id,
             parent_conv.agent_id,
             conversation_store,
-            harness="claude-native",
+            harness=CLAUDE_NATIVE_CODING_AGENT.harness,
         )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     await _publish_session_created(
-        parent_id, child.id, parent_conv.agent_id, conversation_store, harness="claude-native"
+        parent_id,
+        child.id,
+        parent_conv.agent_id,
+        conversation_store,
+        harness=CLAUDE_NATIVE_CODING_AGENT.harness,
     )
     return child.id
 
@@ -3892,12 +3902,16 @@ async def _create_and_publish_antigravity_child(
             existing.id,
             parent_conv.agent_id,
             conversation_store,
-            harness="antigravity-native",
+            harness=ANTIGRAVITY_NATIVE_CODING_AGENT.harness,
         )
         return existing.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     await _publish_session_created(
-        parent_id, child.id, parent_conv.agent_id, conversation_store, harness="antigravity-native"
+        parent_id,
+        child.id,
+        parent_conv.agent_id,
+        conversation_store,
+        harness=ANTIGRAVITY_NATIVE_CODING_AGENT.harness,
     )
     return child.id
 
@@ -4181,13 +4195,17 @@ async def _create_and_publish_codex_child(
                 existing.id,
                 parent_conv.agent_id,
                 conversation_store,
-                harness="codex-native",
+                harness=CODEX_NATIVE_CODING_AGENT.harness,
             )
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     await _publish_session_created(
-        parent_id, child.id, parent_conv.agent_id, conversation_store, harness="codex-native"
+        parent_id,
+        child.id,
+        parent_conv.agent_id,
+        conversation_store,
+        harness=CODEX_NATIVE_CODING_AGENT.harness,
     )
     return child.id
 
@@ -4289,13 +4307,17 @@ async def _create_and_publish_devin_child(
                 existing.id,
                 parent_conv.agent_id,
                 conversation_store,
-                harness="devin-native",
+                harness=DEVIN_NATIVE_CODING_AGENT.harness,
             )
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
     await _publish_session_created(
-        parent_id, child.id, parent_conv.agent_id, conversation_store, harness="devin-native"
+        parent_id,
+        child.id,
+        parent_conv.agent_id,
+        conversation_store,
+        harness=DEVIN_NATIVE_CODING_AGENT.harness,
     )
     return child.id
 
