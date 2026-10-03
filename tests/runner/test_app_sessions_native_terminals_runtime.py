@@ -1631,6 +1631,18 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         lambda _harness, args, *, cfg: list(args),
     )
 
+    import omnigent.config as config_mod
+
+    real_load_effective_config = config_mod.load_effective_config
+    load_config_workspaces: list[str | Path | None] = []
+
+    def _spy_load_effective_config(*, workspace: str | Path | None = None) -> Any:
+        """Record the workspace each config load selects, then load normally."""
+        load_config_workspaces.append(workspace)
+        return real_load_effective_config(workspace=workspace)
+
+    monkeypatch.setattr(config_mod, "load_effective_config", _spy_load_effective_config)
+
     # agent_spec is a ResolvedSpec whose workdir is the bundle dir — the
     # exact value the old code wrongly used as the cwd. Its os_env declares
     # sandbox: none, so the launched terminal must inherit that (not the
@@ -1688,6 +1700,16 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
+
+    # Project config must load from the selected worktree, not the process cwd:
+    # the launch threads the resolved workspace into load_effective_config.
+    assert load_config_workspaces and all(
+        ws == str(worktree.resolve()) for ws in load_config_workspaces
+    ), (
+        f"Codex config must load from the worktree {worktree.resolve()!r}; "
+        f"load_effective_config saw {load_config_workspaces!r}"
+    )
+
     assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
 
     # Sandbox-override regression: the launched Codex terminal must inherit

@@ -82,6 +82,49 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
     assert "agent is no longer available" not in payload["message"]
 
 
+def test_missing_workspace_classified_as_lifecycle_condition() -> None:
+    """A ``WORKSPACE_MISSING`` cause yields the distinct lifecycle code.
+
+    A session whose bound workspace was removed is a lifecycle condition, not
+    a terminal-startup defect: the payload must carry ``workspace_missing``
+    (not the generic startup-defect code) and an actionable message that names
+    the recovery steps rather than relabelling it a startup failure.
+    """
+    exc = OmnigentError(
+        "workspace path does not exist: /home/me/project",
+        code=ErrorCode.WORKSPACE_MISSING,
+    )
+
+    payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_1")
+
+    assert payload["code"] == ErrorCode.WORKSPACE_MISSING
+    message = payload["message"]
+    # Names the recovery actions instead of a generic startup defect.
+    assert "Native Claude terminal failed to start" not in message
+    assert "Restore" in message
+    assert "new session" in message
+    # Correlation id preserved so operators can cross-reference the log.
+    match = _ERROR_ID_RE.search(message)
+    assert match is not None, message
+    assert payload["error_id"] == match.group(1)
+
+
+def test_unrelated_missing_file_is_not_a_workspace_condition() -> None:
+    """Only the ``WORKSPACE_MISSING`` code selects the workspace branch.
+
+    A bare ``FileNotFoundError`` (e.g. a missing binary) is a startup defect,
+    not a removed-workspace lifecycle event, and must keep the generic code.
+    """
+    payload = _native_terminal_start_error_payload(
+        FileNotFoundError(2, "No such file or directory"),
+        "Claude",
+        session_id="conv_1",
+    )
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    assert "Restore that directory" not in payload["message"]
+
+
 @pytest.mark.parametrize(
     ("exc", "category"),
     [
@@ -89,6 +132,10 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
         (OSError(28, "No space left on device"), "host"),
         (
             OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
+            "user",
+        ),
+        (
+            OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING),
             "user",
         ),
     ],

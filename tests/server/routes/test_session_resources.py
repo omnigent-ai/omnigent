@@ -1734,6 +1734,51 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
 
 
 @pytest.mark.asyncio
+async def test_recreate_native_claude_missing_workspace_is_actionable_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """Recreating native Claude on a gone workspace is a typed 410, not an opaque 500.
+
+    This is the native recreation path: the ``omnigent claude`` wrapper
+    re-posts its own ``main`` terminal with ``ensure_native_terminal`` after
+    the session workspace was deleted. The runner refuses the launch with
+    ``workspace_missing``. The server derives the client-facing status from
+    that error *code*, so even a runner that labelled the refusal with a
+    different status surfaces as 410 ``workspace_missing`` carrying the
+    actionable path, instead of a generic 500 the client can't act on.
+    """
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"
+    runner_message = "workspace path does not exist: /home/me/gone"
+    fake_runner = _FakeRunnerClient(
+        responses={
+            path: (
+                500,
+                {"error": {"code": "workspace_missing", "message": runner_message}},
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        path,
+        json={
+            "terminal": "claude",
+            "session_key": "main",
+            "ensure_native_terminal": True,
+        },
+    )
+
+    assert resp.status_code == 410, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "workspace_missing"
+    # The runner's actionable path reaches the client unchanged.
+    assert body["error"]["message"] == runner_message
+    assert "id" not in body
+    # The recreation request reached the runner (bootstrap exemption applied).
+    assert fake_runner.calls == [("POST", path)]
+
+
+@pytest.mark.asyncio
 async def test_sign_in_link_proxies_to_runner(
     client: httpx.AsyncClient,
 ) -> None:

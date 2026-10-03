@@ -1372,6 +1372,216 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_loads_project_config_from_session_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Host-spawned launch reads ``harness.claude-native`` config from the
+    resolved workspace, not the process cwd.
+
+    The workspace's project ``.omnigent/config.yaml`` args win over a
+    conflicting global config, so they reach the spawned terminal.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    # Global config carries a conflicting args override; the selected session
+    # workspace's project config must win because that is where the terminal
+    # launches and loads its configuration.
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    args: [--from-global]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    workspace = tmp_path / "session-workspace"
+    (workspace / ".omnigent").mkdir(parents=True)
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    args: [--from-workspace]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    session_id = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        instructions="Be a concise, careful coding assistant.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    await _auto_create_claude_terminal(
+        session_id,
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        agent_spec=agent_spec,
+    )
+
+    args = captured["spec"].args
+    assert "--from-workspace" in args, f"workspace project config not applied: {args!r}"
+    assert "--from-global" not in args, f"global config leaked over workspace: {args!r}"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_prefers_snapshot_workspace_over_runner_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The explicit session-snapshot workspace wins over the runner-env fallback.
+
+    When the session snapshot carries a workspace, the launch resolves it
+    ahead of ``OMNIGENT_RUNNER_WORKSPACE`` and loads config from there, so
+    the snapshot workspace's project args reach the spawned terminal even
+    when the runner env points elsewhere.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    args: [--from-global]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    # The runner env points at a different workspace with its own config; the
+    # snapshot workspace must take precedence over this fallback.
+    runner_env_workspace = tmp_path / "runner-env-workspace"
+    (runner_env_workspace / ".omnigent").mkdir(parents=True)
+    (runner_env_workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    args: [--from-runner-env]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(runner_env_workspace))
+
+    snapshot_workspace = tmp_path / "snapshot-workspace"
+    (snapshot_workspace / ".omnigent").mkdir(parents=True)
+    (snapshot_workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    args: [--from-snapshot]\n"
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    session_id = "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7"
+    session_init = RunnerSessionInitEnvelope.model_validate(
+        {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": "agent",
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": str(snapshot_workspace),
+                "labels": {},
+            },
+        }
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        instructions="Be a concise, careful coding assistant.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    await _auto_create_claude_terminal(
+        session_id,
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        agent_spec=agent_spec,
+        session_init=session_init,
+    )
+
+    args = captured["spec"].args
+    assert "--from-snapshot" in args, f"snapshot workspace config not applied: {args!r}"
+    assert "--from-runner-env" not in args, f"runner-env fallback won over snapshot: {args!r}"
+    assert "--from-global" not in args, f"global config leaked over workspace: {args!r}"
+
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_inherits_agent_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1969,7 +2179,9 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    runner_workspace = tmp_path / "workspace"
+    runner_workspace.mkdir(exist_ok=True)
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(runner_workspace))
     # Pin the launch config to Claude's native auth so the test does not
     # depend on the runner process's ambient Databricks profile.
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
@@ -2127,7 +2339,9 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    runner_workspace = tmp_path / "workspace"
+    runner_workspace.mkdir(exist_ok=True)
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(runner_workspace))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
 
     # Write the previous claude_session_id into the bridge state.json *before*

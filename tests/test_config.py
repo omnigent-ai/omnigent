@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,39 @@ def test_effective_config_merges_project_over_user(
     monkeypatch.chdir(project)
 
     assert load_effective_config() == {"profile": "local", "model": "global-model"}
+
+
+def test_effective_config_reads_project_config_from_workspace_not_cwd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An explicit workspace supplies the project config even after cwd was removed."""
+    config_home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    config_home.mkdir()
+    (workspace / ".omnigent").mkdir(parents=True)
+    (config_home / "config.yaml").write_text(
+        "model: global-model\nharness:\n  claude-native:\n    args: [--verbose]\n"
+    )
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    command: /workspace/claude\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    launch_dir = tmp_path / "launch-dir"
+    launch_dir.mkdir()
+    monkeypatch.chdir(launch_dir)
+    launch_dir.rmdir()
+    with pytest.raises(FileNotFoundError):
+        os.getcwd()
+
+    cfg = load_effective_config(workspace=workspace)
+
+    assert cfg == {
+        "model": "global-model",
+        "harness": {"claude-native": {"args": ["--verbose"], "command": "/workspace/claude"}},
+    }
+    # The loader read the workspace directly rather than moving the process there.
+    with pytest.raises(FileNotFoundError):
+        os.getcwd()
 
 
 def test_github_account_preference_round_trip(tmp_path: Path) -> None:
