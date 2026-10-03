@@ -16,21 +16,21 @@ Usage::
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import logging
 import os
 import re
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
 _logger = logging.getLogger(__name__)
 
-# Built-in provider modules, in registration order. Each exposes ``PROVIDER``.
+# Built-in descriptors load before installed contributions. Each exposes ``PROVIDER``.
 PROVIDER_MODULES: tuple[str, ...] = ("omnigent.git_providers.github",)
-# Comma-separated extra provider modules, registered after the built-ins.
-PROVIDER_MODULES_ENV = "OMNIGENT_GIT_PROVIDER_MODULES"
+ENTRY_POINT_GROUP = "omnigent.git_providers"
 
 _FACET_KINDS = ("connection", "credential", "pull_requests", "policy")
 _SCP_REMOTE_HOST = re.compile(r"^[\w.\-]+@(?P<host>[\w.\-]+):")
@@ -150,89 +150,91 @@ def host_of(url: str) -> str | None:
     return host or None
 
 
-# Registry state. ``_providers`` is computed on first use; the lock is
-# re-entrant because a provider module may register more providers on import.
+# Discovery is cached for the process; provider facets remain lazy.
 _lock = threading.RLock()
 _providers: tuple[GitProvider, ...] | None = None
-_registered: dict[str, GitProvider] = {}
-# Ids of the providers whose descriptor already raised once in this process.
 _failed_descriptors: set[str] = set()
 _failed_descriptors_lock = threading.Lock()
 
 
-def _module_paths() -> list[str]:
-    """Return the built-in provider modules followed by the env-configured ones."""
-    extra = os.environ.get(PROVIDER_MODULES_ENV, "")
-    return [*PROVIDER_MODULES, *(path for entry in extra.split(",") if (path := entry.strip()))]
-
-
-def _load_module_providers() -> list[GitProvider]:
-    """Import each provider module and collect its ``PROVIDER``, skipping broken modules.
-
-    A module that raises any exception while it is imported or read is skipped, so one
-    broken module cannot hide the other providers.
-    """
-    loaded: list[GitProvider] = []
-    for module_path in _module_paths():
-        try:
-            module = importlib.import_module(module_path)
-            descriptor = getattr(module, "PROVIDER", None)
-            descriptor_id = getattr(descriptor, "id", None)
-        except Exception:  # noqa: BLE001 — a broken provider module must not stop the others
-            _logger.warning(
-                "Failed to import git provider module %s; skipping",
-                module_path,
-                exc_info=True,
+def _load_providers() -> tuple[GitProvider, ...]:
+    entries = [
+        importlib.metadata.EntryPoint(name=path, value=f"{path}:PROVIDER", group=ENTRY_POINT_GROUP)
+        for path in PROVIDER_MODULES
+    ]
+    try:
+        entries.extend(
+            sorted(
+                importlib.metadata.entry_points(group=ENTRY_POINT_GROUP),
+                key=lambda entry: (entry.name, entry.value),
             )
-            continue
-        if descriptor is None or not isinstance(descriptor_id, str):
-            _logger.warning("Git provider module %s has no usable PROVIDER; skipping", module_path)
-            continue
-        loaded.append(descriptor)
-    return loaded
-
-
-def _by_id(*descriptors: GitProvider) -> tuple[GitProvider, ...]:
-    """Keep first-seen order; a later provider with the same id replaces it in place."""
-    merged: dict[str, GitProvider] = {}
-    for descriptor in descriptors:
-        merged[descriptor.id] = descriptor
-    return tuple(merged.values())
+        )
+    except Exception:  # noqa: BLE001 — installed metadata must not hide built-ins
+        _logger.warning("Failed to discover git provider plugins", exc_info=True)
+    loaded: dict[str, GitProvider] = {}
+    for entry in entries:
+        try:
+            contribution = entry.load()
+            descriptor = contribution() if callable(contribution) else contribution
+            descriptor_id = getattr(descriptor, "id", None)
+            display_name = getattr(descriptor, "display_name", None)
+            if (
+                not isinstance(descriptor_id, str)
+                or re.fullmatch(r"[a-z][a-z0-9_-]*", descriptor_id) is None
+                or not isinstance(display_name, str)
+                or not display_name.strip()
+                or not isinstance(getattr(descriptor, "facets", None), FacetModules)
+                or not all(
+                    callable(getattr(descriptor, method, None))
+                    for method in ("matches_host", "parse_remote_url", "parse_pr_url")
+                )
+            ):
+                raise ValueError("Contribution must be a git provider descriptor or factory")
+            if descriptor_id in loaded:
+                raise ValueError(f"Provider id {descriptor_id!r} is already defined")
+            loaded[descriptor_id] = cast(GitProvider, descriptor)
+        except Exception:  # noqa: BLE001 — a broken plugin must not hide other providers
+            _logger.warning("Failed to load git provider %s; skipping", entry.name, exc_info=True)
+    return tuple(loaded.values())
 
 
 def providers() -> tuple[GitProvider, ...]:
-    """Return every provider: built-ins, env modules, then registered ones.
+    """Return built-ins and installed ``omnigent.git_providers`` entry points.
 
-    Provider modules are imported on the first call and the result is cached
-    until :func:`reset_for_tests`. A module that fails to import is skipped.
+    Contributions expose a lightweight descriptor or a zero-argument factory.
+    Duplicate IDs and broken contributions are skipped. Discovery runs once per
+    process; install a plugin in the host environment and restart to pick it up.
     """
     global _providers
     with _lock:
         if _providers is None:
-            _providers = _by_id(*_load_module_providers(), *_registered.values())
+            _providers = _load_providers()
         return _providers
 
 
 def provider(provider_id: str) -> GitProvider | None:
-    """Return the provider registered under *provider_id*, or ``None``."""
+    """Return the provider with *provider_id*, or ``None``."""
     return next((p for p in providers() if p.id == provider_id), None)
 
 
-def register_provider(descriptor: GitProvider) -> None:
-    """Add a provider; one with an existing id replaces that provider in place."""
-    global _providers
-    with _lock:
-        _registered[descriptor.id] = descriptor
-        if _providers is not None:
-            _providers = _by_id(*_providers, descriptor)
+def provider_display(provider_id: str) -> dict[str, str] | None:
+    """Return the provider's labels for shared pull request surfaces."""
+    descriptor = provider(provider_id)
+    if descriptor is None:
+        return None
+    return {
+        "id": descriptor.id,
+        "display_name": descriptor.display_name,
+        "request_name": getattr(descriptor, "request_name", "pull request"),
+        "number_prefix": getattr(descriptor, "number_prefix", "#"),
+    }
 
 
 def reset_for_tests() -> None:
-    """Forget loaded and registered providers, and past failures, so the next use starts over."""
+    """Forget cached discovery and failures so the next test starts cleanly."""
     global _providers
     with _lock:
         _providers = None
-        _registered.clear()
     with _failed_descriptors_lock:
         _failed_descriptors.clear()
 

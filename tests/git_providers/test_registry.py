@@ -1,4 +1,4 @@
-"""Git provider registry: loading order, registration, facets, and URL resolution."""
+"""Git provider registry: installed plugins, facets, and URL resolution."""
 
 from __future__ import annotations
 
@@ -8,11 +8,13 @@ import sys
 import types
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from importlib.metadata import EntryPoint, entry_points
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
 
+import omnigent.git_providers as registry
 from omnigent.git_providers import (
     EnvInstances,
     FacetModules,
@@ -22,8 +24,8 @@ from omnigent.git_providers import (
     host_of,
     load_facet,
     provider,
+    provider_display,
     providers,
-    register_provider,
     reset_for_tests,
     resolve_pr_url,
     resolve_remote,
@@ -38,7 +40,8 @@ GITLAB_MR = "https://git.example.test/g/s/p/-/merge_requests/7"
 @pytest.fixture(autouse=True)
 def _isolated_registry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     """Start from the built-in providers, with no ambient GitHub host configuration."""
-    for name in ("OMNIGENT_GIT_PROVIDER_MODULES", "OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "GH_HOST"):
+    monkeypatch.setattr(registry.importlib.metadata, "entry_points", lambda **_: ())
+    for name in ("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "GH_HOST"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
     reset_for_tests()
@@ -121,93 +124,109 @@ def _ids() -> list[str]:
     return [descriptor.id for descriptor in providers()]
 
 
-# ── Loading and registration ────────────────────────────────────────────────
+def _add_provider(descriptor: registry.GitProvider) -> None:
+    registry._providers = (*providers(), descriptor)
 
 
-def test_providers_load_on_first_use_and_stay_cached(monkeypatch: pytest.MonkeyPatch) -> None:
-    lookups: list[str] = []
-    module = types.ModuleType("gp_test_lazy_forge")
+def _plugins(monkeypatch: pytest.MonkeyPatch, *modules: str) -> None:
+    entries = tuple(
+        EntryPoint(name=name, value=f"{name}:PROVIDER", group=registry.ENTRY_POINT_GROUP)
+        for name in modules
+    )
+    monkeypatch.setattr(registry.importlib.metadata, "entry_points", lambda **_: entries)
 
-    def module_getattr(name: str) -> object:
-        if name != "PROVIDER":
-            raise AttributeError(name)
-        lookups.append(name)
+
+def test_plugins_load_on_first_use_and_stay_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def factory() -> FakeProvider:
+        calls.append("loaded")
         return FakeProvider("lazy")
 
-    module.__getattr__ = module_getattr
-    monkeypatch.setitem(sys.modules, "gp_test_lazy_forge", module)
-    # Set after the registry reset: modules are read on first use, not before.
-    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_MODULES", "gp_test_lazy_forge")
-    assert lookups == []
-
+    _provider_module(monkeypatch, "gp_test_lazy", factory)
+    _plugins(monkeypatch, "gp_test_lazy")
+    assert calls == []
     loaded = providers()
-
     assert [descriptor.id for descriptor in loaded] == ["github", "lazy"]
     assert loaded[0] is GITHUB
     assert providers() is loaded
-    assert lookups == ["PROVIDER"]
+    assert calls == ["loaded"]
 
 
-def test_env_modules_follow_builtins_and_broken_modules_are_skipped(
+def test_installed_plugins_follow_builtins_and_broken_plugins_are_skipped(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     _provider_module(monkeypatch, "gp_test_forge_a", FakeProvider("forge_a"))
     _provider_module(monkeypatch, "gp_test_forge_b", FakeProvider("forge_b"))
-    monkeypatch.setitem(
-        sys.modules, "gp_test_no_provider", types.ModuleType("gp_test_no_provider")
+    _provider_module(monkeypatch, "gp_test_invalid", object())
+    _plugins(
+        monkeypatch, "gp_test_forge_a", "gp_test_missing", "gp_test_invalid", "gp_test_forge_b"
     )
-    monkeypatch.setenv(
-        "OMNIGENT_GIT_PROVIDER_MODULES",
-        " gp_test_forge_a, gp_test_missing_module ,, gp_test_no_provider,gp_test_forge_b ",
-    )
-
     with caplog.at_level(logging.WARNING, logger="omnigent.git_providers"):
         assert _ids() == ["github", "forge_a", "forge_b"]
-
-    warnings = [record.getMessage() for record in caplog.records]
-    assert any("gp_test_missing_module" in message for message in warnings)
-    assert any("gp_test_no_provider" in message for message in warnings)
+    assert "gp_test_missing" in caplog.text
+    assert "gp_test_invalid" in caplog.text
 
 
-def test_registered_providers_follow_env_modules(monkeypatch: pytest.MonkeyPatch) -> None:
-    _provider_module(monkeypatch, "gp_test_forge_env", FakeProvider("forge_env"))
-    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_MODULES", "gp_test_forge_env")
-    register_provider(FakeProvider("registered"))
-
-    assert _ids() == ["github", "forge_env", "registered"]
-
-
-@pytest.mark.parametrize("loaded_first", [False, True])
-def test_register_provider_replaces_an_existing_id_in_place(loaded_first: bool) -> None:
-    if loaded_first:
-        providers()
-    register_provider(FakeProvider("gitlab"))
-    replacement = FakeProvider("github", display_name="Replacement")
-    register_provider(replacement)
-    newer_gitlab = FakeProvider("gitlab", display_name="Newer")
-    register_provider(newer_gitlab)
-
-    assert _ids() == ["github", "gitlab"]
-    assert provider("github") is replacement
-    assert provider("gitlab") is newer_gitlab
-
-
-def test_reset_for_tests_forgets_registered_providers() -> None:
-    register_provider(FakeProvider("gitlab"))
-    register_provider(FakeProvider("github", display_name="Replacement"))
-
-    reset_for_tests()
-
-    assert _ids() == ["github"]
+def test_plugins_cannot_replace_builtins_or_other_plugins(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    original = FakeProvider("forge")
+    _provider_module(monkeypatch, "gp_test_a", original)
+    _provider_module(monkeypatch, "gp_test_b", FakeProvider("forge", display_name="Replacement"))
+    _provider_module(monkeypatch, "gp_test_c", FakeProvider("github", display_name="Replacement"))
+    _plugins(monkeypatch, "gp_test_c", "gp_test_b", "gp_test_a")
+    assert _ids() == ["github", "forge"]
     assert provider("github") is GITHUB
-    assert provider("gitlab") is None
+    assert provider("forge") is original
+    assert "already defined" in caplog.text
+
+
+def test_broken_discovery_keeps_github_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(**_: object) -> object:
+        raise RuntimeError("broken package metadata")
+
+    monkeypatch.setattr(registry.importlib.metadata, "entry_points", broken)
+    parsed = resolve_pr_url("https://github.com/o/r/pull/7")
+    assert parsed is not None and parsed.provider == "github"
+
+
+def test_installed_distribution_contributes_a_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    distribution = tmp_path / "example_forge-1.0.dist-info"
+    distribution.mkdir()
+    (distribution / "METADATA").write_text("Name: example-forge\nVersion: 1.0\n")
+    (distribution / "entry_points.txt").write_text(
+        "[omnigent.git_providers]\nexample = gp_test_packaged:PROVIDER\n"
+    )
+    descriptor = FakeProvider("example", default_hosts=("forge.example.test",))
+    _provider_module(monkeypatch, "gp_test_packaged", descriptor)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(registry.importlib.metadata, "entry_points", entry_points)
+
+    parsed = resolve_pr_url("https://forge.example.test/o/r/pull/7")
+
+    assert provider("example") is descriptor
+    assert parsed is not None and parsed.provider == "example"
+
+
+def test_plugin_labels_are_optional() -> None:
+    _add_provider(FakeProvider("forge"))
+    assert provider_display("forge") == {
+        "id": "forge",
+        "display_name": "Fake",
+        "request_name": "pull request",
+        "number_prefix": "#",
+    }
+    assert provider_display("missing") is None
 
 
 # ── Facets ──────────────────────────────────────────────────────────────────
 
 
 def _register_forge_facets(**facets: str) -> None:
-    register_provider(FakeProvider("forge", facets=FacetModules(**facets)))
+    _add_provider(FakeProvider("forge", facets=FacetModules(**facets)))
 
 
 def test_load_facet_returns_none_when_the_provider_or_facet_is_unset() -> None:
@@ -303,8 +322,8 @@ def test_env_instances_read_the_provider_host_list(monkeypatch: pytest.MonkeyPat
 
 def test_a_provider_that_claims_the_host_wins_over_earlier_host_agnostic_ones() -> None:
     # GitHub (registered first) parses PR URLs on any host, as does "agnostic".
-    register_provider(FakeProvider("agnostic", any_host=True))
-    register_provider(FakeProvider("claimer", default_hosts=("git.example.test",)))
+    _add_provider(FakeProvider("agnostic", any_host=True))
+    _add_provider(FakeProvider("claimer", default_hosts=("git.example.test",)))
 
     pull_request = resolve_pr_url(GITHUB_SHAPED_PR)
     remote = resolve_remote("https://git.example.test/owner/repo.git")
@@ -314,8 +333,8 @@ def test_a_provider_that_claims_the_host_wins_over_earlier_host_agnostic_ones() 
 
 
 def test_unclaimed_hosts_fall_back_to_registration_order() -> None:
-    register_provider(FakeProvider("agnostic", any_host=True))
-    register_provider(FakeProvider("claimer", default_hosts=("git.example.test",)))
+    _add_provider(FakeProvider("agnostic", any_host=True))
+    _add_provider(FakeProvider("claimer", default_hosts=("git.example.test",)))
 
     pull_request = resolve_pr_url("https://other.example.test/owner/repo/pull/7")
     remote = resolve_remote("https://other.example.test/owner/repo.git")
@@ -328,7 +347,7 @@ def test_unclaimed_hosts_fall_back_to_registration_order() -> None:
 def test_resolution_reads_configured_instances_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    register_provider(FakeProvider("claimer"))
+    _add_provider(FakeProvider("claimer"))
     monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_CLAIMER_HOSTS", "git.example.test")
 
     parsed = resolve_pr_url(GITHUB_SHAPED_PR)
@@ -341,7 +360,7 @@ def test_explicit_instances_replace_the_environment() -> None:
         def hosts_for(self, provider_id: str) -> frozenset[str]:
             return frozenset({"git.example.test"} if provider_id == "claimer" else ())
 
-    register_provider(FakeProvider("claimer"))
+    _add_provider(FakeProvider("claimer"))
 
     from_env = resolve_pr_url(GITHUB_SHAPED_PR)
     configured = resolve_pr_url(GITHUB_SHAPED_PR, Configured())
@@ -353,7 +372,7 @@ def test_explicit_instances_replace_the_environment() -> None:
 def test_pull_request_ref_uses_a_registered_gitlab_descriptor() -> None:
     with pytest.raises(ValueError):
         PullRequestRef.from_url(GITLAB_MR)
-    register_provider(FakeGitLab())
+    _add_provider(FakeGitLab())
 
     reference = PullRequestRef.from_url(GITLAB_MR)
 
@@ -419,9 +438,7 @@ def test_a_provider_module_that_raises_at_import_is_skipped(
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     _provider_module(monkeypatch, "gp_test_forge_after", FakeProvider("forge_after"))
-    monkeypatch.setenv(
-        "OMNIGENT_GIT_PROVIDER_MODULES", "gp_test_provider_raises,gp_test_forge_after"
-    )
+    _plugins(monkeypatch, "gp_test_provider_raises", "gp_test_forge_after")
 
     with caplog.at_level(logging.WARNING, logger=REGISTRY_LOGGER):
         ids = _ids()
@@ -448,7 +465,7 @@ def test_a_provider_module_whose_provider_attribute_raises_is_skipped(
 
     module.__getattr__ = module_getattr
     monkeypatch.setitem(sys.modules, "gp_test_provider_attribute_raises", module)
-    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_MODULES", "gp_test_provider_attribute_raises")
+    _plugins(monkeypatch, "gp_test_provider_attribute_raises")
 
     with caplog.at_level(logging.WARNING, logger=REGISTRY_LOGGER):
         assert _ids() == ["github"]
@@ -461,7 +478,7 @@ def test_a_provider_module_whose_provider_attribute_raises_is_skipped(
 def test_a_descriptor_that_raises_does_not_stop_pull_request_resolution(method: str) -> None:
     # It would parse the URL if asked, so GitHub's answer shows that it was skipped.
     raising = RaisingProvider("raising", frozenset({method}), parses=True)
-    register_provider(raising)
+    _add_provider(raising)
 
     parsed = resolve_pr_url(GITHUB_SHAPED_PR)
 
@@ -472,8 +489,8 @@ def test_a_descriptor_that_raises_does_not_stop_pull_request_resolution(method: 
 @pytest.mark.parametrize("method", ["matches_host", "parse_remote_url"])
 def test_a_descriptor_that_raises_does_not_stop_remote_resolution(method: str) -> None:
     raising = RaisingProvider("raising", frozenset({method}))
-    register_provider(raising)
-    register_provider(FakeProvider("agnostic", any_host=True))
+    _add_provider(raising)
+    _add_provider(FakeProvider("agnostic", any_host=True))
 
     remote = resolve_remote("https://git.example.test/owner/repo.git")
 
@@ -484,7 +501,7 @@ def test_a_descriptor_that_raises_does_not_stop_remote_resolution(method: str) -
 def test_a_failing_descriptor_warns_once_then_logs_at_debug(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    register_provider(RaisingProvider("raising", frozenset({"matches_host"})))
+    _add_provider(RaisingProvider("raising", frozenset({"matches_host"})))
 
     with caplog.at_level(logging.DEBUG, logger=REGISTRY_LOGGER):
         for _ in range(3):
@@ -503,8 +520,8 @@ def test_a_failing_descriptor_warns_once_then_logs_at_debug(
 def test_each_failing_descriptor_warns_once_across_its_methods(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    register_provider(RaisingProvider("first", frozenset({"matches_host", "parse_pr_url"})))
-    register_provider(RaisingProvider("second", frozenset({"matches_host"})))
+    _add_provider(RaisingProvider("first", frozenset({"matches_host", "parse_pr_url"})))
+    _add_provider(RaisingProvider("second", frozenset({"matches_host"})))
 
     with caplog.at_level(logging.DEBUG, logger=REGISTRY_LOGGER):
         # No provider parses this URL, so each descriptor is asked for its claim and its parse.
@@ -535,7 +552,7 @@ def test_reset_for_tests_lets_the_next_failure_warn_again(
 ) -> None:
     with caplog.at_level(logging.DEBUG, logger=REGISTRY_LOGGER):
         for _ in range(2):
-            register_provider(RaisingProvider("raising", frozenset({"matches_host"})))
+            _add_provider(RaisingProvider("raising", frozenset({"matches_host"})))
             resolve_pr_url(GITHUB_SHAPED_PR)
             reset_for_tests()
 

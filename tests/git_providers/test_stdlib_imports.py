@@ -22,18 +22,13 @@ def _run_isolated(body: str) -> subprocess.CompletedProcess[str]:
     """Run *body* in a fresh ``python -I`` that resolves ``omnigent`` like this process.
 
     ``-I`` ignores ``PYTHONPATH``, so the probe adopts this process's import roots
-    itself. Extra provider modules from the environment are left out.
+    itself.
     """
     roots = [path for path in sys.path if path]
     probe = f"import sys\nsys.path[:0] = {roots!r}\n{body}"
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.endswith("_GIT_PROVIDER_MODULES")
-    }
     return subprocess.run(
         [sys.executable, "-I", "-c", probe],
-        env=env,
+        env=os.environ.copy(),
         capture_output=True,
         text=True,
         timeout=budget(120),

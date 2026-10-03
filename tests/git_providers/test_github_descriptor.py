@@ -36,7 +36,6 @@ _MAX_DNS_HOST = ".".join(["a" * 63] * 3 + ["a" * 61])
 def gh_config_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
     """Hide ambient GitHub host configuration; yield an empty gh config dir."""
     for name in (
-        "OMNIGENT_GIT_PROVIDER_MODULES",
         "OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS",
         "GH_HOST",
         "XDG_CONFIG_HOME",
@@ -55,7 +54,6 @@ def test_descriptor_is_the_registered_github_provider() -> None:
     assert PROVIDER.id == "github"
     assert PROVIDER.display_name == "GitHub"
     assert PROVIDER.default_hosts == ("github.com",)
-    assert PROVIDER.facets.pull_requests == "omnigent.runner.git_providers.github"
 
 
 # ── Pull request URLs ───────────────────────────────────────────────────────
