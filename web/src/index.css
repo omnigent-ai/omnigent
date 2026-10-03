@@ -843,6 +843,17 @@ aside[aria-label="Workspace"][data-maximized] {
   height: 2.25rem;
   -webkit-app-region: drag;
 }
+/* Screens mounted outside the AppShell (login / register / setup / approve) render
+ * this strip (ElectronWindowDragStrip, mac shell only) so the frameless window stays
+ * draggable. Fixed so it rides the window; edge to edge, no title-bar cluster here. */
+.electron-standalone-drag-strip {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 2.25rem;
+  -webkit-app-region: drag;
+  /* Keeps the strip from swallowing clicks; the geometric drag region still works. */
+  pointer-events: none;
+}
 /* The title-bar cluster (Search/Settings/toggle), pinned beside the traffic
  * lights and independent of the sidebar — that independence is the point: it
  * holds this exact spot whether the sidebar is open, collapsed, or peeking.
@@ -904,10 +915,11 @@ aside[aria-label="Workspace"][data-maximized] {
   .workspace-tab-strip {
   padding-left: 10.5rem;
 }
-/* Drag regions are geometric, not z-ordered: anything that overlaps the
- * strip (e.g. the mobile full-screen sidebar overlay) would lose clicks
- * without an explicit counter-region on interactive elements. */
-[data-electron-mac] :is(a, button, input, textarea, [role="button"]) {
+/* Drag regions are geometric, not z-ordered: anything that overlaps a strip (the
+ * mobile full-screen sidebar overlay, an auth card scrolled under the standalone
+ * strip) would lose clicks without an explicit counter-region on interactive elements. */
+[data-electron-mac] :is(a, button, input, textarea, [role="button"]),
+body:has(.electron-standalone-drag-strip) :is(a, button, input, textarea, [role="button"]) {
   -webkit-app-region: no-drag;
 }
 /* The title-bar breadcrumb doubles as a window-drag handle (its title is a
