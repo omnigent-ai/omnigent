@@ -107,7 +107,7 @@ describe("FlatFileList status / download alignment", () => {
     const size = screen.getByText("2.0 KB");
     const slot = size.parentElement;
     expect(slot).toHaveClass("relative");
-    expect(size).toHaveClass("group-hover:invisible");
+    expect(size).toHaveClass("group-hover:invisible", "group-focus-within:invisible");
     const download = screen.getByRole("button", { name: /download app\.ts/i });
     const overlay = download.closest("span.absolute") as HTMLElement | null;
     expect(overlay).not.toBeNull();
@@ -216,7 +216,7 @@ describe("FlatFileList canonical row actions", () => {
     });
 
     fireEvent.contextMenu(screen.getByText(path.split("/").at(-1) ?? path));
-    await user.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Copy relative path" }));
     expect(copyTextMock).toHaveBeenCalledWith(path);
   });
 });

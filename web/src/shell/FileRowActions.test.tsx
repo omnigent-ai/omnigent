@@ -63,9 +63,11 @@ function renderActions(
   const onOpenInfo = vi.fn();
   const actions = (
     <FileRowActions {...file} downloadable onOpenInfo={onOpenInfo} {...props}>
-      {(moreActions, rowRef) => (
+      {(moreActions, rowRef, primaryActionRef) => (
         <div ref={rowRef} data-testid="file-row" tabIndex={-1}>
-          <button type="button">Open {props.name ?? file.name}</button>
+          <button ref={primaryActionRef} type="button">
+            Open {props.name ?? file.name}
+          </button>
           {moreActions}
         </div>
       )}
@@ -90,7 +92,12 @@ describe("FileRowActions", () => {
     fireEvent.contextMenu(row);
     const contextMenu = await screen.findByRole("menu");
     const contextLabels = menuLabels(contextMenu);
-    expect(contextLabels).toEqual(["Download", "Copy path", "Show in Finder", "File info"]);
+    expect(contextLabels).toEqual([
+      "Download",
+      "Copy relative path",
+      "Show in Finder",
+      "File info",
+    ]);
     await user.keyboard("{Escape}");
 
     await user.click(screen.getByRole("button", { name: `More actions for ${file.name}` }));
@@ -112,7 +119,7 @@ describe("FileRowActions", () => {
     const menu = await screen.findByRole("menu");
     expect(menuLabels(menu)).toEqual([
       "Browse folder",
-      "Copy path",
+      "Copy relative path",
       "Open in Finder",
       "Folder info",
     ]);
@@ -133,7 +140,7 @@ describe("FileRowActions", () => {
 
     fireEvent.contextMenu(screen.getByTestId("file-row"));
     expect(menuLabels(await screen.findByRole("menu"))).toEqual([
-      "Copy path",
+      "Copy relative path",
       "File info (last known)",
     ]);
   });
@@ -148,8 +155,8 @@ describe("FileRowActions", () => {
 
     fireEvent.contextMenu(screen.getByTestId("file-row"));
     const menu = await screen.findByRole("menu");
-    expect(menuLabels(menu)).toEqual(["Download", "Copy path", "File info"]);
-    await user.click(within(menu).getByRole("menuitem", { name: "Copy path" }));
+    expect(menuLabels(menu)).toEqual(["Download", "Copy absolute path", "File info"]);
+    await user.click(within(menu).getByRole("menuitem", { name: "Copy absolute path" }));
     expect(copyTextMock).toHaveBeenCalledWith("/tmp/duplicate #.txt");
 
     fireEvent.contextMenu(screen.getByTestId("file-row"));
@@ -176,7 +183,11 @@ describe("FileRowActions", () => {
       await user.keyboard("{Escape}");
 
       expect(screen.getByTestId("drawer")).toHaveAttribute("data-state", "open");
-      expect(entry === "context menu" ? row : kebab).toHaveFocus();
+      expect(
+        entry === "context menu"
+          ? screen.getByRole("button", { name: `Open ${file.name}` })
+          : kebab,
+      ).toHaveFocus();
     },
   );
 
@@ -191,12 +202,13 @@ describe("FileRowActions", () => {
     expect(kebab).toHaveFocus();
   });
 
-  it("opens Info without a request and returns focus to the row", async () => {
+  it("opens Info without a request and returns its focus target", async () => {
     const user = userEvent.setup();
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     const { onOpenInfo } = renderActions();
     const row = screen.getByTestId("file-row");
-    row.focus();
+    const primary = screen.getByRole("button", { name: `Open ${file.name}` });
+    primary.focus();
     fireEvent.contextMenu(row);
     await user.click(await screen.findByRole("menuitem", { name: "File info" }));
 
@@ -211,8 +223,28 @@ describe("FileRowActions", () => {
         linesAdded: 4,
         linesRemoved: 2,
       }),
-      row,
+      primary,
     );
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("passes the kebab as the Info focus target when opened from its menu", async () => {
+    const user = userEvent.setup();
+    const { onOpenInfo } = renderActions();
+    const kebab = screen.getByRole("button", { name: `More actions for ${file.name}` });
+
+    await user.click(kebab);
+    await user.click(await screen.findByRole("menuitem", { name: "File info" }));
+
+    expect(onOpenInfo.mock.calls[0]?.[1]).toBe(kebab);
+  });
+
+  it("omits Browse folder when no browse action is provided", async () => {
+    renderActions({ kind: "folder", name: "src", path: "src", revealPath: null });
+
+    fireEvent.contextMenu(screen.getByTestId("file-row"));
+
+    expect(await screen.findByRole("menuitem", { name: "Folder info" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Browse folder" })).not.toBeInTheDocument();
   });
 });

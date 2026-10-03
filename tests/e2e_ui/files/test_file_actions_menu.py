@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from tests.e2e_ui.conftest import open_right_rail
 
 _FILE_NAME = "row actions Ω report.txt"
 _FILE_CONTENT = "file-row-actions-menu-e2e-content"
+_TOUCH_FOLDER = "touch actions folder"
 
 
 def _seed_file(page: Page, base_url: str, session_id: str, request: pytest.FixtureRequest) -> Path:
@@ -37,7 +39,7 @@ def test_file_row_context_menu_kebab_info_and_copy(
     seeded_session: tuple[str, str],
     request: pytest.FixtureRequest,
 ) -> None:
-    """Exercise pointer, keyboard, Info, and Copy path entry points."""
+    """Exercise pointer, keyboard, Info, and relative-path copy entry points."""
     base_url, session_id = seeded_session
     _seed_file(page, base_url, session_id, request)
     page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
@@ -49,7 +51,7 @@ def test_file_row_context_menu_kebab_info_and_copy(
 
     row.click(button="right")
     expect(page.get_by_role("menuitem", name="Download")).to_be_visible()
-    expect(page.get_by_role("menuitem", name="Copy path")).to_be_visible()
+    expect(page.get_by_role("menuitem", name="Copy relative path")).to_be_visible()
     expect(page.get_by_role("menuitem", name="File info")).to_be_visible()
     expect(
         page.get_by_role("menuitem", name=re.compile("Finder|File Explorer|file manager"))
@@ -62,26 +64,95 @@ def test_file_row_context_menu_kebab_info_and_copy(
     expect(info).to_contain_text("file")
     expect(info).to_contain_text("Changes")
     info.get_by_role("button", name="Close").click()
-    expect(row).to_be_focused()
+    expect(panel.get_by_role("button", name=_FILE_NAME, exact=True)).to_be_focused()
 
     row.focus()
     row.press("ContextMenu")
     expect(page.get_by_role("menuitem", name="File info")).to_be_visible()
     page.keyboard.press("Escape")
+    expect(panel.get_by_role("button", name=_FILE_NAME, exact=True)).to_be_focused()
 
     kebab = panel.get_by_role("button", name=f"More actions for {_FILE_NAME}")
     kebab.focus()
     kebab.press("Enter")
-    expect(page.get_by_role("menuitem", name="Copy path")).to_be_visible()
+    expect(page.get_by_role("menuitem", name="Copy relative path")).to_be_visible()
     page.keyboard.press("Escape")
     expect(kebab).to_be_focused()
     kebab.click()
-    page.get_by_role("menuitem", name="Copy path").click()
+    page.get_by_role("menuitem", name="File info").click()
+    info.get_by_role("button", name="Close").click()
+    expect(kebab).to_be_focused()
+    kebab.click()
+    page.get_by_role("menuitem", name="Copy relative path").click()
     page.wait_for_function(
         "expected => navigator.clipboard.readText().then(text => text === expected)",
         arg=_FILE_NAME,
     )
     assert page.evaluate("() => navigator.clipboard.readText()") == _FILE_NAME
+
+
+def test_size_does_not_overlap_actions_on_keyboard_focus_or_open_menu(
+    page: Page,
+    seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+) -> None:
+    """Tree, search, and Changes rows keep their size clear of visible actions."""
+    base_url, session_id = seeded_session
+    _seed_file(page, base_url, session_id, request)
+    page.route(
+        re.compile(
+            rf"/v1/sessions/{re.escape(session_id)}/resources/environments/[^/]+/changes(\?|$)"
+        ),
+        lambda route: route.fulfill(
+            json={
+                "data": [
+                    {
+                        "path": _FILE_NAME,
+                        "name": _FILE_NAME,
+                        "status": "created",
+                        "bytes": len(_FILE_CONTENT),
+                        "modified_at": None,
+                        "lines_added": None,
+                        "lines_removed": None,
+                    }
+                ]
+            }
+        ),
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role("tab", name=re.compile("^Files")).click()
+
+    def check_row(row: Locator) -> None:
+        page.mouse.move(0, 0)
+        row.locator('button:not([aria-label^="More actions for"])').first.focus()
+        kebab = row.get_by_role("button", name=re.compile("^More actions for"))
+        _assert_size_does_not_overlap_kebab(row)
+        kebab.click()
+        page.mouse.move(0, 0)
+        expect(page.get_by_role("menuitem", name="File info")).to_be_visible()
+        _assert_size_does_not_overlap_kebab(row)
+        page.keyboard.press("Escape")
+
+    row = page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_FILE_NAME).last
+    expect(row).to_be_visible(timeout=30_000)
+    check_row(row)
+
+    search = panel.get_by_role("searchbox", name="Search all files")
+    search.fill(_FILE_NAME)
+    search_row = (
+        page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_FILE_NAME).last
+    )
+    expect(search_row).to_be_visible(timeout=30_000)
+    check_row(search_row)
+
+    panel.get_by_role("tab", name=re.compile("^Changes")).click()
+    changes_row = (
+        page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_FILE_NAME).last
+    )
+    expect(changes_row).to_be_visible(timeout=30_000)
+    check_row(changes_row)
 
 
 @pytest.fixture
@@ -90,11 +161,20 @@ def touch_files_page(
     page: Page,
     seeded_session: tuple[str, str],
     request: pytest.FixtureRequest,
+    tmp_path: Path,
 ) -> tuple[Page, Locator]:
     """Open the Files drawer in a touch-enabled browser context."""
     base_url, session_id = seeded_session
-    _seed_file(page, base_url, session_id, request)
-    context = browser.new_context(has_touch=True, viewport={"width": 390, "height": 844})
+    seeded_file = _seed_file(page, base_url, session_id, request)
+    folder = seeded_file.parent / _TOUCH_FOLDER
+    folder.mkdir()
+    (folder / "inside.txt").write_text("folder hold", encoding="utf-8")
+    request.addfinalizer(lambda: shutil.rmtree(folder, ignore_errors=True))
+    context = browser.new_context(
+        has_touch=True,
+        viewport={"width": 390, "height": 844},
+        record_video_dir=tmp_path,
+    )
     page = context.new_page()
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_role("button", name="Conversation actions").click()
@@ -133,7 +213,6 @@ def test_touch_long_press_opens_menu_without_opening_file(
 ) -> None:
     """A stationary hold opens actions without triggering the row click."""
     page, row = touch_files_page
-    before = row.get_attribute("aria-expanded")
     cdp = page.context.new_cdp_session(page)
     point = _touch_point(row)
     _assert_touch_point_hits(row, point)
@@ -146,7 +225,60 @@ def test_touch_long_press_opens_menu_without_opening_file(
     expect(row).to_be_visible()
     expect(page.locator('[data-testid="file-viewer"]:visible')).to_have_count(0)
     assert row.evaluate("element => getComputedStyle(element).userSelect") == "none"
-    assert row.get_attribute("aria-expanded") == before
+
+
+def test_touch_long_press_release_does_not_toggle_folder(
+    touch_files_page: tuple[Page, Locator],
+) -> None:
+    """Releasing a folder hold leaves its expansion state unchanged."""
+    page, _ = touch_files_page
+    folder = page.locator("button[aria-expanded]").filter(has_text=_TOUCH_FOLDER).last
+    expect(folder).to_be_visible()
+    before = folder.get_attribute("aria-expanded")
+    assert before == "false"
+    point = _touch_point(folder)
+    row = folder.locator("xpath=..")
+    _assert_touch_point_hits(row, point)
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
+    try:
+        page.wait_for_timeout(900)
+        expect(page.get_by_role("menuitem", name="Browse folder")).to_be_visible()
+    finally:
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+    assert folder.get_attribute("aria-expanded") == before
+
+
+def _assert_size_does_not_overlap_kebab(row: Locator) -> None:
+    expect(row.locator('button[aria-label^="More actions for"]')).to_have_css("opacity", "1")
+    layout = row.evaluate(
+        """row => {
+          const kebab = row.querySelector('button[aria-label^="More actions for"]');
+          const sizes = [...row.querySelectorAll('span.text-sm.text-muted-foreground')];
+          const size = sizes.find(element =>
+            /\\d+(?:\\.\\d+)?\\s+[KMGT]?B/.test(element.textContent || '')
+          );
+          if (!kebab || !size) return null;
+          const a = size.getBoundingClientRect();
+          const b = kebab.getBoundingClientRect();
+          return {
+            visibility: getComputedStyle(size).visibility,
+            opacity: getComputedStyle(kebab).opacity,
+            overlap: a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top,
+          };
+        }"""
+    )
+    assert layout is not None, "expected a size label and row kebab"
+    assert layout["visibility"] == "hidden" or not layout["overlap"], layout
+
+
+def test_coarse_pointer_idle_hides_size_under_kebab(
+    touch_files_page: tuple[Page, Locator],
+) -> None:
+    """At rest on a coarse pointer, the visible kebab has clear space."""
+    page, row = touch_files_page
+    assert page.evaluate("() => matchMedia('(pointer: coarse)').matches")
+    _assert_size_does_not_overlap_kebab(row)
 
 
 def test_touch_scroll_hold_does_not_open_menu(touch_files_page: tuple[Page, Locator]) -> None:
