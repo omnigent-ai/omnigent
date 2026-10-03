@@ -188,7 +188,9 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Cursor",
     iconKind: "cursor",
     sortRank: 30,
-    capabilities: ["cursorMode"],
+    // The host lists `cursor-agent models` before launch, so the pick rides
+    // `model_override` into the first cursor-agent process.
+    capabilities: ["cursorMode", "modelPicker"],
   },
   {
     key: "pi",

@@ -1776,30 +1776,66 @@ describe("NewChatLandingScreen initial picker loading", () => {
     );
   });
 
-  it.each([
-    { harness: "cursor-native", label: "Cursor" },
-    { harness: "opencode-native", label: "OpenCode" },
-  ])("does not request unrelated model catalogs for $label", ({ harness, label }) => {
+  it.each([{ harness: "opencode-native", label: "OpenCode" }])(
+    "does not request unrelated model catalogs for $label",
+    ({ harness, label }) => {
+      mockAgents([
+        {
+          id: "a_no_models",
+          name: `${harness}-ui`,
+          display_name: label,
+          description: null,
+          harness,
+          skills: [],
+        },
+      ]);
+      mockModelQueries(() => pendingModels);
+      renderLanding();
+
+      expect(expectReadyPicker()).toHaveAccessibleName(new RegExp(label));
+      expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+        "host_1",
+        "claude-native",
+        false,
+        expect.any(Object),
+      );
+    },
+  );
+
+  it("waits only for the selected host's Cursor catalog before showing Cursor", () => {
     mockAgents([
       {
-        id: "a_no_models",
-        name: `${harness}-ui`,
-        display_name: label,
+        id: "a_cursor",
+        name: "cursor-native-ui",
+        display_name: "Cursor",
         description: null,
-        harness,
+        harness: "cursor-native",
         skills: [],
       },
     ]);
     mockModelQueries(() => pendingModels);
     renderLanding();
 
-    expect(expectReadyPicker()).toHaveAccessibleName(new RegExp(label));
+    const loading = expectLoading();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "cursor-native", true, {
+      poll: true,
+    });
     expect(useHostModelOptionsMock).toHaveBeenCalledWith(
       "host_1",
       "claude-native",
       false,
       expect.any(Object),
     );
+    editDraft("Cursor is still listing models");
+    expect(expectLoading()).toBe(loading);
+
+    const cursorModels = {
+      ...SUCCESS_QUERY_STATE,
+      data: [{ id: "auto", displayName: "Auto", isDefault: true }],
+    };
+    mockModelQueries((harness) => (harness === "cursor-native" ? cursorModels : pendingModels));
+    editDraft("Cursor models arrived");
+    expect(expectReadyPicker()).toHaveAccessibleName(/Cursor.*Auto/);
   });
 
   it("waits for project config, pinned agents, and the configured host's model before showing its defaults", () => {
@@ -3856,10 +3892,15 @@ describe("NewChatLandingScreen", () => {
         fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
       }
 
-      if (["claude", "codex", "pi", "devin"].includes(native.key)) {
+      if (["claude", "codex", "pi", "devin", "cursor"].includes(native.key)) {
         fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
         expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
-        expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+        // Cursor's efforts are model variants, not a separate axis.
+        if (native.key === "cursor") {
+          expect(screen.queryByTestId("new-chat-landing-agent-efforts")).toBeNull();
+        } else {
+          expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+        }
         expect(screen.queryByText("Advanced settings")).toBeNull();
       } else {
         expect(screen.queryByTestId(`new-chat-landing-agent-config-${agentId}`)).toBeNull();
@@ -7170,6 +7211,179 @@ describe("NewChatLandingScreen", () => {
 });
 
 // Bundled and host skills can be selected before a session exists.
+describe("NewChatLandingScreen Cursor launch-time models", () => {
+  const CURSOR_SOURCE = { kind: "subscription", label: "Subscription", name: "cursor-agent" };
+  const CURSOR_AGENT: AvailableAgent = {
+    id: "a_cursor",
+    name: "cursor-native-ui",
+    display_name: "Cursor",
+    description: null,
+    harness: "cursor-native",
+    skills: [],
+  };
+  // Stable per-host results: the picker's reseed effects key on their identity.
+  const HOST_1_CURSOR_MODELS = {
+    ...SUCCESS_QUERY_STATE,
+    data: [
+      { id: "auto", displayName: "Auto", isDefault: true, source: CURSOR_SOURCE },
+      { id: "grok-4.7", displayName: "Grok 4.7", source: CURSOR_SOURCE },
+    ],
+  };
+  const HOST_2_CURSOR_MODELS = {
+    ...SUCCESS_QUERY_STATE,
+    data: [
+      { id: "auto", displayName: "Auto", isDefault: true, source: CURSOR_SOURCE },
+      { id: "composer-2.5", displayName: "Composer 2.5", source: CURSOR_SOURCE },
+    ],
+  };
+  const SIGNED_OUT = {
+    ...SUCCESS_QUERY_STATE,
+    status: "error",
+    isSuccess: false,
+    isError: true,
+    data: undefined,
+    error: new Error(
+      "cursor-agent models exited with status 1; if Cursor is signed out on this host, run 'cursor-agent login'",
+    ),
+  } as const;
+
+  beforeEach(() => {
+    setupLandingMocks();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function mockCursorCatalogs(byHost: Record<string, unknown>) {
+    useHostModelOptionsMock.mockImplementation(
+      (hostId, harness, enabled = true) =>
+        (hostId !== null && enabled && harness === "cursor-native"
+          ? (byHost[hostId] ?? DISABLED_QUERY_RESULT)
+          : harness === "claude-native" && hostId !== null && enabled
+            ? CLAUDE_MODEL_OPTIONS_RESULT
+            : DISABLED_QUERY_RESULT) as ReturnType<typeof useHostModelOptions>,
+    );
+  }
+
+  function sessionCreates() {
+    return authenticatedFetchMock.mock.calls.filter(([url]) => url === "/v1/sessions");
+  }
+
+  it("lists the selected host's Cursor models before any session exists and pins the pick", async () => {
+    mockAgents([CURSOR_AGENT]);
+    mockCursorCatalogs({ host_1: HOST_1_CURSOR_MODELS });
+    renderLanding();
+
+    openAgentModels("a_cursor");
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "cursor-native", true, {
+      poll: true,
+    });
+    expect(screen.getByTestId("new-chat-landing-agent-model-grok-4.7")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-efforts")).toBeNull();
+    expect(sessionCreates()).toHaveLength(0);
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-grok-4.7"));
+    closeMenu();
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Grok 4.7");
+
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("grok-4.7");
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(sessionCreates()).toHaveLength(1);
+  });
+
+  it("explains a failed Cursor lookup and launches on Cursor's own default", async () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "cursor-native": { model: "grok-4.7" } }),
+    );
+    mockAgents([CURSOR_AGENT]);
+    mockCursorCatalogs({ host_1: SIGNED_OUT });
+    renderLanding();
+
+    openAgentModels("a_cursor");
+    const models = screen.getByTestId("new-chat-landing-agent-models").closest("[role=menu]")!;
+    expect(models).toHaveTextContent("run 'cursor-agent login'");
+    expect(screen.queryByTestId("new-chat-landing-agent-model-grok-4.7")).toBeNull();
+    closeMenu();
+
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBeUndefined();
+  });
+
+  it("replaces the Cursor list and drops a pick the new host does not offer", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_1");
+    localStorage.setItem(
+      RECENT_KEY,
+      JSON.stringify({ host_1: ["/Users/corey/repo"], host_2: ["/work/repo"] }),
+    );
+    mockHosts([host("online", 1), host("online", 2)]);
+    mockAgents([CURSOR_AGENT]);
+    mockCursorCatalogs({ host_1: HOST_1_CURSOR_MODELS, host_2: HOST_2_CURSOR_MODELS });
+    renderLanding();
+
+    openAgentModels("a_cursor");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-grok-4.7"));
+    closeMenu();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_2"));
+    await waitFor(() =>
+      expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+        "host_2",
+        "cursor-native",
+        true,
+        expect.any(Object),
+      ),
+    );
+
+    openAgentModels("a_cursor");
+    expect(screen.queryByTestId("new-chat-landing-agent-model-grok-4.7")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-model-composer-2.5")).toBeTruthy();
+    closeMenu();
+
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBeUndefined();
+  });
+
+  it("does not carry another harness's model into a Cursor launch", async () => {
+    localStorage.setItem(LAST_AGENT_KEY, "a1");
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { model: "opus", effort: "high" } }),
+    );
+    mockAgents([...DEFAULT_LANDING_AGENTS, CURSOR_AGENT]);
+    mockCursorCatalogs({ host_1: HOST_1_CURSOR_MODELS });
+    renderLanding();
+
+    selectUnconfiguredAgent("a_cursor");
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("restores a remembered Cursor model the host still offers", async () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "cursor-native": { model: "grok-4.7" } }),
+    );
+    mockAgents([CURSOR_AGENT]);
+    mockCursorCatalogs({ host_1: HOST_1_CURSOR_MODELS });
+    renderLanding();
+
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Grok 4.7");
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("grok-4.7");
+  });
+});
+
 describe("NewChatLandingScreen skills menu", () => {
   beforeEach(() => {
     setupLandingMocks();

@@ -668,14 +668,203 @@ async def test_handle_model_options_rejects_unsupported_harness() -> None:
     host = _make_host_process()
 
     result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_models", harness="cursor-native"),
+        HostModelOptionsFrame(request_id="req_models", harness="kiro-native"),
     )
 
     assert result == HostModelOptionsResultFrame(
         request_id="req_models",
         status="failed",
-        error="model options are unsupported for harness 'cursor-native'",
+        error="model options are unsupported for harness 'kiro-native'",
     )
+
+
+_CURSOR_MODELS_STDOUT = """Available models
+
+auto - Auto (default)
+gpt-5.3-codex-high - Codex 5.3 High
+claude-opus-5-5-high - Claude Opus 5.5 High
+claude-opus-5-5-max - Claude Opus 5.5 Max
+composer-2.5 - Composer 2.5 (current)
+"""
+
+
+async def test_handle_model_options_lists_cursor_models_from_host_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cursor's launch picker runs ``cursor-agent models`` on the host, no runner needed."""
+    from omnigent.harnesses.cursor_native import main as cursor_native
+
+    monkeypatch.setattr(
+        cursor_native, "resolve_cursor_executable", lambda **_: "/opt/cursor-agent"
+    )
+    run = Mock(return_value=SimpleNamespace(stdout=_CURSOR_MODELS_STDOUT))
+    monkeypatch.setattr(cursor_native, "subprocess", SimpleNamespace(run=run))
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_cursor", harness="cursor-native"),
+    )
+
+    source = {"kind": "subscription", "label": "Subscription", "name": "cursor-agent"}
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_cursor",
+        status="ok",
+        models=[
+            {
+                "id": "auto",
+                "displayName": "Auto",
+                "isDefault": True,
+                "isCurrent": False,
+                "source": source,
+            },
+            {
+                "id": "gpt-5.3-codex",
+                "displayName": "Codex 5.3",
+                "isDefault": False,
+                "isCurrent": False,
+                "source": source,
+            },
+            {
+                "id": "claude-opus-5-5",
+                "displayName": "Claude Opus 5.5",
+                "isDefault": False,
+                "isCurrent": False,
+                "source": source,
+            },
+            {
+                "id": "composer-2.5",
+                "displayName": "Composer 2.5",
+                "isDefault": False,
+                "isCurrent": True,
+                "source": source,
+            },
+        ],
+        routable_models=["auto", "gpt-5.3-codex", "claude-opus-5-5", "composer-2.5"],
+    )
+    assert run.call_args.args[0] == ["/opt/cursor-agent", "models"]
+
+
+async def test_handle_model_options_cursor_discovery_runs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The blocking CLI call must not stall the host tunnel's receive loop."""
+    from omnigent.harnesses.cursor_native import main as cursor_native
+
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+
+    def _discover() -> list[cursor_native.CursorModelOption]:
+        threads.append(threading.get_ident())
+        return [{"id": "auto", "displayName": "Auto", "isDefault": True, "isCurrent": True}]
+
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", _discover)
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_cursor", harness="cursor-native"),
+    )
+
+    assert result.status == "ok"
+    assert threads and threads[0] != loop_thread
+
+
+async def test_handle_model_options_missing_cursor_cli_is_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A host without cursor-agent answers with install guidance, not a host-log warning."""
+    from omnigent.harnesses.cursor_native import main as cursor_native
+
+    monkeypatch.setattr(cursor_native, "resolve_cli_binary", lambda *_args, **_kwargs: None)
+    run = Mock(side_effect=AssertionError("a missing CLI must not spawn a subprocess"))
+    monkeypatch.setattr(cursor_native, "subprocess", SimpleNamespace(run=run))
+    host = _make_host_process()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        result = await host._handle_model_options(
+            HostModelOptionsFrame(request_id="req_cursor", harness="cursor-native"),
+        )
+
+    assert result.status == "failed"
+    assert result.models == []
+    assert result.error is not None
+    assert "requires the 'cursor-agent' CLI" in result.error
+    run.assert_not_called()
+    assert not caplog.records
+
+
+@pytest.mark.parametrize(
+    ("failure", "error"),
+    [
+        (
+            # What a signed-out cursor-agent does: exit 1 with an auth error.
+            subprocess.CalledProcessError(1, "cursor-agent", stderr="Authentication required."),
+            "cursor-agent models exited with status 1; "
+            "if Cursor is signed out on this host, run 'cursor-agent login'",
+        ),
+        (
+            subprocess.TimeoutExpired("cursor-agent", 10),
+            "cursor-agent models timed out on this host",
+        ),
+        (
+            ValueError("cursor-agent model list did not contain any valid models"),
+            "failed to resolve Cursor model options",
+        ),
+    ],
+)
+async def test_handle_model_options_cursor_probe_failure_is_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
+    error: str,
+) -> None:
+    """A failed or empty Cursor listing is a failed lookup, never an empty catalog."""
+    from omnigent.harnesses.cursor_native import main as cursor_native
+
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", Mock(side_effect=failure))
+    host = _make_host_process()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        result = await host._handle_model_options(
+            HostModelOptionsFrame(request_id="req_cursor", harness="cursor-native"),
+        )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_cursor", status="failed", error=error
+    )
+    record = next(r for r in caplog.records if r.message.startswith("Cursor model catalog"))
+    assert record.exc_info is not None
+    assert record.exc_info[1] is failure
+
+
+async def test_handle_model_options_cursor_recovers_after_failed_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient failure is not remembered: the next request re-probes the CLI."""
+    from omnigent.harnesses.cursor_native import main as cursor_native
+
+    monkeypatch.setattr(
+        cursor_native, "resolve_cursor_executable", lambda **_: "/opt/cursor-agent"
+    )
+    run = Mock(
+        side_effect=[
+            subprocess.TimeoutExpired("cursor-agent", 10),
+            SimpleNamespace(stdout=_CURSOR_MODELS_STDOUT),
+        ]
+    )
+    monkeypatch.setattr(cursor_native, "subprocess", SimpleNamespace(run=run))
+    host = _make_host_process()
+
+    first = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="first", harness="cursor-native"),
+    )
+    second = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="second", harness="cursor-native"),
+    )
+
+    assert first.status == "failed"
+    assert second.status == "ok"
+    assert [model["id"] for model in second.models][:2] == ["auto", "gpt-5.3-codex"]
 
 
 async def test_handle_model_options_reports_the_endpoints_wider_catalog(

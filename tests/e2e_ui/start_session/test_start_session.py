@@ -2127,6 +2127,117 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_select_cursor_model_before_first_message(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Cursor lists the host's models before any session exists; the pick rides the create."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_cursor_model(base_url, session_id))
+
+
+async def _drive_cursor_model(base_url: str, session_id: str) -> None:
+    agent_id = "ag_cursor_e2e"
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=json.dumps(
+                    {
+                        "data": [
+                            {
+                                "id": agent_id,
+                                "name": "cursor-native-ui",
+                                "display_name": "Cursor",
+                                "harness": "cursor-native",
+                                "skills": [],
+                            }
+                        ]
+                    }
+                ),
+            )
+            # What the host answers after running ``cursor-agent models``.
+            source = {"kind": "subscription", "label": "Subscription", "name": "cursor-agent"}
+            catalog_requests: list[int] = []
+
+            async def handle_cursor_models(route: Route) -> None:
+                catalog_requests.append(len(create_bodies))
+                await route.fulfill(
+                    json={
+                        "models": [
+                            {
+                                "id": "auto",
+                                "displayName": "Auto",
+                                "isDefault": True,
+                                "source": source,
+                            },
+                            {"id": "grok-4.7", "displayName": "Grok 4.7", "source": source},
+                            {
+                                "id": "composer-2.5",
+                                "displayName": "Composer 2.5",
+                                "source": source,
+                            },
+                        ]
+                    }
+                )
+
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
+                lambda route: route.fulfill(json={"data": []}),
+            )
+            await page.route(
+                f"**/v1/hosts/{_HOST_ID}/harnesses/cursor-native/model-options",
+                handle_cursor_models,
+            )
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(
+                timeout=30_000
+            )
+            await _open_entry_models(page, agent_id)
+            await expect(page.get_by_test_id("new-chat-landing-agent-models")).to_be_visible()
+            default_row = page.locator(
+                '[data-testid^="new-chat-landing-agent-model-"][aria-checked="true"]'
+            )
+            await expect(default_row).to_contain_text("Auto")
+            await page.get_by_role("menuitemcheckbox", name="Grok 4.7", exact=True).click()
+            await _close_entry_models(page)
+            picker = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(picker).to_contain_text("Grok 4.7")
+            # The catalog came from the host with no session created yet.
+            assert catalog_requests and catalog_requests[0] == 0, catalog_requests
+            assert create_bodies == []
+
+            # Cursor's execution mode still rides the hand menu next to the model.
+            permission = page.get_by_test_id("new-chat-landing-permission-chip")
+            await permission.click()
+            await page.get_by_test_id("new-chat-landing-permission-option-plan").click()
+            await expect(permission).to_contain_text("Plan")
+
+            await page.get_by_test_id("new-chat-landing-input").fill("inspect this repository")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == agent_id, body
+            assert body["host_id"] == _HOST_ID, body
+            assert body.get("model_override") == "grok-4.7", body
+            assert body.get("reasoning_effort") is None, body
+            assert body.get("terminal_launch_args") == ["--mode", "plan"], body
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
     """A safer approval preset clears bypass and reaches the create call.
 
@@ -3698,7 +3809,6 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
 @pytest.mark.parametrize(
     ("native_name", "mode", "mode_label", "launch_args"),
     [
-        ("cursor", "plan", "Plan", ["--mode", "plan"]),
         (
             "antigravity",
             "skip",

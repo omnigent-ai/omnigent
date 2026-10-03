@@ -3079,6 +3079,13 @@ export function NewChatLandingScreen() {
     canLoadHostModels("pi-native"),
     { poll: selectedNativeHarness === "pi-native" },
   );
+  const {
+    data: hostCursorModelOptions,
+    isLoading: hostCursorModelsLoading,
+    error: hostCursorModelsError,
+  } = useHostModelOptions(selectedHostId, "cursor-native", canLoadHostModels("cursor-native"), {
+    poll: selectedNativeHarness === "cursor-native",
+  });
   // Keep this host's cached choices while requests wait for readiness.
   // A fetched catalog, including an empty one, takes precedence.
   const cachedHostModels =
@@ -3122,6 +3129,12 @@ export function NewChatLandingScreen() {
     hostPiModelOptions,
     hostPiModelsLoading,
     cachedHostModels?.pi,
+  );
+  const availableCursorModels = availableHostModels(
+    "cursor-native",
+    hostCursorModelOptions,
+    hostCursorModelsLoading,
+    cachedHostModels?.cursor,
   );
   const {
     data: hostDevinModelOptions,
@@ -3205,6 +3218,12 @@ export function NewChatLandingScreen() {
             source: option.source,
           })),
     [availablePiModels, sandboxSelected, sandboxCatalog],
+  );
+  // Base Cursor models from the host's `cursor-agent models`; each id is a
+  // valid `--model` value for the first cursor-agent process.
+  const cursorModelOptions = useMemo(
+    () => (sandboxSelected ? (sandboxCatalog ?? []) : (availableCursorModels ?? [])),
+    [availableCursorModels, sandboxSelected, sandboxCatalog],
   );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsDevinMode = nativeAgentHasCapability(selectedAgent, "devinMode");
@@ -3294,7 +3313,7 @@ export function NewChatLandingScreen() {
       // Routing inherits the picked harness's defaults, not a previous selection's mode.
       return [{ label: "Permission mode", value: AUTO_PERMISSION_MODE.label }];
     }
-    if (supportsModelPicker && !supportsPermissionMode) {
+    if (supportsModelPicker && !supportsPermissionMode && !supportsCursorMode) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ??
         defaultModelLabel(piModelOptions);
@@ -3376,7 +3395,20 @@ export function NewChatLandingScreen() {
     if (supportsCursorMode) {
       const modeValue =
         CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.label ?? cursorExecMode;
-      return [{ label: "Mode", value: modeValue }, ...routingRow];
+      const pickedCursorRow = cursorModelOptions.find((m) => m.id === pickedModel);
+      const modelRows = routingOn
+        ? routingRow
+        : [
+            {
+              label: "Model",
+              value: visibleModelLabel(
+                pickedCursorRow
+                  ? nativeModelLabel(pickedCursorRow)
+                  : defaultModelLabel(cursorModelOptions),
+              ),
+            },
+          ];
+      return [...modelRows, { label: "Mode", value: modeValue }, ...sourceRows(cursorModelOptions)];
     }
     if (supportsAgySkipPermissions) {
       const skipValue =
@@ -3413,6 +3445,7 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    cursorModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -3440,9 +3473,11 @@ export function NewChatLandingScreen() {
         ? devinModelOptions
         : selectedNativeHarness === "pi-native"
           ? piModelOptions
-          : selectedNativeHarness === "codex-native"
-            ? codexModelOptions
-            : [];
+          : selectedNativeHarness === "cursor-native"
+            ? cursorModelOptions
+            : selectedNativeHarness === "codex-native"
+              ? codexModelOptions
+              : [];
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     sandboxCatalogPending ||
@@ -3456,7 +3491,9 @@ export function NewChatLandingScreen() {
             ? hostPiModelsLoading
             : selectedNativeHarness === "devin-native"
               ? hostDevinModelsLoading
-              : false));
+              : selectedNativeHarness === "cursor-native"
+                ? hostCursorModelsLoading
+                : false));
   const pickerModelsError = sandboxSelected
     ? sandboxCatalogError
       ? new Error(sandboxCatalogError)
@@ -3467,7 +3504,9 @@ export function NewChatLandingScreen() {
         ? hostCodexModelsError
         : selectedNativeHarness === "devin-native"
           ? hostDevinModelsError
-          : null;
+          : selectedNativeHarness === "cursor-native"
+            ? hostCursorModelsError
+            : null;
   const pickerDataLoading =
     sandboxCatalogPending ||
     agentsLoading ||
@@ -3521,6 +3560,7 @@ export function NewChatLandingScreen() {
               claude: availableClaudeModels,
               codex: availableCodexModels,
               pi: availablePiModels,
+              cursor: availableCursorModels,
             },
           }
         : null,
@@ -3533,6 +3573,7 @@ export function NewChatLandingScreen() {
       availableClaudeModels,
       availableCodexModels,
       availablePiModels,
+      availableCursorModels,
     ],
   );
   useEffect(() => {
@@ -3882,6 +3923,7 @@ export function NewChatLandingScreen() {
     "codex-native": availableCodexModels,
     "pi-native": availablePiModels,
     "devin-native": hostDevinModelOptions,
+    "cursor-native": availableCursorModels,
   };
   const pickerEntrySummaries = Object.fromEntries(
     [...harnessEntries, ...agentEntries].map((agent) => {
@@ -3903,7 +3945,9 @@ export function NewChatLandingScreen() {
               ? piModelOptions
               : native.iconKind === "devin"
                 ? devinModelOptions
-                : [];
+                : native.iconKind === "cursor"
+                  ? cursorModelOptions
+                  : [];
       const savedFusion = fusionOption(catalog)?.fusion;
       // Preserve saved IDs while host data is absent; an empty result is authoritative.
       const hostCatalogUnavailable =
@@ -4004,9 +4048,11 @@ export function NewChatLandingScreen() {
         ? claudeModelOptions
         : selectedNativeHarness === "devin-native"
           ? devinModelOptions
-          : selectedNativeHarness === "codex-native"
-            ? codexModelOptions
-            : [];
+          : selectedNativeHarness === "cursor-native"
+            ? cursorModelOptions
+            : selectedNativeHarness === "codex-native"
+              ? codexModelOptions
+              : [];
   const projectDefaultModelValid =
     projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
       ? projectDefaultModel
@@ -4123,6 +4169,15 @@ export function NewChatLandingScreen() {
       );
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
+      // Only a row from this host's Cursor catalog may seed; another harness's
+      // pick left in the shared state must not ride a Cursor create.
+      setPickedModel(
+        projectSeed(cursorModelOptions) ??
+          (stored.model != null && cursorModelOptions.some((m) => m.id === stored.model)
+            ? stored.model
+            : ""),
+      );
+      setPickedEffort("");
     } else if (supportsAgySkipPermissions) {
       setAgySkipMode(resolve(AGY_NATIVE_SKIP_MODES, AGY_NATIVE_DEFAULT_SKIP_MODE));
     } else if (supportsDevinPermission) {
@@ -4141,6 +4196,7 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    cursorModelOptions,
     projectDefaultModel,
   ]);
   useEffect(() => {
