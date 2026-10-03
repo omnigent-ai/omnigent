@@ -1,6 +1,6 @@
-import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
+import { type KeyboardEvent, type RefObject, useEffect, useState } from "react";
 
-import type { MentionItem, MentionState } from "@/lib/composerMentions";
+import { parseMentionToken, type MentionItem, type MentionState } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -62,19 +62,13 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const [mentionedItems, setMentionedItems] = useState<MentionItem[]>([]);
   const mentionOpen = mentionEntries.length > 0;
 
-  // Pre-select the top row whenever the listing changes — lets Enter/Tab act on
-  // the top hit without arrowing first. Keyed by type+path so a file and a dir
-  // of the same name stay distinct. (Render-phase state adjustment, the React
-  // "store-previous-props" pattern — mirrors the slash menu's reset.)
-  const prevMentionMatchesRef = useRef<string[]>([]);
-  const mentionEntryKeys = mentionEntries.map((e) => `${e.type}:${e.path}`);
-  if (
-    mentionEntryKeys.length !== prevMentionMatchesRef.current.length ||
-    mentionEntryKeys.some((k, i) => k !== prevMentionMatchesRef.current[i])
-  ) {
-    prevMentionMatchesRef.current = mentionEntryKeys;
-    setMentionIndex(mentionEntryKeys.length > 0 ? 0 : -1);
-  }
+  // Pre-select the top row whenever the listing changes — lets Enter attach or
+  // ArrowRight open the top hit without arrowing first. The serialized key also
+  // distinguishes a file and directory that happen to share a path.
+  const mentionEntryKey = mentionEntries.map((entry) => `${entry.type}:${entry.path}`).join("\0");
+  useEffect(() => {
+    setMentionIndex(mentionEntries.length > 0 ? 0 : -1);
+  }, [mentionEntryKey, mentionEntries.length]);
 
   const attachMention = (path: string, isDir: boolean) => {
     if (!mention) return;
@@ -97,19 +91,30 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     });
   };
 
-  const openMentionDir = (path: string) => {
+  const replaceMentionQuery = (query: string) => {
     if (!mention) return;
-    const inserted = `@${path}/`;
+    const inserted = query ? `@${query}/` : "@";
     const next = text.slice(0, mention.start) + inserted + text.slice(mention.end);
     setText(next);
     const caret = mention.start + inserted.length;
-    setMention({ query: `${path}/`, start: mention.start, end: caret });
+    setMention({ query: query ? `${query}/` : "", start: mention.start, end: caret });
     setMentionIndex(0);
     queueMicrotask(() => {
       const ta = textareaRef.current;
       if (ta) ta.setSelectionRange(caret, caret);
       ta?.focus();
     });
+  };
+
+  const openMentionDir = (path: string) => replaceMentionQuery(path);
+
+  const openMentionParent = () => {
+    if (!mention) return false;
+    const { dir } = parseMentionToken(mention.query);
+    if (!dir) return false;
+    const slash = dir.lastIndexOf("/");
+    replaceMentionQuery(slash >= 0 ? dir.slice(0, slash) : "");
+    return true;
   };
 
   const removeMentionedItem = (index: number) =>
@@ -122,6 +127,11 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
+    const plainKey = !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey;
+    if (e.key === "ArrowLeft" && plainKey && openMentionParent()) {
+      e.preventDefault();
+      return true;
+    }
     if (!mentionOpen) return false;
     const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
     if (e.key === "ArrowDown") {
@@ -134,17 +144,17 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
       return true;
     }
-    // Enter: open a folder (drill in) or attach a file. Tab: attach the
-    // highlighted row as a unit — whole folder or file — without drilling.
+    // Enter attaches the highlighted file or whole folder. ArrowRight opens a
+    // folder; ArrowLeft returns to its parent. Tab and Backspace keep their
+    // native behavior.
     if (e.key === "Enter" && !e.shiftKey && !isMobile && active) {
       e.preventDefault();
-      if (active.type === "directory") openMentionDir(active.path);
-      else attachMention(active.path, false);
+      attachMention(active.path, active.type === "directory");
       return true;
     }
-    if (e.key === "Tab" && active) {
+    if (e.key === "ArrowRight" && plainKey && active?.type === "directory") {
       e.preventDefault();
-      attachMention(active.path, active.type === "directory");
+      openMentionDir(active.path);
       return true;
     }
     if (e.key === "Escape") {

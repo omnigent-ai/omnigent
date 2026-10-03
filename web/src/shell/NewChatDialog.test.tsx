@@ -30,7 +30,16 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  createEvent,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Profiler, type ProfilerOnRenderCallback } from "react";
 import { MemoryRouter } from "react-router-dom";
@@ -8104,6 +8113,36 @@ describe("NewChatLandingScreen @-file-mention", () => {
     } finally {
       restoreViewport();
     }
+  });
+
+  it("uses Enter to attach, arrows to browse, and leaves Tab native", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const composer = input();
+    fireEvent.change(composer, { target: { value: "@", selectionStart: 1 } });
+    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.keyDown(composer, { key: "ArrowRight" });
+    expect((composer as HTMLTextAreaElement).value).toBe("@omnigent/");
+    expect(screen.getByTitle("Attach cli.py")).toBeInTheDocument();
+
+    fireEvent.keyDown(composer, { key: "ArrowLeft" });
+    expect((composer as HTMLTextAreaElement).value).toBe("@");
+    expect(screen.getByTitle("Open omnigent")).toBeInTheDocument();
+
+    const backspace = createEvent.keyDown(composer, { key: "Backspace" });
+    fireEvent(composer, backspace);
+    expect(backspace.defaultPrevented).toBe(false);
+
+    const tab = createEvent.keyDown(composer, { key: "Tab" });
+    fireEvent(composer, tab);
+    expect(tab.defaultPrevented).toBe(false);
+    expect(screen.queryByText("@omnigent/")).not.toBeInTheDocument();
+
+    fireEvent.keyDown(composer, { key: "Enter" });
+    expect(screen.getByText("@omnigent/")).toBeInTheDocument();
   });
 
   it("does NOT open the menu for a non-native (SDK) agent", () => {

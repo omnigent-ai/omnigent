@@ -5,7 +5,7 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -364,25 +364,45 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.getByText("@readme.md")).toBeInTheDocument();
   });
 
-  it("Enter on a directory row drills in rather than attaching", () => {
+  it("Enter on a directory row attaches the whole directory", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
-    // Row 0 is the "src" folder: Enter must open it (reveal nested files), and
-    // must NOT produce a chip — drilling is navigation, not attachment. (The
-    // token becomes "@src/" in the textarea; a chip would instead surface a
-    // "Remove src" button, which must be absent.)
+    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("aria-selected", "true");
+    // Row 0 is the "src" folder: Enter attaches it as a unit rather than
+    // drilling into it. ArrowRight is the folder-navigation key.
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Remove src")).not.toBeInTheDocument();
+    expect(screen.getByText("@src/")).toBeInTheDocument();
   });
 
-  it("Tab attaches the highlighted folder as a whole-directory unit", () => {
+  it("ArrowRight opens a directory and ArrowLeft returns to its parent", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
-    // Tab on the "src" folder attaches it as a unit (trailing-slash chip),
-    // distinct from Enter's drill-in.
-    fireEvent.keyDown(textarea(), { key: "Tab" });
-    expect(screen.getByText("@src/")).toBeInTheDocument();
+    const ta = textarea();
+
+    fireEvent.keyDown(ta, { key: "ArrowRight" });
+    expect(ta.value).toBe("@src/");
+    expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
+
+    fireEvent.keyDown(ta, { key: "ArrowLeft" });
+    expect(ta.value).toBe("@");
+    expect(screen.getByTitle("Open src")).toBeInTheDocument();
+  });
+
+  it("Backspace keeps its native editing behavior", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    const backspace = createEvent.keyDown(textarea(), { key: "Backspace" });
+    fireEvent(textarea(), backspace);
+    expect(backspace.defaultPrevented).toBe(false);
+  });
+
+  it("Tab keeps its native focus behavior instead of attaching a mention", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    const tab = createEvent.keyDown(textarea(), { key: "Tab" });
+    fireEvent(textarea(), tab);
+    expect(tab.defaultPrevented).toBe(false);
+    expect(screen.queryByText("@src/")).not.toBeInTheDocument();
   });
 
   it("Escape closes the mention menu", () => {
