@@ -46,6 +46,7 @@ import {
   LaptopIcon,
   LayoutDashboardIcon,
   Loader2Icon,
+  PaletteIcon,
   MailIcon,
   MailOpenIcon,
   MessageCircleDashedIcon,
@@ -411,6 +412,7 @@ function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
   isCanvasPage: boolean;
+  isDesignPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
@@ -423,6 +425,7 @@ function useActiveNavItem(): {
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
   const isCanvasPage = !isExtensionRoute && leaf === "canvas";
+  const isDesignPage = !isExtensionRoute && leaf === "design";
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
@@ -431,6 +434,7 @@ function useActiveNavItem(): {
     activeConversationId == null &&
     !isInboxPage &&
     !isCanvasPage &&
+    !isDesignPage &&
     !isTasksPage &&
     !isUsagePage &&
     !isExtensionRoute;
@@ -446,6 +450,7 @@ function useActiveNavItem(): {
     isNewChatPage,
     isInboxPage,
     isCanvasPage,
+    isDesignPage,
     isTasksPage,
     isUsagePage,
     activeExtensionPageId,
@@ -598,6 +603,7 @@ function SidebarImpl({
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
+  const designEnabled = isFeatureEnabled(serverInfo, "design");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -722,6 +728,7 @@ function SidebarImpl({
     isNewChatPage,
     isInboxPage,
     isCanvasPage,
+    isDesignPage,
     isTasksPage,
     isUsagePage,
     activeExtensionPageId,
@@ -1171,6 +1178,17 @@ function SidebarImpl({
                   onClick={onNavClick}
                   componentId="sidebar.canvas"
                   testId="canvas-nav"
+                />
+              )}
+              {designEnabled && (
+                <PrimaryNavLink
+                  to="/design"
+                  label="Design"
+                  icon={PaletteIcon}
+                  active={isDesignPage}
+                  onClick={onNavClick}
+                  componentId="sidebar.design"
+                  testId="design-nav"
                 />
               )}
               <ExtensionPrimaryNavigation

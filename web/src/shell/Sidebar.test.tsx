@@ -1063,6 +1063,31 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("hides Design navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/design", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { canvas: true },
+    });
+
+    expect(screen.queryByTestId("design-nav")).toBeNull();
+  });
+
+  it("renders and highlights the Design nav row without lighting New session", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/design?session=conv_a&file=deck.slides.html", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { design: true },
+    });
+
+    const design = screen.getByTestId("design-nav");
+    expect(design).toHaveAttribute("href", "/design");
+    expect(design).toHaveTextContent("Design");
+    expect(design).toHaveAttribute("aria-current", "page");
+    expect(design).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it("keeps filtering visible while session selection remains hover-revealed", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
