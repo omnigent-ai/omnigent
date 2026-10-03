@@ -9,12 +9,15 @@
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  CURSOR_LEFT_CSI,
+  CURSOR_LEFT_SS3,
   SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
   decodeTerminalClipboardBase64,
   hadRecentTerminalInput,
+  imeInsertRealignment,
   isUnexpectedTerminalClose,
   loadWebglRenderer,
   openTerminalLink,
@@ -366,6 +369,47 @@ describe("terminalKeyEventPayload", () => {
     expect(
       terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
     ).toBeNull();
+  });
+});
+
+describe("imeInsertRealignment", () => {
+  it("realigns an auto-inserted pair that left the caret inside", () => {
+    expect(imeInsertRealignment("", "()", 1)).toEqual({
+      moveLeft: 1,
+      stagedValue: "(",
+    });
+  });
+
+  it("realigns a pair appended after previously staged text", () => {
+    expect(imeInsertRealignment("(", "(b)", 2)).toEqual({
+      moveLeft: 1,
+      stagedValue: "(b",
+    });
+  });
+
+  it("is a no-op when the caret sits at the end of the value", () => {
+    expect(imeInsertRealignment("", "你好", 2)).toBeNull();
+  });
+
+  it("moves one cell per code point, not per UTF-16 unit", () => {
+    expect(imeInsertRealignment("", "a😀😀", 1)).toEqual({
+      moveLeft: 2,
+      stagedValue: "a",
+    });
+  });
+
+  it("refuses a caret inside text staged before this event", () => {
+    expect(imeInsertRealignment("()", "()!", 1)).toBeNull();
+  });
+
+  it("refuses changes that are not a pure append", () => {
+    expect(imeInsertRealignment("(a)", "(b)", 2)).toBeNull();
+    expect(imeInsertRealignment("()", "()", 1)).toBeNull();
+    expect(imeInsertRealignment("()", "(", 0)).toBeNull();
+  });
+
+  it("is a no-op without a caret position", () => {
+    expect(imeInsertRealignment("", "()", null)).toBeNull();
   });
 });
 
@@ -1207,6 +1251,179 @@ describe("TerminalSession", () => {
     const { container, session } = makeSession();
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
+    session.dispose();
+  });
+
+  it("realigns the cursor and composition anchor after an IME auto-pair", async () => {
+    // The PTY must receive the pair, cursor-left, then candidate; never preedit.
+    const settle = () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+
+    const fire229 = (type: string) => {
+      const ev = new KeyboardEvent(type, { key: "Process", bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "keyCode", { get: () => 229 });
+      textarea.dispatchEvent(ev);
+    };
+    const compositionInput = (data: string) =>
+      textarea.dispatchEvent(
+        new InputEvent("input", {
+          data,
+          inputType: "insertCompositionText",
+          bubbles: true,
+          composed: true,
+        }),
+      );
+
+    fire229("keydown");
+    textarea.value = "()";
+    textarea.selectionStart = 1;
+    textarea.selectionEnd = 1;
+    textarea.dispatchEvent(
+      new InputEvent("input", {
+        data: "()",
+        inputType: "insertText",
+        bubbles: true,
+        composed: true,
+      }),
+    );
+    fire229("keyup");
+    await settle();
+
+    // CompositionHelper anchors at the end of the unstaged value.
+    expect(textarea.value).toBe("(");
+    expect(textarea.selectionStart).toBe(1);
+
+    // Compose "ni" at the in-pair caret.
+    fire229("keydown");
+    textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    textarea.value = "(n";
+    textarea.selectionStart = 2;
+    textarea.selectionEnd = 2;
+    textarea.dispatchEvent(new CompositionEvent("compositionupdate", { data: "n", bubbles: true }));
+    compositionInput("n");
+    fire229("keyup");
+    await settle();
+    fire229("keydown");
+    textarea.value = "(ni";
+    textarea.selectionStart = 3;
+    textarea.selectionEnd = 3;
+    textarea.dispatchEvent(
+      new CompositionEvent("compositionupdate", { data: "ni", bubbles: true }),
+    );
+    compositionInput("ni");
+    fire229("keyup");
+    await settle();
+
+    // Commit the selected candidate.
+    textarea.value = "(你";
+    textarea.selectionStart = 2;
+    textarea.selectionEnd = 2;
+    textarea.dispatchEvent(
+      new CompositionEvent("compositionupdate", { data: "你", bubbles: true }),
+    );
+    textarea.dispatchEvent(new CompositionEvent("compositionend", { data: "你", bubbles: true }));
+    compositionInput("你");
+    await settle();
+
+    // instanceof Uint8Array fails across jsdom realms.
+    const sentBytes = socket.sent
+      .filter((frame) => typeof frame !== "string")
+      .map((frame) => new TextDecoder().decode(frame as Uint8Array))
+      .join("");
+    expect(sentBytes).toBe(`()${CURSOR_LEFT_CSI}你`);
+    session.dispose();
+  });
+
+  it("realigns even when the auto-pair event reports only the typed character", async () => {
+    // Some keyboards report only "(" in InputEvent.data for the pair.
+    const settle = () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+
+    const fire229 = (type: string) => {
+      const ev = new KeyboardEvent(type, { key: "Process", bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "keyCode", { get: () => 229 });
+      textarea.dispatchEvent(ev);
+    };
+    fire229("keydown");
+    textarea.value = "()";
+    textarea.selectionStart = 1;
+    textarea.selectionEnd = 1;
+    textarea.dispatchEvent(
+      new InputEvent("input", {
+        data: "(",
+        inputType: "insertText",
+        bubbles: true,
+        composed: true,
+      }),
+    );
+    fire229("keyup");
+    await settle();
+
+    expect(textarea.value).toBe("(");
+    expect(textarea.selectionStart).toBe(1);
+    const sentBytes = socket.sent
+      .filter((frame) => typeof frame !== "string")
+      .map((frame) => new TextDecoder().decode(frame as Uint8Array))
+      .join("");
+    expect(sentBytes).toBe(`()${CURSOR_LEFT_CSI}`);
+    session.dispose();
+  });
+
+  it("encodes the realigning arrow per application-cursor-keys mode", async () => {
+    // DECCKM expects SS3 arrows rather than CSI.
+    const settle = () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[?1h", resolve);
+    });
+    expect(term.modes.applicationCursorKeysMode).toBe(true);
+    const textarea = term.textarea!;
+    textarea.focus();
+
+    const fire229 = (type: string) => {
+      const ev = new KeyboardEvent(type, { key: "Process", bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "keyCode", { get: () => 229 });
+      textarea.dispatchEvent(ev);
+    };
+    fire229("keydown");
+    textarea.value = "()";
+    textarea.selectionStart = 1;
+    textarea.selectionEnd = 1;
+    textarea.dispatchEvent(
+      new InputEvent("input", {
+        data: "()",
+        inputType: "insertText",
+        bubbles: true,
+        composed: true,
+      }),
+    );
+    fire229("keyup");
+    await settle();
+
+    const sentBytes = socket.sent
+      .filter((frame) => typeof frame !== "string")
+      .map((frame) => new TextDecoder().decode(frame as Uint8Array))
+      .join("");
+    expect(sentBytes).toBe(`()${CURSOR_LEFT_SS3}`);
     session.dispose();
   });
 });
