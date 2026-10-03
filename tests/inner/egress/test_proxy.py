@@ -3014,3 +3014,50 @@ async def test_stop_cancels_in_flight_connection_handlers(
     finally:
         for s in socks:
             s.close()
+
+
+@pytest.mark.asyncio
+async def test_http_request_chains_through_upstream_proxy(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An allowed request is tunnelled via the ambient HTTP_PROXY, not dialed directly."""
+    cert_path, key_path, _ = ca_paths
+    seen: list[bytes] = []
+
+    async def upstream_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        seen.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        seen.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nvia-up")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(upstream_proxy, "127.0.0.1", 0)
+    for k in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+    monkeypatch.setattr(
+        asyncio.get_event_loop(),
+        "getaddrinfo",
+        _stub_getaddrinfo_resolving(
+            {"allowed.example.com": "93.184.216.34", "127.0.0.1": "127.0.0.1"}
+        ),
+    )
+    proxy = EgressProxy(parse_rules(["GET allowed.example.com/**"]), cert_path, key_path)
+    port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET http://allowed.example.com/x HTTP/1.1\r\nHost: allowed.example.com\r\n\r\n"
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(4096), timeout=5)
+        writer.close()
+    finally:
+        await proxy.stop()
+        server.close()
+
+    assert response.endswith(b"via-up")
+    assert seen[0].startswith(b"CONNECT 93.184.216.34:80 HTTP/1.1")
+    assert seen[1].startswith(b"GET /x HTTP/1.1")
