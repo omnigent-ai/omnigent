@@ -6,6 +6,7 @@ import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { isAbsoluteComposerPath } from "@/lib/composerContext";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -40,7 +41,7 @@ interface FileRowActionItem {
 }
 
 export const ROW_MENU_SLOT_CLASS =
-  "transition-[width] group-hover:w-20 group-focus-within:w-20 group-data-[state=open]:w-20 pointer-coarse:w-20";
+  "transition-[width] group-hover:w-20 group-focus-within:w-20 group-data-[state=open]:w-20 group-data-[actions-open=true]:w-20 pointer-coarse:w-20";
 
 interface FileRowActionsProps extends FileRowInfo {
   revealPath: string | null;
@@ -48,13 +49,23 @@ interface FileRowActionsProps extends FileRowInfo {
   downloadable?: boolean;
   isDeleted?: boolean;
   onBrowse?: () => void;
+  actionName?: string;
   onOpenInfo: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
-  children: (moreActions: ReactNode, rowRef: RefObject<HTMLDivElement | null>) => ReactElement;
+  children: (
+    moreActions: ReactNode,
+    rowRef: RefObject<HTMLDivElement | null>,
+    primaryActionRef: RefObject<HTMLButtonElement | null>,
+    actionsOpen: boolean,
+  ) => ReactElement;
 }
 
 export function FileRowActions({ children, ...props }: FileRowActionsProps) {
   const rowRef = useRef<HTMLDivElement>(null);
+  const primaryActionRef = useRef<HTMLButtonElement>(null);
+  const kebabRef = useRef<HTMLButtonElement>(null);
+  const focusReturnRef = useRef<HTMLElement | null>(null);
   const [contextOpen, setContextOpen] = useState(false);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
   const isCoarsePointer = useIsCoarsePointer();
   const isDeleted = props.isDeleted ?? props.lastKnown ?? false;
   const revealTarget = useRevealTarget(isDeleted ? null : props.revealPath);
@@ -72,7 +83,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
     });
   }
   items.push({
-    label: "Copy path",
+    label: `Copy ${isAbsoluteComposerPath(props.path) ? "absolute" : "relative"} path`,
     icon: CopyIcon,
     onSelect: () => {
       void copyText(props.path).catch(() => toast.error("Copy failed"));
@@ -85,11 +96,11 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
       onSelect: () => revealInFileManager(revealTarget),
     });
   }
-  if (props.kind === "folder" && !isDeleted) {
+  if (props.kind === "folder" && !isDeleted && props.onBrowse) {
     items.unshift({
       label: "Browse folder",
       icon: FolderOpenIcon,
-      onSelect: () => props.onBrowse?.(),
+      onSelect: props.onBrowse,
     });
   }
   items.push({
@@ -109,7 +120,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
           linesRemoved,
           lastKnown: isDeleted,
         },
-        rowRef.current,
+        focusReturnRef.current,
       );
     },
   });
@@ -123,13 +134,19 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
     ));
 
   const kebab = (
-    <DropdownMenu>
+    <DropdownMenu
+      onOpenChange={(open) => {
+        setDropdownOpen(open);
+        if (open) focusReturnRef.current = kebabRef.current;
+      }}
+    >
       <DropdownMenuTrigger asChild>
         <Button
+          ref={kebabRef}
           type="button"
           variant="ghost"
           size="icon-sm"
-          aria-label={`More actions for ${props.name}`}
+          aria-label={`More actions for ${props.actionName ?? props.name}`}
           onClick={(event) => event.stopPropagation()}
           className={cn(
             "size-[18px] shrink-0 rounded p-0.5 text-muted-foreground transition-opacity hover:bg-muted hover:text-foreground",
@@ -148,13 +165,29 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
   );
 
   return (
-    <ContextMenu onOpenChange={setContextOpen}>
-      <ContextMenuTrigger asChild>{children(kebab, rowRef)}</ContextMenuTrigger>
+    <ContextMenu
+      onOpenChange={(open) => {
+        setContextOpen(open);
+        if (open) focusReturnRef.current = primaryActionRef.current;
+      }}
+    >
+      <ContextMenuTrigger asChild>
+        {children(kebab, rowRef, primaryActionRef, isCoarsePointer || contextOpen || dropdownOpen)}
+      </ContextMenuTrigger>
       <ContextMenuContent
         onEscapeKeyDown={(event) => event.stopPropagation()}
         onCloseAutoFocus={(event) => {
           event.preventDefault();
-          rowRef.current?.focus();
+          const target = focusReturnRef.current;
+          if (target?.isConnected) {
+            target.focus();
+          } else {
+            document
+              .querySelector<HTMLElement>(
+                '[role="tab"][aria-selected="true"], [data-testid="files-panel-drawer"] button',
+              )
+              ?.focus();
+          }
         }}
       >
         {renderItems(ContextMenuItem)}
