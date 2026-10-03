@@ -51,6 +51,8 @@ class AcpAgentEntry:
     :param command: The command to launch, e.g. ``"gemini --experimental-acp"``.
     :param model: Optional model id, applied to the agent's live session via a
         warm switch (see :class:`omnigent.inner.acp_executor.AcpAgentConfig`).
+    :param icon: Optional ACP icon. Emoji works directly; a relative image path
+        resolves to no icon because generated ACP bundles contain no image assets.
     :param session_id_mode: ``"server"`` (default) or ``"client"``.
     :param send_model: Send the model in ``session/new`` (Qwen-shaped agents).
     :param omnigent_mcp: Lend Omnigent's builtin MCP relay in ``session/new``.
@@ -71,6 +73,7 @@ class AcpAgentEntry:
     name: str
     command: str
     model: str | None = None
+    icon: str | None = None
     session_id_mode: str = "server"
     send_model: bool = False
     omnigent_mcp: bool = True
@@ -161,6 +164,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
         seen[base] = count
         slug = base if count == 1 else f"{base}-{count}"
         model = raw.get("model")
+        icon = raw.get("icon")
         mode = raw.get("session_id_mode")
         omnigent_mcp = raw.get("omnigent_mcp", True)
         if not isinstance(omnigent_mcp, bool):
@@ -174,6 +178,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
                 name=name.strip(),
                 command=command.strip(),
                 model=model.strip() if isinstance(model, str) and model.strip() else None,
+                icon=icon.strip() if isinstance(icon, str) and icon.strip() else None,
                 session_id_mode=mode if mode in ("server", "client") else "server",
                 send_model=bool(raw.get("send_model", False)),
                 omnigent_mcp=omnigent_mcp,
@@ -233,6 +238,8 @@ def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
         item: dict[str, object] = {"name": e.name, "command": e.command}
         if e.model:
             item["model"] = e.model
+        if e.icon:
+            item["icon"] = e.icon
         if e.session_id_mode != "server":
             item["session_id_mode"] = e.session_id_mode
         if e.send_model:
