@@ -195,19 +195,19 @@ def test_a_directory_outside_git_reports_not_a_git_repo_from_github(tmp_path: Pa
     assert info["capabilities"] == GITHUB_CAPABILITIES
 
 
-def test_a_gitlab_origin_is_an_unsupported_remote(
+def test_an_unknown_origin_is_an_unsupported_remote(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _git(repo, "remote", "add", "origin", "https://gitlab.com/g/p.git")
+    _git(repo, "remote", "add", "origin", "https://unknown-forge.example.test/g/p.git")
     # gh is installed and signed in, yet resolves no repository for this remote.
     _stub_gh(monkeypatch, {AUTH_STATUS: (0, json.dumps(SIGNED_IN), "")})
 
     assert pr_resource.resolve_provider(str(repo)) == ProviderResolution(
-        "github", "gitlab.com", unclaimed=True
+        "github", "unknown-forge.example.test", unclaimed=True
     )
     info = pr_resource.pr_info(str(repo))
     assert (info["available"], info["reason"]) == (False, "unsupported_remote")
-    assert info["remote_host"] == "gitlab.com"
+    assert info["remote_host"] == "unknown-forge.example.test"
     session = pr_resource.pr_info(str(repo), session_id="session")
     assert session["reason"] == "unsupported_remote"
     assert (session["prs"], session["tracking_available"]) == ([], True)
@@ -221,7 +221,7 @@ def test_a_gitlab_origin_is_an_unsupported_remote(
 def test_an_unclaimed_origin_keeps_the_cli_and_sign_in_guidance(
     repo: Path, monkeypatch: pytest.MonkeyPatch, gh_state: str
 ) -> None:
-    _git(repo, "remote", "add", "origin", "https://gitlab.com/g/p.git")
+    _git(repo, "remote", "add", "origin", "https://unknown-forge.example.test/g/p.git")
     _stub_gh(monkeypatch, {("auth", "status"): (1, "", "not logged in")})
     if gh_state == "missing":
         monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
@@ -301,7 +301,7 @@ def test_a_github_origin_with_a_port_resolves_to_github(repo: Path, url: str) ->
 
 def test_a_partial_clone_origin_is_still_matched(repo: Path) -> None:
     _git(repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
-    _git(repo, "remote", "add", "mirror", "https://gitlab.com/g/p.git")
+    _git(repo, "remote", "add", "mirror", "https://unknown-forge.example.test/g/p.git")
     # With these, ``git remote -v`` ends origin's fetch line with `` [blob:none]``.
     _git(repo, "config", "remote.origin.promisor", "true")
     _git(repo, "config", "remote.origin.partialclonefilter", "blob:none")
@@ -395,14 +395,16 @@ def test_a_ghes_origin_resolves_to_github_through_gh_host(
 
 
 def test_origin_is_matched_before_the_other_remotes(repo: Path) -> None:
-    _git(repo, "remote", "add", "aaa", "https://gitlab.com/g/p.git")
+    _git(repo, "remote", "add", "aaa", "https://unknown-forge.example.test/g/p.git")
     _git(repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
     assert pr_resource.resolve_provider(str(repo)) == ProviderResolution("github", "github.com")
 
     # An unclaimed origin still names the remote host; a later remote may be claimed.
-    _git(repo, "remote", "set-url", "origin", "https://gitlab.com/g/p.git")
+    _git(repo, "remote", "set-url", "origin", "https://unknown-forge.example.test/g/p.git")
     _git(repo, "remote", "set-url", "aaa", "https://github.com/acme/repo.git")
-    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution("github", "gitlab.com")
+    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution(
+        "github", "unknown-forge.example.test"
+    )
 
 
 def test_workspaces_without_a_network_remote_use_the_first_provider(
@@ -418,7 +420,7 @@ def test_workspaces_without_a_network_remote_use_the_first_provider(
 
 
 def test_a_tracked_pr_decides_the_provider(repo: Path) -> None:
-    _git(repo, "remote", "add", "origin", "https://gitlab.com/g/p.git")
+    _git(repo, "remote", "add", "origin", "https://unknown-forge.example.test/g/p.git")
     _git(repo, "config", "omnigent.gitprovider", "forgejo")
     url = "https://github.com/acme/repo/pull/7"
     SessionPrRegistry("session").record(

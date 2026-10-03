@@ -100,9 +100,12 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Sessions](./sessions.md) covers the sidebar, whole-session and message forks,
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 
+- [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
+  Canvas links, and native tracking.
+
 ## Seed scope
 
-The five recipes above are the seed set. Completing this set means checking
+The original five recipes form the seed set. Completing this set means checking
 the listed entry points against current source and recording how to verify
 them, including explicit gaps. It does not mean that every recipe has been
 driven live or that the whole product is mapped. Keep the backlog below

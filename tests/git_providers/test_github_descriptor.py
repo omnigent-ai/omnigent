@@ -36,6 +36,7 @@ _MAX_DNS_HOST = ".".join(["a" * 63] * 3 + ["a" * 61])
 @pytest.fixture(autouse=True)
 def gh_config_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
     """Hide ambient GitHub host configuration; yield an empty gh config dir."""
+    monkeypatch.setattr(registry, "PROVIDER_MODULES", ("omnigent.git_providers.github",))
     for name in (
         "OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS",
         "GH_HOST",

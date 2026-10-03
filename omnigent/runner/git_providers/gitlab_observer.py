@@ -1,0 +1,262 @@
+"""Network-free attribution of successful glab and GitLab MCP merge-request writes."""
+
+from __future__ import annotations
+
+import os
+import re
+from collections.abc import Mapping, Sequence
+from pathlib import PurePath
+from urllib.parse import unquote
+
+from omnigent.git_providers import EnvInstances
+from omnigent.git_providers.gitlab import GitLabProvider, instance_authority
+from omnigent.runner.git_providers import ShellPrOp, ShellSegment
+from omnigent.runner.git_providers.tool_output import result_objects
+from omnigent.runner.session_prs import PullRequestRef
+
+_WRITES = {"create", "update", "merge", "close", "reopen", "approve", "revoke", "rebase", "delete"}
+_MCP_WRITES = {
+    "create_merge_request",
+    "update_merge_request",
+    "merge_merge_request",
+    "approve_merge_request",
+    "unapprove_merge_request",
+    "rebase_merge_request",
+    "delete_merge_request",
+}
+_VALUE_FLAGS = {
+    "--repo",
+    "-R",
+    "--hostname",
+    "--title",
+    "-t",
+    "--description",
+    "-d",
+    "--description-file",
+    "--attach",
+    "--head",
+    "--related-issue",
+    "--template",
+    "--source-branch",
+    "-s",
+    "--target-branch",
+    "-b",
+    "--assignee",
+    "-a",
+    "--reviewer",
+    "--label",
+    "-l",
+    "--unlabel",
+    "-u",
+    "--milestone",
+    "-m",
+    "--output",
+    "-F",
+    "--sha",
+    "--message",
+    "--squash-message",
+    "--method",
+    "-X",
+    "--field",
+    "--raw-field",
+    "--input",
+    "--header",
+    "-H",
+    "--jq",
+    "--page",
+    "--per-page",
+    "-p",
+    "-P",
+}
+_SWITCHES = {
+    "--yes",
+    "-y",
+    "--draft",
+    "--ready",
+    "--remove-source-branch",
+    "-r",
+    "--squash",
+    "--auto-merge",
+    "--when-pipeline-succeeds",
+    "--no-edit",
+    "--fill",
+    "--fill-commit-body",
+    "--push",
+    "--web",
+    "--include",
+    "-i",
+    "--paginate",
+    "--lock-discussion",
+    "--unlock-discussion",
+    "--unassign",
+    "--wip",
+    "--signoff",
+    "--squash-before-merge",
+    "--allow-collaboration",
+    "--copy-issue-labels",
+    "--create-source-branch",
+    "--no-editor",
+    "--recover",
+    "--help",
+    "-h",
+    "-w",
+}
+
+
+def _arguments(tokens: list[str]) -> tuple[list[str], dict[str, str]] | None:
+    positional, flags = [], {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        flag, equals, value = token.partition("=")
+        api = positional[:1] == ["api"]
+        merge = positional[:2] in (["mr", "merge"], ["mr", "accept"])
+        takes_value = flag in _VALUE_FLAGS or (api and flag == "-f")
+        if (flag == "-f" and not api) or (merge and flag in {"-d", "-s"}):
+            takes_value = False
+        if takes_value:
+            if not equals:
+                index += 1
+                if index == len(tokens):
+                    return None
+                value = tokens[index]
+            flags[flag] = value
+        elif flag in _SWITCHES or flag == "-f" or (merge and flag in {"-d", "-s"}):
+            flags[flag] = value if equals else "true"
+        elif len(token) > 2 and (token[:2] in _VALUE_FLAGS or (api and token[:2] == "-f")):
+            flags[token[:2]] = token[2:]
+        elif token.startswith("-"):
+            return None
+        else:
+            positional.append(token)
+        index += 1
+    return positional, flags
+
+
+def reference(value: object) -> PullRequestRef | None:
+    """Read only a trusted GitLab MR URL, excluding other providers and body text."""
+    if not isinstance(value, str):
+        return None
+    parsed = GitLabProvider().parse_pr_url(value, EnvInstances())
+    return PullRequestRef(**vars(parsed)) if parsed else None
+
+
+def _target(project: object, iid: object, host: str) -> PullRequestRef | None:
+    if not isinstance(project, str) or not isinstance(iid, (str, int)) or isinstance(iid, bool):
+        return None
+    project = unquote(project).removesuffix(".git").strip("/")
+    remote = GitLabProvider().parse_remote_url(project, EnvInstances())
+    if remote:
+        host, project = remote.host, remote.repository
+    else:
+        first, separator, rest = project.partition("/")
+        if separator and GitLabProvider().matches_host(first, EnvInstances()):
+            host, project = first, rest
+    return reference(f"https://{host}/{project}/-/merge_requests/{str(iid).lstrip('!')}")
+
+
+def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
+    """Describe MR reads too, so mixed command output cannot masquerade as a write."""
+    operations = []
+    for segment in segments:
+        if PurePath(segment.invocation_tokens[0]).name != "glab":
+            continue
+        tokens = list(segment.invocation_tokens[1:])
+        parsed = _arguments(tokens)
+        if parsed is None:
+            operations.append(ShellPrOp(False, False, None, True))
+            continue
+        positional, flags = parsed
+        if not positional or positional[0] not in {"mr", "api"}:
+            continue
+        host = flags.get("--hostname") or next(
+            (
+                t.split("=", 1)[1]
+                for t in segment.raw_tokens
+                if t.startswith(("GITLAB_HOST=", "GLAB_HOST="))
+            ),
+            os.environ.get("GITLAB_HOST") or os.environ.get("GLAB_HOST") or "gitlab.com",
+        )
+        host = instance_authority(host) or ""
+        project = flags.get("--repo", flags.get("-R"))
+        target, tracks, creates = None, False, False
+        if positional[0] == "mr" and len(positional) > 1:
+            action = {"new": "create", "accept": "merge"}.get(positional[1], positional[1])
+            tracks, creates = action in _WRITES, action == "create"
+            if len(positional) > 2 and not creates:
+                target = reference(positional[2]) or _target(project, positional[2], host)
+        elif positional[0] == "api" and len(positional) > 1:
+            endpoint = positional[1].split("?", 1)[0].strip("/")
+            match = re.fullmatch(
+                r"projects/([^/]+)/merge_requests(?:/([1-9][0-9]*)(?:/(merge|approve|unapprove|rebase))?)?",
+                endpoint,
+            )
+            method = flags.get("--method", flags.get("-X")) or (
+                "POST"
+                if any(k in flags for k in ("--field", "-f", "--raw-field", "-F", "--input"))
+                else "GET"
+            )
+            if match:
+                creates = match[2] is None and method.upper() == "POST"
+                tracks = creates or (
+                    match[2] is not None and method.upper() in {"PUT", "POST", "DELETE"}
+                )
+                target = _target(match[1], match[2], host) if match[2] else None
+        if any(flag in flags for flag in ("--help", "-h")) or (
+            creates and any(flag in flags for flag in ("--web", "-w"))
+        ):
+            tracks, creates = False, False
+        operations.append(ShellPrOp(tracks, creates, target, "--jq" in flags))
+    return operations
+
+
+def pr_from_object(obj: Mapping[str, object]) -> PullRequestRef | None:
+    """A GitLab result identifies an MR by web_url and its project-local IID."""
+    ref = reference(obj.get("web_url"))
+    return ref if ref is not None and str(obj.get("iid")) == str(ref.number) else None
+
+
+def mcp_prs(
+    tool_name: str, arguments: dict[str, object], result: object
+) -> tuple[list[PullRequestRef], bool] | None:
+    """Track explicit MR mutation tools, never notes, reads or URLs quoted in content."""
+    name = tool_name.rsplit("__", 1)[-1].removeprefix("gitlab_")
+    if name not in _MCP_WRITES:
+        return None
+    created = name == "create_merge_request"
+    configured_host = arguments.get("hostname", arguments.get("host")) or os.environ.get(
+        "GITLAB_HOST", os.environ.get("GLAB_HOST")
+    )
+    host = configured_host or "gitlab.com"
+    host = instance_authority(host) if isinstance(host, str) else None
+    if host is None:
+        return [], created
+    project = arguments.get("project_id", arguments.get("project"))
+    if created and arguments.get("target_project_id") is not None:
+        project = arguments["target_project_id"]
+    iid = arguments.get("merge_request_iid", arguments.get("iid"))
+    target = _target(project, iid, host) if host and not created else None
+    references = []
+    for obj in result_objects(result):
+        for candidate in (obj, obj.get("merge_request")):
+            if not isinstance(candidate, dict):
+                continue
+            ref = pr_from_object(candidate)
+            if ref is None or (target is not None and ref.url != target.url):
+                continue
+            if configured_host and ref.host != host:
+                continue
+            if isinstance(project, str) and not project.isdigit():
+                expected = _target(project, ref.number, host if configured_host else ref.host)
+                if expected is None or expected.url != ref.url:
+                    continue
+            if (
+                isinstance(project, (str, int))
+                and str(project).isdigit()
+                and str(candidate.get("project_id")) != str(project)
+            ):
+                continue
+            if iid is not None and not created and str(ref.number) != str(iid):
+                continue
+            references.append(ref)
+    return references or ([target] if target else []), created

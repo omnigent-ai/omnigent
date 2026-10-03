@@ -129,6 +129,7 @@ Install = Callable[..., Facet]
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     """Use the built-in providers with no host settings, a fresh store, and no past failures."""
+    monkeypatch.setattr(provider_registry, "PROVIDER_MODULES", ("omnigent.git_providers.github",))
     monkeypatch.setattr(provider_registry.importlib.metadata, "entry_points", lambda **_: ())
     for name in (
         "OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS",

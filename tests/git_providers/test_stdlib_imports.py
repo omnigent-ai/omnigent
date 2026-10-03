@@ -48,6 +48,7 @@ def test_descriptors_import_only_the_standard_library() -> None:
         "before = set(sys.modules)\n"
         "import omnigent.git_providers\n"
         "import omnigent.git_providers.github\n"
+        "import omnigent.git_providers.gitlab\n"
         "omnigent.git_providers.providers()\n"
         "print('\\n'.join(sorted(set(sys.modules) - before)))\n"
     )
@@ -55,6 +56,7 @@ def test_descriptors_import_only_the_standard_library() -> None:
     assert result.returncode == 0, result.stderr
     loaded = result.stdout.split()
     assert "omnigent.git_providers.github" in loaded
+    assert "omnigent.git_providers.gitlab" in loaded
     assert [name for name in loaded if not _allowed(name)] == []
 
 

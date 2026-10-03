@@ -211,6 +211,7 @@ class FakeGitLabFacet:
 @pytest.fixture
 def facet(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[FakeGitLabFacet]:
     """Register the fake provider and its facet module; forget both afterwards."""
+    monkeypatch.setattr(provider_registry, "PROVIDER_MODULES", ("omnigent.git_providers.github",))
     monkeypatch.setattr(provider_registry.importlib.metadata, "entry_points", lambda **_: ())
     monkeypatch.delenv("GH_HOST", raising=False)
     monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
