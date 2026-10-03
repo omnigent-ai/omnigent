@@ -235,7 +235,10 @@ export function SlidesViewer({
         )}
       >
         <div style={{ width: STAGE_W * scale, height: STAGE_H * scale }}>
+          {/* Changing srcdoc on a live iframe adds a browser history entry; a new
+              iframe per document loads without one. */}
           <iframe
+            key={srcDoc}
             ref={iframeRef}
             srcDoc={srcDoc}
             sandbox={HTML_PREVIEW_SANDBOX}

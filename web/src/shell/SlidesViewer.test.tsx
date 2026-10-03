@@ -644,4 +644,18 @@ describe("SlidesViewer design kit", () => {
     expect(srcdoc()).toContain("--kit-primary:#ff0066");
     expect(srcdoc()).toContain("<h1>Four</h1>");
   });
+
+  it("gives each document a fresh iframe so swaps add no browser history", async () => {
+    serve({});
+    const { rerender } = render(<SlidesViewer content={DECK} conversationId="conv_1" />);
+    const loading = deckFrame();
+    await vi.waitFor(() => expect(srcdoc()).toBe(prepareSlidesDoc(DECK)));
+    const first = deckFrame();
+    expect(first).not.toBe(loading);
+
+    const updated = DECK.replace("Three", "Four");
+    rerender(<SlidesViewer content={updated} conversationId="conv_1" />);
+    await vi.waitFor(() => expect(srcdoc()).toContain("<h1>Four</h1>"));
+    expect(deckFrame()).not.toBe(first);
+  });
 });
