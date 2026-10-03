@@ -73,12 +73,16 @@ class _CliTicket:
         fulfillment when a grant store is wired. ``None`` while pending
         or when grants are unavailable. Handed to the CLI exactly once
         by the poll response.
+    :param refresh_expires_at: Absolute epoch seconds when the refresh
+        grant can no longer be renewed, paired with ``refresh_token``.
+        ``None`` when no grant was issued.
     """
 
     created_at: float = field(default_factory=time.time)
     token: str | None = None
     user_id: str | None = None
     refresh_token: str | None = None
+    refresh_expires_at: int | None = None
 
 
 def create_auth_router(
@@ -447,11 +451,13 @@ def create_auth_router(
             # grant-store failure must not break login itself.
             if device_grant_store is not None:
                 try:
-                    ticket.refresh_token = issue_login_grant(
+                    login_grant = issue_login_grant(
                         device_grant_store,
                         user_id=email,
                         cookie_secret=config.cookie_secret,
                     )
+                    ticket.refresh_token = login_grant.refresh_token
+                    ticket.refresh_expires_at = login_grant.refresh_expires_at
                 except Exception:
                     _logger.exception("cli-login: refresh grant issuance failed")
             # Return a simple HTML page — the CLI is polling
@@ -650,6 +656,7 @@ def create_auth_router(
         token = ticket.token
         user_id = ticket.user_id
         refresh_token = ticket.refresh_token
+        refresh_expires_at = ticket.refresh_expires_at
         del _cli_tickets[ticket_id]
         content: dict[str, object] = {
             "token": token,
@@ -660,6 +667,8 @@ def create_auth_router(
         # extra key, new CLIs against old servers see it absent.
         if refresh_token is not None:
             content["refresh_token"] = refresh_token
+        if refresh_expires_at is not None:
+            content["refresh_expires_at"] = refresh_expires_at
         return JSONResponse(status_code=200, content=content)
 
     # ── Admin: read-only user list ────────────────────────────────

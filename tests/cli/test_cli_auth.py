@@ -693,6 +693,35 @@ def test_store_token_persists_refresh_material(token_dir) -> None:
     assert data["http://localhost:6767"]["refresh_token"] == "refresh-1"
 
 
+def test_store_token_persists_refresh_expiry(token_dir) -> None:
+    """The refresh grant's absolute expiry round-trips when supplied, and
+    is absent when omitted so an old server never blanks a known value."""
+    import json
+
+    from omnigent.cli_auth import store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="jwt",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+        refresh_expires_at=1_800_000_000,
+    )
+    entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
+    assert entry["refresh_expires_at"] == 1_800_000_000
+
+    store_token(
+        "http://localhost:6767",
+        token="jwt",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+    )
+    entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
+    assert "refresh_expires_at" not in entry
+
+
 def test_stored_token_status_classification(token_dir) -> None:
     """absent / expired / ok are distinguished — the host uses this to say
     "your login expired" instead of dialing into a misleading 403."""
@@ -748,6 +777,42 @@ def test_refresh_stored_token_renews_and_rotates(token_dir, monkeypatch) -> None
     entry = data["http://localhost:6767"]
     assert entry["token"] == "fresh" and entry["refresh_token"] == "refresh-2"
     assert load_token("http://localhost:6767") == "fresh"
+
+
+def test_refresh_preserves_refresh_expiry_when_payload_omits_it(token_dir, monkeypatch) -> None:
+    """A refresh whose response carries no refresh_expires_at keeps the
+    expiry the entry already held — a renew must never blank it."""
+    import json
+
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+        refresh_expires_at=1_800_000_000,
+    )
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "fresh",
+                "refresh_token": "refresh-1",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") == "fresh"
+    entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
+    assert entry["refresh_expires_at"] == 1_800_000_000
 
 
 def test_refresh_stored_token_no_material_is_none(token_dir) -> None:

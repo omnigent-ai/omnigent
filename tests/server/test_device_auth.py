@@ -687,6 +687,17 @@ def test_create_redeemed_grant_refresh_cycle(store: DeviceGrantStore) -> None:
     assert stale is not None and stale.id == g.id
 
 
+def test_issue_login_grant_reports_absolute_expiry(store: DeviceGrantStore) -> None:
+    """The login grant's refresh_expires_at is its approved_at anchor plus
+    the 30-day absolute lifetime — the true expiry the client persists."""
+    from omnigent.server.routes.device_auth import issue_login_grant
+
+    result = issue_login_grant(store, user_id="alice@example.com", cookie_secret=_KEY)
+    grant = store.get_by_refresh_hash(hash_secret(result.refresh_token, _KEY))
+    assert grant is not None and grant.approved_at is not None
+    assert result.refresh_expires_at == grant.approved_at + _LIFETIME
+
+
 def test_create_redeemed_grant_survives_pending_purge(store: DeviceGrantStore) -> None:
     """expires_at (the device_code window) is meaningless for a grant born
     redeemed — the pending/denied purge bucket must never collect it."""
@@ -721,7 +732,7 @@ def test_login_grant_refresh_round_trip(disabled_app: TestClient, tmp_path: Path
 
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/test.db")
     secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
-    refresh = issue_login_grant(store, user_id="admin", cookie_secret=secret)
+    refresh = issue_login_grant(store, user_id="admin", cookie_secret=secret).refresh_token
 
     # Refresh: fresh access token, SAME refresh token handed back.
     r = disabled_app.post(
@@ -762,7 +773,7 @@ def test_login_grant_token_keeps_session_authority(
 
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/test.db")
     secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
-    refresh = issue_login_grant(store, user_id="admin", cookie_secret=secret)
+    refresh = issue_login_grant(store, user_id="admin", cookie_secret=secret).refresh_token
     r = disabled_app.post(
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
     )
@@ -883,7 +894,9 @@ def test_oauth_token_router_oidc_mode(tmp_path: Path) -> None:
     app = FastAPI()
     app.include_router(create_oauth_token_router(provider, store))  # type: ignore[arg-type]
 
-    refresh = issue_login_grant(store, user_id="alice@example.com", cookie_secret=_KEY)
+    refresh = issue_login_grant(
+        store, user_id="alice@example.com", cookie_secret=_KEY
+    ).refresh_token
     with TestClient(app) as client:
         # device_code exchanges are refused on a standalone mount.
         r = client.post(
