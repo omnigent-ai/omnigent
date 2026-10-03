@@ -37,8 +37,6 @@ def create_mobile_push_router(
     router = APIRouter(prefix="/v1/mobile-push", tags=["mobile-push"], route_class=GatedRoute)
 
     def identity(request: Request) -> str:
-        if store is None or config is None:
-            raise HTTPException(404, "Mobile push is disabled")
         user_id = require_user(request, auth_provider)
         if user_id is None:
             raise HTTPException(401, "Authentication required")
