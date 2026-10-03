@@ -303,7 +303,8 @@ def create_host_tunnel_router(
 
         await ws.accept()
         conn: HostConnection | None = None
-        host_persisted = False
+        # Keep this upsert's token for pre-registry cleanup.
+        host_generation: int | None = None
         stage = "hello"
         try:
             raw = await ws.receive_text()
@@ -336,7 +337,7 @@ def create_host_tunnel_router(
                 configured_harnesses=frame.configured_harnesses,
                 managed_token=managed_token,
             )
-            host_persisted = True
+            host_generation = persisted_host.connect_generation
             if persisted_host.account_generation is not None:
                 from omnigent.db.account_authority import bind_account_authority
 
@@ -481,8 +482,11 @@ def create_host_tunnel_router(
             if conn is not None:
                 if host_registry.deregister(host_id, conn=conn):
                     await asyncio.to_thread(host_store.set_offline, host_id)
-            elif host_persisted:
-                await asyncio.to_thread(host_store.set_offline, host_id)
+            elif host_generation is not None:
+                # Clear this failed connect's ghost-online row if still owned.
+                await asyncio.to_thread(
+                    host_store.set_offline_if_generation, host_id, host_generation
+                )
 
     return router
 
