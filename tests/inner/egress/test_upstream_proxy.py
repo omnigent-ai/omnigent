@@ -101,3 +101,10 @@ async def test_https_handshakes_with_original_host_over_tunnel(
     t.join(5)
     listener.close()
     assert sni == ["example.test"]
+
+
+async def test_https_proxy_url_is_rejected(monkeypatch, clean_proxy_env):
+    monkeypatch.setenv("http_proxy", "https://user:secret@127.0.0.1:1")
+    with pytest.raises(OSError, match="http://") as exc:
+        await _open_upstream("example.test", "203.0.113.5", 80)
+    assert "secret" not in str(exc.value)

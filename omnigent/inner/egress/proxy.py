@@ -168,13 +168,9 @@ async def _open_upstream(
             connect_host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
         )
     p = urlparse(proxy)
-    if not p.hostname:
-        raise OSError("invalid upstream proxy URL")
-    reader, writer = await asyncio.open_connection(
-        p.hostname,
-        p.port or 3128,
-        ssl=ssl.create_default_context() if p.scheme == "https" else None,
-    )
+    if p.scheme != "http" or not p.hostname:  # https:// would need TLS-in-TLS
+        raise OSError("upstream proxy must be an http://host:port URL")
+    reader, writer = await asyncio.open_connection(p.hostname, p.port or 3128)
     try:
         auth = b""
         if p.username:  # basic auth only; no NTLM/Kerberos
