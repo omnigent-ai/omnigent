@@ -101,6 +101,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Slide decks](./slide-decks.md) covers the `*.slides.html` viewer in the file
   viewer: navigation, fullscreen, printing, and the Source toggle.
+- [Design page](./design-page.md) covers the flag-gated `/design` deck gallery
+  across recent sessions: workspace groups, kit indicator, and the deck viewer.
 
 ## Seed scope
 
