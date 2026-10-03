@@ -92,25 +92,39 @@ def _configured_provider(root: str) -> str | None:
     return (out.strip().lower() or None) if rc == 0 else None
 
 
-def _workspace_provider(root: str) -> ProviderResolution:
-    """Resolve the provider of the workspace itself, ignoring tracked PRs."""
+def _workspace_providers(root: str) -> list[ProviderResolution]:
+    """Find every provider in the checkout, retaining the preferred display order."""
     urls = _remote_urls(root)
     first_host = next((host for url in urls if (host := host_of(url))), None)
     configured = _configured_provider(root)
-    if configured:
-        return ProviderResolution(configured, first_host)
+    found = {configured: ProviderResolution(configured, first_host)} if configured else {}
     for url in urls:
         parsed = resolve_remote(url)
-        if parsed is not None and _facet(parsed.provider) is not None:
-            return ProviderResolution(parsed.provider, first_host)
+        if parsed is not None and parsed.provider not in found:
+            try:
+                facet = _facet(parsed.provider)
+            except Exception:  # noqa: BLE001 — optional integrations must not hide other remotes
+                _logger.warning("Could not load git provider %s", parsed.provider, exc_info=True)
+                continue
+            if facet is not None:
+                found[parsed.provider] = ProviderResolution(parsed.provider, first_host)
+    if found:
+        return list(found.values())
     # No provider with a facet claims a remote, e.g. an ssh host alias; the first
     # provider's CLI may still resolve it.
     fallback = next(iter(providers()), None)
-    return ProviderResolution(
-        fallback.id if fallback is not None else None,
-        first_host,
-        unclaimed=first_host is not None,
-    )
+    return [
+        ProviderResolution(
+            fallback.id if fallback is not None else None,
+            first_host,
+            unclaimed=first_host is not None,
+        )
+    ]
+
+
+def _workspace_provider(root: str) -> ProviderResolution:
+    """Choose the default display provider; discovery still visits every provider."""
+    return _workspace_providers(root)[0]
 
 
 def _resolve(root: str, reference: PullRequestRef | None) -> ProviderResolution:
@@ -187,9 +201,9 @@ def _cannot_serve(info: dict[str, Any], capabilities: ProviderCapabilities) -> b
     return not (capabilities.account_switching and several_accounts)
 
 
-def _workspace_info(root: str) -> dict[str, Any]:
+def _workspace_info(root: str, resolution: ProviderResolution | None = None) -> dict[str, Any]:
     """Info for the workspace's branch, or the unsupported-remote payload."""
-    resolution = _workspace_provider(root)
+    resolution = resolution or _workspace_provider(root)
     facet = _facet(resolution.provider)
     if facet is None:
         return unsupported_remote_info(resolution.remote_host or "")
@@ -201,10 +215,34 @@ def _workspace_info(root: str) -> dict[str, Any]:
 
 def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     """Info for one tracked PR, or the unsupported payload when its provider has no facet."""
-    facet = _facet(reference.provider)
-    if facet is None:
-        return {**unsupported_remote_info(reference.host), "selected_pr_url": reference.url}
-    return facet.reference_info(root, reference)
+    try:
+        facet = _facet(reference.provider)
+        if facet is None:
+            return {**unsupported_remote_info(reference.host), "selected_pr_url": reference.url}
+        return facet.reference_info(root, reference)
+    except Exception:  # noqa: BLE001 — retain the selector and healthy providers on failure
+        _logger.warning("Git provider %s failed PR lookup", reference.provider, exc_info=True)
+        return {
+            **unsupported_remote_info(reference.host),
+            "reason": "provider_unavailable",
+            "provider": reference.provider,
+            "selected_pr_url": reference.url,
+            "warnings": ["Could not load this pull request. Refresh to retry."],
+        }
+
+
+def _discovery_info(root: str, resolution: ProviderResolution) -> dict[str, Any]:
+    try:
+        return _workspace_info(root, resolution)
+    except Exception:  # noqa: BLE001 — one unavailable forge must not hide the others
+        _logger.warning("Git provider %s failed discovery", resolution.provider, exc_info=True)
+        return {
+            **unsupported_remote_info(resolution.remote_host or ""),
+            "provider": resolution.provider,
+            "warnings": [
+                f"{resolution.provider} pull request discovery failed. Refresh to retry."
+            ],
+        }
 
 
 def _pr_title(pr: object) -> str | None:
@@ -300,7 +338,7 @@ def _session_prs_with_titles(
 def pr_info(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
-    """Read the selected session PR, with branch inference for untracked sessions.
+    """Read the selected session PR and discover untracked providers from all remotes.
 
     :param root: Absolute workspace path.
     :param session_id: Session whose tracked PRs to list; ``None`` reads only
@@ -318,24 +356,66 @@ def pr_info(
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
     entries = registry.list()
-    if pr_url:
-        info = _reference_info(root, _selected_pr(session_id, pr_url))
-    elif entries:
-        info = _reference_info(root, entries[0])
+    reference = _selected_pr(session_id, pr_url) if pr_url else entries[0] if entries else None
+    tracked_providers = {entry.provider for entry in entries}
+    resolutions = (
+        []
+        if pr_url
+        else [
+            resolution
+            for resolution in _workspace_providers(root)
+            if resolution.provider not in tracked_providers
+        ]
+    )
+    discovered: list[dict[str, Any]] = []
+    if not resolutions:
+        assert reference is not None
+        info = _reference_info(root, reference)
+    elif len(resolutions) == 1 and reference is None:
+        discovered = [_discovery_info(root, resolutions[0])]
+        info = discovered[0]
     else:
-        info = _workspace_info(root)
-        pr = info.get("pr")
+        # Each provider enforces its request budget; unrelated forges run concurrently.
+        with ThreadPoolExecutor(max_workers=min(4, len(resolutions) + bool(reference))) as pool:
+            selected = pool.submit(_reference_info, root, reference) if reference else None
+            discovered = list(pool.map(lambda value: _discovery_info(root, value), resolutions))
+            info = selected.result() if selected else discovered[0]
+    discovered_at = time.time()
+    for candidate in discovered:
+        pr = candidate.get("pr")
         if isinstance(pr, dict) and isinstance(pr.get("url"), str):
-            reference = PullRequestRef.from_url(pr["url"])
-            registry.record([reference], relationship="inferred", source="branch")
-            entries = registry.list()
-            if any(entry.url == reference.url for entry in entries):
-                facet = _facet(reference.provider)
-                if facet is not None:
-                    facet.on_inferred_pr(root, reference)
-                info["selected_pr_url"] = reference.url
-            else:
-                info["pr"] = None
+            try:
+                inferred = PullRequestRef.from_url(pr["url"])
+                if inferred.provider != candidate.get("provider"):
+                    raise ValueError("Discovery returned a different provider's pull request")
+                registry.record(
+                    [inferred], relationship="inferred", source="branch", timestamp=discovered_at
+                )
+                if any(entry.url == inferred.url for entry in registry.list()):
+                    candidate["selected_pr_url"] = inferred.url
+                    try:
+                        facet = _facet(inferred.provider)
+                        if facet is not None:
+                            facet.on_inferred_pr(root, inferred)
+                        title = _pr_title(pr)
+                        if title is not None:
+                            registry.update_titles({inferred.url: title})
+                    except Exception:  # noqa: BLE001 — metadata cannot undo a valid association
+                        _logger.warning("Could not cache discovered PR metadata", exc_info=True)
+                else:
+                    candidate["pr"] = None
+            except Exception:  # noqa: BLE001 — failed optional inference preserves selected PRs
+                _logger.warning("Could not associate discovered pull request", exc_info=True)
+                candidate["pr"] = None
+                candidate.setdefault("warnings", []).append(
+                    "Could not associate this pull request."
+                )
+    entries = registry.list()
+    if reference is None:
+        info = next((candidate for candidate in discovered if candidate.get("pr")), info)
+    for candidate in discovered:
+        if candidate is not info:
+            info.setdefault("warnings", []).extend(candidate.get("warnings", []))
     info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
     info["tracking_available"] = True
     provider_id = info.get("provider")

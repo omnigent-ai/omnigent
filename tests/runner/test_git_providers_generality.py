@@ -14,6 +14,7 @@ import sys
 import types
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from threading import Barrier
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -41,6 +42,7 @@ from omnigent.runner.git_providers import (
 from omnigent.runner.git_providers.tool_output import pr_reference, result_objects
 from omnigent.runner.pr_observer import extract_prs
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from tests.budgets import budget
 from tests.runner.git_provider_fixtures import register_provider
 
 HOST = "git.example.test"
@@ -481,3 +483,154 @@ def test_optional_title_failure_keeps_selected_pr_and_healthy_titles(
         MR: "Last known MR title",
     }
     assert next(entry for entry in registry.list() if entry.url == MR) == before
+
+
+@pytest.mark.parametrize("github_origin", [False, True])
+def test_every_remote_provider_is_discovered_and_unlink_stays_removed(
+    facet: FakeGitLabFacet, repo: str, monkeypatch: pytest.MonkeyPatch, github_origin: bool
+) -> None:
+    github_url = "https://github.com/example/project/pull/42"
+    github_remote = "https://github.com/example/project.git"
+    subprocess.run(["git", "remote", "add", "mirror", github_remote], cwd=repo, check=True)
+    subprocess.run(["git", "remote", "add", "duplicate", ORIGIN], cwd=repo, check=True)
+    if github_origin:
+        subprocess.run(["git", "remote", "set-url", "origin", github_remote], cwd=repo, check=True)
+    github = provider_registry.load_facet("github", "pull_requests")
+    ready = Barrier(2, timeout=budget(5))
+    calls = []
+
+    def github_info(_root):
+        calls.append("github")
+        ready.wait()
+        return {
+            "provider": "github",
+            "available": True,
+            "pr": {"url": github_url, "title": "GitHub branch PR"},
+        }
+
+    original = facet.workspace_info
+
+    def gitlab_info(root):
+        ready.wait()
+        return original(root)
+
+    facet.branch_pr = MR
+    monkeypatch.setattr(facet, "workspace_info", gitlab_info)
+    monkeypatch.setattr(github, "workspace_info", github_info)
+    monkeypatch.setattr(github, "on_inferred_pr", lambda *_: None)
+    monkeypatch.setattr(github, "titles_available", lambda _: True)
+    monkeypatch.setattr(
+        github, "pr_title", lambda *_: pytest.fail("Discovery already read the title")
+    )
+    monkeypatch.setattr(
+        github,
+        "reference_info",
+        lambda _root, ref: {
+            "provider": "github",
+            "selected_pr_url": ref.url,
+            "pr": {"url": ref.url, "title": "GitHub branch PR"},
+        },
+    )
+
+    info = pr_resource.pr_info(repo, session_id="all-providers")
+
+    expected = github_url if github_origin else MR
+    assert info["selected_pr_url"] == expected
+    assert {pr["url"]: pr["title"] for pr in info["prs"]} == {
+        github_url: "GitHub branch PR",
+        MR: "Branch MR",
+    }
+    assert calls == ["github"]
+    assert facet.calls.count("workspace_info") == 1
+    assert all(pr["relationship"] == "inferred" for pr in info["prs"])
+    assert pr_resource.pr_info(repo, session_id="all-providers")["selected_pr_url"] == expected
+
+    monkeypatch.setattr(facet, "workspace_info", original)
+    removed = pr_resource.update_session_pr(repo, "all-providers", MR, "remove")
+    assert [pr["url"] for pr in removed["prs"]] == [github_url]
+    assert [pr["url"] for pr in pr_resource.pr_info(repo, session_id="all-providers")["prs"]] == [
+        github_url
+    ]
+    restored = pr_resource.update_session_pr(repo, "all-providers", MR, "attach")
+    assert restored["selected_pr_url"] == MR
+    assert {pr["url"] for pr in restored["prs"]} == {github_url, MR}
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("relationship", ["attached", "inferred"])
+def test_tracked_provider_does_not_stop_discovery_or_lose_selection_on_failure(
+    facet: FakeGitLabFacet, repo: str, monkeypatch: pytest.MonkeyPatch, failure: bool, relationship
+) -> None:
+    selected = "https://github.com/example/project/pull/42"
+    SessionPrRegistry("mixed-discovery").record(
+        [PullRequestRef.from_url(selected)], relationship=relationship, source="user", timestamp=1
+    )
+    github = provider_registry.load_facet("github", "pull_requests")
+    monkeypatch.setattr(
+        github,
+        "reference_info",
+        lambda _root, ref: {
+            "provider": "github",
+            "selected_pr_url": ref.url,
+            "pr": {"url": ref.url, "title": "Selected GitHub PR"},
+        },
+    )
+    monkeypatch.setattr(github, "titles_available", lambda _: True)
+    facet.branch_pr = MR
+    if failure:
+
+        def unavailable(_root):
+            raise RuntimeError("Forge offline")
+
+        monkeypatch.setattr(facet, "workspace_info", unavailable)
+
+    info = pr_resource.pr_info(repo, session_id="mixed-discovery")
+
+    assert info["selected_pr_url"] == selected
+    assert {pr["url"] for pr in info["prs"]} == ({selected} if failure else {selected, MR})
+    assert SessionPrRegistry("mixed-discovery").list()[0].relationship == relationship
+    assert pr_resource.pr_info(repo, session_id="mixed-discovery")["selected_pr_url"] == selected
+    if failure:
+        assert any("discovery failed" in warning for warning in info["warnings"])
+
+
+def test_failing_tracked_provider_keeps_newly_discovered_provider_selectable(
+    facet: FakeGitLabFacet, repo: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = "https://github.com/example/project/pull/42"
+    SessionPrRegistry("failed-selected").record(
+        [PullRequestRef.from_url(selected)], relationship="attached", source="user"
+    )
+    github = provider_registry.load_facet("github", "pull_requests")
+
+    def unavailable(*_args):
+        raise RuntimeError("GitHub offline")
+
+    monkeypatch.setattr(github, "reference_info", unavailable)
+    monkeypatch.setattr(github, "titles_available", lambda _: False)
+    facet.branch_pr = MR
+
+    for _ in range(2):
+        info = pr_resource.pr_info(repo, session_id="failed-selected")
+        assert info["selected_pr_url"] == selected
+        assert info["reason"] == "provider_unavailable"
+        assert info["tracking_available"]
+        assert {pr["url"] for pr in info["prs"]} == {selected, MR}
+    assert pr_resource.pr_info(repo, session_id="failed-selected", pr_url=MR)["pr"]["url"] == MR
+
+
+@pytest.mark.parametrize("failure", ["on_inferred_pr", "update_titles"])
+def test_optional_inferred_metadata_failure_preserves_pr(
+    facet: FakeGitLabFacet, repo: str, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    def unavailable(*_args, **_kwargs):
+        raise OSError("Metadata store unavailable")
+
+    facet.branch_pr = MR
+    monkeypatch.setattr(
+        facet if failure == "on_inferred_pr" else SessionPrRegistry, failure, unavailable
+    )
+    info = pr_resource.pr_info(repo, session_id="metadata-failure")
+    assert info["pr"]["url"] == MR
+    assert info["selected_pr_url"] == MR
+    assert [pr["url"] for pr in info["prs"]] == [MR]

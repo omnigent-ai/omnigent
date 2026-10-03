@@ -102,12 +102,21 @@ class SessionPrRegistry:
         return state
 
     def list(self) -> list[SessionPullRequest]:
-        """Read a locked snapshot, reporting corruption or contention as ValueError."""
+        """Read a locked snapshot with explicit activity before inferred PRs.
+
+        :raises ValueError: If the registry is corrupt or busy.
+        """
         if not self.path.parent.exists():
             return []
         try:
             with FileLock(str(self.path) + ".lock", timeout=1):
-                return sorted(self._read().prs, key=lambda pr: pr.last_seen_at, reverse=True)
+                return sorted(
+                    self._read().prs,
+                    key=lambda pr: (
+                        pr.relationship == "inferred",
+                        pr.first_seen_at if pr.relationship == "inferred" else -pr.last_seen_at,
+                    ),
+                )
         except FileLockTimeout as exc:
             raise ValueError("PR tracking is busy; try again.") from exc
 
