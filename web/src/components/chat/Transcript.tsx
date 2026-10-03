@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { type Virtualizer, measureElement, useVirtualizer } from "@tanstack/react-virtual";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
   Conversation,
@@ -255,6 +255,8 @@ function TranscriptImpl({
     [display.bubbles],
   );
   const nav = useUserMessageNav(userMessageIds, ensureItemVisible);
+  // The bottom pin's growth check, run by the list when a mounted row grows.
+  const bottomPinRef = useRef<(() => void) | null>(null);
   useMessageDeepLink(conversationId ?? null, {
     ensureMessageVisible: ensureItemVisible,
     ready: display.conversationId === conversationId && !!scroller?.el && !!scrollToItemRef.current,
@@ -332,7 +334,7 @@ function TranscriptImpl({
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
-            <KeepBottomOnViewportResize />
+            <KeepBottomOnViewportResize pinRef={bottomPinRef} />
             <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader
               scrollElement={scroller?.el ?? null}
@@ -370,6 +372,7 @@ function TranscriptImpl({
                   disableVirtualization={disableVirtualization}
                   messageId={messageId}
                   onGeometryChange={onGeometryChange}
+                  pinRef={bottomPinRef}
                 />
                 {/* Pending elicitation cards, floated to the bottom of the chat
                 so an outstanding question stays in view. Newest renders last,
@@ -539,6 +542,23 @@ function rememberTranscriptView(convId: string, snap: TranscriptViewSnapshot): v
     transcriptViewCache.delete(oldest);
   }
 }
+/** The virtualizer's row measurement, then the bottom pin when it came from the row
+ *  ResizeObserver: a mounted row grew, which the content box only reports a frame later.
+ *  Mount measures skip it; a history page's rows land before the prepend hold runs. */
+export function measureRowAndPin(
+  pinRef: React.RefObject<(() => void) | null> | undefined,
+): (
+  node: Element,
+  entry: ResizeObserverEntry | undefined,
+  instance: Virtualizer<HTMLElement, Element>,
+) => number {
+  return (node, entry, instance) => {
+    const size = measureElement(node, entry, instance);
+    if (entry) pinRef?.current?.();
+    return size;
+  };
+}
+
 /** Physical "is this scroll element at (or within a hair of) its bottom". */
 const BOTTOM_EPSILON_PX = 8;
 const RESTORE_CANCEL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
@@ -557,6 +577,7 @@ export function VirtualBubbleList({
   disableVirtualization,
   messageId,
   onGeometryChange,
+  pinRef,
 }: {
   bubbles: Bubble[];
   scrollEl: HTMLElement | null;
@@ -569,6 +590,8 @@ export function VirtualBubbleList({
   messageId?: string | null;
   /** Publishes virtualizer-derived geometry up to the rail/spacer. */
   onGeometryChange: (geometry: TranscriptGeometry) => void;
+  /** KeepBottomOnViewportResize's growth check; run when a mounted row grows. */
+  pinRef?: React.RefObject<(() => void) | null>;
 }) {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     stopScroll: () => void;
@@ -718,6 +741,7 @@ export function VirtualBubbleList({
     gap: 16,
     overscan: 6,
     scrollMargin,
+    measureElement: measureRowAndPin(pinRef),
   });
 
   // An assistant bubble is keyed by its first item, so a history page that

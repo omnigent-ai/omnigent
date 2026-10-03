@@ -2,7 +2,13 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
-import { isNativeFindShortcut, type TranscriptGeometry, VirtualBubbleList } from "./Transcript";
+import type { Virtualizer } from "@tanstack/react-virtual";
+import {
+  isNativeFindShortcut,
+  measureRowAndPin,
+  type TranscriptGeometry,
+  VirtualBubbleList,
+} from "./Transcript";
 
 afterEach(cleanup);
 
@@ -88,6 +94,32 @@ it("remeasures scrollMargin when task padding changes without changing bubbles",
   view.rerender(list(true, scrollEl));
 
   await waitFor(() => expect(row.style.transform).toBe("translateY(-64px)"));
+});
+
+it("pins after an observer re-measure of a row, never after a mount measure", () => {
+  const pin = vi.fn();
+  const measure = measureRowAndPin({ current: pin });
+  const node = document.createElement("div");
+  node.getBoundingClientRect = () => ({ height: 40 }) as DOMRect;
+  const instance = { options: { horizontal: false } } as unknown as Virtualizer<
+    HTMLElement,
+    Element
+  >;
+
+  // Mounting measures without an entry; the row's height is the default measure.
+  expect(measure(node, undefined, instance)).toBe(40);
+  expect(pin).not.toHaveBeenCalled();
+
+  // The virtualizer's ResizeObserver hands over an entry when a mounted row grew.
+  const entry = {
+    borderBoxSize: [{ blockSize: 64, inlineSize: 600 }],
+  } as unknown as ResizeObserverEntry;
+  expect(measure(node, entry, instance)).toBe(64);
+  expect(pin).toHaveBeenCalledOnce();
+
+  // Without a registered pin the measurement still goes through.
+  expect(measureRowAndPin({ current: null })(node, entry, instance)).toBe(64);
+  expect(measureRowAndPin(undefined)(node, entry, instance)).toBe(64);
 });
 
 it("publishes navigation that distinguishes loaded and missing turns", async () => {
