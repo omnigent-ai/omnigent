@@ -21,8 +21,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
+import yaml
+
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
+from omnigent.spec.parser import (
+    _FRONTMATTER_RE,
+    _discover_skills,
+    _parse_skill,
+    discover_host_skills,
+)
 from omnigent.spec.types import AgentSpec, SkillSpec
 
 _log = logging.getLogger(__name__)
@@ -418,17 +425,66 @@ def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[st
     return out
 
 
-def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
-    """
-    Enabled Claude Code plugin skills, namespaced ``<plugin>:<skill>``.
+def _parse_plugin_command(command_md: Path) -> SkillSpec | None:
+    """Parse a plugin command; fall back to its first body line for the description.
 
-    Plugin skills are host skills, so they obey the spec's
-    ``skills_filter`` exactly as :func:`discover_host_skills` does:
-    ``"none"`` suppresses them entirely (hermetic), ``"all"`` surfaces
-    every skill from every enabled plugin, and a list selects by the
-    skill's own (bare) name — matching how the filter names skills,
-    independent of the display namespace.
-    """
+    Commands have no skill_dir because sibling command files are not resources.
+    :param command_md: Command markdown path.
+    :returns: The command spec, or None for unreadable files."""
+    try:
+        text = command_md.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    description = ""
+    body = text
+    match = _FRONTMATTER_RE.match(text)
+    if match:
+        frontmatter_str, body = match.groups()
+        try:
+            frontmatter = yaml.safe_load(frontmatter_str)
+        except yaml.YAMLError:
+            frontmatter = None
+        if isinstance(frontmatter, dict):
+            raw = frontmatter.get("description")
+            if isinstance(raw, str):
+                description = raw.strip()
+    if not description:
+        description = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    return SkillSpec(
+        name=command_md.stem,
+        description=description,
+        content=body.strip(),
+        skill_dir=None,
+    )
+
+
+def _discover_plugin_commands(commands_dir: Path) -> list[SkillSpec]:
+    """Read top-level command markdown files in stable order, skipping unreadable files.
+
+    :param commands_dir: Plugin commands directory.
+    :returns: Parsed commands, or an empty list when the directory is unavailable."""
+    if not commands_dir.is_dir():
+        return []
+    try:
+        entries = sorted(commands_dir.iterdir())
+    except OSError as exc:
+        _log.warning("Skipping unreadable plugin commands dir %s: %s", commands_dir, exc)
+        return []
+    out: list[SkillSpec] = []
+    for entry in entries:
+        if not entry.is_file() or entry.suffix != ".md" or entry.name.startswith("."):
+            continue
+        spec = _parse_plugin_command(entry)
+        if spec is not None:
+            out.append(spec)
+    return out
+
+
+def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """Discover enabled plugin skills and commands, namespaced as plugin:name.
+
+    Skills precede commands on name collisions. Filtering uses bare names;
+    "none" suppresses all entries, while "all" includes every enabled plugin."""
     if ctx.skills_filter == "none":
         return []
     filter_names: set[str] | None = (
@@ -441,7 +497,9 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     for key, install_path in _plugin_install_paths(ctx, enabled).items():
         plugin = key.split("@", 1)[0]
         skipped: list[str] = []
-        for spec in _discover_skills(install_path / "skills", skipped=skipped):
+        specs = _discover_skills(install_path / "skills", skipped=skipped)
+        specs += _discover_plugin_commands(install_path / "commands")
+        for spec in specs:
             if filter_names is not None and spec.name not in filter_names:
                 continue
             out.append(replace(spec, name=f"{plugin}:{spec.name}"))
