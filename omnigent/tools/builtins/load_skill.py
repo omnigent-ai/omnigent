@@ -5,18 +5,38 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import omnigent
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
+
+_PACKAGE_DIR = Path(omnigent.__file__).resolve().parent
+
+#: Framework-owned skills every agent can load. Bundle and host skills of
+#: the same name win; a missing source dir is skipped.
+FRAMEWORK_SKILL_DIRS: tuple[Path, ...] = (
+    _PACKAGE_DIR / "onboarding" / "agent" / "skills" / "build-omnigent",
+    _PACKAGE_DIR / "resources" / "skills" / "slide-decks",
+)
+
+
+def framework_skills() -> list[SkillSpec]:
+    """Parse the framework skills whose source dir exists."""
+    from omnigent.spec.parser import _parse_skill
+
+    return [
+        _parse_skill(d / "SKILL.md") for d in FRAMEWORK_SKILL_DIRS if (d / "SKILL.md").is_file()
+    ]
 
 
 class LoadSkillTool(Tool):
     """
     Built-in tool that loads a skill's full instructions by name.
 
-    Looks up the skill from bundled skills (in the agent spec)
-    and host-scope skills (``.claude/skills/``, ``.agents/skills/``,
-    ``~/.claude/skills/``, ``~/.agents/skills/``). Returns the
+    Looks up the skill from bundled skills (in the agent spec),
+    host-scope skills (``.claude/skills/``, ``.agents/skills/``,
+    ``~/.claude/skills/``, ``~/.agents/skills/``), and
+    :data:`FRAMEWORK_SKILL_DIRS`, in that priority. Returns the
     skill content with an optional resource file listing appended.
 
     :param skills: The agent's bundled skill list.
@@ -58,6 +78,8 @@ class LoadSkillTool(Tool):
         for hs in host_skills:
             if hs.name not in bundled_names:
                 all_skills.append(hs)
+        known_names = {s.name for s in all_skills}
+        all_skills.extend(fs for fs in framework_skills() if fs.name not in known_names)
         self._skills = all_skills
         self._skills_by_name: dict[str, SkillSpec] = {s.name: s for s in all_skills}
 

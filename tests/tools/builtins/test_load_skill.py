@@ -343,3 +343,33 @@ def test_load_skill_tool_accepts_namespaced_alias(tmp_path: Path, tool_ctx: Tool
     tool = LoadSkillTool([skill])
     result = tool.invoke(json.dumps({"name": "myplugin:brand-review"}), tool_ctx)
     assert result == "Review the brand."
+
+
+def test_framework_skill_listed_and_loaded_without_bundling(tool_ctx: ToolContext) -> None:
+    """slide-decks is advertised and loadable for a spec that does not bundle it."""
+    tool = LoadSkillTool([], skills_filter="none")
+
+    assert "slide-decks" in tool.get_schema()["function"]["description"]
+    assert "## Deck format" in tool.invoke(json.dumps({"name": "slide-decks"}), tool_ctx)
+
+
+def test_bundled_skill_wins_over_framework_skill(tool_ctx: ToolContext) -> None:
+    """A bundled skill of the same name replaces the framework copy, no duplicate."""
+    own = SkillSpec(name="slide-decks", description="Mine.", content="Mine.")
+    tool = LoadSkillTool([own], skills_filter="none")
+
+    assert [s.name for s in tool.skills].count("slide-decks") == 1
+    assert tool.invoke(json.dumps({"name": "slide-decks"}), tool_ctx) == "Mine."
+
+
+def test_missing_framework_skill_source_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A framework skill dir that does not exist is skipped, not an error."""
+    from omnigent.tools.builtins import load_skill
+
+    real = load_skill.FRAMEWORK_SKILL_DIRS
+    monkeypatch.setattr(load_skill, "FRAMEWORK_SKILL_DIRS", (tmp_path / "missing", *real))
+
+    names = [s.name for s in LoadSkillTool([], skills_filter="none").skills]
+    assert names == ["build-omnigent", "slide-decks"]

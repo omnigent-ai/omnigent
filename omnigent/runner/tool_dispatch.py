@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
-    from omnigent.spec.types import AgentSpec, SkillSpec
+    from omnigent.spec.types import AgentSpec
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
@@ -8891,45 +8891,6 @@ async def _cancel_subagent_task(
     )
 
 
-def _inject_orchestrator_skills(
-    skills: list[SkillSpec],
-    agent_spec: AgentSpec | None,
-) -> list[SkillSpec]:
-    """
-    Auto-inject built-in platform skills for every omnigent agent.
-
-    The ``build-omnigent`` skill teaches the LLM how to author valid
-    agent configs. Every agent on the platform should have access to it
-    — whether it declares ``tools.agents`` or not — so that any
-    ``omnigent claude`` user can author and launch new agents. The
-    skill is injected from the canonical source at
-    ``omnigent/onboarding/agent/skills/build-omnigent/`` when not
-    already present in the bundled set.
-
-    :param skills: The agent's current skill list (bundled +
-        potentially others); mutated in-place and returned.
-    :param agent_spec: The session's AgentSpec (unused after the gate
-        removal; retained for call-site compatibility).
-    :returns: The (possibly augmented) skill list.
-    """
-    del agent_spec  # no longer gated; inject unconditionally
-    existing_names = {getattr(s, "name", None) for s in skills}
-    if "build-omnigent" in existing_names:
-        return skills
-    from omnigent.spec.parser import _discover_skills
-
-    onboarding_skills_dir = (
-        Path(__file__).resolve().parent.parent / "onboarding" / "agent" / "skills"
-    )
-    if not onboarding_skills_dir.is_dir():
-        return skills
-    for spec in _discover_skills(onboarding_skills_dir, skipped=[]):
-        if spec.name == "build-omnigent":
-            skills.append(spec)
-            break
-    return skills
-
-
 def _execute_skill_tool(
     tool_name: str,
     args: _JsonObject,
@@ -8956,12 +8917,6 @@ def _execute_skill_tool(
 
     bundled_skills = list(getattr(agent_spec, "skills", None) or [])
     skills_filter = getattr(agent_spec, "skills_filter", "all")
-    # Auto-inject the build-omnigent skill for agents that opt into the
-    # orchestration surface (tools.agents). This teaches the LLM how to
-    # author valid agent configs via sys_os_write without requiring the
-    # agent's own bundle to ship a skills/ directory.
-    bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
-
     # Both tools must resolve the same registry: a skill load_skill can load
     # from host scope must have its files readable too.
     load_tool = LoadSkillTool(

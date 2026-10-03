@@ -8,20 +8,6 @@ description: Turn context the user provides into a slide deck that the Omnigent 
 Use when the user asks for slides, a deck, or a presentation built from
 context they gave you (notes, a doc, a PR, a conversation).
 
-## Delegating
-
-Writing a deck is writing HTML and CSS, so polly dispatches an `implement`
-sub-agent. A worktree does not contain the kit (`.omnigent/` is gitignored)
-and is not where the user looks for the deck, so the contract must give:
-
-- the absolute workspace root;
-- the absolute output path, e.g. `<root>/decks/<slug>.slides.html`;
-- the absolute kit folder `<root>/.omnigent/design-kit/`, to read from there
-  and not from the worktree;
-- "Write only this file. Do not commit, push, or open a PR." (unless the user
-  asked to commit the deck to a repo);
-- the "Deck format" and "Design kit" sections below, pasted in.
-
 ## Deck format
 
 - The file name must end in `.slides.html`. Any other name opens in the plain
@@ -66,7 +52,7 @@ folder).
   `.omnigent/design-kit/` and editing it.
 - A "Design kit not applied: reason" notice means the kit could not be
   applied (an invalid `kit.json` or kit file, a failed read, or a timeout);
-  the notice gives the reason. Report it to the user (or polly) rather than
+  the notice gives the reason. Report it to the user rather than
   restyling the deck to match. The viewer reads the kit when a deck opens or
   its content changes, so reopen the deck after editing only the kit.
 
@@ -80,3 +66,11 @@ folder).
 4. Tell the user the file path and how to view it: open it from the Files
    panel, step through with the arrow keys, and use "Print / Save as PDF" to
    export.
+
+## If you delegate the deck to a sub-agent
+
+A worktree does not contain the kit (`.omnigent/` is gitignored), so give the
+sub-agent absolute paths: the workspace root, the output path (e.g.
+`<root>/decks/<slug>.slides.html`), and the kit folder
+`<root>/.omnigent/design-kit/`. Tell it to write only that file, with no
+commit, push, or PR.
