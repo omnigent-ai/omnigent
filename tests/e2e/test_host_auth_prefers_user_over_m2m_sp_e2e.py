@@ -251,6 +251,8 @@ def test_resolve_auth_for_host_config_profile_env_is_honoured_in_host_path(
     auth, _host = databricks_executor._resolve_databricks_auth(
         host="https://myworkspace.cloud.databricks.com"
     )
+    # Profile selection runs on the first token request, not at resolution.
+    resolved_token = auth.current_token()
 
     # The first profile tried must be DEFAULT (from DATABRICKS_CONFIG_PROFILE),
     # NOT sp-profile (from file-order walk).
@@ -262,7 +264,6 @@ def test_resolve_auth_for_host_config_profile_env_is_honoured_in_host_path(
         "When the env-named profile matches the requested host it must be "
         "tried before any file-order walk."
     )
-    resolved_token = auth.current_token()
     assert resolved_token == "token-for-DEFAULT", (
         f"Expected token for DEFAULT profile, got {resolved_token!r}"
     )

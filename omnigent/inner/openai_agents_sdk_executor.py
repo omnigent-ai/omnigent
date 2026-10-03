@@ -450,8 +450,11 @@ def _get_openai_async_client(
         Without a profile, only legacy ``"databricks-"`` names enable
         ambient Databricks credential fallback.
     :raises DatabricksAuthError: When an explicit ``profile`` is given,
-        authentication fails, and no ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY``
-        env-var fallbacks are available.
+        no credential configuration resolves for it, and no
+        ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` env-var fallbacks are
+        available. Credential failures for a resolvable profile surface on
+        the client's first request unless an env-var fallback exists, in
+        which case they are checked here so the fallback still applies.
     :raises OSError: If ucode host state is present but missing the
         corresponding base URL or auth command.
     """
@@ -522,6 +525,11 @@ def _get_openai_async_client(
 
         try:
             auth, host = _resolve_databricks_auth(profile)
+            if os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_KEY"):
+                # Credentials initialize on first use; confirm them now so a
+                # profile with broken credentials still falls back to the
+                # env-var client instead of failing on its first request.
+                auth.current_token()
             return AsyncOpenAI(
                 base_url=base_url_override or _databricks_openai_base_url(host),
                 api_key=_OPENAI_KEY_PLACEHOLDER,

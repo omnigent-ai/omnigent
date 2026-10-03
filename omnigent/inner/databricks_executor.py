@@ -22,10 +22,12 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 import time
-from collections.abc import AsyncIterator, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -63,6 +65,9 @@ _API_CALL_TIMEOUT_SECONDS = 30.0
 _STREAM_IDLE_TIMEOUT_SECONDS = 60.0
 _CLI_TOKEN_REFRESH_MARGIN_SECONDS = 90.0
 _CLI_TOKEN_DEFAULT_TTL_SECONDS = 50 * 60.0
+# HTTP clients retry a failed auth callback; one credential failure answers
+# the retries of that request instead of re-running the credential chain.
+_AUTH_FAILURE_REUSE_SECONDS = 30.0
 
 _SESSION_ONLY_EXECUTOR_EXTRA_KEYS = {
     "new_user_messages_flushed",
@@ -469,6 +474,14 @@ class DatabricksAuthError(OSError):
     """
 
 
+class _ReplayedDatabricksAuthError(DatabricksAuthError):
+    """A recent credential failure answered again without re-running the chain."""
+
+
+class _ProfileRepointedError(ValueError):
+    """The resolved profile now names a different workspace host."""
+
+
 class _DatabricksAuthConfig(Protocol):
     def authenticate(self) -> dict[str, str]:
         raise NotImplementedError
@@ -492,6 +505,7 @@ class _DatabricksCliProfileAuthConfig:
         now = time.time()
         cached = self._cached_token
         if cached is None or cached.expires_at - now <= _CLI_TOKEN_REFRESH_MARGIN_SECONDS:
+            _check_profile_still_names_host(self)
             cached = _databricks_cli_profile_token(self.profile, now=now)
             self._cached_token = cached
         return {"Authorization": f"Bearer {cached.access_token}"}
@@ -593,10 +607,15 @@ class _DatabricksBearerAuth(httpx.Auth):
         self._config = config
         self._profile_name = profile_name
         self._failure_message = failure_message
+        self._recent_failure: tuple[float, DatabricksAuthError] | None = None
+        self._lock = threading.Lock()
 
     @property
     def profile_name(self) -> str | None:
-        return self._profile_name
+        if self._profile_name is not None:
+            return self._profile_name
+        selected = getattr(self._config, "profile_name", None)
+        return selected if isinstance(selected, str) else None
 
     def _authenticate_headers(self) -> dict[str, str]:
         """
@@ -611,16 +630,36 @@ class _DatabricksBearerAuth(httpx.Auth):
         :raises DatabricksAuthError: When the SDK cannot mint a token
             (expired refresh token, revoked credentials, etc.).
         """
-        try:
-            return self._config.authenticate()
-        except Exception as exc:
-            if self._failure_message is not None:
-                raise DatabricksAuthError(self._failure_message) from exc
-            profile_flag = f" -p {self._profile_name}" if self._profile_name else ""
-            raise DatabricksAuthError(
-                f"Databricks authentication failed for profile {self._profile_name!r}. "
-                f"Run: databricks auth login{profile_flag}"
-            ) from exc
+        # One mint at a time per auth object: concurrent requests wait for the
+        # bearer instead of each spawning their own CLI refresh.
+        with self._lock:
+            recent = self._recent_failure
+            if recent is not None and time.monotonic() - recent[0] < _AUTH_FAILURE_REUSE_SECONDS:
+                raise _ReplayedDatabricksAuthError(str(recent[1])) from recent[1].__cause__
+            try:
+                headers = self._config.authenticate()
+            except _ProfileRepointedError as exc:
+                # A cheap config read whose remedy is to resolve again: never replay it.
+                raise self._auth_error(exc) from exc
+            except Exception as exc:
+                error = self._auth_error(exc)
+                self._recent_failure = (time.monotonic(), error)
+                raise error from exc
+            self._recent_failure = None
+            return headers
+
+    def _auth_error(self, exc: Exception) -> DatabricksAuthError:
+        """Translate a credential failure into the user-facing error."""
+        if isinstance(exc, _ProfileRepointedError):
+            return DatabricksAuthError(str(exc))
+        profile_name = self.profile_name
+        if profile_name is None and self._failure_message is not None:
+            return DatabricksAuthError(self._failure_message)
+        profile_flag = f" -p {profile_name}" if profile_name else ""
+        return DatabricksAuthError(
+            f"Databricks authentication failed for profile {profile_name!r}. "
+            f"Run: databricks auth login{profile_flag}"
+        )
 
     def current_token(self) -> str | None:
         """
@@ -664,10 +703,13 @@ def _resolve_databricks_auth(
 ) -> tuple[_DatabricksBearerAuth, str]:
     """Resolve Databricks credentials and return per-request auth + host.
 
-    Validates that authentication succeeds at call time. On success,
-    returns an httpx Auth that re-authenticates on every HTTP request
-    (surviving OAuth access-token expiry transparently) and the
-    workspace host URL.
+    Resolution only reads configuration (profile section, env vars, host):
+    SDK credential initialization, which can launch a ``databricks auth
+    token`` subprocess, runs when the returned auth first mints a token.
+    Runners sharing a profile therefore refresh only when a request needs
+    a bearer, and a broken credential chain cannot abort resolution. The
+    returned httpx Auth re-authenticates on every HTTP request (surviving
+    OAuth access-token expiry transparently).
 
     :param profile: Databricks config profile name, e.g. ``"dev"``.
         ``None`` uses the SDK's default resolution order. Mutually
@@ -683,14 +725,15 @@ def _resolve_databricks_auth(
     :returns: ``(auth, host)`` — an httpx Auth for injection into
         ``httpx.Client``/``httpx.AsyncClient`` and the workspace URL,
         e.g. ``"https://example.cloud.databricks.com"``.
-    :raises DatabricksAuthError: When credentials are missing or
-        authentication fails.
+    :raises DatabricksAuthError: When no credential configuration
+        resolves. Credential failures surface from the returned auth on
+        its first token request.
     :raises ImportError: When the ``databricks-sdk`` package is not
         installed.
     :raises ValueError: When both ``profile`` and ``host`` are given.
     """
     try:
-        from databricks.sdk.config import Config
+        import databricks.sdk.config  # noqa: F401 — availability check; see _sdk_config
     except ImportError as exc:
         raise ImportError(
             "The 'databricks-sdk' package is required for Databricks authentication. "
@@ -706,8 +749,7 @@ def _resolve_databricks_auth(
     cfg = None
 
     try:
-        cfg = Config(profile=sdk_profile)
-        cfg.authenticate()
+        cfg = _sdk_config(profile=sdk_profile)
     except ValueError:
         if profile is None and sdk_profile is not None:
             # Profile name came from the DATABRICKS_CONFIG_PROFILE env var,
@@ -726,8 +768,7 @@ def _resolve_databricks_auth(
                 sdk_profile,
             )
             try:
-                cfg = Config()
-                cfg.authenticate()
+                cfg = _sdk_config()
             except ValueError:
                 cfg = None
         else:
@@ -763,12 +804,98 @@ def _resolve_databricks_auth(
     )
 
 
-def _sdk_config(**kwargs: str) -> Any:  # type: ignore[explicit-any]  # SDK Config, imported lazily
-    """Construct a databricks-sdk ``Config`` (test indirection point).
+def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SDK CredentialsStrategy, imported lazily
+    """Build an SDK credentials strategy that initializes credentials on first use.
 
-    The SDK probes host metadata at construction time, which makes
-    offline unit tests against placeholder hosts impossible — tests
-    patch this helper with a stub instead of touching the SDK module.
+    ``Config.__init__`` runs its strategy eagerly, and the ``databricks-cli``
+    provider shells out to ``databricks auth token`` right there. This one
+    runs the SDK's default provider chain on the first header request,
+    against the same ``Config``, and rejects a profile that no longer names
+    the resolved host before and after every mint, so a repointed profile
+    never reaches the CLI and a bearer minted as the profile moved is never
+    kept.
+    """
+    from databricks.sdk.credentials_provider import CredentialsStrategy, DefaultCredentials
+
+    class _LazyDefaultCredentials(CredentialsStrategy):
+        def __init__(self) -> None:
+            self._configured_auth_type: str | None = None
+            self._chain: DefaultCredentials | None = None
+            self._provider: Callable[[], dict[str, str]] | None = None
+            self._lock = threading.Lock()
+
+        def auth_type(self) -> str:
+            if self._chain is not None:
+                return self._chain.auth_type()
+            # Config.init_auth() writes this back to cfg.auth_type; keep the
+            # configured preference so the deferred chain still honors it.
+            return self._configured_auth_type or ""
+
+        def __call__(self, cfg: Any) -> Callable[[], dict[str, str]]:  # type: ignore[explicit-any]  # SDK Config
+            self._configured_auth_type = cfg.auth_type or None
+
+            def headers() -> dict[str, str]:
+                _check_profile_still_names_host(cfg)
+                provider = self._provider
+                if provider is None:
+                    with self._lock:
+                        provider = self._provider
+                        if provider is None:
+                            chain = DefaultCredentials()
+                            provider = chain(cfg)
+                            cfg.auth_type = chain.auth_type()
+                            self._chain = chain
+                            self._provider = provider
+                result = provider()
+                try:
+                    _check_profile_still_names_host(cfg)
+                except _ProfileRepointedError:
+                    # The profile moved while the CLI read it, so the provider now
+                    # caches a bearer for another workspace: rebuild it next time.
+                    with self._lock:
+                        self._chain = None
+                        self._provider = None
+                    raise
+                return result
+
+            return headers
+
+    return _LazyDefaultCredentials()
+
+
+def _check_profile_still_names_host(cfg: Any) -> None:  # type: ignore[explicit-any]  # SDK Config or _DatabricksCliProfileAuthConfig
+    """Refuse to mint when ``cfg.profile`` was repointed since ``cfg.host`` resolved.
+
+    ``databricks auth token --profile`` (newer SDKs and the profile-pinned CLI
+    fallback) reads the profile's host again, so a repointed profile would
+    hand this host's client a bearer for another workspace.
+
+    :raises _ProfileRepointedError: When the profile now names a different host.
+    """
+    if not cfg.profile or not cfg.host:
+        return
+    config = _read_databrickscfg_no_inheritance()
+    if config is None or not config.has_section(cfg.profile):
+        return
+    # A section without its own host inherits [DEFAULT]'s, as the CLI reads it.
+    default_host = config["DEFAULT"].get("host", "") if config.has_section("DEFAULT") else ""
+    current = (config[cfg.profile].get("host") or default_host).strip()
+    if current and _normalized_workspace_host(current) != _normalized_workspace_host(cfg.host):
+        raise _ProfileRepointedError(
+            f"Databricks profile {cfg.profile!r} now names {current}, not the resolved "
+            f"{cfg.host}; resolve credentials again"
+        )
+
+
+def _sdk_config(**kwargs: str | None) -> Any:  # type: ignore[explicit-any]  # SDK Config, imported lazily
+    """Construct a databricks-sdk ``Config`` whose credentials initialize on first use.
+
+    Construction resolves settings and raises ``ValueError`` for a missing
+    profile or ambiguous auth settings; providers (including unsupported
+    ``auth_type`` values) run on the first ``authenticate()`` call, so it
+    never launches a ``databricks auth token`` subprocess. Also the test
+    indirection point: tests patch this helper with a stub instead of
+    touching the SDK module.
 
     :param kwargs: ``Config`` keyword arguments, e.g.
         ``profile="my-ws"`` or ``host=..., auth_type="databricks-cli"``.
@@ -779,11 +906,57 @@ def _sdk_config(**kwargs: str) -> Any:  # type: ignore[explicit-any]  # SDK Conf
     # The SDK types ``Config.__init__`` as taking a CredentialsStrategy
     # positionally; keyword config attributes are dynamically declared,
     # so the kwargs expansion is untypeable here.
-    return Config(**kwargs)  # type: ignore[arg-type]
+    return Config(credentials_strategy=_lazy_sdk_credentials_strategy(), **kwargs)  # type: ignore[arg-type]
 
 
 def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth, str]:
     """Resolve per-request auth for a specific workspace host.
+
+    Credential sources are selected and authenticated on the first token
+    request (see :func:`_select_host_auth_config`), so resolution itself
+    never launches a CLI token refresh. A selection failure surfaces as
+    :class:`DatabricksAuthError` on that first request.
+
+    :param host: Workspace host, e.g.
+        ``"https://example.databricks.com"``.
+    :returns: ``(auth, host)`` — an httpx Auth and the workspace URL.
+    """
+    host_failure = (
+        f"Databricks authentication failed for workspace {host}. "
+        f"Run: databricks auth login --host {host}"
+    )
+    return _DatabricksBearerAuth(_DeferredHostAuthConfig(host), failure_message=host_failure), host
+
+
+class _DeferredHostAuthConfig:
+    """Auth config for a workspace host that picks its credential source on first use."""
+
+    def __init__(self, host: str) -> None:
+        self._host = host
+        self._selected: _DatabricksAuthConfig | None = None
+        self._profile_name: str | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def profile_name(self) -> str | None:
+        """Profile that supplied the credential; ``None`` before the first
+        mint or when the host-keyed CLI lookup won."""
+        return self._profile_name
+
+    def authenticate(self) -> dict[str, str]:
+        with self._lock:
+            selected = self._selected
+            if selected is None:
+                selected, self._profile_name, headers = _select_host_auth_config(self._host)
+                self._selected = selected
+                return headers
+            return selected.authenticate()
+
+
+def _select_host_auth_config(
+    host: str,
+) -> tuple[_DatabricksAuthConfig, str | None, dict[str, str]]:
+    """Probe credential sources for *host* and return the first that authenticates.
 
     Prefers a ``~/.databrickscfg`` profile pinned to *host*:
     ``databricks auth login --host <host>`` saves one, and the CLI's
@@ -804,14 +977,13 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
 
     :param host: Workspace host, e.g.
         ``"https://example.databricks.com"``.
-    :returns: ``(auth, host)`` — an httpx Auth and the workspace URL.
-    :raises DatabricksAuthError: When no credential source resolves
-        for the host.
+    :returns: ``(config, profile_name, headers)`` — the authenticated
+        config, the profile it came from (``None`` for the host-keyed CLI
+        lookup) and the headers from its first ``authenticate()``.
+    :raises Exception: Whatever the host-keyed CLI lookup raised when no
+        profile authenticated; :class:`_DatabricksBearerAuth` reports it
+        as :class:`DatabricksAuthError`.
     """
-    host_failure = (
-        f"Databricks authentication failed for workspace {host}. "
-        f"Run: databricks auth login --host {host}"
-    )
     # One parse of ~/.databrickscfg yields both the host-matching profiles and
     # which of them are service principals; ordering then works off those sets.
     matches, sp_sections = _databrickscfg_host_matches_and_sp_sections(host)
@@ -821,9 +993,10 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     # under the SP again, the exact wrong-identity symptom the ordering fixes.
     failed_user_profiles: list[str] = []
     for profile_name in _order_profiles_by_identity_preference(matches, sp_sections):
+        cfg: _DatabricksAuthConfig
         try:
             cfg = _sdk_config(profile=profile_name)
-            cfg.authenticate()
+            headers = cfg.authenticate()
         except Exception:  # noqa: BLE001 — try the next matching profile
             logger.debug(
                 "profile %r matched host %s but did not authenticate via SDK",
@@ -832,7 +1005,7 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
             )
             try:
                 cfg = _DatabricksCliProfileAuthConfig(profile=profile_name, host=host)
-                cfg.authenticate()
+                headers = cfg.authenticate()
             except Exception:  # noqa: BLE001 — try the next matching profile
                 logger.debug(
                     "profile %r matched host %s but did not authenticate via CLI",
@@ -855,13 +1028,9 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
                 ", ".join(repr(p) for p in failed_user_profiles),
                 host,
             )
-        return _DatabricksBearerAuth(cfg, profile_name=profile_name), cfg.host or host
-    try:
-        host_cfg = _sdk_config(host=host, auth_type="databricks-cli")
-        host_cfg.authenticate()
-    except Exception as exc:
-        raise DatabricksAuthError(host_failure) from exc
-    return _DatabricksBearerAuth(host_cfg, failure_message=host_failure), host
+        return cfg, profile_name, headers
+    host_cfg = _sdk_config(host=host, auth_type="databricks-cli")
+    return host_cfg, None, host_cfg.authenticate()
 
 
 class _ReusedDatabricksTokenSource:
@@ -891,11 +1060,17 @@ class _ReusedDatabricksTokenSource:
             return None
 
     def current_token(self) -> str | None:
-        """Mint a token, resolving auth lazily and retrying once if it is stale."""
+        """Mint a token, resolving auth lazily and re-resolving after a fresh failure.
+
+        A failure replayed inside the auth's reuse window is not re-resolved: the
+        kept auth keeps answering retries without running the credential chain.
+        """
         cached = self._auth
         if cached is not None:
             try:
                 return cached.current_token()
+            except _ReplayedDatabricksAuthError:
+                return None
             except DatabricksAuthError:
                 self._auth = None
         auth = self._resolve()
@@ -913,6 +1088,24 @@ class _ReusedDatabricksTokenSource:
 # ``auth_type = databricks-cli`` cannot smear onto named SP sections and
 # misclassify them as user profiles.
 _NO_DEFAULT_INHERITANCE = "@omnigent-no-default-inheritance@"
+
+
+def _normalized_workspace_host(value: str) -> str:
+    """Canonical form for comparing workspace hosts, mirroring the SDK's host fix-up.
+
+    Ignores scheme, case, a ``:443`` port and trailing slashes; keeps other
+    ports, paths and query selectors such as ``?o=<workspace id>``.
+    """
+    value = value.strip()
+    parts = urlsplit(value if "://" in value else f"https://{value}")
+    netloc = parts.netloc.lower()
+    try:
+        if parts.port == 443:
+            netloc = netloc.rsplit(":", 1)[0]
+    except ValueError:  # non-numeric port: compare the spelling as written
+        pass
+    canonical = netloc + parts.path.rstrip("/")
+    return f"{canonical}?{parts.query}" if parts.query else canonical
 
 
 def _read_databrickscfg_no_inheritance() -> configparser.ConfigParser | None:
@@ -993,14 +1186,10 @@ def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], s
         ``([], set())`` when the file is missing or unparseable.
     """
 
-    def _norm(value: str) -> str:
-        value = value.strip().rstrip("/")
-        return value.split("://", 1)[-1].lower()
-
     config = _read_databrickscfg_no_inheritance()
     if config is None:
         return [], set()
-    wanted = _norm(host)
+    wanted = _normalized_workspace_host(host)
     # With the sentinel default_section, the file's [DEFAULT] is a plain
     # section named "DEFAULT"; its host is what named sections inherit.
     default_host = config["DEFAULT"].get("host", "") if config.has_section("DEFAULT") else ""
@@ -1019,9 +1208,9 @@ def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], s
         # overrides inheritance to no host, matching ConfigParser semantics —
         # so an empty host does not fall back and does not match.
         section_host = options.get("host", default_host)
-        if _norm(section_host) == wanted:
+        if _normalized_workspace_host(section_host) == wanted:
             matches.append(section)
-    if default_host and _norm(default_host) == wanted:
+    if default_host and _normalized_workspace_host(default_host) == wanted:
         matches.append("DEFAULT")
     return matches, sp_sections
 

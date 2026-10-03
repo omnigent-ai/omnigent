@@ -3226,3 +3226,108 @@ def test_no_compaction_item_no_compaction_event() -> None:
         assert len(compaction_events) == 0
 
     _run(_t())
+
+
+class _BrokenCredentialsConfig:
+    """SDK ``Config`` stand-in whose configuration loads but whose credentials fail."""
+
+    host = "https://profile-host.example.com"
+
+    def authenticate(self):
+        raise ValueError("databricks-cli: cannot get access token: invalid_grant")
+
+
+def test_get_openai_client_profile_with_broken_credentials_falls_back_to_env(monkeypatch, caplog):
+    """A profile whose credentials fail on first use still falls back to env-var credentials.
+
+    Credential initialization is deferred past resolution, so the fallback
+    must confirm the credential itself while ``OPENAI_BASE_URL`` /
+    ``OPENAI_API_KEY`` are available to fall back to.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log capture fixture.
+    """
+    import logging
+
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.setattr(_sdk_config_mod, "Config", lambda **_kw: _BrokenCredentialsConfig())
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.databricks.com/serving-endpoints")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    with caplog.at_level(logging.WARNING):
+        client = _get_openai_async_client(profile="dogfood")
+
+    assert client.base_url.host == "example.databricks.com"
+    assert any(
+        "dogfood" in record.message and "OPENAI_BASE_URL" in record.message
+        for record in caplog.records
+    ), [record.message for record in caplog.records]
+
+
+def test_get_openai_client_profile_without_env_fallback_defers_credential_failure(monkeypatch):
+    """Without env-var credentials the client is built and its first request reports the failure.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.setattr(_sdk_config_mod, "Config", lambda **_kw: _BrokenCredentialsConfig())
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    captured: dict[str, Any] = {}
+
+    class _StubAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import openai as _openai_mod
+
+    with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI):
+        _get_openai_async_client(profile="dogfood")
+
+    assert captured["base_url"] == "https://profile-host.example.com/ai-gateway/openai/v1"
+    assert isinstance(captured["http_client"], httpx.AsyncClient)
+    try:
+        with pytest.raises(DatabricksAuthError, match="databricks auth login -p dogfood"):
+            captured["http_client"].auth.current_token()
+    finally:
+        _run(captured["http_client"].aclose())
+
+
+def test_get_openai_client_profile_failure_is_not_minted_again_per_retry(monkeypatch):
+    """The OpenAI client's connection retries reuse one credential failure.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import openai
+
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    class _CountingBrokenConfig(_BrokenCredentialsConfig):
+        attempts = 0
+
+        def authenticate(self):
+            type(self).attempts += 1
+            return super().authenticate()
+
+    monkeypatch.setattr(_sdk_config_mod, "Config", lambda **_kw: _CountingBrokenConfig())
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    client = _get_openai_async_client(profile="dogfood")
+    client.max_retries = 2
+
+    async def _call() -> None:
+        try:
+            with pytest.raises(openai.APIConnectionError):
+                await client.chat.completions.create(
+                    model="databricks-test-model", messages=[{"role": "user", "content": "hi"}]
+                )
+        finally:
+            await client.close()
+
+    _run(_call())
+    assert _CountingBrokenConfig.attempts == 1, "each retry must not re-run the credential chain"

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import sys
 import threading
 import unittest
@@ -2658,3 +2659,426 @@ def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
     assert source.current_token() is None
     available["ok"] = True
     assert source.current_token() == "tok-late"
+
+
+def test_reused_token_source_throttles_after_a_failed_mint(monkeypatch):
+    """Retries inside the reuse window neither re-run the chain nor re-resolve."""
+    from omnigent.inner import databricks_executor
+    from omnigent.inner.databricks_executor import (
+        _DatabricksBearerAuth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    class _Cfg:
+        def __init__(self):
+            self.attempts = 0
+
+        def authenticate(self):
+            self.attempts += 1
+            raise ValueError("invalid_grant")
+
+    cfgs = []
+
+    def _fake_resolve(profile=None, *, host=None):
+        cfgs.append(_Cfg())
+        return _DatabricksBearerAuth(cfgs[-1], profile_name=None), "https://ex.test"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(databricks_executor.time, "monotonic", lambda: clock["now"])
+
+    source = _ReusedDatabricksTokenSource()
+    assert source.current_token() is None
+    assert source.current_token() is None
+    assert [cfg.attempts for cfg in cfgs] == [1], "one chain run answers the whole window"
+
+    clock["now"] += databricks_executor._AUTH_FAILURE_REUSE_SECONDS + 1
+    assert source.current_token() is None
+    assert [cfg.attempts for cfg in cfgs] == [2, 1], (
+        "after the window a fresh failure re-resolves once"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deferred SDK credential initialization (real databricks-sdk + fake CLI)
+# ---------------------------------------------------------------------------
+
+_HOST_A = "https://a.example.cloud.databricks.com"
+_HOST_B = "https://b.example.cloud.databricks.com"
+
+# Fake modern Databricks CLI: logs invocations, reports a version that makes
+# newer SDKs mint with ``--profile`` (re-reading the profile's host), and
+# mints a host-naming token unless the ``invalid-grant`` marker exists.
+_FAKE_DATABRICKS_CLI = """#!/usr/bin/env python3
+import configparser, json, os, sys
+from datetime import datetime, timedelta
+stage = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+args = sys.argv[1:]
+with open(os.path.join(stage, "cli.log"), "a") as fh:
+    fh.write(" ".join(args) + "\\n")
+if args[:1] == ["version"]:
+    print(json.dumps({"Version": "1.15.0", "Major": 1, "Minor": 15, "Patch": 0}))
+    sys.exit(0)
+if args[:2] != ["auth", "token"]:
+    sys.stderr.write("Error: unknown command " + " ".join(args[:1]) + "\\n")
+    sys.exit(1)
+if os.path.exists(os.path.join(stage, "invalid-grant")):
+    sys.stderr.write('Error: oauth2: "invalid_grant" "Refresh token is invalid or expired"\\n')
+    sys.exit(1)
+cfg_file = os.environ.get("DATABRICKS_CONFIG_FILE") or os.path.expanduser("~/.databrickscfg")
+if "--host" in args:
+    host = args[args.index("--host") + 1]
+else:
+    profiles = configparser.ConfigParser()
+    profiles.read(cfg_file)
+    host = profiles[args[args.index("--profile") + 1]]["host"]
+marker = os.path.join(stage, "repoint-on-mint")
+if os.path.exists(marker):
+    # The profile moves while the CLI is minting: mint for its new host.
+    host = open(marker).read().strip()
+    with open(cfg_file, "w") as fh:
+        fh.write("[example]\\nhost = " + host + "\\nauth_type = databricks-cli\\n")
+    os.remove(marker)
+ttl = int(os.environ.get("OMNIGENT_TEST_FAKE_CLI_TTL_S", "3600"))
+expiry = (datetime.now() + timedelta(seconds=ttl)).strftime("%Y-%m-%dT%H:%M:%S")
+token = {"access_token": f"fake-token-for-{host}-{os.getpid()}", "token_type": "Bearer"}
+token["expiry"] = expiry
+print(json.dumps(token))
+"""
+
+
+@dataclass
+class _FakeDatabricksCli:
+    root: _Path
+    cfg_path: _Path
+
+    def token_calls(self) -> list[str]:
+        """``auth token`` invocations, ignoring any CLI version probe."""
+        log = self.root / "cli.log"
+        lines = log.read_text().splitlines() if log.exists() else []
+        return [line for line in lines if line.startswith("auth token ")]
+
+    def break_refresh_token(self) -> None:
+        (self.root / "invalid-grant").touch()
+
+
+@pytest.fixture
+def fake_databricks_cli(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> _FakeDatabricksCli:
+    """A logging ``databricks`` CLI first on PATH plus an ``[example]`` CLI profile for host A."""
+    root = tmp_path / "cli-stage"
+    (root / "bin").mkdir(parents=True)
+    cli = root / "bin" / "databricks"
+    # The SDK only accepts a ``databricks`` executable larger than 1 MiB.
+    cli.write_text(_FAKE_DATABRICKS_CLI + ("# " + "x" * 1022 + "\n") * 1100)
+    cli.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{root / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.delenv("DATABRICKS_CLI_PATH", raising=False)
+    monkeypatch.delenv("OMNIGENT_TEST_FAKE_CLI_TTL_S", raising=False)
+    cfg_path = root / "databrickscfg"
+    cfg_path.write_text(f"[example]\nhost = {_HOST_A}\nauth_type = databricks-cli\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    if hasattr(_sdk_config_mod, "get_host_metadata"):
+        from databricks.sdk.oauth import HostMetadata
+
+        monkeypatch.setattr(
+            _sdk_config_mod, "get_host_metadata", lambda _host: HostMetadata(oidc_endpoint="")
+        )
+    return _FakeDatabricksCli(root=root, cfg_path=cfg_path)
+
+
+def test_resolve_databricks_auth_defers_cli_refresh_to_first_token_request(
+    fake_databricks_cli: _FakeDatabricksCli,
+) -> None:
+    """Resolution only reads the profile; the CLI runs when a token is first requested."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    auth, host = _resolve_databricks_auth("example")
+
+    assert host == _HOST_A
+    assert fake_databricks_cli.token_calls() == [], (
+        "resolution must not run `databricks auth token`"
+    )
+    first = auth.current_token()
+    assert first.startswith(f"fake-token-for-{_HOST_A}-")
+    assert len(fake_databricks_cli.token_calls()) == 1
+    assert auth.current_token() == first
+    assert len(fake_databricks_cli.token_calls()) == 1, (
+        "repeat requests must reuse the SDK token cache"
+    )
+
+
+def test_resolve_databricks_auth_keeps_deferred_credentials_bound_to_resolved_host(
+    fake_databricks_cli: _FakeDatabricksCli,
+) -> None:
+    """A profile repointed after resolution cannot hand the host-A client a bearer for host B.
+
+    Newer SDKs mint with ``--profile`` and the CLI re-reads the profile, so the
+    first mint has to refuse instead of trusting the resolved host.
+    """
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    auth, host = _resolve_databricks_auth("example")
+    fake_databricks_cli.cfg_path.write_text(
+        f"[example]\nhost = {_HOST_B}\nauth_type = databricks-cli\n"
+    )
+
+    assert host == _HOST_A
+    with pytest.raises(DatabricksAuthError, match="now names") as excinfo:
+        auth.current_token()
+    assert _HOST_A in str(excinfo.value)
+    assert _HOST_B in str(excinfo.value)
+    assert fake_databricks_cli.token_calls() == [], (
+        "no bearer may be minted for the repointed profile"
+    )
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [f"{_HOST_A}:443", f"{_HOST_A}/?o=123", _HOST_A.removeprefix("https://") + "/"],
+)
+def test_resolve_databricks_auth_accepts_equivalent_profile_host_spellings(
+    fake_databricks_cli: _FakeDatabricksCli, spelling: str
+) -> None:
+    """Spellings the SDK canonicalizes (port 443, query selector, bare host) are not repoints."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    fake_databricks_cli.cfg_path.write_text(
+        f"[example]\nhost = {spelling}\nauth_type = databricks-cli\n"
+    )
+
+    auth, host = _resolve_databricks_auth("example")
+
+    assert host.startswith(_HOST_A)
+    assert auth.current_token().startswith("fake-token-for-")
+    assert len(fake_databricks_cli.token_calls()) == 1
+
+
+def test_resolve_databricks_auth_refuses_refresh_after_profile_repoint(
+    fake_databricks_cli: _FakeDatabricksCli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A token refresh after the profile was repointed is refused rather than sent to host A."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    # Every minted token is already expired, so each request refreshes.
+    monkeypatch.setenv("OMNIGENT_TEST_FAKE_CLI_TTL_S", "-60")
+    auth, _host = _resolve_databricks_auth("example")
+    assert auth.current_token().startswith(f"fake-token-for-{_HOST_A}-")
+    minted_before_repoint = len(fake_databricks_cli.token_calls())
+
+    fake_databricks_cli.cfg_path.write_text(
+        f"[example]\nhost = {_HOST_B}\nauth_type = databricks-cli\n"
+    )
+
+    with pytest.raises(DatabricksAuthError, match="now names"):
+        auth.current_token()
+    assert len(fake_databricks_cli.token_calls()) == minted_before_repoint, (
+        "no mint for the repointed profile"
+    )
+
+
+def test_resolve_databricks_auth_drops_a_bearer_minted_while_the_profile_moved(
+    fake_databricks_cli: _FakeDatabricksCli,
+) -> None:
+    """A bearer minted as the profile moved is refused and never served later."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    auth, _host = _resolve_databricks_auth("example")
+    (fake_databricks_cli.root / "repoint-on-mint").write_text(_HOST_B)
+
+    with pytest.raises(DatabricksAuthError, match="now names"):
+        auth.current_token()
+
+    fake_databricks_cli.cfg_path.write_text(
+        f"[example]\nhost = {_HOST_A}\nauth_type = databricks-cli\n"
+    )
+    assert auth.current_token().startswith(f"fake-token-for-{_HOST_A}-"), (
+        "the rejected host-B bearer must not be reused once the profile names A again"
+    )
+    assert len(fake_databricks_cli.token_calls()) == 2
+
+
+def test_bearer_auth_serializes_concurrent_mints() -> None:
+    """Simultaneous requests on one auth object never run the credential chain concurrently."""
+    import time
+
+    class _SlowConfig:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.calls = 0
+            self._lock = threading.Lock()
+
+        def authenticate(self) -> dict[str, str]:
+            with self._lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                self.calls += 1
+            time.sleep(0.05)
+            with self._lock:
+                self.active -= 1
+            return {"Authorization": "Bearer tok"}
+
+    config = _SlowConfig()
+    auth = _DatabricksBearerAuth(config, profile_name="example")
+    threads = [threading.Thread(target=auth.current_token) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert config.calls == 4
+    assert config.max_active == 1, "mints on one auth object overlapped"
+
+
+def test_resolve_databricks_auth_refuses_when_inherited_default_host_is_repointed(
+    fake_databricks_cli: _FakeDatabricksCli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile inheriting ``[DEFAULT]``'s host is guarded by that host too."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    fake_databricks_cli.cfg_path.write_text(
+        f"[DEFAULT]\nhost = {_HOST_A}\n\n[example]\nauth_type = databricks-cli\n"
+    )
+    # The SDK does not inherit [DEFAULT] into named profiles; the host arrives
+    # from the environment, as it does for the CLI-managed OAuth profiles.
+    monkeypatch.setenv("DATABRICKS_HOST", _HOST_A)
+
+    auth, host = _resolve_databricks_auth("example")
+    fake_databricks_cli.cfg_path.write_text(
+        f"[DEFAULT]\nhost = {_HOST_B}\n\n[example]\nauth_type = databricks-cli\n"
+    )
+
+    assert host == _HOST_A
+    with pytest.raises(DatabricksAuthError, match="now names") as excinfo:
+        auth.current_token()
+    assert _HOST_B in str(excinfo.value)
+    assert fake_databricks_cli.token_calls() == []
+
+
+def test_resolve_databricks_auth_reports_cli_failure_on_first_token_request(
+    fake_databricks_cli: _FakeDatabricksCli,
+) -> None:
+    """A broken refresh token no longer aborts resolution; the first mint reports it."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    fake_databricks_cli.break_refresh_token()
+
+    auth, _host = _resolve_databricks_auth("example")
+    assert fake_databricks_cli.token_calls() == []
+
+    with pytest.raises(DatabricksAuthError, match="databricks auth login -p example") as excinfo:
+        auth.current_token()
+    assert "invalid_grant" in str(excinfo.value.__cause__)
+    assert len(fake_databricks_cli.token_calls()) == 1
+
+
+def test_resolve_auth_for_host_without_matching_profile_defers_host_keyed_lookup(
+    fake_databricks_cli: _FakeDatabricksCli,
+) -> None:
+    """With no profile for the host, the host-keyed CLI lookup still runs on first use only."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    fake_databricks_cli.cfg_path.write_text(
+        f"[other]\nhost = {_HOST_B}\nauth_type = databricks-cli\n"
+    )
+
+    auth, host = _resolve_databricks_auth(host=_HOST_A)
+
+    assert host == _HOST_A
+    assert fake_databricks_cli.token_calls() == []
+    assert auth.current_token().startswith(f"fake-token-for-{_HOST_A}-")
+    (token_call,) = fake_databricks_cli.token_calls()
+    assert f"--host {_HOST_A}" in token_call
+    assert auth.profile_name is None
+
+
+def test_profile_cli_auth_config_refuses_a_repointed_profile(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """The profile-pinned CLI fallback does not mint for a profile that moved hosts."""
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(f"[fresh]\nhost = {_HOST_B}\nauth_type = databricks-cli\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(
+        databricks_executor.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("the CLI must not run for a repointed profile"),
+    )
+
+    cfg = databricks_executor._DatabricksCliProfileAuthConfig(profile="fresh", host=_HOST_A)
+    with pytest.raises(databricks_executor._ProfileRepointedError, match=_HOST_B):
+        cfg.authenticate()
+
+
+def test_bearer_auth_failure_names_the_selected_profile_over_the_host_hint() -> None:
+    """A host-resolved auth reports the winning profile once one has been selected."""
+
+    class _SelectedProfileConfig:
+        profile_name = "example"
+
+        def authenticate(self) -> dict[str, str]:
+            raise ValueError("token expired")
+
+    class _UnselectedConfig:
+        profile_name = None
+
+        def authenticate(self) -> dict[str, str]:
+            raise ValueError("no credential source")
+
+    host_hint = "Databricks authentication failed for workspace https://a.example. Run: --host"
+
+    with pytest.raises(DatabricksAuthError, match="databricks auth login -p example"):
+        _DatabricksBearerAuth(_SelectedProfileConfig(), failure_message=host_hint).current_token()
+    with pytest.raises(DatabricksAuthError, match="Run: --host"):
+        _DatabricksBearerAuth(_UnselectedConfig(), failure_message=host_hint).current_token()
+
+
+def test_bearer_auth_reuses_a_recent_failure_instead_of_rerunning_the_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retries right after a credential failure get the same error without a new mint."""
+    from omnigent.inner import databricks_executor
+
+    class _BrokenConfig:
+        attempts = 0
+
+        def authenticate(self) -> dict[str, str]:
+            self.attempts += 1
+            raise ValueError("invalid_grant")
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(databricks_executor.time, "monotonic", lambda: clock["now"])
+    config = _BrokenConfig()
+    auth = _DatabricksBearerAuth(config, profile_name="example")
+
+    for _ in range(2):
+        with pytest.raises(DatabricksAuthError, match="databricks auth login -p example"):
+            auth.current_token()
+    assert config.attempts == 1, "a retry inside the reuse window must not re-run the chain"
+
+    clock["now"] += databricks_executor._AUTH_FAILURE_REUSE_SECONDS + 1
+    with pytest.raises(DatabricksAuthError):
+        auth.current_token()
+    assert config.attempts == 2, "after the window the chain runs again"
+
+
+def test_resolve_auth_for_host_defers_profile_selection_to_first_token_request(
+    fake_databricks_cli: _FakeDatabricksCli,
+) -> None:
+    """Host resolution picks and authenticates the matching profile on first use."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    auth, host = _resolve_databricks_auth(host=_HOST_A)
+
+    assert host == _HOST_A
+    assert fake_databricks_cli.token_calls() == []
+    assert auth.profile_name is None
+    assert auth.current_token().startswith(f"fake-token-for-{_HOST_A}-")
+    assert len(fake_databricks_cli.token_calls()) == 1
+    assert auth.profile_name == "example"
