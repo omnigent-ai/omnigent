@@ -1614,7 +1614,7 @@ def register_resource_routes(
         before: str | None = None,
         order: str = "desc",
     ) -> JSONResponse:
-        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+        from omnigent.runner.environment_filesystem import _MAX_READ_BYTES, CallerProcessFilesystem
 
         await _ensure_session_registered(session_id)
         agent_spec = await _resolve_session_agent_spec(session_id)
@@ -1651,7 +1651,7 @@ def register_resource_routes(
             )
 
         # File previews need every line within the byte cap.
-        content = await fs.read(path, limit=None)
+        content = await fs.read(path, max_bytes=_MAX_READ_BYTES)
         content_type_guess, _ = mimetypes.guess_type(path)
         payload: dict[str, object] = {
             "object": "session.environment.filesystem.file_content",

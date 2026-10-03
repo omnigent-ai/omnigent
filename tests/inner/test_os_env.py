@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import os
 import shutil
 import tracemalloc
@@ -206,7 +207,7 @@ def test_read_impl_binary_inlined_within_cap(tmp_path: Path) -> None:
     f = tmp_path / "logo.png"
     f.write_bytes(_BINARY)
 
-    result = _read_impl(f, offset=1, limit=2_000, max_binary_bytes=10 * 1024 * 1024)
+    result = _read_impl(f, offset=1, limit=2_000, max_bytes=10 * 1024 * 1024)
 
     assert result["encoding"] == "base64"
     assert base64.b64decode(result["content"]) == _BINARY
@@ -222,7 +223,7 @@ def test_read_impl_binary_truncated_at_cap(tmp_path: Path) -> None:
     f = tmp_path / "logo.png"
     f.write_bytes(_BINARY)
 
-    result = _read_impl(f, offset=1, limit=2_000, max_binary_bytes=4)
+    result = _read_impl(f, offset=1, limit=2_000, max_bytes=4)
 
     assert base64.b64decode(result["content"]) == _BINARY[:4]
     assert result["returned_bytes"] == 4
@@ -270,7 +271,7 @@ def test_read_impl_binary_descriptor_does_not_read_whole_file(tmp_path: Path) ->
 
 
 def test_read_impl_binary_cap_reads_only_the_cap(tmp_path: Path) -> None:
-    """The byte-capped path reads at most ``max_binary_bytes``, not the file.
+    """The byte-capped path reads at most ``max_bytes``, not the file.
 
     :returns: None.
     """
@@ -280,7 +281,7 @@ def test_read_impl_binary_cap_reads_only_the_cap(tmp_path: Path) -> None:
 
     tracemalloc.start()
     try:
-        result = _read_impl(f, offset=1, limit=2_000, max_binary_bytes=16)
+        result = _read_impl(f, offset=1, limit=2_000, max_bytes=16)
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -289,6 +290,73 @@ def test_read_impl_binary_cap_reads_only_the_cap(tmp_path: Path) -> None:
     assert result["total_bytes"] == size
     assert result["truncated"] is True
     assert peak < 10 * 1024 * 1024
+
+
+def test_read_impl_text_cap_bounds_memory_for_gigabyte_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 1 GiB file, even with a huge first line, must only read a bounded prefix."""
+    path = tmp_path / "gigabyte.txt"
+    byte_cap = 64 * 1024
+    with path.open("wb") as fh:
+        fh.write(b"x" * (byte_cap + 1))
+        fh.truncate(1024**3)
+
+    reads: list[int] = []
+    original_open = Path.open
+
+    class BoundedReader(io.BufferedReader):
+        def read(self, size: int = -1) -> bytes:
+            assert 0 <= size <= byte_cap + 1, "attempted an unbounded file read"
+            data = super().read(size)
+            reads.append(len(data))
+            return data
+
+    def guarded_open(file_path, mode="r", *args, **kwargs):
+        if file_path != path:
+            return original_open(file_path, mode, *args, **kwargs)
+        assert mode == "rb", "text reads must enforce the byte cap before decoding"
+        return BoundedReader(io.FileIO(path, "r"))
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    tracemalloc.start()
+    try:
+        result = _read_impl(path, offset=1, limit=None, max_bytes=byte_cap)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result["encoding"] == "utf-8"
+    assert result["content"] == "x" * byte_cap
+    assert result["truncated"] is True
+    assert result["total_lines"] is None
+    assert sum(reads) <= byte_cap + 1 + 8192
+    assert peak < 4 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("raw", "byte_cap", "expected", "truncated"),
+    [
+        (b"", 1, "", False),
+        (b"abc", 3, "abc", False),
+        (b"abcdef", 3, "abc", True),
+        ("abcé".encode(), 4, "abc", True),
+        ("abcé".encode(), 5, "abcé", False),
+        ("a😀tail".encode(), 4, "a", True),
+    ],
+)
+def test_read_impl_text_byte_cap_preserves_utf8(
+    tmp_path: Path, raw: bytes, byte_cap: int, expected: str, truncated: bool
+) -> None:
+    """The byte cap distinguishes complete files from prefixes ending mid-codepoint."""
+    path = tmp_path / "text.txt"
+    path.write_bytes(raw)
+
+    result = _read_impl(path, offset=1, limit=None, max_bytes=byte_cap)
+
+    assert result["encoding"] == "utf-8"
+    assert result["content"] == expected
+    assert result["truncated"] is truncated
 
 
 def test_read_impl_multibyte_char_straddling_sniff_boundary_is_text(tmp_path: Path) -> None:

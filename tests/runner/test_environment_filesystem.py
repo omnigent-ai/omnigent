@@ -203,18 +203,22 @@ async def test_read_file_content_has_no_agent_line_cap(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("absolute_path", [False, True], ids=["workspace", "host"])
 async def test_read_file_content_retains_byte_cap(
     client: httpx.AsyncClient,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
+    absolute_path: bool,
 ) -> None:
     """Viewer reads still flag oversized text and preserve UTF-8 boundaries."""
     monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 4)
-    (workspace / "large.txt").write_text("abcé\nlast line\n", encoding="utf-8")
+    file_path = (workspace.parent if absolute_path else workspace) / "large.txt"
+    file_path.write_text("abcé\nlast line\n", encoding="utf-8")
+    request_path = str(file_path) if absolute_path else file_path.name
 
     resp = await client.get(
         f"/v1/sessions/conv_test/resources/environments"
-        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/large.txt"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{request_path}"
     )
 
     assert resp.status_code == 200
