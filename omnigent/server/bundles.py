@@ -5,10 +5,15 @@ from __future__ import annotations
 import hashlib
 import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TYPE_CHECKING
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
+
+if TYPE_CHECKING:
+    from omnigent.entities import Agent
+    from omnigent.stores.artifact_store import ArtifactStore
 
 
 def _is_dotted_callable_path(path: str) -> bool:
@@ -169,6 +174,29 @@ def validate_agent_bundle(
         _reject_uploaded_callable_tools(spec)
 
     return spec
+
+
+def agent_needs_own_copy(agent: Agent, user_id: str | None) -> bool:
+    """Whether *user_id* must get their own copy of *agent* instead of sharing it.
+
+    Server agents (no session, no owner) and the caller's own agents are shared.
+    Another user's agent, or a user agent with no recorded owner, is copied so
+    its owner can never change code that runs in the caller's sessions. Without
+    auth (``user_id`` None) there is one user, so nothing is copied.
+    """
+    if user_id is None:
+        return False
+    if agent.session_id is None and agent.created_by is None:
+        return False
+    return agent.created_by != user_id
+
+
+def copy_agent_bundle(artifact_store: ArtifactStore, location: str, new_agent_id: str) -> str:
+    """Store a copy of the bundle at *location* under *new_agent_id*; return its location."""
+    data = artifact_store.get(location)
+    new_location = bundle_location(new_agent_id, data)
+    artifact_store.put(new_location, data)
+    return new_location
 
 
 def bundle_location(agent_id: str, bundle_bytes: bytes) -> str:

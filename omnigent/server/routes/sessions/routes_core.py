@@ -72,7 +72,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     BackgroundTitleRequest,
 )
-from omnigent.server.bundles import validate_agent_bundle
+from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
@@ -125,6 +125,7 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
     _codex_plan_mode_enabled,
+    _delete_stored_session_bundle_after_failure,
     _discovery_key,
     _enforce_filesystem_attachment_policy,
     _filesystem_attachment_in_history,
@@ -3139,14 +3140,11 @@ def register_core_routes(
             up_to_response_id=body.up_to_response_id,
         )
 
-        # Clone params for the fork's session-scoped agent. Created inside
-        # fork_conversation's transaction (not agent_store.create): a
-        # pre-created row would survive a fork failure as an orphaned
-        # session_id=NULL built-in polluting the picker. Session-scoped rows
-        # are exempt from the unique built-in-name index, so the clone reuses
-        # the source's name verbatim — no "(fork …)" suffix needed.
-        cloned_agent_id = generate_agent_id()
-        cloned_agent_name = base_agent.name
+        # Cross-user forks copy the agent (bundle under the copy's id) so its owner
+        # can never change code in the caller's sessions; same-user forks share it.
+        needs_own_copy = agent_needs_own_copy(base_agent, user_id)
+        if needs_own_copy and artifact_store is None:
+            raise OmnigentError("artifact store is not configured", code=ErrorCode.INTERNAL_ERROR)
 
         # A model id is provider-bound, so the source's model_override /
         # reasoning_effort only carry over when the switch stays in the same
@@ -3406,15 +3404,32 @@ def register_core_routes(
                     sizes=[stored.bytes for stored in filesystem_sources],
                 )
 
+        # Copied last, after every validation above; the copy row itself is
+        # inserted inside fork_conversation's transaction.
+        fork_agent_id = base_agent.id
+        clone_location: str | None = None
+        if needs_own_copy:
+            assert artifact_store is not None
+            fork_agent_id = generate_agent_id()
+            clone_location = await asyncio.to_thread(
+                copy_agent_bundle, artifact_store, base_agent.bundle_location, fork_agent_id
+            )
+
+        async def drop_unused_copy() -> None:
+            if clone_location is not None and artifact_store is not None:
+                await asyncio.to_thread(
+                    _delete_stored_session_bundle_after_failure, artifact_store, clone_location
+                )
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
                 source_id,
                 title=body.title,
-                agent_id=cloned_agent_id,
-                cloned_agent_name=cloned_agent_name,
-                cloned_agent_bundle_location=base_agent.bundle_location,
-                cloned_agent_description=base_agent.description,
+                agent_id=fork_agent_id,
+                cloned_agent_name=base_agent.name if clone_location else None,
+                cloned_agent_bundle_location=clone_location,
+                cloned_agent_description=base_agent.description if clone_location else None,
                 copy_model_settings=copy_model_settings,
                 # Explicit run-config picks from the fork dialog. Each rides a
                 # (value, set-flag) pair so the store can tell "override to
@@ -3444,17 +3459,22 @@ def register_core_routes(
                 created_by=user_id,
             )
         except LookupError as exc:
+            await drop_unused_copy()
             raise OmnigentError(
                 f"Session not found: {source_id!r}",
                 code=ErrorCode.NOT_FOUND,
             ) from exc
         except ValueError as exc:
+            await drop_unused_copy()
             # Store raises ValueError when up_to_response_id names no
             # response in the source conversation (stale client state).
             raise OmnigentError(
                 str(exc),
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        except Exception:
+            await drop_unused_copy()
+            raise
 
         # Create the fork-owned rows the rewritten items now reference —
         # before the fork is announced or returned, so no reader sees the ids
@@ -3532,9 +3552,6 @@ def register_core_routes(
             await _schedule_managed_launch(
                 request,
                 session_id=new_conv.id,
-                # The fork's own session-scoped agent clone. Deliberately not
-                # the built-in it derives from: only a genuine built-in may
-                # classify a managed runner, and a clone must not inherit that.
                 agent_id=new_conv.agent_id,
                 user_id=user_id,
                 sandbox_provider=body.sandbox_provider,

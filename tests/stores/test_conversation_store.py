@@ -5303,6 +5303,43 @@ def test_fork_clone_agent_is_session_scoped(
     assert "2f9e296b0ecfc976c94f8630a80881f8" in builtin_ids
 
 
+def test_cross_user_fork_copy_persists_as_the_forkers_agent(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A cross-user fork's copy row keeps the source's name and description, points
+    at its own bundle, and is owned by the forker (not the source's owner)."""
+    source = conversation_store.create_session_with_agent(
+        agent_id="5c3f6b0e2a7d4e11b9a0c8d7e6f5a4b3",
+        agent_name="orion",
+        agent_bundle_location="5c3f6b0e2a7d4e11b9a0c8d7e6f5a4b3/hash",
+        agent_description="coordinator",
+        title="alice's session",
+        created_by="alice@example.com",
+    )
+
+    fork = conversation_store.fork_conversation(
+        source.conversation.id,
+        agent_id="9d8c7b6a5f4e43d2a1b0c9d8e7f6a5b4",
+        cloned_agent_name="orion",
+        cloned_agent_bundle_location="9d8c7b6a5f4e43d2a1b0c9d8e7f6a5b4/hash",
+        cloned_agent_description="coordinator",
+        created_by="bob@example.com",
+    )
+
+    copy = agent_store.get(fork.agent_id or "")
+    assert copy is not None
+    assert (copy.name, copy.description, copy.bundle_location, copy.created_by) == (
+        "orion",
+        "coordinator",
+        "9d8c7b6a5f4e43d2a1b0c9d8e7f6a5b4/hash",
+        "bob@example.com",
+    )
+    assert copy.session_id == fork.id
+    original = agent_store.get("5c3f6b0e2a7d4e11b9a0c8d7e6f5a4b3")
+    assert original is not None and original.created_by == "alice@example.com"
+
+
 def test_fork_clone_agent_failure_leaves_no_orphan(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,

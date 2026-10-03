@@ -4898,6 +4898,37 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return _to_conversation(new_conv, fork_meta, fork_labels)
 
+    def list_session_roots_for_agent(self, agent_id: str, limit: int) -> list[str]:
+        """
+        Up to *limit* distinct roots of sessions using *agent_id* (see the protocol docstring).
+
+        Pages ``ix_conversations_agent_id`` in id order and dedupes as it goes, so
+        one tree's children never crowd out other roots.
+        """
+        # ponytail: reads at most 1,000 rows, so an agent used by more sessions can
+        # hide later roots; an index on (agent_id, root_conversation_id) lifts that.
+        page_size, max_pages = 200, 5
+        roots: dict[str, None] = {}
+        after: str | None = None
+        with self._conv_session("list_session_roots_for_agent") as session:
+            for _ in range(max_pages):
+                stmt = select(SqlConversation.id, SqlConversation.root_conversation_id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.agent_id == agent_id,
+                )
+                if after is not None:
+                    stmt = stmt.where(SqlConversation.id > after)
+                rows = session.execute(stmt.order_by(SqlConversation.id).limit(page_size)).all()
+                roots.update(
+                    dict.fromkeys(
+                        row.root_conversation_id for row in rows if row.root_conversation_id
+                    )
+                )
+                if len(rows) < page_size or len(roots) >= limit:
+                    break
+                after = rows[-1].id
+        return list(roots)[:limit]
+
     def has_other_live_session_in_workspace(
         self,
         *,
@@ -5112,10 +5143,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
             if bound_agent_ids:
-                # Session-scoped agents are 1:1 with their conversation
-                # (forks always clone a fresh agent), so every binding
-                # collected from the deleted subtree is dead. Template
-                # agents are shared and survive via the kind guard.
+                # No surviving conversation uses these agents (a fork of the
+                # same user's session shares its row, so it counts as a
+                # reference above). Server agents survive via the kind guard.
                 session.execute(
                     delete(SqlAgent).where(
                         SqlAgent.workspace_id == current_workspace_id(),
