@@ -1,6 +1,6 @@
 import type * as GoalApiModule from "@/lib/goalApi";
 
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getGoal, type Goal } from "@/lib/goalApi";
 import { useGoalState } from "./useGoalState";
@@ -21,6 +21,8 @@ const GOAL: Goal = {
   createdAt: null,
   updatedAt: null,
 };
+
+const GOAL_COMPLETE: Goal = { ...GOAL, status: "complete" };
 
 beforeEach(() => {
   mockGetGoal.mockReset();
@@ -62,5 +64,37 @@ describe("useGoalState", () => {
     await waitFor(() => expect(result.current.goal).toEqual(GOAL));
     expect(mockGetGoal).toHaveBeenCalledTimes(1);
     expect(mockGetGoal).toHaveBeenCalledWith("conv");
+  });
+
+  it("refetches when refresh is called", async () => {
+    mockGetGoal
+      .mockResolvedValueOnce({ goal: GOAL })
+      .mockResolvedValueOnce({ goal: GOAL_COMPLETE });
+
+    const { result } = renderHook(() => useGoalState("conv", true));
+    await waitFor(() => expect(result.current.goal).toEqual(GOAL));
+
+    act(() => {
+      result.current.refresh();
+    });
+
+    await waitFor(() => expect(result.current.goal).toEqual(GOAL_COMPLETE));
+    expect(mockGetGoal).toHaveBeenCalledTimes(2);
+  });
+
+  it("refresh is a stable reference across renders", () => {
+    mockGetGoal.mockResolvedValue({ goal: null });
+
+    const { result, rerender } = renderHook(() => useGoalState("conv", true));
+    const first = result.current.refresh;
+    rerender();
+    expect(result.current.refresh).toBe(first);
+  });
+
+  it("never calls getGoal when disabled (non-codex-native sessions)", () => {
+    // Polly-Claude and Polly-Codex sessions pass enabled=false; verify no
+    // fetch is made so the server's 400 INVALID_INPUT path is never hit.
+    renderHook(() => useGoalState("conv", false));
+    expect(mockGetGoal).not.toHaveBeenCalled();
   });
 });

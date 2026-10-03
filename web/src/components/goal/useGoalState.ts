@@ -1,9 +1,11 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { getGoal, type Goal } from "@/lib/goalApi";
 
 interface UseGoalStateResult {
   goal: Goal | null;
   setGoal: (goal: Goal | null) => void;
+  /** Re-fetch the current goal from the server. */
+  refresh: () => void;
 }
 
 /**
@@ -14,6 +16,7 @@ interface UseGoalStateResult {
  */
 export function useGoalState(conversationId: string | null, enabled: boolean): UseGoalStateResult {
   const [goal, setGoal] = useState<Goal | null>(null);
+  const [refreshNonce, setRefreshNonce] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -31,7 +34,11 @@ export function useGoalState(conversationId: string | null, enabled: boolean): U
     return () => {
       cancelled = true;
     };
-  }, [conversationId, enabled]);
+  }, [conversationId, enabled, refreshNonce]);
 
-  return { goal, setGoal };
+  const refresh = useCallback(() => {
+    setRefreshNonce((n) => n + 1);
+  }, []);
+
+  return { goal, setGoal, refresh };
 }
