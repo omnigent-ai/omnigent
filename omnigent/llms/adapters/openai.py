@@ -66,18 +66,34 @@ class OpenAICompatibleAdapter(BaseAdapter):
     def _build_headers(
         self,
         api_key_override: str | None = None,
+        extra_headers: object = None,
     ) -> dict[str, str]:
         """
         Build HTTP headers for the request.
 
         :param api_key_override: API key from ``connection_params``.
             ``None`` means no auth header is added.
+        :param extra_headers: Caller-supplied headers from
+            ``connection_params["extra_headers"]``; string entries are
+            merged last and override built headers.
         :returns: Headers dict with Authorization if an API key is
             provided.
         """
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key_override:
             headers["Authorization"] = f"Bearer {api_key_override}"
+        # Databricks-local divergence (see third_party/sync): merge caller-supplied
+        # headers threaded through connection_params. MAS routes CP serving-endpoint
+        # calls through the Barnacle forward proxy for CP→CP mTLS, which needs a
+        # `host` header + s2s auth headers rather than a bearer token.
+        if isinstance(extra_headers, dict):
+            headers.update(
+                {
+                    key: value
+                    for key, value in extra_headers.items()
+                    if isinstance(key, str) and isinstance(value, str)
+                }
+            )
         return headers
 
     def _build_payload(
@@ -130,7 +146,7 @@ class OpenAICompatibleAdapter(BaseAdapter):
         :param stream: Enable streaming.
         :param extra: Additional kwargs.
         :param connection_params: Per-call overrides. Supported keys:
-            ``"api_key"``, ``"base_url"``.
+            ``"api_key"``, ``"base_url"``, ``"extra_headers"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
         :returns: Response dict or async iterator of chunk dicts.
@@ -150,20 +166,8 @@ class OpenAICompatibleAdapter(BaseAdapter):
         url = f"{effective_base}/chat/completions"
         headers = self._build_headers(
             api_key_override=params.get("api_key"),
+            extra_headers=params.get("extra_headers"),
         )
-        # Databricks-local divergence (see third_party/sync): merge caller-supplied
-        # headers threaded through connection_params. MAS routes CP serving-endpoint
-        # calls through the Barnacle forward proxy for CP→CP mTLS, which needs a
-        # `host` header + s2s auth headers rather than a bearer token.
-        extra_headers: object = params.get("extra_headers")
-        if isinstance(extra_headers, dict):
-            headers.update(
-                {
-                    key: value
-                    for key, value in extra_headers.items()
-                    if isinstance(key, str) and isinstance(value, str)
-                }
-            )
 
         if stream:
             effective_timeout = timeout if timeout is not None else _STREAM_TIMEOUT
@@ -488,7 +492,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
             :class:`ResponseStreamEvent`. If ``False``, return a
             :class:`Response`.
         :param connection_params: Per-call overrides. Supported keys:
-            ``"api_key"``, ``"base_url"``.
+            ``"api_key"``, ``"base_url"``, ``"extra_headers"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
         :param kwargs: Additional API kwargs (temperature, etc.).
@@ -520,6 +524,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         url = f"{effective_base}/responses"
         headers = self._build_headers(
             api_key_override=params.get("api_key"),
+            extra_headers=params.get("extra_headers"),
         )
 
         if stream:
