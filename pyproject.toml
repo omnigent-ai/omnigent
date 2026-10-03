@@ -228,12 +228,14 @@ agents-sdk = [
 ]
 # Google Antigravity SDK harness (`harness: antigravity`). Optional: the
 # harness module imports the SDK lazily on first turn, so only users of the
-# harness need this extra. Early SDK (v0.1.x) — pin minor.
+# harness need this extra. Early SDK (v0.1.x) — pin minor. The floor is the
+# release verified to route `run_command` through the pre-tool hook that shows
+# Omnigent's approval card; older harnesses ran shell commands unasked.
 # google-antigravity ships proto gencode compiled against protobuf 7.x, so
 # the runtime must satisfy >=7 when this extra is installed; the core allows
 # >=6,<8, so this constraint selects the 7.x slot and prevents the
 # "gencode/runtime version mismatch" error at import time.
-antigravity = ["google-antigravity>=0.1,<1", "protobuf>=7,<8"]
+antigravity = ["google-antigravity>=0.1.20,<1", "protobuf>=7,<8"]
 # GitHub Copilot SDK harness (`harness: copilot`). Optional: the harness module
 # imports the SDK lazily on first turn, so only users of the harness need this
 # extra. The wheel bundles the Copilot CLI binary it drives (~90MB), which is

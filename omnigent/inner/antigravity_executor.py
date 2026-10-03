@@ -25,6 +25,12 @@ Streaming model:
 - Tool *requests* derive from ``Step.tool_calls`` (deduped by call id); tool
   *completions* (with payload, error, duration) arrive via a registered
   ``PostToolCallHook`` and pair back by call id.
+- ``run_command`` confirmation: the SDK's default policy denies its shell tool
+  outright, so ``LocalAgentConfig.policies`` is set to
+  ``policy.confirm_run_command(handler)`` with a handler that routes the
+  request through Omnigent's elicitation handler (the approval card). A denied
+  call comes back from the harness as an ``ERROR`` step; it is surfaced as a
+  failed tool call, not a turn failure.
 - Cancellation: :meth:`interrupt_session` -> ``conversation.cancel()``, which
   surfaces ``TurnCancelled``.
 
@@ -33,13 +39,15 @@ Authentication is Gemini-native: a direct API key (``api_key``) or Vertex AI
 ``base_url``, so there is deliberately no gateway / Databricks routing path.
 
 SDK touchpoints are isolated in :meth:`_open_agent`, :meth:`_build_sdk_tools`,
-:meth:`_build_post_tool_hook`, and :meth:`_drive_turn`, and duck-typed to
-tolerate drift across the v0.1.x surface. Unit tests stub the SDK module.
+:meth:`_build_post_tool_hook`, :meth:`_build_tool_policies`, and
+:meth:`_drive_turn`, and duck-typed to tolerate drift across the v0.1.x
+surface. Unit tests stub the SDK module.
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import importlib
 import json
@@ -97,6 +105,9 @@ SDKTool: TypeAlias = Any  # type: ignore[explicit-any]
 SDKHook: TypeAlias = Any  # type: ignore[explicit-any]
 SDKConfig: TypeAlias = Any  # type: ignore[explicit-any]
 SDKHookContext: TypeAlias = Any  # type: ignore[explicit-any]
+SDKPolicy: TypeAlias = Any  # type: ignore[explicit-any]
+SDKPolicyFactory: TypeAlias = Any  # type: ignore[explicit-any]
+SDKPolicies: TypeAlias = Any  # type: ignore[explicit-any]
 ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ToolResult: TypeAlias = Any  # type: ignore[explicit-any]
 # Aliased so the explicit ``Any`` (with its ``type: ignore``) lives here, not
@@ -111,6 +122,13 @@ _ToolCallable: TypeAlias = Callable[..., Awaitable[ToolResult]]  # type: ignore[
 # sys / sub-agent / MCP tools under policy.
 ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
     [str, dict[str, Any]], Awaitable[dict[str, Any]]
+]
+
+# Tool-permission callback the harness ExecutorAdapter wires in (assigns
+# ``executor._elicitation_handler`` when unset). ``(tool_name, tool_input)``
+# raises Omnigent's approval card and resolves to the user's allow/deny.
+ElicitationHandler: TypeAlias = Callable[  # type: ignore[explicit-any]
+    [str, dict[str, Any]], Awaitable[bool]
 ]
 
 
@@ -280,6 +298,14 @@ class _PendingTool:
 
 
 @dataclass
+class _DeniedTool:
+    """A tool call refused at confirmation time; ``name``/``args`` are the SDK's proposal."""
+
+    name: str
+    args: ToolArgs
+
+
+@dataclass
 class _AntigravitySessionState:
     """Per-session state for the Antigravity executor.
 
@@ -299,6 +325,9 @@ class _AntigravitySessionState:
         rebuilds rather than reusing the cancelled conversation.
     :param pending_tools: Open tool calls keyed by call id, populated on
         :class:`ToolCallRequest` and drained by the ``PostToolCallHook``.
+    :param denied_tools: Tool calls refused through the confirmation handler
+        this turn, in order, each awaiting the ``ERROR`` step the harness
+        emits for the denial (see :meth:`_complete_denied_tool`).
     :param active_queue: The current turn's event queue (the
         ``PostToolCallHook`` enqueues completions here), or ``None`` between
         turns.
@@ -312,6 +341,7 @@ class _AntigravitySessionState:
     conversation: SDKConversation = None
     agent_signature: tuple[str | None, str, str] | None = field(default=None)
     pending_tools: dict[str, _PendingTool] = field(default_factory=dict)
+    denied_tools: collections.deque[_DeniedTool] = field(default_factory=collections.deque)
     active_queue: _EventQueue | None = field(default=None)
     last_usage: SDKUsage = None
     interrupt_requested: bool = False
@@ -357,6 +387,10 @@ class AntigravityExecutor(Executor):
         # Set by the harness ExecutorAdapter when unset; the SDK tools route
         # invocations through this to reach Omnigent's tools under policy.
         self._tool_executor: ToolExecutor | None = None
+        # Set by the harness ExecutorAdapter when unset; the SDK's run_command
+        # confirmation is answered through this (Omnigent's approval card).
+        # Without it the confirmation fails closed.
+        self._elicitation_handler: ElicitationHandler | None = None
 
     def supports_streaming(self) -> bool:
         return True
@@ -520,6 +554,7 @@ class AntigravityExecutor(Executor):
         event_queue: _EventQueue = asyncio.Queue()
         state.active_queue = event_queue
         state.pending_tools.clear()
+        state.denied_tools.clear()
         state.last_usage = None
         state.interrupt_requested = False
 
@@ -594,6 +629,19 @@ class AntigravityExecutor(Executor):
         try:
             await conversation.send(prompt)
             async for step in conversation.receive_steps():
+                step_type = _enum_name(getattr(step, "type", None))
+                status = _enum_name(getattr(step, "status", None))
+
+                # A call refused at confirmation time comes back as an ERROR step
+                # without tool_calls; close it as a failed tool call and keep
+                # streaming, since the SDK turn itself continues past it.
+                if (
+                    status in ("ERROR", "TERMINAL_ERROR")
+                    and step_type != "TOOL_CALL"
+                    and self._complete_denied_tool(step, state)
+                ):
+                    continue
+
                 # Only surface MODEL->USER steps. The SDK echoes the user's
                 # input and environment-directed steps in the same stream (its
                 # ``receive_chunks`` filters identically); without this the
@@ -617,9 +665,6 @@ class AntigravityExecutor(Executor):
                     state.last_usage = usage
 
                 self._emit_tool_requests(step, state, seen_tool_ids)
-
-                step_type = _enum_name(getattr(step, "type", None))
-                status = _enum_name(getattr(step, "status", None))
 
                 # Fallback completion: results normally arrive via the
                 # PostToolCallHook, which pops the call from pending_tools. If a
@@ -744,6 +789,32 @@ class AntigravityExecutor(Executor):
                 )
             )
 
+    def _complete_denied_tool(self, step: SDKStep, state: _AntigravitySessionState) -> bool:
+        """Turn the ERROR step reporting a confirmation-time denial into a failed tool call.
+
+        Returns ``False`` when no denial is outstanding, leaving the step a turn error."""
+        queue = state.active_queue
+        if queue is None or not state.denied_tools:
+            return False
+        denied = state.denied_tools.popleft()
+        raw_id = getattr(step, "id", None)
+        call_id = raw_id if isinstance(raw_id, str) and raw_id else uuid.uuid4().hex
+        error = getattr(step, "error", "") or f"{denied.name} was not approved"
+        queue.put_nowait(
+            ToolCallRequest(name=denied.name, args=denied.args, metadata={"call_id": call_id})
+        )
+        queue.put_nowait(
+            ToolCallComplete(
+                name=denied.name,
+                status=ToolCallStatus.ERROR,
+                result=None,
+                error=error,
+                duration_ms=0.0,
+                metadata={"call_id": call_id},
+            )
+        )
+        return True
+
     @staticmethod
     def _cancelled_error_type() -> type[BaseException]:
         """Return the SDK's cancellation exception type, or a sentinel.
@@ -844,11 +915,13 @@ class AntigravityExecutor(Executor):
         """Construct and open a ``google.antigravity.Agent``.
 
         Isolated SDK touchpoint. Builds a ``LocalAgentConfig`` from the
-        resolved model / prompt / credentials / tools / hooks and enters the
-        agent's async context. Omnigent's tools are exposed as callables
-        (``LocalAgentConfig.tools``) routing through :attr:`_tool_executor`, so
-        the agent runs them under policy. A ``PostToolCallHook`` surfaces a
-        :class:`ToolCallComplete` for every tool the agent runs.
+        resolved model / prompt / credentials / tools / hooks / policies and
+        enters the agent's async context. Omnigent's tools are exposed as
+        callables (``LocalAgentConfig.tools``) routing through
+        :attr:`_tool_executor`, so the agent runs them under policy. A
+        ``PostToolCallHook`` surfaces a :class:`ToolCallComplete` for every
+        tool the agent runs, and the policies route the SDK's ``run_command``
+        confirmation to Omnigent's approval card.
 
         :param state: The session state the tool-completion hook closes over.
         :param model: The resolved model id to pin, or ``None`` to use the SDK
@@ -863,6 +936,9 @@ class AntigravityExecutor(Executor):
         if sdk_tools:
             config_kwargs["tools"] = sdk_tools
         config_kwargs["hooks"] = [self._build_post_tool_hook(antigravity, state)]
+        policies = self._build_tool_policies(antigravity, state)
+        if policies is not None:
+            config_kwargs["policies"] = policies
         config = self._build_local_agent_config(antigravity, model=model, kwargs=config_kwargs)
         agent = antigravity.Agent(config)
         # Agent is documented as an async context manager; enter it if so.
@@ -925,6 +1001,55 @@ class AntigravityExecutor(Executor):
                 )
 
         return _OmnigentToolCompleteHook()
+
+    def _build_tool_policies(
+        self, antigravity: ModuleType, state: _AntigravitySessionState
+    ) -> list[SDKPolicy] | None:
+        """Build ``LocalAgentConfig.policies`` that confirm ``run_command`` with the user.
+
+        Other SDK tools keep the SDK default; ``None`` when the SDK has no such policy."""
+        policy = getattr(getattr(antigravity, "hooks", None), "policy", None)
+        confirm_run_command: SDKPolicyFactory = getattr(policy, "confirm_run_command", None)
+        if not callable(confirm_run_command):
+            logger.warning(
+                "google-antigravity exposes no policy.confirm_run_command; "
+                "run_command cannot be confirmed through Omnigent"
+            )
+            return None
+        policies: SDKPolicies = confirm_run_command(
+            handler=self._make_run_command_confirmer(state)
+        )
+        return list(policies)
+
+    def _make_run_command_confirmer(
+        self, state: _AntigravitySessionState
+    ) -> Callable[[SDKToolCall], Awaitable[bool]]:
+        """Build the ``ask_user`` handler for a ``run_command`` confirmation.
+
+        Refusals are recorded on *state*; without an elicitation handler it fails closed."""
+
+        async def _confirm(tool_call: SDKToolCall) -> bool:
+            name = _tool_name(getattr(tool_call, "name", None)) or "run_command"
+            raw_args = getattr(tool_call, "args", None)
+            args: ToolArgs = dict(raw_args) if isinstance(raw_args, dict) else {}
+            handler = self._elicitation_handler
+            if handler is None:
+                logger.warning(
+                    "Antigravity asked to confirm %s but no elicitation handler is wired; denying",
+                    name,
+                )
+                allowed = False
+            else:
+                try:
+                    allowed = bool(await handler(name, args))
+                except Exception:
+                    logger.exception("Antigravity %s confirmation failed; denying", name)
+                    allowed = False
+            if not allowed:
+                state.denied_tools.append(_DeniedTool(name=name, args=args))
+            return allowed
+
+        return _confirm
 
     def _build_sdk_tools(self, tools: list[ToolSpec]) -> list[SDKTool]:
         """Build SDK tools (plain callables) from Omnigent tool specs.
