@@ -110,11 +110,18 @@ def test_reveal_local_file_and_folder(page: Page, workspace: tuple[str, str, str
     ]
 
 
-def test_browser_tab_keeps_native_menu(page: Page, workspace: tuple[str, str, str]) -> None:
+def test_browser_tab_opens_shared_menu_without_finder_action(
+    page: Page, workspace: tuple[str, str, str]
+) -> None:
     base_url, session_id, _root = workspace
     rail = _files_rail(page, base_url, session_id)
 
     row = rail.get_by_text(_FILE, exact=True)
     expect(row).to_be_visible(timeout=30_000)
     row.click(button="right")
-    expect(page.get_by_role("menuitem")).to_have_count(0)
+    menu = page.get_by_role("menu")
+    expect(menu).to_be_visible()
+    expect(menu.get_by_role("menuitem", name="Download", exact=True)).to_be_visible()
+    expect(menu.get_by_role("menuitem", name="Copy path", exact=True)).to_be_visible()
+    expect(menu.get_by_role("menuitem", name="File info", exact=True)).to_be_visible()
+    expect(menu.get_by_role("menuitem", name=re.compile(r"^(Show in|Open in) "))).to_have_count(0)
