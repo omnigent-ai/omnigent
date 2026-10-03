@@ -197,8 +197,15 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 - Keep any recovered before-clip unchanged. A missing before-clip is not a
   reason to skip the after-clip; note the missing before-clip in your evidence.
 - For internal/API-only results with no visible user interaction, written
-  evidence is enough. Set `recordings: []` and describe the before/after result
-  in your evidence and the PR Demo section.
+  evidence is enough. Judge visibility by what one user sees in one session
+  after the fix, not by the host-level symptom the ticket reports: a pane or
+  process lifecycle change (a finished pane the reaper now removes) shows in
+  the session's Terminal view and is filmable with a shortened idle window; see
+  the `terminal` lane in `dev/recording-lanes.md`. Footage of the ticket's
+  surface in the recovered repro bundle proves the surface is filmable: film the
+  after-fix counterpart on the same lane. Only when neither applies, set
+  `recordings: []` and describe the before/after result in your evidence and
+  the PR Demo section.
 - If recording is blocked by missing tools or an environment that cannot run
   the journey, set `recordings: []` and name the specific blocker in
   `recording_unavailable_reason`. Do not block the fix or PR because footage is

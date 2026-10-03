@@ -176,12 +176,18 @@ readiness; name pending publication/review steps in `remaining_work`.
   captions unchanged. Each after-clip's caption lists the actions shown, ending
   with the corrected behavior. A missing before-clip is not a reason to skip
   the after-clip. Use `[]` only for internal/API-only results with no visible
-  user interaction, or when recording is blocked as described above.
+  user interaction as Step 2B.5 judges it (a lifecycle change visible in the
+  Terminal view, or a surface the repro bundle already filmed, is not internal),
+  or when recording is blocked as described above.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
 
   - For internal/API-only results, say there is no visible user interaction
-    and put the written before/after evidence in the PR Demo section.
+    and that neither the ticket nor the repro handoff declares a `terminal`,
+    `web`, `mobile`, `desktop`, or `cli` facet for that result; such a facet,
+    or inherited footage of it, voids this reason — film the surface or name
+    the capture blocker you hit. Put the written before/after evidence in the
+    PR Demo section.
   - For a recording failure, name the missing tool or the environment problem.
     Text-only CLI output is not a reason to skip recording.
   - Do not substitute a video of test output or a made-up demonstration.
