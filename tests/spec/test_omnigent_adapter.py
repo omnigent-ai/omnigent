@@ -2590,3 +2590,59 @@ def test_compat_yaml_executor_api_key_auth_is_not_dropped(tmp_path: Path) -> Non
 
     assert isinstance(spec.executor.auth, ApiKeyAuth)
     assert spec.executor.auth.api_key == "sk-test-key"
+
+
+def _write_single_file_yaml(tmp_path: Path, extra: dict[str, Any]) -> Path:
+    """Write a minimal single-file omnigent YAML plus *extra* top-level keys."""
+    yaml_path = tmp_path / "agent.yaml"
+    yaml_path.write_text(
+        yaml.dump(
+            {
+                "name": "trimmed",
+                "prompt": "You are a test agent.",
+                "executor": {"model": "openai/gpt-5", "harness": "claude-sdk"},
+                **extra,
+            }
+        )
+    )
+    return yaml_path
+
+
+def test_compat_yaml_tool_groups_is_not_dropped(tmp_path: Path) -> None:
+    """
+    ``tool_groups:`` in a single-file YAML reaches the spec. The omnigent
+    loader ignores unknown top-level keys, so without the raw-YAML read the
+    block would be silently discarded and every group left registered.
+    """
+    from omnigent.spec._omnigent_compat import load_omnigent_yaml
+
+    yaml_path = _write_single_file_yaml(
+        tmp_path, {"tool_groups": {"browser": False, "comments": False}}
+    )
+
+    spec = load_omnigent_yaml(yaml_path)
+
+    assert spec.tool_groups.browser is False
+    assert spec.tool_groups.comments is False
+    assert spec.tool_groups.scheduled_tasks is True
+
+
+def test_compat_yaml_tool_groups_typo_fails_the_load(tmp_path: Path) -> None:
+    """A misspelled group fails through ``load()`` exactly as it does for a bundle."""
+    yaml_path = _write_single_file_yaml(tmp_path, {"tool_groups": {"scheduled-tasks": False}})
+
+    with pytest.raises(OmnigentError, match=r"unknown group\(s\) \['scheduled-tasks'\]"):
+        load(yaml_path)
+
+
+def test_compat_yaml_tool_groups_discovery_needs_spawn_off(tmp_path: Path) -> None:
+    """The adapter checks ``agent_discovery`` against the YAML's own ``spawn:``."""
+    from omnigent.spec._omnigent_compat import load_omnigent_yaml
+
+    yaml_path = _write_single_file_yaml(
+        tmp_path,
+        {"spawn": True, "tool_groups": {"agent_discovery": False, "scheduled_tasks": False}},
+    )
+
+    with pytest.raises(OmnigentError, match="spawn: true"):
+        load_omnigent_yaml(yaml_path)
