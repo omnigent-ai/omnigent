@@ -9,10 +9,14 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
 from omnigent.harnesses.kiro_native.bridge import acp_record_path, send_kiro_permission_verdict
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _logger = logging.getLogger(__name__)
 
@@ -186,6 +190,25 @@ def _read_new_permission_events(
     return events, new_offset
 
 
+def _recorded_verdict_probe(record_file: Path, offset: int, request_id: str) -> Callable[[], bool]:
+    """Return a poll-safe check for Kiro's recorded response to *request_id*.
+
+    Each call parses only the recorder bytes appended since the previous call.
+    """
+    recorded = False
+
+    def probe() -> bool:
+        nonlocal offset, recorded
+        if not recorded:
+            events, offset = _read_new_permission_events(record_file, offset)
+            recorded = any(
+                event.kind == "response" and event.request_id == request_id for event in events
+            )
+        return recorded
+
+    return probe
+
+
 async def supervise_kiro_permission_mirror(
     *,
     base_url: str,
@@ -278,6 +301,16 @@ async def _run_one_permission(
     elicitation_id: str,
 ) -> None:
     """Park one Kiro permission request on the server and deliver the verdict."""
+    record_file = acp_record_path(bridge_dir)
+    try:
+        start_offset = record_file.stat().st_size
+    except FileNotFoundError:
+        start_offset = 0
+    except OSError:
+        _logger.exception(
+            "failed to stat kiro ACP recorder %s; scanning its full history", record_file
+        )
+        start_offset = 0
     payload = {
         "elicitation_id": elicitation_id,
         "agent": "Kiro",
@@ -317,6 +350,9 @@ async def _run_one_permission(
             bridge_dir,
             action=action,
             expected_title=permission.title,
+            verdict_recorded=_recorded_verdict_probe(
+                record_file, start_offset, permission.request_id
+            ),
         )
     except RuntimeError:
         _logger.exception(

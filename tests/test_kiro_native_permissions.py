@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -187,8 +188,15 @@ async def test_run_one_permission_posts_then_delivers_verdict(
 ) -> None:
     delivered: list[tuple[Path, str]] = []
 
-    def _fake_send(bridge_dir: Path, *, action: str, expected_title: str | None = None) -> None:
+    def _fake_send(
+        bridge_dir: Path,
+        *,
+        action: str,
+        expected_title: str | None = None,
+        verdict_recorded: Callable[[], bool] | None = None,
+    ) -> None:
         assert expected_title == "Running: pwd"
+        assert callable(verdict_recorded)
         delivered.append((bridge_dir, action))
 
     monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
@@ -218,6 +226,49 @@ async def test_run_one_permission_posts_then_delivers_verdict(
         assert delivered == []
     else:
         assert delivered == [(tmp_path, expected_action)]
+
+
+@pytest.mark.asyncio
+async def test_run_one_permission_reports_recorded_verdict_for_this_request_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The delivery probe flips only on this request's recorder response, then stays set."""
+    record_file = acp_record_path(tmp_path)
+    record_file.write_bytes(_record_bytes(_permission_msg("req-1")))
+    seen: list[bool] = []
+
+    def _fake_send(
+        bridge_dir: Path,
+        *,
+        action: str,
+        expected_title: str | None = None,
+        verdict_recorded: Callable[[], bool] | None = None,
+    ) -> None:
+        assert verdict_recorded is not None
+        seen.append(verdict_recorded())
+        with record_file.open("ab") as handle:
+            handle.write(_record_bytes(_permission_result_msg("req-2")))
+        seen.append(verdict_recorded())
+        with record_file.open("ab") as handle:
+            handle.write(_record_bytes(_permission_result_msg("req-1")))
+        seen.append(verdict_recorded())
+        seen.append(verdict_recorded())
+
+    monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    client = _QueueClient([httpx.Response(200, json={"action": "accept"})])
+
+    await knp._run_one_permission(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+    )
+
+    assert seen == [False, False, True, True]
 
 
 @pytest.mark.asyncio
