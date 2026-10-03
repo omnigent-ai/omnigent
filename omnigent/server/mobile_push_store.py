@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Literal, cast
@@ -14,7 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import (
-    current_account_user,
+    account_authority_scope,
     lock_account,
     require_active_account,
 )
@@ -28,7 +29,13 @@ from omnigent.db.db_models import (
     current_workspace_id,
     workspace_scope,
 )
-from omnigent.db.enum_codecs import encode_session_live_status
+from omnigent.db.enum_codecs import (
+    decode_mobile_push_kind,
+    decode_mobile_push_platform,
+    encode_mobile_push_kind,
+    encode_mobile_push_platform,
+    encode_session_live_status,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -36,6 +43,10 @@ from omnigent.db.utils import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.mobile_push_content import Platform, PushKind
+
+FCM_TOKEN_PATTERN = r"^[A-Za-z0-9:_-]+$"
+FCM_TOKEN_MAX_LENGTH = 1024
+LEASE_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -59,6 +70,7 @@ class Delivery:
     reason: str | None
     lease: str
     attempts: int
+    lease_deadline: float
 
 
 @dataclass(frozen=True)
@@ -71,7 +83,7 @@ def _device(row: SqlMobilePushDevice) -> Device:
     return Device(
         row.installation_id,
         row.user_id,
-        cast(Platform, row.platform),
+        cast(Platform, decode_mobile_push_platform(row.platform)),
         row.fcm_token,
         row.generation,
         row.account_generation,
@@ -120,6 +132,11 @@ class MobilePushStore:
         fcm_token: str,
         now: int | None = None,
     ) -> Device:
+        if (
+            not 1 <= len(fcm_token) <= FCM_TOKEN_MAX_LENGTH
+            or re.fullmatch(FCM_TOKEN_PATTERN, fcm_token) is None
+        ):
+            raise OmnigentError("Invalid FCM registration token", code=ErrorCode.INVALID_INPUT)
         token_hash = hashlib.sha256(fcm_token.encode()).hexdigest()
         stamp = _now(now)
 
@@ -168,7 +185,7 @@ class MobilePushStore:
             row = SqlMobilePushDevice(
                 installation_id=installation_id,
                 user_id=user_id,
-                platform=platform,
+                platform=encode_mobile_push_platform(platform),
                 fcm_token=fcm_token,
                 token_hash=token_hash,
                 generation=uuid4().hex,
@@ -259,10 +276,7 @@ class MobilePushStore:
                 )
             )
             users = {device.user_id for device in devices}
-            if actor := current_account_user():
-                users.add(actor)
             accounts = {user: lock_account(session, user) for user in sorted(users)}
-            require_active_account(session, None)
             for device in devices:
                 account = accounts[device.user_id]
                 if account is not None and account.deleted_at is not None:
@@ -277,7 +291,7 @@ class MobilePushStore:
                     SqlMobilePushOutbox.user_id == device.user_id,
                     SqlMobilePushOutbox.installation_id == device.installation_id,
                     SqlMobilePushOutbox.device_generation == device.generation,
-                    SqlMobilePushOutbox.kind == kind,
+                    SqlMobilePushOutbox.kind == encode_mobile_push_kind(kind),
                 )
                 session.execute(
                     delete(SqlMobilePushOutbox).where(
@@ -293,7 +307,7 @@ class MobilePushStore:
                             user_id=device.user_id,
                             installation_id=device.installation_id,
                             device_generation=device.generation,
-                            kind=kind,
+                            kind=encode_mobile_push_kind(kind),
                             reason=reason,
                             not_before=stamp + (0 if kind == "needs_input" else 10),
                             expires_at=stamp + 3600,
@@ -303,11 +317,48 @@ class MobilePushStore:
                         )
                     )
 
-        run_write_transaction(self._writer, "queue_notification_intents", write)
+        with account_authority_scope(None, None):
+            run_write_transaction(self._writer, "queue_notification_intents", write)
 
     def cancel(
         self, session_id: str, *, prompts_only: bool = False, terminal_only: bool = False
     ) -> None:
+        prompt_kind = encode_mobile_push_kind("needs_input")
+        with self._session("find_obsolete_notification_intents") as session:
+            root_id = self._root(session, session_id)
+            candidates = [session_id]
+            if root_id is not None and root_id != session_id and not terminal_only:
+                candidates.append(root_id)
+            for candidate in candidates:
+                query = select(SqlMobilePushOutbox.id).where(
+                    SqlMobilePushOutbox.workspace_id == current_workspace_id(),
+                    SqlMobilePushOutbox.session_id == candidate,
+                )
+                if prompts_only or candidate != session_id:
+                    query = query.where(SqlMobilePushOutbox.kind == prompt_kind)
+                elif terminal_only:
+                    query = query.where(
+                        SqlMobilePushOutbox.kind.in_(
+                            (
+                                encode_mobile_push_kind("completed"),
+                                encode_mobile_push_kind("failed"),
+                            )
+                        )
+                    )
+                if (
+                    session.scalar(
+                        query.order_by(
+                            SqlMobilePushOutbox.kind,
+                            SqlMobilePushOutbox.delivered,
+                            SqlMobilePushOutbox.id,
+                        ).limit(1)
+                    )
+                    is not None
+                ):
+                    break
+            else:
+                return
+
         def write(session: Session) -> None:
             root_id = self._root(session, session_id)
             rows = list(
@@ -317,7 +368,7 @@ class MobilePushStore:
                         or_(
                             SqlMobilePushOutbox.session_id == session_id,
                             (SqlMobilePushOutbox.session_id == root_id)
-                            & (SqlMobilePushOutbox.kind == "needs_input"),
+                            & (SqlMobilePushOutbox.kind == prompt_kind),
                         ),
                     )
                 )
@@ -326,14 +377,15 @@ class MobilePushStore:
             for user in users:
                 require_active_account(session, user)
             for row in rows:
-                if terminal_only and row.kind == "needs_input":
+                if terminal_only and row.kind == prompt_kind:
                     continue
                 if not prompts_only or (
-                    row.kind == "needs_input" and not self._has_prompts(session, row.session_id)
+                    row.kind == prompt_kind and not self._has_prompts(session, row.session_id)
                 ):
                     session.delete(row)
 
-        run_write_transaction(self._writer, "cancel_obsolete_notification_intents", write)
+        with account_authority_scope(None, None):
+            run_write_transaction(self._writer, "cancel_obsolete_notification_intents", write)
 
     def pending_workspaces(self, *, now: int | None = None, limit: int = 32) -> list[int]:
         stamp = _now(now)
@@ -464,6 +516,9 @@ class MobilePushStore:
 
     def claim(self, *, now: int | None = None, limit: int = 50) -> list[Delivery]:
         stamp = _now(now)
+        lease_deadline = time.monotonic() + (
+            LEASE_SECONDS if now is not None else max(0, stamp + LEASE_SECONDS - time.time())
+        )
 
         def write(session: Session) -> list[Delivery]:
             rows = list(
@@ -512,8 +567,8 @@ class MobilePushStore:
                         )
                         .values(
                             lease=lease,
-                            lease_until=stamp + 30,
-                            not_before=stamp + 30,
+                            lease_until=stamp + LEASE_SECONDS,
+                            not_before=stamp + LEASE_SECONDS,
                             attempts=row.attempts + 1,
                         )
                         .execution_options(synchronize_session=False)
@@ -527,10 +582,11 @@ class MobilePushStore:
                             row.user_id,
                             row.installation_id,
                             row.device_generation,
-                            cast(PushKind, row.kind),
+                            cast(PushKind, decode_mobile_push_kind(row.kind)),
                             row.reason,
                             lease,
                             row.attempts + 1,
+                            lease_deadline,
                         )
                     )
             return claimed
