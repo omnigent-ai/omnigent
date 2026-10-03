@@ -134,6 +134,13 @@ def test_options_do_not_parse_values_or_prompt() -> None:
             ("--add-dir", "/tmp/shared", "--image", "shot.png", "describe"),
             ["--add-dir", "/tmp/shared", "--image", "shot.png"],
         ),
+        # ``--remote-auth-token-env`` takes a value; its env-var name must be
+        # kept, not dropped as the prompt (dropping it would leave a dangling
+        # flag that swallows the ``resume`` subcommand on cold resume).
+        (
+            ("--remote-auth-token-env", "CODEX_REMOTE_TOKEN", "initial prompt"),
+            ["--remote-auth-token-env", "CODEX_REMOTE_TOKEN"],
+        ),
         # Everything after ``--`` is prompt text, as is the ``-`` stdin marker.
         (("-c", 'model="gpt-5.4"', "--", "--yolo", "fix it"), ["-c", 'model="gpt-5.4"']),
         (("--model", "gpt-5.4-mini", "-"), ["--model", "gpt-5.4-mini"]),

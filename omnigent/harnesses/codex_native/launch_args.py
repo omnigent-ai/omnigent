@@ -111,6 +111,9 @@ _CODEX_VALUE_FLAGS = frozenset(
         "--local-provider",
         "--enable",
         "--disable",
+        # Names an env var holding the remote auth token; unlike the reserved
+        # ``--remote`` transport flag it takes a value and is caller-settable.
+        "--remote-auth-token-env",
     }
 )
 
@@ -214,26 +217,7 @@ def codex_config_profile(args: Sequence[str]) -> str | None:
             profile = canonical[index + 1]
             if not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
                 raise ValueError("Invalid Codex config profile name")
-        if arg in {
-            "-c",
-            "--config",
-            "-s",
-            "--sandbox",
-            "-a",
-            "--ask-for-approval",
-            "-p",
-            "--profile",
-            "--add-dir",
-            "-m",
-            "--model",
-            "-C",
-            "--cd",
-            "-i",
-            "--image",
-            "--local-provider",
-            "--enable",
-            "--disable",
-        }:
+        if arg in _CODEX_VALUE_FLAGS:
             index += 1
         index += 1
     return profile

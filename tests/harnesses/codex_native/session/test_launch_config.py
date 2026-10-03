@@ -270,7 +270,15 @@ def test_build_codex_remote_args_resume_omits_positional_launch_prompt(
     """Resuming forwards the launch configuration but not the persisted positional prompt."""
     launch_prompt = "Reply with INITIAL_ONCE"
     args = codex_native_app_server.build_codex_remote_args(
-        codex_args=("--model", "gpt-5.4-mini", launch_prompt, "--sandbox", "read-only"),
+        codex_args=(
+            "--model",
+            "gpt-5.4-mini",
+            "--remote-auth-token-env",
+            "CODEX_REMOTE_TOKEN",
+            launch_prompt,
+            "--sandbox",
+            "read-only",
+        ),
         thread_id="thread_existing",
         remote_url="ws://127.0.0.1:9876",
         config_overrides=('model_provider="omnigent"',),
@@ -284,6 +292,9 @@ def test_build_codex_remote_args_resume_omits_positional_launch_prompt(
     )
     assert args[args.index("--model") + 1] == "gpt-5.4-mini", args
     assert args[args.index("-c") + 1] == 'model_provider="omnigent"', args
+    # The auth-token env-var name is the option's value: it must survive so
+    # ``resume`` stays the subcommand rather than being swallowed as the value.
+    assert args[args.index("--remote-auth-token-env") + 1] == "CODEX_REMOTE_TOKEN", args
 
 
 @pytest.mark.parametrize(
