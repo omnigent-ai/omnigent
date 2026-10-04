@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { ArrowLeftIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -7,10 +7,16 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { BrandHarness } from "@/components/onboarding/harnessBrand";
 import type { Host } from "@/hooks/useHosts";
 import {
+  INVENTORY_HARNESS_IDS,
   type InventoryMcpServer,
   type InventoryPlugin,
   useHarnessInventory,
 } from "@/hooks/useHarnessInventory";
+
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { useSkillContent } from "@/hooks/useSkillContent";
+import { ApiError } from "@/lib/sessionsApi";
 
 type CatalogKind = "mcps" | "skills" | "plugins";
 
@@ -80,6 +86,8 @@ export function HarnessCatalog({
     searchParams.get("tab") === "settings" ? "settings" : "mcps",
   );
   const [open, setOpen] = useState<OpenPlugin | null>(null);
+  const [skillName, setSkillName] = useState<string | null>(null);
+  const [contentSupported, setContentSupported] = useState(true);
   const inventory = useHarnessInventory(host, { includePluginMetadata: family === "claude" });
   const back = () => setOpen(null);
 
@@ -104,7 +112,29 @@ export function HarnessCatalog({
       ? unavailable.includes("skills") && unavailable.includes("mcps")
       : unavailable.includes(kind);
 
-  if (open) return <PluginPage plugin={open.plugin} mcps={open.mcps} onBack={back} />;
+  if (skillName !== null)
+    return (
+      <SkillPage
+        host={host}
+        harness={INVENTORY_HARNESS_IDS[family]}
+        name={skillName}
+        backLabel={open ? open.plugin.name : "Skills"}
+        onBack={() => setSkillName(null)}
+        onUnavailable={() => {
+          setContentSupported(false);
+          setSkillName(null);
+        }}
+      />
+    );
+  if (open)
+    return (
+      <PluginPage
+        plugin={open.plugin}
+        mcps={open.mcps}
+        onBack={back}
+        onSkillOpen={contentSupported ? setSkillName : undefined}
+      />
+    );
 
   const ownList = (kind: CatalogKind, count: number, list: ReactNode) => {
     const noun = KINDS.find((k) => k.id === kind)?.noun;
@@ -176,6 +206,7 @@ export function HarnessCatalog({
                   icon={<SparkleIcon className="size-4 text-muted-foreground" />}
                   name={skill.name}
                   detail={skill.description}
+                  onOpen={contentSupported ? () => setSkillName(skill.name) : undefined}
                 />
               ))}
             </ul>,
@@ -291,10 +322,12 @@ function PluginPage({
   plugin,
   mcps,
   onBack,
+  onSkillOpen,
 }: {
   plugin: InventoryPlugin;
   mcps: InventoryMcpServer[];
   onBack: () => void;
+  onSkillOpen?: (name: string) => void;
 }) {
   return (
     <>
@@ -327,6 +360,7 @@ function PluginPage({
                 key={name}
                 icon={<SparkleIcon className="size-4 text-muted-foreground" />}
                 name={name}
+                onOpen={onSkillOpen ? () => onSkillOpen(`${plugin.name}:${name}`) : undefined}
               />
             ))}
           </ul>
@@ -347,3 +381,66 @@ function PluginPage({
     </>
   );
 }
+
+function SkillPage({
+  host,
+  harness,
+  name,
+  backLabel,
+  onBack,
+  onUnavailable,
+}: {
+  host: Host;
+  harness: string;
+  name: string;
+  backLabel: string;
+  onBack: () => void;
+  onUnavailable: () => void;
+}) {
+  const query = useSkillContent(host.host_id, harness, name, { enabled: true });
+  const missingRoute = query.error instanceof ApiError && query.error.status === 404;
+  useEffect(() => {
+    if (missingRoute) onUnavailable();
+  }, [missingRoute, onUnavailable]);
+  return (
+    <>
+      <BackButton label={backLabel} onClick={onBack} />
+      <h1 className="truncate text-2xl font-semibold">{name}</h1>
+      {query.isPending ? (
+        <Notice>Loading skill contents…</Notice>
+      ) : query.error ? (
+        <Notice>
+          {query.error instanceof ApiError && query.error.status === 501
+            ? `Update ${host.name} to see skill contents.`
+            : "Couldn't load skill contents."}
+        </Notice>
+      ) : query.data ? (
+        <>
+          {query.data.description && (
+            <p className="mt-4 text-ui text-muted-foreground">{query.data.description}</p>
+          )}
+          <h2 className="mt-6 text-ui font-medium">Contents</h2>
+          {query.data.truncated && <Notice>Contents truncated (256 KiB limit).</Notice>}
+          <div className="prose prose-sm mt-2 max-w-none overflow-x-auto rounded-xl border border-border p-5 dark:prose-invert">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              skipHtml
+              components={SKILL_MARKDOWN_COMPONENTS}
+            >
+              {query.data.content}
+            </ReactMarkdown>
+          </div>
+        </>
+      ) : null}
+    </>
+  );
+}
+
+const SKILL_MARKDOWN_COMPONENTS: Components = {
+  img: ({ alt }) => <span>{alt}</span>,
+  a: ({ href, children }) => (
+    <a href={href} rel="noreferrer" target="_blank">
+      {children}
+    </a>
+  ),
+};

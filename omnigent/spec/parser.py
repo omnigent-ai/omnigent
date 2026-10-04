@@ -2581,7 +2581,7 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         # scanner in _discover_skills and the per-skill guards in the menu
         # providers catch it and skip the file instead of 500-ing the menu.
         raise OmnigentError(
-            f"SKILL.md could not be read: {skill_md}: {exc}",
+            f"SKILL.md could not be read: {skill_md}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
     match = _FRONTMATTER_RE.match(text)
@@ -2594,14 +2594,12 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     try:
         frontmatter = yaml.safe_load(frontmatter_str)
     except yaml.YAMLError as exc:
-        # Retry with colon-bearing prose quoted before giving up, and report
-        # the ORIGINAL error if that still fails so the message names the real
-        # complaint rather than the rewrite's.
+        # Retry prose containing colons; diagnostics must not include file contents.
         try:
             frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
         except yaml.YAMLError:
             raise OmnigentError(
-                f"SKILL.md has invalid YAML frontmatter: {skill_md}: {exc}",
+                f"SKILL.md has invalid YAML frontmatter: {skill_md}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
     if not isinstance(frontmatter, dict):
