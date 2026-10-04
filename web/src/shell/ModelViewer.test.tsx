@@ -314,7 +314,11 @@ function paintsOwnBackground(record: RendererRecord | null): boolean {
 function backgroundsAbove(host: HTMLElement): string[] {
   const found: string[] = [];
   for (let el: HTMLElement | null = host; el && el !== document.body; el = el.parentElement) {
-    found.push(...Array.from(el.classList).filter((c) => c.startsWith("bg-")));
+    // Variant-prefixed utilities too (`dark:bg-…`); jsdom applies no Tailwind.
+    found.push(...Array.from(el.classList).filter((c) => /(^|:)bg-/.test(c)));
+    // Inline values jsdom can't resolve (e.g. `var(--background)`) never reach the computed color.
+    const inline = el.style.background || el.style.backgroundColor;
+    if (inline) found.push(inline);
     const color = getComputedStyle(el).backgroundColor;
     if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") found.push(color);
   }
