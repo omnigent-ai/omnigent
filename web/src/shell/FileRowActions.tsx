@@ -90,6 +90,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
   const isCoarsePointer = useIsCoarsePointer();
   const isDeleted = props.isDeleted ?? props.lastKnown ?? false;
   const revealTarget = useRevealTarget(isDeleted ? null : props.revealPath);
+  const actionLabel = `More actions for ${props.actionName ?? props.name}`;
   const items: FileRowActionItem[] = [];
 
   if (props.kind === "file" && !isDeleted && props.downloadable && props.conversationId) {
@@ -182,7 +183,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
           type="button"
           variant="ghost"
           size="icon-sm"
-          aria-label={`More actions for ${props.actionName ?? props.name}`}
+          aria-label={actionLabel}
           onClick={(event) => event.stopPropagation()}
           className={cn(
             "size-[18px] shrink-0 rounded p-0.5 text-muted-foreground transition-opacity hover:bg-muted hover:text-foreground",
@@ -244,6 +245,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
         {children(kebab, rowRef, primaryActionRef, contextOpen || dropdownOpen)}
       </ContextMenuTrigger>
       <ContextMenuContent
+        aria-label={actionLabel}
         onEscapeKeyDown={(event) => event.stopPropagation()}
         onCloseAutoFocus={restoreFocusAfterMenuClose}
       >
