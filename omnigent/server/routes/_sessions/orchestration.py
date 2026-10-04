@@ -7211,30 +7211,31 @@ async def _relay_runner_live_elsewhere(
     conversation_store: ConversationStore,
 ) -> bool:
     """
-    Resolve this relay's bound runner and check it against another replica.
+    Check this relay's bound runner using shared connectivity metadata.
 
-    The active relay's runner id is normally known from its own
-    ``_runner_relay_tasks`` registration; a caller that drives
-    :func:`_relay_runner_stream` directly (tests, or a code path
-    bypassing :func:`_ensure_runner_relay`) has no such entry, so fall
-    back to the session row's binding. One row read serves both the
-    binding and the liveness stamp, keeping this path bounded.
+    A full-conversation read can depend on unrelated backends; their outage
+    must not hide a fresh heartbeat from another replica. Prefer the active
+    relay's runner binding, falling back to the metadata binding when called
+    without a registered relay.
 
     :param session_id: Session/conversation identifier.
-    :param conversation_store: Store used to read the session row.
+    :param conversation_store: Store used to read connectivity metadata.
     :returns: ``True`` when the bound runner is confirmed live on
         another replica; ``False`` when unbound, unreadable, or not.
     """
     try:
-        row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        connectivity = await asyncio.to_thread(
+            conversation_store.get_session_connectivity, [session_id]
+        )
     except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
         _logger.warning(
-            "Relay: session-row lookup failed for session=%s",
+            "Relay: connectivity lookup failed for session=%s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
         return False
+    row = connectivity.get(session_id)
     if row is None:
         return False
     handle = _runner_relay_tasks.get(session_id)
@@ -7242,7 +7243,10 @@ async def _relay_runner_live_elsewhere(
     if runner_id is None:
         return False
     reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return _runner_live_on_another_replica_from_conversations([row], runner_id, reference_stamp)
+    return row.runner_id == runner_id and _runner_stamp_is_live_elsewhere(
+        stamp=row.runner_last_seen,
+        reference_stamp=reference_stamp,
+    )
 
 
 async def _relay_runner_stream(
