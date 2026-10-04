@@ -2410,15 +2410,33 @@ def register_events_routes(
                 _runner_needs_session_init = False
             else:
                 _runner_needs_session_init = True
-        if runner_client is None:
-            # A rollout can leave the runner live on a sibling pod; re-address
-            # (WRONG_REPLICA) instead of failing the turn — see the guard's
-            # docstring. Skipped on a definitive host refusal (authoritative
-            # local answer, surfaced below).
-            if not relaunched_launch_refused:
+        if runner_client is None and not relaunched_launch_refused:
+            # Binding and tunnel registration can change during a lookup or
+            # connect wait. Resolve once more from the same fresh row we dispatch.
+            fresh_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if fresh_conv is None:
+                raise _session_not_found()
+            runner_client = await _get_runner_client(
+                session_id, runner_router, conversation=fresh_conv
+            )
+            if runner_client is None:
+                await _raise_if_runner_on_another_replica(
+                    fresh_conv, request.app.state, conversation_store
+                )
+                expected_runner_id = relaunched_runner_id or conv.runner_id
+                if fresh_conv.runner_id is not None and fresh_conv.runner_id != expected_runner_id:
+                    # A concurrent rebind invalidated this request's routing.
+                    # Retry without attributing the old runner's stamp to the new one.
+                    raise OmnigentError(
+                        "session runner binding changed during dispatch; retry",
+                        code=ErrorCode.WRONG_REPLICA,
+                    )
                 await _raise_if_runner_re_tunnelled_to_another_replica(
                     session_id, conv.runner_id, conversation_store
                 )
+            conv = fresh_conv
+            _runner_needs_session_init = runner_client is not None
+        if runner_client is None:
             # A native terminal-session message must NOT be silently
             # dropped when no runner is reachable — the runner crashed
             # before connecting (the daemon couldn't bring it up). Persist
