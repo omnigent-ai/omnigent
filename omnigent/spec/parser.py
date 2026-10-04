@@ -2581,7 +2581,8 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         # scanner in _discover_skills and the per-skill guards in the menu
         # providers catch it and skip the file instead of 500-ing the menu.
         raise OmnigentError(
-            f"SKILL.md could not be read: {skill_md}",
+            f"SKILL.md could not be read: {skill_md} "
+            f"({type(exc).__name__}, errno={getattr(exc, 'errno', None)})",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
     match = _FRONTMATTER_RE.match(text)
@@ -2599,7 +2600,7 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
             frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
         except yaml.YAMLError:
             raise OmnigentError(
-                f"SKILL.md has invalid YAML frontmatter: {skill_md}",
+                f"SKILL.md has invalid YAML frontmatter: {skill_md} ({type(exc).__name__})",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
     if not isinstance(frontmatter, dict):

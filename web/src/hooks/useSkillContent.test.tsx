@@ -33,3 +33,16 @@ it("fetches an encoded skill only while enabled, with no browser cache", async (
   unmount();
   await waitFor(() => expect(client.getQueryCache().getAll()).toHaveLength(0));
 });
+
+it.each([404, 501])("preserves HTTP %s for compatibility handling", async (status) => {
+  vi.mocked(authenticatedFetch).mockResolvedValue(Response.json({}, { status }));
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  const { result } = renderHook(() => useSkillContent("host", "claude-native", "review"), {
+    wrapper,
+  });
+  await waitFor(() => expect(result.current.error).toMatchObject({ status }));
+  expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+});
