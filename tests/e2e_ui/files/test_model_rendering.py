@@ -84,19 +84,30 @@ def _large_ascii_stl(min_bytes: int = 9 * 1024 * 1024 + 512 * 1024) -> str:
     return "".join(parts)
 
 
-# Installed before the SPA boots. Records whether the loading status was in the
-# DOM when the preview host first mounted, catching that transient state without
-# external polling.
+# Installed before the SPA boots. Records the loading label shown when the
+# preview host first mounts, and the first status announcement made before the
+# canvas exists (the status region mounts empty so screen readers announce it).
 _LOAD_PROBE_JS = """
 (() => {
-  window.__modelLoadProbe = { statusAtHostMount: undefined };
+  const probe = { labelAtHostMount: undefined, statusBeforeCanvas: undefined };
+  window.__modelLoadProbe = probe;
   const check = () => {
     const host = document.querySelector('[aria-label^="3D preview of"]');
-    if (!host || window.__modelLoadProbe.statusAtHostMount !== undefined) return;
-    const status = host.parentElement && host.parentElement.querySelector('[role="status"]');
-    window.__modelLoadProbe.statusAtHostMount = status ? status.textContent : null;
+    if (!host || !host.parentElement) return;
+    if (probe.labelAtHostMount === undefined) {
+      const text = host.parentElement.textContent || "";
+      probe.labelAtHostMount = text.includes("Preparing model…") ? "Preparing model…" : text;
+    }
+    const status = host.parentElement.querySelector('[role="status"]');
+    if (probe.statusBeforeCanvas === undefined && status && status.textContent) {
+      probe.statusBeforeCanvas = host.querySelector("canvas") ? null : status.textContent;
+    }
   };
-  new MutationObserver(check).observe(document, { childList: true, subtree: true });
+  new MutationObserver(check).observe(document, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
   check();
 })();
 """
@@ -202,11 +213,13 @@ def test_large_model_shows_loading_status_until_it_renders(
     expect(preview).to_be_visible(timeout=30_000)
     expect(preview.locator("canvas")).to_be_visible(timeout=120_000)
 
-    # The probe records status presence at host mount, before the canvas was
-    # built — DOM presence and timing, not painted visibility.
+    # The probe records the label at host mount and the first announcement,
+    # both before the canvas was built: DOM presence and timing, not paint.
     probe = page.evaluate("() => window.__modelLoadProbe")
-    assert probe["statusAtHostMount"] == "Preparing model…", probe
+    assert probe["labelAtHostMount"] == "Preparing model…", probe
+    assert probe["statusBeforeCanvas"] == "Preparing model…", probe
 
     # And it is gone once the model is on screen.
     expect(file_viewer.get_by_text("Preparing model…")).to_have_count(0)
+    expect(file_viewer.get_by_role("status")).to_have_text("")
     expect(file_viewer.get_by_text("Unable to render 3D model")).to_have_count(0)
