@@ -61,15 +61,15 @@ def _large_ascii_stl(min_bytes: int = 9 * 1024 * 1024 + 512 * 1024) -> str:
     """An ASCII STL height field just under the 10 MiB read cap, large enough
     that the viewer's decode, parse and scene build take a visible while."""
     side = max(4, math.isqrt(min_bytes // 150) + 1)
+
+    def height(a: float, b: float) -> float:
+        return math.sin(a * 0.4) * math.cos(b * 0.4) * 6.0
+
     parts = ["solid plate\n"]
     size = len(parts[0])
     i = 0
     while size < min_bytes:
         gx, gy = i % side, i // side
-
-        def height(a: float, b: float) -> float:
-            return math.sin(a * 0.4) * math.cos(b * 0.4) * 6.0
-
         facet = (
             "  facet normal 0 0 1\n    outer loop\n"
             f"      vertex {gx:.3f} {gy:.3f} {height(gx, gy):.3f}\n"
