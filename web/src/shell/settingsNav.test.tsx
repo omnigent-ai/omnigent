@@ -30,7 +30,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
-    features: { harnesses: mocks.harnessesEnabled },
+    features: { harness_settings_ui: mocks.harnessesEnabled },
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin

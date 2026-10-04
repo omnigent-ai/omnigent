@@ -1,5 +1,5 @@
 // Placeholder content for the harness details page where there's no backend
-// yet: MCP tool lists and skill contents. WIP behind the `harnesses` release
+// yet: MCP tool lists and skill contents. WIP behind the `harness_settings_ui` release
 // feature.
 
 export type CatalogKind = "mcps" | "skills" | "plugins";

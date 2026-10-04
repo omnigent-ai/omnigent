@@ -102,7 +102,7 @@ export function settingsNavGroups(
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
-  // WIP: gated behind the `harnesses` release feature. Slots after Appearance.
+  // WIP: gated behind the `harness_settings_ui` release feature. Slots after Appearance.
   if (harnessesEnabled) {
     general.splice(2, 0, { id: "harnesses", label: "Harnesses", icon: VectorSquareIcon });
   }
@@ -185,10 +185,10 @@ export function useSettingsRoute(): {
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
     !(singleUser && (next === "members" || next === "sharing")) &&
-    // Harnesses is WIP behind the `harnesses` release feature; a deep link to
+    // Harnesses is WIP behind the `harness_settings_ui` release feature; a deep link to
     // it while disabled falls back to the default section rather than an empty
     // page. Keeps content, nav, and header in agreement on availability.
-    !(next === "harnesses" && !isFeatureEnabled(info, "harnesses"));
+    !(next === "harnesses" && !isFeatureEnabled(info, "harness_settings_ui"));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
   return harness ? { inSettings: true, section, harness } : { inSettings: true, section };
@@ -232,7 +232,7 @@ export function SettingsSidebarBody({
   // not just accounts deploys. Non-admins never see it.
   const isAdmin = useIsAdmin();
   const integrationsEnabled = info !== "loading" && (info.enabled_connections ?? []).length > 0;
-  const harnessesEnabled = isFeatureEnabled(info, "harnesses");
+  const harnessesEnabled = isFeatureEnabled(info, "harness_settings_ui");
   const { section } = useSettingsRoute();
   const groups = settingsNavGroups(
     hasAuthSession,

@@ -56,7 +56,9 @@ vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
 // so drive that flag through the server-info mock.
 let harnessInstall = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ features: { harness_install: harnessInstall, harnesses: true } }),
+  useServerInfo: () => ({
+    features: { harness_install: harnessInstall, harness_settings_ui: true },
+  }),
 }));
 
 // The real ComposerAgentIcon pulls in the whole composer; stub it to a marker.
