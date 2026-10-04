@@ -2,6 +2,7 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { Profiler } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileContentResponse, WorkspaceFileDownloadProgress } from "@/hooks/useFileContent";
+import type * as UseFileContentModule from "@/hooks/useFileContent";
 
 // ── Mocks ───────────────────────────────────────────────────────────────────
 //
@@ -74,6 +75,7 @@ interface RendererRecord {
   disposed: boolean;
   contextLost: boolean;
   clearColor?: number;
+  labelAtFirstRender?: boolean;
 }
 let lastRenderer: RendererRecord | null = null;
 
@@ -146,10 +148,19 @@ vi.mock("three/examples/jsm/loaders/GLTFLoader.js", () => ({
 // The real module stays for `fileContentToBlob`; only the uncapped-byte fetch
 // is stubbed so large-model tests control it without a network.
 const fetchWorkspaceFileBytesMock = vi.hoisted(() => vi.fn());
-vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  fetchWorkspaceFileBytes: fetchWorkspaceFileBytesMock,
-}));
+// Holds the envelope byte read open so a test can sit mid-load before the parse.
+const blobBehavior = vi.hoisted(() => ({ pending: false }));
+vi.mock("@/hooks/useFileContent", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseFileContentModule>();
+  return {
+    ...actual,
+    fetchWorkspaceFileBytes: fetchWorkspaceFileBytesMock,
+    fileContentToBlob: (data: FileContentResponse) =>
+      blobBehavior.pending
+        ? Object.assign(new Blob(), { arrayBuffer: () => new Promise<ArrayBuffer>(() => {}) })
+        : actual.fileContentToBlob(data),
+  };
+});
 
 vi.mock("three/examples/jsm/controls/OrbitControls.js", () => ({
   OrbitControls: class {
@@ -215,7 +226,10 @@ vi.mock("three", () => {
     setClearColor(color: number) {
       this.record.clearColor = color;
     }
-    render() {}
+    render() {
+      // Whether the loading label was still in the DOM when the first frame drew.
+      this.record.labelAtFirstRender ??= document.body.textContent?.includes("Preparing model…");
+    }
     dispose() {
       this.record.disposed = true;
     }
@@ -339,6 +353,7 @@ beforeEach(() => {
   lastMaterial = null;
   themeState.resolvedTheme = "light";
   fetchWorkspaceFileBytesMock.mockReset();
+  blobBehavior.pending = false;
   fetchWorkspaceFileBytesMock.mockResolvedValue(new ArrayBuffer(8));
   vi.stubGlobal("requestAnimationFrame", scheduleFrame);
   vi.stubGlobal("cancelAnimationFrame", (id: number) => {
@@ -493,6 +508,15 @@ describe("ModelViewer error states", () => {
 
     expect(await screen.findByText(/256 MiB preview limit/)).toBeDefined();
     expect(screen.queryByText(/truncated by the server/)).toBeNull();
+    // Let the delayed status-region fill run before checking that nothing is announced.
+    await act(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(resolve, 0);
+        }),
+    );
+    expect(screen.getByRole("status").textContent).toBe("");
+    expect(screen.queryByText(/Downloading model/)).toBeNull();
   });
 
   it("explains that glTF files with relative dependencies are not previewable", async () => {
@@ -639,6 +663,27 @@ describe("ModelViewer loading state", () => {
     });
     return frames;
   }
+
+  it("keeps the preparing status while the file bytes are still being read", async () => {
+    blobBehavior.pending = true;
+    render(
+      <ModelViewer data={makeData({ path: "big.stl" })} path="big.stl" conversationId="conv_1" />,
+    );
+
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Preparing model…"));
+    expect(screen.getByLabelText("3D preview of big.stl").querySelector("canvas")).toBeNull();
+    expect(screen.queryByText(/Unable to render 3D model/)).toBeNull();
+    expect(parseCalls).toEqual([]);
+  });
+
+  it("keeps the loading label up until the first frame is drawn", async () => {
+    render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(lastRenderer?.labelAtFirstRender).toBe(true);
+    await waitFor(() => expect(screen.queryByText("Preparing model…")).toBeNull());
+    expect(screen.getByLabelText("3D preview of part.stl").querySelector("canvas")).not.toBeNull();
+  });
 
   it("shows a preparing status from mount and clears it once the model renders", async () => {
     render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
@@ -887,6 +932,7 @@ describe("ModelViewer error recovery (container stays mounted)", () => {
     expect(screen.queryByText(/Unable to render 3D model/)).toBeNull();
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(parseCalls).toEqual(["stl", "stl"]);
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe(""));
   });
 });
 
