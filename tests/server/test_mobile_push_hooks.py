@@ -172,6 +172,76 @@ async def test_expired_delivery_budget_never_starts_google_call(push_store, sess
     assert len(push_store.claim(now=120)) == 1
 
 
+async def test_sent_acknowledgement_outlives_delivery_budget(push_store, session_id, monkeypatch):
+    from dataclasses import replace
+    from threading import Event
+    from time import monotonic
+    from unittest.mock import AsyncMock
+
+    from omnigent.db.db_models import SqlMobilePushOutbox
+    from omnigent.server.mobile_push import MobilePushService
+    from omnigent.server.mobile_push_sender import SendResult
+
+    register(push_store)
+    push_store.enqueue(session_id, "completed", now=100)
+    delivery = replace(push_store.claim(now=110)[0], lease_deadline=monotonic() + 2)
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    budget_elapsed = asyncio.Event()
+    release = Event()
+    outcomes = []
+    bounds = []
+    timeout = asyncio.timeout
+    acknowledge = push_store.acknowledge
+
+    def record_timeout(delay):
+        bound = timeout(delay)
+        bounds.append(bound)
+        return bound
+
+    def slow_acknowledge(item, outcome, **kwargs):
+        outcomes.append(outcome)
+        if outcome == "sent":
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5)
+        try:
+            return acknowledge(item, outcome, **kwargs)
+        finally:
+            if outcome == "sent":
+                loop.call_soon_threadsafe(finished.set)
+
+    monkeypatch.setattr(asyncio, "timeout", record_timeout)
+    monkeypatch.setattr(push_store, "acknowledge", slow_acknowledge)
+    sender = Mock(
+        authorization=AsyncMock(return_value="access"),
+        post=AsyncMock(return_value=SendResult("sent")),
+    )
+    service = MobilePushService(push_store, Mock(), sender, preview=False)
+    task = asyncio.create_task(service._deliver_safely(delivery, now=110))
+    timer = None
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        deadline = bounds[0].when()
+        assert deadline is not None
+        timer = loop.call_at(deadline, budget_elapsed.set)
+        await asyncio.wait_for(budget_elapsed.wait(), 5)
+        if bounds[0].expired():
+            await asyncio.wait_for(task, 5)
+    finally:
+        release.set()
+        if timer is not None:
+            timer.cancel()
+        await asyncio.wait_for(task, 5)
+        await asyncio.wait_for(finished.wait(), 5)
+    assert outcomes == ["sent"]
+    sender.post.assert_awaited_once()
+    with push_store._session("verify_sent_after_budget_expiry") as transaction:
+        row = transaction.get(SqlMobilePushOutbox, (0, delivery.id))
+        assert row is not None and row.delivered
+        assert row.attempts == 1
+
+
 @pytest.fixture(autouse=True)
 def isolated_hooks(monkeypatch):
     from omnigent.server import session_live_state
