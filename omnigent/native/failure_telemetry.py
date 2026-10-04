@@ -95,7 +95,8 @@ def normalize_failure_context(value: object) -> FailureContext:
         if isinstance(raw, str) and raw.strip():
             limit = 1024 if key == "native_error_message" else 256
             # Clipping first can turn a quoted credential into an unrecognized fragment.
-            result[key] = redact_log_text(raw, include_whitespace_credentials=True).strip()[:limit]
+            redacted = redact_log_text(raw, include_whitespace_credentials=True).strip()[:limit]
+            result[key] = redacted.encode("utf-8", errors="replace").decode("utf-8")
     for key in _BOOL_FIELDS:
         raw = value.get(key)
         if isinstance(raw, bool):
