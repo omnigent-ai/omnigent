@@ -232,3 +232,11 @@ async def test_missing_executable_is_unreachable(monkeypatch, tmp_path):
     entry = _entry({"command": str(tmp_path / "missing-executable")})
     monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [entry])
     assert (await HostMcpTools().probe("claude", "docs"))["connection"] == "unreachable"
+
+
+def test_transport_timeouts_keep_the_timeout_status():
+    import httpx
+
+    timeout = httpx.ReadTimeout("synthetic-private-URL")
+    assert mcp_tools._failure_status(timeout) == "timeout"
+    assert mcp_tools._failure_status(ExceptionGroup("transport", [timeout])) == "timeout"  # noqa: F821

@@ -227,14 +227,19 @@ def _text(value: str, limit: int) -> str:
     return "".join(c if c.isprintable() else " " for c in value).strip()[:limit]
 
 
-def _needs_auth(exc: BaseException) -> bool:
+def _failure_status(exc: BaseException) -> str:
     import httpx
 
     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 401:
-        return True
-    return isinstance(exc, BaseExceptionGroup) and any(  # noqa: F821 — Python >=3.12
-        _needs_auth(child) for child in exc.exceptions
-    )
+        return "needs_auth"
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+        return "timeout"
+    if isinstance(exc, BaseExceptionGroup):  # noqa: F821 — Python >=3.12
+        for child in exc.exceptions:
+            status = _failure_status(child)
+            if status != "unreachable":
+                return status
+    return "unreachable"
 
 
 async def _worker() -> None:
@@ -263,7 +268,7 @@ async def _worker() -> None:
             "truncated": len(tools) > MAX_TOOLS,
         }
     except Exception as exc:  # noqa: BLE001 — only the connection enum leaves this process
-        result = _result("needs_auth" if _needs_auth(exc) else "unreachable")
+        result = _result(_failure_status(exc))
     print(json.dumps(result), flush=True)
     await asyncio.to_thread(sys.stdin.readline)
     await connection.close()
