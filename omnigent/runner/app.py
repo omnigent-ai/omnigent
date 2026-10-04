@@ -1794,8 +1794,12 @@ def create_runner_app(
             extra=debug_event(
                 "required_terminal_exited",
                 session_id=event.session_id,
+                terminal_id=event.terminal_id,
+                terminal_instance_id=event.terminal_instance_id,
                 terminal_name=event.terminal_name,
                 terminal_exit_status=event.exit_status,
+                runner_shutting_down=_shutting_down.is_set(),
+                **event.lifecycle_context,
                 error_code=error["code"],
                 # An unrecognized exit is the harness CLI dying under the runner.
                 error_category=(diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
@@ -3206,6 +3210,7 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
         _session_message_buffers.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
@@ -6350,6 +6355,7 @@ def create_runner_app(
         if body_type == "interrupt":
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
+            resource_registry.note_terminal_control_request(conversation_id, "interrupt")
             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
             if _interrupt_resp is not None:
                 return _interrupt_resp
@@ -6499,6 +6505,7 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "stop_session":
+            resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
