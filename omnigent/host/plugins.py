@@ -23,7 +23,7 @@ MAX_PLUGIN_DESCRIPTION = 1000
 def _text(value: object, limit: int) -> str | None:
     if not isinstance(value, str):
         return None
-    return "".join(c for c in value if c.isprintable())[:limit]
+    return "".join(c if c.isprintable() else " " for c in value).strip()[:limit]
 
 
 def discover_plugins() -> list[dict[str, object]]:

@@ -388,7 +388,7 @@ it("shows installed plugin metadata and disabled bundled servers", () => {
   expect(screen.getByTestId("catalog-row-hooks").textContent).toContain("Disabled");
   fireEvent.click(screen.getByTestId("catalog-row-hooks"));
   expect(screen.getByText("Hook helpers")).toBeTruthy();
-  expect(screen.getByText(/v1.2.3 · market · Disabled/)).toBeTruthy();
+  expect(screen.getByText(/v1\.2\.3 · market · Disabled/)).toBeTruthy();
   selectTab("MCPs · 1");
   expect(screen.getByTestId("catalog-row-bundled")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Plugins" }));

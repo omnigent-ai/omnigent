@@ -98,7 +98,7 @@ async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<Mcp
   return body.mcp_servers;
 }
 
-type PluginWire = Omit<InventoryPlugin, "id">;
+type PluginWire = Omit<InventoryPlugin, "id"> & { marketplace: string };
 
 async function fetchPlugins(hostId: string, signal: AbortSignal): Promise<PluginWire[]> {
   const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/plugins`, {

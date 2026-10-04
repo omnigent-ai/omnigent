@@ -10,8 +10,10 @@ import time
 from pathlib import Path
 
 import httpx
+import pytest
 
 
+@pytest.mark.min_server_version("0.17.0")
 def test_host_plugin_inventory(live_server: str, tmp_path: Path) -> None:
     root = tmp_path / "claude" / "plugins"
     plugin = root / "cache" / "hooks"
@@ -42,7 +44,11 @@ def test_host_plugin_inventory(live_server: str, tmp_path: Path) -> None:
             "OMNIGENT_DATA_DIR": str(tmp_path / "data"),
             "CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
-            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+            "PYTHONPATH": os.pathsep.join(
+                filter(
+                    None, [str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH")]
+                )
+            ),
         }
     )
     with httpx.Client(base_url=live_server, timeout=20) as client:

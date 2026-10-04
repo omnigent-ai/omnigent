@@ -27,7 +27,7 @@ def test_installed_plugins_scope_metadata_and_secrets(
             directory / ".claude-plugin" / "plugin.json",
             {
                 "version": "1.2.3",
-                "description": "A plugin\x00",
+                "description": "A\nplugin\x00",
                 "hooks": {"command": "synthetic-secret"},
             },
         )

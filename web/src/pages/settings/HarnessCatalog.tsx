@@ -277,7 +277,7 @@ function pluginDetail(plugin: InventoryPlugin, mcpCount: number) {
   return [
     plugin.version && `v${plugin.version}`,
     plugin.marketplace,
-    plugin.enabled === undefined ? undefined : plugin.enabled ? "Enabled" : "Disabled",
+    plugin.enabled !== undefined && (plugin.enabled ? "Enabled" : "Disabled"),
     plural(plugin.skills.length, "skill"),
     plural(mcpCount, "MCP"),
     plugin.has_hooks && "Hooks",

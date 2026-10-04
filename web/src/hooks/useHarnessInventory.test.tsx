@@ -33,7 +33,7 @@ function serve(routes: Routes) {
       parsed.pathname === "/v1/skills"
         ? `skills:${parsed.searchParams.get("harness")}:${parsed.searchParams.get("path")}`
         : parsed.pathname;
-    const body = routes[key] ?? (key.endsWith("/plugins") ? 501 : undefined);
+    const body = routes[key];
     if (body === undefined) throw new Error(`unexpected request ${url}`);
     if (typeof body === "number") return new Response("{}", { status: body });
     return Response.json(body);
@@ -69,6 +69,7 @@ describe("installedHarnesses", () => {
 describe("useHarnessInventory", () => {
   it("maps login state, skills, plugins, and MCPs per harness", async () => {
     serve({
+      "/v1/hosts/host_1/plugins": 501,
       "skills:claude-native:~": {
         skills: [
           { name: "review", description: "" },
@@ -129,6 +130,7 @@ describe("useHarnessInventory", () => {
 
   it("says Signed in when the login source is unknown", async () => {
     serve({
+      "/v1/hosts/host_1/plugins": 501,
       "skills:claude-native:~": { skills: [] },
       "skills:codex-native:~": { skills: [] },
       "/v1/hosts/host_1/mcp-servers": { mcp_servers: [] },
@@ -147,6 +149,7 @@ describe("useHarnessInventory", () => {
 
   it("keeps skills when the MCP route fails, e.g. on an older host", async () => {
     serve({
+      "/v1/hosts/host_1/plugins": 501,
       "skills:claude-native:~": { skills: [{ name: "review", description: "" }] },
       "skills:codex-native:~": 502,
       "/v1/hosts/host_1/mcp-servers": 501,
