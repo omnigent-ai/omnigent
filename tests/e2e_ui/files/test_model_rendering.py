@@ -183,6 +183,9 @@ _THEMES: dict[str, tuple[str, dict[str, str]]] = {
 # themed pane must differ from it.
 _LEGACY_CLEAR_COLORS = {"light": (255, 255, 255), "dark": (14, 16, 19)}
 
+# Per-channel slack for the canvas/pane match; the pane gradient varies by a level or two.
+_TOLERANCE = 2
+
 
 def _apply_theme_preferences(page: Page, mode: str, extra: dict[str, str]) -> None:
     """Seed the Appearance localStorage keys the Settings controls write before the
@@ -204,7 +207,8 @@ def _pixels_across_top_edge(
     assert box is not None
     x = round(box["x"] + box["width"] / 2)
     top = round(box["y"])
-    image = Image.open(io.BytesIO(page.screenshot())).convert("RGB")
+    # CSS-px scale, so the bounding box maps onto pixels at any device scale factor.
+    image = Image.open(io.BytesIO(page.screenshot(scale="css"))).convert("RGB")
     return image.getpixel((x, top - 2)), image.getpixel((x, top + 2))
 
 
@@ -225,10 +229,12 @@ def test_model_preview_canvas_matches_pane_background(
 
     assert page.evaluate("document.documentElement.classList.contains('dark')") == (mode == "dark")
     pane, canvas_pixel = _pixels_across_top_edge(page, canvas)
-    assert pane != _LEGACY_CLEAR_COLORS[mode], (
-        f"pane rgb{pane} is the viewer's old clear colour, so this case cannot detect a regression"
+    legacy = _LEGACY_CLEAR_COLORS[mode]
+    assert max(abs(p - o) for p, o in zip(pane, legacy, strict=True)) > _TOLERANCE, (
+        f"pane rgb{pane} is within tolerance of the viewer's old clear colour, "
+        "so this case cannot detect a regression"
     )
 
-    assert all(abs(p - c) <= 2 for p, c in zip(pane, canvas_pixel, strict=True)), (
+    assert all(abs(p - c) <= _TOLERANCE for p, c in zip(pane, canvas_pixel, strict=True)), (
         f"3D preview canvas rgb{canvas_pixel} does not match the pane rgb{pane} above it"
     )
