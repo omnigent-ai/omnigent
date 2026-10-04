@@ -16,12 +16,10 @@ from tests.server.test_mobile_push_store import session_id as session_id
 
 
 @pytest.mark.parametrize("handover", [False, True])
-async def test_repeated_running_publish_cancels_once_across_replica_handover(
+async def test_running_publish_cancels_across_replica_handover(
     push_store, session_id, monkeypatch, handover
 ):
     from concurrent.futures import Future
-
-    from sqlalchemy import event
 
     from omnigent.server import mobile_push, mobile_push_store, session_live_state
     from omnigent.server.routes._sessions import helpers
@@ -31,45 +29,24 @@ async def test_repeated_running_publish_cancels_once_across_replica_handover(
     service = mobile_push.MobilePushService(push_store, Mock(), Mock(), preview=False)
     monkeypatch.setattr(mobile_push, "_service", service)
     writes = []
-    statements = []
     run = mobile_push_store.run_write_transaction
 
     def record_write(factory, name, callback):
         writes.append(name)
         return run(factory, name, callback)
 
-    def record_sql(connection, cursor, statement, parameters, context, executemany):
-        if "FROM mobile_push_outbox" in statement and statement.startswith("SELECT"):
-            statements.append((statement, parameters))
-
     monkeypatch.setattr(mobile_push_store, "run_write_transaction", record_write)
     monkeypatch.setattr(session_live_state, "persist_live_status", Mock())
     helpers._session_status_cache[session_id] = "running" if handover else "idle"
-    event.listen(push_store._engine, "before_cursor_execute", record_sql)
     try:
         for _ in range(8):
             helpers._publish_status(session_id, "running")
         barrier = Future()
         session_live_state.submit("test_repeated_push_cancel_barrier", barrier.set_result, None)
         await asyncio.wait_for(asyncio.wrap_future(barrier), 5)
-        assert writes == ["cancel_obsolete_notification_intents"]
-        existence = [
-            (statement, parameters) for statement, parameters in statements if "LIMIT" in statement
-        ]
-        assert len(existence) == 8
-        with push_store._engine.connect() as connection:
-            plans = [
-                row[3]
-                for statement, parameters in existence
-                for row in connection.exec_driver_sql(
-                    "EXPLAIN QUERY PLAN " + statement, parameters
-                )
-            ]
-        assert all("SEARCH" in plan and "ix_mobile_push_outbox_activity" in plan for plan in plans)
-        assert not any("SCAN" in plan or "TEMP B-TREE" in plan for plan in plans)
+        assert writes == ["cancel_obsolete_notification_intents"] * 8
         assert push_store.claim(now=110) == []
     finally:
-        event.remove(push_store._engine, "before_cursor_execute", record_sql)
         helpers._session_status_cache.pop(session_id, None)
 
 

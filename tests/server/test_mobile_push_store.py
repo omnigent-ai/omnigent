@@ -259,7 +259,6 @@ def test_every_retained_push_index_backs_an_executed_query(push_store, session_i
         "ix_mobile_push_outbox_device",
         "ix_mobile_push_outbox_user",
         "ix_mobile_push_outbox_tenants",
-        "ix_mobile_push_outbox_activity",
     }
     assert {
         index.name
@@ -305,10 +304,6 @@ def test_every_retained_push_index_backs_an_executed_query(push_store, session_i
         name for name in expected for statement, plan in plans if name in plan and "SEARCH" in plan
     }
     assert used == expected
-    assert any(
-        "ix_mobile_push_outbox_activity" in plan and "LIMIT" in statement
-        for statement, plan in plans
-    )
 
 
 @pytest.mark.parametrize("token", ["x" * 1025, "tökén", "token.with.dot", "token@host"])
@@ -345,33 +340,67 @@ def test_mobile_push_codecs_round_trip(field, name, code):
         decode(99)
 
 
-def test_activity_cancel_probe_work_is_bounded(push_store, session_id):
+def test_activity_cancel_waits_for_prior_enqueue_commit(
+    push_store, session_id, db_uri, monkeypatch
+):
+    from threading import Event
+
     from sqlalchemy import event
+    from sqlalchemy.orm import Session
 
-    measurements = []
-    for size in (16, 16384):
-        seed_outbox_backlog(push_store, session_id, [0], size, due=True, kind="needs_input")
-        steps = [0]
+    from omnigent.db.db_models import SqlMobilePushOutbox
+    from omnigent.server import mobile_push_store
 
-        def progress(steps=steps):
-            steps[0] += 1
-            return 0
+    register(push_store)
+    replica_b = mobile_push_store.MobilePushStore(db_uri)
+    with replica_b._writer("persist_resume_before_delayed_enqueue") as transaction:
+        metadata = transaction.get(SqlConversationMetadata, (0, session_id))
+        assert metadata is not None
+        metadata.live_status = encode_session_live_status("running")
+    inserted = Event()
+    allow_commit = Event()
+    cancel_started = Event()
+    run = mobile_push_store.run_write_transaction
 
-        def checkout(connection, record, proxy, progress=progress):
-            connection.set_progress_handler(progress, 1)
+    def pause_insert(transaction, context):
+        if any(isinstance(row, SqlMobilePushOutbox) for row in transaction.new):
+            inserted.set()
+            assert allow_commit.wait(5)
 
-        def checkin(connection, record):
-            connection.set_progress_handler(None, 0)
+    def observe_cancel(factory, name, callback):
+        if name == "cancel_obsolete_notification_intents":
+            cancel_started.set()
+        return run(factory, name, callback)
 
-        event.listen(push_store._engine, "checkout", checkout)
-        event.listen(push_store._engine, "checkin", checkin)
-        try:
-            push_store.cancel(session_id, terminal_only=True)
-        finally:
-            event.remove(push_store._engine, "checkout", checkout)
-            event.remove(push_store._engine, "checkin", checkin)
-        measurements.append(steps[0])
-    assert measurements[1] <= measurements[0] + 50
+    monkeypatch.setattr(mobile_push_store, "run_write_transaction", observe_cancel)
+    event.listen(Session, "after_flush", pause_insert)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            enqueue = threads.submit(push_store.enqueue, session_id, "completed", now=100)
+            try:
+                assert inserted.wait(5)
+                cancel = threads.submit(replica_b.cancel, session_id, terminal_only=True)
+                cancel.add_done_callback(lambda future: cancel_started.set())
+                assert cancel_started.wait(5)
+            finally:
+                allow_commit.set()
+            enqueue.result(timeout=5)
+            cancel.result(timeout=5)
+    finally:
+        allow_commit.set()
+        event.remove(Session, "after_flush", pause_insert)
+    with replica_b._session("verify_prior_turn_cancelled") as transaction:
+        assert transaction.scalar(select(SqlMobilePushOutbox.id)) is None
+    with replica_b._writer("persist_next_completion") as transaction:
+        metadata = transaction.get(SqlConversationMetadata, (0, session_id))
+        assert metadata is not None
+        metadata.live_status = encode_session_live_status("idle")
+    replica_b.enqueue(session_id, "completed", now=101)
+    with replica_b._session("verify_next_turn_settle_delay") as transaction:
+        row = transaction.scalar(select(SqlMobilePushOutbox))
+        assert row is not None and row.not_before == 111
+    assert replica_b.claim(now=110) == []
+    assert len(replica_b.claim(now=111)) == 1
 
 
 def test_device_and_delivery_use_compact_storage(push_store, session_id):
