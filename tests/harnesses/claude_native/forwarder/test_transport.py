@@ -303,6 +303,11 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     # The failed edge carries BOTH the drop reason as ``output`` (#1113 — the
     # server surfaces it as the failure detail) and the turn's response id so
     # it closes the streaming turn instead of leaving its tool cards spinning.
+    context = requests[-1]["data"].pop("failure_context")
+    assert context["failure_source"] == "forwarder_delivery"
+    assert context["detail_source"] == "forwarder_delivery_error"
+    assert context["failure_id"]
+    assert "poison-item:0:message" in context["forwarder_source_id"]
     assert requests[-1]["data"] == {
         "status": "failed",
         "output": "transcript item poison-item:0:message rejected",

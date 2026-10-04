@@ -4835,6 +4835,7 @@ async def test_post_external_session_status_failed_surfaces_output_and_reauth(
 async def test_post_external_session_status_failure_detail_keeps_native_code(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A harness ``failure_detail`` names the failure without the Codex wire label.
@@ -4855,6 +4856,19 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
             "data": {
                 "status": "failed",
                 "failure_detail": "API Error: 400 The request was malformed.",
+                "failure_context": {
+                    "native_error_category": "invalid_request",
+                    "detail_source": "hook_last_assistant_message",
+                    "failure_source": "claude_hook",
+                    "native_session_id": "native-session",
+                    "failure_id": "native-failure-synthetic",
+                    "http_status": 400,
+                    "provider_error_param": "user",
+                    "origin": "forged-origin",
+                    "code": "forged-code",
+                    "session_id": "forged-session",
+                    "request_id": "must-not-be-an-inference-request",
+                },
             },
         },
     )
@@ -4865,6 +4879,51 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
     assert error is not None
     assert error["code"] == "native_turn_error"
     assert error["message"] == "API Error: 400 The request was malformed."
+    (record,) = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+    ]
+    assert record.session_id == session["id"]
+    attrs = record.attributes
+    assert attrs["origin"] == "external_session_status"
+    assert attrs["code"] == "native_turn_error"
+    assert attrs["native_error_category"] == "invalid_request"
+    assert attrs["detail_source"] == "hook_last_assistant_message"
+    assert attrs["failure_source"] == "claude_hook"
+    assert attrs["native_session_id"] == "native-session"
+    assert attrs["failure_id"] == "native-failure-synthetic"
+    assert attrs["http_status"] == "400"
+    assert attrs["provider_error_param"] == "user"
+    assert "native_request_id" in attrs["failure_context_missing_fields"].split(",")
+    assert "must-not-be-an-inference-request" not in str(attrs)
+
+
+@pytest.mark.parametrize("context", [None, [], "invalid", {"native_error_category": ["invalid"]}])
+async def test_malformed_native_failure_context_does_not_reject_status(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    context: object,
+) -> None:
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "failure_context": context},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert published[0][1]["status"] == "failed"
+    (record,) = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+    ]
+    assert record.attributes["detail_source"] == "missing"
+    assert "native_error_category" in record.attributes["failure_context_missing_fields"].split(
+        ","
+    )
 
 
 async def test_post_external_session_status_carries_response_id(
@@ -5306,7 +5365,14 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
 
     assert status_resp.status_code == 202, status_resp.text
     assert forwarded, "the failed edge was never forwarded to the runner"
-    assert forwarded[0]["body"]["data"] == {"status": "failed", "output": detail}
+    assert forwarded[0]["body"]["data"] == {
+        "status": "failed",
+        "output": detail,
+        "failure_context": {
+            "failure_source": "external_status",
+            "detail_source": "assistant_output_fallback",
+        },
+    }
     failed_events = [ev for _sid, ev in published if ev.get("status") == "failed"]
     assert failed_events, f"no failed status was published: {published}"
     error = failed_events[0]["error"]

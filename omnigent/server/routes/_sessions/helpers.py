@@ -4809,6 +4809,7 @@ def _publish_status(
     persist_live_status: bool = True,
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
+    failure_context: object = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4841,6 +4842,8 @@ def _publish_status(
         server-side failure logs one ERROR from here, so without it the
         dozen unrelated causes that reach this function are one
         undifferentiated signature. Ignored for non-failed edges.
+    :param failure_context: Bounded native evidence added to the canonical
+        failure log, without affecting status, error codes, or displayed text.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -4901,6 +4904,8 @@ def _publish_status(
         # for <id>: <detail>" shape so existing detail-matching stays valid.
         origin = failure_origin or "unattributed"
         failure_code = error.code if error is not None else "none"
+        from omnigent.native.failure_telemetry import failure_log_attributes
+
         _logger.error(
             "session turn failed for %s (origin=%s code=%s prev=%s): %s",
             session_id,
@@ -4915,6 +4920,7 @@ def _publish_status(
                 code=failure_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
+                **failure_log_attributes(failure_context),
             ),
         )
         session_live_state.persist_scheduled_run_completion(
