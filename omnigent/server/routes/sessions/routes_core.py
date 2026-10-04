@@ -1009,6 +1009,8 @@ def register_core_routes(
             result.session_id,
             inherited_runner_id,
             parent_session_id=parsed_metadata.parent_session_id,
+            agent_id=result.agent_id,
+            harness=spec_harness(spec),
         )
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.

@@ -912,6 +912,25 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
         assert leaked.lower() not in flat
 
 
+def test_sse_child_creation_preserves_relationship_without_content() -> None:
+    attrs = session_stream._sse_safe_attributes(
+        {
+            "type": "session.created",
+            "conversation_id": "parent",
+            "parent_session_id": "parent",
+            "child_session_id": "child",
+            "agent_id": "agent",
+            "title": "private task description",
+            "data": {"prompt": "private prompt"},
+        }
+    )
+    assert attrs == {
+        "parent_session_id": "parent",
+        "child_session_id": "child",
+        "agent_id": "agent",
+    }
+
+
 def test_sse_safe_attributes_captures_level_and_code_for_error_items() -> None:
     # Level and code on an error item must be captured so dashboards can
     # exclude info-level notices from error-rate metrics.

@@ -121,7 +121,7 @@ function assetLists(context: ImportContext, harness: ImportHarness): AssetList[]
       rows: own(context.plugins).map((plugin) => ({
         id: plugin.id,
         name: plugin.name,
-        metadata: countLabel(plugin.skillCount, "skill"),
+        metadata: countLabel(plugin.skills.length || undefined, "skill"),
       })),
     },
   ];

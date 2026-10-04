@@ -318,6 +318,7 @@ describe("FilesPanel header role", () => {
     });
     const changesHeading = screen.getByRole("heading", { name: "Changes" });
     expect(changesHeading).toBeInTheDocument();
+    expect(changesHeading).toHaveClass("pl-1");
     expect(changesHeading.parentElement).toHaveClass("h-11");
     expect(screen.queryByRole("heading", { name: "Working folder" })).toBeNull();
     expect(screen.queryByTestId("browse-location-path")).toBeNull();

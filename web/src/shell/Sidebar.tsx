@@ -2448,25 +2448,52 @@ function ConversationList({
                         // switching scope just exits selection. Only the
                         // "select" entry point hides, being already active.
                         !selectionMode ? (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-xs"
-                                aria-label="Select sessions"
-                                data-testid="toggle-selection-mode"
-                                className="text-muted-foreground"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  onEnterSelectionMode("sessions");
-                                }}
-                              >
-                                <ListChecksIcon className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">Select sessions</TooltipContent>
-                          </Tooltip>
+                          <div className="flex items-center gap-0.5">
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  asChild
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="New session"
+                                  data-testid="sessions-new-session"
+                                  className="text-muted-foreground"
+                                >
+                                  <Link
+                                    to="/"
+                                    componentId="sidebar.sessions_new_chat"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      onActiveTabChange("mine");
+                                      onRowClick(event);
+                                    }}
+                                  >
+                                    <MessageCirclePlusIcon className="size-3.5" />
+                                  </Link>
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">New session</TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="Select sessions"
+                                  data-testid="toggle-selection-mode"
+                                  className="text-muted-foreground"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onEnterSelectionMode("sessions");
+                                  }}
+                                >
+                                  <ListChecksIcon className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">Select sessions</TooltipContent>
+                            </Tooltip>
+                          </div>
                         ) : undefined
                       }
                       persistentHeaderAction={

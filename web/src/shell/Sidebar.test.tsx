@@ -1070,6 +1070,15 @@ describe("Sidebar session list", () => {
     const sessionsSection = screen.getByText("Sessions").closest("section");
     expect(sessionsSection).not.toBeNull();
 
+    const newSession = within(sessionsSection!).getByRole("link", {
+      name: "New session",
+    });
+    expect(newSession).toHaveAttribute("data-testid", "sessions-new-session");
+    expect(newSession).toHaveAttribute("href", "/");
+    expect(newSession).toHaveAttribute("data-size", "icon-xs");
+    expect(newSession).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    expect(newSession).not.toHaveTextContent("New session");
+
     const selectSessions = within(sessionsSection!).getByRole("button", {
       name: "Select sessions",
     });
@@ -1077,7 +1086,11 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
-    expect(selectSessions.parentElement).toHaveClass(
+    expect(
+      newSession.compareDocumentPosition(selectSessions) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(selectSessions.parentElement).toHaveClass("flex", "gap-0.5");
+    expect(selectSessions.parentElement?.parentElement).toHaveClass(
       "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
@@ -1098,6 +1111,7 @@ describe("Sidebar session list", () => {
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
     expect(within(sessionsSection!).queryByRole("button", { name: "Select sessions" })).toBeNull();
+    expect(within(sessionsSection!).queryByRole("link", { name: "New session" })).toBeNull();
   });
 
   it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
