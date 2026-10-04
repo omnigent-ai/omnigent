@@ -8,7 +8,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { JSDOM } = require("jsdom");
 
-it("renders consent, sign-in, retry, and completion without exposing login output", (t) => {
+it("renders consent, sign-in, retry, and completion", (t) => {
   const dom = new JSDOM(
     fs.readFileSync(path.join(__dirname, "../arca-connect/index.html"), "utf8"),
     {

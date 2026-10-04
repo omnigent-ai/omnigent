@@ -140,6 +140,7 @@ function resolveArcaPathAsync(deps = {}) {
  * after "ssh" is passed through to ssh and runs as the remote command.
  *
  * @param {string} serverUrl
+ * @param {boolean} [login] Prepare the remote grant instead of starting a host.
  * @returns {string[]}
  */
 function buildArcaArgs(serverUrl, login = false) {
@@ -328,18 +329,24 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
   }
   let stdout = "";
   let stderr = "";
-  let timedOut = false;
-  let canceled = false;
   let settle;
   const promise = new Promise((resolve) => {
     const timer = setTimeout(() => {
-      timedOut = true;
+      settle(
+        login
+          ? {
+              ok: false,
+              errorKind: "timeout",
+              error:
+                "Arca sign-in timed out. Check Arca Companion, finish browser sign-in, and try again.",
+            }
+          : describeConnectFailure({ code: null, stdout: "", stderr: "", timedOut: true }),
+      );
       try {
         child.kill();
       } catch {
         // Already gone.
       }
-      settle(describeConnectFailure({ code: null, stdout: "", stderr: "", timedOut: true }));
     }, timeoutMs);
     if (typeof timer.unref === "function") timer.unref();
     child.stdout?.on("data", (chunk) => {
@@ -368,10 +375,6 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
       settle({ ok: false, error: `Couldn't run arca: ${error.message}` });
     });
     child.on("exit", (code) => {
-      if (canceled) {
-        settle({ ok: false, canceled: true, error: "Connecting to Arca was canceled." });
-        return;
-      }
       if (code === 0) {
         // `omni host --background` reuses a healthy daemon and says so — the
         // caller can then skip waiting for a host that was online all along.
@@ -379,6 +382,19 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
         return;
       }
       if (login) {
+        if (code === 127) {
+          settle(describeConnectFailure({ code, stdout: "", stderr: "" }));
+          return;
+        }
+        if (code === 255) {
+          settle({
+            ok: false,
+            errorKind: "unreachable",
+            error:
+              "Arca sign-in couldn't reach the remote command. Check `arca ssh` in a terminal and try again.",
+          });
+          return;
+        }
         settle({
           ok: false,
           authError: true,
@@ -388,15 +404,18 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
         });
         return;
       }
-      settle(describeConnectFailure({ code, stdout, stderr, timedOut }));
+      settle(describeConnectFailure({ code, stdout, stderr }));
     });
   });
   return {
     command: `arca ${args.join(" ")}`,
     promise,
     cancel: () => {
-      canceled = true;
-      settle({ ok: false, canceled: true, error: "Connecting to Arca was canceled." });
+      settle({
+        ok: false,
+        canceled: true,
+        error: login ? "Arca sign-in was canceled." : "Connecting to Arca was canceled.",
+      });
       try {
         child.kill();
       } catch {

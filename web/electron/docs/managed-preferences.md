@@ -87,6 +87,9 @@ Use an Isaac release that supports Omnigent-app login and the
 `OMNIGENT_AUTH_REQUIRED` startup diagnostic before deploying this flow.
 SPOG entries can include `/omnigent?o=<workspace-id>` to select the workspace;
 the same full server URL is used for remote login and host startup.
+Connection status and overlapping setup sign-ins are shared only for the same
+full target, including `?o=`. Closing one setup window leaves a shared sign-in
+running for the others; closing the last waiting window cancels it.
 
 ## MDM profile example
 

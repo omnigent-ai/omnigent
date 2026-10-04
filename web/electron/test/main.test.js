@@ -551,6 +551,7 @@ function loadNavigationHarness({
       isExecutableFile: () => false,
       resolveCliPath: () => (cliPath ? { path: cliPath } : null),
       cliCommandParts: require("../src/omnigent_cli").cliCommandParts,
+      normalizeServerUrl: require("../src/omnigent_cli").normalizeServerUrl,
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
     },
@@ -784,11 +785,64 @@ describe("Arca auto-connect wiring", () => {
       assert.ok(finishLogin);
       closed = true;
       page.emit("destroyed");
+      assert.equal((await result).canceled, true);
       assert.equal(h.calls.arcaLoginCancels, 1);
       finishLogin({ ok: true });
-      assert.equal((await result).canceled, true);
       assert.equal(h.calls.arcaConnects.length, 1);
       assert.equal(saved(h).arca_auto_connect, undefined);
+    });
+
+    it("shares sign-in across setup windows without letting one closure cancel the other", async (t) => {
+      let finishLogin;
+      let attempts = 0;
+      const h = harness(t, {
+        arcaResult: () => (++attempts === 1 ? { ok: false, errorKind: "omni-auth" } : { ok: true }),
+        arcaLoginResult: () =>
+          new Promise((resolve) => {
+            finishLogin = resolve;
+          }),
+      });
+      let closed = false;
+      const page = Object.assign(new EventEmitter(), { send() {}, isDestroyed: () => closed });
+      const first = connect(h, workspace, page);
+      const second = connect(h);
+      await tick();
+      assert.deepEqual(h.calls.arcaLogins, [workspace]);
+      closed = true;
+      page.emit("destroyed");
+      assert.equal((await first).canceled, true);
+      assert.equal(h.calls.arcaLoginCancels, 0);
+      finishLogin({ ok: true });
+      assert.equal((await second).ok, true);
+      assert.deepEqual(h.calls.arcaConnects, [workspace, workspace]);
+      assert.equal(h.calls.arcaLoginCancels, 0);
+      assert.equal(page.listenerCount("destroyed"), 0);
+      assert.equal(saved(h).arca_auto_connect, true);
+    });
+
+    it("does not share sign-in or host success across SPOG workspace selectors", async (t) => {
+      const firstTarget = "https://account.databricks.com/omnigent?o=123";
+      const secondTarget = "https://account.databricks.com/omnigent?o=456";
+      const authenticated = new Set();
+      const finishLogin = new Map();
+      const h = harness(t, {
+        arcaResult: (url) =>
+          authenticated.has(url) ? { ok: true } : { ok: false, errorKind: "omni-auth" },
+        arcaLoginResult: (url) =>
+          new Promise((resolve) => {
+            finishLogin.set(url, resolve);
+          }),
+      });
+      const first = connect(h, firstTarget);
+      const second = connect(h, secondTarget);
+      await tick();
+      assert.deepEqual(h.calls.arcaLogins, [firstTarget, secondTarget]);
+      authenticated.add(firstTarget);
+      finishLogin.get(firstTarget)({ ok: true });
+      assert.equal((await first).ok, true);
+      finishLogin.get(secondTarget)({ ok: false, errorKind: "omni-auth", error: "Canceled" });
+      assert.equal((await second).ok, false);
+      assert.deepEqual(h.calls.arcaConnects, [firstTarget, secondTarget, firstTarget]);
     });
 
     it("keeps the auto-connect opt-in only when the connect succeeds", async (t) => {

@@ -192,7 +192,12 @@ describe("startArcaConnect / connectArcaHost", () => {
     assert.equal((await run.promise).ok, false);
   });
   it("does not forward remote login output or error tickets to the renderer", async () => {
-    for (const code of [0, 1]) {
+    for (const [code, errorKind] of [
+      [0, undefined],
+      [1, "omni-auth"],
+      [127, "missing-remote-cli"],
+      [255, "unreachable"],
+    ]) {
       const child = fakeConnectChild();
       const chunks = [];
       const run = startArcaLogin("https://account.databricks.com/omnigent?o=123", {
@@ -210,6 +215,8 @@ describe("startArcaConnect / connectArcaHost", () => {
       // oxlint-disable-next-line no-await-in-loop -- Exercise both process outcomes.
       const result = await run.promise;
       assert.equal(result.ok, code === 0);
+      assert.equal(result.errorKind, errorKind);
+      assert.equal(result.authError === true, code === 1);
       assert.deepEqual(chunks, []);
       assert.doesNotMatch(JSON.stringify(result), /SECRET|ticket=/);
     }
@@ -224,7 +231,9 @@ describe("startArcaConnect / connectArcaHost", () => {
     });
     const keepAlive = setTimeout(() => {}, 1000);
     try {
-      assert.equal((await run.promise).errorKind, "timeout");
+      const result = await run.promise;
+      assert.equal(result.errorKind, "timeout");
+      assert.match(result.error, /sign-in timed out.*Arca Companion/);
       assert.equal(child.killed, true);
       child.emit("exit", 0);
       assert.equal((await run.promise).ok, false);

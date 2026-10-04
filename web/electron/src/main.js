@@ -311,7 +311,13 @@ const arcaConnectFlow = createArcaConnectFlow({
   preloadPath: path.join(__dirname, "arca_connect_preload.js"),
   startConnect: (serverUrl, onOutput) => arca.startArcaConnect(serverUrl, { onOutput }),
   startLogin: (serverUrl) => arca.startArcaLogin(serverUrl),
-  loginCommandLine: (serverUrl) => `arca ${arca.buildLoginArgs(serverUrl).join(" ")}`,
+  loginCommandLine: (serverUrl) => {
+    try {
+      return `arca ${arca.buildLoginArgs(serverUrl).join(" ")}`;
+    } catch {
+      return "arca ssh isaac omni login …";
+    }
+  },
   commandLine: (serverUrl) => {
     try {
       return `arca ${arca.buildConnectArgs(serverUrl).join(" ")}`;
@@ -401,6 +407,7 @@ const arcaAutoConnect = createArcaAutoConnect({
  * succeeded.
  */
 const onboardingArcaOptIn = { pending: 0, baseline: undefined, succeeded: false };
+const onboardingArcaLogins = new Map();
 
 /**
  * Onboarding's Arca connect, run through the auto-connect state machine so
@@ -413,7 +420,7 @@ const onboardingArcaOptIn = { pending: 0, baseline: undefined, succeeded: false 
  * @param {string} serverUrl
  * @param {(line: string) => void} log
  * @param {Electron.WebContents} sender The shell-owned setup page.
- * @returns {Promise<{ ok: boolean, canceled?: boolean, alreadyRunning?: boolean, error?: string }>}
+ * @returns {Promise<{ ok: boolean, canceled?: boolean, alreadyRunning?: boolean, error?: string, authError?: boolean, errorKind?: import("./arca").ArcaErrorKind }>}
  */
 async function connectOnboardingArca(serverUrl, log, sender) {
   const isClosed = () => sender.isDestroyed();
@@ -445,13 +452,32 @@ async function connectOnboardingArca(serverUrl, log, sender) {
         // The setup page's Install click authorizes sign-in; passive auto-connect never does.
         log(`$ arca ${arca.buildLoginArgs(serverUrl).join(" ")}`);
         log("Signing in on Arca. If a browser window opens, finish signing in there.");
-        const login = arca.startArcaLogin(serverUrl);
-        sender.once("destroyed", login.cancel);
+        const target = omnigentCli.normalizeServerUrl(new URL(serverUrl).href);
+        let login = onboardingArcaLogins.get(target);
+        if (!login) {
+          login = { ...arca.startArcaLogin(serverUrl), waiters: 0 };
+          onboardingArcaLogins.set(target, login);
+          login.promise = login.promise.finally(() => {
+            if (onboardingArcaLogins.get(target) === login) onboardingArcaLogins.delete(target);
+          });
+        }
+        login.waiters += 1;
+        let onClosed;
+        const closed = new Promise((resolve) => {
+          onClosed = () => resolve({ ok: false, canceled: true });
+          sender.once("destroyed", onClosed);
+        });
         let auth;
         try {
-          auth = await login.promise;
+          auth = await Promise.race([login.promise, closed]);
         } finally {
-          sender.removeListener("destroyed", login.cancel);
+          sender.removeListener("destroyed", onClosed);
+          login.waiters -= 1;
+          // A closed setup window must not cancel another window's sign-in.
+          if (login.waiters === 0 && onboardingArcaLogins.get(target) === login) {
+            onboardingArcaLogins.delete(target);
+            login.cancel();
+          }
         }
         if (isClosed()) {
           result = { ok: false, canceled: true };
@@ -4550,7 +4576,12 @@ function registerIpc() {
     const autoRun = arcaAutoConnect.inFlight(arcaServerUrl);
     if (autoRun) {
       const status = await autoRun;
-      if (status.errorKind === "omni-auth" && isPinnedOriginSender(event) && !win.isDestroyed()) {
+      if (
+        status.state === "failed" &&
+        status.errorKind === "omni-auth" &&
+        isPinnedOriginSender(event) &&
+        !win.isDestroyed()
+      ) {
         return arcaConnectFlow.run(win, arcaServerUrl);
       }
       return status.state === "online"
