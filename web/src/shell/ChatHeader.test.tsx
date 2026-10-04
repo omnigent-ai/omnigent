@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
@@ -78,6 +79,7 @@ function renderHeader(props: {
   hasHeaderMenu?: boolean;
   hasAgentInfo?: boolean;
   hasRailContent?: boolean;
+  rightPanelOpen?: boolean;
   showFilesPanel?: boolean;
   pending?: boolean;
   mobileMenu?: typeof mobileMenu;
@@ -115,7 +117,7 @@ function renderHeader(props: {
             hasHeaderMenu={props.hasHeaderMenu ?? false}
             showFilesPanel={props.showFilesPanel ?? false}
             hasRailContent={props.hasRailContent ?? true}
-            rightPanelOpen={false}
+            rightPanelOpen={props.rightPanelOpen ?? false}
             onToggleRightPanel={() => {}}
             pending={props.pending}
             mobileMenu={props.mobileMenu ?? mobileMenu}
@@ -214,6 +216,35 @@ describe("ChatHeader — workspace pane alignment", () => {
 
     expect(header).not.toBeNull();
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
+  });
+});
+
+describe("ChatHeader — workspace pane shortcut", () => {
+  it.each([
+    { rightPanelOpen: false, label: "Expand right panel" },
+    { rightPanelOpen: true, label: "Collapse right panel" },
+  ])("shows the shortcut when the action is '$label'", ({ rightPanelOpen, label }) => {
+    vi.useFakeTimers();
+    try {
+      renderHeader({
+        sidebarOpen: true,
+        conversationId: "conv_workspace_shortcut",
+        rightPanelOpen,
+      });
+      const trigger = screen.getByRole("button", { name: label });
+
+      expect(trigger).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+]`);
+      fireEvent.focus(trigger);
+      act(() => vi.advanceTimersByTime(1000));
+
+      const tooltip = screen.getByRole("tooltip");
+      expect(tooltip).toHaveTextContent(label);
+      expect(
+        Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+      ).toEqual([MOD_KEY, ALT_KEY, "]"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -368,6 +399,24 @@ describe("ChatHeader — conversation breadcrumb", () => {
       boundAgent: { id: "a1", name: "check-account-eligibility" },
     });
     expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["claude-native-ui", "claude-code-native-ui", "Claude Code"],
+    ["claude-native-ui", null, "Claude Code"],
+    ["codex-native-ui", "codex-native-ui", "Codex"],
+  ] as const)("uses the product name for %s with wrapper %s", (name, wrapperLabel, displayName) => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name },
+      wrapperLabel,
+    });
+    expect(screen.getByText(displayName)).toBeInTheDocument();
+    expect(screen.queryByText(name)).toBeNull();
   });
 
   it("names the product, not the internal wrapper row, on a native sub-agent", () => {
@@ -587,7 +636,7 @@ describe("ChatHeader — floating mobile controls", () => {
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(trigger.parentElement).not.toHaveClass("max-md:px-1", "max-md:py-1");
     expect(trigger).toHaveClass("size-10");
-    expect(toggle).toHaveClass("size-10");
+    expect(toggle).toHaveClass("size-6", "max-md:size-11");
   });
 
   it("folds the Chat/Terminal switch into the header kebab on mobile", () => {

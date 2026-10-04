@@ -233,6 +233,20 @@
       .recent-copy:hover {
         background: color-mix(in srgb, var(--foreground) 5%, transparent);
       }
+      #other-account {
+        margin-top: 8px;
+        padding: 0;
+        border: none;
+        background: none;
+        color: var(--muted-foreground);
+        font: inherit;
+        font-size: 12px;
+        text-decoration: underline;
+        cursor: pointer;
+      }
+      #other-account[hidden] {
+        display: none;
+      }
       .err {
         margin-top: 12px;
         color: var(--destructive);
@@ -488,6 +502,7 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>
         </button>
       </div>
+      <button id="other-account" type="button" hidden>Sign in with a different account</button>
       <div class="err" id="err"></div>
 
       <div class="recents" id="managed" hidden>
@@ -543,7 +558,8 @@
     <script>
       // Shared URL helpers (electron/src/url.js), exposed as window.omnigentUrl
       // — the same module the main process uses, so the two never drift.
-      const { isPlainHttpRemote, serverDisplayLabel } = window.omnigentUrl;
+      const { isPlainHttpRemote, serverDisplayLabel, normalizeUrl, isDatabricksOAuthServerUrl } =
+        window.omnigentUrl;
       // Uses the Electron preload bridge (electron/src/preload.js).
       const setup = window.omnigentSetup;
       const input = document.getElementById("url");
@@ -552,6 +568,7 @@
       const connectLabel = document.getElementById("connect-label");
       const connectSpinner = document.getElementById("connect-spinner");
       const cancelConnectButton = document.getElementById("cancel-connect");
+      const otherAccountButton = document.getElementById("other-account");
       let activeConnect = null;
       const err = document.getElementById("err");
 
@@ -579,6 +596,7 @@
       // where the whole point is a *different* server than the saved one.
       if (failedUrl) {
         input.value = failedUrl;
+        renderOtherAccount();
       } else if (!isEphemeral) {
         setup
           .getServerUrl()
@@ -587,7 +605,8 @@
           })
           .catch(() => {
             if (!activeConnect && !input.value) input.value = "http://localhost:6767";
-          });
+          })
+          .finally(renderOtherAccount);
       }
 
       // Organization-provided and recent servers share one rendering path.
@@ -694,6 +713,19 @@
         });
         document.getElementById("start-local").disabled = busy;
         document.getElementById("cli-gear").disabled = busy;
+        otherAccountButton.disabled = busy;
+        renderOtherAccount();
+      }
+
+      // Connect reuses the saved Databricks sign-in; this offers a fresh browser sign-in.
+      function renderOtherAccount() {
+        let databricks = false;
+        try {
+          databricks = isDatabricksOAuthServerUrl(normalizeUrl(input.value));
+        } catch {
+          // Not a URL yet.
+        }
+        otherAccountButton.hidden = !databricks;
       }
 
       const unsubscribeProgress = setup.onConnectionProgress?.((progress) => {
@@ -734,7 +766,7 @@
         }
       });
 
-      async function connect() {
+      async function connect({ browserSignIn = false } = {}) {
         if (activeConnect || document.getElementById("start-local").disabled) return;
         err.textContent = "";
         const value = input.value;
@@ -749,7 +781,9 @@
         activeConnect = attempt;
         renderConnectState();
         try {
-          const result = await setup.setServerUrl(value, { requestId: attempt.requestId });
+          const options = { requestId: attempt.requestId };
+          if (browserSignIn) options.browserSignIn = true;
+          const result = await setup.setServerUrl(value, options);
           if (activeConnect === attempt && result?.error) err.textContent = result.error;
         } catch (e) {
           if (activeConnect === attempt) err.textContent = String(e && e.message ? e.message : e);
@@ -761,7 +795,9 @@
         }
       }
 
-      button.addEventListener("click", connect);
+      button.addEventListener("click", () => connect());
+      otherAccountButton.addEventListener("click", () => connect({ browserSignIn: true }));
+      input.addEventListener("input", renderOtherAccount);
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") connect();
       });

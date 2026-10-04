@@ -252,7 +252,7 @@ Forces a specific sandbox configuration on agent start.
 |-----------|------|---------|-------------|
 | `sandbox_type` | string | `"linux_bwrap"` | Sandbox backend (`linux_bwrap`, `darwin_seatbelt`, `none`) |
 | `allow_network` | boolean | `true` | Allow network access |
-| `write_paths` | string[] | `null` | Writable paths (null inherits agent config) |
+| `write_paths` | (string or object)[] | `null` | Writable paths; objects accept `path` and `copy_on_write` (null inherits agent config) |
 | `read_paths` | string[] | `null` | Read-only paths (null inherits agent config) |
 | `env_passthrough` | string[] | `null` | Env vars allowed through to the agent process (see below) |
 
@@ -468,6 +468,42 @@ def my_policy(event: PolicyEvent) -> PolicyResponse | None:
         return {"result": "DENY", "reason": "This tool is blocked."}
     return {"result": "ALLOW"}
 ```
+
+### Response segments and `turn_final`
+
+`response` policies receive assistant text in `event["data"]`. In runner-relayed
+sessions, they run before each nonempty text segment is persisted, including
+progress text before tool calls. Use `event["context"]["turn_final"]` to decide
+whether to perform completion-specific work:
+
+| Value | Meaning |
+|-------|---------|
+| `True` | The final text segment of a successfully completed relayed turn. |
+| `False` | An intermediate segment, or text from a failed, cancelled, or incomplete relayed turn. |
+| `None` | The calling path does not distinguish segments. Also used outside the `response` phase. |
+
+Within a response policy, skip only an explicit `False` to preserve existing
+behavior on callers that supply `None`. `None` does not assert successful
+completion. For example:
+
+```python
+from omnigent.policies.schema import PolicyEvent, PolicyResponse
+
+def count_responses(event: PolicyEvent) -> PolicyResponse | None:
+    if event["type"] != "response":
+        return None
+    if event.get("context", {}).get("turn_final") is False:
+        return None
+    return {
+        "result": "ALLOW",
+        "state_updates": [{"key": "responses", "action": "increment", "value": 1}],
+    }
+```
+
+Content checks should inspect every segment, including those marked `False`.
+The relay skips empty and whitespace-only segments: a turn that ends with a tool
+call and no trailing text has no final response-policy invocation. `turn_final`
+describes the current evaluation; it does not guarantee one callback per turn.
 
 ### Factory form
 

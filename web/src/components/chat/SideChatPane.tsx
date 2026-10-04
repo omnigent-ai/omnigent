@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUpIcon, MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
+import { toast } from "sonner";
+import { useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
 import {
   type Bubble,
@@ -14,12 +16,13 @@ import {
   bubbleKey,
   buildPendingBubbles,
   computeIsWorking,
+  computeIsTurnActive,
   mergePendingBubbles,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
 } from "@/components/chat/chatBubbleParts";
-import { ChatComposer } from "@/components/composer/ChatComposer";
+import { ChatComposer, ComposerSendButton } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
@@ -27,8 +30,9 @@ import { Button } from "@/components/ui/button";
 import { useChatStore, ensureConversationStreamed } from "@/store/chatStore";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
+import { useSession } from "@/hooks/useSession";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
-import { stopSession } from "@/lib/sessionsApi";
+import { interrupt, stopSession } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
@@ -89,7 +93,7 @@ const EMPTY_STATE_BODY = "Ask a question here without affecting the main convers
 export function SideChatPane({
   childId,
   onStart,
-  readOnly = false,
+  readOnly: restoredReadOnly = false,
 }: {
   childId: string;
   onStart?: (text: string) => Promise<void>;
@@ -98,6 +102,10 @@ export function SideChatPane({
   readOnly?: boolean;
 }) {
   const pending = isPendingSideChat(childId);
+  const [starting, setStarting] = useState(false);
+  // The server seals a side chat whose fork died with its runner.
+  const { session } = useSession(pending ? null : childId);
+  const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
   // Open the child's stream once (real tabs only) so it hydrates and streams
   // here. The store guards a double-bind and re-binds a failed entry, so
   // re-mounts / tab switches / retries are cheap.
@@ -212,7 +220,11 @@ export function SideChatPane({
   ]);
 
   const lastAssistantIndex = liveCandidateAssistantIndex(bubbles);
-  const showsWorking = computeIsWorking(sessionStatus);
+  const showsWorking =
+    !readOnly && (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
+  // Native interruption needs an observed turn; local streaming can start before one exists.
+  const interruptReady =
+    !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
 
   // Keep the newest content in view. A side chat is short and non-virtualized,
   // so a bottom sentinel scrolled on each change is enough.
@@ -222,10 +234,21 @@ export function SideChatPane({
   }, [bubbles.length, activeResponse]);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
-  const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed;
+  const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed && !showsWorking;
+
+  const startSideChat = async (text: string) => {
+    if (!onStart) return;
+    setStarting(true);
+    try {
+      await onStart(text);
+    } catch {
+      // Re-enable the composer while preserving the draft for retry.
+      setStarting(false);
+    }
+  };
 
   return (
-    <ConversationScopeContext.Provider value={pending ? null : childId}>
+    <ConversationScopeContext.Provider value={childId}>
       <div className="side-chat-backdrop flex h-full min-h-0 flex-col">
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4">
           {loadFailed ? (
@@ -266,7 +289,7 @@ export function SideChatPane({
             </div>
           )}
         </div>
-        <div className="shrink-0 p-3">
+        <div className="shrink-0 px-3 pt-3 pb-5">
           {readOnly ? (
             <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
               This side chat has ended and can’t be continued.
@@ -275,9 +298,12 @@ export function SideChatPane({
             <SideChatComposer
               childId={childId}
               agentId={boundAgentId}
+              responseId={activeResponse?.responseId}
+              interruptReady={interruptReady}
               busy={showsWorking}
               pending={pending}
-              onStart={onStart}
+              starting={starting}
+              onStart={onStart ? startSideChat : undefined}
             />
           )}
         </div>
@@ -296,22 +322,29 @@ export function SideChatPane({
 function SideChatComposer({
   childId,
   agentId,
+  responseId,
+  interruptReady,
   busy,
   pending,
+  starting,
   onStart,
 }: {
   childId: string;
   agentId: string | null;
+  responseId: string | undefined;
+  interruptReady: boolean;
   busy: boolean;
   pending: boolean;
+  starting: boolean;
   onStart?: (text: string) => Promise<void>;
 }) {
   const send = useChatStore((s) => s.send);
+  const queryClient = useQueryClient();
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [autoSend, setAutoSend] = useState<string | null>(null);
-  const [starting, setStarting] = useState(false);
+  const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceSnapshotRef = useRef("");
@@ -328,32 +361,46 @@ function SideChatComposer({
       setAutoSend(draft);
     }
   }, [pending, childId, clearSideChatDraft]);
+  // Re-read the labels so a side chat the server just sealed turns read-only.
+  const refreshLabels = useCallback(
+    () => void queryClient.invalidateQueries({ queryKey: ["session", childId] }),
+    [queryClient, childId],
+  );
   useEffect(() => {
     if (autoSend === null || agentId === null) return;
-    void send(autoSend, agentId, undefined, { pinnedConversationId: childId });
+    void send(autoSend, agentId, undefined, { pinnedConversationId: childId }).finally(
+      refreshLabels,
+    );
     setAutoSend(null);
-  }, [autoSend, agentId, send, childId]);
+  }, [autoSend, agentId, send, childId, refreshLabels]);
 
   const ready = pending ? !starting : agentId !== null;
   const canSend = text.trim().length > 0 || (!pending && files.length > 0);
+  const showInterrupt = !pending && busy;
+
+  const interruptSideChat = () => {
+    if (interrupting || !interruptReady) return;
+    setInterrupting(true);
+    void interrupt(childId, responseId)
+      .catch(() => toast.error("Couldn’t interrupt this side chat. Please try again."))
+      .finally(() => setInterrupting(false));
+  };
 
   const submit = () => {
     const trimmed = text.trim();
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
-      setStarting(true);
-      // Keep the text: on success the tab closes (this unmounts); on failure
-      // re-enable so the user can retry without re-typing.
-      onStart(trimmed).catch(() => setStarting(false));
+      // Keep the text so a failed fork can be retried without re-typing.
+      void onStart(trimmed);
       return;
     }
-    if ((trimmed.length === 0 && files.length === 0) || agentId === null) return;
+    if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
     setText("");
     const outgoing = files;
     setFiles([]);
     void send(trimmed, agentId, outgoing.length > 0 ? outgoing : undefined, {
       pinnedConversationId: childId,
-    });
+    }).finally(refreshLabels);
   };
 
   return (
@@ -421,17 +468,17 @@ function SideChatComposer({
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}
                 onInterim={(spoken) => dictation.replaceInterim(spoken)}
               />
-              <Button
+              <ComposerSendButton
                 type="button"
-                size="icon"
-                variant="default"
-                aria-label="Send side question"
-                disabled={!canSend || !ready || busy}
-                onClick={submit}
-                data-testid="side-chat-send"
-              >
-                <ArrowUpIcon className="size-4" />
-              </Button>
+                label={showInterrupt ? "Interrupt side chat" : "Send side question"}
+                interrupt={showInterrupt}
+                busy={interrupting}
+                disabled={
+                  showInterrupt ? interrupting || !interruptReady : !canSend || !ready || busy
+                }
+                onClick={showInterrupt ? interruptSideChat : submit}
+                data-testid={showInterrupt ? "side-chat-interrupt" : "side-chat-send"}
+              />
             </>
           ),
         }}

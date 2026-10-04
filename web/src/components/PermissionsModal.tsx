@@ -341,7 +341,6 @@ export function PermissionsModal({
             <CopyLinkButton sessionId={sessionId} />
             <Button
               variant="ghost"
-              size="sm"
               onClick={() => setShowQr(true)}
               className="gap-1.5 text-primary"
             >
@@ -590,7 +589,6 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   return (
     <Button
       variant="ghost"
-      size="sm"
       onClick={handleCopy}
       className="gap-1.5 text-primary"
       componentId="diagnostics.permissions.copy_link"

@@ -150,6 +150,11 @@
   --icon-container-default: 16px;
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 60 40 10;
+  /* Onboarding wizard page surface — a hair off the white card so it reads as a
+     distinct backdrop (the card stays var(--card)). */
+  --onboarding-wizard-background: #fcfbfb;
+  --onboarding-modal-border: #0000001a;
+  --onboarding-modal-shadow: 0 24px 80px 8px #00000012;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 12%);
   --composer-shadow-focus: 0 0 20px -6px rgb(0 0 0 / 12%);
 
@@ -258,6 +263,9 @@
 .dark {
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 0 0 0;
+  --onboarding-wizard-background: #131315;
+  --onboarding-modal-border: #ffffff14;
+  --onboarding-modal-shadow: 0 24px 80px 8px #00000038;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 80%);
   --composer-shadow-focus: 0 0 14px -8px rgb(0 0 0 / 90%);
   --destructive: #e65b77;
@@ -417,7 +425,9 @@
   background-color: var(--muted);
 }
 
-.composer-agent-menu .composer-agent-row > [role="menuitem"] {
+/* Disabled rows wrap the item in a tooltip span, so match through one wrapper. */
+.composer-agent-menu .composer-agent-row > [role="menuitem"],
+.composer-agent-menu .composer-agent-row > span > [role="menuitem"] {
   gap: 0;
   padding: 0;
 }
@@ -521,9 +531,60 @@
   padding: 1px;
 }
 
-/* Compact icon-only buttons use the full 16px glyph inside that box. */
-.button-standard-icons[data-size="icon-xs"] svg:not([data-icon-size]) {
+/* Small and standard icon buttons use the full 16px glyph. */
+.button-standard-icons:is([data-size="icon-xs"], [data-size="icon-sm"], [data-size="icon"])
+  svg:not([data-icon-size]) {
   padding: 0;
+}
+
+/* Large icon buttons step up to a 24px glyph. */
+.button-standard-icons[data-size="icon-lg"] svg:not([data-icon-size]) {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+}
+
+/* The desktop workspace rail stays mounted through its exit so its content
+   can fade and slide as one stable sibling of the session surface. */
+.workspace-panel-motion {
+  min-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateX(12px);
+  pointer-events: none;
+}
+
+.workspace-panel-motion[data-animate-visibility] {
+  transition:
+    width 300ms ease-in-out,
+    opacity 300ms ease-in-out,
+    transform 300ms ease-in-out;
+}
+
+.workspace-panel-motion[data-state="open"] {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+.workspace-panel-motion[data-resizing] {
+  transition: none;
+}
+
+[data-workspace-panel-animate] .chat-header {
+  transition: right 300ms ease-in-out;
+}
+
+[data-workspace-panel-resizing] .chat-header {
+  transition: none;
+}
+
+@starting-style {
+  .workspace-panel-motion[data-state="open"][data-animate-visibility] {
+    width: 0 !important;
+    opacity: 0;
+    transform: translateX(12px);
+  }
 }
 
 /* The transparent <main> shows the palette canvas through. */
@@ -674,6 +735,11 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
  * opaque background so the chat underneath doesn't bleed through. */
 aside[aria-label="Workspace"][data-maximized] {
   background: var(--card-solid) !important;
+}
+
+/* Label-only tooltips must not block controls beneath their portal wrapper. */
+[data-radix-popper-content-wrapper]:has([data-noninteractive-tooltip]) {
+  pointer-events: none !important;
 }
 
 /* Popovers/menus — same glass treatment */
@@ -869,8 +935,8 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 
 /* The iOS WKWebView runs full-screen under the keyboard at every responsive
- * width. Lock the shell to the visual viewport published by
- * useIOSViewportLock so flow content, including the composer, stays visible. */
+ * width. useIOSViewportLock publishes the area above the docked keyboard so
+ * flow content stays visible without shrinking for floating iPad controls. */
 [data-ios-native].app-shell {
   height: 100lvh;
   height: var(--omnigent-viewport-height, 100lvh);
@@ -939,12 +1005,6 @@ aside[aria-label="Workspace"][data-maximized] {
     padding-top: calc(3.25rem + var(--omnigent-inset-top));
   }
 
-  /* With the bottom pill retired the terminal card is the lowest content in
-     the terminal view — keep it clear of the home indicator. */
-  [data-ios-native] .main-terminal-view {
-    padding-bottom: calc(0.375rem + var(--omnigent-safe-bottom));
-  }
-
   [data-ios-native] .chat-scroll-fade {
     mask-image: linear-gradient(
       to bottom,
@@ -1009,6 +1069,20 @@ aside[aria-label="Workspace"][data-maximized] {
   padding-bottom: var(--omnigent-safe-bottom);
   padding-left: min(var(--omnigent-safe-left), var(--omnigent-lateral-inset-cap));
   padding-right: min(var(--omnigent-safe-right), var(--omnigent-lateral-inset-cap));
+}
+
+/* At phone widths the open drawer's Search bubble pairs with the chat
+ * header's overflow bubble in the exposed chat strip beside it. The chat
+ * header sits at safe-top - 0.5rem (rule above), so mirror that offset here
+ * or the paired bubbles drift 0.5rem apart. Keeps the specificity of the
+ * padding rule above and follows it in source order so it wins the tie. */
+@media (width < 48rem) {
+  :is([data-ios-native], [data-android-native])
+    aside.conversations-sidebar:not(aside[aria-label="Workspace"] *):not([data-collapsed]):not(
+      .is-peek
+    ) {
+    padding-top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  }
 }
 
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
@@ -1224,6 +1298,15 @@ aside[aria-label="Workspace"][data-maximized] {
 [data-streamdown="code-block-body"] {
   font-size: 0.875em;
 }
+/* Fallback mono fonts (e.g. JetBrains Mono) ship ligatures that can visually
+ * swallow spaces in CLI flags like `-c --markdown`; code must render literally. */
+[data-streamdown="inline-code"],
+[data-streamdown="code-block-body"] {
+  font-variant-ligatures: none;
+  font-feature-settings:
+    "liga" 0,
+    "calt" 0;
+}
 
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
  * hide the native one so both don't show. */
@@ -1298,6 +1381,19 @@ aside[aria-label="Workspace"][data-maximized] {
   margin-right: calc(2rem - 1px);
 }
 
+/* Streamdown centers the SVG in a shrink-to-fit flex child. Give that child
+ * the diagram area's width so Mermaid's width="100%" does not collapse. */
+[data-streamdown="mermaid-block"] div:has(> svg[aria-roledescription]) {
+  width: 100%;
+}
+
+/* Keep Mermaid's canvas transparent so the diagram follows the surrounding
+ * chat or file surface in either theme. The SVG itself has no canvas fill. */
+[data-streamdown="mermaid-block"],
+[data-streamdown="mermaid-block"] > div:last-child {
+  background-color: transparent;
+}
+
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can
  * leave the default arrow cursor on links — force pointer to signal affordance. */
 [data-streamdown="link"] {
@@ -1366,25 +1462,72 @@ aside[aria-label="Workspace"][data-maximized] {
   vertical-align: -0.075em;
 }
 
-/* Message highlights must match FLASH_DURATION_MS in chatStore.ts. */
+/* Message highlights must match FLASH_DURATION_MS in chatStore.ts.
+   Omit the final keyframe to fade back to the bubble's own background. */
 @keyframes message-highlight {
   0%,
   40% {
     background-color: var(--message-highlight);
-  }
-  100% {
-    background-color: transparent;
   }
 }
 
 .animate-message-highlight {
   --message-highlight: color-mix(in oklch, var(--warning) 16%, transparent);
   animation: message-highlight 1500ms ease-out;
-  border-radius: var(--radius-lg);
 }
 
 .dark .animate-message-highlight {
   --message-highlight: color-mix(in oklch, var(--warning) 24%, transparent);
+}
+
+@keyframes user-message-enter {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-user-message-enter {
+  animation: user-message-enter 300ms ease-out both;
+}
+
+/* File-tree children fade without animating geometry. Height or position
+   transitions fight the virtualizer and make long lists visibly drift. */
+@keyframes file-tree-row-expand {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes file-tree-row-collapse {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.file-tree-row-enter,
+.file-tree-row-exit {
+  overflow: hidden;
+  will-change: opacity;
+}
+
+.file-tree-row-enter {
+  animation: file-tree-row-expand 180ms cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
+.file-tree-row-exit {
+  pointer-events: none;
+  animation: file-tree-row-collapse 180ms cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 
 /* Workspace navigation keeps its compact outline highlight. */
@@ -1409,7 +1552,8 @@ aside[aria-label="Workspace"][data-maximized] {
 @media (prefers-reduced-motion: reduce) {
   .animate-message-highlight {
     animation: none;
-    background-color: var(--message-highlight);
+    /* Override inline contributor tints while the static highlight is active. */
+    background-color: var(--message-highlight) !important;
   }
 
   .animate-user-msg-flash {

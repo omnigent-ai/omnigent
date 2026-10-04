@@ -10,11 +10,11 @@ comment in ``db_models.py`` for the trade-off rationale.
 
 from __future__ import annotations
 
-from omnigent.runner import app as runner_app
+from omnigent.runner import subagent_work
 
 
 def _reset_ordinal_counters() -> None:
-    runner_app._subagent_ordinal_counters.clear()
+    subagent_work._subagent_ordinal_counters.clear()
 
 
 class TestNextSubagentOrdinal:
@@ -25,22 +25,22 @@ class TestNextSubagentOrdinal:
         _reset_ordinal_counters()
 
     def test_first_ordinal_is_one(self) -> None:
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 1
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 1
 
     def test_ordinals_increment(self) -> None:
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 1
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 2
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 3
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 1
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 2
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 3
 
     def test_ordinals_independent_per_parent(self) -> None:
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 1
-        assert runner_app.next_subagent_ordinal("parent_2", "researcher") == 1
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 2
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 1
+        assert subagent_work.next_subagent_ordinal("parent_2", "researcher") == 1
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 2
 
     def test_ordinals_independent_per_agent_type(self) -> None:
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 1
-        assert runner_app.next_subagent_ordinal("parent_1", "coder") == 1
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 2
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 1
+        assert subagent_work.next_subagent_ordinal("parent_1", "coder") == 1
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 2
 
 
 class TestRecoverSubagentOrdinals:
@@ -56,37 +56,37 @@ class TestRecoverSubagentOrdinals:
             {"session_name": "researcher-3"},
             {"session_name": "researcher-2"},
         ]
-        runner_app.recover_subagent_ordinals("parent_1", "researcher", children)
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 4
+        subagent_work.recover_subagent_ordinals("parent_1", "researcher", children)
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 4
 
     def test_recovery_ignores_other_agent_types(self) -> None:
         children = [
             {"session_name": "coder-5"},
             {"session_name": "researcher-2"},
         ]
-        runner_app.recover_subagent_ordinals("parent_1", "researcher", children)
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 3
+        subagent_work.recover_subagent_ordinals("parent_1", "researcher", children)
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 3
 
     def test_recovery_with_no_matching_children(self) -> None:
         children = [
             {"session_name": "coder-5"},
             {"session_name": "manual-title"},
         ]
-        runner_app.recover_subagent_ordinals("parent_1", "researcher", children)
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 1
+        subagent_work.recover_subagent_ordinals("parent_1", "researcher", children)
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 1
 
     def test_recovery_skips_when_already_initialized(self) -> None:
-        runner_app.next_subagent_ordinal("parent_1", "researcher")  # sets to 1
+        subagent_work.next_subagent_ordinal("parent_1", "researcher")  # sets to 1
         children = [
             {"session_name": "researcher-10"},
         ]
-        runner_app.recover_subagent_ordinals("parent_1", "researcher", children)
+        subagent_work.recover_subagent_ordinals("parent_1", "researcher", children)
         # Should NOT reset — already initialized
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 2
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 2
 
     def test_recovery_handles_empty_children(self) -> None:
-        runner_app.recover_subagent_ordinals("parent_1", "researcher", [])
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 1
+        subagent_work.recover_subagent_ordinals("parent_1", "researcher", [])
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 1
 
     def test_recovery_handles_non_string_session_name(self) -> None:
         children = [
@@ -94,8 +94,8 @@ class TestRecoverSubagentOrdinals:
             {"session_name": 42},
             {"session_name": "researcher-2"},
         ]
-        runner_app.recover_subagent_ordinals("parent_1", "researcher", children)
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 3
+        subagent_work.recover_subagent_ordinals("parent_1", "researcher", children)
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 3
 
     def test_recovery_handles_malformed_ordinals(self) -> None:
         children = [
@@ -103,8 +103,8 @@ class TestRecoverSubagentOrdinals:
             {"session_name": "researcher-abc"},
             {"session_name": "researcher-2"},
         ]
-        runner_app.recover_subagent_ordinals("parent_1", "researcher", children)
-        assert runner_app.next_subagent_ordinal("parent_1", "researcher") == 3
+        subagent_work.recover_subagent_ordinals("parent_1", "researcher", children)
+        assert subagent_work.next_subagent_ordinal("parent_1", "researcher") == 3
 
 
 class TestOrdinalRetryBehavior:
@@ -124,7 +124,7 @@ class TestOrdinalRetryBehavior:
     def test_sequential_bumps_produce_distinct_names(self) -> None:
         names = []
         for _ in range(5):
-            ordinal = runner_app.next_subagent_ordinal("parent_1", "researcher")
+            ordinal = subagent_work.next_subagent_ordinal("parent_1", "researcher")
             names.append(f"researcher-{ordinal}")
         assert names == [
             "researcher-1",
@@ -135,20 +135,20 @@ class TestOrdinalRetryBehavior:
         ]
 
     def test_bumps_after_recovery_continue_from_high_water(self) -> None:
-        runner_app.recover_subagent_ordinals(
+        subagent_work.recover_subagent_ordinals(
             "parent_1",
             "researcher",
             [{"session_name": "researcher-3"}],
         )
         names = []
         for _ in range(3):
-            ordinal = runner_app.next_subagent_ordinal("parent_1", "researcher")
+            ordinal = subagent_work.next_subagent_ordinal("parent_1", "researcher")
             names.append(f"researcher-{ordinal}")
         assert names == ["researcher-4", "researcher-5", "researcher-6"]
 
     def test_bumps_across_agent_types_are_independent(self) -> None:
-        r1 = runner_app.next_subagent_ordinal("parent_1", "researcher")
-        c1 = runner_app.next_subagent_ordinal("parent_1", "coder")
-        r2 = runner_app.next_subagent_ordinal("parent_1", "researcher")
-        c2 = runner_app.next_subagent_ordinal("parent_1", "coder")
+        r1 = subagent_work.next_subagent_ordinal("parent_1", "researcher")
+        c1 = subagent_work.next_subagent_ordinal("parent_1", "coder")
+        r2 = subagent_work.next_subagent_ordinal("parent_1", "researcher")
+        c2 = subagent_work.next_subagent_ordinal("parent_1", "coder")
         assert (r1, c1, r2, c2) == (1, 1, 2, 2)

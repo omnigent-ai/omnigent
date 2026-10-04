@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -62,14 +62,6 @@ FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY = "omnigent.fork.source_external_session_
 # ``external_session_id`` is NULL).
 FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 
-# Set by an in-place agent switch (``POST /v1/sessions/{id}/switch-agent``):
-# the BUILT-IN agent id the session was switched away from, so the UI can
-# offer a one-click "Switch back". A convenience pointer only — switching
-# back is a fresh re-clone of that built-in (a new session-scoped agent,
-# fresh harness), not a transactional undo. Persisted (not instance-scoped),
-# so it survives across turns and is overwritten by each subsequent switch.
-SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
-
 # Opt-in DANGEROUS launch directive for a codex-native session: when set to
 # ``"1"`` the runner launches Codex with
 # ``--dangerously-bypass-approvals-and-sandbox`` and puts the app-server
@@ -90,6 +82,22 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # is the store layer; the SQLAlchemy store and the server route both import it,
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
+
+
+class DailyCostState(TypedDict):
+    """Daily cost state record returned by list_daily_cost_states.
+
+    :param cost_usd: Cumulative spend for this user on this day.
+    :param ask_approved_usd: Highest soft-limit checkpoint the user approved.
+    :param day_utc: The UTC day as "YYYY-MM-DD".
+    :param user_id: The user this record belongs to.
+    """
+
+    cost_usd: float
+    ask_approved_usd: float
+    day_utc: str
+    user_id: str
+
 
 # Reserved label-key PREFIX that records whether a session is "pinned" in the
 # sidebar. Pins are PER-USER: the stored key is ``omnigent.pinned.<user_id>``
@@ -411,6 +419,12 @@ class ConversationStore(ABC):
         conversation_id: str | None = None,
         project_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        model_override: str | None = None,
+        cost_control_mode_override: str | None = None,
+        subagent_routing_override: str | None = None,
+        harness_override: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -466,6 +480,13 @@ class ConversationStore(ABC):
         :param conversation_id: Optional caller-supplied identifier.
             ``None`` generates a new random id. Reserved for flows that
             require database-enforced idempotency.
+        :param labels: Initial conversation labels to persist with the
+            conversation.
+        :param reasoning_effort: Optional per-session reasoning effort.
+        :param model_override: Optional per-session model override.
+        :param cost_control_mode_override: Optional per-session cost-control mode.
+        :param subagent_routing_override: Optional per-session sub-agent routing mode.
+        :param harness_override: Optional per-session harness override.
         :returns: The newly created :class:`Conversation`.
         :raises NameAlreadyExistsError: If
             ``parent_conversation_id`` is not ``None`` and a
@@ -583,6 +604,21 @@ class ConversationStore(ABC):
         :returns: Mapping from every unique input parent id to the
             matching direct child ids. Parents with no direct sub-agent
             children, or ids that do not exist, map to an empty list.
+        """
+        ...
+
+    @abstractmethod
+    def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
+        """
+        Fetch one persisted item by id, or ``None`` when absent.
+
+        A bounded point lookup on the item's key, never a scan. Lets the native
+        mirror path recognise a forwarder retry of an item it has already
+        persisted before it touches the pending-input queue.
+
+        :param conversation_id: The conversation to look in, e.g. ``"conv_abc123"``.
+        :param item_id: The item id, e.g. a source-derived ``stable_id``.
+        :returns: The item, or ``None``.
         """
         ...
 
@@ -1284,6 +1320,26 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_daily_cost_states(
+        self,
+        user_id: str,
+        since_day_utc: str,
+    ) -> list[DailyCostState]:
+        """
+        Return daily cost states for a user from since_day_utc onward.
+
+        Reads the full state (cost_usd, ask_approved_usd, day_utc) for
+        each day with recorded cost >= since_day_utc. Used by both daily
+        and period-based cost-budget policies.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as ``"YYYY-MM-DD"``.
+        :returns: List of :class:`DailyCostState` dicts. Days with no spend
+            are omitted. Sorted ascending by day_utc.
+        """
+        ...
+
+    @abstractmethod
     def get_session_owner(self, conversation_id: str, *, owner_only: bool = False) -> str | None:
         """
         Return the highest-privilege non-public grantee of a session.
@@ -1347,7 +1403,7 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def clear_runner_liveness(self, runner_id: str) -> None:
+    def clear_runner_liveness(self, runner_id: str, not_after: int | None = None) -> None:
         """
         Clear ``runner_last_seen`` for every session bound to a runner.
 
@@ -1356,6 +1412,11 @@ class ConversationStore(ABC):
         :data:`RUNNER_LIVENESS_TTL_S`. Must NOT bump ``updated_at``.
 
         :param runner_id: The disconnected runner's id.
+        :param not_after: When given, only clear a row whose
+            ``runner_last_seen`` is ``NULL`` or ``<= not_after`` — the
+            runner may have re-tunnelled to another replica, which
+            stamps a newer value this clear must not erase. ``None``
+            clears unconditionally (the pre-cross-replica behavior).
         """
         ...
 
@@ -1462,11 +1523,8 @@ class ConversationStore(ABC):
         bound and the binding fields persisted, but the launch
         failed and any worktree was rolled back. Clearing all four
         fields in one transaction keeps the row consistent with the
-        host's actual state (no runner, no worktree) and, unlike
-        :meth:`set_host_id` (which treats ``None`` as "leave
-        untouched" and so cannot clear ``git_branch``), lets a later
-        rebind that omits a worktree start from a clean slate rather
-        than inheriting a stale branch. Nulling ``host_id`` and
+        host's actual state (no runner, no worktree) and lets a later
+        rebind start from a clean slate. Nulling ``host_id`` and
         ``workspace`` together never violates
         ``ck_conversations_workspace_required_for_host`` (workspace
         is only required while ``host_id`` is set).
@@ -1538,8 +1596,9 @@ class ConversationStore(ABC):
         :param git_branch: Optional git branch checked out in a
             server-created worktree, e.g. ``"feature/login"``. Set
             when binding an existing session to a freshly created
-            worktree (the fork resume path). ``None`` leaves it
-            untouched.
+            worktree (the fork resume path). ``None`` preserves the
+            branch on the same host/workspace, but clears it when
+            the host or an explicitly supplied workspace changes.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
@@ -1802,81 +1861,13 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def switch_conversation_agent(
-        self,
-        conversation_id: str,
-        *,
-        new_agent_id: str,
-        new_agent_name: str,
-        new_agent_bundle_location: str,
-        new_agent_description: str | None,
-        copy_model_settings: bool,
-        carry_history_into_native: bool,
-        presentation_labels: dict[str, str],
-        previous_builtin_id: str | None,
-    ) -> Conversation:
-        """
-        Rebind a session in place to a different (cloned) agent.
-
-        Unlike :meth:`fork_conversation`, this mutates the SAME
-        conversation row — the transcript, comments, files, host,
-        and workspace are untouched; only the agent/harness changes.
-        In one transaction it: deletes the session's current
-        session-scoped agent (now unreferenced once ``agent_id`` is
-        repointed), creates a new session-scoped agent from the
-        supplied bundle, points ``agent_id`` at it, applies the
-        model-settings and label deltas below, and clears
-        ``external_session_id`` (the old harness's native runtime
-        state). The whole operation is atomic: any failure rolls back
-        and the session stays on its current agent.
-
-        The replacement agent's ``created_by`` is left unset, so it is
-        admin-only to mutate until a full switch implementation assigns
-        the session owner (the delete is also not yet reference-safe for
-        an agent shared via reuse or named sub-agents).
-
-        :param conversation_id: Session to switch, e.g.
-            ``"conv_abc123"``.
-        :param new_agent_id: Pre-generated id for the new
-            session-scoped agent, e.g. ``"ag_def456"``.
-        :param new_agent_name: Name for the new agent row, e.g.
-            ``"Codex (switch ag_def456)"``.
-        :param new_agent_bundle_location: Artifact-store key of the
-            target built-in's bundle to clone, e.g.
-            ``"ag_builtin/abcd1234"``.
-        :param new_agent_description: Optional description from the
-            target's spec. ``None`` leaves the column NULL.
-        :param copy_model_settings: When ``True``, keep the session's
-            existing ``model_override`` / ``reasoning_effort`` (the
-            switch stays in the same provider family). When ``False``,
-            both are reset to ``None`` so the new agent's defaults
-            apply (a cross-family switch — a model id is provider-bound).
-        :param carry_history_into_native: When ``True``, stamp
-            :data:`FORK_CARRY_HISTORY_LABEL_KEY` so a native target
-            rebuilds its transcript from this session's own AP items on
-            the next turn; when ``False``, that label is removed. Set by
-            the route only when the target is native AND same-family.
-        :param presentation_labels: Replace the session's
-            ``omnigent.ui`` / ``omnigent.wrapper`` labels with these so
-            the UI mode matches the TARGET harness (native →
-            ``{ui: terminal, wrapper: ...}``; SDK → ``{}`` → chat mode).
-        :param previous_builtin_id: Built-in agent id the session is
-            switching away from, stamped as
-            :data:`SWITCH_PREVIOUS_BUILTIN_LABEL_KEY` for a one-click
-            "Switch back". ``None`` leaves it unset.
-        :returns: The updated :class:`Conversation`.
-        :raises LookupError: If no conversation with *conversation_id*
-            exists.
-        """
-        ...
-
-    @abstractmethod
     def has_other_live_session_in_workspace(
         self,
         *,
         host_id: str,
         workspace: str,
         exclude_conversation_id: str,
+        include_subdirectories: bool = False,
     ) -> bool:
         """
         Is another non-archived conversation sitting in this ``(host_id, workspace)``?
@@ -1894,6 +1885,7 @@ class ConversationStore(ABC):
         :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
         :param exclude_conversation_id: The conversation being deleted or
             archived — its own row must not count as "another session".
+        :param include_subdirectories: Also protect sessions inside this worktree root.
         :returns: ``True`` when at least one other live conversation
             references the pair, else ``False``.
         """

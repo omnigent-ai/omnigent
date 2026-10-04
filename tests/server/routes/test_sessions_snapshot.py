@@ -2988,3 +2988,38 @@ async def test_snapshot_does_not_query_runner_skills_or_publish_skill_events(
     assert "skills_status" not in snapshot.model_dump()
     assert all(not url.endswith("/skills") for url in calls)
     assert all(event.get("type") != "session.skills" for event in published)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_status", "online", "lost"),
+    [
+        ("dead", False, True),
+        ("unknown", False, True),
+        ("alive", False, False),
+        (None, False, False),
+        ("dead", True, False),
+    ],
+)
+async def test_side_chat_fork_lost_trusts_only_a_host_verdict(
+    monkeypatch: pytest.MonkeyPatch, host_status: str | None, online: bool, lost: bool
+) -> None:
+    """Only the launching host can prove an offline runner is gone; no reply proves nothing."""
+    from omnigent.server.routes._sessions import orchestration
+
+    async def _status(_conn: Any, _registry: Any, _runner_id: str) -> str | None:
+        return host_status
+
+    monkeypatch.setattr(orchestration, "_query_host_runner_status", _status)
+    monkeypatch.setattr("omnigent.runner.routing.routing_host_id", lambda _c, _s: "host-1")
+    registry = SimpleNamespace(get=lambda host_id: object() if host_id == "host-1" else None)
+    router = SimpleNamespace(runner_is_online=lambda _runner_id: online)
+    store = _ParentStore(SimpleNamespace(runner_id="runner-birth"))  # parent not relaunched yet
+    child = _side_chat_child(runner_id="runner-birth")
+
+    assert await orchestration._codex_side_chat_fork_lost(child, store, router, registry) is lost  # type: ignore[arg-type]
+
+    ordinary = _side_chat_child(runner_id="runner-birth", nickname="reviewer")
+    assert (
+        await orchestration._codex_side_chat_fork_lost(ordinary, store, router, registry) is False
+    )  # type: ignore[arg-type]

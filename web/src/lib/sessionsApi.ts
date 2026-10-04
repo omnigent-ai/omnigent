@@ -15,7 +15,7 @@ import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
-import { setSessionHost } from "./sessionHost";
+import { setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import type {
@@ -116,6 +116,8 @@ interface SessionResponseWire {
    * other carrier and it's absent for those.
    */
   host_id?: string | null;
+  runner_online?: boolean | null;
+  host_online?: boolean | null;
   /**
    * Whether this session is bound to a dormant managed host the server can
    * wake in place (its sandbox provider supports resume). Read only when the
@@ -195,6 +197,8 @@ interface SessionResponseWire {
     title?: string;
     cause?: string;
     remediation?: string;
+    /** For `runner_rejected_event`: the persisted item the runner refused (newer servers). */
+    item_id?: string;
   } | null;
   /**
    * Outstanding `response.elicitation_request` event dicts at the
@@ -310,14 +314,18 @@ function usageByModelFromWire(
 
 function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
-  // attach) can pin to the replica holding that host's runner tunnel.
+  // attach) can pin to the replica holding that host's runner tunnel; a
+  // sub-agent child inherits its parent's through the recorded parent link.
   setSessionHost(wire.id, wire.host_id);
+  setSessionParent(wire.id, wire.parent_session_id);
   return {
     id: wire.id,
     agentId: wire.agent_id,
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
+    runnerOnline: wire.runner_online ?? undefined,
     hostId: wire.host_id ?? null,
+    hostOnline: wire.host_online ?? undefined,
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,
     status: wire.status,
@@ -774,7 +782,7 @@ export async function createBundledSession(
  *
  * @param sourceId - Session to fork, e.g. "conv_abc123".
  * @param options.title - Optional title for the new fork.
- * @param options.agentId - Optional built-in agent to switch the fork to
+ * @param options.agentId - Optional agent to switch the fork to
  *   (e.g. fork a Claude-SDK session into Claude Code). Omitted → keep the
  *   source's agent. The server carries model settings (and native
  *   history) across only within the same provider family.
@@ -878,67 +886,38 @@ export async function forkSession(
 }
 
 /**
- * Open a generic side chat by forking the conversation and launching a runner
- * for the fork on the SOURCE's own host — exactly what the per-message Fork
- * button does. This is host-agnostic: it drives on a local host or a managed
- * one, with no managed-sandbox requirement. Codex sessions do NOT use this —
- * they fork in-process via their native `/side` path (prompt-cache-warm) — so
- * this is the generic (non-Codex) create.
+ * Fork a generic side chat in the parent's current working directory.
+ * Hosted sessions launch a separate runner; CLI sessions use their existing
+ * runner, and in-process sessions use normal server dispatch. Codex uses its
+ * native `/side` fork instead.
  *
- * When the source is on a git branch the fork launches in its OWN worktree
- * (`side-chat/<id>`, based on the source branch) so the side chat stays off the
- * parent's working tree; otherwise it launches in the source's workspace.
+ * Like native Codex side chats, these share the parent's workspace. A saved
+ * branch may belong to a previous host and must not be required to send.
  *
  * @param sourceId - The parent conversation to fork, e.g. "conv_abc123".
  * @returns The new side-chat session id.
- * @throws Error when the source has no host/workspace to launch on, or when the
- *   fork / runner launch fails, so the caller can surface it (a toast).
+ * @throws Error when the source is disconnected or the fork / runner launch fails.
  */
 export async function createSideChat(sourceId: string): Promise<{ childSessionId: string }> {
-  const source = await getSession(sourceId);
-  const { hostId, workspace, gitBranch } = source;
-  if (!hostId || !workspace) {
-    // No host/workspace to run on — fail before creating an orphan fork so the
-    // caller shows an error instead of opening a dead tab.
-    throw new Error("This session has no host to run a side chat on.");
+  let source = await getSession(sourceId);
+  if (source.hostResumable && source.hostOnline === false && source.runnerOnline !== true) {
+    await retrySession(sourceId);
+    source = await getSession(sourceId);
+  }
+  const { hostId, workspace, runnerId } = source;
+  const canLaunchOnHost = hostId && workspace && source.hostOnline !== false;
+  const canUseRunner =
+    source.runnerOnline !== false && (runnerId != null || source.runnerOnline === true);
+  if (!canLaunchOnHost && !canUseRunner) {
+    throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
   }
   const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
-  await launchRunner(
-    hostId,
-    fork.id,
-    workspace,
-    gitBranch ? { branchName: `side-chat/${fork.id.slice(-8)}`, baseBranch: gitBranch } : undefined,
-  );
+  if (canLaunchOnHost) {
+    await launchRunner(hostId, fork.id, workspace);
+  } else if (runnerId) {
+    await updateSession(fork.id, { runnerId });
+  }
   return { childSessionId: fork.id };
-}
-
-/**
- * Switch an existing session in place to a different agent/harness:
- * ``POST /v1/sessions/{id}/switch-agent``.
- *
- * Unlike fork, this keeps the SAME session (transcript, comments, files,
- * workspace) and only rebinds the agent. The next turn runs on the new
- * harness; history carries per the same rule as a fork switch
- * (``forkTargetCarriesHistory``). Model settings reset to the target's
- * defaults on a cross-family switch. Only built-in agents are bindable,
- * and only while the session is idle (a running turn → 409).
- *
- * @param sessionId - The session to switch, e.g. ``"conv_abc123"``.
- * @param agentId - Built-in agent to switch to, e.g. ``"ag_builtin_codex"``.
- * @returns The session as it stands after the switch.
- * @throws Error carrying the server's failure detail (e.g. 409 when a turn
- *   is running) so the caller can surface it inline.
- */
-export async function switchSessionAgent(sessionId: string, agentId: string): Promise<Session> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/switch-agent`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agent_id: agentId }),
-    },
-  );
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
 /**
@@ -1209,6 +1188,29 @@ export async function getSessionSlim(
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+export interface SessionSignInLink {
+  pending: boolean;
+  url: string | null;
+  code: string | null;
+}
+
+/**
+ * Ask the session's host for the sign-in prompt its terminal shows right now.
+ *
+ * A link saved in an error card is bound to the launcher process that printed
+ * it and goes stale once that process moves on, so the card asks at click time.
+ */
+export async function getSessionSignInLink(
+  sessionId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<SessionSignInLink> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/sign-in-link`,
+    { signal: options.signal },
+  );
+  return readJsonOrThrow<SessionSignInLink>(res);
+}
+
 export interface SessionUsageSnapshot {
   id: string;
   totalCostUsd: number | null;
@@ -1435,9 +1437,13 @@ export function openSessionStream(
  * `session.interrupted` (transient) and `response.incomplete` (with
  * `incomplete_details.reason == "user_interrupt"`) on the live
  * stream — clients can mark the bubble interrupted from either.
+ * Native side chats include their observed response id to target the exact turn.
  */
-export function interrupt(sessionId: string): Promise<PostEventResponse> {
-  return postEvent(sessionId, { type: "interrupt", data: {} });
+export function interrupt(sessionId: string, responseId?: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, {
+    type: "interrupt",
+    data: responseId ? { response_id: responseId } : {},
+  });
 }
 
 /**
@@ -1457,11 +1463,15 @@ export function retrySession(sessionId: string): Promise<PostEventResponse> {
 }
 
 // Multiple error cards can describe the same failed turn.
-const rateLimitedTurnRetries = new Map<string, Promise<void>>();
+const failedTurnContinuations = new Map<string, Promise<void>>();
 
-/** Continue a rate-limited turn without replaying the original prompt or tools. */
-export function retryRateLimitedTurn(sessionId: string): Promise<void> {
-  const pending = rateLimitedTurnRetries.get(sessionId);
+/**
+ * Continue a turn whose upstream model call failed mid-stream (rate limit,
+ * transient gateway error) without replaying the original prompt or tools —
+ * the runner itself is healthy, only the turn died.
+ */
+export function continueFailedTurn(sessionId: string): Promise<void> {
+  const pending = failedTurnContinuations.get(sessionId);
   if (pending) return pending;
 
   const retry = postEvent(sessionId, {
@@ -1471,7 +1481,7 @@ export function retryRateLimitedTurn(sessionId: string): Promise<void> {
       content: [
         {
           type: "input_text",
-          text: "Please continue from where you left off before the rate limit error.",
+          text: "Please continue from where you left off.",
         },
       ],
     },
@@ -1481,9 +1491,9 @@ export function retryRateLimitedTurn(sessionId: string): Promise<void> {
       if (!result.queued) throw new Error("The retry was not accepted");
     })
     .finally(() => {
-      rateLimitedTurnRetries.delete(sessionId);
+      failedTurnContinuations.delete(sessionId);
     });
-  rateLimitedTurnRetries.set(sessionId, retry);
+  failedTurnContinuations.set(sessionId, retry);
   return retry;
 }
 

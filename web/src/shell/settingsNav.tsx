@@ -133,9 +133,8 @@ export function settingsNavGroups(
     // on a deploy with sign-in.
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
   }
-  const groups: SettingsNavGroup[] = [];
-  // Desktop (Local CLI) leads when present — it's the shell-specific section a
-  // desktop user is most likely here to change.
+  const groups: SettingsNavGroup[] = [{ title: "General", items: general }];
+  // Keep shell-specific settings directly after the cross-platform preferences.
   if (isDesktop) {
     groups.push({
       title: "Desktop",
@@ -145,7 +144,6 @@ export function settingsNavGroups(
       ],
     });
   }
-  groups.push({ title: "General", items: general });
   // Admin: server-wide management, admin-only. Nested here as sub-categories
   // (rather than links out of the Account section) so entering them stays
   // inside /settings — the sidebar keeps the settings nav instead of snapping
@@ -292,44 +290,48 @@ export function SettingsSidebarBody({
       </div>
       <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
         {groups.map((group) => (
-          <div key={group.title} className="flex flex-col gap-0">
-            <h2 className="px-2 py-1 text-sm font-normal text-muted-foreground">{group.title}</h2>
-            {group.items.map((item) => {
-              const Icon = item.icon;
-              const selected = section === item.id;
-              return (
-                <Button
-                  key={item.id}
-                  asChild
-                  variant="ghost"
-                  className={cn(
-                    SIDEBAR_ROW,
-                    "w-full justify-start border-0 font-normal",
-                    selected &&
-                      "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
-                    item.hideOnMobile && "max-md:hidden",
-                  )}
-                >
-                  <Link
-                    to={item.to ?? `/settings/${item.id}`}
-                    onClick={onNavClick}
-                    data-testid={`settings-nav-${item.id}`}
-                    componentId={`settings.nav.${item.id}`}
-                    aria-current={selected ? "page" : undefined}
+          <div key={group.title} className="flex flex-col">
+            <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
+              {group.title}
+            </h2>
+            <div className="mt-1 flex flex-col gap-px">
+              {group.items.map((item) => {
+                const Icon = item.icon;
+                const selected = section === item.id;
+                return (
+                  <Button
+                    key={item.id}
+                    asChild
+                    variant="ghost"
+                    className={cn(
+                      SIDEBAR_ROW,
+                      "w-full justify-start border-0 font-normal",
+                      selected &&
+                        "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
+                      item.hideOnMobile && "max-md:hidden",
+                    )}
                   >
-                    <Icon
-                      className={cn(
-                        "ui-icon",
-                        selected
-                          ? "text-[var(--sidebar-active-foreground)]"
-                          : "text-muted-foreground",
-                      )}
-                    />
-                    {item.label}
-                  </Link>
-                </Button>
-              );
-            })}
+                    <Link
+                      to={item.to ?? `/settings/${item.id}`}
+                      onClick={onNavClick}
+                      data-testid={`settings-nav-${item.id}`}
+                      componentId={`settings.nav.${item.id}`}
+                      aria-current={selected ? "page" : undefined}
+                    >
+                      <Icon
+                        className={cn(
+                          "ui-icon",
+                          selected
+                            ? "text-[var(--sidebar-active-foreground)]"
+                            : "text-muted-foreground",
+                        )}
+                      />
+                      {item.label}
+                    </Link>
+                  </Button>
+                );
+              })}
+            </div>
           </div>
         ))}
       </nav>

@@ -74,6 +74,20 @@ async def test_handle_async_request_raises_connect_error_on_race() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_for_runner_resolves_on_register_and_times_out_when_absent() -> None:
+    """wait_for_runner parks until the runner registers, else returns False at the deadline."""
+    reg = TunnelRegistry()
+    transport = WSTunnelTransport(reg, "r1")
+
+    assert await transport.wait_for_runner(0.05) is False
+
+    waiter = asyncio.ensure_future(transport.wait_for_runner(5.0))
+    await asyncio.sleep(0)
+    reg.register("r1", _NoopWS(), _hello())
+    assert await asyncio.wait_for(waiter, timeout=1.0) is True
+
+
+@pytest.mark.asyncio
 async def test_handle_async_request_returns_response() -> None:
     """A full request/response cycle through the transport."""
     reg = TunnelRegistry()

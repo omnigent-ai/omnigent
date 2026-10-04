@@ -77,12 +77,8 @@ import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
-import {
-  WorkspacePicker,
-  isNavigablePath,
-  resolveWorkspacePath,
-  useResolvedHostHome,
-} from "./WorkspacePicker";
+import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
@@ -735,7 +731,6 @@ export function ForkSessionForm({
   const [workspace, setWorkspace] = useState("");
   const [branchName, setBranchName] = useState("");
   const [browsing, setBrowsing] = useState(false);
-  const [browseNonce, setBrowseNonce] = useState(0);
   // True when the user picked a server-provisioned sandbox instead of a
   // connected host — the fork then carries host_type "managed" and the
   // server provisions its compute, so no launchRunner call follows.
@@ -818,8 +813,8 @@ export function ForkSessionForm({
   // "databricks_coding_agent (fork ag_a) (fork ag_b)" or
   // "claude-native-ui (switch ag_c)", neither of which matches a built-in by
   // name. agentRootName peels ALL layers — a single-layer / fork-only strip
-  // (the previous regex here) would miss nested clones and every "(switch …)"
-  // clone the in-place switch-agent flow creates — so the label resolves and
+  // (the previous regex here) would miss nested clones and the "(switch …)"
+  // clones older sessions still carry, so the label resolves and
   // the dedup below still hides the source's own agent.
   const sourceAgentName = sourceAgent?.name ?? null;
   const sourceAgentBaseName = sourceAgentName ? agentRootName(sourceAgentName) : null;
@@ -1114,7 +1109,6 @@ export function ForkSessionForm({
   function commitWorkspacePath(path: string): void {
     setWorkspace(path);
     setBrowsing(true);
-    setBrowseNonce((n) => n + 1);
   }
 
   /** Target the clone at a connected host, dropping any sandbox pick. */
@@ -1680,20 +1674,13 @@ export function ForkSessionForm({
                           recent={recent}
                           dropdownDisabled={browsing}
                         />
-                        {browsing && (
-                          <WorkspacePicker
-                            key={browseNonce}
-                            hostId={selectedHostId}
-                            initialPath={
-                              isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
-                            }
-                            onSelect={(path) => {
-                              setWorkspace(path);
-                              setBrowsing(false);
-                            }}
-                            onClose={() => setBrowsing(false)}
-                          />
-                        )}
+                        <WorkspacePickerDialog
+                          open={browsing}
+                          onOpenChange={setBrowsing}
+                          hostId={selectedHostId}
+                          initialPath={workspaceTrimmed}
+                          onConfirm={setWorkspace}
+                        />
                         {showMismatchWarning && (
                           <p
                             className="flex items-start gap-1.5 text-sm text-warning"

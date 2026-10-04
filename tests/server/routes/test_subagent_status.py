@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.runtime import session_stream
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, session_metadata_logging
 from omnigent.server.routes import sessions
 from omnigent.server.routes._sessions import common
 from omnigent.server.routes.sessions import routes_events
@@ -26,6 +26,7 @@ from omnigent.server.schemas import BackgroundTaskInfo
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from tests.debug_log_helpers import capture_debug_rows
 
 _BACKGROUND_TASK = BackgroundTaskInfo(status="running", description="Wait for CI")
 
@@ -306,13 +307,18 @@ async def test_subagent_idle_validates_optional_response_id(
     assert route.forwarded == []
 
 
-@pytest.mark.parametrize("status", ["idle", "running", "failed"])
+@pytest.mark.parametrize(
+    ("status", "turn_outcome"),
+    [("idle", None), ("running", None), ("failed", None), ("idle", "cancelled")],
+)
 async def test_external_session_status_still_forwards_to_runner(
-    status_route: _StatusRoute, status: str
+    status_route: _StatusRoute, status: str, turn_outcome: str | None
 ) -> None:
     route = status_route
     sid = route.child_id
     data = {"status": status, "output": "authoritative result"}
+    if turn_outcome is not None:
+        data["turn_outcome"] = turn_outcome
     response = await route.client.post(
         f"/v1/sessions/{sid}/events", json={"type": "external_session_status", "data": data}
     )
@@ -324,3 +330,107 @@ async def test_external_session_status_still_forwards_to_runner(
     assert body["type"] == "external_session_status"
     assert body["data"] == data
     assert route.telemetry.call_count == (0 if status == "running" else 1)
+
+
+@pytest.mark.parametrize("is_child", [False, True], ids=["main", "native-child"])
+@pytest.mark.parametrize(
+    ("event_type", "data"),
+    [
+        ("external_session_status", {"status": "running"}),
+        ("external_session_status", {"status": "failed"}),
+        ("subagent.status", {"idle": True}),
+    ],
+)
+async def test_status_observes_existing_session_metadata_off_event_loop(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    is_child: bool,
+    event_type: str,
+    data: dict[str, Any],
+) -> None:
+    route = status_route
+    sid = route.child_id if is_child else route.parent_id
+    if is_child:
+        route.store.set_labels(sid, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
+    monkeypatch.setattr(routes_events, "debug_sink_enabled", lambda: True)
+    monkeypatch.setattr(session_metadata_logging, "debug_sink_enabled", lambda: True)
+    event_loop_thread = threading.get_ident()
+    observe = routes_events.log_session_metadata
+
+    def observe_in_worker(*args: Any, **kwargs: Any) -> None:
+        assert threading.get_ident() != event_loop_thread
+        observe(*args, **kwargs)
+
+    monkeypatch.setattr(routes_events, "log_session_metadata", observe_in_worker)
+    with capture_debug_rows("server") as rows:
+        response = await route.client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": event_type, "data": data},
+        )
+
+    assert response.status_code == 202, response.text
+    observations = [row for row in rows if row["event_name"] == "session_metadata"]
+    assert len(observations) == 1
+    assert observations[0]["session_id"] == sid
+    attrs = observations[0]["attributes"]
+    assert attrs["observation"] == event_type
+    assert attrs["root_session_id"] == route.parent_id
+    if is_child:
+        assert attrs["session_kind"] == "sub_agent"
+        assert attrs["parent_session_id"] == route.parent_id
+        assert attrs["harness"] == "claude-native"
+    else:
+        assert attrs["session_kind"] == "default"
+        assert "parent_session_id" not in attrs
+        assert "harness" not in attrs
+        assert attrs["harness_source"] == "missing_agent"
+        assert attrs["harness_resolution"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("harness", "status", "confirmation", "wrapper", "expected"),
+    [
+        ("claude-native", "idle", {}, None, None),
+        ("claude-native", "idle", {"turn_completed": True}, None, "completed"),
+        ("cursor-native", "idle", {"turn_outcome": "cancelled"}, None, "cancelled"),
+        ("cursor-native", "idle", {"turn_outcome": "failed"}, None, "failed"),
+        ("codex-native", "idle", {}, None, "completed"),
+        ("claude-native", "failed", {}, None, "failed"),
+        (
+            "claude-native",
+            "idle",
+            {"turn_completed": True},
+            "claude-code-native-ui-subagent",
+            None,
+        ),
+        ("claude-native", "failed", {}, "claude-code-native-ui-subagent", None),
+    ],
+)
+async def test_external_child_activity_uses_confirmed_outcome(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    status: str,
+    confirmation: dict[str, Any],
+    wrapper: str | None,
+    expected: str | None,
+) -> None:
+    route = status_route
+    if wrapper is not None:
+        route.store.set_labels(route.child_id, {"omnigent.wrapper": wrapper})
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: harness)
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": status, "response_id": "child-turn", **confirmation},
+        },
+    )
+    assert response.status_code == 202, response.text
+    items = route.store.list_items(route.parent_id).data
+    if expected is None:
+        assert items == []
+    else:
+        assert len(items) == 1
+        assert items[0].data.event_type == "session.subagent.returned"
+        assert items[0].data.resource["status"] == expected

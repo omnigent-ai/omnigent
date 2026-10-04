@@ -40,11 +40,13 @@ describe("ensureServerAuth", () => {
     mock.method(cli, "isLoopbackServer", () => false);
     mock.method(cli, "probeServerAuth", async () => ({ authed: true, reachable: true }));
     const login = mock.method(cli, "loginServer", async () => ({ ok: false, output: "" }));
+    const onLogin = mock.fn();
 
-    const res = await ensureServerAuth(CLI_PATH, SERVER);
+    const res = await ensureServerAuth(CLI_PATH, SERVER, { onLogin });
 
     assert.deepEqual(res, { ok: true });
     assert.equal(login.mock.callCount(), 0);
+    assert.equal(onLogin.mock.callCount(), 0);
   });
 
   it("skips login (defers to the connect attempt) when the server is unreachable", async () => {
@@ -62,11 +64,13 @@ describe("ensureServerAuth", () => {
     mock.method(cli, "isLoopbackServer", () => false);
     mock.method(cli, "probeServerAuth", async () => ({ authed: false, reachable: true }));
     const login = mock.method(cli, "loginServer", async () => ({ ok: true, output: "Logged in." }));
+    const onLogin = mock.fn();
 
-    const res = await ensureServerAuth(CLI_PATH, SERVER);
+    const res = await ensureServerAuth(CLI_PATH, SERVER, { onLogin });
 
     assert.deepEqual(res, { ok: true });
     assert.equal(login.mock.callCount(), 1);
+    assert.equal(onLogin.mock.callCount(), 1);
     assert.deepEqual(login.mock.calls[0].arguments, [CLI_PATH, SERVER]);
   });
 

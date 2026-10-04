@@ -208,7 +208,7 @@ export function HeaderConversationMenu({
     // and per-call mutate callbacks don't fire once their observer unmounts.
     // The Undo toast is driven by module state + the app-level Toaster, so it
     // survives this menu unmounting.
-    showArchiveUndoToast(queryClient, [conversation]);
+    showArchiveUndoToast(queryClient, [conversation], navigate);
   };
 
   const mainItems = (

@@ -163,3 +163,22 @@ it("does not pretend login stopped if cancellation itself fails", async (t) => {
   assert.equal(h.cancel.disabled, false);
   assert.match(h.error.textContent, /Could not cancel sign-in/);
 });
+
+it("offers a fresh browser sign-in for Databricks workspaces only", async (t) => {
+  const h = await harness(t);
+  const other = h.document.getElementById("other-account");
+  assert.equal(other.hidden, false);
+  other.click();
+  assert.equal(h.requests[0].url, SERVER);
+  assert.equal(h.requests[0].browserSignIn, true);
+  assert.equal(other.disabled, true);
+  h.requests[0].resolve({});
+  await tick();
+  h.connect.click();
+  assert.equal(h.requests[1].browserSignIn, undefined);
+  h.requests[1].resolve({});
+  await tick();
+  h.input.value = "http://localhost:6767";
+  h.input.dispatchEvent(new h.window.Event("input"));
+  assert.equal(other.hidden, true);
+});

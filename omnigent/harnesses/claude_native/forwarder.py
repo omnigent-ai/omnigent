@@ -12,12 +12,13 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
 
+from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -37,6 +38,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_hook_events_since_with_position,
     read_message_deltas_from_offset,
     read_pane_signals,
+    read_seen_claude_session_ids,
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
@@ -56,6 +58,7 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
 )
 from omnigent.process_logging import harness_stderr_capture_enabled
+from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     encode_session_event_batch,
@@ -73,6 +76,9 @@ _INVOCATION_SETTINGS_FILE = "claude-settings.json"
 # Keep child-history requests below the server's 10 MiB API ceiling to bound
 # per-request latency and retry cost while still accommodating large events.
 MAX_SUBAGENT_EVENT_BATCH_BYTES = 5 * 1024 * 1024
+# Keep preview batches small so live text does not monopolize the server.
+_MAX_DELTA_BATCH_EVENTS = 32
+_MAX_DELTA_BATCH_BYTES = 256 * 1024
 _TRUNCATABLE_SUBAGENT_FIELDS = frozenset(
     {"arguments", "content", "input", "output", "stderr", "stdout", "text"}
 )
@@ -1133,6 +1139,7 @@ async def forward_claude_transcript_to_session(
     auth: httpx.Auth | None = None,
     skip_user_messages: bool = False,
     start_at_offset: int | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> None:
     """
     Tail Claude's JSONL transcript and mirror semantic items into AP.
@@ -1187,6 +1194,7 @@ async def forward_claude_transcript_to_session(
     )
     subagent_status_retries = _PostRetryTracker()
     session_event_batch_capability = _SessionEventBatchCapability()
+    delta_batch_capability = _SessionEventBatchCapability()
     subagent_status_capability = _SubagentStatusCapability()
     # Dedupe: Claude rewrites the same usage block every poll until
     # the next assistant entry; only POST on real change. Mutated in
@@ -1218,9 +1226,19 @@ async def forward_claude_transcript_to_session(
 
     async with (
         _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s),
-        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
         open_server_client(
-            base_url, headers=headers, auth=auth, timeout=timeout
+            base_url,
+            headers=headers,
+            auth=auth,
+            timeout=timeout,
+            event_dispatcher=event_dispatcher,
+        ) as client,
+        open_server_client(
+            base_url,
+            headers=headers,
+            auth=auth,
+            timeout=timeout,
+            event_dispatcher=event_dispatcher,
         ) as subagent_client,
     ):
         while True:
@@ -1387,6 +1405,7 @@ async def forward_claude_transcript_to_session(
                             bridge_dir=bridge_dir,
                             state=delta_state,
                             seen_keys=seen_delta_keys,
+                            batch_capability=delta_batch_capability,
                         )
                         # Mint a pending token for any PreCompact that first
                         # became visible THIS poll, before the transcript items
@@ -1418,10 +1437,9 @@ async def forward_claude_transcript_to_session(
                             # The turn-end edges (Stop→idle / StopFailure→failed)
                             # carry the turn's response id so ap-web can CLOSE the
                             # streaming ``activeResponse`` opened by the turn-start
-                            # ``running`` edge (_forward_available_items). The
-                            # transcript forwarder ran just above, so
-                            # ``state.current_response_id`` is the active turn's id
-                            # (the user-message reset only fires on the next turn).
+                            # ``running`` edge. The transcript forwarder ran just
+                            # above, so ``state.current_response_id`` is the active
+                            # turn's id.
                             response_id=state.current_response_id,
                         )
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
@@ -1786,6 +1804,12 @@ def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, o
             "item_type": item.item_type,
             "item_data": item.data,
             "response_id": item.response_id,
+            **(
+                {"subagent_return_id": item.subagent_return_id}
+                if item.subagent_return_id is not None
+                else {}
+            ),
+            **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
         },
     }
 
@@ -3015,6 +3039,7 @@ async def supervise_forwarder(
     auth: httpx.Auth | None = None,
     skip_user_messages: bool = False,
     start_at_offset: int | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> None:
     """
     Run :func:`forward_claude_transcript_to_session` under a restart supervisor.
@@ -3077,6 +3102,7 @@ async def supervise_forwarder(
                 auth=auth,
                 skip_user_messages=skip_user_messages,
                 start_at_offset=start_at_offset,
+                event_dispatcher=event_dispatcher,
             )
             # The forwarder loop is ``while True`` and is not expected
             # to return normally. Treat any normal return as a crash
@@ -3439,24 +3465,47 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
-def _is_subagent_hook_record(record: ClaudeHookRecord) -> bool:
+def _stop_failure_detail(record: ClaudeHookRecord) -> str | None:
+    """
+    Return the reason a ``StopFailure`` hook gives for its failed turn.
+
+    The hook carries the error text Claude Code rendered, which the transcript
+    mirror can deliver after the failed edge or not at all; without it the
+    server borrows the turn's last prose or reports no detail.
+
+    :param record: ``StopFailure`` hook record.
+    :returns: The error text, a category-only fallback, or ``None``.
+    """
+    if record.failure_message is not None:
+        return record.failure_message
+    if record.failure_category is not None:
+        return f"Claude Code ended the turn with an API error ({record.failure_category})."
+    return None
+
+
+def _is_subagent_hook_record(
+    record: ClaudeHookRecord,
+    *,
+    parent_claude_session_ids: Collection[str] | None = None,
+) -> bool:
     """
     Return whether a hook record originated from a Claude subagent.
 
-    Claude Code subagent transcripts live under a ``subagents/``
-    subdirectory (e.g.
-    ``~/.claude/projects/<encoded>/<session>/subagents/agent-<id>.jsonl``).
-    When a subagent fires a lifecycle hook (``Stop``,
-    ``UserPromptSubmit``), its ``transcript_path`` contains that
-    ``subagents`` component. The parent process's transcript lives
-    one level up (``<session>.jsonl``) and never contains it.
-
-    :param record: Claude hook record read from ``hooks.jsonl``.
-    :returns: ``True`` when the record's transcript path indicates a
-        subagent, ``False`` otherwise (including when no transcript
-        path is available — conservative default so parent events
-        are never accidentally dropped).
+    Primary: a session id absent from the set of ids ever pinned to
+    this bridge belongs to a background subagent process. In-process
+    subagents share the parent's session id and transcript path, so an
+    ``agent_id`` marks them. Fallback: the ``subagents/`` path component.
     """
+    if record.agent_id is not None:
+        return True
+    # Primary: id not in any id the parent has ever held → subagent.
+    if (
+        parent_claude_session_ids
+        and record.claude_session_id
+        and record.claude_session_id not in parent_claude_session_ids
+    ):
+        return True
+    # Fallback: subagent directory structure.
     if record.transcript_path is None:
         return False
     return "subagents" in record.transcript_path.parts
@@ -3728,6 +3777,10 @@ async def _forward_available_status_events(
         retried and the failing event is retried later.
     """
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
+    # Read all session ids ever pinned to this bridge so a rotation race
+    # (batch spans the old id's StopFailure and the new SessionStart)
+    # does not drop the parent's own failure as a subagent event.
+    parent_claude_session_ids = read_seen_claude_session_ids(bridge_dir)
     if not result.records:
         if result.event_cursor == state.event_cursor and result.byte_offset == (
             state.byte_offset or 0
@@ -3759,7 +3812,9 @@ async def _forward_available_status_events(
         # failure must NOT flip the parent session to ``failed`` — the
         # parent turn is still running while it awaits the Agent tool
         # result.
-        if status is not None and _is_subagent_hook_record(record):
+        if status is not None and _is_subagent_hook_record(
+            record, parent_claude_session_ids=parent_claude_session_ids
+        ):
             _logger.debug(
                 "Skipping subagent hook status; session=%s event=%s status=%s transcript=%s",
                 session_id,
@@ -3772,6 +3827,25 @@ async def _forward_available_status_events(
             await _write_hook_state_async(bridge_dir, durable)
             continue
         if status is None:
+            if record.event_name == "UserPromptSubmit" and not _is_subagent_hook_record(
+                record, parent_claude_session_ids=parent_claude_session_ids
+            ):
+                with contextlib.suppress(Exception):
+                    # This proves Claude saw a submit; later hooks can still block the turn.
+                    _logger.info(
+                        "Claude UserPromptSubmit observed; "
+                        "session=%s hook_cursor=%s recorded_at=%s",
+                        session_id,
+                        record.event_cursor,
+                        record.recorded_at,
+                        extra=debug_event(
+                            "claude_native_prompt_submit_hook",
+                            session_id=session_id,
+                            claude_session_id=record.claude_session_id,
+                            hook_cursor=record.event_cursor,
+                            hook_recorded_at=record.recorded_at,
+                        ),
+                    )
             # Compaction boundary (PreCompact / SessionStart source=compact)
             # → forward as a compaction-status event so the web UI brackets
             # Claude's real terminal compaction with its spinner. Best-effort:
@@ -3996,6 +4070,10 @@ async def _forward_available_status_events(
                 session_id=session_id,
                 status=status,
                 response_id=response_id,
+                # The ``Stop`` hook fires exactly once per finished turn and
+                # never on an interrupt, so its ``idle`` edge is a confirmed
+                # turn completion, unlike quiescence-derived idles.
+                turn_completed=True if status == "idle" else None,
                 # Only the ``Stop`` (idle) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
                 # This is the one thing the status file cannot report: its
@@ -4009,6 +4087,7 @@ async def _forward_available_status_events(
                 # the UI can name the shells. Dropped on ``failed`` for the same
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
+                failure_detail=_stop_failure_detail(record) if status == "failed" else None,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
@@ -5110,6 +5189,12 @@ async def _post_external_conversation_item(
                     # the server derives the item's id from this and treats
                     # a re-post as a no-op instead of a duplicate.
                     "source_id": item.source_id,
+                    **(
+                        {"subagent_return_id": item.subagent_return_id}
+                        if item.subagent_return_id is not None
+                        else {}
+                    ),
+                    **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
                 },
             },
         )
@@ -5139,17 +5224,60 @@ async def _post_external_output_text_delta(
     """
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_output_text_delta",
-            "data": {
-                "delta": delta.delta,
-                "message_id": delta.message_id,
-                "index": delta.index,
-                "final": delta.final,
-            },
-        },
+        json=_delta_event(delta),
     )
     resp.raise_for_status()
+
+
+def _delta_event(delta: ClaudeMessageDelta) -> dict[str, object]:
+    return {
+        "type": "external_output_text_delta",
+        "data": {
+            "delta": delta.delta,
+            "message_id": delta.message_id,
+            "index": delta.index,
+            "final": delta.final,
+        },
+    }
+
+
+async def _post_delta_batch(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    deltas: list[ClaudeMessageDelta],
+    batch_capability: _SessionEventBatchCapability,
+) -> None:
+    async def post_individually() -> None:
+        for delta in deltas:
+            try:
+                await _post_external_output_text_delta(client, session_id=session_id, delta=delta)
+            except httpx.HTTPError as exc:
+                _logger.debug(
+                    "Dropping Claude streamed delta after HTTP failure; session=%s "
+                    "message_id=%s index=%s http_status=%s",
+                    session_id,
+                    delta.message_id,
+                    delta.index,
+                    _http_status_for_log(exc),
+                    extra={"session_id": session_id},
+                )
+
+    if len(deltas) == 1 or batch_capability.supported is False:
+        await post_individually()
+        return
+    events = [_delta_event(delta) for delta in deltas]
+    try:
+        response = await client.post(f"/v1/sessions/{session_id}/events", json=events)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 422:
+            raise
+        # Servers predating event arrays reject a list before applying entries.
+        batch_capability.supported = False
+        await post_individually()
+    else:
+        batch_capability.supported = True
 
 
 async def _forward_available_deltas(
@@ -5159,6 +5287,7 @@ async def _forward_available_deltas(
     bridge_dir: Path,
     state: DeltaForwardState,
     seen_keys: dict[tuple[str, int], None],
+    batch_capability: _SessionEventBatchCapability | None = None,
 ) -> DeltaForwardState:
     """
     Forward newly appended assistant-text deltas to the active session.
@@ -5194,28 +5323,51 @@ async def _forward_available_deltas(
     )
     if result.byte_offset == state.byte_offset and not result.deltas:
         return state
+    if batch_capability is None:
+        batch_capability = _SessionEventBatchCapability()
+    pending: list[ClaudeMessageDelta] = []
+    pending_bytes = 2  # JSON array brackets
+
+    async def flush() -> None:
+        nonlocal pending, pending_bytes
+        if not pending:
+            return
+        try:
+            await _post_delta_batch(
+                client,
+                session_id=session_id,
+                deltas=pending,
+                batch_capability=batch_capability,
+            )
+        except httpx.HTTPError as exc:
+            _logger.debug(
+                "Dropping %d Claude streamed deltas after HTTP failure; session=%s http_status=%s",
+                len(pending),
+                session_id,
+                _http_status_for_log(exc),
+                extra={"session_id": session_id},
+            )
+        pending = []
+        pending_bytes = 2
+
     for delta in result.deltas:
         key = (delta.message_id, delta.index)
         if key in seen_keys:
             continue
         seen_keys[key] = None
-        # Bound the dedupe ring by evicting the oldest key (dicts are
-        # insertion-ordered) so a very long session can't grow it without
-        # limit.
         while len(seen_keys) > _MAX_SEEN_DELTA_KEYS:
             del seen_keys[next(iter(seen_keys))]
-        try:
-            await _post_external_output_text_delta(client, session_id=session_id, delta=delta)
-        except httpx.HTTPError as exc:
-            _logger.debug(
-                "Dropping Claude streamed delta after HTTP failure; session=%s "
-                "message_id=%s index=%s http_status=%s",
-                session_id,
-                delta.message_id,
-                delta.index,
-                _http_status_for_log(exc),
-                extra={"session_id": session_id},
-            )
+        event_bytes = len(encode_session_event_batch([_delta_event(delta)])) - 2
+        if pending and (
+            len(pending) >= _MAX_DELTA_BATCH_EVENTS
+            or pending_bytes + 1 + event_bytes > _MAX_DELTA_BATCH_BYTES
+        ):
+            await flush()
+        pending.append(delta)
+        pending_bytes += event_bytes + (1 if len(pending) > 1 else 0)
+        if pending_bytes >= _MAX_DELTA_BATCH_BYTES:
+            await flush()
+    await flush()
     updated = DeltaForwardState(byte_offset=result.byte_offset)
     await _write_delta_forward_state_async(bridge_dir, updated)
     return updated

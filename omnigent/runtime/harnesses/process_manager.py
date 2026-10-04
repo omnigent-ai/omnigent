@@ -813,9 +813,8 @@ class HarnessProcessManager:
             if entry is not None and harness != "any" and entry.harness != harness:
                 # The harness is fixed at spawn time (it selects which runner
                 # module the subprocess loads), but the socket is keyed by
-                # conversation only — so after an in-place agent switch
-                # (``POST /v1/sessions/{id}/switch-agent``) a later turn
-                # resolves a DIFFERENT harness and must respawn, otherwise the
+                # conversation only, so if the session's agent binding changes,
+                # a later turn resolves a DIFFERENT harness and must respawn, otherwise the
                 # cached subprocess keeps serving the old harness. Mirrors the
                 # model-change respawn below.
                 #
@@ -1550,13 +1549,40 @@ async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) ->
     :returns: None.
     """
     root = tmp_parent if tmp_parent is not None else _default_tmp_parent()
-    if not root.exists():
+    try:
+        if not root.exists():
+            return
+    except OSError as exc:
+        _logger.warning(
+            "cannot access %s for the orphan sweep: %s; skipping sweep",
+            root,
+            exc,
+        )
         return
-    for child in root.iterdir():
-        if not child.is_dir() or not child.name.startswith("ap-"):
-            continue
-        sentinel = child / _AP_PID_FILE
-        if not sentinel.exists():
+    try:
+        children = list(root.iterdir())
+    except OSError as exc:
+        _logger.warning(
+            "cannot enumerate %s for the orphan sweep: %s; skipping sweep",
+            root,
+            exc,
+        )
+        return
+    for child in children:
+        try:
+            if not child.is_dir() or not child.name.startswith("ap-"):
+                continue
+            sentinel = child / _AP_PID_FILE
+            if not sentinel.exists():
+                # No sentinel: directory either pre-dates the
+                # convention or is mid-creation. Leave alone.
+                continue
+        except OSError as exc:
+            _logger.warning(
+                "cannot inspect %s during the orphan sweep: %s; skipping",
+                child,
+                exc,
+            )
             continue
         try:
             pid = int(sentinel.read_text(encoding="utf-8").strip())

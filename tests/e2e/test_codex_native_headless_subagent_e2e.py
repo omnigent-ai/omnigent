@@ -28,8 +28,6 @@ credential)::
 
 from __future__ import annotations
 
-import io
-import json
 import os
 import secrets
 import shutil
@@ -37,13 +35,14 @@ import signal
 import socket
 import subprocess
 import sys
-import tarfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -231,13 +230,8 @@ def credential_less_codex_rig(
 
 def _spec_bundle() -> bytes:
     """Gzip the codex sub-agent spec as a session bundle (strict parser path)."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = _CODEX_SUBAGENT_YAML.encode()
-        info = tarfile.TarInfo("config.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
+    data = _CODEX_SUBAGENT_YAML.encode()
+    return bundle_files({"config.yaml": data})
 
 
 @pytest.mark.timeout(400)
@@ -254,21 +248,18 @@ def test_polly_shaped_codex_subagent_first_turn_survives_headless_dispatch(
     """
     base_url, runner_id, runner_log = credential_less_codex_rig
 
-    create = _client.post(
+    create = post_session_bundle(
+        _client.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"workspace": str(_REPO_ROOT)})},
-        files={"bundle": ("codex.tar.gz", _spec_bundle(), "application/gzip")},
+        _spec_bundle(),
+        metadata={"workspace": str(_REPO_ROOT)},
+        filename="codex.tar.gz",
         timeout=30.0,
     )
     create.raise_for_status()
     session_id = str(create.json()["session_id"])
     try:
-        bind = _client.patch(
-            f"{base_url}/v1/sessions/{session_id}",
-            json={"runner_id": runner_id},
-            timeout=60.0,
-        )
-        bind.raise_for_status()
+        bind_session_runner(_client.patch, base_url, session_id, runner_id, timeout=60.0)
 
         send = _client.post(
             f"{base_url}/v1/sessions/{session_id}/events",

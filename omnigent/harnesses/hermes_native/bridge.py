@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import TypeAlias
 
 from omnigent._platform import stable_user_id
+from omnigent.native.input_ready import PaneSettledProbe
 
 _logger = logging.getLogger(__name__)
 
@@ -298,6 +299,13 @@ def _load_user_hermes_config() -> _ConfigObject:
 _MCP_BRIDGE_CONFIG_FILE = "bridge.json"
 
 
+def _policy_hook_script_path() -> str:
+    """Absolute path to the shipped hook entrypoint, resolved from its module."""
+    from omnigent.inner import hermes_policy_hook
+
+    return str(Path(hermes_policy_hook.__file__).resolve())
+
+
 def write_policy_hook_config(
     bridge_dir: Path,
     server_url: str,
@@ -338,7 +346,7 @@ def write_policy_hook_config(
     # token-bearing hook wrapper.
     _ensure_dir(hermes_home)
 
-    hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
+    hook_script_path = _policy_hook_script_path()
 
     # Wrapper shell script: sets env vars and execs the Python hook. It bakes a
     # one-shot auth token + workspace-routing header, so it is owner-only
@@ -438,7 +446,7 @@ def inject_relay_into_policy_hook(
     if not wrapper.is_file():
         return False
 
-    hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
+    hook_script_path = _policy_hook_script_path()
     from omnigent.native.native_policy_hook import _RELAY_TOKEN_ENV, _RELAY_URL_ENV
 
     new_text = (
@@ -923,3 +931,8 @@ def send_hermes_pane_keys(bridge_dir: Path, *keys: str) -> None:
     if info is None:
         raise RuntimeError("hermes-native tmux target not advertised")
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)
+
+
+#: Provider ``input_ready_probe``: Hermes renders no idle marker, so apply the
+#: same pane-settled gate as :func:`_settle_pane` to the watcher's captures.
+native_input_ready = PaneSettledProbe(_SETTLE_STABLE_POLLS)

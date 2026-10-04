@@ -329,6 +329,12 @@ function splitPath(path: string): { dir: string; name: string } {
 type DiffOptions = React.ComponentProps<typeof FileDiff>["options"];
 
 /**
+ * Files with more unified diff lines than this wait for "Show diff": FileDiff
+ * tokenizes on the main thread (disableWorkerPool), so a huge file freezes the app.
+ */
+export const LARGE_DIFF_THRESHOLD = 2000;
+
+/**
  * One file's section in the stacked diff: a sticky grey header (chevron + status
  * + path + diffstat) and the file's rendered diff. Clicking the header toggles
  * the diff open/closed. The diff mounts lazily once the section nears the
@@ -353,6 +359,7 @@ function GithubFileSection({
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [seen, setSeen] = useState(false);
+  const [showLargeDiff, setShowLargeDiff] = useState(false);
 
   useEffect(() => {
     registerRef(file.path, ref.current);
@@ -418,6 +425,17 @@ function GithubFileSection({
         <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           Loading diff…
+        </div>
+      ) : fileDiff && fileDiff.unifiedLineCount > LARGE_DIFF_THRESHOLD && !showLargeDiff ? (
+        <div className="flex items-center gap-3 p-4 text-ui text-muted-foreground">
+          Large diff — {fileDiff.unifiedLineCount.toLocaleString()} lines
+          <button
+            type="button"
+            className="text-foreground underline-offset-2 hover:underline"
+            onClick={() => setShowLargeDiff(true)}
+          >
+            Show diff
+          </button>
         </div>
       ) : fileDiff ? (
         <FileDiff fileDiff={fileDiff} options={options} disableWorkerPool />
@@ -878,11 +896,13 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
         </a>
       </div>
     ) : undefined;
+  const showTrackingControls = !!associations?.tracking_available && !linkInEmptyState;
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {associations?.tracking_available && !linkInEmptyState && (
-        <div className="shrink-0 border-b border-border p-2">
-          <div className="flex items-center gap-2">
+      {showTrackingControls ? (
+        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
+          <h2 className="shrink-0 font-medium text-ui">GitHub</h2>
+          <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
             {prs.length > 0 && (
               <TooltipProvider>
                 <Select
@@ -974,8 +994,14 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               </TooltipProvider>
             </div>
           </div>
-          {linkControls}
         </div>
+      ) : (
+        <div className="flex h-11 shrink-0 items-center border-b border-border px-2">
+          <h2 className="font-medium text-ui">GitHub</h2>
+        </div>
+      )}
+      {showTrackingControls && (linking || update.isError) && (
+        <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
       )}
       <div className="min-h-0 flex-1">
         <GithubPanelDetails

@@ -420,6 +420,29 @@ overrides this auto-selection.
 > `403` even though the host connects. Framework-level; applies to every sandbox
 > provider (Modal / Daytona / Islo / Kubernetes / …).
 
+### Browser origin allowlist
+
+Independent of the auth mode above, the server also checks the browser
+`Origin` header on WebSocket handshakes and file-upload POSTs — the only
+signal that tells the user's own web UI apart from some other page open in
+the same browser. Set `OMNIGENT_WS_ALLOWED_ORIGINS` (comma-separated) to
+trust origins beyond the server's own host, e.g. when the web UI is reached
+through a proxy, tunnel, or a domain the server doesn't know about itself.
+
+An entry's host may start with `*.` to trust every subdomain of a domain in
+one entry, instead of listing each hostname individually — useful when many
+or rotating subdomains all serve the same deploy (per-workspace subdomains,
+preview environments, a tunnel provider's generated hostnames, …):
+
+```dotenv
+OMNIGENT_WS_ALLOWED_ORIGINS=https://*.example.com
+```
+
+This matches `https://foo.example.com` and `https://a.b.example.com` (any
+subdomain depth), but not the bare `https://example.com` itself. See
+[`tailscale/README.md`](tailscale/README.md) for a worked example
+using Tailscale's per-device hostnames.
+
 ### Single sign-on (OIDC)
 
 The built-in `accounts` flow needs no setup beyond the deploy itself. To let
@@ -442,6 +465,12 @@ docker compose up -d        # restart to apply
 
 Your team signs in with their existing accounts, and there are no passwords
 for you to manage. Nothing else about the app changes.
+
+Generic OIDC also supports public PKCE clients without a client secret,
+PS256-signed identity tokens, and operator-configured authorization/token/JWKS
+endpoints. See [public clients and explicit endpoints](docker/README.md#public-pkce-clients-and-explicit-endpoints)
+for configuration and security considerations. Existing client-secret login
+remains the default.
 
 > [!TIP]
 > The only outside step is creating an app with your provider (e.g. Google

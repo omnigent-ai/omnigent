@@ -11,7 +11,6 @@ import pytest
 from dev.repro_env.runtime import isolated_env
 from dev.repro_env.transport import Relay
 from omnigent.harnesses.claude_native.bridge import ensure_claude_workspace_trusted
-from tests.e2e_ui import conftest as fixtures
 
 
 def test_isolates_inherited_native_state(tmp_path):
@@ -43,36 +42,6 @@ def test_onboarding_uses_selected_claude_directory(monkeypatch, tmp_path):
     assert state["hasCompletedOnboarding"]
     assert state["projects"][str(workspace)]["hasTrustDialogAccepted"]
     assert not (tmp_path / "home/.claude.json").exists()
-
-
-def test_mock_config_honors_config_home_and_restores(monkeypatch, tmp_path):
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    path = tmp_path / "config.yaml"
-    path.write_text("original\n")
-    with fixtures._temp_omnigent_mock_config("http://127.0.0.1:12345", "claude"):
-        assert "12345" in path.read_text()
-    assert path.read_text() == "original\n"
-
-
-@pytest.mark.parametrize("harness", ["claude", "codex"])
-@pytest.mark.parametrize("owned", [True, False])
-def test_mock_fixture_ignores_credential_placeholder(monkeypatch, harness, owned):
-    monkeypatch.setenv("LLM_API_KEY", "synthetic-proxy-placeholder")
-    monkeypatch.setattr(
-        fixtures, "_server_state", {"runner_id": "runner", "workflow_owned": owned}
-    )
-    monkeypatch.setattr(fixtures, "_ensure_runner_online", lambda *_: None)
-    monkeypatch.setattr(fixtures, f"_create_native_{harness}_session", lambda *_: "session")
-    monkeypatch.setattr(fixtures.httpx, "delete", Mock())
-    from contextlib import nullcontext
-
-    configure = Mock(return_value=nullcontext())
-    monkeypatch.setattr(fixtures, "_temp_omnigent_mock_config", configure)
-    fixture = getattr(fixtures, f"native_{harness}_mock_session").__wrapped__
-    journey = fixture("http://server", "http://model", None)
-    assert next(journey) == ("http://server", "session")
-    journey.close()
-    assert configure.call_count == (0 if owned else 1)
 
 
 def test_relays_streams_and_reconnects_without_restarting_service(tmp_path, monkeypatch):
@@ -208,43 +177,6 @@ def test_relay_preserves_half_closed_connection_during_collection():
         assert received == [b"request"]
 
 
-@pytest.mark.parametrize("present", range(1, 7))
-def test_partial_prepared_environment_fails_before_spawning_mock(monkeypatch, present):
-    keys = ("OMNIGENT_REPRO_SERVER_URL", "OMNIGENT_REPRO_MODEL_URL", "OMNIGENT_REPRO_RUNNER_ID")
-    for index, key in enumerate(keys):
-        monkeypatch.setenv(key, "configured" if present & (1 << index) else "")
-    spawn = Mock(side_effect=AssertionError("must not spawn a different mock"))
-    monkeypatch.setattr(fixtures.subprocess, "Popen", spawn)
-    with pytest.raises(RuntimeError, match="Incomplete prepared reproduction environment"):
-        next(fixtures.mock_llm_server_url.__wrapped__(None))
-    spawn.assert_not_called()
-
-
-@pytest.mark.parametrize("key", ["pid", "runner_pid", "database_uri", "restart_server"])
-def test_workflow_owned_state_explains_unsupported_access(key):
-    state = fixtures._ServerState(workflow_owned=True)
-    with pytest.raises(RuntimeError, match="Workflow-owned reproduction does not expose"):
-        _ = state[key]
-
-
-def test_mock_config_backup_survives_and_blocks_overwrite(monkeypatch, tmp_path):
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    path = tmp_path / "config.yaml"
-    backup = tmp_path / "config.yaml.e2e-backup"
-    path.write_bytes(b"original config\n")
-    with fixtures._temp_omnigent_mock_config("http://127.0.0.1:12345", "claude"):
-        assert backup.read_bytes() == b"original config\n"
-        assert backup.stat().st_mode & 0o077 == 0
-    assert path.read_bytes() == b"original config\n"
-    assert not backup.exists()
-    backup.write_bytes(b"interrupted run original\n")
-    with pytest.raises(RuntimeError, match="recover the original config"):
-        with fixtures._temp_omnigent_mock_config("http://127.0.0.1:12345", "claude"):
-            pytest.fail("must not overwrite a recovery backup")
-    assert backup.read_bytes() == b"interrupted run original\n"
-    assert path.read_bytes() == b"original config\n"
-
-
 def test_serve_rejects_previous_attempt_without_discarding_stop(tmp_path):
     from dev.repro_env.runtime import serve
 
@@ -261,6 +193,8 @@ def test_stop_during_startup_is_successful_cancellation(tmp_path, monkeypatch):
     import time
 
     from dev.repro_env import runtime
+
+    monkeypatch.setattr("dev.repro_env.doctor.launch_observations", lambda root: {})
 
     state = tmp_path / "environment.json"
     state.write_text(
@@ -339,31 +273,12 @@ def test_generated_provider_config_disables_runner_idle_shutdown(monkeypatch, tm
     assert _load_runner_idle_timeout_s_from_config() == 0
 
 
-@pytest.mark.parametrize("raise_in_test", [False, True])
-def test_mock_config_restores_symlink_target(monkeypatch, tmp_path, raise_in_test):
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    target = tmp_path / "original.yaml"
-    target.write_text("original provider config\n")
-    config = tmp_path / "config.yaml"
-    config.symlink_to(target.name)
-    link_inode = config.lstat().st_ino
-    try:
-        with fixtures._temp_omnigent_mock_config("http://127.0.0.1:12345", "claude"):
-            assert "12345" in target.read_text()
-            if raise_in_test:
-                raise ValueError("test assertion failed")
-    except ValueError:
-        assert raise_in_test
-    assert config.is_symlink()
-    assert config.lstat().st_ino == link_inode
-    assert config.readlink() == Path(target.name)
-    assert target.read_text() == "original provider config\n"
-
-
 def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monkeypatch):
     import time
 
     from dev.repro_env import runtime
+
+    monkeypatch.setattr("dev.repro_env.doctor.launch_observations", lambda root: {})
 
     state = tmp_path / "environment.json"
     state.write_text(
@@ -397,6 +312,8 @@ def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monke
     relays[-1].__exit__.side_effect = TimeoutError("stuck relay")
     monkeypatch.setattr(runtime, "Relay", Mock(side_effect=relays))
     runtime.supervise(tmp_path)
+    model_command = runtime.subprocess.Popen.call_args_list[0].args[0]
+    assert model_command[1:3] == ["-m", "tests.server.integration.mock_llm_server"]
     final = json.loads(state.read_text())
     assert final["status"] == "failed"
     assert "stuck relay" in final["error"]

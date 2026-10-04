@@ -23,12 +23,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
-from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e"
@@ -41,23 +39,6 @@ _TEMPLATE_ID = "ag_agenta_template"  # builtin:false, older
 _UPLOAD_ID = "ag_agenta_upload_v2"  # session-scoped, newer — must win
 _SCAN_TEMPLATE_SESSION = "conv_bound_template"
 _SCAN_UPLOAD_SESSION = "conv_upload_v2"
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* in a dedicated thread with its own event loop."""
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 def _agents_body() -> str:
@@ -208,7 +189,7 @@ async def _drive(base_url: str, created_session_id: str) -> None:
                 return page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
 
             # The seeded (built-in) debby lists inline. Agent A is a custom
-            # agent, so it lives in the "Custom agents" submenu — drill in.
+            # agent, so it lives in the custom-agent "Other..." submenu — drill in.
             await expect(option(_DEBBY_ID)).to_be_visible()
             await page.get_by_test_id("new-chat-landing-custom-agents").click()
             # Agent A is offered as the NEWER upload id — the stale template id

@@ -1,0 +1,12170 @@
+"""Tests for native Claude Code bridge helpers."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import os
+import queue
+import select
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from http.client import BadStatusLine, RemoteDisconnected
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import pairwise
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, TextIO
+from unittest.mock import Mock
+
+import pytest
+
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native import hook as claude_native_hook
+from omnigent.harnesses.claude_native.bridge import (
+    _BACKGROUND_TASK_FIELD_MAX_CHARS,
+    _LOGIN_GUIDANCE,
+    _build_tools,
+    _claude_prompt_rendered,
+    _escape_unsupported_slash_command,
+    _hook_record_from_jsonl_record,
+    _is_box_rule,
+    _JsonlRecord,
+    _occupying_surface,
+    augment_claude_args,
+    count_hook_events,
+    display_cost_approval_popup,
+    ensure_claude_workspace_trusted,
+    inject_interrupt,
+    inject_user_message,
+    is_auth_slash_command,
+    kill_session,
+    post_tools_changed,
+    prepare_bridge_dir,
+    read_assistant_text_since,
+    read_claude_session_id,
+    read_hook_events_from_offset,
+    read_launch_model,
+    read_message_deltas_from_offset,
+    read_permission_hook_config,
+    read_seen_claude_session_ids,
+    read_transcript_items_from_offset,
+    read_transcript_items_since,
+    read_transcript_path,
+    record_hook_event,
+    start_tool_relay,
+    stop_hook_seen_since,
+    write_tmux_target,
+)
+from omnigent.inner.datamodel import (
+    CredentialProxyEntry,
+    CredentialProxySpec,
+    CredentialSourceSpec,
+    OSEnvSandboxSpec,
+)
+from omnigent.native import native_cost_popup
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
+
+
+@pytest.fixture(autouse=True)
+def _trust_tmp_bridge_parent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    Treat each test's temp dir as the Claude bridge root.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+
+
+def _composer_pane(draft: str = "") -> str:
+    """
+    Render a pane whose live input box holds *draft*.
+
+    Claude Code always frames the composer with corner-free rules, and
+    that frame is how the bridge tells the live input box apart from a
+    prompt echoed into scrollback or an overlay's selected row, so a fake
+    pane has to carry it to stand in for the real one.
+
+    :param draft: Text sitting in the composer; empty means idle.
+    :returns: The pane text.
+    """
+    return f"""\
+──────────────────────────────
+❯ {draft}
+──────────────────────────────
+  ? for shortcuts
+"""
+
+
+def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
+    settings_path = Path(args[args.index("--settings") + 1])
+    return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def subprocess_bridge_root() -> Iterator[Path]:
+    """
+    Yield a bridge root accepted by subprocess bridge tests.
+
+    :yields: Temporary directory path under the production trusted
+        Claude bridge root, so a child
+        ``python -m omnigent.harnesses.claude_native.bridge`` accepts bridge
+        writes without inheriting pytest monkeypatches.
+    """
+    production_root = (
+        Path(tempfile.gettempdir())
+        / f"omnigent-{claude_native_bridge.stable_user_id()}"
+        / "claude-native"
+    )
+    production_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(production_root.parent, 0o700)
+    os.chmod(production_root, 0o700)
+    with tempfile.TemporaryDirectory(prefix="bridge-test-", dir=production_root) as raw:
+        yield Path(raw)
+
+
+class _NoPrefixReadFile:
+    """
+    File wrapper that fails if a reader touches bytes before a cursor.
+
+    :param handle: Wrapped file object returned by :class:`Path.open`.
+    :param min_read_offset: Smallest byte offset that may be read.
+    """
+
+    def __init__(self, handle: Any, min_read_offset: int) -> None:
+        """
+        Initialize the tracking wrapper.
+
+        :param handle: Wrapped file object returned by :class:`Path.open`.
+        :param min_read_offset: Smallest byte offset that may be read.
+        :returns: None.
+        """
+        self._handle = handle
+        self._min_read_offset = min_read_offset
+
+    def __enter__(self) -> _NoPrefixReadFile:
+        """
+        Enter the wrapped file context.
+
+        :returns: This wrapper.
+        """
+        self._handle.__enter__()
+        return self
+
+    def __exit__(self, *args: object) -> object:
+        """
+        Exit the wrapped file context.
+
+        :param args: Context-manager exception details.
+        :returns: Wrapped ``__exit__`` return value.
+        """
+        return self._handle.__exit__(*args)
+
+    def seek(self, *args: object) -> object:
+        """
+        Delegate a seek operation to the wrapped file.
+
+        :param args: Seek arguments.
+        :returns: Wrapped ``seek`` return value.
+        """
+        return self._handle.seek(*args)
+
+    def tell(self) -> int:
+        """
+        Return the wrapped file's current offset.
+
+        :returns: Current byte offset.
+        """
+        return int(self._handle.tell())
+
+    def read(self, *args: object) -> object:
+        """
+        Read bytes after asserting the prefix is not touched.
+
+        :param args: Read arguments.
+        :returns: Wrapped ``read`` return value.
+        """
+        self._assert_not_prefix_read()
+        return self._handle.read(*args)
+
+    def readline(self, *args: object) -> object:
+        """
+        Read one line after asserting the prefix is not touched.
+
+        :param args: Readline arguments.
+        :returns: Wrapped ``readline`` return value.
+        """
+        self._assert_not_prefix_read()
+        return self._handle.readline(*args)
+
+    def _assert_not_prefix_read(self) -> None:
+        """
+        Raise if the wrapped file is positioned before the saved cursor.
+
+        :returns: None.
+        """
+        if self.tell() < self._min_read_offset:
+            raise AssertionError("byte-offset reader touched the JSONL prefix")
+
+
+def _fail_if_path_reads_before_offset(
+    monkeypatch: pytest.MonkeyPatch,
+    path: Path,
+    min_read_offset: int,
+) -> None:
+    """
+    Patch :class:`Path.open` so reads before ``min_read_offset`` fail.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param path: Path whose reads should be tracked.
+    :param min_read_offset: Smallest byte offset that may be read.
+    :returns: None.
+    """
+    real_open = Path.open
+
+    def _open_with_tracking(self: Path, *args: Any, **kwargs: Any) -> Any:
+        """
+        Wrap reads for the tracked path and delegate all other opens.
+
+        :param self: Path being opened.
+        :param args: Positional ``Path.open`` arguments.
+        :param kwargs: Keyword ``Path.open`` arguments.
+        :returns: File object or tracking wrapper.
+        """
+        handle = real_open(self, *args, **kwargs)
+        if self == path:
+            return _NoPrefixReadFile(handle, min_read_offset)
+        return handle
+
+    monkeypatch.setattr(Path, "open", _open_with_tracking)
+
+
+def test_prepare_bridge_dir_preserves_token_and_updates_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Bridge setup is stable across wrapper re-runs for one session.
+
+    If this regresses, reattaching ``omnigent claude`` can rotate the
+    bearer token while the already-running MCP server still expects the
+    old token.
+    """
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    first = prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path,
+    )
+    first_config = json.loads((first / "bridge.json").read_text(encoding="utf-8"))
+    second = prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path / "later",
+    )
+    second_config = json.loads((second / "bridge.json").read_text(encoding="utf-8"))
+
+    assert first == second
+    assert second_config["token"] == first_config["token"]
+    assert second_config["workspace"] == str(tmp_path / "later")
+    assert "headers" not in second_config
+
+
+def test_prepare_bridge_dir_preserves_permission_hook_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Re-preparing a bridge keeps the permission command hook's Omnigent URL.
+
+    The claude-native ``PermissionRequest`` command hook reads
+    ``permission_hook.json`` at hook time to learn which Omnigent server to
+    POST to (the URL is not baked into Claude's launch args). A
+    rebind/reattach that re-runs ``prepare_bridge_dir`` must NOT wipe
+    that file — if it does, the permission subprocess bails with "AP
+    server URL missing" and approval prompts silently stop reaching the
+    web UI (a regression we guard against).
+    """
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    # ``augment_claude_args`` is the production path that writes
+    # permission_hook.json (via ``build_hook_settings``) on cold launch.
+    augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    assert (bridge_dir / "permission_hook.json").exists()
+
+    # Simulate a wrapper rebind/reattach that re-prepares the bridge
+    # without relaunching the terminal (so build_hook_settings does not
+    # run again to recreate the file).
+    prepare_bridge_dir("conv_abc", workspace=tmp_path / "later")
+
+    config = read_permission_hook_config(bridge_dir)
+    assert config["ap_server_url"] == "http://127.0.0.1:8787"
+    assert config["ap_auth_headers"] == {"Authorization": "Bearer xyz"}
+
+
+def test_prepare_bridge_dir_restricts_filesystem_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Bridge directory and bearer token are not world-readable.
+
+    `/tmp` is shared with other Unix users on the host. The bridge dir
+    holds a bearer token the local MCP server uses; if its perms drift
+    to a default 0o755 (dir) / 0o644 (file) other users on the box can
+    read it and impersonate the runner against the MCP server. Per the
+    design doc §12 the dir must be 0o700 and bearer files 0o600. A
+    regression here would be invisible without an explicit stat assertion.
+    """
+    import stat
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    bridge_json = bridge_dir / "bridge.json"
+
+    dir_mode = stat.S_IMODE(bridge_dir.stat().st_mode)
+    bearer_mode = stat.S_IMODE(bridge_json.stat().st_mode)
+
+    assert dir_mode == 0o700, (
+        f"bridge dir at {bridge_dir} has mode {oct(dir_mode)}; "
+        "expected 0o700 so other host users cannot enter it"
+    )
+    assert bearer_mode == 0o600, (
+        f"bearer file {bridge_json} has mode {oct(bearer_mode)}; "
+        "expected 0o600 so other host users cannot read the token"
+    )
+
+
+def test_prepare_bridge_dir_refuses_symlinked_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Pre-created symlinked bridge ancestor is refused, not silently followed.
+
+    Without `_ensure_secure_dir`, ``mkdir(parents=True, exist_ok=True)``
+    happily walks through a symlinked intermediate dir, redirecting the
+    bridge tree (including ``bridge.json``'s bearer token) to a path an
+    attacker controls. A regression that removes the validation — or
+    swaps it back to plain mkdir — would let this attack succeed.
+    """
+    # Layout: tmp_path is the trusted parent. Place a "claude-native"
+    # symlink that points at a separate attacker-controlled directory
+    # before any prepare_bridge_dir() call runs.
+    attacker_dir = tmp_path / "attacker-controlled"
+    attacker_dir.mkdir()
+    symlink = tmp_path / "claude-native"
+    symlink.symlink_to(attacker_dir, target_is_directory=True)
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", symlink)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        prepare_bridge_dir("conv_abc", workspace=tmp_path)
+
+    # Confirm the bearer token did NOT land in the attacker-controlled
+    # directory — the refusal happened before any file write.
+    assert not (attacker_dir / "bridge.json").exists()
+
+
+def test_prepare_bridge_dir_persists_and_applies_resolved_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A resolved sandbox reaches both the bridge config and its sys_os_* tools.
+
+    ``enforce_sandbox``/``force_sandbox`` resolves a real sandbox onto the
+    session's ``os_env.sandbox`` upstream (``runner/app.py``'s
+    ``_apply_sandbox_override_from_verdict``), but that decision used to
+    have no path into the claude-native bridge: ``prepare_bridge_dir``
+    never wrote it to the config file, and ``_build_tools`` unconditionally
+    hardcoded ``OSEnvSandboxSpec(type="none")`` regardless of the policy.
+    A server operator configuring ``force_sandbox`` for claude-native
+    sessions got silent unenforced host access. This locks in the fix:
+    the resolved sandbox must survive the config round-trip and actually
+    reach the ``OSEnvSpec`` that builds the ``sys_os_*`` tools.
+
+    ``create_os_environment`` is patched at the boundary (same pattern as
+    ``test_executor_factory_decodes_os_env_json`` in
+    ``tests/inner/test_codex_harness.py``) rather than resolving a real
+    backend, so this is a platform-independent test of the config plumbing
+    — ``linux_bwrap`` and ``darwin_seatbelt`` only resolve on their own OS
+    and would otherwise fail this test on CI's Linux runners.
+    """
+    resolved_sandbox = OSEnvSandboxSpec(type="linux_bwrap", allow_network=False)
+
+    bridge_dir = prepare_bridge_dir(
+        "conv_sandboxed",
+        workspace=tmp_path,
+        sandbox=resolved_sandbox,
+    )
+    config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
+    assert config["sandbox"]["type"] == "linux_bwrap"
+    assert config["sandbox"]["allow_network"] is False
+
+    captured: dict[str, Any] = {}
+
+    def _fake_create_os_environment(spec: Any) -> None:
+        captured["spec"] = spec
+        return
+
+    monkeypatch.setattr(
+        "omnigent.inner.os_env.create_os_environment",
+        _fake_create_os_environment,
+    )
+    _build_tools(config)
+
+    sandbox = captured["spec"].sandbox
+    assert sandbox.type == "linux_bwrap"
+    assert sandbox.allow_network is False
+
+
+def test_prepare_bridge_dir_without_sandbox_builds_unsandboxed_tools(
+    tmp_path: Path,
+) -> None:
+    """
+    No resolved sandbox preserves the prior unsandboxed default.
+
+    Sessions with nothing to carry (e.g. the ``omnigent claude`` CLI's own
+    synthesized wrapper spec, which intentionally declares
+    ``os_env.sandbox.type: none``) must keep working exactly as before —
+    this is the fallback the fix above must not disturb.
+    """
+    bridge_dir = prepare_bridge_dir("conv_unsandboxed", workspace=tmp_path)
+    config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
+    assert "sandbox" not in config
+
+    tools, close_tools = _build_tools(config)
+    try:
+        os_env = tools["sys_os_shell"]._os_env
+        assert os_env is not None
+        assert os_env.sandbox.backend_type == "none"
+        assert os_env.sandbox.active is False
+    finally:
+        close_tools()
+
+
+def test_prepare_bridge_dir_drops_credential_proxy_instead_of_corrupting_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sandbox with a real ``credential_proxy`` never corrupts the round-trip.
+
+    ``dataclasses.asdict`` flattens the nested ``CredentialProxySpec`` to a
+    plain dict, and a naive ``OSEnvSandboxSpec(**payload)`` on read has no
+    way to tell that dict apart from a real one — it gets assigned straight
+    through, so any sandboxed code that later dereferences ``.entries`` /
+    ``.databricks`` on it crashes with ``AttributeError: 'dict' object has
+    no attribute ...``. ``credential_proxy`` is resolved parent-side only
+    and was never meant to cross this boundary in the first place (see
+    ``SandboxPolicy.to_jsonable``'s identical exclusion) — this locks in
+    that it is dropped, not corrupted: the bridge config never carries it,
+    and the rebuilt spec cleanly has it unset rather than a stray dict.
+
+    ``create_os_environment`` is patched at the boundary (see
+    ``test_prepare_bridge_dir_persists_and_applies_resolved_sandbox`` above)
+    so this is platform-independent — the sandbox type only needs to be
+    *something* non-``"none"``, not a backend real for the CI host's OS.
+    """
+    sandbox = OSEnvSandboxSpec(
+        type="linux_bwrap",
+        credential_proxy=CredentialProxySpec(
+            entries=[
+                CredentialProxyEntry(
+                    host="github.com",
+                    scheme="bearer",
+                    source=CredentialSourceSpec(kind="env", env="GH_TOKEN"),
+                )
+            ],
+        ),
+    )
+
+    bridge_dir = prepare_bridge_dir(
+        "conv_credproxy",
+        workspace=tmp_path,
+        sandbox=sandbox,
+    )
+    config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
+    assert "credential_proxy" not in config["sandbox"]
+    assert config["sandbox"]["type"] == "linux_bwrap"
+
+    captured: dict[str, Any] = {}
+
+    def _fake_create_os_environment(spec: Any) -> None:
+        captured["spec"] = spec
+        return
+
+    monkeypatch.setattr(
+        "omnigent.inner.os_env.create_os_environment",
+        _fake_create_os_environment,
+    )
+    _build_tools(config)
+
+    sandbox_rebuilt = captured["spec"].sandbox
+    assert sandbox_rebuilt.type == "linux_bwrap"
+    assert sandbox_rebuilt.credential_proxy is None
+
+
+def test_ensure_secure_dir_succeeds_without_getuid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows lacks ``os.getuid()``; bridge dir creation must still work."""
+    monkeypatch.delattr(os, "getuid", raising=False)
+
+    bridge_dir = tmp_path / "bridge-without-getuid"
+
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+
+    assert bridge_dir.is_dir()
+
+
+def test_trusted_parent_accepts_qwen_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts qwen-native bridge dirs.
+
+    The comment relay (``start_tool_relay`` → ``_ensure_secure_dir`` →
+    ``_trusted_parent_for_bridge_dir``) writes its JSON file under the
+    harness's bridge dir, validating it lives below a known bridge root.
+    qwen-native reuses this relay but keeps files under its own root
+    (``$TMPDIR/omnigent-<uid>/qwen-native``); if that root is missing from the
+    allowlist, every qwen-native session raises ``not under an allowed bridge
+    root`` and the relay never starts (observed in a live runner log). This
+    pins the qwen-native branch so the regression can't return.
+    """
+    from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
+
+    # Distinct claude root so the qwen target can't match the claude branch
+    # first (the autouse fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    # qwen root mirrors production shape: <uid-scoped temp>/qwen-native.
+    qwen_root = tmp_path / "omnigent-test" / "qwen-native"
+    monkeypatch.setattr(qwen_native_bridge, "_BRIDGE_ROOT", qwen_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(qwen_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    # Same anchor as cursor-native: the uid-scoped temp dir's parent.
+    assert trusted == claude_native_bridge._absolute_syntactic_path(qwen_root.parent.parent)
+
+
+def test_trusted_parent_accepts_kiro_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts kiro-native bridge dirs.
+
+    kiro-native reuses the shared ``serve-mcp`` / relay infrastructure but keeps
+    files under its own root (``$TMPDIR/omnigent-<uid>/kiro-native``). Without the
+    kiro branch, ``start_tool_relay`` -> ``_ensure_secure_dir`` ->
+    ``_trusted_parent_for_bridge_dir`` raises ``not under an allowed bridge root``
+    and the relay (and serve-mcp's own ``server.json`` write) never start. This
+    pins the kiro-native branch.
+    """
+    from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+
+    # Distinct claude root so the kiro target can't match the claude branch
+    # first (the autouse fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    # kiro root mirrors production shape: <uid-scoped temp>/kiro-native.
+    kiro_root = tmp_path / "omnigent-test" / "kiro-native"
+    monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", kiro_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(kiro_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    # Same anchor as cursor-native: the uid-scoped temp dir's parent.
+    assert trusted == claude_native_bridge._absolute_syntactic_path(kiro_root.parent.parent)
+
+
+def test_trusted_parent_accepts_devin_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts devin-native bridge dirs.
+
+    devin-native keeps its bridge files under its own uid-scoped temp root
+    (``$TMPDIR/omnigent-<uid>/devin-native``), the same shape as cursor-native.
+    Without the devin branch, the comment/tool relay's
+    ``start_tool_relay`` -> ``_ensure_secure_dir`` ->
+    ``_trusted_parent_for_bridge_dir`` raises ``not under an allowed bridge
+    root`` and the relay never starts for devin sessions. This pins the
+    devin-native branch.
+    """
+    from omnigent.harnesses.devin_native import bridge as devin_native_bridge
+
+    # Distinct claude root so the devin target can't match the claude branch
+    # first (the autouse fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    # devin root mirrors production shape: <uid-scoped temp>/devin-native.
+    devin_root = tmp_path / "omnigent-test" / "devin-native"
+    monkeypatch.setattr(devin_native_bridge, "_BRIDGE_ROOT", devin_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(devin_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    # Same anchor as cursor-native: the uid-scoped temp dir's parent.
+    assert trusted == claude_native_bridge._absolute_syntactic_path(devin_root.parent.parent)
+
+
+def test_trusted_parent_rejects_path_outside_all_roots_and_names_qwen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path under no known root is refused, and the error names the qwen root."""
+    from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
+
+    # Distinct claude root so ``outside`` below isn't swept under it (the autouse
+    # fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    qwen_root = tmp_path / "omnigent-test" / "qwen-native"
+    monkeypatch.setattr(qwen_native_bridge, "_BRIDGE_ROOT", qwen_root)
+
+    outside = claude_native_bridge._absolute_syntactic_path(tmp_path / "somewhere-else" / "x")
+    with pytest.raises(RuntimeError, match="not under an allowed bridge root") as exc:
+        claude_native_bridge._trusted_parent_for_bridge_dir(outside)
+    assert "qwen-native" in str(exc.value)
+
+
+def test_record_hook_event_updates_transcript_state(tmp_path: Path) -> None:
+    """
+    Hook records expose Claude's JSONL transcript path to the executor.
+
+    This fails if the harness would send channel messages but then have
+    no transcript cursor to read Claude's response from.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+
+    assert read_transcript_path(bridge_dir) == transcript_path
+    assert count_hook_events(bridge_dir) == 1
+
+
+def test_record_hook_event_ignores_foreign_identity(tmp_path: Path) -> None:
+    """
+    A side-channel event cannot re-aim the bridge at a foreign transcript.
+
+    Ordinary mid-session events (tool edges, stops) carry whatever
+    session_id/transcript_path their context reports; one from another
+    session — e.g. a background Task agent's edge — used to silently
+    repoint ``transcript_path``, starving the forwarder on a file that
+    never grows. The event is still recorded; only identity is ignored.
+    """
+    bridge_dir = tmp_path / "bridge"
+    pinned_transcript = tmp_path / "pinned.jsonl"
+    foreign_transcript = tmp_path / "agent-foreign.jsonl"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "pinned-session",
+            "transcript_path": str(pinned_transcript),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "foreign-session",
+            "transcript_path": str(foreign_transcript),
+        },
+    )
+
+    assert read_transcript_path(bridge_dir) == pinned_transcript
+    assert read_claude_session_id(bridge_dir) == "pinned-session"
+    assert read_seen_claude_session_ids(bridge_dir) == {"pinned-session"}
+    # The event itself is still recorded — only its identity is ignored.
+    assert count_hook_events(bridge_dir) == 2
+
+
+def test_record_hook_event_session_start_rotates_identity(tmp_path: Path) -> None:
+    """
+    A SessionStart announcement legitimately moves the bridge's identity.
+
+    /clear, /fork and resume all become a new Claude session announced by
+    a SessionStart hook; the pin must follow the front door so rotation
+    keeps working, and the prior id stays in the seen set for the
+    fork-vs-resume classifier.
+    """
+    bridge_dir = tmp_path / "bridge"
+    old_transcript = tmp_path / "old.jsonl"
+    new_transcript = tmp_path / "new.jsonl"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "old-session",
+            "transcript_path": str(old_transcript),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "new-session",
+            "transcript_path": str(new_transcript),
+        },
+    )
+
+    assert read_transcript_path(bridge_dir) == new_transcript
+    assert read_claude_session_id(bridge_dir) == "new-session"
+    assert read_seen_claude_session_ids(bridge_dir) == {"old-session", "new-session"}
+
+
+def test_record_hook_event_first_event_bootstraps_identity(tmp_path: Path) -> None:
+    """
+    With no pin yet, the first identity-bearing event is trusted.
+
+    A fresh bridge may see an ordinary event before SessionStart lands
+    (hook ordering is not guaranteed); refusing it would leave the
+    forwarder with no transcript at all.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+
+    assert read_transcript_path(bridge_dir) == transcript_path
+    assert read_claude_session_id(bridge_dir) == "claude-session"
+
+
+def test_read_assistant_text_since_parses_claude_jsonl(tmp_path: Path) -> None:
+    """
+    Transcript parsing returns only assistant text after the cursor.
+
+    The parser must not echo channel/user records back into the
+    Omnigent assistant stream.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"message": {"role": "user", "content": "hi"}}),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "first"}],
+                        }
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "..."},
+                                {"type": "text", "text": "second"},
+                            ],
+                        }
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cursor, chunks = read_assistant_text_since(transcript_path, 1)
+
+    assert cursor == 3, "cursor should advance past all three complete transcript records"
+    assert chunks == ["first", "second"]
+
+
+def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path) -> None:
+    """
+    Transcript parsing preserves user text, tools, results, and output.
+
+    This covers the real Claude JSONL shapes observed in native CLI
+    runs: user message strings, assistant ``tool_use`` blocks, user
+    ``tool_result`` blocks, assistant text, and metadata records that
+    must not become chat items.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "permission-mode", "mode": "default"}),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "user-1",
+                        "message": {"role": "user", "content": "please inspect TODO.md"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-tool-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "check the todo file first"},
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_read_1",
+                                    "name": "Read",
+                                    "input": {"file_path": "TODO.md"},
+                                },
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "tool-result-1",
+                        "parentUuid": "assistant-tool-1",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_read_1",
+                                    "content": "TODO contents",
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                        "toolUseResult": {
+                            "type": "text",
+                            "file": {"filePath": "TODO.md", "content": "TODO contents"},
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "attachment",
+                        "uuid": "metadata-attachment",
+                        "attachment": {"type": "task_reminder", "content": [], "itemCount": 0},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-text-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Done."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert cursor == 6, "cursor should include metadata records even when they emit no items"
+    assert [item.item_type for item in items] == [
+        "message",
+        "reasoning",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "please inspect TODO.md"}],
+    }
+    reasoning = items[1]
+    assert reasoning.data == {
+        "agent": "claude-native-ui",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "check the todo file first"}],
+    }
+    tool_call = items[2]
+    assert tool_call.data["name"] == "Read"
+    assert json.loads(tool_call.data["arguments"]) == {"file_path": "TODO.md"}
+    assert tool_call.data["call_id"] == "toolu_read_1"
+    assert reasoning.response_id == tool_call.response_id
+    assert items[3].response_id == tool_call.response_id
+    assert items[3].data == {"call_id": "toolu_read_1", "output": "TODO contents"}
+    assert items[4].response_id == tool_call.response_id
+    assert items[4].data == {
+        "role": "assistant",
+        "agent": "claude-native-ui",
+        "content": [{"type": "output_text", "text": "Done."}],
+    }
+    assert current_response_id == tool_call.response_id
+
+
+def test_read_transcript_items_since_mirrors_thinking_as_reasoning(tmp_path: Path) -> None:
+    """
+    A ``thinking`` block becomes a ``reasoning`` item in the mirrored turn.
+
+    Claude Code renders the thought in the TUI and persists it to the
+    transcript, so the chat mirror must surface the same reasoning
+    context: a ``reasoning`` item sharing the turn's response id,
+    ordered before the answer text it precedes.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "the user wants the token verbatim",
+                            "signature": "sig",
+                        },
+                        {"type": "text", "text": "TOKEN"},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["reasoning", "message"]
+    reasoning, answer = items
+    assert reasoning.data == {
+        "agent": "claude-native-ui",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "the user wants the token verbatim"}],
+    }
+    assert reasoning.source_id.endswith(":0:reasoning"), (
+        "reasoning items need a stable per-block source id so forwarder retries dedup"
+    )
+    assert reasoning.response_id == answer.response_id
+    assert current_response_id == answer.response_id
+
+
+def test_read_transcript_items_since_skips_unreadable_thinking(tmp_path: Path) -> None:
+    """
+    Thinking with no readable text mirrors nothing.
+
+    A whitespace-only ``thinking`` block and a ``redacted_thinking``
+    block (encrypted payload, no text anywhere — the TUI shows nothing
+    either) must not produce a dead, empty reasoning section in chat.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "   "},
+                        {"type": "redacted_thinking", "data": "opaque-bytes"},
+                        {"type": "text", "text": "Done."},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message"]
+
+
+def test_unwrap_pasted_content_markers_strips_claude_paste_wrappers() -> None:
+    """
+    Paste wrappers Claude adds to bracketed-paste input are removed for display.
+
+    Omnigent injects every web-UI message as a bracketed paste, so Claude
+    records even a short typed line wrapped in ``<pasted_content id=…>``
+    markers. The mirrored user bubble must show the bare text.
+    """
+    unwrap = claude_native_bridge._unwrap_pasted_content_markers
+    # A bare paste (the omnigent-delivered shape) becomes clean text.
+    assert unwrap('\n\n<pasted_content id="a5f5">\nxyz\n</pasted_content id="a5f5">\n') == "xyz"
+    # Interior newlines in the pasted body are preserved.
+    assert (
+        unwrap('\n\n<pasted_content id="x">\nline1\nline2\n</pasted_content id="x">\n')
+        == "line1\nline2"
+    )
+    # Text the person typed with no paste is returned byte-for-byte.
+    assert unwrap("just a normal message") == "just a normal message"
+    assert unwrap("  keep leading/trailing spaces  ") == "  keep leading/trailing spaces  "
+    # Text typed around a paste keeps the surrounding words, drops the tags.
+    assert (
+        unwrap('before\n\n<pasted_content id="x">\nmid\n</pasted_content id="x">\nafter')
+        == "before\n\nmid\nafter"
+    )
+    # A closing tag that dropped the repeated id still unwraps.
+    assert unwrap('\n\n<pasted_content id="x">\nabc\n</pasted_content>\n') == "abc"
+
+
+def test_read_transcript_items_since_unwraps_pasted_content(tmp_path: Path) -> None:
+    """
+    A user message Claude wrapped as a paste mirrors to the UI as clean text.
+
+    Reproduces the reported bug: a plainly typed ``xyz`` sent through the
+    Omnigent web UI is delivered as a bracketed paste, so Claude persists it
+    wrapped in ``<pasted_content id=…>`` markers. The forwarded user bubble
+    must not carry the raw markers.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    wrapped = '\n\n<pasted_content id="a5f5">\nxyz\n</pasted_content id="a5f5">\n'
+    transcript_path.write_text(
+        json.dumps(
+            {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": wrapped}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message"]
+    assert items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "xyz"}],
+    }
+
+
+def test_read_transcript_items_since_unwraps_pasted_content_in_list_blocks(
+    tmp_path: Path,
+) -> None:
+    """
+    List-form user text blocks are unwrapped too.
+
+    Claude ships user content as a string today, but the JSONL format is not
+    under our control; the defensive list-form path must strip paste markers
+    the same way so a format change can't regress the bug.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    wrapped = '\n\n<pasted_content id="x">\nhello\n</pasted_content id="x">\n'
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": [{"type": "text", "text": wrapped}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "hello"}],
+    }
+
+
+def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) -> None:
+    """
+    Reading an image file must not replay its base64 data as prompt text.
+
+    Claude's ``Read`` tool returns image files as a list of
+    ``{"type": "image", "source": {"type": "base64", ...}}`` blocks.
+    Serialized verbatim, a single image costs hundreds of thousands of
+    tokens and overflows the context window on resume. The stored
+    ``function_call_output`` must drop the base64 payload.
+    """
+    huge_b64 = "iVBORw0KGgo" + "A" * 100_000
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-tool-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_read_img",
+                                    "name": "Read",
+                                    "input": {"file_path": "chart.png"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "tool-result-1",
+                        "parentUuid": "assistant-tool-1",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_read_img",
+                                    "content": [
+                                        {
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": "image/png",
+                                                "data": huge_b64,
+                                            },
+                                        }
+                                    ],
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    outputs = [item for item in items if item.item_type == "function_call_output"]
+    assert len(outputs) == 1
+    output = outputs[0].data["output"]
+    assert huge_b64 not in output, "base64 image data must not be replayed as text"
+    # The placeholder names the media type and tells the agent how to
+    # recover the image (re-run the tool call), so it is not silently lost.
+    assert "image/png image omitted from history" in output
+    assert "re-run the tool call" in output
+    assert len(output) < 300
+
+
+def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Path) -> None:
+    task_notification = (
+        "<task-notification>\n"
+        "<task-id>b1mhekpmy</task-id>\n"
+        '<summary>Monitor event: "PR 2086 E2E UI + npm test CI results"</summary>\n'
+        "<event>E2E UI Tests (shard 2/3)\tfail\t1m50s\thttps://example.test</event>\n"
+        "</task-notification>"
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "task-notification-1",
+                "message": {"role": "user", "content": task_notification},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert current_response_id is None
+    assert [item.item_type for item in items] == ["message"]
+    assert items[0].data == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": task_notification}],
+    }
+
+
+_TEAMMATE_MESSAGE = '<teammate-message teammate_id="reviewer">Done</teammate-message>'
+_TASK_COMPLETION = (
+    "<task-notification><task-id>agent-1</task-id><status>completed</status></task-notification>"
+)
+
+
+def _read_native_user(
+    tmp_path: Path, content: Any, *, queued: str | None = None, **metadata: Any
+) -> tuple[int, str | None, list[Any]]:
+    entry = (
+        {
+            "type": "attachment",
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": queued,
+                "prompt": content,
+                **metadata,
+            },
+        }
+        if queued
+        else {"type": "user", "message": {"role": "user", "content": content}, **metadata}
+    )
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(_transcript_line(entry), encoding="utf-8")
+    return read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+@pytest.mark.parametrize(
+    "text,candidate",
+    [
+        (_TEAMMATE_MESSAGE, True),
+        ('<agent-message from="reviewer">Done</agent-message>', True),
+        (_TEAMMATE_MESSAGE + _TEAMMATE_MESSAGE, True),
+        ("Another Claude session sent a message:\n" + _TEAMMATE_MESSAGE, True),
+        ("A peer session sent a message while you were working:\n" + _TEAMMATE_MESSAGE, True),
+        (
+            "Another Claude session sent a message while you were working:\n" + _TEAMMATE_MESSAGE,
+            True,
+        ),
+        (
+            "Another Claude session sent a message:\n"
+            + _TEAMMATE_MESSAGE
+            + "\nThis came from another Claude session — not typed by your user, "
+            "but working on their behalf.",
+            True,
+        ),
+        ("Explain this: " + _TEAMMATE_MESSAGE, False),
+        (_TEAMMATE_MESSAGE + "\nWhat does this mean?", False),
+        ("```xml\n" + _TEAMMATE_MESSAGE + "\n```", False),
+    ],
+)
+def test_team_markup_needs_provenance(
+    tmp_path: Path, text: str, candidate: bool, as_blocks: bool
+) -> None:
+    content = [{"type": "text", "text": text}] if as_blocks else text
+    _, _, items = _read_native_user(tmp_path, content)
+    [item] = items
+    assert item.agent_message_candidate is candidate
+    assert item.data == {"role": "user", "content": [{"type": "input_text", "text": text}]}
+
+    _, response_id, peers = _read_native_user(tmp_path, content, origin={"kind": "peer"})
+    assert all(peer.data.get("is_meta") for peer in peers)
+    assert response_id == "active"
+
+
+@pytest.mark.parametrize(
+    "queued,text,metadata",
+    [
+        ("prompt", _TEAMMATE_MESSAGE, {"isMeta": True}),
+        ("prompt", _TEAMMATE_MESSAGE, {"origin": {"kind": "peer"}}),
+        ("prompt", "<task-notification><task-id>task-1</task-id></task-notification>", {}),
+        (
+            None,
+            "<task-notification><status>completed</status></task-notification>",
+            {"isMeta": True},
+        ),
+        (
+            None,
+            "<task-notification><task-id>agent-1</task-id><status>completed</status>",
+            {"isMeta": True},
+        ),
+    ],
+)
+def test_internal_scaffolding_does_not_split_parent_response(
+    tmp_path: Path, queued: str | None, text: str, metadata: dict[str, Any]
+) -> None:
+    _, response_id, items = _read_native_user(tmp_path, text, queued=queued, **metadata)
+    assert items == []
+    assert response_id == "active"
+
+
+@pytest.mark.parametrize("queued", [None, "prompt", "task-notification"])
+@pytest.mark.parametrize("handback", [False, True])
+def test_completion_preserves_hidden_provenance(
+    tmp_path: Path, queued: str | None, handback: bool
+) -> None:
+    origin = {"kind": "peer", "handback": True, "senderTaskId": "agent-1"} if handback else None
+    text = _TEAMMATE_MESSAGE if handback else _TASK_COMPLETION
+    _, response_id, items = _read_native_user(
+        tmp_path, text, queued=queued, isMeta=True, origin=origin
+    )
+    [item] = items
+    assert item.data["is_meta"] is True
+    assert item.subagent_return_id == ("agent-1" if handback else None)
+    if queued or handback:
+        assert response_id == "active"
+
+
+@pytest.mark.parametrize("internal", [False, True])
+def test_mixed_native_blocks_keep_human_text_and_hide_completion_guidance(
+    tmp_path: Path, internal: bool
+) -> None:
+    text = "Internal guidance" if internal else "Explain the message format"
+    content = [
+        {"type": "text", "text": _TASK_COMPLETION if internal else _TEAMMATE_MESSAGE},
+        {"type": "text", "text": text},
+    ]
+    _, _, items = _read_native_user(tmp_path, content, isMeta=internal)
+    if internal:
+        assert len(items) == 2
+        assert all(item.data.get("is_meta") for item in items)
+    else:
+        [item] = items
+        assert not item.agent_message_candidate
+        assert [block["text"] for block in item.data["content"]] == [_TEAMMATE_MESSAGE, text]
+
+
+@pytest.mark.parametrize("status", ["completed", "async_launched"])
+def test_native_agent_tool_result_carries_only_completion_provenance(
+    tmp_path: Path, status: str
+) -> None:
+    _, response_id, items = _read_native_user(
+        tmp_path,
+        [{"type": "tool_result", "tool_use_id": "tool-1", "content": "Result text"}],
+        toolUseResult={"agentId": "agent-1", "status": status},
+    )
+    [item] = items
+    assert item.subagent_return_id == ("agent-1" if status == "completed" else None)
+    assert item.data == {"call_id": "tool-1", "output": "Result text"}
+    assert response_id == "active"
+
+
+def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
+    """
+    An ``isCompactSummary`` user record is flagged, not rendered as a bubble.
+
+    Claude writes an ``isCompactSummary: true`` user record carrying the
+    continuation summary right after it compacts. The bridge must surface it
+    as a single ``message`` item with ``is_compact_summary=True`` (so the
+    forwarder can persist a durable compaction boundary) and preserve the
+    summary text — never drop it or route it through slash/scaffolding
+    detection.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "compact-summary-1",
+                "isCompactSummary": True,
+                "message": {
+                    "role": "user",
+                    "content": "This session is being continued. Prior summary: …",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert len(items) == 1
+    assert items[0].is_compact_summary is True
+    assert items[0].item_type == "message"
+    assert items[0].data["content"][0]["text"].startswith("This session is being continued")
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "Not enough messages to compact.",
+        "not enough messages to compact",
+        "Nothing to compact.",
+    ],
+)
+def test_read_transcript_items_since_flags_compact_noop(tmp_path: Path, stdout: str) -> None:
+    """
+    A ``/compact`` refusal stdout record is surfaced with its text.
+
+    When Claude declines ``/compact`` (context too small), it writes the
+    refusal to a standalone ``local_command`` stdout record — separate from
+    the ``/compact`` command echo. The bridge must surface it as a
+    ``slash_command`` item flagged ``is_compact_noop=True`` (so the forwarder
+    dismisses the stranded "Compacting…" spinner) carrying the refusal text as
+    ``output`` (so the web shows the same message Claude did).
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "compact-cmd",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-name>/compact</command-name>\n"
+                                "            <command-message>compact</command-message>\n"
+                                "            <command-args></command-args>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "local_command",
+                        "uuid": "compact-stdout",
+                        "isMeta": False,
+                        "content": f"<local-command-stdout>{stdout}</local-command-stdout>",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    # Exactly one bubble: the bare ``/compact`` echo is deduped away so the
+    # web shows a single "Command compact" row (like the terminal), and it
+    # carries the refusal text as ``output``.
+    compact_items = [item for item in items if item.data.get("name") == "compact"]
+    assert len(compact_items) == 1, f"expected one /compact bubble, got {items!r}"
+    noop = compact_items[0]
+    assert noop.is_compact_noop is True
+    assert noop.item_type == "slash_command"
+    assert noop.data["kind"] == "command"
+    assert noop.data["output"] == stdout.strip()
+
+    byte_result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+    record_items = [item for record in byte_result.record_items for item in record.items]
+    assert record_items == byte_result.items
+
+
+def test_read_transcript_items_since_keeps_real_bash_local_command(tmp_path: Path) -> None:
+    """
+    A non-refusal ``local_command`` stdout is not mistaken for a compact noop.
+
+    A shell ``!cmd`` record still surfaces as a terminal command, never a
+    flagged compact-noop item.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "local_command",
+                "uuid": "bash-1",
+                "content": ("<bash-input>echo hi</bash-input>\n<bash-stdout>hi</bash-stdout>"),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert all(not item.is_compact_noop for item in items), items
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        "Prompt is too long",
+        "prompt is too long: 210000 tokens > 200000 maximum",
+        "Prompt is too long\n",
+    ],
+)
+def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str) -> None:
+    """
+    When Claude Code writes "Prompt is too long" to the transcript, the
+    bridge rewrites it to actionable guidance so the web UI shows
+    something useful instead of the raw API error.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "err-1",
+                "message": {"role": "assistant", "content": raw_text},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+
+    assert len(items) == 1
+    text = items[0].data["content"][0]["text"]
+    assert "Context limit reached" in text
+    assert "/compact" in text
+    assert "/clear" in text
+
+
+def _assistant_transcript_text(
+    tmp_path: Path,
+    raw_text: str,
+    *,
+    is_api_error: bool = False,
+) -> str:
+    """
+    Return the display text the bridge produces for one assistant record.
+
+    :param tmp_path: Directory to hold the throwaway transcript.
+    :param raw_text: Assistant message content written to the JSONL.
+    :param is_api_error: Write Claude Code's ``isApiErrorMessage`` flag
+        beside ``message``, marking the record as CLI-authored.
+    :returns: Text of the single parsed conversation item.
+    """
+    record: dict[str, Any] = {
+        "type": "assistant",
+        "uuid": "auth-1",
+        "message": {"role": "assistant", "content": raw_text},
+    }
+    if is_api_error:
+        record["isApiErrorMessage"] = True
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(record) + "\n",
+        encoding="utf-8",
+    )
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+    assert len(items) == 1
+    return str(items[0].data["content"][0]["text"])
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Prose ABOUT the command — including a turn explaining this very
+        # rewrite — must survive untouched.
+        "You can run /login to sign in again.",
+        "The CLI says: Please run /login\nBut the web chat cannot send it.",
+        "Please run /clear",
+        # Byte-identical to the CLI's error, but UNFLAGGED. Without the
+        # flag there is nothing to tell it apart from a model quoting
+        # the line, and replacing a real turn would delete an answer the
+        # user asked for — so it is forwarded as-is.
+        "Login expired · Please run /login",
+    ],
+)
+def test_read_transcript_leaves_unflagged_login_text_untouched(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    """
+    Only a CLI-flagged record gets the guidance, never an unflagged one.
+
+    Appending remedy text to a real model answer that merely mentions
+    ``/login`` would misdirect the user. ``isApiErrorMessage`` is the
+    only evidence that the text is not model output; without it,
+    nothing is touched.
+    """
+    assert _assistant_transcript_text(tmp_path, raw_text) == raw_text
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Verbatim constants from the claude binary (2.1.212). The last
+        # two do NOT end in "Please run /login", so the unflagged
+        # single-line anchor alone would miss them.
+        "Login expired · Please run /login",
+        "OAuth token revoked · Please run /login",
+        "Your organization has disabled API key authentication · Run /login "
+        "to sign in with your claude.ai account",
+    ],
+)
+def test_read_transcript_rewrites_flagged_api_error_anywhere(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    """
+    A CLI-flagged record gets guidance appended wherever its ``/login`` sits.
+
+    ``isApiErrorMessage`` is Claude Code's own marker for a record it
+    synthesized instead of receiving from the model — an expired login
+    never reaches the API, so there is no model turn behind the text.
+    That makes a wider match safe, which is what catches the auth
+    strings whose instruction sits mid-sentence. The CLI's own text is
+    kept: variants whose remedy goes beyond re-auth must not lose it.
+    """
+    expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
+
+
+def test_read_transcript_flag_inside_message_also_counts(tmp_path: Path) -> None:
+    """
+    The flag is honoured inside ``message`` as well as beside it.
+
+    Claude Code writes it as a sibling of ``message`` but reads it back
+    from both places, so accept either rather than betting on one.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "auth-2",
+                "message": {
+                    "role": "assistant",
+                    "content": "Credit balance too low · Run /login to switch accounts",
+                    "isApiErrorMessage": True,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+
+    rendered = items[0].data["content"][0]["text"]
+    assert "omni setup" in rendered
+    # The CLI's own diagnosis (a billing problem, not an expired login)
+    # must survive: the guidance is appended, never a replacement.
+    assert rendered.startswith("Credit balance too low · Run /login to switch accounts")
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        # Not about auth at all.
+        "API Error: 500 Internal Server Error",
+        # Auth errors that name /logout ALONE (verbatim from the binary).
+        # Their remedy is unsetting an env var, which `omni setup` does
+        # not do — appending its guidance there would only add noise.
+        "ANTHROPIC_API_KEY is set · unset it or /logout to clear the saved key",
+        "Unset the ANTHROPIC_API_KEY environment variable, or claude /logout then say continue",
+        "This background session shares credentials with other sessions; /logout here has "
+        "no effect. Run /logout from your main terminal to sign out.",
+    ],
+)
+def test_read_transcript_flagged_record_without_login_is_untouched(
+    tmp_path: Path,
+    raw_text: str,
+) -> None:
+    """
+    Flagging alone rewrites nothing — the text must name ``/login``.
+
+    Two families must survive verbatim: API errors unrelated to auth
+    (rate limits, overload, 5xx), and the auth errors that point at
+    ``/logout`` alone. The latter describe an env var or a sibling
+    session overriding the credential, and the instruction they carry —
+    unset ``ANTHROPIC_API_KEY`` — is one ``omni setup`` cannot perform,
+    so replacing the message would strand the user. A message naming
+    both (``...then /logout and /login.``) still matches on ``/login``.
+    """
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == raw_text
+
+
+def test_read_transcript_rewrites_logout_and_login_together(tmp_path: Path) -> None:
+    """
+    A message naming BOTH commands is still a ``/login`` dead end.
+
+    The CLI's "...then /logout and /login." shape ends in a re-auth
+    instruction, so it takes the guidance via its ``/login`` — but its
+    env-var prerequisite (unset or re-mint ``CLAUDE_CODE_OAUTH_TOKEN``,
+    which ``omni setup`` cannot do) must stay on screen, so the CLI
+    text is kept and the guidance appended below it.
+    """
+    raw_text = (
+        "If CLAUDE_CODE_OAUTH_TOKEN is set, unset it or re-mint it for this "
+        "account, then /logout and /login."
+    )
+
+    expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
+
+
+def test_read_transcript_items_from_offset_skips_existing_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Byte-offset transcript reads do not reparse old JSONL prefixes.
+
+    A poll after a large existing transcript should seek directly to
+    the saved byte offset. The patched file wrapper raises if reads
+    touch the old prefix, so this test fails under the prior full-file
+    rescan behavior.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    prefix = "".join(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": f"prefix-{index}",
+                "message": {"role": "user", "content": f"prefix {index}"},
+            }
+        )
+        + "\n"
+        for index in range(100)
+    )
+    transcript_path.write_text(
+        prefix
+        + json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-new",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "new output"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prefix_offset = len(prefix.encode("utf-8"))
+    _fail_if_path_reads_before_offset(monkeypatch, transcript_path, prefix_offset)
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        prefix_offset,
+        start_line=100,
+        agent_name="claude-native-ui",
+    )
+
+    assert result.line_cursor == 101
+    assert result.byte_offset == transcript_path.stat().st_size
+    assert [item.item_type for item in result.items] == ["message"]
+    assert result.items[0].data == {
+        "role": "assistant",
+        "agent": "claude-native-ui",
+        "content": [{"type": "output_text", "text": "new output"}],
+    }
+
+
+def test_read_transcript_items_from_offset_preserves_partial_trailing_line(
+    tmp_path: Path,
+) -> None:
+    """
+    A partial trailing transcript JSON record is retried after completion.
+
+    Claude writes JSONL append-only, and a poll can land after bytes
+    are written but before the final newline. The reader must not
+    advance the byte offset in that case or the completed record will
+    be skipped forever.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    partial = (
+        '{"type":"assistant","uuid":"assistant-partial","message":{"role":"assistant",'
+        '"content":[{"type":"text","text":"eventually complete"}]}'
+    )
+    transcript_path.write_text(partial, encoding="utf-8")
+
+    first = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+
+    assert first.line_cursor == 0
+    assert first.byte_offset == 0
+    assert first.items == []
+
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write("}\n")
+    second = read_transcript_items_from_offset(
+        transcript_path,
+        first.byte_offset,
+        start_line=first.line_cursor,
+        agent_name="claude-native-ui",
+    )
+
+    assert second.line_cursor == 1
+    assert second.byte_offset == transcript_path.stat().st_size
+    assert [item.data for item in second.items] == [
+        {
+            "role": "assistant",
+            "agent": "claude-native-ui",
+            "content": [{"type": "output_text", "text": "eventually complete"}],
+        }
+    ]
+
+
+def _transcript_line(entry: dict[str, Any]) -> str:
+    """
+    Serialize one transcript entry as a JSONL line.
+
+    :param entry: Decoded transcript record.
+    :returns: The record as a newline-terminated JSON string.
+    """
+    return json.dumps(entry) + "\n"
+
+
+def _assistant_text_entry(uuid: str, text: str) -> dict[str, Any]:
+    """
+    Build a minimal assistant transcript entry.
+
+    :param uuid: Record uuid (drives deterministic ids).
+    :param text: Assistant output text.
+    :returns: The decoded transcript record.
+    """
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+    }
+
+
+def test_scheduled_wake_opens_marked_turn(tmp_path: Path) -> None:
+    """
+    Assistant output inheriting a settled turn id opens a marked new turn.
+
+    Cron and wakeup firings re-invoke Claude with no user transcript
+    entry, so the resumed output would inherit the finished turn's id
+    forever. With ``settled_response_id`` set to that id, the parser
+    must mint a fresh id and prepend the scheduled-wake marker.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        _transcript_line(_assistant_text_entry("wake-1", "iteration two output"))
+        + _transcript_line(_assistant_text_entry("wake-2", "more of iteration two")),
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp_prev_turn",
+        settled_response_id="resp_prev_turn",
+    )
+
+    kinds = [item.item_type for item in result.items]
+    assert kinds == ["message", "message", "message"]
+    marker = result.items[0]
+    assert marker.data["role"] == "user"
+    assert marker.data["content"] == [
+        {"type": "input_text", "text": claude_native_bridge._SCHEDULED_WAKE_MARKER_TEXT}
+    ]
+    new_turn_id = marker.response_id
+    assert new_turn_id != "resp_prev_turn"
+    # The waking entry's output and the rest of the batch share the new id.
+    assert [item.response_id for item in result.items] == [new_turn_id] * 3
+    assert result.current_response_id == new_turn_id
+
+    # Re-reads are idempotent: same window, same ids (retries dedupe on them).
+    replay = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp_prev_turn",
+        settled_response_id="resp_prev_turn",
+    )
+    assert [item.source_id for item in replay.items] == [item.source_id for item in result.items]
+    assert [item.response_id for item in replay.items] == [
+        item.response_id for item in result.items
+    ]
+
+
+def test_scheduled_wake_requires_settled_turn(tmp_path: Path) -> None:
+    """
+    Without a settle, post-turn assistant output inherits the active id.
+
+    Mid-turn output (including a delta-held tail flushed late) must keep
+    extending its own turn — no marker, no fresh id.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        _transcript_line(_assistant_text_entry("tail-1", "same turn tail")),
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp_live_turn",
+    )
+
+    assert [item.item_type for item in result.items] == ["message"]
+    assert result.items[0].data["role"] == "assistant"
+    assert result.items[0].response_id == "resp_live_turn"
+    assert result.current_response_id == "resp_live_turn"
+
+
+def test_scheduled_wake_not_marked_for_post_compaction_output(tmp_path: Path) -> None:
+    """
+    Post-compaction output in the SAME batch as the summary is no wake.
+
+    The compaction card is the boundary; the resumed output continues
+    the settled turn. A batch holding the ``isCompactSummary`` record
+    AND the resumed assistant entry must parse the resume with the
+    settle disarmed — no marker, same turn id.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        _transcript_line(
+            {
+                "type": "user",
+                "uuid": "compact-1",
+                "isCompactSummary": True,
+                "message": {"role": "user", "content": "Summary of the prior context."},
+            }
+        )
+        + _transcript_line(_assistant_text_entry("post-compact", "continuing the task")),
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp_prev_turn",
+        settled_response_id="resp_prev_turn",
+    )
+
+    texts = [
+        block.get("text")
+        for item in result.items
+        if item.item_type == "message"
+        for block in item.data["content"]
+        if isinstance(block, dict)
+    ]
+    assert claude_native_bridge._SCHEDULED_WAKE_MARKER_TEXT not in texts
+    resumed = result.items[-1]
+    assert resumed.data["role"] == "assistant"
+    assert resumed.response_id == "resp_prev_turn"
+    assert result.current_response_id == "resp_prev_turn"
+
+
+def test_scheduled_wake_skips_tool_results_and_real_prompts(tmp_path: Path) -> None:
+    """
+    Only assistant output triggers the wake; other entries behave as before.
+
+    A late tool result for the settled turn keeps that turn's id (its
+    call card pairs by id), and a REAL user prompt opens the next turn
+    the ordinary way — no wake marker anywhere.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        _transcript_line(
+            {
+                "type": "user",
+                "uuid": "late-result",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_bg_1",
+                            "content": "background shell done",
+                        }
+                    ],
+                },
+            }
+        )
+        + _transcript_line(
+            {
+                "type": "user",
+                "uuid": "real-prompt",
+                "message": {"role": "user", "content": "next question"},
+            }
+        )
+        + _transcript_line(_assistant_text_entry("next-turn", "answering the question")),
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp_prev_turn",
+        settled_response_id="resp_prev_turn",
+    )
+
+    texts = [
+        block.get("text")
+        for item in result.items
+        if item.item_type == "message"
+        for block in item.data["content"]
+        if isinstance(block, dict)
+    ]
+    assert claude_native_bridge._SCHEDULED_WAKE_MARKER_TEXT not in texts
+    assert [item.item_type for item in result.items] == [
+        "function_call_output",
+        "message",
+        "message",
+    ]
+    # The late result stays on the settled turn; the real prompt resets the
+    # id, so the answer opens a fresh turn without any wake involvement.
+    assert result.items[0].response_id == "resp_prev_turn"
+    assert result.items[2].data["role"] == "assistant"
+    assert result.items[2].response_id not in {"resp_prev_turn", None}
+
+
+def test_read_transcript_line_cursor_migration_preserves_legacy_source_ids(
+    tmp_path: Path,
+) -> None:
+    """
+    Line-cursor migration keeps UUID-less fallback ids stable.
+
+    Older forwarder state can contain ``line-N`` source ids in
+    ``seen_source_ids``. The compatibility reader must keep producing
+    that legacy id shape for the migration poll so already-posted
+    UUID-less items are not duplicated before future byte-offset polls
+    switch to byte-based fallbacks.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    first_record = (
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "already forwarded"},
+            }
+        )
+        + "\n"
+    )
+    transcript_path.write_text(
+        first_record
+        + json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "new output"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    migrated = claude_native_bridge.read_transcript_items_since_with_position(
+        transcript_path,
+        1,
+        agent_name="claude-native-ui",
+    )
+    byte_offset = len(first_record.encode("utf-8"))
+    byte_reader = read_transcript_items_from_offset(
+        transcript_path,
+        byte_offset,
+        start_line=1,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.source_id for item in migrated.items] == ["line-2:0:message"]
+    assert [item.source_id for item in byte_reader.items] == [f"byte-{byte_offset}:0:message"]
+
+
+def test_read_transcript_items_since_ignores_observed_status_records(tmp_path: Path) -> None:
+    """
+    Non-conversation Claude JSONL records do not become Omnigent items.
+
+    The local transcript audit found status/UI records such as
+    ``queue-operation``, ``branch-update``, ``progress``,
+    ``pr-link``, and non-prompt attachments alongside normal
+    message records. They must not show up as chat items or reset
+    the active response id for following assistant output.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-tool-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_bash_1",
+                                    "name": "Bash",
+                                    "input": {"command": "sleep 1"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps({"type": "queue-operation", "operation": "enqueue", "content": "STOP"}),
+                json.dumps({"type": "branch-update", "gitBranch": "feature/native-claude"}),
+                json.dumps(
+                    {
+                        "type": "progress",
+                        "uuid": "progress-1",
+                        "toolUseID": "toolu_bash_1",
+                        "data": {"type": "hook_progress", "hookEvent": "PostToolUse"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "pr-link",
+                        "prNumber": 123,
+                        "prRepository": "example/repo",
+                        "prUrl": "https://example.invalid/pr/123",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "attachment",
+                        "uuid": "file-attachment",
+                        "attachment": {
+                            "type": "file",
+                            "filename": "TODO.md",
+                            "displayPath": "TODO.md",
+                            "content": [],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "tool-result-1",
+                        "parentUuid": "assistant-tool-1",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_bash_1",
+                                    "content": "(No output)",
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-text-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Done."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert cursor == 8, "cursor should advance past ignored status/UI records"
+    assert [item.item_type for item in items] == [
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert items[0].data["call_id"] == "toolu_bash_1"
+    assert items[1].data == {"call_id": "toolu_bash_1", "output": "(No output)"}
+    assert items[2].data == {
+        "role": "assistant",
+        "agent": "claude-native-ui",
+        "content": [{"type": "output_text", "text": "Done."}],
+    }
+    assert items[0].response_id == items[1].response_id == items[2].response_id
+    assert current_response_id == items[0].response_id
+
+
+def test_read_transcript_items_since_parses_interruption_queued_prompt(tmp_path: Path) -> None:
+    """
+    Queued prompt attachments become user messages in the transcript.
+
+    Claude records text entered while a tool/assistant turn is still
+    busy as ``attachment.type == "queued_command"``. This test uses
+    that real interruption shape so a regression would drop the
+    user's ``STOP`` message and incorrectly group the assistant's
+    post-interrupt response under the pre-interrupt response id.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "user-count",
+                        "message": {
+                            "role": "user",
+                            "content": "count to 10 unless I tell you to stop",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-three",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "3"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-sleep",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_sleep_1",
+                                    "name": "Bash",
+                                    "input": {"command": "sleep 1"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "queue-operation",
+                        "operation": "enqueue",
+                        "content": "STOP",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "sleep-result",
+                        "parentUuid": "assistant-sleep",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_sleep_1",
+                                    "content": "(Bash completed with no output)",
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "attachment",
+                        "uuid": "queued-stop",
+                        "attachment": {
+                            "type": "queued_command",
+                            "prompt": "STOP",
+                            "commandMode": "prompt",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-stopped",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Stopped at 3."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert cursor == 7, "cursor should include the queued-command attachment record"
+    assert [item.item_type for item in items] == [
+        "message",
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+        "message",
+    ]
+    assert items[4].source_id == "queued-stop:0:message"
+    assert items[4].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "STOP"}],
+    }
+    assert items[5].data == {
+        "role": "assistant",
+        "agent": "claude-native-ui",
+        "content": [{"type": "output_text", "text": "Stopped at 3."}],
+    }
+    assert items[3].response_id == items[2].response_id
+    assert items[4].response_id != items[3].response_id
+    assert items[5].response_id != items[3].response_id
+    assert current_response_id == items[5].response_id
+
+
+def test_read_hook_events_from_offset_skips_existing_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Byte-offset hook reads parse only hook records appended after the cursor.
+
+    This guards the status forwarder hot path: many old hook records
+    must not be rescanned on every poll once a byte cursor exists.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    hooks_path = bridge_dir / "hooks.jsonl"
+    prefix = "".join(
+        json.dumps({"payload": {"hook_event_name": "SessionStart"}}) + "\n" for _index in range(50)
+    )
+    hooks_path.write_text(
+        prefix + json.dumps({"payload": {"hook_event_name": "Stop"}}) + "\n",
+        encoding="utf-8",
+    )
+    prefix_offset = len(prefix.encode("utf-8"))
+    _fail_if_path_reads_before_offset(monkeypatch, hooks_path, prefix_offset)
+
+    result = read_hook_events_from_offset(
+        bridge_dir,
+        prefix_offset,
+        start_event_count=50,
+    )
+
+    assert result.event_cursor == 51
+    assert result.byte_offset == hooks_path.stat().st_size
+    assert [record.event_name for record in result.records] == ["Stop"]
+
+
+def test_read_hook_events_from_offset_preserves_partial_trailing_line(tmp_path: Path) -> None:
+    """
+    A partial trailing hook JSON record is not skipped.
+
+    Hook processes append status edges concurrently with the forwarder
+    poll loop. If the reader advanced past a partial line, the web UI
+    could miss the matching ``running`` or ``idle`` transition.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    hooks_path = bridge_dir / "hooks.jsonl"
+    hooks_path.write_text('{"payload":{"hook_event_name":"Stop"', encoding="utf-8")
+
+    first = read_hook_events_from_offset(bridge_dir, 0, start_event_count=0)
+
+    assert first.event_cursor == 0
+    assert first.byte_offset == 0
+    assert first.records == []
+
+    with hooks_path.open("a", encoding="utf-8") as handle:
+        handle.write("}}\n")
+    second = read_hook_events_from_offset(
+        bridge_dir,
+        first.byte_offset,
+        start_event_count=first.event_cursor,
+    )
+
+    assert second.event_cursor == 1
+    assert second.byte_offset == hooks_path.stat().st_size
+    assert [record.event_name for record in second.records] == ["Stop"]
+
+
+def test_read_transcript_items_since_surfaces_skill_as_slash_command(
+    tmp_path: Path,
+) -> None:
+    """
+    A Skill marker record becomes one ``slash_command`` item, not
+    a user bubble (the raw-markup regression) and not a drop
+    (the over-correction). The subsequent assistant turn
+    still surfaces.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "slash-skill",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-name>/dev-productivity:simplify</command-name>\n"
+                                "            <command-message>simplify</command-message>\n"
+                                "            <command-args></command-args>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-after",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Done."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert cursor == 2
+    assert [item.item_type for item in items] == ["slash_command", "message"]
+    # Leading ``/`` stripped, args empty, ``output`` omitted via exclude_none.
+    # ``kind`` is ``"skill"`` because the name isn't in the surfaced-CLI
+    # set (``effort``, ``clear``, ``compact``, ``model``, ``ultrareview``).
+    assert items[0].data == {
+        "agent": "claude-native-ui",
+        "kind": "skill",
+        "name": "dev-productivity:simplify",
+        "arguments": "",
+    }
+    assert items[1].data == {
+        "role": "assistant",
+        "agent": "claude-native-ui",
+        "content": [{"type": "output_text", "text": "Done."}],
+    }
+    # Slash command + the assistant turn it triggered must cluster in
+    # one bubble — see test_slash_command_does_not_inherit_prior_turn_response_id.
+    assert items[0].response_id == items[1].response_id
+
+
+def test_slash_command_does_not_inherit_prior_turn_response_id(tmp_path: Path) -> None:
+    """
+    Slash command opens a new logical turn. With a prior assistant
+    record establishing ``current_response_id``, the slash command +
+    the assistant text it triggers must share their own
+    ``response_id`` (distinct from the prior turn) so the web UI
+    clusters them in one bubble instead of folding the follow-up
+    text back into the older bubble.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "prior-assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Earlier reply."}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "slash-skill",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-name>/dev-productivity:simplify</command-name>\n"
+                                "            <command-message>simplify</command-message>\n"
+                                "            <command-args></command-args>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-after-skill",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Simplified."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message", "slash_command", "message"]
+    prior_id, slash_id, after_id = (item.response_id for item in items)
+    assert prior_id != slash_id
+    assert slash_id == after_id
+
+
+def test_read_transcript_items_since_drops_cli_builtin_slash_commands(
+    tmp_path: Path,
+) -> None:
+    """
+    A real ``/login`` invocation generates three sibling
+    ``role=user`` JSONL records: ``isMeta=true`` caveat, the
+    ``<command-name>`` echo, and a follow-up
+    ``<local-command-stdout>`` carrying the CLI's reply. All three
+    must drop. Legitimate user messages around them still surface.
+
+    Uses ``/login`` because it's in the DROPPED set; commands in the
+    SURFACED set (``/effort``, ``/clear``, ``/compact``, ``/model``,
+    ``/ultrareview``) deliberately emit a ``slash_command`` item now,
+    so they'd fail this assertion — see the surfaces-cli-commands
+    parametric test below.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "real-user-msg",
+                        "message": {"role": "user", "content": "hi"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "caveat-meta",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<local-command-caveat>Caveat: ...</local-command-caveat>"
+                            ),
+                        },
+                        "isMeta": True,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "slash-login",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-name>/login</command-name>\n"
+                                "            <command-message>login</command-message>\n"
+                                "            <command-args></command-args>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "login-stdout",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<local-command-stdout>Opening browser…</local-command-stdout>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-after",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Done."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    # Five lines consumed; only the real user msg + final assistant text
+    # become items. The stdout record on its own line is the leak that
+    # rendered as a user bubble before this fix.
+    assert cursor == 5
+    assert [item.item_type for item in items] == ["message", "message"]
+    assert items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "hi"}],
+    }
+    assert items[1].data == {
+        "role": "assistant",
+        "agent": "claude-native-ui",
+        "content": [{"type": "output_text", "text": "Done."}],
+    }
+
+
+@pytest.mark.parametrize(
+    "marker_content",
+    [
+        "<local-command-stdout>Set effort level to max</local-command-stdout>",
+        "<local-command-stderr>command failed</local-command-stderr>",
+        # Standalone command-message / command-args records (4 of these
+        # appear in the real transcripts without a preceding command-name).
+        "<command-message>effort</command-message>",
+        "<command-args>max</command-args>",
+    ],
+)
+def test_read_transcript_items_since_drops_standalone_cli_scaffolding_records(
+    tmp_path: Path, marker_content: str
+) -> None:
+    """
+    Any ``role=user`` record whose content starts with a known CLI
+    scaffolding marker is CLI bookkeeping, not user content. Each
+    must drop instead of rendering markup as a user bubble.
+
+    Note: ``<bash-input>``, ``<bash-stdout>``, and ``<bash-stderr>`` are
+    intentionally excluded here — they are surfaced as ``terminal_command``
+    items (see ``test_read_transcript_items_since_surfaces_terminal_command_*``).
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "scaffolding",
+                "message": {"role": "user", "content": marker_content},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert items == [], (
+        f"CLI scaffolding ({marker_content[:40]}...) must drop; "
+        f"bridge emitted {[item.item_type for item in items]}"
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        # String form (how Claude Code ships it today), both variants.
+        "[Request interrupted by user]",
+        "[Request interrupted by user for tool use]",
+        # List form — defensive: Claude's JSONL shape isn't under our control.
+        [{"type": "text", "text": "[Request interrupted by user]"}],
+    ],
+)
+def test_read_transcript_items_since_keeps_interrupt_marker(
+    tmp_path: Path, content: object
+) -> None:
+    """
+    Claude's ``[Request interrupted by user]`` record is mirrored, not dropped.
+
+    We deliberately keep it in history (it mirrors Claude's own session); the
+    web UI re-classifies it as a muted "System: Interrupted" marker via
+    ``parseSystemMessage`` rather than a raw user bubble. Guards against
+    re-adding a bridge-side drop filter, which would starve the UI of the
+    marker and leave a reload with no sign the turn was interrupted.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "interrupt",
+                "message": {"role": "user", "content": content},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message"], (
+        f"Interrupt marker must be mirrored as a message item for the UI to "
+        f"re-classify; bridge emitted {[item.item_type for item in items]}"
+    )
+
+
+def test_read_transcript_items_since_surfaces_bash_input_as_terminal_command(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``role=user`` record starting with ``<bash-input>`` is emitted by
+    Claude Code when the user types ``!cmd``. It must surface as a
+    ``terminal_command`` item with ``kind="input"`` instead of being
+    dropped or rendered as raw markup.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "bash-in",
+                "message": {"role": "user", "content": "<bash-input>pwd</bash-input>"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert len(items) == 1
+    assert items[0].item_type == "terminal_command"
+    assert items[0].data == {"kind": "input", "input": "pwd"}
+    assert isinstance(items[0].response_id, str)
+    assert items[0].response_id.startswith("resp_claude_")
+
+
+def test_read_transcript_items_since_surfaces_bash_output_as_terminal_command(
+    tmp_path: Path,
+) -> None:
+    """
+    The sibling ``role=user`` record carrying ``<bash-stdout>`` and
+    ``<bash-stderr>`` must surface as a ``terminal_command`` item with
+    ``kind="output"`` so stdout/stderr are visible in the server UI.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "bash-out",
+                "message": {
+                    "role": "user",
+                    "content": "<bash-stdout>/home/user</bash-stdout><bash-stderr></bash-stderr>",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert len(items) == 1
+    assert items[0].item_type == "terminal_command"
+    assert items[0].data == {"kind": "output", "stdout": "/home/user", "stderr": ""}
+    assert isinstance(items[0].response_id, str)
+    assert items[0].response_id.startswith("resp_claude_")
+
+
+def test_read_transcript_items_since_surfaces_top_level_local_command(
+    tmp_path: Path,
+) -> None:
+    """
+    Top-level ``local_command`` shell records become terminal items.
+
+    Claude Code can record ``!cmd`` as ``subtype="local_command"``
+    with a top-level ``content`` field instead of a ``role=user``
+    message. This test fails if the parser only looks under
+    ``message`` and silently drops shell commands before the
+    forwarder can POST them to AP.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "subtype": "local_command",
+                        "uuid": "bash-in-local",
+                        "content": "<bash-input>pwd</bash-input>",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "subtype": "local_command",
+                        "uuid": "bash-out-local",
+                        "content": (
+                            "<bash-stdout>/home/user</bash-stdout><bash-stderr></bash-stderr>"
+                        ),
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == ["terminal_command", "terminal_command"]
+    assert [item.data for item in items] == [
+        {"kind": "input", "input": "pwd"},
+        {"kind": "output", "stdout": "/home/user", "stderr": ""},
+    ]
+    assert items[0].response_id == items[1].response_id
+    assert items[0].response_id.startswith("resp_claude_")
+
+
+def test_read_transcript_items_since_surfaces_combined_shell_record(
+    tmp_path: Path,
+) -> None:
+    """
+    One transcript record can carry both shell input and output.
+
+    A regression that returns after the input tag would persist only
+    the invocation and lose the result, recreating the broken web
+    transcript that shows a local shell command with no output.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "subtype": "local_command",
+                "uuid": "bash-combined",
+                "content": ("<bash-input>printf hi</bash-input><bash-stdout>hi</bash-stdout>"),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == ["terminal_command", "terminal_command"]
+    assert [item.data for item in items] == [
+        {"kind": "input", "input": "printf hi"},
+        {"kind": "output", "stdout": "hi", "stderr": None},
+    ]
+    assert items[0].response_id == items[1].response_id
+
+
+def test_read_transcript_items_since_surfaces_skill_when_command_name_is_not_first_tag(
+    tmp_path: Path,
+) -> None:
+    """
+    Skill invocations with args ship the tag order
+    ``<command-message>…<command-name>…<command-args>…`` (real shape
+    observed in transcripts for e.g. ``/supervisor-agent-e2e-test use this skill``).
+    The dispatcher must detect ``<command-name>`` anywhere in the
+    content, not just at the start — otherwise the record falls into
+    the scaffolding-drop branch because ``<command-message>`` IS in
+    ``_CLI_SCAFFOLDING_MARKERS`` and the skill silently disappears.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "slash-skill-with-args",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<command-message>supervisor-agent-e2e-test</command-message>\n"
+                        "<command-name>/supervisor-agent-e2e-test</command-name>\n"
+                        "<command-args>use this skill</command-args>"
+                    ),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert len(items) == 1
+    assert items[0].item_type == "slash_command"
+    assert items[0].data == {
+        "agent": "claude-native-ui",
+        "kind": "skill",
+        "name": "supervisor-agent-e2e-test",
+        "arguments": "use this skill",
+    }
+
+
+def test_read_transcript_items_since_carries_stdout_for_skill_with_output(
+    tmp_path: Path,
+) -> None:
+    """
+    Inline ``<local-command-stdout>`` is threaded into ``output``
+    so the renderer can show it in the expanded panel. Regex bugs
+    that grab the wrong group surface here.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "slash-skill-with-stdout",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<command-name>/oncall</command-name>\n"
+                        "<command-message>oncall</command-message>\n"
+                        "<command-args>file-bug</command-args>\n"
+                        "<local-command-stdout>oncall: file-bug subcommand "
+                        "started</local-command-stdout>"
+                    ),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert len(items) == 1
+    assert items[0].item_type == "slash_command"
+    assert items[0].data == {
+        "agent": "claude-native-ui",
+        "kind": "skill",
+        "name": "oncall",
+        "arguments": "file-bug",
+        "output": "oncall: file-bug subcommand started",
+    }
+
+
+@pytest.mark.parametrize(
+    "builtin_name",
+    [
+        "add-dir",
+        "plugin",
+        "terminal-setup",
+    ],
+)
+def test_read_transcript_items_since_drops_recently_added_cli_builtins(
+    tmp_path: Path, builtin_name: str
+) -> None:
+    """
+    Names in the CLI built-in DROPPED set drop end-to-end — not
+    surface as fake Skill rows. Drives each through the full bridge
+    pipeline (set membership alone wouldn't catch a name that's in
+    the set but mishandled downstream).
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": f"slash-{builtin_name}",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        f"<command-name>/{builtin_name}</command-name>\n"
+                        f"            <command-message>{builtin_name}</command-message>\n"
+                        "            <command-args></command-args>"
+                    ),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert items == [], (
+        f"/{builtin_name} must drop; bridge emitted {[item.item_type for item in items]}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("command_name", "args"),
+    [
+        ("effort", "high"),
+        ("clear", ""),
+        ("compact", ""),
+        ("model", "claude-opus-4-7"),
+        ("ultrareview", ""),
+    ],
+)
+def test_read_transcript_items_since_surfaces_cli_commands_with_kind_command(
+    tmp_path: Path, command_name: str, args: str
+) -> None:
+    """
+    Surfaced CLI built-ins (``/effort``, ``/clear``, ``/compact``,
+    ``/model``, ``/ultrareview``) emit a ``slash_command`` item with
+    ``kind="command"`` — the renderer uses that to switch the prefix
+    label from "Skill" to "Command".
+
+    These commands change conversation-visible state (effort level,
+    context reset, compaction, model swap, kicking off a review). A
+    web observer must see them; otherwise the next assistant turn
+    appears to shift unprompted. If a regression promotes any of
+    these names back into the dropped set, items would be empty and
+    this test fails.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": f"slash-{command_name}",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        f"<command-name>/{command_name}</command-name>\n"
+                        f"            <command-message>{command_name}</command-message>\n"
+                        f"            <command-args>{args}</command-args>"
+                    ),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert len(items) == 1
+    assert items[0].item_type == "slash_command"
+    assert items[0].data == {
+        "agent": "claude-native-ui",
+        "kind": "command",
+        "name": command_name,
+        "arguments": args,
+    }
+
+
+def test_read_transcript_items_since_drops_malformed_slash_command_record(
+    tmp_path: Path,
+) -> None:
+    """
+    A truncated slash-command record (open tag, no close) drops
+    instead of falling through to the user-bubble path that would
+    render the markup verbatim. Subsequent legitimate
+    records still surface — one bad line must not kill the poll loop.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "slash-truncated",
+                        "message": {
+                            "role": "user",
+                            # Start tag with no closing tag — pathological shape.
+                            "content": "<command-name>/oncall",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-after",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Done."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message"]
+    assert items[0].data == {
+        "role": "assistant",
+        "agent": "claude-native-ui",
+        "content": [{"type": "output_text", "text": "Done."}],
+    }
+
+
+def test_read_transcript_items_since_drops_list_form_slash_command_text_block(
+    tmp_path: Path,
+) -> None:
+    """
+    Slash-command markup inside a list-form ``content`` text block
+    drops instead of leaking as a user bubble. Sibling tool_result
+    blocks in the same record still surface.
+
+    Today Claude Code emits slash-command records as string content
+    (covered by the surfaces/drops/malformed tests above). If that
+    serialization ever changes to list form, the string-branch guard
+    no longer fires — without the list-branch filter this regresses
+    to the raw-markup-as-user-bubble bug.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "list-form-slash",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "<command-name>/dev-productivity:simplify"
+                                "</command-name>\n"
+                                "            <command-args></command-args>"
+                            ),
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_legit",
+                            "content": "tool finished",
+                        },
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    # The text block holding ``<command-name>…`` is dropped; only the
+    # legitimate tool_result survives. If the list-branch filter
+    # regresses, items would contain a "message" with the raw markup
+    # as ``input_text``.
+    assert [item.item_type for item in items] == ["function_call_output"]
+    assert items[0].data["call_id"] == "call_legit"
+
+
+def test_read_transcript_items_from_offset_surfaces_skill_as_slash_command(
+    tmp_path: Path,
+) -> None:
+    """
+    Byte-offset transcript reads emit ``slash_command`` items, not
+    raw user bubbles, for Claude Code Skill records.
+
+    Both transcript readers (line-cursor ``read_transcript_items_since``
+    and byte-offset ``read_transcript_items_from_offset``) flow through
+    the same ``_user_transcript_items_from_entry`` parser. The line-
+    cursor path is covered above; this pins the byte-offset path so a
+    future change to the byte-offset wrapper that drops ``agent_name``
+    or ``record_offset`` from the parser call fails loud here.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "byte-offset-skill",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<command-name>/dev-productivity:simplify</command-name>\n"
+                        "            <command-args></command-args>"
+                    ),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+    )
+
+    assert result.byte_offset == transcript_path.stat().st_size
+    assert [item.item_type for item in result.items] == ["slash_command"]
+    assert result.items[0].data == {
+        "agent": "claude-native-ui",
+        "kind": "skill",
+        "name": "dev-productivity:simplify",
+        "arguments": "",
+    }
+
+
+def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
+    """
+    Claude receives the Omnigent MCP server and hook settings in one launch.
+
+    This fails if the terminal starts Claude without the bridge pieces
+    needed for tool dispatch / transcript discovery. Also asserts the
+    org-blocked Channels flag is not present.
+    """
+    args = augment_claude_args(
+        ("--resume", "abc"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert args[:2] == ["--resume", "abc"]
+    mcp_config = json.loads(args[args.index("--mcp-config") + 1])
+    server = mcp_config["mcpServers"]["omnigent"]
+    assert server["command"] == "/venv/bin/python"
+    assert server["args"][-2:] == ["--bridge-dir", str(tmp_path)]
+    # Web-UI input does not flow through Claude Channels — that
+    # capability is blocked at the org level. The wrapper must not
+    # pass the development-channels flag.
+    assert "--dangerously-load-development-channels" not in args
+    settings = _load_invocation_settings(args)
+    prompt_hooks = settings["hooks"]["UserPromptSubmit"][0]["hooks"]
+    assert any("framework-context" in hook["command"] for hook in prompt_hooks)
+    assert (
+        "omnigent.harnesses.claude_native.hook"
+        in settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+    )
+    # ``PreCompact`` must be wired so the forwarder can surface
+    # ``response.compaction.in_progress`` while Claude compacts in the
+    # terminal. Missing it = no "Compacting…" spinner for claude-native.
+    assert "PreCompact" in settings["hooks"], (
+        f"PreCompact hook must be registered; got hooks {sorted(settings['hooks'])!r}."
+    )
+    assert (
+        "omnigent.harnesses.claude_native.hook"
+        in settings["hooks"]["PreCompact"][0]["hooks"][0]["command"]
+    )
+    # No built-in tools are disabled anymore: ``AskUserQuestion`` and
+    # ``ExitPlanMode`` both surface through the standard PermissionRequest
+    # elicitation card (question answers ride back via ``updatedInput``),
+    # so the wrapper must not inject a ``--disallowedTools`` flag of its own.
+    assert "--disallowedTools" not in args
+
+
+def test_generated_claude_subprocesses_pin_runner_tmpdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP and Python hooks use the temp root that created the bridge."""
+    runner_tmpdir = tmp_path / "runner-tmp"
+    bridge_dir = (
+        runner_tmpdir
+        / f"omnigent-{claude_native_bridge.stable_user_id()}"
+        / "claude-native"
+        / "session"
+    )
+    bridge_dir.mkdir(parents=True)
+    inherited_tmpdir = tmp_path / "shell-tmp"
+    inherited_tmpdir.mkdir()
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT",
+        runner_tmpdir,
+    )
+    monkeypatch.setenv("TMPDIR", str(inherited_tmpdir))
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787",
+        subagent_router_dir=bridge_dir,
+        turn_routing=True,
+    )
+    mcp_config = json.loads(args[args.index("--mcp-config") + 1])
+    settings = _load_invocation_settings(args)
+
+    server_env = mcp_config["mcpServers"]["omnigent"]["env"]
+    assert server_env["TMPDIR"] == str(runner_tmpdir)
+    python_commands = [
+        hook["command"]
+        for entries in settings["hooks"].values()
+        for entry in entries
+        for hook in entry["hooks"]
+        if "/venv/bin/python" in hook["command"]
+    ]
+    assert len(python_commands) == 18
+    expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
+    assert all(expected_tmpdir in command for command in python_commands)
+
+
+def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:
+    """
+    ``EnterWorktree`` / ``ExitWorktree`` PostToolUse events reach the observer hook.
+
+    Both tools move the session transcript into the new cwd's project dir, and
+    only the observer hook updates the bridge's ``transcript_path``. Without
+    this entry the forwarder tails the vanished pre-move file until the turn's
+    ``Stop``, so nothing the tool did (its own result included) is mirrored.
+    """
+    settings = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    worktree_entries = [
+        entry
+        for entry in settings["hooks"]["PostToolUse"]
+        if entry.get("matcher") == "EnterWorktree|ExitWorktree"
+    ]
+    assert len(worktree_entries) == 1
+    assert (
+        "omnigent.harnesses.claude_native.hook --bridge-dir"
+        in worktree_entries[0]["hooks"][0]["command"]
+    )
+
+
+def test_framework_context_hook_consumes_hidden_notice(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """The hook returns hidden context once, then removes it."""
+    path = tmp_path / "pending_framework_context.txt"
+    path.write_text("downscaled", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+
+    assert claude_native_hook.main(["framework-context", "--bridge-dir", str(tmp_path)]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["additionalContext"] == "downscaled"
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "api_key_helper",
+    (
+        "printf %s sk-sentinel-do-not-use",
+        "credential-helper --token sk-sentinel-do-not-use",
+    ),
+)
+def test_augment_claude_args_materializes_api_key_helper(
+    tmp_path: Path,
+    api_key_helper: str,
+) -> None:
+    bridge_dir = tmp_path / "session"
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        api_key_helper=api_key_helper,
+    )
+
+    settings_path = Path(args[args.index("--settings") + 1])
+    settings = _load_invocation_settings(args)
+    assert all("sk-sentinel-do-not-use" not in arg for arg in args)
+    assert settings["apiKeyHelper"] == api_key_helper
+    assert settings_path.parent == bridge_dir
+    assert bridge_dir.stat().st_mode & 0o777 == 0o700
+    assert settings_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_augment_claude_args_threads_model_overrides_into_settings(tmp_path: Path) -> None:
+    """``model_overrides`` is written into the invocation-local sidecar."""
+    overrides = {
+        "claude-opus-4-8": "databricks-claude-opus-4-8",
+        "claude-opus-5": "databricks-claude-opus-5",
+    }
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        api_key_helper="printf tok",
+        model_overrides=overrides,
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings["apiKeyHelper"] == "printf tok"
+    assert settings["modelOverrides"] == overrides
+
+
+def test_augment_claude_args_omits_model_overrides_when_unsupplied(tmp_path: Path) -> None:
+    """Existing call sites that omit ``model_overrides`` write no such key."""
+    settings = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    assert "modelOverrides" not in settings
+
+
+def test_augment_claude_args_mirrors_launch_overrides_into_settings(
+    tmp_path: Path,
+) -> None:
+    """
+    Launch-time overrides are duplicated into the ``--settings`` sidecar.
+
+    Claude Code has had restart/re-exec paths that preserve ``--settings``
+    while rebuilding argv without ``--model`` / ``--effort`` /
+    ``--permission-mode``. Mirroring the same effective values into the
+    sidecar prevents a restarted wrapped CLI from falling back to the user's
+    global ``~/.claude/settings.json`` and diverging from the Omnigent
+    session pill.
+    """
+    args = augment_claude_args(
+        ("--model", "claude-fable-5", "--permission-mode", "auto", "--effort", "xhigh"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings["model"] == "claude-fable-5"
+    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["effortLevel"] == "xhigh"
+
+
+@pytest.mark.parametrize(
+    "bypass_args",
+    [
+        ("--dangerously-skip-permissions",),
+        ("--permission-mode", "bypassPermissions"),
+        ("--permission-mode=bypassPermissions",),
+    ],
+    ids=["skip-flag", "mode-spaced", "mode-joined"],
+)
+def test_augment_claude_args_preaccepts_bypass_dialog(
+    bypass_args: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    """
+    A bypass launch pre-accepts Claude's one-time bypass consent dialog.
+
+    Claude shows a blocking "Bypass Permissions mode / 1. No, exit /
+    2. Yes, I accept" dialog before the first bypass launch. It fires no
+    PermissionRequest hook, so a host-spawned worker has nobody to answer it
+    and hangs forever producing no output. Setting
+    ``skipDangerousModePermissionPrompt`` in the invocation-local settings
+    sidecar clears the gate without touching the user's own config. Both
+    spellings that reach the CLI must be recognised.
+    """
+    args = augment_claude_args(
+        bypass_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("skipDangerousModePermissionPrompt") is True, (
+        "bypass launches must set skipDangerousModePermissionPrompt; without it a "
+        f"headless worker hangs on the acceptance dialog. args={bypass_args!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "non_bypass_args",
+    [
+        (),
+        ("--permission-mode", "auto"),
+        ("--permission-mode", "acceptEdits"),
+        ("--permission-mode", "plan"),
+    ],
+    ids=["none", "auto", "acceptEdits", "plan"],
+)
+def test_augment_claude_args_leaves_bypass_consent_alone_otherwise(
+    non_bypass_args: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    """
+    Non-bypass launches must NOT pre-accept bypass mode.
+
+    Writing the key unconditionally would silently record bypass consent for
+    every native session, including ones that never asked for it, so the gate
+    stays scoped to launches that actually request bypass.
+    """
+    args = augment_claude_args(
+        non_bypass_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert "skipDangerousModePermissionPrompt" not in settings, (
+        f"non-bypass launch must not record bypass consent; args={non_bypass_args!r}"
+    )
+
+
+def test_augment_claude_args_preapproves_project_mcp_servers(tmp_path: Path) -> None:
+    """
+    Every launch pre-approves the project's ``.mcp.json`` servers.
+
+    Claude shows a blocking "New MCP server found in this project" dialog the
+    first time it runs in a directory whose ``.mcp.json`` it has not approved,
+    and every per-session worktree is such a directory. Like the trust and
+    bypass gates it fires no hook, so a host-spawned terminal sits on it until
+    the readiness gate times out and reaps the pane. Setting
+    ``enableAllProjectMcpServers`` in the invocation-local settings sidecar
+    clears the gate without writing into the user's config or the repo.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("enableAllProjectMcpServers") is True
+
+
+def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
+    tmp_path: Path,
+) -> None:
+    """The ``--model=<id>`` spelling is mirrored just like ``--model <id>``."""
+    args = augment_claude_args(
+        ("--model=claude-sonnet-5",),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings["model"] == "claude-sonnet-5"
+    assert "permissions" not in settings
+    assert "effortLevel" not in settings
+
+
+def test_augment_claude_args_uses_last_repeated_launch_override(
+    tmp_path: Path,
+) -> None:
+    """Repeated launch override flags mirror the same last-value-wins semantics."""
+    args = augment_claude_args(
+        (
+            "--model",
+            "claude-old",
+            "--model=claude-new",
+            "--permission-mode",
+            "default",
+            "--permission-mode",
+            "auto",
+            "--effort=low",
+            "--effort",
+            "high",
+        ),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings["model"] == "claude-new"
+    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["effortLevel"] == "high"
+
+
+def test_augment_claude_args_appends_caller_system_prompt(
+    tmp_path: Path,
+) -> None:
+    """Claude native appends framework instructions supplied by its launcher."""
+    framework_instruction = "Keep framework metadata separate."
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=framework_instruction,
+    )
+
+    assert args.count("--append-system-prompt") == 1
+    index = args.index("--append-system-prompt")
+    assert args[index + 1] == framework_instruction
+
+
+def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
+    """Framework preapproval extends rather than replaces the user's allowlist."""
+    args = augment_claude_args(
+        ("--allowedTools", "Bash,mcp__user__tool"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        allowed_tools=("mcp__omnigent__sys_session_rename", "Bash"),
+    )
+
+    assert args.count("--allowedTools") == 1
+    index = args.index("--allowedTools")
+    assert args[index + 1].split(",") == [
+        "Bash",
+        "mcp__user__tool",
+        "mcp__omnigent__sys_session_rename",
+    ]
+
+
+def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> None:
+    """The bridge does not invent framework policy on its own."""
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert "--append-system-prompt" not in args
+
+
+def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
+    """
+    A user-supplied ``--disallowedTools`` passes through unchanged.
+
+    With no wrapper-disabled tools, the user's flag must survive
+    verbatim — exactly one flag, exactly their value. This fails if the
+    wrapper appends a duplicate flag or mutates the user's disables.
+    """
+    args = augment_claude_args(
+        ("--disallowedTools", "Bash,Edit"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    flag_indices = [i for i, arg in enumerate(args) if arg == "--disallowedTools"]
+    assert len(flag_indices) == 1
+    disallowed = args[flag_indices[0] + 1].split(",")
+    assert disallowed == ["Bash", "Edit"]
+
+
+def test_augment_claude_args_injects_plugin_dir_for_bundle_with_skills(
+    tmp_path: Path,
+) -> None:
+    """
+    A bundle that ships ``skills/`` is exposed to Claude Code via
+    ``--plugin-dir <bundle>``, with a plugin manifest written so the
+    skills label as ``<agent>:<skill>``.
+
+    This is the claude-native parity for the SDK executor's plugin
+    wiring. It fails if a deployed agent's bundled skills never reach the
+    real ``claude`` CLI (the gap before this change — native ignores the
+    harness ``tools``/skill plumbing, so ``--plugin-dir`` is the only
+    surface). ``skills_filter`` defaults to ``"all"``, so host skills use
+    the CLI's default sources and no ``--setting-sources`` is emitted.
+    """
+    bundle = tmp_path / "bundle"
+    (bundle / "skills" / "authoring").mkdir(parents=True)
+    (bundle / "skills" / "authoring" / "SKILL.md").write_text("# authoring\n")
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        bundle_dir=bundle,
+        agent_name="researcher",
+    )
+
+    assert "--plugin-dir" in args
+    # The plugin path is the bundle root (Claude discovers
+    # <bundle>/skills/<dir>/SKILL.md under the plugin convention).
+    assert args[args.index("--plugin-dir") + 1] == str(bundle)
+    # "all" → host skills via the CLI default; no explicit override.
+    assert "--setting-sources" not in args
+    # The manifest gives the plugin a stable name for clean skill labels.
+    manifest = bundle / ".claude-plugin" / "plugin.json"
+    assert manifest.exists()
+    assert json.loads(manifest.read_text())["name"] == "researcher"
+    # The skill args are appended alongside the MCP/hook injection, not in
+    # place of it — both must reach the final launch command.
+    assert "--mcp-config" in args
+
+
+def test_augment_claude_args_omits_permission_hook_without_omnigent_server(
+    tmp_path: Path,
+) -> None:
+    """
+    No ``PermissionRequest`` hook is registered when the wrapper has
+    no Omnigent server URL to point Claude at.
+
+    This guards the default path: a call site that forgets to plumb
+    the Omnigent server URL must NOT silently fall through to Claude's TUI
+    prompt for every tool — but it also must not register an HTTP hook
+    against an undefined URL. The expected behaviour is "no hook at
+    all", which means Claude uses its built-in permission flow.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+    settings = _load_invocation_settings(args)
+    assert "PermissionRequest" not in settings["hooks"]
+
+
+def test_augment_claude_args_registers_permission_command_hook(
+    tmp_path: Path,
+) -> None:
+    """
+    Passing ``ap_server_url`` registers Claude's
+    ``PermissionRequest`` hook as a command hook that resolves the
+    active Omnigent session at hook time.
+
+    If this regresses, Claude Code's built-in TUI permission prompt
+    appears every time the user is supposed to approve from the web
+    UI instead — silently breaking the blocking-UI-hook contract.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787/",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    settings = _load_invocation_settings(args)
+    permission = settings["hooks"]["PermissionRequest"]
+    assert len(permission) == 1
+    hooks = permission[0]["hooks"]
+    assert len(hooks) == 1
+    hook = hooks[0]
+    assert hook["type"] == "command"
+    # The command hook must carry a day-long timeout. Claude Code's
+    # default command-hook timeout (~60s) would otherwise kill the
+    # hook subprocess before the user answers the permission prompt in
+    # the web UI, flipping the card to "Resolved elsewhere" while the
+    # terminal prompt is still open. A failure here (missing key or a
+    # short value) means that premature auto-resolve has regressed.
+    assert hook["timeout"] == 86400
+    assert "omnigent.harnesses.claude_native.hook permission-request" in hook["command"]
+    assert "--bridge-dir" in hook["command"]
+    assert "Bearer xyz" not in hook["command"]
+    permission_config = json.loads((tmp_path / "permission_hook.json").read_text(encoding="utf-8"))
+    assert permission_config["ap_server_url"] == "http://127.0.0.1:8787/"
+    assert permission_config["ap_auth_headers"] == {"Authorization": "Bearer xyz"}
+    session_start_command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    assert "--conversation-url" not in session_start_command
+    assert "conv_abc" not in session_start_command
+    assert "companyAnnouncements" not in settings
+    # statusLine is now intentionally injected (it's the only place
+    # Claude Code surfaces ``context_window`` on stdin); ensure it
+    # captures to the raw file our forwarder normalizes.
+    assert "context_raw.json" in settings["statusLine"]["command"]
+
+
+def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
+    tmp_path: Path,
+) -> None:
+    """
+    Passing ``ap_server_url`` wires the evaluate-policy hook onto
+    ``UserPromptSubmit`` alongside the transcript forwarder's status hook.
+
+    For native sessions the server-level ``_evaluate_input_policy`` skips
+    message events, so this hook is the sole REQUEST-phase gate (covering
+    both web-UI-injected and direct-terminal prompts). If it regressed,
+    native prompts would reach the model with no request-phase policy. The
+    forwarder's own UserPromptSubmit hook (status → running) must survive,
+    so the policy hook is appended, not substituted.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787/",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    settings = _load_invocation_settings(args)
+    entries = settings["hooks"]["UserPromptSubmit"]
+    commands = [h["command"] for entry in entries for h in entry["hooks"]]
+    # The forwarder status hook stays; the policy hook is appended.
+    assert any("evaluate-policy" in command for command in commands), (
+        f"UserPromptSubmit must carry the evaluate-policy hook; got {commands!r}."
+    )
+    assert any("evaluate-policy" not in command for command in commands), (
+        "The transcript forwarder's UserPromptSubmit hook must not be replaced."
+    )
+
+
+def test_augment_claude_args_omits_user_prompt_submit_policy_hook_without_server(
+    tmp_path: Path,
+) -> None:
+    """
+    Without ``ap_server_url`` the UserPromptSubmit policy hook is not wired.
+
+    Policy hooks only make sense when an Omnigent server is configured to
+    evaluate against; the forwarder's status hook still registers, but no
+    evaluate-policy command should appear (mirrors PreToolUse/PostToolUse,
+    which are also gated behind ``ap_server_url``).
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+    settings = _load_invocation_settings(args)
+    entries = settings["hooks"]["UserPromptSubmit"]
+    commands = [h["command"] for entry in entries for h in entry["hooks"]]
+    assert all("evaluate-policy" not in command for command in commands)
+
+
+def test_augment_claude_args_keeps_permission_hook_without_launch_session_id(
+    tmp_path: Path,
+) -> None:
+    """
+    Permission routing no longer depends on a launch-time conversation id.
+
+    The command hook reads the active session from bridge config at
+    hook time, so launch-time conversation ids are not part of the
+    hook settings contract.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        ap_server_url="http://127.0.0.1:8787",
+    )
+    settings = _load_invocation_settings(args)
+    assert settings["hooks"]["PermissionRequest"][0]["hooks"][0]["type"] == "command"
+    session_start_command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    assert "--conversation-url" not in session_start_command
+    assert "companyAnnouncements" not in settings
+    assert "context_raw.json" in settings["statusLine"]["command"]
+
+
+def test_mcp_server_initialize_omits_blocked_channel_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    subprocess_bridge_root: Path,
+) -> None:
+    """
+    The MCP server does not advertise the org-blocked Channels capability.
+
+    This fails if a future change re-enables Claude Channels: Claude
+    Code would refuse to start with that capability advertised under
+    org policy, breaking the native wrapper.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", subprocess_bridge_root
+    )
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {},
+                }
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        initialize = _read_json_line(proc.stdout, timeout_s=5.0)
+        assert initialize["id"] == 1
+        capabilities = initialize["result"]["capabilities"]
+        # Tools/list_changed is still needed for the active-turn relay.
+        assert capabilities["tools"] == {"listChanged": True}
+        # The experimental Claude/channel capability must NOT appear:
+        # advertising it triggers org-policy refusal in Claude Code.
+        assert "experimental" not in capabilities or "claude/channel" not in capabilities.get(
+            "experimental", {}
+        )
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+
+def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
+    """
+    The runner advertisement file is shaped so the harness can find it.
+
+    This catches mismatches between runner-side writes and the
+    harness-side ``inject_user_message`` reader, which would cause
+    the web UI to time out with "tmux target not advertised yet".
+    """
+    bridge_dir = tmp_path / "bridge"
+    before = time.time()
+
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+        pid=12345,
+    )
+    after = time.time()
+
+    payload = json.loads((bridge_dir / "tmux.json").read_text(encoding="utf-8"))
+    assert payload["socket_path"] == "/tmp/example/tmux.sock"
+    assert payload["tmux_target"] == "claude:0.0"
+    assert payload["pid"] == 12345
+    assert before <= payload["updated_at"] <= after
+
+
+@pytest.mark.parametrize(
+    "content,expected_payload",
+    [
+        # Plain single line: trailing CR appended (newline -> 0x0d).
+        ("hello world", b"hello world\r"),
+        # Multi-line: interior newline rides as CR inside the paste so
+        # Claude's TUI keeps it as data instead of submitting per line.
+        ("line one\nline two", b"line one\rline two\r"),
+        # Trailing "\" escapes the appended paste CR, not the submit Enter.
+        ("deploy to prod\\", b"deploy to prod\\\r"),
+        # CRLF line endings coalesce to a single CR (no doubled blank line).
+        ("a\r\nb", b"a\rb\r"),
+        # A stray ESC in the content is dropped so it can't prematurely
+        # close the bracketed-paste sequence on Claude's side.
+        ("a\x1bb", b"ab\r"),
+        # Large payload (a PR diff in a sub-agent dispatch). Must ride the
+        # load-buffer file — per-byte send-keys argv tripped tmux's ~16KB
+        # client→server command cap with "command too long".
+        ("x" * 100_000, b"x" * 100_000 + b"\r"),
+    ],
+    ids=["plain", "multiline", "trailing-backslash", "crlf", "embedded-esc", "large"],
+)
+def test_inject_user_message_pastes_content_then_submits(
+    content: str,
+    expected_payload: bytes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Every message is delivered as one bracketed paste, then a separate Enter.
+
+    The paste goes via ``load-buffer`` (from a temp file, so size is
+    unbounded — tmux caps a single command at ~16KB, which a PR-diff
+    dispatch exceeded as "command too long") then ``paste-buffer -p``,
+    with interior newlines encoded as CR so Claude Code's TUI keeps
+    multi-line input as a single editable block instead of submitting on
+    each newline (anthropics/claude-code#52126). Fails if the harness
+    regresses to send-keys argv delivery, drops the trailing Enter, or
+    stops clearing the stale buffer.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    captured: list[list[str]] = []
+    loaded_payloads: list[bytes] = []
+    # Simulates Claude Code's input-box state machine: empty before the
+    # paste, draft (collapsed-paste placeholder) after the paste, empty
+    # again once Enter submits. The paste-committed and submit-verified
+    # gates both poll capture-pane, so a static pane would either stall
+    # the paste gate (draft never appears) or fail verification.
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Record tmux calls; simulate the TUI's input-box state.
+
+        ``capture-pane`` calls (the readiness / paste-committed /
+        submit-verified polls) return the current simulated pane and
+        are not recorded — the assertions below count only the
+        delivery invocations. ``load-buffer`` calls read the temp
+        file's bytes at call time (the harness unlinks it after the
+        paste, so asserting later would race the cleanup).
+        ``paste-buffer`` puts the draft into the simulated input box;
+        ``Enter`` clears it (submit).
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (capture_output, text, etc.).
+        :returns: A fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("[Pasted text #1 +2 lines]")
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content=content)
+
+    # CSI-u Ctrl+A, Ctrl+K (clear), load-buffer, paste-buffer, Enter — fewer than 5
+    # means a delivery step was dropped.
+    assert len(captured) == 5, (
+        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
+        f"got {len(captured)}."
+    )
+    clear_home, clear_kill, load, paste, submit = captured
+    assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
+    assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
+    # The buffer file carried the normalized content + trailing CR. A
+    # missing trailing CR is the trailing-CR regression; a newline that stayed
+    # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
+    assert loaded_payloads == [expected_payload]
+    assert load[:6] == [
+        "tmux",
+        "-S",
+        "/tmp/example/tmux.sock",
+        "load-buffer",
+        "-b",
+        "omnigent-paste",
+    ]
+    # -p (bracketed-paste markers) dropped = newlines submit per-line in
+    # the TUI; -d dropped = stale buffer copies accumulate server-side.
+    assert paste == [
+        "tmux",
+        "-S",
+        "/tmp/example/tmux.sock",
+        "paste-buffer",
+        "-p",
+        "-d",
+        "-b",
+        "omnigent-paste",
+        "-t",
+        "claude:0.0",
+    ]
+    assert submit == [
+        "tmux",
+        "-S",
+        "/tmp/example/tmux.sock",
+        "send-keys",
+        "-t",
+        "claude:0.0",
+        "Enter",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("plain text", "plain text"),
+        ("/help", "\ufeff/help"),
+        ("/exit", "\ufeff/exit"),
+        ("/quit now", "\ufeff/quit now"),
+        ("  /help", "  \ufeff/help"),
+        ("/clear", "/clear"),
+        ("/compact", "/compact"),
+        ("/model sonnet-4", "/model sonnet-4"),
+        ("/effort high", "/effort high"),
+        ("/ultrareview", "/ultrareview"),
+        ("/branch", "/branch"),
+        ("/fork", "/fork"),
+        ("/my-skill some args", "/my-skill some args"),
+    ],
+)
+def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
+    """
+    Dropped Claude Code commands are escaped so they become plain text;
+    supported commands and skills are left untouched.
+    """
+    assert _escape_unsupported_slash_command(content) == expected
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("/login", True),
+        ("  /login", True),
+        ("/logout", True),
+        ("/login --claudeai", True),
+        ("plain text", False),
+        ("/clear", False),
+        ("/loginsomething", False),
+        ("please run /login", False),
+    ],
+)
+def test_is_auth_slash_command(content: str, expected: bool) -> None:
+    """
+    Only a leading ``/login`` / ``/logout`` is an auth command.
+
+    A bare mention mid-sentence is ordinary prose and must still reach
+    Claude Code — the caller short-circuits the whole turn on a True.
+    """
+    assert is_auth_slash_command(content) is expected
+
+
+def test_inject_user_message_escapes_unsupported_slash_command_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Unsupported slash commands land in the tmux buffer with a leading
+    zero-width escape so Claude Code treats them as user text.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    loaded_payloads: list[bytes] = []
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Record buffer payloads and simulate a ready TUI.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("[Pasted text #1 +2 lines]")
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    inject_user_message(bridge_dir, content="/help")
+    assert loaded_payloads[0].startswith("\ufeff/help".encode("utf-8"))
+
+    inject_user_message(bridge_dir, content="/clear")
+    assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
+
+
+def _rejection_pane(name: str, draft: str = "") -> str:
+    """
+    Render a pane where Claude Code has rejected an unknown command.
+
+    Mirrors the real TUI output: the rejection prints as its own
+    bullet-led transcript line above the (now empty) composer.
+
+    :param name: The rejected command name without the slash.
+    :param draft: Text sitting in the composer; empty means idle.
+    :returns: The pane text.
+    """
+    return f"""\
+● Unknown command: /{name}
+──────────────────────────────
+❯ {draft}
+──────────────────────────────
+  ? for shortcuts
+"""
+
+
+def _run_unknown_command_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    content: str,
+    reject_name: str | None,
+) -> list[bytes]:
+    """
+    Drive ``inject_user_message`` against a fake TUI, optionally rejecting.
+
+    The fake pane accepts the paste into the composer; on Enter it either
+    starts a turn silently (``reject_name=None`` — a recognized skill) or
+    prints the "Unknown command" rejection line the way Claude Code does
+    for a name it cannot resolve.
+
+    :param tmp_path: Test temp dir for the bridge directory.
+    :param monkeypatch: Pytest monkeypatch for subprocess + timeouts.
+    :param content: User text to inject.
+    :param reject_name: Command name the fake TUI rejects, or ``None``.
+    :returns: The byte payloads delivered via ``load-buffer``, in order.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    # Keep the rejection watch fast: it polls the pane, which the fake
+    # answers instantly, so a short timeout keeps the no-rejection case
+    # from sleeping out the full production window.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._UNKNOWN_COMMAND_WATCH_TIMEOUT_S", 0.5
+    )
+
+    loaded_payloads: list[bytes] = []
+    tui: dict[str, Any] = {"pane": _composer_pane(), "submits": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Record buffer payloads and simulate accept/reject on submit.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("[Pasted text #1 +2 lines]")
+        if cmd[-1] == "Enter":
+            tui["submits"] += 1
+            if reject_name is not None and tui["submits"] == 1:
+                tui["pane"] = _rejection_pane(reject_name)
+            else:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content=content)
+    return loaded_payloads
+
+
+def test_unknown_command_rejection_redelivers_escaped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message rejected as "Unknown command" is re-delivered escaped.
+
+    Claude Code drops a message whose leading ``/name`` it does not
+    recognize without ever calling the model — the message would be
+    silently swallowed. The bridge must watch for the rejection and paste
+    the message again with the zero-width escape so it reaches the model
+    as plain user text.
+    """
+    payloads = _run_unknown_command_injection(
+        tmp_path,
+        monkeypatch,
+        content="/not-a-real-skill hello world",
+        reject_name="not-a-real-skill",
+    )
+    assert len(payloads) == 2, (
+        f"Expected the rejected message to be pasted twice (raw, then escaped); "
+        f"got {len(payloads)} paste(s)."
+    )
+    assert payloads[0].startswith(b"/not-a-real-skill")
+    assert payloads[1].startswith("\ufeff/not-a-real-skill hello world".encode("utf-8"))
+
+
+def test_unknown_name_accepted_as_skill_is_not_redelivered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unknown-to-the-bridge name Claude Code accepts runs exactly once.
+
+    A real skill invocation prints no rejection, so the watch must lapse
+    without a second paste — re-delivering would run the skill twice.
+    """
+    payloads = _run_unknown_command_injection(
+        tmp_path,
+        monkeypatch,
+        content="/my-real-skill do the thing",
+        reject_name=None,
+    )
+    assert len(payloads) == 1, (
+        f"Expected a single paste for an accepted skill; got {len(payloads)}."
+    )
+    assert payloads[0].startswith(b"/my-real-skill")
+
+
+def test_plain_text_skips_the_rejection_watch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message with no leading slash command never watches for a rejection.
+
+    The watch costs up to the full timeout when no rejection prints, so
+    ordinary messages must skip it entirely (no second paste either).
+    """
+    payloads = _run_unknown_command_injection(
+        tmp_path,
+        monkeypatch,
+        content="just a normal message",
+        reject_name=None,
+    )
+    assert len(payloads) == 1
+
+
+def test_stale_rejection_in_scrollback_does_not_trigger_redelivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A rejection of the same name already in scrollback is not "fresh".
+
+    The watch counts rejection lines against a pre-submit baseline; a
+    stale line from an earlier message keeps the count flat, so an
+    accepted skill re-sent after an earlier typo must not be re-delivered
+    escaped (which would duplicate the message).
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._UNKNOWN_COMMAND_WATCH_TIMEOUT_S", 0.5
+    )
+    stale = "● Unknown command: /my-skill\n"
+
+    loaded_payloads: list[bytes] = []
+    tui = {"pane": stale + _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Serve a pane whose scrollback already carries the rejection.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = stale + _composer_pane("[Pasted text #1 +2 lines]")
+        if cmd[-1] == "Enter":
+            # Accepted this time: the stale rejection stays, no new one.
+            tui["pane"] = stale + _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="/my-skill retry after typo fix")
+    assert len(loaded_payloads) == 1, (
+        f"A stale rejection must not trigger escaped re-delivery; "
+        f"got {len(loaded_payloads)} paste(s)."
+    )
+
+
+def test_rejection_line_matching_ignores_message_echo() -> None:
+    """
+    The rejection matcher counts rejections, not echoed composer text.
+
+    A user message *containing* the words "Unknown command: /x" renders
+    on a composer row (behind the prompt glyph) and must not count. The
+    TUI also reflows the rejection at the pane width — "Unknown command:"
+    and the name can land on separate lines — so a wrapped rejection must
+    still count.
+    """
+    counter = claude_native_bridge._count_unknown_command_rejections
+    needle = "Unknown command: /x"
+    assert counter("● Unknown command: /x\n❯ \n", needle) == 1
+    # Echoed in the composer draft — not a rejection line.
+    assert counter("❯ say Unknown command: /x\n", needle) == 0
+    assert counter("● Unknown command: /x\n● Unknown command: /x\n", needle) == 2
+    # Narrow pane: the TUI wraps the name onto its own line.
+    wrapped = "● Unknown command:\n  /x\n❯ \n"
+    assert counter(wrapped, needle) == 1
+    long_needle = "Unknown command: /definitely-not-a-real-command"
+    long_wrapped = "● Unknown command:\n  /definitely-not-a-real-command\n❯ \n"
+    assert counter(long_wrapped, long_needle) == 1
+
+
+def test_inject_user_message_raises_when_tmux_target_never_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The injection helper fails loud when the runner has not written tmux.json.
+
+    Failing silently would let the Omnigent turn complete with no user
+    message ever reaching Claude — the executor needs the
+    RuntimeError so it can surface an ExecutorError.
+    """
+    with pytest.raises(RuntimeError, match="tmux target is not advertised"):
+        inject_user_message(tmp_path / "bridge", content="hi", timeout_s=0.0)
+
+
+def test_inject_user_message_raises_on_tmux_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Non-zero tmux exit propagates as a RuntimeError with stderr context.
+
+    Without this, a broken tmux socket (server died, permission
+    issue) would be reported to the web UI as a successful turn
+    with no Claude response.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Pass the readiness gate, then fail the send-keys call.
+
+        ``capture-pane`` returns a ready pane (rc=0) so the test
+        exercises the send-keys failure path specifically, not the
+        readiness timeout. All other tmux calls return rc=1 to
+        simulate a dead tmux server.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: A fake CompletedProcess (rc=0 for capture-pane,
+            rc=1 otherwise).
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
+        return SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="no server running on /tmp/example/tmux.sock",
+        )
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="no server running"):
+        inject_user_message(bridge_dir, content="hi")
+
+
+def test_inject_user_message_waits_for_claude_prompt_before_typing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Injection polls for Claude's prompt before sending any keystrokes.
+
+    On a freshly-created session ``tmux.json`` is advertised before
+    Claude Code's input box mounts. If we typed immediately the first
+    message would be dropped into the still-booting TUI. This pins that
+    no send-keys is issued until ``capture-pane`` shows the prompt
+    glyph, and that injection proceeds once it does.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    send_keys: list[list[str]] = []
+    # Prompt is absent for the first two polls (TUI still booting),
+    # then renders. A wrong gate would send keys during the empty
+    # polls; a correct gate waits for the third capture. After boot the
+    # fake behaves like the live input box: the paste deposits the
+    # draft, Enter clears it (so the submit-verification gate passes).
+    boot_panes = ["", "", _composer_pane()]
+    capture_calls = {"n": 0}
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Serve a not-ready-then-ready pane; record send-keys calls.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the next
+            boot pane until the prompt renders, then the simulated
+            input-box state; send-keys returns rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            idx = min(capture_calls["n"], len(boot_panes) - 1)
+            capture_calls["n"] += 1
+            # No keystrokes may have been sent before the prompt shows.
+            if boot_panes[idx] == "":
+                assert send_keys == [], "typed before Claude prompt rendered"
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("hello")
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        send_keys.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="hello")
+
+    # Gate polled until the third capture (prompt present), then the
+    # five delivery calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter)
+    # fired.
+    assert capture_calls["n"] >= 3, (
+        f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
+    )
+    assert len(send_keys) == 5, (
+        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
+        f"got {len(send_keys)}."
+    )
+    clear_home, clear_kill, load, paste, submit = send_keys
+    assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
+    assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
+    # The paste fires after the gate via the buffer path. The exact
+    # payload/flag assertions live in the dedicated paste test; here the
+    # gate ordering is the claim.
+    assert load[3] == "load-buffer"
+    assert paste[3] == "paste-buffer"
+    assert submit[-1] == "Enter"
+
+
+def test_inject_user_message_raises_when_prompt_never_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Injection fails loud if Claude's prompt never renders (boot failed).
+
+    Without this the turn would complete with the message dropped and
+    the web UI stuck on "Working…". The RuntimeError surfaces as an
+    ExecutorError instead. No keystrokes must be sent on this path.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    send_keys: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Always report an empty (never-ready) pane, liveness unanswered.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns "" and the
+            liveness probe answers without a ``#{pane_dead}`` flag, so the
+            wait runs to the (shortened) slow-boot cap rather than being
+            cut short by a pane the probe never affirmed dead.
+        """
+        del kwargs
+        # Read-only queries (pane capture, liveness probe) are not
+        # keystrokes — only writes must be absent on this path.
+        if "capture-pane" in cmd or "list-panes" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        send_keys.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.5)
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
+    assert send_keys == [], "no keystrokes should be sent when the prompt never renders"
+
+
+def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The readiness gate only trusts the prompt glyph in the pane tail.
+
+    Claude echoes prior user input (which may contain ``❯``) into
+    scrollback. If the gate matched anywhere in the pane it would
+    falsely pass while the live input box is still booting. Here ``❯``
+    appears only in an early line, with later non-empty lines lacking
+    it, so the gate must NOT treat the pane as ready.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    # `❯` only on an early line; the last several non-empty lines (the
+    # tail the gate scans) do not contain it.
+    scrollback = "\n".join(
+        [
+            "❯ old prompt echo",
+            "output line 1",
+            "output line 2",
+            "output line 3",
+            "output line 4",
+            "output line 5",
+        ]
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Return a pane with the glyph only in scrollback.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            scrollback pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=scrollback, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
+
+
+def test_inject_user_message_resends_enter_when_first_submit_swallowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A submit Enter swallowed by the TUI's paste burst is retried.
+
+    Claude Code coalesces rapid stdin bursts into a paste; an Enter
+    that lands inside that window becomes a newline in the draft
+    instead of a submit, and the message sits unsent — the "typed but
+    never sent" bug. The helper must observe (via capture-pane) that
+    the draft is still in the input box after Enter and re-send Enter
+    until it clears. Here the fake TUI swallows the first Enter
+    (draft stays put) and submits on the second; a regression to
+    fire-and-forget Enter would send exactly one and return "success"
+    with the message undelivered.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    # Shrink the polling cadence so the retry happens in milliseconds —
+    # the production defaults (1s retry spacing) would make this test slow.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    enters: list[list[str]] = []
+    # Input-box state machine: the paste deposits the draft; the FIRST
+    # Enter is swallowed (folded into the paste burst — draft stays);
+    # the second Enter submits and clears the box.
+    tui = {"pane": _composer_pane(), "swallowed_enters": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that swallows the first submit Enter.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated input-box pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+            if tui["swallowed_enters"] == 0:
+                tui["swallowed_enters"] = 1  # folded into the paste — draft stays
+            else:
+                tui["pane"] = _composer_pane()  # submitted — input box clears
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="fix the flaky test")
+
+    # Exactly two Enters: the swallowed one plus one retry. One means
+    # the verify-retry loop regressed to fire-and-forget (the bug);
+    # three+ means retries keep firing after the draft cleared.
+    assert len(enters) == 2, (
+        f"Expected the swallowed Enter to be retried exactly once, got {len(enters)} Enter(s)."
+    )
+
+
+def test_inject_user_message_raises_when_draft_never_submits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Injection fails loud when the draft never leaves the input box.
+
+    If every submit Enter is swallowed (e.g. the pane is wedged in a
+    dialog), returning success would complete the Omnigent turn with
+    the message still sitting unsent in Claude's input box. The
+    RuntimeError surfaces as an ExecutorError instead.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI where the draft never submits.
+
+        The paste deposits the draft and every Enter is ignored, so
+        the input box never clears.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated input-box pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="message was not delivered"):
+        inject_user_message(bridge_dir, content="fix the flaky test")
+
+
+def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Submit-Enter retries into a stalled TUI back off instead of piling up.
+
+    Every Enter sent while the TUI is unresponsive queues in the pty and
+    replays when the TUI recovers; a fixed 1s cadence piles up dozens of
+    them over the verify window. The retries must back off exponentially
+    (capped), so the eventual replay burst stays small, while a fully
+    wedged pane still fails loud at the end of the window.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.05)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_MAX_INTERVAL_S",
+        0.2,
+        raising=False,
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    enters: list[float] = []
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a stalled TUI: the draft commits but no Enter ever lands.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated input-box pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+        if cmd[-1] == "Enter":
+            enters.append(time.monotonic())
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="message was not delivered"):
+        inject_user_message(bridge_dir, content="fix the flaky test")
+
+    # The initial submit plus backed-off retries at 0.05/0.1/0.2/0.2s
+    # spacing fit ~4 Enters into the 0.5s window; a fixed 0.05s cadence
+    # (the regression) fires ~10.
+    assert 2 <= len(enters) <= 6, (
+        f"Expected few, backed-off Enter retries within the window, got {len(enters)}."
+    )
+
+
+def test_inject_user_message_outlasts_slow_submit_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A submit accepted late — past the slow-accept warning threshold — still
+    delivers: the bridge warns that the TUI is slow and keeps retrying
+    instead of abandoning the committed draft as undelivered.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._SUBMIT_SLOW_ACCEPT_WARN_S",
+        0.1,
+        raising=False,
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    tui = {"pane": _composer_pane(), "accept_after": None}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that only accepts an Enter arriving 0.3s post-paste.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated input-box pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+            tui["accept_after"] = time.monotonic() + 0.3
+        if (
+            cmd[-1] == "Enter"
+            and tui["accept_after"] is not None
+            and time.monotonic() >= tui["accept_after"]
+        ):
+            tui["pane"] = _composer_pane()  # submitted — input box clears
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with caplog.at_level("WARNING", logger="omnigent.harnesses.claude_native.bridge"):
+        inject_user_message(bridge_dir, content="fix the flaky test")
+
+    assert any("not accepted after" in record.getMessage() for record in caplog.records), [
+        record.getMessage() for record in caplog.records
+    ]
+
+
+def test_inject_slash_command_outlasts_slow_submit_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The slash-command submit shares the escalating verify: a command only
+    accepted past the slow-accept threshold is delivered (with the slow-TUI
+    warning) instead of failing the turn.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._SUBMIT_SLOW_ACCEPT_WARN_S",
+        0.1,
+        raising=False,
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    tui = {"pane": _composer_pane(), "accept_after": None}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that only accepts an Enter arriving 0.3s post-type.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated input-box pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "-l" in cmd and cmd[-1] == "/effort high":
+            tui["pane"] = _composer_pane("/effort high")
+            tui["accept_after"] = time.monotonic() + 0.3
+        if (
+            cmd[-1] == "Enter"
+            and tui["accept_after"] is not None
+            and time.monotonic() >= tui["accept_after"]
+        ):
+            tui["pane"] = _composer_pane()  # submitted — input box clears
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with caplog.at_level("WARNING", logger="omnigent.harnesses.claude_native.bridge"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert any("not accepted after" in record.getMessage() for record in caplog.records), [
+        record.getMessage() for record in caplog.records
+    ]
+
+
+def test_inject_interrupt_sends_escape_keystroke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    inject_interrupt issues ``tmux send-keys ... Escape`` on the pane.
+
+    Without the ``-l`` flag, tmux interprets ``Escape`` as the key
+    name (the single ASCII byte 0x1b). If the flag leaks in or the
+    keyword changes, Claude won't see a cancel and the Omnigent stop
+    button silently degrades back to a no-op.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    captured: list[list[str]] = []
+
+    class _FakeCompleted:
+        """Fake CompletedProcess returned by the patched subprocess.run."""
+
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
+        """
+        Record the tmux command argv list.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: A fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        captured.append(cmd)
+        return _FakeCompleted()
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_interrupt(bridge_dir)
+
+    # One tmux call: send Escape (no literal flag). If 2+, a stray
+    # Enter or extra key was appended; if 0, the call was skipped.
+    assert len(captured) == 1, f"Expected 1 tmux send-keys call, got {len(captured)}."
+    assert captured[0] == [
+        "tmux",
+        "-S",
+        "/tmp/example/tmux.sock",
+        "send-keys",
+        "-t",
+        "claude:0.0",
+        "Escape",
+    ]
+
+
+def test_inject_interrupt_raises_when_tmux_target_never_published(
+    tmp_path: Path,
+) -> None:
+    """
+    inject_interrupt fails loud if tmux.json hasn't been written.
+
+    The runner route catches RuntimeError and returns 503 so the
+    Omnigent server falls back to the DBOS cancel path. Swallowing this
+    silently would make the stop button appear to work while
+    actually doing nothing.
+    """
+    with pytest.raises(RuntimeError, match="tmux target is not advertised"):
+        inject_interrupt(tmp_path / "bridge", timeout_s=0.0)
+
+
+def test_inject_interrupt_raises_on_tmux_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Non-zero tmux exit propagates as RuntimeError with stderr context.
+
+    Mirrors :func:`inject_user_message` so the runner route can
+    distinguish a bridge-not-ready error from a transport failure
+    via the message.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    class _FakeCompleted:
+        """Fake CompletedProcess returning a non-zero exit code."""
+
+        returncode = 1
+        stdout = ""
+        stderr = "no server running on /tmp/example/tmux.sock"
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
+        """
+        Return a fake non-zero CompletedProcess.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: A fake CompletedProcess with rc=1.
+        """
+        del cmd, kwargs
+        return _FakeCompleted()
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="no server running"):
+        inject_interrupt(bridge_dir)
+
+
+def test_kill_session_issues_kill_session_on_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    kill_session issues exactly ``tmux kill-session -t <target>``.
+
+    This is the hard-stop the web UI's "Stop session" affordance
+    relies on. If it regressed to ``send-keys`` (the interrupt path)
+    the session would merely have its current response cancelled and
+    stay alive, so the stop button would silently fail to terminate
+    the session. A single kill-session call on the advertised target
+    is the only thing that ends the ``claude`` process.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="main",
+    )
+
+    captured: list[list[str]] = []
+
+    class _FakeCompleted:
+        """Fake CompletedProcess returned by the patched subprocess.run."""
+
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
+        """
+        Record the tmux command argv list.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: A fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        captured.append(cmd)
+        return _FakeCompleted()
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    kill_session(bridge_dir)
+
+    # Exactly one tmux call: kill-session on the advertised target.
+    # If 0, the kill was skipped; if it carried send-keys/-l/a key
+    # name, it's the interrupt path and wouldn't terminate the pane.
+    assert len(captured) == 1, f"Expected 1 tmux kill-session call, got {len(captured)}."
+    assert captured[0] == [
+        "tmux",
+        "-S",
+        "/tmp/example/tmux.sock",
+        "kill-session",
+        "-t",
+        "main",
+    ]
+
+
+def test_kill_session_raises_when_tmux_target_never_published(
+    tmp_path: Path,
+) -> None:
+    """
+    kill_session fails loud if tmux.json was never written.
+
+    The runner handler catches RuntimeError and returns 503 (best
+    effort — a missing target means there is no live session to
+    kill). Swallowing it silently would make the stop button appear
+    to work while doing nothing.
+    """
+    with pytest.raises(RuntimeError, match="tmux target is not advertised"):
+        kill_session(tmp_path / "bridge", timeout_s=0.0)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "no server running on /tmp/example/tmux.sock",
+        "can't find session: main",
+    ],
+)
+def test_kill_session_is_idempotent_when_tmux_is_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
+) -> None:
+    """A stale tmux advertisement still counts as a successful stop."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="main",
+    )
+
+    class _FakeCompleted:
+        """Fake CompletedProcess returning a non-zero exit code."""
+
+        returncode = 1
+        stdout = ""
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
+        """Return a fake non-zero CompletedProcess."""
+        del cmd, kwargs
+        result = _FakeCompleted()
+        result.stderr = stderr
+        return result
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    kill_session(bridge_dir)
+
+
+def test_kill_session_raises_on_unexpected_tmux_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected tmux failures remain visible to the stop caller."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="main",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="permission denied"):
+        kill_session(bridge_dir)
+
+
+def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Slash commands flow via C-u + literal paste + Enter.
+
+    C-u kills any draft the user is mid-typing — otherwise the paste
+    concatenates and Enter submits ``<draft>/effort high``. ``-l`` is
+    required so tmux pastes ``/`` and spaces literally; Enter submits.
+    Every capture here is blank, so this also pins the fail-soft path:
+    a never-identifiable draft still gets the single blind submit.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    captured: list[list[str]] = []
+
+    class _FakeCompleted:
+        """Fake CompletedProcess returned by the patched subprocess.run."""
+
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
+        """Record one tmux invocation; return rc=0."""
+        del kwargs
+        captured.append(cmd)
+        return _FakeCompleted()
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    # Three keystroke calls in order: C-u (clear), literal paste, Enter.
+    # 2 = C-u was dropped (draft can concatenate); 4+ = duplicated send.
+    # capture-pane calls (the delivery-verification polls) are not keystrokes.
+    keystrokes = [cmd for cmd in captured if "send-keys" in cmd]
+    assert len(keystrokes) == 3, (
+        f"Expected 3 tmux send-keys calls (C-u + paste + Enter), got {len(keystrokes)}."
+    )
+    clear, paste, submit = keystrokes
+    assert clear == [
+        "tmux",
+        "-S",
+        "/tmp/example/tmux.sock",
+        "send-keys",
+        "-t",
+        "claude:0.0",
+        "C-u",
+    ]
+    assert paste == [
+        "tmux",
+        "-S",
+        "/tmp/example/tmux.sock",
+        "send-keys",
+        "-l",
+        "-t",
+        "claude:0.0",
+        "/effort high",
+    ]
+    assert submit == [
+        "tmux",
+        "-S",
+        "/tmp/example/tmux.sock",
+        "send-keys",
+        "-t",
+        "claude:0.0",
+        "Enter",
+    ]
+
+
+def test_tmux_injections_are_serialized_per_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slash command cannot overtake a user message on the same pane."""
+    bridge_dir = tmp_path / "bridge"
+    first_injection_entered = threading.Event()
+    release_first_injection = threading.Event()
+    second_lock_acquire_started = threading.Event()
+    wait_call_threads: list[str] = []
+    errors: list[BaseException] = []
+
+    class ObservedInjectionLock:
+        """Signal when a competing injection tries to acquire the pane lock."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._counter_lock = threading.Lock()
+            self._acquire_count = 0
+
+        def acquire(self, *, timeout: float = -1) -> bool:
+            with self._counter_lock:
+                self._acquire_count += 1
+                if self._acquire_count == 2:
+                    second_lock_acquire_started.set()
+            return self._lock.acquire(timeout=timeout)
+
+        def release(self) -> None:
+            self._lock.release()
+
+    lock_key = os.path.normcase(os.path.abspath(os.fspath(bridge_dir)))
+    monkeypatch.setitem(
+        claude_native_bridge._INJECTION_LOCKS,
+        lock_key,
+        ObservedInjectionLock(),
+    )
+
+    def wait_for_tmux_info(_bridge_dir: Path, *, timeout_s: float) -> dict[str, str]:
+        del timeout_s
+        wait_call_threads.append(threading.current_thread().name)
+        if len(wait_call_threads) == 1:
+            first_injection_entered.set()
+            assert release_first_injection.wait(timeout=2)
+        return {"socket_path": "/tmp/tmux.sock", "tmux_target": "claude:0.0"}
+
+    monkeypatch.setattr(claude_native_bridge, "_wait_for_tmux_info", wait_for_tmux_info)
+    monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(claude_native_bridge, "_paste_and_submit", lambda *_a, **_k: None)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_args: "")
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
+
+    def run_user_message() -> None:
+        try:
+            inject_user_message(bridge_dir, content="seed prompt")
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            errors.append(exc)
+
+    def run_slash_command() -> None:
+        try:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort medium")
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            errors.append(exc)
+
+    user_thread = threading.Thread(target=run_user_message, name="user-message")
+    slash_thread = threading.Thread(target=run_slash_command, name="slash-command")
+    user_thread.start()
+    assert first_injection_entered.wait(timeout=2)
+    slash_thread.start()
+
+    assert second_lock_acquire_started.wait(timeout=2)
+    assert wait_call_threads == ["user-message"]
+
+    release_first_injection.set()
+    user_thread.join(timeout=2)
+    slash_thread.join(timeout=2)
+
+    assert not user_thread.is_alive()
+    assert not slash_thread.is_alive()
+    assert errors == []
+    assert wait_call_threads == ["user-message", "slash-command"]
+
+
+@pytest.mark.parametrize(
+    "bad_command",
+    [
+        "",
+        "effort high",  # missing leading slash
+        "/effort high\nrm -rf /",  # multi-line
+    ],
+)
+def test_inject_slash_command_rejects_invalid_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_command: str,
+) -> None:
+    """
+    Malformed slash commands raise ValueError before touching tmux.
+
+    No leading ``/`` would type as plain text; a stray newline would
+    chain a second command. Validation must fire before the tmux call
+    so the route returns 4xx instead of silently appearing to succeed.
+    """
+    # No tmux.json published — validation must reject before the
+    # wait-for-tmux path, proving the check is up front.
+    bridge_dir = tmp_path / "bridge"
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> object:
+        """Fail the test if tmux is invoked for an invalid command."""
+        del cmd, kwargs
+        raise AssertionError("subprocess.run must not be called for invalid commands")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(ValueError):
+        claude_native_bridge.inject_slash_command(bridge_dir, command=bad_command)
+
+
+def test_cycleable_permission_modes_match_the_server_patch_vocabulary() -> None:
+    """
+    The bridge and the Sessions API accept the same set of modes.
+
+    PATCH validates ``permission_mode`` against its own frozenset before
+    forwarding, so a mode in one set but not the other is either
+    unreachable (rejected at the API after the UI offered it) or
+    reachable but un-offerable. Pin them together.
+    """
+    from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODES
+
+    assert set(claude_native_bridge.CYCLEABLE_PERMISSION_MODES) == set(
+        _CLAUDE_NATIVE_PERMISSION_MODES
+    ), "Bridge cycleable modes and the Sessions API's accepted modes must match."
+
+
+class _FakeModeCycleTmux:
+    """
+    Stand-in tmux whose pane renders Claude's permission-mode footer.
+
+    ``BTab`` advances a cycle of modes; ``capture-pane`` renders the
+    current one exactly as Claude Code's TUI does, so the cycler under
+    test reads real footer text. Construct with a cycle that omits
+    ``auto`` to model an account where the mode is unreachable.
+    """
+
+    def __init__(
+        self,
+        cycle: list[str],
+        *,
+        start: str = "default",
+        stale_reads: int = 0,
+    ) -> None:
+        self.cycle = cycle
+        self.index = cycle.index(start)
+        self.presses = 0
+        # Captures right after a BTab that still render the PREVIOUS mode,
+        # modelling the TUI's asynchronous repaint.
+        self.stale_reads = stale_reads
+        self._pending_stale = 0
+        self._prev_index = self.index
+
+    _FOOTERS = {
+        "default": "⏸ manual mode on",
+        "acceptEdits": "⏵⏵ accept edits on (shift+tab to cycle)",
+        "plan": "⏸ plan mode on (shift+tab to cycle)",
+        "auto": "⏵⏵ auto mode on (shift+tab to cycle)",
+        "bypassPermissions": "⏵⏵ bypass permissions on (shift+tab to cycle)",
+    }
+
+    def run(self, cmd: list[str], **kwargs: object) -> object:
+        """Serve capture-pane / send-keys like the real tmux binary."""
+        del kwargs
+        if "capture-pane" in cmd:
+            # Serve the pre-keystroke mode for the first `stale_reads`
+            # captures after a press, the way a mid-repaint pane does.
+            index = self.index
+            if self._pending_stale > 0:
+                self._pending_stale -= 1
+                index = self._prev_index
+            # Include the input box so the readiness gate passes, then
+            # the status + mode footer rows Claude renders beneath it.
+            pane = (
+                "╭──────────────╮\n"
+                "❯ \n"
+                "╰──────────────╯\n"
+                "  Opus 5 │ 0/1M (0%)\n"
+                f"  {self._FOOTERS[self.cycle[index]]}\n"
+            )
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if cmd[-1] == "BTab":
+            self.presses += 1
+            self._prev_index = self.index
+            self.index = (self.index + 1) % len(self.cycle)
+            self._pending_stale = self.stale_reads
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["auto", "plan", "acceptEdits", "default"],
+)
+def test_set_permission_mode_cycles_until_target_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    """
+    Every cycle-reachable mode is reached by pressing shift+tab.
+
+    Claude Code has no non-interactive mode command, so the switch
+    walks its shift+tab cycle and reads the pane footer to confirm
+    where it landed.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan", "auto"])
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode=target, timeout_s=5.0)
+
+    assert got == target, f"Expected the pane to settle on {target!r}, got {got!r}."
+
+
+def test_set_permission_mode_waits_out_a_stale_mode_footer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pane still showing the old mode doesn't stall the walk.
+
+    Claude repaints the footer asynchronously, so a capture taken right
+    after shift+tab can still render the PREVIOUS mode. Treating that as
+    the landed mode makes the cycler think the keystroke did nothing: it
+    keeps pressing while reading one mode behind, and a reachable target
+    (e.g. ``auto``, the last mode in the cycle) is reported unreachable.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    # Two stale captures per press — enough that a reader accepting the
+    # first non-empty footer always lags a mode behind.
+    fake = _FakeModeCycleTmux(
+        ["default", "acceptEdits", "plan", "auto"],
+        stale_reads=2,
+    )
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+    assert got == "auto", f"Expected the walk to reach auto despite stale reads, got {got!r}."
+    # 3 presses walk default → acceptEdits → plan → auto. More means the
+    # cycler was re-pressing on stale reads and lapped past the target.
+    assert fake.presses == 3, f"Expected 3 presses to reach auto, got {fake.presses}."
+
+
+def test_set_permission_mode_is_a_noop_when_already_in_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Re-requesting the current mode sends no keystrokes.
+
+    Without this the cycler would lap the whole cycle to return to
+    where it started, flashing every intermediate mode on the pane.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan", "auto"], start="auto")
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+    assert got == "auto"
+    assert fake.presses == 0, f"Expected no shift+tab presses, got {fake.presses}."
+
+
+def test_set_permission_mode_raises_when_target_not_in_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unreachable mode fails loud instead of landing somewhere else.
+
+    ``auto`` is only in the cycle for accounts that have the mode. A
+    fixed press count would silently leave the session in whatever mode
+    it happened to land on, so the cycler gives up and reports the modes
+    it actually saw.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    # No ``auto`` in this session's cycle.
+    fake = _FakeModeCycleTmux(["default", "acceptEdits", "plan"])
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    with pytest.raises(RuntimeError, match="not available in this session's cycle"):
+        claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+
+@pytest.mark.parametrize(
+    ("target", "presses"),
+    [("auto", 1), ("acceptEdits", 3)],
+)
+def test_set_permission_mode_leaves_a_bypass_launched_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    presses: int,
+) -> None:
+    """
+    A session launched into bypass can still be switched to a cycle mode.
+
+    Bypass is launch-only, so it is not a switch target, but the pane's
+    ``bypass permissions on`` footer must still read as the current mode:
+    without that the cycler cannot tell where it is starting from and gives
+    up before pressing anything. From bypass the TUI cycles
+    bypass → auto → manual → accept edits → plan, so ``auto`` is one press
+    away and ``acceptEdits`` three.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    fake = _FakeModeCycleTmux(
+        ["bypassPermissions", "auto", "default", "acceptEdits", "plan"],
+        start="bypassPermissions",
+    )
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode=target, timeout_s=5.0)
+
+    assert got == target
+    assert fake.presses == presses, f"Expected {presses} presses, got {fake.presses}."
+
+
+@pytest.mark.parametrize("bad_mode", ["dontAsk", "bypassPermissions", "", "nonsense"])
+def test_set_permission_mode_rejects_non_cycleable_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_mode: str,
+) -> None:
+    """
+    Modes shift+tab can't reach are rejected before touching tmux.
+
+    ``dontAsk`` is never in the cycle and ``bypassPermissions`` only
+    joins it when the session launched into it — cycling toward either
+    would wander through unrelated modes and then fail.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> object:
+        """Fail the test if tmux is invoked for a rejected mode."""
+        del cmd, kwargs
+        raise AssertionError("subprocess.run must not be called for a non-cycleable mode")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(ValueError, match="cannot be switched on a running session"):
+        claude_native_bridge.set_permission_mode(bridge_dir, mode=bad_mode, timeout_s=5.0)
+
+
+def test_set_permission_mode_raises_when_footer_never_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pane with no mode footer fails loud rather than blind-cycling.
+
+    Reading the current mode is what makes the walk deterministic; with
+    no footer the cycler cannot know where it started, so pressing
+    shift+tab would move the session to an unknown mode.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> object:
+        """Render a mounted input box that never shows a mode footer."""
+        del kwargs
+        if "capture-pane" in cmd:
+            pane = "╭────────╮\n❯ \n╰────────╯\n  Opus 5 │ 0/1M (0%)\n"
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if cmd[-1] == "BTab":
+            raise AssertionError("must not cycle when the current mode is unknown")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="did not render a permission-mode footer"):
+        claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+
+def test_set_permission_mode_raises_when_tmux_target_never_published(
+    tmp_path: Path,
+) -> None:
+    """
+    Missing tmux.json surfaces RuntimeError, mirroring inject_slash_command.
+
+    The runner route catches it and returns 503 so the web UI can show
+    "couldn't switch mode" instead of claiming a switch that never
+    reached the pane.
+    """
+    with pytest.raises(RuntimeError, match="tmux target is not advertised"):
+        claude_native_bridge.set_permission_mode(
+            tmp_path / "bridge",
+            mode="auto",
+            timeout_s=0.0,
+        )
+
+
+def test_permission_mode_from_pane_reads_the_footer_below_the_input_box() -> None:
+    """
+    The footer is found beneath the box rule, not at a fixed tail offset.
+
+    A tall footer (extra status rows, concurrent subagent lines) pushes the
+    mode line further from the bottom than a fixed window would reach, so a
+    tail-only scan would report "unknown" and the picker would hide.
+    """
+    pane = (
+        "● Working on it\n"
+        "╭──────────────╮\n"
+        "❯ \n"
+        "╰──────────────╯\n"
+        "  Opus 5 │ 0/1M (0%)\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+        "  ↓ 2 subagents running\n"
+        "  ⧉ In omnigent\n"
+    )
+
+    assert claude_native_bridge._permission_mode_from_pane(pane) == "auto"
+
+
+def test_permission_mode_from_pane_ignores_a_mode_named_in_the_transcript() -> None:
+    """
+    Transcript text above the input box can't be misread as the live mode.
+
+    Claude echoing "plan mode on" while *discussing* modes sits above the
+    box rule; only the region below it is the live footer. Without the
+    anchor the UI would flip to Plan because the agent said the words.
+    """
+    pane = (
+        "● You asked about plan mode on vs auto mode on — here's how they differ.\n"
+        "╭──────────────╮\n"
+        "❯ \n"
+        "╰──────────────╯\n"
+        "  ⏸ manual mode on\n"
+    )
+
+    assert claude_native_bridge._permission_mode_from_pane(pane) == "default"
+
+
+def test_permission_mode_from_pane_returns_none_without_a_footer() -> None:
+    """
+    A footerless pane reads as unknown, never as a guessed default.
+
+    The forwarder treats ``None`` as "no fresh observation" so a mid-repaint
+    capture can't post a spurious switch, and the web picker hides instead
+    of showing a mode the session may not be in.
+    """
+    assert claude_native_bridge._permission_mode_from_pane("") is None
+    assert (
+        claude_native_bridge._permission_mode_from_pane(
+            "╭────────╮\n❯ \n╰────────╯\n  Opus 5 │ 0/1M (0%)\n"
+        )
+        is None
+    )
+
+
+def test_read_permission_mode_reports_the_pane_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``read_permission_mode`` captures the pane and returns its footer mode.
+
+    This is the forwarder's only window onto an in-TUI shift+tab: Claude Code
+    emits no event on a mode change, so the rendered footer is the signal.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> object:
+        """Render a pane sitting in plan mode."""
+        del kwargs
+        if "capture-pane" in cmd:
+            pane = "╭────────╮\n❯ \n╰────────╯\n  ⏸ plan mode on (shift+tab to cycle)\n"
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    assert claude_native_bridge.read_permission_mode(bridge_dir) == "plan"
+
+
+def test_read_permission_mode_returns_none_without_a_tmux_target(tmp_path: Path) -> None:
+    """
+    No published tmux.json reads as unknown instead of raising.
+
+    The forwarder calls this every poll, including before the terminal is up.
+    Raising would have to be swallowed by the caller's poll loop; returning
+    ``None`` keeps "terminal not ready" and "no footer" on one quiet path.
+    """
+    assert claude_native_bridge.read_permission_mode(tmp_path / "bridge") is None
+
+
+def test_inject_slash_command_raises_when_tmux_target_never_published(
+    tmp_path: Path,
+) -> None:
+    """
+    Missing tmux.json surfaces RuntimeError, mirroring inject_user_message.
+
+    The runner route catches and returns 503, so AP's PATCH still
+    succeeds (effort persisted) and the next spawn picks it up.
+    """
+    with pytest.raises(RuntimeError, match="tmux target is not advertised"):
+        claude_native_bridge.inject_slash_command(
+            tmp_path / "bridge",
+            command="/effort high",
+            timeout_s=0.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        ConnectionRefusedError("bridge unavailable"),
+        ConnectionResetError("connection reset"),
+        RemoteDisconnected("bridge disconnected"),
+        TimeoutError("notification timed out"),
+        BadStatusLine("invalid response"),
+    ],
+)
+def test_post_tools_changed_normalizes_transport_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transport_error: Exception
+) -> None:
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(return_value={"socket": "/tmp/og-mcp-test.sock", "token": "test-token"}),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_control_connection",
+        lambda server: Mock(request=Mock(side_effect=transport_error)),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to notify Claude tool list change") as caught:
+        post_tools_changed(tmp_path)
+
+    assert caught.value.__cause__ is transport_error
+
+
+def test_post_tools_changed_normalizes_server_info_read_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Reading the bridge advertisement can fail for reasons other than the file
+    being absent — a runner that has exhausted its file descriptors raises
+    ``OSError`` (EMFILE) on the read. That must arrive as the documented
+    ``RuntimeError`` so the fire-and-forget caller can swallow it instead of
+    leaving an unretrieved task exception behind.
+    """
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(side_effect=OSError(24, "Too many open files")),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to read the Claude native bridge server info"):
+        post_tools_changed(tmp_path)
+
+
+def test_post_tools_changed_stops_waiting_when_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_started = threading.Event()
+    cancelled = threading.Event()
+    read_json = claude_native_bridge._read_json_file
+
+    def observe_read(path: Path) -> dict[str, Any]:
+        read_started.set()
+        return read_json(path)
+
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", observe_read)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        notification = executor.submit(
+            post_tools_changed, tmp_path, timeout_s=3.0, cancelled=cancelled
+        )
+        try:
+            assert read_started.wait(timeout=1.0)
+            assert not notification.done()
+            cancelled.set()
+            with pytest.raises(RuntimeError, match="notification was cancelled"):
+                notification.result(timeout=1.0)
+        finally:
+            cancelled.set()
+
+
+def test_post_tools_changed_preserves_programming_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_wait_for_server_info",
+        Mock(return_value={"socket": "/tmp/og-mcp-test.sock", "token": "test-token"}),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_control_connection",
+        lambda server: Mock(request=Mock(side_effect=ValueError("bug"))),
+    )
+
+    with pytest.raises(ValueError, match="bug"):
+        post_tools_changed(tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result_kind", ["text", "images", "image_error"])
+@pytest.mark.parametrize("cancellable", [False, True])
+async def test_channel_server_relays_active_omnigent_tools(
+    result_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    subprocess_bridge_root: Path,
+    cancellable: bool,
+) -> None:
+    """
+    Active turn tools are advertised to Claude and dispatched through AP.
+
+    This fails if Claude Code can receive web-channel inputs but cannot
+    call the Omnigent tools made available to the server-side agent.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", subprocess_bridge_root
+    )
+    bridge_dir = prepare_bridge_dir("conv_tools", workspace=tmp_path)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    calls: list[dict[str, object]] = []
+    from PIL import Image
+
+    from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
+    from omnigent.util.json_types import JsonObject
+
+    image_blocks: list[JsonObject] = []
+    for color in ("red", "blue"):
+        buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), color).save(buffer, format="PNG")
+        image_blocks.append(
+            {
+                "type": "image",
+                "data": base64.b64encode(buffer.getvalue()).decode(),
+                "mimeType": "image/png",
+            }
+        )
+    image_blocks.append({"type": "text", "text": "After both images: subtract 30; word amber."})
+
+    async def tool_executor(name: str, arguments: dict[str, object]) -> object:
+        """
+        Capture one relayed tool call.
+
+        :param name: Tool name from Claude's MCP request, e.g.
+            ``"sys_custom"``.
+        :param arguments: Tool arguments from Claude.
+        :returns: Structured tool result.
+        """
+        calls.append({"name": name, "arguments": arguments})
+        if result_kind != "text":
+            return json.loads(
+                encode_mcp_image_result(image_blocks, is_error=result_kind == "image_error")
+            )
+        return {"echo": arguments}
+
+    relay = None
+    try:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        _write_json_line(
+            proc.stdin,
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+        initialize = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        assert initialize["id"] == 1
+
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_custom",
+                    "description": "Test-only active Omnigent tool.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                    },
+                }
+            ],
+            tool_executor=tool_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        post_tools_changed(bridge_dir, cancelled=threading.Event() if cancellable else None)
+        changed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        assert changed["method"] == "notifications/tools/list_changed"
+
+        _write_json_line(
+            proc.stdin,
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+        listed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        listed_tools = listed["result"]["tools"]
+        custom_tools = [tool for tool in listed_tools if tool["name"] == "sys_custom"]
+        assert custom_tools == [
+            {
+                "name": "sys_custom",
+                "description": "Test-only active Omnigent tool.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                },
+            }
+        ]
+
+        _write_json_line(
+            proc.stdin,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "sys_custom",
+                    "arguments": {"value": "hello"},
+                },
+            },
+        )
+        tool_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        assert tool_result["id"] == 3
+        if result_kind == "text":
+            text = tool_result["result"]["content"][0]["text"]
+            assert json.loads(text) == {"echo": {"value": "hello"}}
+        else:
+            assert tool_result["result"] == {
+                "content": image_blocks,
+                "isError": result_kind == "image_error",
+            }
+        assert calls == [{"name": "sys_custom", "arguments": {"value": "hello"}}]
+    finally:
+        if relay is not None:
+            relay.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+
+def test_call_relay_tool_returns_mcp_error_on_read_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A relay POST that times out mid-read returns an MCP error, not a raise.
+
+    Regression test: ``request.urlopen`` raises a bare ``socket.timeout`` /
+    ``TimeoutError`` (an ``OSError`` subclass that is NOT a ``URLError``) when
+    the relay server accepts the connection but never responds. The previous
+    ``except error.URLError`` did not catch it, so the exception propagated up
+    through ``_call_mcp_tool`` → ``_stdio_jsonrpc_loop`` and killed the MCP
+    server — surfacing to Claude Code as ``-32000: Connection closed``. This
+    asserts the call instead yields an ``isError`` MCP result so the stdio
+    loop can keep serving.
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    class _HangingHandler(BaseHTTPRequestHandler):
+        """HTTP handler that accepts the request then stalls past the timeout."""
+
+        def log_message(self, format: str, *args: Any) -> None:
+            """
+            Silence the default per-request stderr logging.
+
+            :param format: Unused format string.
+            :param args: Unused format args.
+            :returns: None.
+            """
+            del format, args
+
+        def do_POST(self) -> None:
+            """
+            Read the request body, then block without replying.
+
+            :returns: None.
+            """
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            started.set()
+            # Hold the connection open with no response so the client's read
+            # times out. Released in the test's finally so the thread exits.
+            release.wait(timeout=10.0)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _HangingHandler)
+    host, port = httpd.server_address
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    claude_native_bridge._write_json_file(
+        bridge_dir / claude_native_bridge._TOOL_RELAY_FILE,
+        {"url": f"http://{host}:{port}", "token": "relay-token", "tools": []},
+    )
+    # Force a sub-second read timeout so the test is fast; the production
+    # value is minutes. The point under test is the exception TYPE handling,
+    # not the duration.
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_POST_TIMEOUT_S", 0.3)
+
+    try:
+        result = claude_native_bridge._call_relay_tool(
+            bridge_dir, "sys_os_shell", {"command": "echo hi"}
+        )
+    finally:
+        release.set()
+        httpd.shutdown()
+        httpd.server_close()
+        server_thread.join(timeout=5.0)
+
+    assert started.is_set(), "relay server never received the POST"
+    # The result is a well-formed MCP error result, NOT a raised exception.
+    assert result["isError"] is True
+    error_text = json.loads(result["content"][0]["text"])["error"]
+    assert "failed to call Omnigent tool relay" in error_text
+
+
+@pytest.mark.asyncio
+async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    subprocess_bridge_root: Path,
+) -> None:
+    """
+    An exception handling one request becomes -32603 and the server lives.
+
+    Regression test for the bridge crash: an *uncaught* exception while
+    handling ONE ``tools/call`` must not tear down the long-lived stdio MCP
+    server. The relay backend returns invalid UTF-8 bytes, so
+    ``_call_relay_tool``'s ``resp.read().decode("utf-8")`` raises
+    ``UnicodeDecodeError`` — a ``ValueError`` that is NOT an ``OSError``, so
+    it escapes the ``except OSError`` clause and propagates out of
+    ``_handle_mcp_request``. The loop's per-request guard must convert it into
+    a JSON-RPC ``-32603`` error for the offending call, and a SUBSEQUENT
+    ``tools/list`` on the same process must still succeed — proving the server
+    did not exit (which Claude would otherwise see as
+    ``-32000: Connection closed``). Without the guard, the decode error kills
+    ``_serve_mcp`` and the ``tools/list`` read below times out.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", subprocess_bridge_root
+    )
+    bridge_dir = prepare_bridge_dir("conv_crash", workspace=tmp_path)
+
+    # A relay server that returns HTTP 200 with invalid UTF-8 bytes. This
+    # makes _call_relay_tool's resp.read().decode("utf-8") raise
+    # UnicodeDecodeError (a ValueError, NOT an OSError), which the function's
+    # except OSError does not catch — so the exception propagates up to the
+    # stdio loop and exercises the per-request guard under test. The relay
+    # tool name must appear in tool_relay.json so _call_mcp_tool routes to
+    # _call_relay_tool.
+    class _InvalidUtf8Handler(BaseHTTPRequestHandler):
+        """HTTP handler that replies 200 with an undecodable body."""
+
+        def log_message(self, format: str, *args: Any) -> None:
+            """
+            Silence the default per-request stderr logging.
+
+            :param format: Unused format string.
+            :param args: Unused format args.
+            :returns: None.
+            """
+            del format, args
+
+        def do_POST(self) -> None:
+            """
+            Reply with bytes that are not valid UTF-8.
+
+            :returns: None.
+            """
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            # 0xFF/0xFE are never valid UTF-8 lead bytes → decode() raises.
+            body = b"\xff\xfe\xfa"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _InvalidUtf8Handler)
+    host, port = httpd.server_address
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    claude_native_bridge._write_json_file(
+        bridge_dir / claude_native_bridge._TOOL_RELAY_FILE,
+        {
+            "url": f"http://{host}:{port}",
+            "token": "relay-token",
+            "tools": [
+                {
+                    "name": "sys_flaky",
+                    "description": "Relay tool whose backend returns undecodable bytes.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        },
+    )
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        _write_json_line(
+            proc.stdin,
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+        initialize = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        assert initialize["id"] == 1
+
+        # Call the flaky relay tool. Decoding the undecodable response raises
+        # UnicodeDecodeError, which escapes _call_relay_tool's except OSError
+        # and is caught by the loop's per-request guard.
+        _write_json_line(
+            proc.stdin,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "sys_flaky", "arguments": {}},
+            },
+        )
+        call_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        assert call_result["id"] == 2
+        # The guard reports the uncaught exception as a JSON-RPC -32603
+        # ("Internal error") response — NOT a normal MCP error result. This is
+        # the assertion that fails if the guard is removed (the call would get
+        # no response because the server would have exited).
+        assert call_result["error"]["code"] == -32603
+        assert "result" not in call_result
+
+        # The decisive assertion: the server is STILL ALIVE and answers the
+        # next request. Before the per-request loop guard, the exception above
+        # would have exited the process and this read would time out.
+        _write_json_line(
+            proc.stdin,
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+        )
+        listed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        assert listed["id"] == 3
+        assert "tools" in listed["result"]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        server_thread.join(timeout=5.0)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize("concurrent_method", ["ping", "tools/call"])
+def test_serve_mcp_answers_while_relay_call_is_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    concurrent_method: str,
+) -> None:
+    """A slow relay call must not stop the stdio server from serving peers."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    blocked_call_started = threading.Event()
+    release_blocked_call = threading.Event()
+    requests: queue.Queue[bytes] = queue.Queue()
+    responses: queue.Queue[dict[str, Any]] = queue.Queue()
+
+    class _QueuedStdin:
+        """Minimal binary stdin stream driven by a queue."""
+
+        buffer: _QueuedStdin
+
+        def __init__(self) -> None:
+            self.buffer = self
+
+        def readline(self) -> bytes:
+            return requests.get(timeout=5.0)
+
+    def _write_request(payload: dict[str, object]) -> None:
+        requests.put((json.dumps(payload) + "\n").encode("utf-8"))
+
+    def _call_relay_tool(
+        bridge_dir: Path,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        del bridge_dir, arguments
+        if name == "sys_slow":
+            blocked_call_started.set()
+            release_blocked_call.wait(timeout=10.0)
+            return {"content": [{"type": "text", "text": "slow-done"}]}
+        return {"content": [{"type": "text", "text": "fast-done"}]}
+
+    monkeypatch.setattr(claude_native_bridge.sys, "stdin", _QueuedStdin())
+    monkeypatch.setattr(
+        claude_native_bridge, "_read_relay_tool_names", lambda _path: {"sys_slow", "sys_fast"}
+    )
+    monkeypatch.setattr(claude_native_bridge, "_call_relay_tool", _call_relay_tool)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_write_jsonrpc",
+        lambda payload, _lock, **_kwargs: responses.put(payload),
+    )
+    server_thread = threading.Thread(
+        target=claude_native_bridge._stdio_jsonrpc_loop,
+        args=({}, threading.Lock(), bridge_dir),
+        daemon=True,
+    )
+    server_thread.start()
+    try:
+        _write_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "sys_slow", "arguments": {}},
+            }
+        )
+        assert blocked_call_started.wait(timeout=5.0)
+
+        if concurrent_method == "ping":
+            concurrent_request: dict[str, object] = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "ping",
+                "params": {},
+            }
+        else:
+            concurrent_request = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "sys_fast", "arguments": {}},
+            }
+        _write_request(concurrent_request)
+
+        concurrent_response = responses.get(timeout=1.0)
+        assert concurrent_response["id"] == 2
+        if concurrent_method == "ping":
+            assert concurrent_response["result"] == {}
+        else:
+            assert concurrent_response["result"]["content"][0]["text"] == "fast-done"
+
+        release_blocked_call.set()
+        blocked_response = responses.get(timeout=5.0)
+        assert blocked_response["id"] == 1
+    finally:
+        release_blocked_call.set()
+        requests.put(b"")
+        server_thread.join(timeout=5.0)
+
+
+def test_serve_mcp_rejects_at_concurrency_cap_and_keeps_serving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A saturated request cap rejects work without stopping the server."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    blocked_call_started = threading.Event()
+    release_blocked_call = threading.Event()
+    requests: queue.Queue[bytes] = queue.Queue()
+    responses: queue.Queue[dict[str, Any]] = queue.Queue()
+
+    class _QueuedStdin:
+        """Minimal binary stdin stream driven by a queue."""
+
+        buffer: _QueuedStdin
+
+        def __init__(self) -> None:
+            self.buffer = self
+
+        def readline(self) -> bytes:
+            return requests.get(timeout=5.0)
+
+    def _write_request(request_id: int) -> None:
+        requests.put(
+            (json.dumps({"jsonrpc": "2.0", "id": request_id, "method": "ping"}) + "\n").encode()
+        )
+
+    def _handle_mcp_request(
+        method: str,
+        params: object,
+        tools: dict[str, object],
+        request_bridge_dir: Path,
+    ) -> dict[str, object]:
+        del method, params, tools, request_bridge_dir
+        if not blocked_call_started.is_set():
+            blocked_call_started.set()
+            release_blocked_call.wait(timeout=10.0)
+        return {}
+
+    monkeypatch.setattr(claude_native_bridge, "_MAX_CONCURRENT_MCP_REQUESTS", 1)
+    monkeypatch.setattr(claude_native_bridge.sys, "stdin", _QueuedStdin())
+    monkeypatch.setattr(claude_native_bridge, "_handle_mcp_request", _handle_mcp_request)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_write_jsonrpc",
+        lambda payload, _lock, **_kwargs: responses.put(payload),
+    )
+    server_thread = threading.Thread(
+        target=claude_native_bridge._stdio_jsonrpc_loop,
+        args=({}, threading.Lock(), bridge_dir),
+        daemon=True,
+    )
+    server_thread.start()
+    try:
+        _write_request(1)
+        assert blocked_call_started.wait(timeout=5.0)
+
+        _write_request(2)
+        rejected = responses.get(timeout=1.0)
+        assert rejected == {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {"code": -32000, "message": "server busy"},
+        }
+
+        release_blocked_call.set()
+        assert responses.get(timeout=5.0)["id"] == 1
+        for request_thread in threading.enumerate():
+            if request_thread.name == "claude-native-mcp-request":
+                request_thread.join(timeout=5.0)
+                assert not request_thread.is_alive()
+        _write_request(3)
+        assert responses.get(timeout=5.0) == {"jsonrpc": "2.0", "id": 3, "result": {}}
+    finally:
+        release_blocked_call.set()
+        requests.put(b"")
+        server_thread.join(timeout=5.0)
+
+
+def test_serve_mcp_rejects_when_request_thread_cannot_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request-thread start failure rejects calls without stopping the server."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    requests: queue.Queue[bytes] = queue.Queue()
+    responses: queue.Queue[dict[str, Any]] = queue.Queue()
+
+    class _QueuedStdin:
+        """Minimal binary stdin stream driven by a queue."""
+
+        buffer: _QueuedStdin
+
+        def __init__(self) -> None:
+            self.buffer = self
+
+        def readline(self) -> bytes:
+            return requests.get(timeout=5.0)
+
+    real_thread = threading.Thread
+
+    class _FailingThread(real_thread):
+        """Request thread whose start simulates OS resource exhaustion."""
+
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    def _write_request(request_id: int) -> None:
+        requests.put(
+            (json.dumps({"jsonrpc": "2.0", "id": request_id, "method": "ping"}) + "\n").encode()
+        )
+
+    monkeypatch.setattr(claude_native_bridge, "_MAX_CONCURRENT_MCP_REQUESTS", 1)
+    monkeypatch.setattr(claude_native_bridge.sys, "stdin", _QueuedStdin())
+    monkeypatch.setattr(claude_native_bridge.threading, "Thread", _FailingThread)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_write_jsonrpc",
+        lambda payload, _lock, **_kwargs: responses.put(payload),
+    )
+    server_thread = real_thread(
+        target=claude_native_bridge._stdio_jsonrpc_loop,
+        args=({}, threading.Lock(), bridge_dir),
+        daemon=True,
+    )
+    server_thread.start()
+    try:
+        for request_id in (1, 2):
+            _write_request(request_id)
+            assert responses.get(timeout=5.0) == {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32000, "message": "server busy"},
+            }
+    finally:
+        requests.put(b"")
+        server_thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_start_tool_relay_accepts_pi_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relay startup accepts Pi-native's persistent bridge root."""
+    from omnigent.harnesses.pi_native import bridge as pi_native_bridge
+
+    pi_root = tmp_path / ".omnigent" / "pi-native"
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", pi_root)
+    bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_pi")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """Return an empty result for the unused relay tool callback."""
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_list",
+                    "description": "List Omnigent sessions.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        assert relay_file.exists(), (
+            "Pi-native relay did not write tool_relay.json under the persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_list"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
+async def test_start_tool_relay_accepts_codex_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Relay startup accepts Codex-native's persistent bridge root.
+
+    Codex-native reuses the Claude MCP relay but stores bridge files in
+    ``~/.omnigent/codex-native`` instead of Claude's ``/tmp`` bridge
+    root. A regression here logs "Failed to start comment relay" and
+    leaves Codex without comment/session tools.
+
+    :param tmp_path: Pytest temp directory used as an isolated user
+        state parent.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+
+    codex_root = tmp_path / ".omnigent" / "codex-native"
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", codex_root)
+    bridge_dir = codex_native_bridge.prepare_bridge_dir("conv_codex")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """
+        Return an empty result for the unused relay tool callback.
+
+        :param name: Tool name, e.g. ``"list_comments"``.
+        :param arguments: Tool arguments, e.g. ``{"status": "pending"}``.
+        :returns: Empty tool result.
+        """
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "list_comments",
+                    "description": "List comments.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+
+        assert relay_file.exists(), (
+            "Codex-native relay did not write tool_relay.json under the persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "list_comments"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
+async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Relay startup accepts Antigravity-native's persistent bridge root (#1194).
+
+    Antigravity-native reuses the Claude MCP relay but stores bridge files in
+    ``~/.omnigent/antigravity-native`` (the same ``$HOME/.omnigent/<harness>``
+    shape codex uses). A regression in :func:`_trusted_parent_for_bridge_dir`
+    would reject the bridge dir, the relay would fail to write
+    ``tool_relay.json``, and the wrapped agy would get no ``sys_*`` tools.
+
+    :param tmp_path: Pytest temp directory used as an isolated user
+        state parent.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.harnesses.antigravity_native import bridge as antigravity_native_bridge
+
+    antigravity_root = tmp_path / ".omnigent" / "antigravity-native"
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.bridge._BRIDGE_ROOT", antigravity_root
+    )
+    bridge_dir = antigravity_native_bridge.prepare_bridge_dir("conv_agy")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """
+        Return an empty result for the unused relay tool callback.
+
+        :param name: Tool name, e.g. ``"sys_session_list"``.
+        :param arguments: Tool arguments.
+        :returns: Empty tool result.
+        """
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_create",
+                    "description": "Spawn an Omnigent sub-agent session.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+
+        assert relay_file.exists(), (
+            "Antigravity-native relay did not write tool_relay.json under the "
+            "persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_create"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
+async def test_start_tool_relay_accepts_opencode_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Relay startup accepts OpenCode-native's persistent bridge root.
+
+    opencode-native reuses the Claude MCP relay but stores bridge files in
+    ``~/.omnigent/opencode-native`` (the same ``$HOME/.omnigent/<harness>``
+    shape codex/antigravity use). The missing allowlist entry made ``serve-mcp``
+    crash on startup (``_ensure_secure_dir`` → "not under an allowed bridge
+    root"), which opencode surfaced as ``MCP error -32000: Connection closed``
+    and the wrapped opencode got no ``sys_*`` tools. Guards the regression.
+
+    :param tmp_path: Pytest temp directory used as an isolated user state parent.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
+
+    opencode_root = tmp_path / ".omnigent" / "opencode-native"
+    monkeypatch.setattr("omnigent.harnesses.opencode_native.bridge._BRIDGE_ROOT", opencode_root)
+    bridge_dir = opencode_native_bridge.prepare_bridge_dir("conv_oc")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """Return an empty result for the unused relay tool callback."""
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_list",
+                    "description": "List Omnigent sessions.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        assert relay_file.exists(), (
+            "OpenCode-native relay did not write tool_relay.json under the persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_list"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_close_keeps_advertisement_owned_by_newer_relay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    subprocess_bridge_root: Path,
+) -> None:
+    """
+    Closing a superseded relay must not delete a newer relay's advertisement.
+
+    Fork/clear/resume sessions keep the same ``bridge_id`` — hence the same
+    bridge dir and ``tool_relay.json``. When a newer session starts its relay
+    it overwrites the file with its own token; closing the older session's
+    relay (e.g. on session delete) must recognise it no longer owns the file
+    and leave it in place. Unconditional unlinking here would erase the
+    still-active newer session's ``list_comments`` / ``update_comment``.
+    """
+    # gettempdir(), not a literal /tmp: the fixture root lives under the
+    # platform temp dir (/var/folders/… on macOS), which /tmp never contains.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", Path(tempfile.gettempdir())
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", subprocess_bridge_root
+    )
+    bridge_dir = prepare_bridge_dir("conv_shared_bridge", workspace=tmp_path)
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """
+        Unused executor — this test only exercises advertisement lifecycle.
+
+        :param name: Tool name (unused).
+        :param arguments: Tool arguments (unused).
+        :returns: Empty result dict.
+        """
+        del name, arguments
+        return {}
+
+    tools = [
+        {
+            "name": "list_comments",
+            "description": "",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+    loop = asyncio.get_running_loop()
+
+    old_relay = None
+    new_relay = None
+    try:
+        old_relay = start_tool_relay(
+            bridge_dir=bridge_dir, tools=tools, tool_executor=_executor, loop=loop
+        )
+        old_token = json.loads(relay_file.read_text())["token"]
+
+        # A second relay on the same bridge dir overwrites the advertisement
+        # with its own token — the fork/clear/resume reuse of one bridge_id.
+        new_relay = start_tool_relay(
+            bridge_dir=bridge_dir, tools=tools, tool_executor=_executor, loop=loop
+        )
+        new_token = json.loads(relay_file.read_text())["token"]
+        # Tokens are random per relay; equality would mean start_tool_relay did
+        # not rebind, collapsing the two-relay premise of this test.
+        assert new_token != old_token, "second relay did not rewrite the token"
+
+        # Closing the OLD relay must NOT remove the file the NEW relay owns.
+        old_relay.close()
+        assert relay_file.exists(), (
+            "old relay.close() deleted tool_relay.json now owned by the newer "
+            "relay — the still-active session would lose its comment tools"
+        )
+        # The file still advertises the NEW relay, untouched by the old close.
+        assert json.loads(relay_file.read_text())["token"] == new_token, (
+            "old relay.close() mutated the newer relay's advertisement"
+        )
+
+        # The owning relay's close() does remove its own advertisement.
+        new_relay.close()
+        assert not relay_file.exists(), (
+            "new relay.close() left a stale tool_relay.json after the owning relay shut down"
+        )
+    finally:
+        # close() is safe to call twice (shutdown is idempotent once the
+        # server has stopped); guarantees both sockets are released on failure.
+        if old_relay is not None:
+            old_relay.close()
+        if new_relay is not None:
+            new_relay.close()
+
+
+def _write_json_line(handle: TextIO, payload: dict[str, object]) -> None:
+    """
+    Write one JSON-RPC line to a subprocess stdin stream.
+
+    :param handle: Text stdin handle returned by
+        :class:`subprocess.Popen`.
+    :param payload: JSON-compatible object to write.
+    :returns: None.
+    """
+    handle.write(json.dumps(payload) + "\n")
+    handle.flush()
+
+
+def _read_json_line(handle: TextIO, *, timeout_s: float) -> dict[str, object]:
+    """
+    Read one JSON line from a subprocess stdout stream.
+
+    :param handle: Text stdout handle returned by
+        :class:`subprocess.Popen`.
+    :param timeout_s: Seconds to wait, e.g. ``5.0``.
+    :returns: Parsed JSON object.
+    :raises TimeoutError: If no line is available before the
+        timeout.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        ready, _write, _error = select.select([handle], [], [], 0.05)
+        if not ready:
+            continue
+        line = handle.readline()
+        if line:
+            payload = json.loads(line)
+            assert isinstance(payload, dict)
+            return payload
+    raise TimeoutError("subprocess did not emit a JSON line")
+
+
+def test_usage_from_transcript_entry_sums_context_tokens() -> None:
+    """
+    Context-token count must sum the three input-side fields.
+
+    The "context tokens" exposed to web's input-composer ring is
+    ``input_tokens + cache_creation_input_tokens +
+    cache_read_input_tokens``. ``output_tokens`` is generated within
+    the same call and does NOT count toward the next prompt's size,
+    so it must be reported separately, not folded into the sum.
+    """
+    entry = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": 6,
+                "cache_creation_input_tokens": 22967,
+                "cache_read_input_tokens": 21595,
+                "output_tokens": 554,
+            },
+        },
+    }
+
+    usage = claude_native_bridge._usage_from_transcript_entry(entry)
+
+    assert usage == {
+        "context_tokens": 6 + 22967 + 21595,
+        "input_tokens": 6,
+        "output_tokens": 554,
+        "cache_creation_input_tokens": 22967,
+        "cache_read_input_tokens": 21595,
+    }
+
+
+def test_usage_from_transcript_entry_returns_none_for_non_assistant() -> None:
+    """User-role entries do not carry ``message.usage``; helper returns ``None``."""
+    assert (
+        claude_native_bridge._usage_from_transcript_entry(
+            {"type": "user", "message": {"role": "user", "content": "hi"}}
+        )
+        is None
+    )
+
+
+def test_usage_from_transcript_entry_tolerates_missing_cache_fields() -> None:
+    """
+    Old transcript shapes without cache_creation/cache_read still parse.
+
+    Treats absent cache fields as zero so the helper degrades gracefully
+    on transcripts written by Claude versions predating prompt caching.
+    """
+    entry = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 100, "output_tokens": 20},
+        },
+    }
+    usage = claude_native_bridge._usage_from_transcript_entry(entry)
+    assert usage == {"context_tokens": 100, "input_tokens": 100, "output_tokens": 20}
+
+
+def test_usage_from_transcript_entry_forwards_cache_keys_for_cost() -> None:
+    """
+    Cache-read and cache-creation token counts must appear in the
+    returned dict so ``compute_llm_cost`` can bill them at their
+    cheaper per-token rates.
+
+    Without this, cached tokens are invisible to cost computation
+    and get implicitly billed at the full input rate (or not at all,
+    depending on how ``input_tokens`` was populated upstream).
+    """
+    entry = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": 50,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 8000,
+                "output_tokens": 200,
+            },
+        },
+    }
+    usage = claude_native_bridge._usage_from_transcript_entry(entry)
+    # cache_read present, cache_creation absent (zero is omitted).
+    assert usage is not None
+    assert usage["cache_read_input_tokens"] == 8000
+    assert "cache_creation_input_tokens" not in usage
+    assert usage["input_tokens"] == 50
+    assert usage["output_tokens"] == 200
+    assert usage["context_tokens"] == 50 + 8000
+
+
+def test_read_transcript_items_from_offset_returns_latest_usage(tmp_path: Path) -> None:
+    """
+    The transcript reader exposes the most recent assistant ``usage``.
+
+    Two assistant entries are written; the last one's usage must win
+    so the input-composer ring tracks the *current* prompt size, not a
+    stale earlier value.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "one"}],
+                            "usage": {
+                                "input_tokens": 10,
+                                "cache_creation_input_tokens": 100,
+                                "cache_read_input_tokens": 0,
+                                "output_tokens": 5,
+                            },
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "a2",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "two"}],
+                            "usage": {
+                                "input_tokens": 20,
+                                "cache_creation_input_tokens": 50,
+                                "cache_read_input_tokens": 200,
+                                "output_tokens": 7,
+                            },
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_usage == {
+        "context_tokens": 20 + 50 + 200,
+        "input_tokens": 20,
+        "output_tokens": 7,
+        "cache_creation_input_tokens": 50,
+        "cache_read_input_tokens": 200,
+    }
+
+
+def test_read_transcript_items_from_offset_latest_usage_none_when_user_only(
+    tmp_path: Path,
+) -> None:
+    """A batch of user-only entries leaves ``latest_usage`` / ``latest_model`` as ``None``."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_usage is None
+    assert result.latest_model is None
+
+
+def test_read_transcript_items_from_offset_returns_latest_model(
+    tmp_path: Path,
+) -> None:
+    """
+    The transcript reader exposes ``message.model`` from the latest assistant turn.
+
+    Surfaced for diagnostics / future use; the ring's denominator now
+    comes from the statusLine stdin (see
+    :func:`read_claude_context_state`), not a model lookup.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-sonnet-4-6",
+                            "content": [{"type": "text", "text": "one"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "a2",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-opus-4-7",
+                            "content": [{"type": "text", "text": "two"}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_model == "claude-opus-4-7"
+
+
+@pytest.mark.parametrize("initial_model", [None, "gateway-claude-model"])
+def test_transcript_synthetic_error_preserves_model(
+    tmp_path: Path, initial_model: str | None
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    models = [initial_model, "<synthetic>"] if initial_model else ["<synthetic>"]
+    transcript_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": f"a{index}",
+                    "message": {
+                        "role": "assistant",
+                        "model": model,
+                        "content": [{"type": "text", "text": "API Error: 429"}],
+                    },
+                }
+            )
+            + "\n"
+            for index, model in enumerate(models)
+        ),
+        encoding="utf-8",
+    )
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert result.latest_model == initial_model
+    assert result.items  # Error messages remain visible; only model metadata is ignored.
+
+
+def test_read_transcript_items_surfaces_custom_title_without_an_item(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``/rename`` record surfaces on ``latest_custom_title`` and renders nothing.
+
+    Claude writes the operator's title as a ``custom-title`` metadata
+    record carrying no ``message``, so it must not become a conversation
+    item — the forwarder mirrors it onto the session title instead.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "message": {"role": "user", "content": "hi"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "custom-title",
+                        "customTitle": "auth-refactor",
+                        "sessionId": "s1",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title == "auth-refactor"
+    # The rename record itself is metadata, not a user/assistant bubble.
+    assert [item.item_type for item in result.items] == ["message"]
+
+
+def test_read_transcript_items_custom_title_last_write_wins(tmp_path: Path) -> None:
+    """Renaming twice in one window leaves the most recent title."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "custom-title", "customTitle": "first", "sessionId": "s1"}),
+                json.dumps({"type": "custom-title", "customTitle": "second", "sessionId": "s1"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title == "second"
+
+
+def test_read_transcript_items_ignores_ai_title_and_blank_custom_title(
+    tmp_path: Path,
+) -> None:
+    """
+    Claude's own ``aiTitle`` and a blank ``customTitle`` are both ignored.
+
+    Omnigent runs its own background titler, so forwarding Claude's
+    generated title would put two auto-titlers in a fight over one field;
+    only an explicit ``/rename`` propagates.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "Generated summary of the session",
+                        "sessionId": "s1",
+                    }
+                ),
+                json.dumps({"type": "custom-title", "customTitle": "   ", "sessionId": "s1"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title is None
+    assert result.items == []
+
+
+def test_read_transcript_items_since_surfaces_custom_title(tmp_path: Path) -> None:
+    """The legacy line-cursor reader surfaces the rename too."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "custom-title", "customTitle": "auth-refactor", "sessionId": "s1"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = claude_native_bridge.read_transcript_items_since_with_position(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title == "auth-refactor"
+
+
+def test_read_claude_context_state_returns_parsed_payload(tmp_path: Path) -> None:
+    """
+    ``context.json`` round-trips into a dict with both fields.
+
+    The statusLine wrapper writes this file every Claude Code render
+    tick; the forwarder reads it on each poll to drive the ring.
+    Drift here silently breaks the ring on every claude-native chat.
+    """
+    bridge_dir = tmp_path
+    payload = {
+        "context_window_size": 1_000_000,
+        "current_usage": {
+            "input_tokens": 6,
+            "cache_creation_input_tokens": 22967,
+            "cache_read_input_tokens": 21595,
+            "output_tokens": 554,
+        },
+    }
+    (bridge_dir / "context.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    state = claude_native_bridge.read_claude_context_state(bridge_dir)
+
+    assert state is not None
+    assert state["context_window_size"] == 1_000_000
+    assert state["current_usage"]["input_tokens"] == 6
+
+
+def test_read_claude_context_state_returns_none_when_missing(tmp_path: Path) -> None:
+    """A missing context.json must not raise — forwarder treats as no update."""
+    assert claude_native_bridge.read_claude_context_state(tmp_path) is None
+
+
+def test_read_claude_context_state_rejects_non_positive_window(tmp_path: Path) -> None:
+    """
+    A non-positive ``context_window_size`` is dropped.
+
+    Defends the ring's denominator: zero would NaN the math, negative
+    would render a backwards arc. Either is worse than no update.
+    """
+    bridge_dir = tmp_path
+    (bridge_dir / "context.json").write_text(
+        json.dumps({"context_window_size": 0}), encoding="utf-8"
+    )
+    assert claude_native_bridge.read_claude_context_state(bridge_dir) is None
+
+
+def test_read_user_status_line_command_returns_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The user's global statusLine.command is returned for chaining.
+
+    The wrapper invokes it post-capture so claude-hud / the user's
+    custom status bar still renders for omnigent-launched sessions.
+    """
+    fake_home = tmp_path
+    settings = fake_home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        json.dumps({"statusLine": {"type": "command", "command": "bun run hud"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+
+    assert claude_native_bridge.read_user_status_line_command() == "bun run hud"
+
+
+def test_read_user_status_line_command_returns_none_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No global statusLine → chain is omitted; wrapper prints nothing extra."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    assert claude_native_bridge.read_user_status_line_command() is None
+
+
+@pytest.mark.parametrize("effort", sorted(CLAUDE_EFFORTS))
+def test_read_user_effort_level_returns_configured_level(
+    effort: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recognized ``effortLevel`` is returned, to stamp on the session row."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"effortLevel": effort}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    assert claude_native_bridge.read_user_effort_level() == effort
+
+
+def test_read_user_effort_level_returns_none_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``effortLevel`` → None, so creation omits reasoning_effort entirely."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    assert claude_native_bridge.read_user_effort_level() is None
+
+
+def test_read_user_effort_level_rejects_unrecognized_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrecognized value is treated as unset (fail-soft, so launch never 400s)."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"effortLevel": "ultra"}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    assert claude_native_bridge.read_user_effort_level() is None
+
+
+def test_read_user_effort_level_returns_none_when_settings_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing settings.json → None; absence of config must not raise."""
+    missing = tmp_path / "does-not-exist" / "settings.json"
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", missing)
+    assert claude_native_bridge.read_user_effort_level() is None
+
+
+# ---------------------------------------------------------------------------
+# launch_model storage and retrieval
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_bridge_dir_stores_launch_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``launch_model`` is persisted in bridge.json when provided."""
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path,
+        launch_model="databricks-claude-opus-4-7",
+    )
+    config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
+    assert config["launch_model"] == "databricks-claude-opus-4-7"
+
+
+def test_prepare_bridge_dir_omits_launch_model_when_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``launch_model`` key is absent from bridge.json when not provided."""
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path,
+    )
+    config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
+    assert "launch_model" not in config
+
+
+def test_read_launch_model_returns_stored_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``read_launch_model`` round-trips the value stored by ``prepare_bridge_dir``."""
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path,
+        launch_model="databricks-claude-sonnet-4-6",
+    )
+    assert read_launch_model(bridge_dir) == "databricks-claude-sonnet-4-6"
+
+
+def test_read_launch_model_returns_none_when_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``read_launch_model`` returns ``None`` when no launch model was stored."""
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path,
+    )
+    assert read_launch_model(bridge_dir) is None
+
+
+def test_read_launch_model_returns_none_for_missing_bridge_dir(
+    tmp_path: Path,
+) -> None:
+    """``read_launch_model`` returns ``None`` for a nonexistent bridge dir."""
+    assert read_launch_model(tmp_path / "nonexistent") is None
+
+
+def test_model_env_round_trips_the_launch_vocabulary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner reads the alias pinning from here, not from its own env."""
+    from omnigent.harnesses.claude_native.bridge import read_model_env
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path,
+        launch_model="databricks-claude-opus-4-8",
+        launch_env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-sonnet-5",
+            # Unrelated launch env must not be persisted.
+            "ANTHROPIC_BASE_URL": "https://example.invalid",
+        },
+    )
+    assert read_model_env(bridge_dir) == {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-sonnet-5",
+    }
+
+
+def test_record_model_vocabulary_backfills_a_runner_prepared_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner path records the vocabulary AFTER preparing the bridge.
+
+    The runner prepares the bridge before it resolves the provider config,
+    so the pins and launch model land via a second write — and must read
+    back exactly as the CLI path's prepare-time record does.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        read_launch_model,
+        read_model_env,
+        record_model_vocabulary,
+    )
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    assert read_model_env(bridge_dir) == {}
+
+    record_model_vocabulary(
+        bridge_dir,
+        launch_env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+            "ANTHROPIC_BASE_URL": "https://example.invalid",
+        },
+        launch_model="databricks-claude-opus-4-8",
+    )
+    assert read_model_env(bridge_dir) == {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+    }
+    assert read_launch_model(bridge_dir) == "databricks-claude-opus-4-8"
+
+    # A bare subscription launch records nothing and disturbs nothing.
+    record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None)
+    assert read_model_env(bridge_dir) == {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+    }
+
+
+def test_record_model_vocabulary_never_materializes_an_unprepared_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recording is a no-op until a prepared bridge config exists.
+
+    A model-options listing can race terminal creation; writing vocabulary
+    into a nonexistent bridge would materialize an incomplete dir with no
+    owner.pid, which orphan pruning then skips forever.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        bridge_dir_for_bridge_id,
+        record_model_vocabulary,
+    )
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = bridge_dir_for_bridge_id("conv_unprepared")
+    record_model_vocabulary(
+        bridge_dir,
+        launch_env=None,
+        launch_model=None,
+        picker_values=["system.ai.glm-5-3"],
+    )
+    assert not bridge_dir.exists()
+
+
+def test_picker_values_round_trip_from_either_launch_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pane's ``/model`` vocabulary includes the picker the launch saw.
+
+    A workspace-managed picker lists models of no Claude family, which no
+    alias pin spells, so the routed and mid-session switch paths translate
+    against these rows.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        read_model_picker_values,
+        record_model_vocabulary,
+    )
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path,
+        picker_values=["system.ai.claude-opus-4-8[1m]", "system.ai.glm-5-3"],
+    )
+    assert read_model_picker_values(bridge_dir) == [
+        "system.ai.claude-opus-4-8[1m]",
+        "system.ai.glm-5-3",
+    ]
+
+    # The runner path records the same values after preparing the bridge.
+    bridge_dir = prepare_bridge_dir("conv_def", workspace=tmp_path)
+    assert read_model_picker_values(bridge_dir) == []
+    record_model_vocabulary(
+        bridge_dir,
+        launch_env=None,
+        launch_model=None,
+        picker_values=["system.ai.glm-5-3"],
+    )
+    assert read_model_picker_values(bridge_dir) == ["system.ai.glm-5-3"]
+    # A launch that learned no catalog leaves the recorded picker alone.
+    record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None)
+    assert read_model_picker_values(bridge_dir) == ["system.ai.glm-5-3"]
+    record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None, picker_values=[])
+    assert read_model_picker_values(bridge_dir) == []
+    assert read_model_picker_values(tmp_path / "nonexistent") == []
+
+
+def test_model_env_is_empty_without_a_ucode_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.harnesses.claude_native.bridge import read_model_env
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    assert read_model_env(bridge_dir) == {}
+    assert read_model_env(tmp_path / "nonexistent") == {}
+
+
+# ── _hook_record_from_jsonl_record: task/todo event parsing ──────────────────
+
+
+def _make_jsonl_record(
+    payload: dict[str, Any],
+    *,
+    line_number: int = 1,
+) -> _JsonlRecord:
+    """
+    Build a ``_JsonlRecord`` wrapping ``payload`` in the hook JSONL envelope.
+
+    :param payload: Hook payload dict (written under the ``payload`` key).
+    :param line_number: Synthetic line number for the record.
+    :returns: A ``_JsonlRecord`` with correct byte offsets and encoded text.
+    """
+    text = json.dumps({"payload": payload}) + "\n"
+    return _JsonlRecord(
+        line_number=line_number,
+        byte_offset=0,
+        next_byte_offset=len(text.encode()),
+        text=text,
+    )
+
+
+def test_hook_record_parses_todo_write_todos() -> None:
+    """
+    ``PostToolUse/TodoWrite`` → ``record.todos`` is the items list.
+
+    This fails if the ``tool_input.todos`` extraction path is broken or
+    the dict-only filter is removed (non-dict entries would leak through).
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "TodoWrite",
+                "tool_input": {
+                    "todos": [
+                        {
+                            "content": "Fix bug",
+                            "status": "in_progress",
+                            "activeForm": "Fixing bug",
+                        },
+                        "not-a-dict",  # must be filtered out
+                    ],
+                },
+            }
+        )
+    )
+    assert record.event_name == "PostToolUse"
+    # Only the dict entry survives; the string is dropped.
+    assert record.todos == [
+        {"content": "Fix bug", "status": "in_progress", "activeForm": "Fixing bug"}
+    ]
+    assert record.task_id is None
+    assert record.task_status is None
+
+
+def test_hook_record_parses_task_update() -> None:
+    """
+    ``PostToolUse/TaskUpdate`` → ``record.task_id`` and ``record.task_status``.
+
+    This fails if the ``taskId``/``status`` extraction from
+    ``tool_input`` is broken or if the field names change.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "TaskUpdate",
+                "tool_input": {"taskId": "42", "status": "in_progress"},
+            }
+        )
+    )
+    assert record.event_name == "PostToolUse"
+    assert record.task_id == "42"
+    assert record.task_status == "in_progress"
+    assert record.todos is None
+
+
+def test_hook_record_parses_task_created() -> None:
+    """
+    ``TaskCreated`` → ``task_id``, ``task_subject``, ``task_status == "pending"``.
+
+    This fails if the field names change or the hardcoded "pending"
+    assignment is removed.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "TaskCreated",
+                "task_id": "7",
+                "task_subject": "Write integration tests",
+            }
+        )
+    )
+    assert record.event_name == "TaskCreated"
+    assert record.task_id == "7"
+    assert record.task_subject == "Write integration tests"
+    # TaskCreated always sets status to "pending" regardless of payload.
+    assert record.task_status == "pending"
+    assert record.todos is None
+
+
+def test_hook_record_parses_task_completed() -> None:
+    """
+    ``TaskCompleted`` → ``task_id``, ``task_status == "completed"``.
+
+    This fails if the hardcoded "completed" assignment is removed or if
+    task_id extraction from the payload breaks.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "TaskCompleted",
+                "task_id": "7",
+            }
+        )
+    )
+    assert record.event_name == "TaskCompleted"
+    assert record.task_id == "7"
+    assert record.task_status == "completed"
+    assert record.task_subject is None
+
+
+def test_hook_record_task_created_with_int_task_id_gives_none() -> None:
+    """
+    Malformed ``TaskCreated`` with a numeric ``task_id`` → ``task_id`` is ``None``.
+
+    Ensures the ``isinstance(raw_task_id, str)`` guard prevents integer ids
+    from leaking into the accumulation maps (which key by str).
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "TaskCreated",
+                "task_id": 99,  # int, not str
+                "task_subject": "Some task",
+            }
+        )
+    )
+    assert record.task_id is None
+    assert record.task_subject == "Some task"
+    # task_status is still set even when task_id is absent.
+    assert record.task_status == "pending"
+
+
+def test_hook_record_task_update_with_missing_task_id_gives_none() -> None:
+    """
+    ``PostToolUse/TaskUpdate`` with no ``taskId`` → ``task_id`` is ``None``.
+
+    Ensures the forwarder safely ignores updates for tasks whose id
+    cannot be extracted (they would silently create orphaned map entries
+    if the None guard were absent).
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "TaskUpdate",
+                "tool_input": {"status": "completed"},  # taskId missing
+            }
+        )
+    )
+    assert record.task_id is None
+    assert record.task_status == "completed"
+
+
+def test_hook_record_todo_write_with_non_list_todos_gives_none() -> None:
+    """
+    ``PostToolUse/TodoWrite`` with ``tool_input.todos`` as a non-list → ``todos`` is ``None``.
+
+    Protects against forwarder crashing when a malformed hook payload
+    arrives with an unexpected ``todos`` shape.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "TodoWrite",
+                "tool_input": {"todos": "not-a-list"},
+            }
+        )
+    )
+    assert record.todos is None
+
+
+def test_hook_record_parses_stop_failure_reason() -> None:
+    """``StopFailure`` keeps its error category and rendered error text."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": " server_error ",
+                "last_assistant_message": "API Error: 500 " + "x" * 5000,
+            }
+        )
+    )
+    assert record.failure_category == "server_error"
+    assert record.failure_message is not None
+    assert record.failure_message.startswith("API Error: 500 x")
+    assert len(record.failure_message) == 4000
+
+
+def test_hook_record_failure_fields_none_when_blank_or_not_stop_failure() -> None:
+    """Blank, non-string, or non-``StopFailure`` fields are not a failure reason."""
+    blank = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "StopFailure", "error": "  ", "last_assistant_message": 7}
+        )
+    )
+    assert blank.failure_category is None
+    assert blank.failure_message is None
+    stop = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "Stop", "error": "rate_limit", "last_assistant_message": "done"}
+        )
+    )
+    assert stop.failure_category is None
+    assert stop.failure_message is None
+
+
+def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
+    """The failure card rewrites dead-end CLI remedies like the mirrored message."""
+    overflow = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "StopFailure", "last_assistant_message": "Prompt is too long"}
+        )
+    )
+    assert overflow.failure_message is not None
+    assert overflow.failure_message.startswith("Context limit reached")
+    login = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "authentication_failed",
+                "last_assistant_message": "Login expired · Please run /login",
+            }
+        )
+    )
+    assert login.failure_message is not None
+    assert login.failure_message.startswith("Login expired · Please run /login\n\n")
+    assert "omni setup" in login.failure_message
+
+
+# ── stop_hook_seen_since: subagent filtering ─────────────────────────
+
+
+def test_stop_hook_seen_since_ignores_subagent_stop(
+    tmp_path: Path,
+) -> None:
+    """
+    ``stop_hook_seen_since`` must skip subagent ``Stop`` events.
+
+    When a Claude Code subagent (spawned via the Agent tool) finishes,
+    its ``Stop`` hook lands in the same ``hooks.jsonl`` as the parent's.
+    The subagent's ``transcript_path`` contains a ``subagents/``
+    component — ``stop_hook_seen_since`` uses this to distinguish it
+    from a parent stop. Without this filter, the tmux message injection
+    path prematurely considers the parent turn complete.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagent_transcript = tmp_path / "session" / "subagents" / "agent-abc.jsonl"
+    subagent_transcript.parent.mkdir(parents=True, exist_ok=True)
+    subagent_transcript.write_text("", encoding="utf-8")
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    cursor = 1
+    # Subagent Stop — must not be detected.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "subagent",
+            "transcript_path": str(subagent_transcript),
+        },
+    )
+    assert not stop_hook_seen_since(bridge_dir, cursor)
+
+    # Parent Stop — must be detected.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    assert stop_hook_seen_since(bridge_dir, cursor)
+
+
+def test_stop_hook_seen_since_skips_in_process_subagent_stop(tmp_path: Path) -> None:
+    """
+    ``stop_hook_seen_since`` must skip a stop carrying ``agent_id``.
+
+    In-process subagents fire ``Stop`` / ``StopFailure`` with the parent's
+    session id and transcript path; only ``agent_id`` identifies them.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    cursor = 1
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+            "agent_id": "a4892977eed616593",
+        },
+    )
+    assert not stop_hook_seen_since(bridge_dir, cursor)
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    assert stop_hook_seen_since(bridge_dir, cursor)
+
+
+def test_stop_hook_seen_since_detects_stop_without_transcript_path(
+    tmp_path: Path,
+) -> None:
+    """
+    ``stop_hook_seen_since`` treats ``Stop`` without a transcript path as a parent event.
+
+    If a hook payload omits ``transcript_path`` (unusual but possible),
+    the conservative default is to treat it as a parent event so the
+    turn-complete signal is not lost.
+    """
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent",
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "parent",
+        },
+    )
+    assert stop_hook_seen_since(bridge_dir, 1)
+
+
+# ── ensure_claude_workspace_trusted ────────────────────
+
+
+def _redirect_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> Path:
+    """
+    Point ``Path.home()`` (and thus ``~/.claude.json``) at a temp dir.
+
+    ``Path.home()`` resolves ``~`` via ``$HOME`` on POSIX, so setting the
+    env var redirects the helper's reads/writes to *home* without
+    patching any production internals.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param home: Temp directory to use as the fake home, e.g.
+        ``tmp_path / "home"``.
+    :returns: The ``.claude.json`` path inside *home*.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert Path.home() == home  # guards against env-resolution surprises
+    return home / ".claude.json"
+
+
+def test_ensure_trusted_creates_config_when_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A fresh host (no ``~/.claude.json``) gets both first-run gates set.
+
+    This is the core workspace-trust case: an ``omnigent host`` machine that
+    has never run Claude interactively. Both the global onboarding gate
+    and the per-workspace trust gate must be pre-accepted so Claude does
+    not block on its TUI prompts.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.mkdir(parents=True)
+
+    ensure_claude_workspace_trusted(workspace)
+
+    data = json.loads(config_path.read_text())
+    # Global onboarding gate — without this Claude shows the theme/login
+    # flow on a never-onboarded machine.
+    assert data["hasCompletedOnboarding"] is True
+    # Per-directory trust gate, keyed by the RESOLVED absolute path —
+    # without this Claude shows "Do you trust the files in this folder?".
+    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+
+
+def test_ensure_trusted_preserves_existing_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Seeding adds only the two gates; all other config is preserved.
+
+    The file holds the user's OAuth account, MCP config, and per-project
+    history. Clobbering any of it would be a regression, so this asserts
+    an unrelated top-level key and a sibling project entry survive
+    untouched while the new workspace's trust gate is added.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    other_workspace = tmp_path / "repo"
+    other_workspace.mkdir()
+    existing = {
+        "oauthAccount": {"emailAddress": "user@example.com"},
+        "hasCompletedOnboarding": True,
+        "projects": {
+            str(other_workspace.resolve()): {
+                "hasTrustDialogAccepted": True,
+                "lastSessionId": "sess_existing",
+            },
+        },
+    }
+    config_path.write_text(json.dumps(existing))
+
+    workspace = tmp_path / "worktrees" / "feature-y"
+    workspace.mkdir(parents=True)
+    ensure_claude_workspace_trusted(workspace)
+
+    data = json.loads(config_path.read_text())
+    # Unrelated top-level state survives — proves we merge, not overwrite.
+    assert data["oauthAccount"] == {"emailAddress": "user@example.com"}
+    # The pre-existing sibling project is untouched, including its own
+    # non-trust keys (a naive ``projects = {key: {...}}`` would drop it).
+    assert data["projects"][str(other_workspace.resolve())] == {
+        "hasTrustDialogAccepted": True,
+        "lastSessionId": "sess_existing",
+    }
+    # The new workspace's trust gate was added alongside it.
+    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+
+
+def test_ensure_trusted_idempotent_does_not_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When both gates are already set, the file is left byte-for-byte alone.
+
+    The seed file is written in compact form; the helper's writer uses
+    two-space indentation. So if the ``if not changed: return`` short-
+    circuit were removed, the file would be reformatted and the bytes
+    would differ — this test would then fail, proving it guards the
+    no-op path (not merely that the values end up correct).
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "worktrees" / "feature-z"
+    workspace.mkdir(parents=True)
+    already = {
+        "hasCompletedOnboarding": True,
+        "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+    }
+    # Compact, no indentation — distinct from the helper's indent=2 output.
+    config_path.write_text(json.dumps(already, separators=(",", ":")))
+    before = config_path.read_bytes()
+
+    ensure_claude_workspace_trusted(workspace)
+
+    # Byte-identical → the helper detected no change and never wrote.
+    assert config_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "raw,expected_exc",
+    [
+        # Invalid JSON — a half-written or corrupt file. Must fail loud,
+        # never be silently replaced (losing the user's real config).
+        ("{not valid json", json.JSONDecodeError),
+        # Valid JSON but not an object (e.g. a stray list). Claude never
+        # writes this shape, so refuse rather than coerce it.
+        ("[1, 2, 3]", ValueError),
+    ],
+)
+def test_ensure_trusted_refuses_malformed_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+    expected_exc: type[Exception],
+) -> None:
+    """
+    A malformed ``~/.claude.json`` raises and is left untouched.
+
+    Fail-loud per project conventions: silently overwriting would
+    destroy whatever the user actually had on disk.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    config_path.write_text(raw)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    with pytest.raises(expected_exc):
+        ensure_claude_workspace_trusted(workspace)
+
+    # The original (malformed) bytes are preserved — no clobber occurred.
+    assert config_path.read_text() == raw
+
+
+def test_display_cost_approval_popup_builds_detached_tmux_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Fires a detached ``display-popup`` at the advertised pane running the
+    cost-popup module with all resolve inputs.
+
+    Proves the modal targets the right tmux socket + pane + attached
+    client (``-c``), launches :mod:`omnigent.native.native_cost_popup`, and
+    forwards the session/elicitation/message plus THIS bridge's
+    ``permission_hook.json`` (where the popup reads the Omnigent url/token). A
+    failure means native approval would render at the wrong pane/client,
+    run the wrong program, or omit an input the resolve POST needs — i.e.
+    it silently wouldn't work.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "tmux.json").write_text(
+        json.dumps({"socket_path": "/tmp/x.sock", "tmux_target": "claude:0.0"}),
+        encoding="utf-8",
+    )
+    # One client attached — display-popup must target it via ``-c`` since
+    # the runner invoking the helper is not itself a tmux client.
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda _s, _t: ["/dev/pts/9"])
+
+    captured: dict[str, Any] = {}
+
+    class _FakePopen:
+        """Records the argv/kwargs; deliberately has no ``wait()`` so the
+        test fails loud if the helper ever blocks on the popup."""
+
+        def __init__(self, args: list[str], **kwargs: Any) -> None:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+
+    display_cost_approval_popup(
+        bridge_dir,
+        session_id="conv_abc123",
+        elicitation_id="elicit_deadbeef",
+        message="Cost $0.12 crossed the $0.10 checkpoint. Continue?",
+        timeout_s=1.0,
+    )
+
+    args = captured["args"]
+    # Targets the advertised socket + pane via display-popup -E (so the
+    # popup closes when the script exits).
+    assert args[:5] == ["tmux", "-S", "/tmp/x.sock", "display-popup", "-E"]
+    # Must target the attached client explicitly; without -c the runner
+    # (not a tmux client) gets "no current client" and nothing renders.
+    assert args[args.index("-c") + 1] == "/dev/pts/9"
+    # The pane comes from tmux.json; a wrong target would render nowhere.
+    assert args[args.index("-t") + 1] == "claude:0.0"
+    # Inner command runs the popup module with every resolve input.
+    inner = shlex.split(args[-1])
+    assert "omnigent.native.native_cost_popup" in inner
+    assert "conv_abc123" in inner  # --session-id value
+    assert "elicit_deadbeef" in inner  # --elicitation-id value
+    assert "Cost $0.12 crossed the $0.10 checkpoint. Continue?" in inner  # --message
+    # AP-routing config must point at THIS bridge's permission_hook.json so
+    # the popup reads the matching ap_server_url + auth headers.
+    cfg = inner[inner.index("--config-file") + 1]
+    assert cfg.endswith("permission_hook.json")
+    assert str(bridge_dir) in cfg
+    # Detached, non-interactive stdio — the runner handler must not inherit
+    # a tty or block; DEVNULL on all three proves fire-and-forget.
+    assert captured["kwargs"]["stdin"] == subprocess.DEVNULL
+    assert captured["kwargs"]["stdout"] == subprocess.DEVNULL
+    assert captured["kwargs"]["stderr"] == subprocess.DEVNULL
+
+
+def test_display_cost_approval_popup_honors_config_file_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``config_file`` override is forwarded instead of permission_hook.json.
+
+    The runner passes a freshly-minted AP-routing snapshot here so a cost gate
+    firing late in a session reads a live bearer, not the stale launch token in
+    permission_hook.json. Without honoring the override the verdict POST would
+    401 and silently lose the approval.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "tmux.json").write_text(
+        json.dumps({"socket_path": "/tmp/x.sock", "tmux_target": "claude:0.0"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda _s, _t: ["/dev/pts/9"])
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda args, **kwargs: captured.setdefault("args", args)
+    )
+    fresh = bridge_dir / "cost_popup.json"
+
+    display_cost_approval_popup(
+        bridge_dir,
+        session_id="conv_abc123",
+        elicitation_id="elicit_deadbeef",
+        message="continue?",
+        timeout_s=1.0,
+        config_file=fresh,
+    )
+
+    inner = shlex.split(captured["args"][-1])
+    cfg = inner[inner.index("--config-file") + 1]
+    assert cfg == str(fresh)
+    assert not cfg.endswith("permission_hook.json")
+
+
+def test_display_cost_approval_popup_skips_when_no_client_attached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With the pane advertised but NO client attached, no popup is fired.
+
+    A ``display-popup`` needs an attached client to render on; with none
+    (e.g. the web Terminal tab closed) tmux would error "no current
+    client". The helper must skip cleanly — NOT spawn a doomed ``tmux`` —
+    leaving the web ApprovalCard as the answer surface. A regression here
+    (spawning anyway) means noisy failed popups and, worse, masks that the
+    real surface is the web card.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "tmux.json").write_text(
+        json.dumps({"socket_path": "/tmp/x.sock", "tmux_target": "claude:0.0"}),
+        encoding="utf-8",
+    )
+    # No client attached.
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda _s, _t: [])
+
+    spawned: list[list[str]] = []
+
+    class _FakePopen:
+        def __init__(self, args: list[str], **kwargs: Any) -> None:
+            spawned.append(args)
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+
+    display_cost_approval_popup(
+        bridge_dir,
+        session_id="conv_abc123",
+        elicitation_id="elicit_x",
+        message="msg",
+        timeout_s=1.0,
+    )
+
+    # No popup spawned when there is no client to render it on.
+    assert spawned == []
+
+
+def test_display_cost_approval_popup_raises_when_pane_not_advertised(
+    tmp_path: Path,
+) -> None:
+    """
+    With no ``tmux.json`` (pane not attached), the helper raises.
+
+    The runner handler catches this as a best-effort miss so the web
+    ApprovalCard stays the answer surface; it must NOT fire a popup at a
+    nonexistent pane. A pass-through (no raise) would mean the runner
+    couldn't tell the pane was absent.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    with pytest.raises(RuntimeError):
+        display_cost_approval_popup(
+            bridge_dir,
+            session_id="conv_abc123",
+            elicitation_id="elicit_x",
+            message="msg",
+            timeout_s=0.05,
+        )
+
+
+def test_claude_prompt_rendered_sees_prompt_above_default_footer() -> None:
+    """
+    The readiness scan reaches the prompt glyph above Claude's footer.
+
+    Claude Code 2.1.x renders a footer below the input box (the box's
+    closing rule line, the cwd/status line, the model+effort line, and
+    the permission-mode hint), so the live ``❯`` row is the 5th
+    non-empty line from the bottom — NOT the last. The prior 4-line scan
+    window never reached it and the web-UI readiness gate timed out with
+    "did not become ready" even though the box was mounted. A failure
+    here means the scan window regressed below 5 and the first web
+    message would be dropped.
+    """
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live prompt row (5th non-empty line from bottom)
+            "────────────────────────────────────────",  # box closing rule
+            "  alice: /home/alice/proj   Remote Control failed",  # status line
+            "  Opus 4.8 (1M context) | effort:high",  # model + effort line
+            "  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents",  # hint line
+        ]
+    )
+    # ``❯`` is 5 non-empty lines above the bottom (rule + status + model
+    # + hint sit below it), so only a scan window of >= 5 reaches it.
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_prompt_above_running_turn_footer() -> None:
+    """
+    The readiness scan reaches the prompt above a tall running-turn footer.
+
+    When a web-UI message is injected while Claude is mid-turn, the footer
+    grows extra status rows below the input box — a running-subagent line
+    (``○ Explore …``) on top of the usual box rule, model, auto-mode, and
+    branch rows. That pushes the live ``❯`` row to the 6th non-empty line
+    from the bottom, one past the old 5-line window, so the readiness gate
+    timed out and the web UI rendered a spurious "did not become ready"
+    runtime-error card even though the terminal was healthy.
+    """
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live prompt row (6th non-empty line from bottom)
+            "────────────────────────────────────────",  # box closing rule
+            "  Opus 4.8 (1M context) | thinking medium",  # model + effort line
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",  # permission-mode hint
+            "  main",  # branch label
+            "  ○ Explore  Find session sidebar state… 1m 4s",  # subagent status
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_prompt_above_subagent_fanout_footer() -> None:
+    """
+    The readiness scan reaches the prompt above an unbounded subagent footer.
+
+    A subagent fan-out renders one ``○ Explore …`` row per concurrent
+    subagent, so the running-turn footer height is unbounded. Here five
+    subagents plus the model/auto-mode/branch rows push the live ``❯`` row
+    to the 12th non-empty line from the bottom — far past any fixed scan
+    window. The box rule below ``❯`` (the input box's closing frame) is
+    what admits it, so the scan must reach the glyph at this depth and the
+    web UI must NOT render a spurious "did not become ready" card.
+    """
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",  # input box top rule
+            "❯ Press up to edit queued messages",  # the live prompt row
+            "────────────────────────────────────────",  # box closing rule
+            "  Opus 4.8 (1M context) | thinking medium | 398.1k/1M (39%)",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+            "  main",
+            "  ○ Explore  Angle A: line-by-line diff scan   1m 35s",
+            "  ○ Explore  Angle C: cross-file tracer         56s",
+            "  ○ Explore  Angle D: reuse                      46s",
+            "  ○ Explore  Angle F: efficiency                 31s",
+            "  ○ Explore  Angle G: altitude                   21s",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_ignores_unframed_glyph_deep_in_tail() -> None:
+    """
+    A glyph in the wider window without a box rule below is not trusted.
+
+    The framed window that lets the scan reach a prompt under a tall
+    running-turn footer must not resurrect the scrollback false positive:
+    a ``❯`` echoed into prior output sits in the wider window too, but
+    without the input box's closing ``────`` rule beneath it. Only plain
+    output follows here, so the gate must still report "not ready".
+    """
+    pane = "\n".join(
+        [
+            "❯ old prompt echo",  # 6th non-empty line from bottom, no rule below
+            "output line 1",
+            "output line 2",
+            "output line 3",
+            "output line 4",
+            "output line 5",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+
+
+def test_claude_prompt_rendered_ignores_custom_api_key_menu() -> None:
+    """The custom-API-key menu's selected row is not the chat input.
+
+    Claude Code's startup "Detected a custom API key" confirmation renders
+    its highlighted choice with the same ``❯`` glyph the chat composer uses
+    (``❯ 2. No (recommended)``). Treating it as ready pastes the first web
+    message into the menu, so no turn starts — the tmux delivery false
+    positive this guards against.
+    """
+    pane = "\n".join(
+        [
+            "Detected a custom API key in your environment",
+            "Do you want to use this API key?",
+            "  1. Yes",
+            "❯ 2. No (recommended)",  # selected menu row, NOT the chat input
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+
+
+def test_claude_prompt_rendered_sees_chat_input_below_menu_glyph() -> None:
+    """A real chat prompt still reads ready even past a menu-shaped echo.
+
+    A numbered ``❯`` choice echoed into scrollback must not suppress the
+    live input box below it: the chat ``❯`` row (no numbered choice after
+    the glyph) is the one that marks readiness.
+    """
+    pane = "\n".join(
+        [
+            "❯ 2. No (recommended)",  # scrollback echo of a prior menu row
+            "output",
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live chat prompt
+            "────────────────────────────────────────",  # box closing rule
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
+    """A numbered composer draft is distinguished from an unframed menu row."""
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",
+            "❯ 2. buy milk",
+            "────────────────────────────────────────",
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_prompt_under_labelled_rule() -> None:
+    """
+    A label on the box's opening rule does not hide the input box.
+
+    Claude Code breaks the opening rule with the session's title
+    (``"──── 01007290 ─"``). Requiring every glyph on the rule to be a
+    rule glyph made ``_composer_row`` anchor on the *closing* rule
+    instead, pick the footer row below it, and report "no input box" with
+    ``❯`` plainly on screen. The turn then waited out
+    ``_CLAUDE_PROMPT_TIMEOUT_S`` and the person's message was never
+    delivered. Pane shape is taken from a session that hit this.
+    """
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            "● 2 background agents launched (↓ to manage)",
+            "  ⎿  Interrupted · What should Claude do instead?",
+            f"{rule} 01007290 ─",  # opening rule, labelled with the session title
+            "❯ ",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+            "  ◯ support-agent:enrichment-ru…  Connecting     40s · ↓ 66.3k tokens",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
+    """
+    A label that fills the rule still does not hide the input box.
+
+    Claude Code right-aligns the title, so the run of glyphs left of it
+    shrinks as the title grows and is a single glyph once the title nears
+    the pane width. The pane is only as wide as the person's browser
+    terminal (``window-size latest`` plus the web client's own
+    ``refresh-client -C``), so an ordinary title on a narrow terminal
+    reaches that shape — and requiring a longer leading run left the
+    labelled-rule turn timing out there exactly as it did before. Pane
+    shape is taken from a 50-column session.
+    """
+    rule = "─" * 50
+    pane = "\n".join(
+        [
+            "  ⎿  Session renamed to:",
+            "     fix-the-billing-webhook-retry-backoff-path-now",
+            "─ fix-the-billing-webhook-retry-backoff-path-now ─",  # 1-glyph lead
+            "❯ ",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ high │ 0/1M $0.00",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "─" * 40,  # plain rule
+        "───",  # shortest plain rule
+        "╭" + "─" * 10 + "╮",  # cornered rule
+        "─" * 40 + " 01007290 ─",  # labelled with a session title
+        "─" * 40 + " design doc work ─",  # label carrying spaces
+        # Claude Code right-aligns the label, so the leading run shrinks to a
+        # single glyph once the title nears the pane width. Both of these come
+        # off a real pane: a 75-char title at 80 columns, and an ordinary
+        # 46-char title on a browser terminal only 50 columns wide.
+        "── " + "t" * 75 + " ─",
+        "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+    ],
+)
+def test_is_box_rule_accepts_rules(line: str) -> None:
+    """Plain, cornered and labelled rules all frame the input box."""
+    assert _is_box_rule(line) is True
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "❯ 2. No (recommended)",  # a menu row, not a rule
+        "│ cell │",  # vertical glyphs bound a table cell, not a rule
+        "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",  # footer row
+        "output line 1",
+        "─ x ─",  # narrower than _MIN_TITLED_RULE_WIDTH
+        # Wide enough to clear the width floor, so only the vertical frame
+        # glyphs keep these off the rule list.
+        "│ a longer table cell │",
+        "│ a very wide pasted table cell indeed │",
+        "──",  # shorter than the minimum rule
+        "│   │",  # nested pipes + spaces: pasted table indentation, not a rule
+        "│   │   │",  # deeper nesting, same shape
+        "│   ├── src",  # a ``tree`` row
+        "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+    ],
+)
+def test_is_box_rule_rejects_non_rules(line: str) -> None:
+    """Ordinary rows must not pass as a rule now that labels are allowed."""
+    assert _is_box_rule(line) is False
+
+
+def test_claude_prompt_rendered_sees_prompt_over_pasted_tree_output() -> None:
+    """
+    Box glyphs inside a multi-line draft do not hide the input box.
+
+    Admitting any run of rule glyphs and spaces as a rule would make a
+    pasted ``tree``/table line (``"│   │"``) an *interior* rule.
+    ``_composer_row`` takes the row under the last two rules, so that
+    false rule and the closing rule would be the pair it checks — skipping
+    the real opening rule where ``❯`` lives and reporting "no input box"
+    for the very reason this labelled-rule fix exists.
+    """
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            f"{rule} 01007290 ─",  # opening rule, labelled
+            "❯ here is the layout I meant:",
+            "  src",
+            "  │   ├── app.py",
+            "  │   │",  # pasted tree indentation — content, not a rule
+            "  │   └── util.py",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
+    """
+    Append raw JSONL lines to the bridge deltas file.
+
+    :param bridge_dir: Bridge directory.
+    :param lines: Already-serialized JSON strings (no trailing newline);
+        each is written as its own newline-terminated record.
+    :returns: None.
+    """
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    with (bridge_dir / "message_deltas.jsonl").open("a", encoding="utf-8") as handle:
+        for line in lines:
+            handle.write(line + "\n")
+
+
+def test_read_message_deltas_parses_and_advances_offset(tmp_path: Path) -> None:
+    """
+    Complete delta records parse in order and the offset reaches EOF.
+
+    Fails if the reader drops fields or stops short of the last complete
+    record — either would lose streamed chunks the forwarder must POST.
+    """
+    bridge_dir = tmp_path / "bridge"
+    _write_deltas_lines(
+        bridge_dir,
+        [
+            json.dumps({"message_id": "m1", "index": 0, "final": False, "delta": "Hello "}),
+            json.dumps({"message_id": "m1", "index": 1, "final": True, "delta": "world"}),
+        ],
+    )
+    result = read_message_deltas_from_offset(bridge_dir, 0)
+    assert [(d.message_id, d.index, d.final, d.delta) for d in result.deltas] == [
+        ("m1", 0, False, "Hello "),
+        ("m1", 1, True, "world"),
+    ]
+    # Offset reached EOF, so a follow-up read sees nothing new.
+    assert result.byte_offset == os.path.getsize(bridge_dir / "message_deltas.jsonl")
+    assert read_message_deltas_from_offset(bridge_dir, result.byte_offset).deltas == []
+
+
+def test_read_message_deltas_resumes_from_offset(tmp_path: Path) -> None:
+    """
+    A second read from the prior offset returns only newly appended records.
+
+    Fails if the byte cursor is ignored (re-reading old chunks → the
+    forwarder re-POSTs and the UI double-renders) or over-advances
+    (skipping a new chunk → a gap in the live text).
+    """
+    bridge_dir = tmp_path / "bridge"
+    _write_deltas_lines(
+        bridge_dir, [json.dumps({"message_id": "m1", "index": 0, "final": True, "delta": "one"})]
+    )
+    first = read_message_deltas_from_offset(bridge_dir, 0)
+    _write_deltas_lines(
+        bridge_dir, [json.dumps({"message_id": "m2", "index": 0, "final": True, "delta": "two"})]
+    )
+    second = read_message_deltas_from_offset(bridge_dir, first.byte_offset)
+    assert [(d.message_id, d.delta) for d in second.deltas] == [("m2", "two")]
+
+
+def test_read_message_deltas_skips_partial_trailing_line(tmp_path: Path) -> None:
+    """
+    A half-written final line is not consumed until its newline lands.
+
+    The hook writes each line with O_APPEND, but the reader can observe a
+    record mid-write; it must leave the offset before the partial line so
+    the next poll retries it. Fails if a torn line is parsed (data loss)
+    or advances the offset past unterminated bytes (permanent loss).
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    complete = json.dumps({"message_id": "m1", "index": 0, "final": False, "delta": "done"}) + "\n"
+    partial = json.dumps({"message_id": "m1", "index": 1, "final": True, "delta": "half"})  # no \n
+    (bridge_dir / "message_deltas.jsonl").write_text(complete + partial, encoding="utf-8")
+
+    result = read_message_deltas_from_offset(bridge_dir, 0)
+    # Only the newline-terminated record is returned...
+    assert [d.delta for d in result.deltas] == ["done"]
+    # ...and the offset sits at the start of the partial line, so once
+    # the hook finishes that line a re-read picks it up.
+    assert result.byte_offset == len(complete.encode("utf-8"))
+
+
+def test_read_message_deltas_skips_malformed_records(tmp_path: Path) -> None:
+    """
+    Lines that aren't well-formed deltas are dropped, not fatal.
+
+    A line missing ``message_id``, with a non-string ``delta``, with a
+    boolean ``index`` (``bool`` is an ``int`` subclass), or that isn't
+    JSON must be skipped while still advancing past it — one bad line
+    must never wedge the live tail. Fails if a malformed record is
+    surfaced (→ a malformed SSE event) or halts the read.
+    """
+    bridge_dir = tmp_path / "bridge"
+    _write_deltas_lines(
+        bridge_dir,
+        [
+            "{not json",
+            json.dumps({"index": 0, "delta": "no id"}),
+            json.dumps({"message_id": "m1", "index": 0, "delta": 123}),
+            json.dumps({"message_id": "m1", "index": True, "delta": "bool index"}),
+            json.dumps({"message_id": "m1", "index": 2, "final": True, "delta": "good"}),
+        ],
+    )
+    result = read_message_deltas_from_offset(bridge_dir, 0)
+    # Only the one well-formed record survives; the four bad lines are
+    # skipped but the offset still reached EOF (they were consumed).
+    assert [(d.message_id, d.index, d.delta) for d in result.deltas] == [("m1", 2, "good")]
+    assert result.byte_offset == os.path.getsize(bridge_dir / "message_deltas.jsonl")
+
+
+def test_read_message_deltas_missing_file_is_empty(tmp_path: Path) -> None:
+    """
+    A read before the hook has written anything returns no deltas.
+
+    Fails if a missing file raises instead of being treated as "no
+    chunks yet" — the forwarder polls this every tick before streaming
+    has started.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    result = read_message_deltas_from_offset(bridge_dir, 0)
+    assert result.deltas == []
+    assert result.byte_offset == 0
+
+
+# ── compute_transcript_cumulative_cost ────────────────────────────────
+
+
+def _write_transcript_jsonl(path: Path, entries: list[dict[str, Any]]) -> None:
+    """
+    Write transcript records as newline-terminated JSONL.
+
+    :param path: Destination JSONL path.
+    :param entries: Decoded transcript records to serialize, one per
+        line, e.g. an assistant message with a ``usage`` block.
+    :returns: None.
+    """
+    path.write_text(
+        "".join(json.dumps(entry) + "\n" for entry in entries),
+        encoding="utf-8",
+    )
+
+
+def _assistant_entry(
+    *,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    is_sidechain: bool = False,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Build one assistant transcript record with a usage block.
+
+    :param model: ``message.model`` to stamp, e.g. ``"test-model"``.
+    :param input_tokens: Non-cached input tokens for the usage block.
+    :param output_tokens: Output tokens for the usage block.
+    :param is_sidechain: When ``True`` mark the record ``isSidechain``
+        (how a sub-agent message is inlined into a parent transcript).
+    :param request_id: Top-level ``requestId`` to stamp, e.g.
+        ``"req_A"``. ``None`` omits it (records without a ``requestId``
+        are each billed once, never collapsed together).
+    :returns: A decoded transcript record dict.
+    """
+    entry: dict[str, Any] = {
+        "message": {
+            "role": "assistant",
+            "model": model,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        }
+    }
+    if is_sidechain:
+        entry["isSidechain"] = True
+    if request_id is not None:
+        entry["requestId"] = request_id
+    return entry
+
+
+def test_compute_transcript_cumulative_cost_dedupes_by_request_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Records sharing a ``requestId`` are billed once, not once per record.
+
+    Claude writes the same API response as multiple transcript records (a
+    streamed partial plus the final record), each carrying that response's
+    full ``usage`` under one ``requestId``. Summing every record
+    double-bills (observed ~2x inflation, which leaked into the parent
+    badge and the cost-budget gate). The cost must dedupe by ``requestId``.
+    """
+    from omnigent.llms.context_window import ModelPricing
+
+    pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "transcript.jsonl"
+    _write_transcript_jsonl(
+        path,
+        [
+            # Two records, SAME requestId = one billed response (2*10 + 3*20 = 80).
+            _assistant_entry(model="m", input_tokens=2, output_tokens=3, request_id="req_A"),
+            _assistant_entry(model="m", input_tokens=2, output_tokens=3, request_id="req_A"),
+            # Distinct requestId = a second billed response (1*10 + 1*20 = 30).
+            _assistant_entry(model="m", input_tokens=1, output_tokens=1, request_id="req_B"),
+        ],
+    )
+    cost = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
+    # 80 + 30 = 110. Without dedup the duplicate req_A record adds another
+    # 80 → 190, the ~2x over-report this dedup fixes.
+    assert cost == pytest.approx(110.0)
+
+
+def test_compute_transcript_cumulative_cost_sums_priced_messages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Cost is the sum over every priced assistant message in the transcript.
+
+    Asserts the exact USD total (real :func:`compute_llm_cost` math), so
+    a regression in per-message summation or token pricing fails loudly —
+    not just "some positive number".
+    """
+    from omnigent.llms.context_window import ModelPricing
+
+    pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "transcript.jsonl"
+    _write_transcript_jsonl(
+        path,
+        [
+            _assistant_entry(model="m", input_tokens=2, output_tokens=3),  # 2*10 + 3*20 = 80
+            {"message": {"role": "user", "content": "hi"}},  # no usage → skipped
+            _assistant_entry(model="m", input_tokens=1, output_tokens=1),  # 1*10 + 1*20 = 30
+        ],
+    )
+    cost = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
+    assert cost == pytest.approx(110.0)
+
+
+def test_compute_transcript_cumulative_cost_refreshes_changed_custom_pricing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Changing provider pricing invalidates the transcript pricing memo."""
+
+    def provider_config(input_per_million: float) -> dict[str, Any]:
+        return {
+            "providers": {
+                "anthropic-local": {
+                    "kind": "local",
+                    "default": True,
+                    "anthropic": {
+                        "base_url": "http://anthropic.local/v1",
+                        "api_key": "test",
+                        "pricing": {
+                            "input_per_million": input_per_million,
+                            "output_per_million": 0.0,
+                        },
+                    },
+                }
+            }
+        }
+
+    active_config = provider_config(1.0)
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: active_config,
+    )
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "transcript.jsonl"
+    _write_transcript_jsonl(
+        path,
+        [_assistant_entry(model="self-hosted", input_tokens=1_000_000, output_tokens=0)],
+    )
+
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(1.0)
+
+    active_config = provider_config(2.0)
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(2.0)
+
+
+def test_compute_transcript_cumulative_cost_excludes_parent_sidechains(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    ``include_sidechains=False`` skips inlined sub-agent records.
+
+    The parent transcript inlines a sub-agent's messages as
+    ``isSidechain: true``; counting them there AND via the sub-agent's
+    own transcript would double-bill, so the parent path must drop them.
+    The sub-agent path (``include_sidechains=True``) counts everything.
+    """
+    from omnigent.llms.context_window import ModelPricing
+
+    pricing = ModelPricing(input_per_token=10.0, output_per_token=0.0)
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "parent.jsonl"
+    _write_transcript_jsonl(
+        path,
+        [
+            _assistant_entry(model="m", input_tokens=5, output_tokens=0),  # own → 50
+            _assistant_entry(  # inlined sub-agent → 1000
+                model="m", input_tokens=100, output_tokens=0, is_sidechain=True
+            ),
+        ],
+    )
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=False
+    ) == pytest.approx(50.0)
+    assert claude_native_bridge.compute_transcript_cumulative_cost(
+        path, include_sidechains=True
+    ) == pytest.approx(1050.0)
+
+
+def test_compute_transcript_cumulative_cost_none_when_nothing_priceable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Returns ``None`` (not ``0.0``) when no message can be priced.
+
+    Covers a missing file, a transcript with no assistant usage, and a
+    model with no available pricing — each must yield ``None`` so the
+    forwarder treats it as "no estimate" rather than "$0 spent".
+    """
+    from omnigent.llms.context_window import ModelPricing
+
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    # Missing file.
+    assert (
+        claude_native_bridge.compute_transcript_cumulative_cost(
+            tmp_path / "missing.jsonl", include_sidechains=True
+        )
+        is None
+    )
+    # File with no assistant usage.
+    pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    no_usage = tmp_path / "no_usage.jsonl"
+    _write_transcript_jsonl(no_usage, [{"message": {"role": "user", "content": "hi"}}])
+    assert (
+        claude_native_bridge.compute_transcript_cumulative_cost(no_usage, include_sidechains=True)
+        is None
+    )
+    # Pricing unavailable for the model.
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: None)
+    priced = tmp_path / "priced.jsonl"
+    _write_transcript_jsonl(priced, [_assistant_entry(model="m", input_tokens=5, output_tokens=5)])
+    assert (
+        claude_native_bridge.compute_transcript_cumulative_cost(priced, include_sidechains=True)
+        is None
+    )
+
+
+def test_format_terminal_failure_tail_returns_empty_for_blank_pane() -> None:
+    """
+    A pane with no visible text yields no tail block.
+
+    :returns: None.
+    """
+    assert claude_native_bridge._format_terminal_failure_tail("   \n\n  ") == ""
+
+
+def test_format_terminal_failure_tail_includes_recent_error_lines() -> None:
+    """
+    The tail block carries the pane's trailing non-blank lines, so a
+    startup crash surfaces in the readiness-timeout error.
+
+    :returns: None.
+    """
+    pane = "ERROR  JSON Parse error: Unrecognized token '<'\n  at <parse> (:0)\n"
+    tail = claude_native_bridge._format_terminal_failure_tail(pane)
+    assert tail.startswith(" Last terminal output:\n")
+    assert "JSON Parse error: Unrecognized token '<'" in tail
+
+
+def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A very long pane is truncated to the configured character cap.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TERMINAL_FAILURE_TAIL_CHARS", 50)
+    pane = "\n".join(f"line {i}" for i in range(100))
+    tail = claude_native_bridge._format_terminal_failure_tail(pane)
+    body = tail.split("\n", 1)[1]
+    assert body.startswith("…")
+    # Leading ellipsis marker plus at most the configured character cap.
+    assert len(body) <= 51
+
+
+def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    On a readiness timeout, the RuntimeError carries Claude Code's own
+    terminal output (e.g. a startup ``JSON Parse error``) so the cause
+    surfaces in the web UI error banner, not only in the terminal.
+
+    Without the tail, the user sees a generic "terminal did not become
+    ready" timeout in the UI while the actual crash sits unread in the
+    terminal pane.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    crash_pane = (
+        "ERROR  JSON Parse error: Unrecognized token '<'\n"
+        "  at <parse> (:0)\n"
+        "  at parse (unknown)\n"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: crash_pane,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "did not become ready" in message
+    assert "Last terminal output:" in message
+    assert "JSON Parse error: Unrecognized token '<'" in message
+
+
+def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A timeout where every capture came back empty says so in the error.
+
+    An empty ``capture-pane`` (a torn read under a busy mid-turn repaint,
+    not a boot crash) leaves no tail to attach. Without the poll/empty
+    counts the error is indistinguishable from "Claude never rendered a
+    prompt", which is what sent triage down the wrong path. The counts make
+    the two failure modes tell themselves apart.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: "",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "did not become ready" in message
+    # One poll happened (do-while), and it was empty.
+    assert "1 polls, 1 empty captures" in message
+    # No pane text to surface when every capture was empty.
+    assert "Last terminal output:" not in message
+
+
+def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The attached tail is a capture the loop saw, not a post-timeout one.
+
+    The bug this guards: attaching a fresh capture taken *after* the
+    deadline can show a healthier frame (e.g. the input box repainting as
+    the turn settles) than any decision the loop actually made, so the
+    error misrepresents why the gate failed. The tail must come from a
+    capture observed while the loop was still deciding. A box-less capture
+    followed by a box-present one that arrives only after the deadline
+    proves the point: the box-present frame must NOT leak into the error.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    observed = "  ✱ Working…\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+    # A frame that would satisfy the readiness check, but only ever returned
+    # after the deadline has passed — mimicking the box repainting late.
+    late_ready = "────────────────\n❯ \n────────────────\n  Opus 4.8\n"
+    calls = {"n": 0}
+
+    def fake_capture(socket_path: str, tmux_target: str) -> str:
+        calls["n"] += 1
+        # First (and only, at timeout_s=0) in-loop capture: no box.
+        # Any later capture would be the box-present frame — which the
+        # rewritten gate must never fetch, since it does not re-capture.
+        return observed if calls["n"] == 1 else late_ready
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", fake_capture)
+    with pytest.raises(RuntimeError) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    # The tail reflects what the loop observed, and the late box-present
+    # frame never appears — proving no post-deadline re-capture happened.
+    assert "auto mode on" in message
+    assert "❯" not in message
+    assert calls["n"] == 1
+
+
+_BOOTING_PANE = "Claude Code — connecting to host...\nThis is taking longer than usual.\n"
+_READY_PANE = "────────────────\n❯ \n────────────────\n  Opus 4.8\n"
+
+
+def test_wait_for_claude_prompt_ready_outlasts_base_budget_while_pane_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A slow boot with a live pane is waited out past the base budget.
+
+    The dropped-first-prompt bug: on a host where booting Claude Code
+    takes longer than the base readiness budget, the gate used to give
+    up even though the terminal process was alive and the composer would
+    have mounted moments later — the session's very first message was
+    silently lost. While ``#{pane_dead}`` affirms the process is running,
+    the gate must keep polling and return once the prompt renders.
+    """
+    frames = iter([_BOOTING_PANE, _BOOTING_PANE, _READY_PANE])
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: next(frames, _READY_PANE),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    # timeout_s=0.0 exhausts the base budget on the first poll, so any
+    # successful return proves the liveness extension carried the wait.
+    claude_native_bridge._wait_for_claude_prompt_ready(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        timeout_s=0.0,
+    )
+
+
+_SIGN_IN_PANE = (
+    "dbexec: launcher 1.2.3\n"
+    "Logging in via SSO...\n"
+    "If the browser does not open automatically, please open the following URL:\n"
+    "\thttps://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz\n"
+)
+
+
+def test_wait_for_claude_prompt_ready_fails_fast_with_the_sign_in_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launcher sign-in prompt holding the pane fails delivery within a poll
+    interval, carrying the address as the next step, instead of waiting out
+    the budget and reaping the pane the person needs to finish signing in.
+    """
+    captures: list[bool] = []
+
+    def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+        captures.append(join_wrapped)
+        return _SIGN_IN_PANE
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudeSignInPending) as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert raised.value.code == "databricks_sign_in_pending"
+    assert raised.value.title == "Claude Code can't start until you sign in to Databricks"
+    # The one-time address stays out of the error text; the card fetches the
+    # live link from the host when clicked.
+    assert "http" not in raised.value.remediation
+    assert raised.value.remediation.startswith(
+        "Open the sign-in link and sign in. Claude Code continues on its own"
+    )
+    # Two plain polls saw the address; each looked again with wrapped rows joined.
+    assert captures == [False, True, False, True]
+    assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
+
+
+def test_wait_for_claude_prompt_ready_prefers_a_rendered_prompt_over_a_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An address left in scrollback is not a sign-in gate once the input box is up."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target, *, join_wrapped=False: _SIGN_IN_PANE + _READY_PANE,
+    )
+    claude_native_bridge._wait_for_claude_prompt_ready(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        timeout_s=30.0,
+    )
+
+
+def test_wait_for_claude_prompt_ready_reports_the_exit_when_pane_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dead pane is reported as an exit, and gets no slow-boot extension.
+
+    Guards the widening: the extension must key on an *affirmative*
+    liveness signal, so a crashed boot (whose pane persists via
+    ``keep_alive_after_exit``, final output still capturable) surfaces
+    at the base budget exactly as fast as before — with the crash tail
+    attached — rather than stalling to the slow-boot cap.
+
+    It must also say what happened. Reporting an exited terminal as
+    "did not become ready ... input prompt never rendered" describes a
+    box that never mounted, which reads as a rendering bug; the pane's
+    wait-status is what tells a clean quit from a crash.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: _BOOTING_PANE,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(
+            False, exited=True, exit_status="0"
+        ),
+    )
+    started = time.monotonic()
+    with pytest.raises(claude_native_bridge.ClaudeTerminalExited) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    # Well under the slow-boot cap: no extension happened.
+    assert time.monotonic() - started < 5.0
+    message = str(excinfo.value)
+    assert "has exited (status 0)" in message
+    assert "did not become ready" not in message
+    assert "connecting to host" in message
+    assert excinfo.value.exit_status == "0"
+
+
+def test_wait_for_claude_prompt_ready_slow_boot_wait_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The liveness extension is capped: a never-ready live pane still fails.
+
+    A pane can be alive yet never mount the composer (e.g. a TUI parked
+    on a surface the gate cannot see). The hard cap keeps the wait — and
+    the turn — bounded, and the error reports the seconds actually
+    waited so the extension is visible in diagnostics.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: _BOOTING_PANE,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.4)
+    started = time.monotonic()
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    waited = time.monotonic() - started
+    assert 0.4 <= waited < 5.0
+    assert "did not become ready" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("alive", [True, None])
+@pytest.mark.parametrize("probe_duration", [0.0, 2.0])
+def test_readiness_throttles_liveness_without_delaying_ready_composer(
+    monkeypatch: pytest.MonkeyPatch, alive: bool | None, probe_duration: float
+) -> None:
+    clock = _VirtualClock()
+    captures: list[float] = []
+    probes: list[tuple[float, float]] = []
+
+    def capture(socket_path: str, tmux_target: str) -> str:
+        captures.append(clock.monotonic())
+        return _READY_PANE if clock.monotonic() >= 6.5 else _BOOTING_PANE
+
+    def probe(socket_path: str, tmux_target: str) -> claude_native_bridge._ClaudePaneState:
+        started = clock.monotonic()
+        clock.sleep(probe_duration)
+        probes.append((started, clock.monotonic()))
+        return claude_native_bridge._ClaudePaneState(alive)
+
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
+
+    claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=1.0)
+
+    assert len(probes) >= 2
+    assert probes[0][0] == 1.0
+    assert all(
+        started - previous_end >= 1.0 for (_, previous_end), (started, _) in pairwise(probes)
+    )
+    assert captures[-2:] == [6.25, 6.5]
+
+
+@pytest.mark.parametrize("alive", [True, None])
+def test_readiness_stops_at_deadline_between_liveness_probes(
+    monkeypatch: pytest.MonkeyPatch, alive: bool | None
+) -> None:
+    clock = _VirtualClock()
+    probe = Mock(return_value=claude_native_bridge._ClaudePaneState(alive))
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.75)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=0.0)
+
+    assert clock.monotonic() == 0.75
+    probe.assert_called_once()
+
+
+@pytest.mark.parametrize("alive", [True, None])
+def test_readiness_detects_dead_pane_on_next_liveness_probe(
+    monkeypatch: pytest.MonkeyPatch, alive: bool | None
+) -> None:
+    clock = _VirtualClock()
+    probe = Mock(
+        side_effect=[
+            claude_native_bridge._ClaudePaneState(alive),
+            claude_native_bridge._ClaudePaneState(False, exited=True, exit_status="0"),
+        ]
+    )
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=0.5)
+
+    assert clock.monotonic() == 1.5
+    assert probe.call_count == 2
+
+
+def test_claude_pane_state_distinguishes_dead_pane_from_unanswered_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_claude_pane_state`` answers only from a responsive tmux server.
+
+    An affirmed ``#{pane_dead}`` ``0`` is alive; an affirmed ``1`` is dead
+    and carries ``#{pane_dead_status}`` so a clean quit (``"0"``) is
+    distinguishable from a crash. A failed query (non-zero exit — unknown
+    target, dead server) is dead. A probe that gets no answer within its
+    budget — a tmux server starved by the same load that makes a boot
+    slow — is inconclusive (``None``), so it cannot cut a slow-boot wait
+    short. The probe gets the shared tmux budget, not a bespoke 1s a
+    starved server outlasts.
+
+    An answer carrying no usable flag is inconclusive too. This is why the
+    probe runs ``list-panes`` and not ``display-message``: the latter
+    prints an empty line and still exits 0 for a target it cannot
+    resolve, so "tmux told us nothing" would read as "the pane is dead"
+    and end a healthy slow boot at the base budget.
+    """
+    responses: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
+        assert kwargs["timeout"] == claude_native_bridge._TMUX_SEND_TIMEOUT_S
+        assert "list-panes" in cmd
+        assert "#{pane_dead} #{pane_dead_status}" in cmd
+        outcome = responses["outcome"]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    def state(**kwargs: Any) -> claude_native_bridge._ClaudePaneState:
+        responses["outcome"] = SimpleNamespace(stderr="", **kwargs)
+        return claude_native_bridge._claude_pane_state("/tmp/sock", "claude:0.0")
+
+    assert state(returncode=0, stdout="0 \n") == (True, False, None)
+    assert state(returncode=0, stdout="1 0\n") == (False, True, "0")
+    assert state(returncode=0, stdout="1 137\n") == (False, True, "137")
+    # Dead, but tmux has not recorded a wait-status yet.
+    assert state(returncode=0, stdout="1 \n") == (False, True, None)
+    # A rejected query ends the wait without claiming the process exited.
+    assert state(returncode=1, stdout="") == (False, False, None)
+    # Answered, but said nothing about the pane.
+    assert state(returncode=0, stdout="\n") == (None, False, None)
+    assert state(returncode=0, stdout="what\n") == (None, False, None)
+
+    responses["outcome"] = subprocess.TimeoutExpired(cmd="tmux", timeout=1.0)
+    assert claude_native_bridge._claude_pane_state("/tmp/sock", "claude:0.0") == (
+        None,
+        False,
+        None,
+    )
+
+    responses["outcome"] = OSError("could not spawn tmux")
+    assert claude_native_bridge._claude_pane_state("/tmp/sock", "claude:0.0") == (
+        None,
+        False,
+        None,
+    )
+
+
+def test_wait_for_claude_prompt_ready_survives_unanswered_liveness_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unanswered liveness probe does not end the slow-boot extension.
+
+    The probe goes unanswered precisely when the tmux server is starved
+    by the load that made the boot slow in the first place. Reading that
+    as death would abort the extension at the base budget and re-drop
+    the first prompt; only an affirmative ``#{pane_dead}`` ``1`` (or the
+    hard cap) may stop the wait.
+    """
+    frames = iter([_BOOTING_PANE, _BOOTING_PANE, _READY_PANE])
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: next(frames, _READY_PANE),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(None),
+    )
+    # timeout_s=0.0 exhausts the base budget on the first poll, so a
+    # successful return proves the inconclusive probe kept the wait going.
+    claude_native_bridge._wait_for_claude_prompt_ready(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        timeout_s=0.0,
+    )
+
+
+@pytest.mark.parametrize("operation", ["advertisement", "readiness", "capture", "send"])
+def test_cancelled_injection_stops_before_polling_or_typing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    cancelled = threading.Event()
+    cancelled.set()
+    run = Mock(side_effect=AssertionError("cancelled injection invoked tmux"))
+    monkeypatch.setattr("subprocess.run", run)
+    with claude_native_bridge.cancellable_injection(cancelled):
+        with pytest.raises(claude_native_bridge.ClaudeInjectionCancelled):
+            if operation == "advertisement":
+                claude_native_bridge._wait_for_tmux_info(tmp_path, timeout_s=30)
+            elif operation == "readiness":
+                claude_native_bridge._wait_for_claude_prompt_ready(
+                    "/tmp/sock", "main", timeout_s=30
+                )
+            elif operation == "capture":
+                claude_native_bridge._capture_pane("/tmp/sock", "main")
+            else:
+                claude_native_bridge._run_tmux("/tmp/sock", "send-keys", "Enter")
+    run.assert_not_called()
+    claude_native_bridge._check_injection_cancelled()
+
+
+# ── _hook_record_from_jsonl_record: background_task_count ────────────────────
+
+
+def test_hook_record_parses_stop_background_tasks() -> None:
+    """
+    ``Stop`` with ``background_tasks`` → ``background_task_count`` is set.
+
+    Claude Code fires the Stop hook with a ``background_tasks`` array when
+    shells are still running. The forwarder uses the count to decide whether
+    to publish ``waiting`` instead of ``idle``.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "abc123",
+                        "type": "shell",
+                        "status": "running",
+                        "description": "Wait for CI",
+                        "command": "sleep 120",
+                    },
+                    {
+                        "id": "def456",
+                        "type": "shell",
+                        "status": "running",
+                        "description": "Build check",
+                        "command": "make build",
+                    },
+                ],
+            }
+        )
+    )
+    assert record.event_name == "Stop"
+    assert record.background_task_count == 2
+
+
+def test_hook_record_stop_counts_only_running_background_tasks() -> None:
+    """Terminal-status entries are excluded so a finished shell can't over-count.
+
+    Claude Code retains finished/stopped shells in the ``background_tasks``
+    array (claude-code #67895/#59456/#14049). Counting the raw length would
+    keep the "N background tasks still running" indicator lit after they exit,
+    so only non-terminal entries are counted — and an unknown/absent status
+    counts as running so a genuinely-live shell is never dropped.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {"id": "a", "type": "shell", "status": "running"},
+                    {"id": "b", "type": "shell", "status": "completed"},
+                    {"id": "c", "type": "shell", "status": "failed"},
+                    {"id": "d", "type": "shell", "status": "stopped"},
+                    {"id": "e", "type": "shell", "status": "killed"},
+                    # Unknown and absent statuses count as live (conservative —
+                    # never under-count and re-hide a running shell).
+                    {"id": "f", "type": "shell", "status": "queued"},
+                    {"id": "g", "type": "shell"},
+                ],
+            }
+        )
+    )
+    assert record.event_name == "Stop"
+    # running + queued + no-status = 3; completed/failed/stopped/killed excluded.
+    assert record.background_task_count == 3
+
+
+def test_hook_record_stop_excludes_backgrounded_subagents() -> None:
+    """Claude ``local_agent`` tasks belong to the sub-agent tally, not shell tally.
+
+    The SDK task lifecycle uses ``local_bash`` and ``local_agent`` task types,
+    including when Ctrl+B moves a foreground sub-agent into the background.
+    Counting both here would show that child in ``BackgroundTaskIndicator`` and
+    ``SubagentTaskIndicator`` at the same time.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "bash-task",
+                        "type": "local_bash",
+                        "status": "running",
+                        "description": "Watch tests",
+                        "command": "pytest -f",
+                    },
+                    {
+                        "id": "agent-task",
+                        "type": "local_agent",
+                        "status": "running",
+                        "description": "Review the change",
+                    },
+                ],
+            }
+        )
+    )
+
+    assert record.background_task_count == 1
+    assert record.background_tasks == [
+        {
+            "id": "bash-task",
+            "type": "local_bash",
+            "status": "running",
+            "description": "Watch tests",
+            "command": "pytest -f",
+        }
+    ]
+
+
+def test_hook_record_stop_all_background_tasks_terminal_counts_zero() -> None:
+    """Every shell finished → count is 0, dropping the indicator."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {"id": "a", "type": "shell", "status": "completed"},
+                    {"id": "b", "type": "shell", "status": "killed"},
+                ],
+            }
+        )
+    )
+    assert record.background_task_count == 0
+
+
+def test_hook_record_stop_without_background_tasks() -> None:
+    """
+    ``Stop`` without ``background_tasks`` → ``background_task_count`` is 0.
+    """
+    record = _hook_record_from_jsonl_record(_make_jsonl_record({"hook_event_name": "Stop"}))
+    assert record.event_name == "Stop"
+    assert record.background_task_count == 0
+
+
+def test_hook_record_non_stop_event_has_zero_background_tasks() -> None:
+    """
+    Non-Stop events always have ``background_task_count == 0``.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+            }
+        )
+    )
+    assert record.background_task_count == 0
+
+
+def test_hook_record_stop_collects_background_task_detail() -> None:
+    """``Stop`` populates ``background_tasks`` with the running shells' detail.
+
+    The detail list backs the UI's per-shell display. It carries only the
+    still-running shells (matching the count), each trimmed to the display
+    fields; terminal entries and non-dict junk drop out of the detail even
+    though the junk still counts.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "a",
+                        "type": "shell",
+                        "status": "running",
+                        "description": "Wait for CI",
+                        "command": "sleep 120",
+                    },
+                    {"id": "b", "status": "completed", "description": "done"},  # terminal
+                    {"id": "c", "status": "running"},  # partial, still running
+                    "garbage",  # non-dict: counts, but no detail
+                ],
+            }
+        )
+    )
+    # running + partial + garbage = 3 counted; only the 2 dicts yield detail.
+    assert record.background_task_count == 3
+    assert record.background_tasks == [
+        {
+            "id": "a",
+            "type": "shell",
+            "status": "running",
+            "description": "Wait for CI",
+            "command": "sleep 120",
+        },
+        {"id": "c", "status": "running"},
+    ]
+
+
+def test_hook_record_stop_background_tasks_none_when_no_usable_detail() -> None:
+    """A count with no dict entries leaves ``background_tasks`` ``None``.
+
+    A non-dict entry counts as running (never under-count) but yields no
+    detail, so the field stays ``None`` rather than an empty list.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "Stop", "background_tasks": ["garbage", 123]})
+    )
+    assert record.background_task_count == 2
+    assert record.background_tasks is None
+
+
+def test_hook_record_stop_background_task_fields_are_truncated() -> None:
+    """Over-long detail fields are clamped so a payload can't bloat the event."""
+    long_value = "x" * 5000
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "a",
+                        "status": "running",
+                        "description": long_value,
+                        "command": long_value,
+                    }
+                ],
+            }
+        )
+    )
+    assert record.background_tasks is not None
+    task = record.background_tasks[0]
+    assert len(task["description"]) == _BACKGROUND_TASK_FIELD_MAX_CHARS
+    assert len(task["command"]) == _BACKGROUND_TASK_FIELD_MAX_CHARS
+
+
+def test_hook_record_non_stop_event_has_no_background_task_detail() -> None:
+    """Non-Stop events never carry ``background_tasks`` detail."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "PostToolUse", "tool_name": "Bash"})
+    )
+    assert record.background_tasks is None
+
+
+# ── /model switching + pane readiness ───────────────────────────────────
+
+#: Claude Code's interactive ``/model`` picker. Omnigent never drives it —
+#: it types ``/model <id>`` — but a picker the person opened by hand covers
+#: the input box, so the readiness gate has to recognise it.
+_MODEL_PICKER_PANE = """\
+  Select model
+  Switch between Claude models. Your pick becomes the default for new sessions.
+    1. Default (recommended)         Use the default model (currently Opus 4.8) · $5/$25 per Mtok
+    2. databricks-claude-opus-4-8    Custom Opus model
+  ❯ 3. databricks-claude-sonnet-5 ✔  Custom Sonnet model
+    4. Haiku                         Haiku 4.5 · Fastest for quick answers · $1/$5 per Mtok
+  ● High effort (default) ←/→ to adjust
+  Enter to set as default · s to use this session only · Esc to cancel
+"""
+
+# The ``/effort`` confirmation, as Claude Code 2.1.222 renders it: the same
+# component as "Switch model?", titled for what is being switched.
+_EFFORT_DIALOG_PANE = """\
+  ⎿  Running /effort high
+╭──────────────────────────────────────────────────────────╮
+│ Change effort level?                                     │
+│ Your next response will be slower and use more tokens    │
+│                                                          │
+│ This conversation is cached for the current effort level. │
+│ Switching to high means the full history gets re-read on  │
+│ your next message.                                       │
+│                                                          │
+│ ❯ 1. Yes, switch to high                                 │
+│   2. No, go back                                         │
+╰──────────────────────────────────────────────────────────╯
+"""
+
+# A tool permission prompt. It can render mid-turn, while a confirm watch is
+# still polling, and its default answer approves the tool — so a stray Enter
+# has to stay off it.
+_PERMISSION_PROMPT_PANE = """\
+╭──────────────────────────────────────────────────────────╮
+│ Bash command                                             │
+│                                                          │
+│ rm -rf build                                             │
+│                                                          │
+│ Do you want to proceed?                                  │
+│ ❯ 1. Yes                                                 │
+│   2. Yes, and don't ask again for rm commands in ~/repo   │
+│   3. No, and tell Claude what to do differently (esc)     │
+╰──────────────────────────────────────────────────────────╯
+"""
+
+_IDLE_PANE = """\
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+──────────────────────────────
+❯
+──────────────────────────────
+  ? for shortcuts
+"""
+
+# The ctrl+r prompt-history search, as Claude Code 2.1.231 renders it. Its
+# selected row carries the composer's ❯ glyph above the filter box's frame
+# rule, so the readiness scan alone reads it as a mounted input box.
+_REVERSE_SEARCH_PANE = """\
+  Search prompts · everywhere
+  ↑ 23m ago  When I run a claude code session in O…
+    4m ago   continue
+  ❯ 1m ago   [Pasted text #1 +22 lines]
+  ╭──────────────────────────────────────────────╮
+  │ ⌕ Filter history…                            │
+  ╰──────────────────────────────────────────────╯
+  ↑/↓ to nav · Enter to use · Esc to cancel · ctrl+s to scope
+"""
+
+# The same ctrl+r search as Claude Code 2.1.212 renders it: the search rides
+# the framed composer as its filter field, so the frame and ❯ glyph read
+# exactly like a free input box — only the lowercase footer under the
+# closing rule tells it apart. Typing filters history; Enter replays an
+# old prompt.
+_INLINE_REVERSE_SEARCH_PANE = """\
+❯ hello history entry
+  ⎿  Not logged in · Please run /login
+──────────────────────────────
+❯ 
+──────────────────────────────
+  search prompts:   ⏸ manual mode on · ← for agents
+"""
+
+# The same inline search in a narrow pane: the footer's left cell wraps
+# ("search" / "prompts:") with the right column's text interleaved, so no
+# single row carries the whole marker.
+_INLINE_REVERSE_SEARCH_WRAPPED_PANE = """\
+❯ hello history entry
+──────────────────────────────
+❯ 
+──────────────────────────────
+  search        ⏸ manual mode on · gh auth login fo
+  prompts:
+  ✘ Auto-update failed · Try claude doctor or npm …
+"""
+
+# The same inline search with a filter that matches nothing — the footer
+# switches to "no matching prompt: <filter>", the only visible difference.
+_INLINE_REVERSE_SEARCH_NO_MATCH_PANE = """\
+❯ hello history entry
+──────────────────────────────
+❯ 
+──────────────────────────────
+  no matching prompt: usr-2-injected  ⏸ manual mode on
+"""
+
+# Shell mode, as Claude Code 2.1.240 renders it: typing ``!`` at an empty
+# composer swaps the ``❯`` glyph for ``!`` and everything typed there runs
+# as a bash command. Note the ``❯`` echoes left in the transcript above —
+# the pane still contains the glyph, which is why the injectable state has
+# to be read off the framed composer row rather than found anywhere.
+_SHELL_MODE_PANE = """\
+❯ /resume
+  ⎿  Resume cancelled
+──────────────────────────────
+!
+──────────────────────────────
+  ! for shell mode
+"""
+
+# The rewind dialog, which Claude Code opens on the double Escape its own
+# shortcuts panel advertises as "double tap esc to clear input". It draws
+# over the composer, and its Enter restores a checkpoint — so an injected
+# message is swallowed and a rewind committed in its place. Its
+# ``❯ (current)`` row carries the glyph without the input box's frame.
+_REWIND_PANE = """\
+❯ /resume
+  ⎿  Resume cancelled
+──────────────────────────────
+  Rewind
+  Restore the code and/or conversation to the point before…
+   ↑ 3 more above
+    /config
+    No code changes
+  ❯ (current)
+  Enter to continue · Esc to cancel
+"""
+
+# A settings panel (``/config``), standing in for the family of panels a
+# person can open from the terminal and leave up — ``/help``, ``/resume``,
+# ``/bashes``. None of them prints a string an allow-list could have known
+# in advance; all of them replace the input box and close on Escape.
+_SETTINGS_PANEL_PANE = """\
+❯ /config
+  ╭──────────────────────────────╮
+  │ ⌕ Search settings…           │
+  ╰──────────────────────────────╯
+     Verbose output                     false
+     Default permission mode            Manual
+   ↓ 22 more below
+   Type to filter · Enter/↓ to select · ↑ to tabs · Esc to clear
+"""
+
+# A sliver-height pane holding a multi-line draft: Claude Code renders the
+# box's opening rule and the draft's first row, then runs out of screen —
+# the closing rule never makes it on. The composer is live, so requiring
+# that closing rule would read an injectable pane as covered.
+_SLIVER_MULTILINE_DRAFT_PANE = """\
+⏺ done
+──────────────────────────────
+❯ line one
+"""
+
+# The expanded ``?`` shortcuts panel: the composer above it is fully usable,
+# and its "! for shell mode" row is why occupancy is read off the composer
+# row — matching that string would send Escape at an injectable pane.
+_SHORTCUTS_PANEL_PANE = """\
+──────────────────────────────
+❯
+──────────────────────────────
+  ! for shell mode        double tap esc to clear input
+  / for commands          shift + tab to auto-accept edits
+"""
+
+
+def _picker_bridge_dir(tmp_path: Path) -> Path:
+    """
+    Create a bridge dir advertising a tmux pane.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: The bridge directory.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    return bridge_dir
+
+
+class _VirtualClock:
+    """Clock whose ``sleep`` advances ``monotonic`` instead of blocking.
+
+    The dialog-confirm poll runs off ``monotonic``, so a no-op ``sleep``
+    alone would leave it spinning for its whole real-time budget.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
+
+
+def _fake_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+    panes: list[str],
+) -> list[list[str]]:
+    """
+    Patch tmux so sends are recorded and captures walk *panes*.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param panes: Pane frames to return in order; the last one repeats.
+    :returns: The list send-keys invocations are appended to (argv tails).
+    """
+    sends: list[list[str]] = []
+    frames = list(panes)
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        sends.append(list(args))
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        return frames.pop(0) if len(frames) > 1 else frames[0]
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    return sends
+
+
+def test_a_model_switch_types_the_argument_form_and_confirms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A model switch is ``/model <id>`` plus the confirm Enter.
+
+    Accepted trade-off: the argument form also saves the pick as the person's
+    global default for new sessions. The interactive picker avoided that write
+    but needed ~35s of screen-scraping automation to drive.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    dialog = "  Switch model?\n  This will invalidate the prompt cache.\n"
+    sends = _fake_tmux(
+        monkeypatch,
+        # Idle at the occupied-input check, then the typed command
+        # renders, the submit pops the dialog, the accept clears it —
+        # one capture per delivery stage.
+        [
+            _IDLE_PANE,
+            _composer_pane("/model databricks-claude-sonnet-5"),
+            dialog,
+            dialog,
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(
+        bridge_dir,
+        command="/model databricks-claude-sonnet-5",
+        auto_confirm=True,
+        confirm_hint=claude_native_bridge.SWITCH_MODEL_DIALOG_HINT,
+    )
+
+    assert [args[-1] for args in sends] == [
+        "C-u",
+        "/model databricks-claude-sonnet-5",
+        "Enter",
+        # The "Switch model?" confirmation, once it actually rendered.
+        "Enter",
+    ]
+    # The id must go through literally, not as a tmux key name.
+    assert sends[1] == [
+        "send-keys",
+        "-l",
+        "-t",
+        "claude:0.0",
+        "/model databricks-claude-sonnet-5",
+    ]
+
+
+def test_confirm_tui_dialog_polls_instead_of_sleeping_a_fixed_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The confirm Enter waits for the dialog rather than racing it.
+
+    The old fixed 0.3s sleep dropped the Enter on a warm session (the dialog
+    took 1.861s), leaving it open until the next injection failed.
+    """
+    dialog = "  Switch model?\n"
+    sends = _fake_tmux(monkeypatch, ["", "", dialog, _IDLE_PANE])
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.SWITCH_MODEL_DIALOG_HINT,
+        )
+        is True
+    )
+    # Exactly one Enter: the dialog verifiably closed on the first press, so
+    # neither a verify retry nor the blind fallback may add another.
+    assert [args[-1] for args in sends] == ["Enter"]
+
+
+def test_a_matched_hint_confirms_before_the_poll_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watch presses the moment the dialog is on screen, then only
+    captures long enough to see it close."""
+    captures: list[int] = []
+    dialog = "  Switch model?\n"
+    frames = ["", dialog, _IDLE_PANE]
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        captures.append(1)
+        return frames[min(len(captures) - 1, len(frames) - 1)]
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *a: None)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.SWITCH_MODEL_DIALOG_HINT,
+        )
+        is True
+    )
+    # Two watch captures (blank, dialog) + one verify capture (closed).
+    assert len(captures) == 3
+
+
+def test_a_dialog_whose_title_drifted_still_gets_the_blind_fallback_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hint that never matches must not leave our own dialog open forever.
+
+    Claude Code can rename a dialog between releases. Nothing recognisable is
+    on screen, so the timeout Enter is the only thing that can close it — and
+    on an idle pane it costs nothing.
+    """
+    drifted = "  Change the effort level?\n  This invalidates the cache.\n"
+    sends = _fake_tmux(monkeypatch, [drifted])
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            timeout_s=0.0,
+        )
+        is False
+    )
+    assert [args[-1] for args in sends] == ["Enter"]
+
+
+def test_an_effort_dialog_rendering_late_is_still_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The warm-session race: the dialog renders seconds after the command.
+
+    A fixed 0.3s sleep fired the Enter into an idle pane, and the dialog that
+    arrived at ~1.9s stayed open — the person's next message was typed into the
+    modal and swallowed. The watch has to outlive that settle.
+    """
+    sends = _fake_tmux(
+        monkeypatch,
+        [_IDLE_PANE, _IDLE_PANE, _EFFORT_DIALOG_PANE, _IDLE_PANE],
+    )
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+        )
+        is True
+    )
+    # One Enter, and only once the dialog was actually on screen.
+    assert [args[-1] for args in sends] == ["Enter"]
+
+
+@pytest.mark.parametrize(
+    ("name", "foreign_pane"),
+    [
+        ("model picker", _MODEL_PICKER_PANE),
+        ("permission prompt", _PERMISSION_PROMPT_PANE),
+    ],
+)
+def test_a_foreign_dialog_rendering_during_the_watch_gets_no_enter(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    foreign_pane: str,
+) -> None:
+    """Someone else's dialog must never take our confirm Enter.
+
+    Our dialog never pops, and mid-watch the person opens a ``/model`` picker
+    (whose Enter rewrites their global default) or Claude asks for a tool
+    permission (whose Enter approves it). Both stay untouched.
+    """
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE, _IDLE_PANE, foreign_pane])
+
+    if name == "permission prompt":
+        with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
+            claude_native_bridge._confirm_tui_dialog(
+                "/tmp/s.sock",
+                "claude:0.0",
+                hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            )
+    else:
+        assert (
+            claude_native_bridge._confirm_tui_dialog(
+                "/tmp/s.sock",
+                "claude:0.0",
+                hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            )
+            is False
+        )
+    assert sends == []
+
+
+def test_a_foreign_dialog_already_open_at_the_start_gets_no_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same protection when the foreign surface was up all along."""
+    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE])
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            timeout_s=0.0,
+        )
+        is False
+    )
+    assert sends == []
+
+
+def test_a_swallowed_confirm_enter_is_retried_while_the_dialog_persists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Enter the busy TUI dropped is re-sent while the dialog stays up.
+
+    The load that renders the dialog ~1.9s late also drops keystrokes
+    mid-repaint. A single unverified Enter then leaves the dialog parked and
+    every later delivery failing the readiness gate — the same wedge the poll
+    fixed, one step later. Each retry fires only while the dialog is
+    verifiably still on screen, so none can leak onto the returned composer.
+    """
+    sends = _fake_tmux(
+        monkeypatch,
+        [_EFFORT_DIALOG_PANE] * 6 + [_IDLE_PANE],
+    )
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+        )
+        is True
+    )
+    enters = [args[-1] for args in sends]
+    assert enters == ["Enter", "Enter"], (
+        f"Expected the swallowed Enter to be retried exactly once before the "
+        f"dialog closed; got {enters}."
+    )
+
+
+def test_a_torn_capture_does_not_end_the_confirm_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty capture means "unknown", never "the dialog closed".
+
+    ``capture-pane`` returns "" on a torn read under a busy repaint — the very
+    load that swallows the Enter. If that blank frame ended the verify, the
+    confirm would report success with the dialog still parked on the pane.
+    """
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _EFFORT_DIALOG_PANE,
+            "",
+            _EFFORT_DIALOG_PANE,
+            "",
+            _EFFORT_DIALOG_PANE,
+            "",
+            _EFFORT_DIALOG_PANE,
+            _IDLE_PANE,
+        ],
+    )
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+        )
+        is True
+    )
+    enters = [args[-1] for args in sends]
+    assert enters == ["Enter", "Enter"], (
+        f"A blank frame must keep the retry alive, not declare the dialog "
+        f"closed after the first Enter; got {enters}."
+    )
+
+
+def test_a_dialog_that_never_closes_gives_up_instead_of_retrying_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The confirm retry is bounded, so a stuck dialog can't hang the runner.
+
+    Every Enter is swallowed and the dialog never leaves the pane — the
+    unrecoverable case. The verify has to exhaust its budget and return,
+    leaving the persisted session value as the fallback. An unbounded retry
+    (a dropped deadline, or a torn-capture guard that never accepts a clean
+    frame) would instead spin forever on the injection thread, and the two
+    tests above would still pass because their dialogs do close.
+    """
+    clock = _VirtualClock()
+    sends: list[list[str]] = []
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        sends.append(list(args))
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    # Nothing here ever clears the dialog, however many Enters arrive.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda _s, _t: _EFFORT_DIALOG_PANE,
+    )
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    assert (
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+        )
+        is True
+    )
+    # Gave up within the accept budget instead of spinning.
+    assert clock.now <= (
+        claude_native_bridge._CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
+        + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    ), f"the confirm verify ran {clock.now}s, past its accept budget"
+    # And it did keep re-pressing while the dialog was verifiably still up.
+    enters = [args[-1] for args in sends]
+    assert len(enters) >= 2, f"the swallowed confirm Enter was never retried; got {enters}"
+
+
+def test_a_slash_command_submit_waits_for_the_command_to_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The submit Enter is withheld until the typed command is in the box.
+
+    The TUI coalesces rapid stdin bursts: an Enter arriving while it is still
+    consuming the command folds in as a newline and the command sits unsent —
+    while the persisted session value claims the switch applied.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    clock = _VirtualClock()
+    pasted_at: float | None = None
+    submitted_at: float | None = None
+    draft_seen = False
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        nonlocal pasted_at, submitted_at
+        del socket_path
+        if args[-1] == "/effort high":
+            pasted_at = clock.monotonic()
+        elif args[-1] == "Enter":
+            assert draft_seen, "Enter arrived before the typed command rendered"
+            submitted_at = clock.monotonic()
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        nonlocal draft_seen
+        del socket_path, tmux_target
+        if pasted_at is None or submitted_at is not None:
+            return _IDLE_PANE
+        if clock.monotonic() - pasted_at < 0.3:
+            return ""
+        draft_seen = True
+        return _composer_pane("/effort high")
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert pasted_at is not None and submitted_at is not None
+    assert submitted_at - pasted_at >= 0.3
+
+
+def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A submit Enter the busy TUI dropped is re-sent while the command sits.
+
+    Without the retry the command stays drafted, the session's persisted
+    effort diverges from the pane, and the next injection's C-u destroys the
+    only evidence. Retries fire only while the command is verifiably still in
+    the box, so none can reach the cleared composer or a dialog.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    tails: list[str] = []
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        if "/effort high" in tails and tails.count("Enter") < 2:
+            return _composer_pane("/effort high")
+        return _IDLE_PANE
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: tails.append(args[-1]))
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert tails == ["C-u", "/effort high", "Enter", "Enter"], (
+        f"Expected the swallowed submit Enter to be retried once; got {tails}."
+    )
+
+
+def test_a_slash_command_stuck_in_the_composer_fails_loud(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command that never submits raises instead of reporting success.
+
+    The runner turns this into a 503 and the persisted session value stays
+    the authoritative fallback — an honest failure, not a silent divergence.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    _fake_tmux(monkeypatch, [_composer_pane("/effort high")])
+
+    with pytest.raises(RuntimeError, match="was not delivered"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+
+def test_a_slash_command_draft_that_never_renders_submits_blind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail-soft: an unidentifiable draft falls back to one unverified Enter.
+
+    Some panes never render the typed command where the check can see it — a
+    custom statusline holding the prompt glyph, or captures that stay torn.
+    Its absence after Enter then proves nothing, so verification would pass
+    trivially, and failing loud would break sessions that are working fine.
+    Exactly one Enter, no retries, no raise: the pre-verification contract,
+    which is the difference between this and the stuck-composer case above.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    # The composer never shows the command, so the draft is never identified.
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    tails = [args[-1] for args in sends]
+    assert tails == ["C-u", "/effort high", "Enter"], (
+        f"An unverifiable draft must submit blind exactly once; got {tails}."
+    )
+
+
+def test_an_effort_switch_with_a_swallowed_confirm_leaves_the_pane_usable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reported wedge, end to end: the pane is injectable again afterwards.
+
+    Live repro: a web effort switch had its confirm Enter dropped, the dialog
+    stayed parked over the composer, and every later message failed the
+    readiness gate with "terminal did not become ready within 30.0s". Driving
+    the whole injection and then asserting that gate — not just counting
+    Enters — is what ties both verified stages to the symptom people hit.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    tui = {"pane": _IDLE_PANE, "confirm_enters": 0}
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        if "-l" in args:
+            tui["pane"] = _composer_pane("/effort high")
+        elif args[-1] == "Enter":
+            if claude_native_bridge.EFFORT_DIALOG_HINT in tui["pane"]:
+                tui["confirm_enters"] += 1
+                # The first confirm Enter is swallowed; the retry lands.
+                if tui["confirm_enters"] >= 2:
+                    tui["pane"] = _IDLE_PANE
+            else:
+                tui["pane"] = _EFFORT_DIALOG_PANE  # the submit ran /effort
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _s, _t: tui["pane"])
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    claude_native_bridge.inject_slash_command(
+        bridge_dir,
+        command="/effort high",
+        auto_confirm=True,
+        confirm_hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+    )
+
+    assert tui["confirm_enters"] >= 2, "the swallowed confirm Enter was never retried"
+    # The very check the next message's readiness gate runs — the parked
+    # dialog used to fail it for 30s per message.
+    assert claude_native_bridge.claude_pane_ready(bridge_dir) is True
+
+
+def test_auto_confirm_without_a_dialog_hint_is_rejected(tmp_path: Path) -> None:
+    """A confirm Enter with nothing to aim at is what hit foreign dialogs."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    with pytest.raises(ValueError, match="confirm_hint"):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir,
+            command="/effort high",
+            auto_confirm=True,
+        )
+
+
+def test_an_effort_injection_with_no_dialog_completes_without_hanging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-dialog case: the fallback Enter lands on an empty prompt, harmlessly."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [_IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(
+        bridge_dir,
+        command="/effort high",
+        auto_confirm=True,
+        confirm_hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+    )
+
+    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter", "Enter"]
+
+
+@pytest.mark.parametrize(
+    "occupied_pane",
+    [
+        _REVERSE_SEARCH_PANE,
+        _INLINE_REVERSE_SEARCH_PANE,
+        _MODEL_PICKER_PANE,
+        _SHELL_MODE_PANE,
+        _REWIND_PANE,
+        _SETTINGS_PANEL_PANE,
+    ],
+    ids=[
+        "reverse-search",
+        "inline-reverse-search",
+        "model-picker",
+        "shell-mode",
+        "rewind",
+        "settings-panel",
+    ],
+)
+def test_inject_user_message_restores_an_occupied_input_box_first(
+    occupied_pane: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Anything occupying the composer is dismissed before typing.
+
+    Whatever a person left up in the embedded terminal, injected
+    keystrokes do not become a chat message: the ctrl+r search filters on
+    them and replays an old prompt on Enter, the rewind dialog commits a
+    checkpoint restore, a settings panel changes a setting, and shell mode
+    hands the message to bash. The injection must Escape the surface first
+    (its own documented dismissal), restoring the empty input box, then
+    deliver the message normally.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    captured: list[list[str]] = []
+    # The surface covers the pane until Escape dismisses it; afterwards
+    # the fake behaves like the live input box (paste deposits the
+    # draft, Enter clears it).
+    tui = {"pane": occupied_pane}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a pane whose occupying surface closes on Escape.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if cmd[-1] == "Escape":
+            tui["pane"] = _composer_pane()
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("restore my composer")
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="restore my composer")
+
+    tails = [cmd[-1] for cmd in captured]
+    # Escape (dismiss the surface) must precede every delivery keystroke.
+    assert tails[:3] == ["Escape", "\x1b[97;5u", "\x1b[107;5u"], (
+        f"Expected the occupying surface to be Escaped before the clear; got {tails}."
+    )
+    assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
+    assert tails[-1] == "Enter"
+
+
+_MCP_APPROVAL_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  New MCP server found in this project: e2e-noop
+  MCP servers may execute code or access system resources. All tool calls
+  require approval. Learn more in the MCP documentation.
+    Use this MCP server
+    Use this and all future MCP servers in this project
+  ❯ Continue without using this MCP server
+  Enter to confirm · Esc to cancel
+"""
+
+_MCP_APPROVAL_CHECKLIST_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  2 new MCP servers found in this project
+  Select any you wish to enable.
+  MCP servers may execute code or access system resources. All tool calls
+  require approval. Learn more in the MCP documentation.
+  ❯ [✔] srv0
+    [✔] srv1
+       Enable selected
+ Space to select · Esc to reject all
+"""
+
+_API_KEY_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  Detected a custom API key in your environment
+  ANTHROPIC_API_KEY: sk-ant-...000000000000000000AA
+  Do you want to use this API key?
+    Yes
+  ❯ No (recommended)
+  Enter to confirm · Esc to cancel
+"""
+
+_TRUST_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+ /private/tmp/ws
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel
+"""
+
+# The same dialog text scrolled into the transcript above a live input box.
+_DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
+
+
+@pytest.mark.parametrize(
+    ("pane", "headline"),
+    [
+        (_MCP_APPROVAL_DIALOG_PANE, "New MCP server found in this project: e2e-noop"),
+        (_MCP_APPROVAL_CHECKLIST_PANE, "2 new MCP servers found in this project"),
+        (_API_KEY_DIALOG_PANE, "Detected a custom API key in your environment"),
+        (_TRUST_DIALOG_PANE, "Accessing workspace:"),
+    ],
+    ids=["mcp-single", "mcp-checklist", "api-key", "folder-trust"],
+)
+def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str) -> None:
+    """
+    Each real startup dialog is recognised by shape and named by its headline.
+
+    All four captures come from Claude Code 2.1.269. None of them is a mounted
+    input box, and each replaces the box with an option list under a
+    "Enter to … · Esc to …" footer, so the headline is what the web error
+    can show the person who has to answer it.
+    """
+    assert claude_native_bridge._terminal_dialog_headline(pane) == headline
+    assert _claude_prompt_rendered(pane) is False
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _READY_PANE,
+        _BOOTING_PANE,
+        _IDLE_PANE,
+        _SHORTCUTS_PANEL_PANE,
+        _SHELL_MODE_PANE,
+        _SETTINGS_PANEL_PANE,
+        _PERMISSION_PROMPT_PANE,
+        _DIALOG_ECHO_ABOVE_COMPOSER_PANE,
+    ],
+    ids=[
+        "ready",
+        "booting",
+        "idle",
+        "shortcuts-panel",
+        "shell-mode",
+        "settings-panel",
+        "permission-prompt",
+        "dialog-echo-above-composer",
+    ],
+)
+def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
+    """
+    Nothing but a footer-bearing dialog without an input box reads as one.
+
+    A live composer wins even with dialog text scrolled above it; a booting
+    pane has no footer; the settings panel's "Esc to clear" is not a confirm
+    footer; and a boxed tool permission prompt has no footer at all, so it
+    stays on its own PermissionRequest path.
+    """
+    assert claude_native_bridge._terminal_dialog_headline(pane) is None
+
+
+def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dialog holding the terminal fails the gate at once, not at the cap.
+
+    Before, the gate sat on the dialog for the 180 s slow-boot cap and raised
+    :class:`ClaudePromptTimeout`, which the executor answers by reaping the
+    pane. The dialog error is a different type on purpose, names the dialog,
+    tells the person what to do, and still carries the pane tail.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: _MCP_APPROVAL_DIALOG_PANE,
+    )
+    started = time.monotonic()
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert time.monotonic() - started < 5.0
+    assert not isinstance(excinfo.value, claude_native_bridge.ClaudePromptTimeout)
+    message = str(excinfo.value)
+    assert "New MCP server found in this project: e2e-noop" in message
+    assert "Open the terminal" in message
+    assert "answer the prompt" in message
+    assert "resend your message" in message
+    assert "Esc to cancel" in message
+
+
+def test_wait_for_claude_prompt_ready_ignores_a_single_dialog_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One dialog-shaped frame is not enough; the composer on the next poll wins.
+
+    A single capture can misreport during a repaint, so the gate only fails
+    when two consecutive polls agree on the same dialog.
+    """
+    frames = iter([_MCP_APPROVAL_DIALOG_PANE, _READY_PANE])
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: next(frames, _READY_PANE),
+    )
+    claude_native_bridge._wait_for_claude_prompt_ready(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        timeout_s=30.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "occupied_pane",
+    [
+        _SHELL_MODE_PANE,
+        _REWIND_PANE,
+        _INLINE_REVERSE_SEARCH_PANE,
+        _INLINE_REVERSE_SEARCH_NO_MATCH_PANE,
+        _INLINE_REVERSE_SEARCH_WRAPPED_PANE,
+    ],
+    ids=[
+        "shell-mode",
+        "rewind",
+        "inline-reverse-search",
+        "inline-reverse-search-no-match",
+        "inline-reverse-search-wrapped",
+    ],
+)
+def test_an_occupied_pane_never_reads_as_a_mounted_input_box(occupied_pane: str) -> None:
+    """
+    An occupied pane is not a mounted chat input, ``❯`` in it or not.
+
+    All these panes carry the glyph — shell mode leaves earlier prompt
+    echoes in the transcript above the ``!`` composer, the rewind dialog
+    marks its selected row with it, and the inline ctrl+r search rides
+    the framed composer itself as its filter field. Reading them as
+    "ready" is what handed a chat message to bash, to a checkpoint
+    restore, and to a history replay; only a framed composer row with no
+    search footer counts.
+    """
+    assert _claude_prompt_rendered(occupied_pane) is False
+
+
+@pytest.mark.parametrize(
+    "occupied_pane",
+    [
+        _INLINE_REVERSE_SEARCH_PANE,
+        _INLINE_REVERSE_SEARCH_NO_MATCH_PANE,
+        _INLINE_REVERSE_SEARCH_WRAPPED_PANE,
+    ],
+    ids=["idle-filter", "no-match-filter", "wrapped-footer"],
+)
+def test_the_inline_history_search_reads_as_occupying(occupied_pane: str) -> None:
+    """
+    The composer-riding ctrl+r search is named as the occupying surface.
+
+    Its frame and ``❯`` glyph are indistinguishable from a free composer,
+    so without the footer read the reclaim would skip the Escape and the
+    injected message would filter history instead of being delivered.
+    """
+    assert _occupying_surface(occupied_pane) == "the prompt-history search"
+
+
+def test_search_chrome_in_the_transcript_does_not_read_as_occupying() -> None:
+    """
+    Search-footer text echoed into scrollback is not a live search.
+
+    The footer read is anchored below the input box's closing rule, so a
+    conversation ABOUT the history search — its chrome quoted in the
+    transcript above the box — must not draw an Escape at a free composer.
+    """
+    pane = "\n".join(
+        [
+            "❯ what does 'search prompts:' mean?",
+            "  ⎿  It is the ctrl+r history search footer.",
+            "──────────────────────────────",
+            "❯ ",
+            "──────────────────────────────",
+            "  ? for shortcuts",
+        ]
+    )
+    assert _occupying_surface(pane) is None
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_a_multiline_draft_in_a_sliver_pane_still_reads_as_ready() -> None:
+    """
+    A composer whose closing rule scrolled off screen is still injectable.
+
+    At the terminal's minimum height a two-line draft pushes the input
+    box's closing rule past the bottom row, leaving only the opening rule
+    and the ``❯`` row visible. The composer is live — treating it as
+    covered would Escape at it and then fail delivery outright.
+    """
+    assert _claude_prompt_rendered(_SLIVER_MULTILINE_DRAFT_PANE) is True
+    assert _occupying_surface(_SLIVER_MULTILINE_DRAFT_PANE) is None
+
+
+def test_a_corner_framed_composer_still_reads_as_ready() -> None:
+    """
+    The composer counts whether or not its frame draws corner glyphs.
+
+    Claude Code has rendered the input box both ways across versions —
+    a bare ``────`` rule in 2.1.240, ``╭──╮``/``╰──╯`` elsewhere — and it
+    is the rule's POSITION directly above the row that identifies the
+    box, not its corners. Reading only one spelling would leave a healthy
+    composer looking covered: an Escape at it, then a readiness timeout.
+    """
+    pane = "\n".join(
+        [
+            "● Working on it",
+            "╭──────────────╮",
+            "❯ ",
+            "╰──────────────╯",
+            "  Opus 5 │ 0/1M (0%)",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+    assert _occupying_surface(pane) is None
+
+
+def test_the_shortcuts_panel_shell_mode_row_is_not_read_as_shell_mode() -> None:
+    """
+    The ``?`` panel's "! for shell mode" row is not a shell-mode composer.
+
+    It renders directly under the input box's closing rule while the
+    composer above is usable, so anchoring on the box's OPENING rule is
+    what keeps a perfectly injectable pane from drawing an Escape.
+    """
+    assert _occupying_surface(_SHORTCUTS_PANEL_PANE) is None
+
+
+def test_inject_user_message_retries_a_swallowed_occupied_input_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An Escape the busy TUI dropped is re-sent while the surface remains.
+
+    A repaint can swallow the dismissal exactly like it swallows submit
+    Enters. A one-shot Escape would then paste into the still-open
+    search filter — the original lost-message bug, made intermittent.
+    Retries fire only while the surface is verifiably on screen, so none
+    can reach the restored composer (where Escape interrupts a turn).
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S", 0.0
+    )
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    escapes = {"n": 0}
+    tui = {"pane": _REVERSE_SEARCH_PANE}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Swallow the first Escape; dismiss the search on the second.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if cmd[-1] == "Escape":
+            escapes["n"] += 1
+            if escapes["n"] >= 2:
+                tui["pane"] = _composer_pane()
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("hello")
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="hello")
+
+    assert escapes["n"] == 2, (
+        f"Expected the swallowed Escape to be retried exactly once, got {escapes['n']}."
+    )
+
+
+def test_inject_slash_command_restores_an_occupied_input_box_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The same reclaim guards slash commands (e.g. a routed model switch).
+
+    Without it, a ``/model`` typed while the ctrl+r search is up lands in
+    the search filter and the pane silently keeps its old model.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        # Search up at the occupied-input check and again at the
+        # re-confirmation, idle after the Escape, then the typed command
+        # renders and the submit clears it.
+        [
+            _REVERSE_SEARCH_PANE,
+            _REVERSE_SEARCH_PANE,
+            _IDLE_PANE,
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
+
+
+def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A surface must be seen twice before an Escape is spent on it.
+
+    Occupancy is inferred from the absence of a framed composer, so any
+    single frame that fails to show one — a repaint caught mid-flight —
+    would otherwise send an Escape, and on a bare composer that
+    interrupts the running turn. A real surface is still there a poll
+    later; this frame is not, so no Escape may be sent.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        # One composer-less frame, then the live input box again.
+        ["● Working on it", _IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    tails = [args[-1] for args in sends]
+    assert "Escape" not in tails, f"A one-frame sighting must not draw an Escape; got {tails}."
+    assert tails == ["C-u", "/effort high", "Enter"]
+
+
+def test_the_shortcuts_panel_is_not_treated_as_an_occupied_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    No Escape at a usable composer, even with the ``?`` panel expanded.
+
+    The panel lists "! for shell mode" verbatim — the string shell mode
+    itself renders — while the composer right above it is injectable. An
+    Escape here would be the blind press the restore must never make
+    (mid-turn it interrupts the response).
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [_SHORTCUTS_PANEL_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter"]
+
+
+def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The claude-native "an injection may land now" signal, which doubles as the
+    settle signal for the routing replay.
+
+    A ``/model`` picker the person opened, or either cache-invalidation
+    confirmation, swallows typed text — so a mounted input box with none of
+    them on top of it is what readiness means. A blocked ``UserPromptSubmit``
+    starts no turn either, so there is no turn id to wait out; this is what
+    says the replay may land.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    frames = {"pane": _IDLE_PANE}
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda _s, _t: frames["pane"],
+    )
+
+    assert claude_native_bridge.claude_pane_ready(bridge_dir) is True
+
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is True
+
+    frames["pane"] = _MODEL_PICKER_PANE
+    assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
+
+    frames["pane"] = "  Switch model?\n"
+    assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
+
+    frames["pane"] = _EFFORT_DIALOG_PANE
+    assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
+
+
+def test_claude_pane_ready_is_false_without_an_advertised_pane(tmp_path: Path) -> None:
+    assert claude_native_bridge.claude_pane_ready(tmp_path / "nope") is False
+
+
+def test_message_display_shell_command_round_trips(tmp_path: Path) -> None:
+    """The generated MessageDisplay shell appender feeds the deltas reader.
+
+    Runs the exact command the settings install through /bin/sh with a
+    pretty-printed raw payload (proving the one-line flattening), then
+    parses it back with the same reader the forwarder uses — the full
+    chunk pipeline minus Claude itself.
+    """
+    args = augment_claude_args((), bridge_dir=tmp_path)
+    settings = _load_invocation_settings(args)
+    command = settings["hooks"]["MessageDisplay"][0]["hooks"][0]["command"]
+    assert "python" not in command, f"per-chunk path must not spawn python: {command}"
+
+    payload = {
+        "hook_event_name": "MessageDisplay",
+        "message_id": "m1",
+        "index": 0,
+        "final": False,
+        "delta": "Hello world",
+    }
+    for i in range(2):
+        payload["index"] = i
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=json.dumps(payload, indent=2),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+    parsed = read_message_deltas_from_offset(tmp_path, 0)
+    assert [(d.message_id, d.index, d.delta) for d in parsed.deltas] == [
+        ("m1", 0, "Hello world"),
+        ("m1", 1, "Hello world"),
+    ]
+
+
+def test_statusline_shell_command_captures_and_chains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The statusLine shim captures raw stdin atomically and chains the user command.
+
+    The captured raw file must normalize into context.json via the
+    forwarder-side sync, and the chained command must receive the exact
+    stdin Claude sent.
+    """
+    from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE, sync_raw_status_context
+
+    chain_out = tmp_path / "chain_out.json"
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.read_user_status_line_command",
+        lambda: f"cat > {chain_out}",
+    )
+    args = augment_claude_args((), bridge_dir=tmp_path)
+    settings = _load_invocation_settings(args)
+    command = settings["statusLine"]["command"]
+    assert "python" not in command, f"statusLine path must not spawn python: {command}"
+
+    payload = json.dumps(
+        {
+            "context_window": {"context_window_size": 500_000},
+            "model": {"id": "claude-opus-4-8"},
+        }
+    )
+    result = subprocess.run(
+        ["/bin/sh", "-c", command], input=payload, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / CONTEXT_RAW_FILE).read_text("utf-8") == payload
+    assert chain_out.read_text("utf-8") == payload
+
+    sync_raw_status_context(tmp_path, None)
+    written = json.loads((tmp_path / "context.json").read_text("utf-8"))
+    assert written == {"context_window_size": 500_000, "model": "claude-opus-4-8"}
+
+
+_PRE_TOOL_USE_PAYLOAD: dict[str, object] = {
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {"command": "true"},
+}
+
+
+class _ScriptedPolicyClient:
+    """Fake runner policy client with a scripted body or failure.
+
+    :param body: JSON body for every response, or ``None`` to raise.
+    """
+
+    def __init__(self, body: dict[str, object] | None) -> None:
+        """Store the script.
+
+        :param body: Response payload; ``None`` makes every call raise.
+        """
+        self.body = body
+        self.calls = 0
+
+    async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
+        """Return the scripted verdict or raise a transport error.
+
+        :param url: Evaluate path (ignored).
+        :param json: Forwarded EvaluationRequest (ignored).
+        :returns: Minimal httpx-Response-shaped namespace.
+        """
+        import json as _json
+
+        del url, json
+        self.calls += 1
+        if self.body is None:
+            raise ConnectionError("scripted transport failure")
+        raw = _json.dumps(self.body).encode("utf-8")
+        return SimpleNamespace(
+            status_code=200, content=raw, headers={"Content-Type": "application/json"}
+        )
+
+
+def _hook_relay(tmp_path, monkeypatch, client):
+    """Boot a relay wired with *client* for the hook-evaluate tests."""
+    from omnigent.harnesses.pi_native import bridge as pi_native_bridge
+
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native")
+    bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_hook_eval")
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """Accept any relayed tool call."""
+        del name, arguments
+        return {}
+
+    relay = claude_native_bridge.start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=_executor,
+        loop=asyncio.get_running_loop(),
+        policy_client=client,  # type: ignore[arg-type]
+        session_id="conv_hook_eval",
+    )
+    return relay, bridge_dir
+
+
+def _relay_request_raw(bridge_dir: Path, path: str, payload: dict[str, object]) -> str:
+    """POST to the relay and return the raw response body text."""
+    import urllib.request
+
+    info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text("utf-8"))
+    req = urllib.request.Request(
+        info["url"].rstrip("/") + path,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {info['token']}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read().decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_allows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ALLOW verdict answers empty (no opinion), evaluating every event.
+
+    The endpoint owns the whole transform chain, so an ALLOW must reach
+    the curl hook as an empty body — and every event must consult the
+    server, since verdicts are content-dependent and nothing is cached.
+    """
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        for _ in range(2):
+            body = await asyncio.to_thread(
+                _relay_request_raw,
+                bridge_dir,
+                "/hook/claude/evaluate-policy",
+                _PRE_TOOL_USE_PAYLOAD,
+            )
+            assert body == "", f"allow must be empty hook output, got {body!r}"
+        assert client.calls == 2, f"every event must evaluate upstream, saw {client.calls}"
+        # The relay wrote the shell-sourceable env file the curl hooks use.
+        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text("utf-8")
+        assert "OMNIGENT_RELAY_URL=" in env_text and "OMNIGENT_RELAY_TOKEN=" in env_text
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_returns_deny_hook_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DENY verdict comes back as ready-made PreToolUse hook output."""
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_DENY", "reason": "blocked by test"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "blocked by test" in output["hookSpecificOutput"]["permissionDecisionReason"]
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
+    client = _ScriptedPolicyClient(None)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+
+        post_body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
+        )
+        assert post_body == "", "PostToolUse must fail open (tool already ran)"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_curl_evaluate_policy_command_round_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generated curl hook command works against a live relay.
+
+    Runs the exact PreToolUse command the settings install through
+    /bin/sh: a DENY upstream must surface as deny hook output, and a
+    bridge dir with no relay must replay stdin into the Python hook
+    (which owns the direct-server path and fail-closed shaping).
+    """
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_DENY", "reason": "curl says no"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        args = augment_claude_args((), bridge_dir=bridge_dir, ap_server_url="http://127.0.0.1:9")
+        settings = _load_invocation_settings(args)
+        pre_entries = [
+            entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry
+        ]
+        command = pre_entries[0]["hooks"][0]["command"]
+        assert "curl" in command and "evaluate-policy" in command
+        # The Python hook must appear only as the relay-less fallback,
+        # after the curl fast path.
+        assert command.index("curl") < command.index("claude_native.hook")
+
+        # Off-loop: the relay proxies through this test's event loop, so a
+        # blocking subprocess.run here would deadlock the curl round trip.
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", command],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
+    finally:
+        relay.close()
+
+    # No relay env file (fresh session before its first dispatched turn,
+    # or runner gone): stdin replays into the Python hook, which takes
+    # its direct-server path (unreachable here) and fails closed with
+    # its own shaping — the pre-curl behavior.
+    bare_dir = tmp_path / "no-relay"
+    bare_dir.mkdir()
+    args = augment_claude_args((), bridge_dir=bare_dir, ap_server_url="http://127.0.0.1:9")
+    (bare_dir / "bridge.json").write_text(
+        json.dumps({"active_session_id": "conv_no_relay"}), encoding="utf-8"
+    )
+    settings = _load_invocation_settings(args)
+    pre_entries = [entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry]
+    result = subprocess.run(
+        ["/bin/sh", "-c", pre_entries[0]["hooks"][0]["command"]],
+        input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+# ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
+
+
+def test_prepare_bridge_dir_writes_owner_pid_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare_bridge_dir records the creating pid so the periodic sweep can
+    prune the dir only when its owner is provably dead."""
+    from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+
+    bridge_dir = prepare_bridge_dir("conv_owner", workspace=tmp_path)
+
+    assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
+    from omnigent.harnesses.claude_native.bridge import prune_orphaned_bridge_dirs
+
+    root = tmp_path / "claude-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    live_dir = root / "liveowner"
+    live_dir.mkdir()
+    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    unmarked_dir = root / "unmarked"
+    unmarked_dir.mkdir()
+
+    pruned = prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+    assert unmarked_dir.exists()
+
+
+# ── /btw side-chat overlay parsing ─────────────────────────────────
+
+_BTW_BORDER = "▔" * 120
+
+
+def _btw_pane(*body_lines: str) -> str:
+    """
+    Build a captured-pane string with a ``/btw`` overlay at the bottom.
+
+    Prepends some inert scrollback and the ``▔`` overlay border, then the
+    supplied overlay body lines, mirroring the real capture layout.
+
+    :param body_lines: Overlay lines below the border (questions, answer,
+        footer), verbatim.
+    :returns: A synthetic pane string for the parser under test.
+    """
+    prefix = ["welcome banner line", "another line", _BTW_BORDER]
+    return "\n".join([*prefix, *body_lines])
+
+
+def test_btw_overlay_parses_completed_single_turn() -> None:
+    """A settled single-turn overlay yields its question and answer."""
+    pane = _btw_pane(
+        "",
+        "    /btw is this backward compatible?",
+        "",
+        "      Yes, the public API is unchanged.",
+        "",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+    )
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None
+    assert overlay.question == "/btw is this backward compatible?"
+    assert overlay.answer == "Yes, the public API is unchanged."
+    assert overlay.truncated is False
+
+
+def test_btw_overlay_takes_current_turn_and_flags_truncation() -> None:
+    """
+    With stacked side turns, only the LAST question is taken, and a tall
+    overflowing overlay is flagged truncated.
+    """
+    answer_lines = [f"      {n} = word{n}" for n in range(1, 16)]
+    pane = _btw_pane(
+        "    /btw earlier question",
+        "    /btw list many numbers",
+        "",
+        *answer_lines,
+        "",
+        "    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close",
+    )
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None
+    assert overlay.question == "/btw list many numbers"
+    assert overlay.answer.splitlines()[0] == "1 = word1"
+    assert "earlier question" not in overlay.answer
+    assert overlay.truncated is True
+
+
+def test_btw_overlay_none_while_generating() -> None:
+    """An overlay still generating (Answering… / no copy·fork) is skipped."""
+    pane = _btw_pane(
+        "    /btw write a long thing",
+        "      ✻ Answering…",
+        "    ←/→ to switch · x to clear history · Esc to close",
+    )
+    assert claude_native_bridge._btw_overlay_from_pane(pane) is None
+
+
+def test_btw_overlay_none_without_overlay() -> None:
+    """A plain composer pane (no overlay footer) yields None."""
+    pane = "\n".join(
+        [
+            "some transcript output",
+            "─" * 80,
+            "❯ ",
+            "─" * 80,
+            "  Opus 4.8 (1M) │ high │ 0/1M $0.00 │ git:main",
+        ]
+    )
+    assert claude_native_bridge._btw_overlay_from_pane(pane) is None
+
+
+def test_btw_overlay_preserves_relative_indentation() -> None:
+    """Dedent strips the fixed margin but keeps nested structure."""
+    pane = _btw_pane(
+        "    /btw show a nested list",
+        "",
+        "      - top",
+        "        - nested",
+        "",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+    )
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None
+    assert overlay.answer == "- top\n  - nested"
+
+
+def test_btw_overlay_present_matches_settled_multiturn_and_generating() -> None:
+    """The dismiss guard matches every /btw overlay state, settled or not."""
+    settled = _btw_pane(
+        "    /btw q",
+        "",
+        "      A",
+        "",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+    )
+    multiturn = _btw_pane(
+        "    /btw q1",
+        "    /btw q2",
+        "",
+        "      A",
+        "    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close",
+    )
+    generating = _btw_pane(
+        "    /btw q",
+        "      ✻ Answering…",
+        "    ←/→ to switch · x to clear history · Esc to close",
+    )
+    assert claude_native_bridge._btw_overlay_present(settled) is True
+    assert claude_native_bridge._btw_overlay_present(multiturn) is True
+    assert claude_native_bridge._btw_overlay_present(generating) is True
+
+
+def test_btw_overlay_present_false_on_bare_composer() -> None:
+    """No /btw footer → no Escape (a blind Escape would cancel a turn)."""
+    pane = "\n".join(
+        [
+            "some transcript output",
+            "─" * 80,
+            "❯ ",
+            "─" * 80,
+            "  Opus 4.8 (1M) │ high │ 0/1M $0.00 │ git:main",
+        ]
+    )
+    assert claude_native_bridge._btw_overlay_present(pane) is False
+
+
+# ---------------------------------------------------------------------------
+# Bridge HTTP server bind/advertise behavior.
+#
+# The servers default to loopback (127.0.0.1). Sandbox backends with SSRF
+# hardening (e.g. OpenShell) deny loopback destinations unconditionally, so a
+# loopback-advertised relay is unreachable from hook subprocesses inside such
+# a sandbox; that integrator opts into an all-interfaces bind via
+# OMNIGENT_BRIDGE_BIND_HOST="0.0.0.0", which advertises the host's routable
+# address. Ports come from a stable, allowlistable pool.
+# ---------------------------------------------------------------------------
+
+
+async def _noop_relay_executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+    """Accept any relayed tool call; these tests only exercise binding."""
+    del name, arguments
+    return {}
+
+
+def _relay_tools() -> list[dict[str, Any]]:
+    """Minimal tool list for a relay advertisement."""
+    return [{"name": "sys_noop", "description": "", "parameters": {"type": "object"}}]
+
+
+@pytest.fixture
+def _no_ambient_bridge_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate bind/advertise decisions from ambient host environment."""
+    monkeypatch.delenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, raising=False)
+    monkeypatch.delenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, raising=False)
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_tool_relay_defaults_to_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no override the relay stays loopback-only, even given a routable IP.
+
+    Loopback is the default posture so an ordinary host keeps the relay off
+    every other interface. A routable address is present here (mocked) to
+    prove detection alone never widens the bind without the opt-in.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    bridge_dir = prepare_bridge_dir("conv_default_loopback", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+        info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert info["url"].startswith("http://127.0.0.1:"), (
+            "detecting a routable address must not widen the default bind"
+        )
+        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text(
+            encoding="utf-8"
+        )
+        assert "OMNIGENT_RELAY_URL='http://127.0.0.1:" in env_text
+    finally:
+        relay.close()
+    assert not (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).exists(), (
+        "close() must recognise its own advertisement and unlink it"
+    )
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_all_interfaces_opt_in_advertises_routable_host_reachable_locally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OMNIGENT_BRIDGE_BIND_HOST=0.0.0.0 advertises the routable host.
+
+    This is the sandbox integrator's opt-in: a loopback advertisement is
+    unreachable from an SSRF-hardened sandbox, so the relay must advertise a
+    routable host while still binding all interfaces. TEST-NET-3 stands in for
+    the detected routable address; it is deliberately not locally bindable,
+    proving the server listens on all interfaces rather than on the advertised
+    address itself, so loopback consumers keep working.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
+    bridge_dir = prepare_bridge_dir("conv_routable_bind", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+        info = json.loads(relay_file.read_text(encoding="utf-8"))
+        port = int(info["url"].rsplit(":", 1)[1])
+        assert info["url"] == f"http://203.0.113.9:{port}", (
+            "relay advertised a non-routable URL; sandboxed hooks cannot reach it"
+        )
+        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text(
+            encoding="utf-8"
+        )
+        assert f"OMNIGENT_RELAY_URL='http://203.0.113.9:{port}'" in env_text
+        # Bound on all interfaces: local (loopback) consumers keep working
+        # even though the advertised host is not bindable here.
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            pass
+    finally:
+        relay.close()
+    assert not (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).exists(), (
+        "close() must recognise its own routable-host advertisement and unlink it"
+    )
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_all_interfaces_opt_in_falls_back_to_loopback_advertise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 0.0.0.0 opt-in advertises loopback when no routable address exists.
+
+    Binding all interfaces still includes loopback, so a local consumer keeps
+    working; a sandbox that filters loopback cannot be helped when the host has
+    no routable interface, but that is a misconfiguration, not this fix's path.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: None,
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
+    bridge_dir = prepare_bridge_dir("conv_loopback_fallback", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+        )
+        assert info["url"].startswith("http://127.0.0.1:")
+    finally:
+        relay.close()
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_tool_relay_bind_host_override_pins_advertised_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit bind-host override wins over routable-address detection."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "127.0.0.1")
+    bridge_dir = prepare_bridge_dir("conv_pinned_bind", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=_relay_tools(),
+        tool_executor=_noop_relay_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+        )
+        assert info["url"].startswith("http://127.0.0.1:")
+    finally:
+        relay.close()
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+async def test_relay_ports_draw_from_stable_pool_with_bind_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pool ports are allocated with bind-retry, then fall back to ephemeral.
+
+    A sandbox network policy allowlists exact host+port pairs, so relay ports
+    must come from the configured pool. Multiple bridge servers run per host
+    (MCP ingress + one relay per session), so an occupied pool port is skipped
+    rather than fatal, and an exhausted pool degrades to an OS-assigned port
+    instead of refusing to start. The bind host is pinned to loopback so the
+    test occupies and probes ports on a single interface.
+    """
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "127.0.0.1")
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        taken_port = int(taken.getsockname()[1])
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_port = int(probe.getsockname()[1])
+        monkeypatch.setenv(
+            claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, f"{taken_port},{free_port}"
+        )
+
+        first_dir = prepare_bridge_dir("conv_pool_first", workspace=tmp_path)
+        first = start_tool_relay(
+            bridge_dir=first_dir,
+            tools=_relay_tools(),
+            tool_executor=_noop_relay_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        second = None
+        try:
+            first_info = json.loads(
+                (first_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+            )
+            assert first_info["url"] == f"http://127.0.0.1:{free_port}", (
+                "relay must skip the occupied pool port and bind the next one"
+            )
+
+            second_dir = prepare_bridge_dir("conv_pool_second", workspace=tmp_path)
+            second = start_tool_relay(
+                bridge_dir=second_dir,
+                tools=_relay_tools(),
+                tool_executor=_noop_relay_executor,
+                loop=asyncio.get_running_loop(),
+            )
+            second_info = json.loads(
+                (second_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text(encoding="utf-8")
+            )
+            second_port = int(second_info["url"].rsplit(":", 1)[1])
+            assert second_port not in (taken_port, free_port), (
+                "an exhausted pool must degrade to an OS-assigned port, not rebind"
+            )
+        finally:
+            first.close()
+            if second is not None:
+                second.close()
+
+
+def test_bridge_port_pool_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pool override accepts ports and inclusive ranges; junk is ignored."""
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, "28800-28802,29000")
+    assert claude_native_bridge._bridge_port_pool() == (28800, 28801, 28802, 29000)
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, "not-ports")
+    assert (
+        claude_native_bridge._bridge_port_pool() == claude_native_bridge.DEFAULT_BRIDGE_PORT_POOL
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, "70000")
+    assert (
+        claude_native_bridge._bridge_port_pool() == claude_native_bridge.DEFAULT_BRIDGE_PORT_POOL
+    )
+    monkeypatch.delenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, raising=False)
+    assert (
+        claude_native_bridge._bridge_port_pool() == claude_native_bridge.DEFAULT_BRIDGE_PORT_POOL
+    )
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_all_interfaces_opt_in_advertises_routable_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The MCP control ingress shares the relay's bind/advertise rules.
+
+    It is the bridge's second HTTP bind site; leaving it loopback-only under
+    the 0.0.0.0 opt-in would reintroduce the sandbox fail-closed path for
+    tools-changed control calls.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._routable_local_address",
+        lambda: "203.0.113.9",
+    )
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "0.0.0.0")
+    bridge_dir = prepare_bridge_dir("conv_ingress_bind", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+        )
+        port = int(info["url"].rsplit(":", 1)[1])
+        assert info["url"] == f"http://203.0.113.9:{port}"
+        with socket.create_connection(("127.0.0.1", port), timeout=5):
+            pass
+        connection = claude_native_bridge._control_connection(info)
+        assert (connection.host, connection.port) == ("203.0.113.9", port)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.fixture
+def _short_harness_socket_root(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Point the harness socket root at a short ``/tmp`` dir (``sun_path`` caps at 104 bytes)."""
+    with tempfile.TemporaryDirectory(prefix="og-mcp-", dir="/tmp") as root:
+        monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", root)
+        yield Path(root)
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_defaults_to_unix_socket(
+    tmp_path: Path, _short_harness_socket_root: Path
+) -> None:
+    """Without the bind-host override the control ingress opens no TCP port.
+
+    Remote-dev port forwarders mirror every loopback listener to the laptop
+    and cap how many they will, so the per-``serve-mcp`` control endpoint
+    lives on a Unix socket: ``post_tools_changed`` reaches it there, and
+    closing the server removes the socket file.
+    """
+    bridge_dir = prepare_bridge_dir("conv_ingress_uds", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+        )
+        assert "url" not in info
+        socket_path = Path(info["socket"])
+        assert socket_path == _short_harness_socket_root / f"mcp-{os.getpid()}.sock"
+        assert socket_path.stat().st_mode & 0o777 == 0o600
+        post_tools_changed(bridge_dir, timeout_s=5.0)
+        assert notifications.get(timeout=5.0) == {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+            "params": {},
+        }
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert not socket_path.exists()
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_reaps_sockets_of_dead_owners(
+    tmp_path: Path, _short_harness_socket_root: Path
+) -> None:
+    """A killed pane leaves its ``serve-mcp`` socket behind; the next start reaps it by pid.
+
+    A socket whose owner is still alive belongs to another live session and stays.
+    """
+    exited = subprocess.Popen([sys.executable, "-c", ""])
+    exited.wait(timeout=30)
+    stale = _short_harness_socket_root / f"mcp-{exited.pid}.sock"
+    live = _short_harness_socket_root / f"mcp-{os.getppid()}.sock"
+    stale.touch()
+    live.touch()
+    bridge_dir = prepare_bridge_dir("conv_ingress_reap", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        assert not stale.exists()
+        assert live.exists()
+        assert (_short_harness_socket_root / f"mcp-{os.getpid()}.sock").exists()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_refuses_symlinked_socket_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _short_harness_socket_root: Path
+) -> None:
+    """A pre-created root that is a symlink is refused, not silently reused.
+
+    ``mkdir(exist_ok=True)`` would trust whatever another local user planted at
+    the socket root; the ingress validates it like a bridge ancestor instead.
+    """
+    real = _short_harness_socket_root / "real"
+    real.mkdir(mode=0o700)
+    link = _short_harness_socket_root / "link"
+    link.symlink_to(real)
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(link))
+    bridge_dir = prepare_bridge_dir("conv_ingress_symlink", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    with pytest.raises(RuntimeError, match="is a symlink"):
+        claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_advertises_absolute_socket_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _short_harness_socket_root: Path
+) -> None:
+    """A relative, not-yet-created socket root is created and advertised absolute.
+
+    ``OMNIGENT_HARNESS_TMP_PARENT=.tmp/oa`` is a documented shape: nested under a
+    parent that may not exist yet, and relative to whatever directory
+    ``serve-mcp`` starts in. The runner reads ``server.json`` from its own working
+    directory, so the advertised path has to be absolute to resolve there.
+    """
+    relative_root = os.path.relpath(_short_harness_socket_root / "nested" / "oa")
+    assert not os.path.isabs(relative_root)
+    assert not (_short_harness_socket_root / "nested").exists()
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", relative_root)
+    bridge_dir = prepare_bridge_dir("conv_ingress_abs", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+        )
+        assert Path(info["socket"]) == Path(os.path.abspath(relative_root)) / (
+            f"mcp-{os.getpid()}.sock"
+        )
+        elsewhere = tmp_path / "a" / "b" / "c" / "d"
+        elsewhere.mkdir(parents=True)
+        monkeypatch.chdir(elsewhere)
+        assert not Path(relative_root).exists()
+        post_tools_changed(bridge_dir, timeout_s=5.0)
+        assert notifications.get(timeout=5.0)["method"] == "notifications/tools/list_changed"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _raw_unix_http_status(socket_path: Path, request: bytes) -> bytes:
+    """Send one pre-framed HTTP request over a Unix socket and return the status line."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5)
+        sock.connect(str(socket_path))
+        sock.sendall(request)
+        return sock.recv(4096).split(b"\r\n", 1)[0]
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network", "_short_harness_socket_root")
+def test_http_ingress_authenticates_before_draining_a_bounded_body(tmp_path: Path) -> None:
+    """A bad token is refused before any body is read, and an oversized body is refused.
+
+    ``Content-Length`` is caller-controlled, so the drain that keeps the real
+    client off EPIPE must not become a way to occupy the server with bytes.
+    """
+    bridge_dir = prepare_bridge_dir("conv_ingress_auth", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        socket_path = Path(
+            json.loads(
+                (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+            )["socket"]
+        )
+        # Declare a body but withhold it: a handler that drained before
+        # authenticating would block here instead of answering 401.
+        unauthorized_headers_only = (
+            b"POST /tools-changed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\n"
+            b"Content-Length: 2\r\n\r\n"
+        )
+        assert (
+            _raw_unix_http_status(socket_path, unauthorized_headers_only)
+            == b"HTTP/1.0 401 Unauthorized"
+        )
+        oversized_body = b"x" * (claude_native_bridge._TOOLS_CHANGED_BODY_MAX_BYTES + 1)
+        oversized = (
+            b"POST /tools-changed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-token\r\n"
+            + f"Content-Length: {len(oversized_body)}\r\n\r\n".encode()
+            + oversized_body
+        )
+        assert _raw_unix_http_status(socket_path, oversized) == (
+            b"HTTP/1.0 413 Request Entity Too Large"
+        )
+        assert notifications.empty()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_approval_wait_marker_tracks_a_parked_permission_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A touched marker reads fresh, a stale one does not, and clearing removes it.
+
+    The idle pane reaper spares a native pane only while this marker is fresh,
+    so a marker that reads stale mid-wait reproduces the wedge where a reaped
+    pane strands its approval card unanswerable.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT_PARENT", tmp_path / "omnigent-test"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT",
+        tmp_path / "omnigent-test" / "approval-parent" / "approval-waits",
+    )
+
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_wait")
+
+    marker = claude_native_bridge.approval_wait_marker_path("conv_wait")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    claude_native_bridge.touch_approval_wait_marker(marker)
+    assert marker.exists()
+    assert claude_native_bridge.approval_wait_is_fresh("conv_wait")
+    # One session's parked prompt must not spare another session's pane.
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_other")
+
+    # Each hook owns its own marker, so one finishing (parallel tool calls each
+    # raising a permission request) leaves the other's evidence.
+    sibling = marker.with_name(marker.name.replace(f".{os.getpid()}.", f".{os.getpid() + 1}."))
+    assert sibling != marker
+    claude_native_bridge.touch_approval_wait_marker(sibling)
+    claude_native_bridge.clear_approval_wait_marker(marker)
+    assert not marker.exists()
+    assert claude_native_bridge.approval_wait_is_fresh("conv_wait")
+
+    # A stale marker (a hook killed mid-wait) reads idle and is pruned.
+    stale = time.time() - claude_native_bridge.APPROVAL_WAIT_MARKER_TTL_S - 1
+    os.utime(sibling, (stale, stale))
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_wait")
+    assert not sibling.exists()
+
+    # The hook clears on exit, so clearing an absent marker must not raise.
+    claude_native_bridge.clear_approval_wait_marker(marker)
+
+    # A hook subprocess derives the root from the bridge dir it was handed,
+    # which must land on the same path the runner-side reaper checks.
+    bridge_dir = tmp_path / "omnigent-test" / "approval-parent" / "abc123"
+    assert (
+        claude_native_bridge.approval_wait_marker_path("conv_wait", bridge_dir=bridge_dir)
+        == marker
+    )
+
+
+def test_hold_approval_wait_marker_refreshes_until_released(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The held marker is re-touched on a timer and gone once the block exits.
+
+    A direct server holds one POST for the whole wait, so a marker touched
+    only at the start of the attempt read stale after the TTL and the reaper
+    killed the parked pane an hour later.
+    """
+    monkeypatch.setattr(claude_native_bridge, "APPROVAL_WAIT_MARKER_REFRESH_S", 0.02)
+    touches: list[Path] = []
+    real_touch = claude_native_bridge.touch_approval_wait_marker
+
+    def _counting_touch(marker: Path) -> None:
+        """
+        Record a touch, then perform it.
+
+        :param marker: Marker path being touched.
+        :returns: None.
+        """
+        touches.append(marker)
+        real_touch(marker)
+
+    monkeypatch.setattr(claude_native_bridge, "touch_approval_wait_marker", _counting_touch)
+    marker = tmp_path / "approval-waits" / "digest.1234.wait"
+    marker.parent.mkdir()
+
+    with claude_native_bridge.hold_approval_wait_marker(marker):
+        assert marker.exists(), "touched before the block starts"
+        deadline = time.monotonic() + 5.0
+        while len(touches) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(touches) >= 3, "the refresher must keep touching while the block runs"
+    assert not marker.exists()
+    settled = len(touches)
+    time.sleep(0.1)
+    assert len(touches) == settled, "the refresher must stop when the block exits"

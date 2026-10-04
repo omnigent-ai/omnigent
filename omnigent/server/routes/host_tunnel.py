@@ -22,13 +22,16 @@ import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
+    IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -36,12 +39,15 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
     HostImportLocalDoneFrame,
+    HostImportLocalSessionChunkFrame,
     HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
+    HostMcpServersResultFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -50,6 +56,7 @@ from omnigent.host.frames import (
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
+    ImportLocalSessionChunkAssembler,
     decode_host_frame,
     encode_host_frame,
 )
@@ -74,6 +81,47 @@ SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 
+RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
+"""Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
+
+
+def log_runner_exited(
+    host_id: str,
+    runner_id: str,
+    error: str,
+    *,
+    session_id: str | None = None,
+) -> None:
+    """Emit the ``runner_exited`` debug event for a host-reported runner death.
+
+    Callers that can resolve the runner's bound sessions emit one row per
+    session so each crash row is attributable; ``session_id=None`` is the
+    fallback when no session is bound or the lookup is unavailable.
+
+    :param host_id: Reporting host, e.g. ``"host_abc"``.
+    :param runner_id: The dead runner, e.g. ``"runner_abc123..."``.
+    :param error: Daemon-composed cause (exit code + log tail).
+    :param session_id: Session bound to the runner, if known.
+    :returns: None.
+    """
+    # A runner-process fault; the free-text cause is unparsed, and the runner
+    # may have died before or during a turn, so the lifecycle stage is unknown.
+    _logger.warning(
+        "Host %s reported runner %s exited: %s",
+        host_id,
+        runner_id,
+        error,
+        extra=debug_event(
+            "runner_exited",
+            session_id=session_id,
+            host_id=host_id,
+            runner_id=runner_id,
+            error_category=ErrorCategory.RUNNER.value,
+            error_impact=ErrorImpact.BLOCKING.value,
+            error_phase=ErrorPhase.UNKNOWN.value,
+        ),
+    )
+
 
 def create_host_tunnel_router(
     host_registry: HostRegistry,
@@ -83,7 +131,7 @@ def create_host_tunnel_router(
     on_host_connect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
-    on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
+    on_runner_exited: RunnerExitedCallback | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
 ) -> APIRouter:
@@ -108,11 +156,13 @@ def create_host_tunnel_router(
         Used for reconnect reconciliation.
     :param on_runner_exited: Optional async callback fired when a host
         reports one of its spawned runners died unexpectedly
-        (``host.runner_exited``). Receives ``(runner_id, error)``.
+        (``host.runner_exited``). Receives ``(host_id, runner_id, error)``.
         The server wires this to mark the runner's session(s) failed
         and push the cause to the open view — the only failure signal
         for a runner that crashed before connecting its tunnel (so the
-        runner-tunnel ``on_runner_disconnect`` path never fires).
+        runner-tunnel ``on_runner_disconnect`` path never fires). When
+        set, it owns the ``runner_exited`` event (see
+        :func:`log_runner_exited`) so rows carry the bound session.
     :param on_host_disconnect: Optional async callback fired when
         a host's tunnel closes. Receives the ``host_id``.
     :param on_host_update: Optional async callback fired when a connected
@@ -298,6 +348,9 @@ def create_host_tunnel_router(
                 ws,
                 frame,
                 owner=tunnel_owner,
+                # A resolved launch token is proof this is a server-provisioned
+                # sandbox, not a user machine reconnecting on a managed host id.
+                registered_with_managed_token=managed_token is not None,
             )
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
@@ -481,12 +534,35 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
 
     :param ws: Accepted Starlette WebSocket.
     :param conn: Host connection whose outbound queue to drain.
+    :returns: None when the queue is retired, or when the socket was
+        closed by another task (ping timeout, retire) while a send
+        raced it.
     """
     while True:
         data = await conn.outbound_queue.get()
         if data is None:
             return
-        await ws.send_text(data)
+        try:
+            await ws.send_text(data)
+        except RuntimeError:
+            if ws.application_state is WebSocketState.DISCONNECTED:
+                # The ping loop or registry retirement closed the socket
+                # concurrently; the disconnect is already logged there.
+                _logger.debug("Host %s send raced a concurrent close", conn.host_id)
+                return
+            raise
+
+
+def _import_session_queue_payload(total: int, session: HostImportedLocalSession) -> dict[str, Any]:
+    """Build the pending-import queue payload for one streamed session."""
+    return {
+        "total": total,
+        "external_session_id": session.external_session_id,
+        "workspace": session.workspace,
+        "items": session.items,
+        "title": session.title,
+        "source": session.source,
+    }
 
 
 async def _receive_loop(
@@ -496,7 +572,7 @@ async def _receive_loop(
     host_store: HostStore,
     host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
-    on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
+    on_runner_exited: RunnerExitedCallback | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
 ) -> None:
     """Receive host frames and route results to pending futures.
@@ -511,11 +587,15 @@ async def _receive_loop(
         persisted).
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
-    :param on_runner_exited: Callback fired with ``(runner_id, error)``
-        when a ``host.runner_exited`` frame arrives; ``None`` skips it.
+    :param on_runner_exited: Callback fired with ``(host_id, runner_id,
+        error)`` when a ``host.runner_exited`` frame arrives; ``None``
+        logs the session-less ``runner_exited`` event here instead.
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
     """
+    # Per-request reassembly of chunked import sessions; buffers die with the
+    # connection, so a tunnel drop can never leak a partial session.
+    import_chunk_assemblers: dict[str, ImportLocalSessionChunkAssembler] = {}
     while True:
         message = await ws.receive()
         if message["type"] == "websocket.disconnect":
@@ -607,32 +687,20 @@ async def _receive_loop(
             # One-way report: a runner this host spawned died unexpectedly. Stash
             # the cause so the runner status endpoint can answer "offline, and
             # here is why" to the client still waiting for the runner to connect.
-            # A runner-process fault; the free-text cause is unparsed, so the
-            # lifecycle stage is unknown.
-            _logger.warning(
-                "Host %s reported runner %s exited: %s",
-                host_id,
-                frame.runner_id,
-                frame.error,
-                extra=debug_event(
-                    "runner_exited",
-                    host_id=host_id,
-                    runner_id=frame.runner_id,
-                    error_category=ErrorCategory.RUNNER.value,
-                    error_impact=ErrorImpact.BLOCKING.value,
-                    # The runner may have died before or during a turn; the host
-                    # can't tell from the exit alone.
-                    error_phase=ErrorPhase.UNKNOWN.value,
-                ),
-            )
             if runner_exit_reports is not None:
                 runner_exit_reports.record(frame.runner_id, frame.error, conn.owner)
-            if on_runner_exited is not None:
-                # Mark the runner's session(s) failed and push the cause
-                # to the open view. A runner that crashed before
-                # connecting its tunnel has no runner-tunnel disconnect
-                # event, so this report is the only failure signal.
-                await on_runner_exited(frame.runner_id, frame.error)
+            if on_runner_exited is None:
+                log_runner_exited(host_id, frame.runner_id, frame.error)
+            else:
+                # Only failure signal for a runner that crashed before connecting
+                # its tunnel; the callback resolves bound sessions and logs the event.
+                try:
+                    await on_runner_exited(host_id, frame.runner_id, frame.error)
+                except Exception:
+                    # One failed report must not tear down the tunnel for every runner.
+                    _logger.exception(
+                        "on_runner_exited callback failed for %s/%s", host_id, frame.runner_id
+                    )
             continue
 
         if isinstance(frame, HostRunnerStatusResultFrame):
@@ -684,6 +752,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "worktree_path": frame.worktree_path,
+                        "workspace": frame.workspace,
                         "branch": frame.branch,
                         "error": frame.error,
                     }
@@ -788,26 +857,74 @@ async def _receive_loop(
             if skills_future is not None and not skills_future.done():
                 skills_future.set_result(frame)
             continue
+        if isinstance(frame, HostMcpServersResultFrame):
+            mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
+            if mcp_future is not None and not mcp_future.done():
+                mcp_future.set_result(frame)
+            continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)
             if queue is not None:
-                s = frame.session
                 queue.put_nowait(
-                    (
-                        "session",
-                        {
-                            "total": frame.total,
-                            "external_session_id": s.external_session_id,
-                            "workspace": s.workspace,
-                            "items": s.items,
-                            "title": s.title,
-                            "source": s.source,
-                        },
-                    )
+                    ("session", _import_session_queue_payload(frame.total, frame.session))
                 )
+            continue
+        if isinstance(frame, HostImportLocalSessionChunkFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is None:
+                # Never allocate memory for an unsolicited or expired request.
+                import_chunk_assemblers.pop(frame.request_id, None)
+                continue
+
+            # Every slice proves the host is making progress. Feed the request
+            # queue so a large session on a slow tunnel cannot hit the
+            # inter-session timeout while chunks are actively arriving.
+            queue.put_nowait(("progress", {}))
+
+            assembler = import_chunk_assemblers.setdefault(
+                frame.request_id, ImportLocalSessionChunkAssembler()
+            )
+            if assembler.opens_new_session(frame):
+                # The previous session never sent its final slice: count it as
+                # failed on its own so this one still assembles.
+                _logger.warning(
+                    "Host %s started a chunked import session before finishing the previous one",
+                    host_id,
+                )
+                queue.put_nowait(("session", {"total": frame.total}))
+            # Every in-flight request on this connection shares one buffer cap.
+            buffered_elsewhere = sum(
+                candidate.buffered_chars
+                for request_id, candidate in import_chunk_assemblers.items()
+                if request_id != frame.request_id
+            )
+            try:
+                session = assembler.add(
+                    frame,
+                    budget=IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS - buffered_elsewhere,
+                )
+            except ValueError as exc:
+                _logger.warning(
+                    "Host %s sent an unusable chunked import session: %s",
+                    host_id,
+                    exc,
+                )
+                # A payload with no external_session_id makes the import loop
+                # count one failed session and continue, keeping the stream
+                # (and the rest of the batch) alive.
+                queue.put_nowait(("session", {"total": frame.total}))
+                continue
+            if session is None:
+                continue
+            queue.put_nowait(("session", _import_session_queue_payload(frame.total, session)))
             continue
         if isinstance(frame, HostImportLocalDoneFrame):
             queue = conn.pending_import_local.get(frame.request_id)
+            assembler = import_chunk_assemblers.pop(frame.request_id, None)
+            if queue is not None and assembler is not None and assembler.in_progress:
+                # A stream that ends before the final slice must count the
+                # partial session as failed instead of silently dropping it.
+                queue.put_nowait(("session", {"total": 0}))
             if queue is not None:
                 queue.put_nowait(
                     (
