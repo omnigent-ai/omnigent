@@ -57,6 +57,8 @@ class ServerRunner:
         base_env: Mapping[str, str] | None,
         server_cwd: Path | None,
         workspace: Path | None,
+        database_uri: str | None,
+        artifact_location: Path | None,
         binding_token: str,
         health_timeout: float,
         poll_interval: float,
@@ -69,7 +71,8 @@ class ServerRunner:
             path.mkdir(parents=True, exist_ok=True)
         self.port = find_free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
-        self.database_uri = f"sqlite:///{root / 'chat.db'}"
+        self.database_uri = database_uri or f"sqlite:///{root / 'chat.db'}"
+        self.artifact_location = artifact_location or root / "artifacts"
         self.runner_id = token_bound_runner_id(binding_token)
         self._token = binding_token
         self._resources = resources
@@ -166,7 +169,7 @@ class ServerRunner:
                 "--database-uri",
                 self.database_uri,
                 "--artifact-location",
-                str(self.root / "artifacts"),
+                str(self.artifact_location),
             ],
             self.server_home,
             {"OMNIGENT_RUNNER_TUNNEL_TOKEN": self._token, **self._server_env},
@@ -226,6 +229,8 @@ def server_runner(
     base_env: Mapping[str, str] | None = None,
     server_cwd: Path | None = None,
     workspace: Path | None = None,
+    database_uri: str | None = None,
+    artifact_location: Path | None = None,
     binding_token: str | None = None,
     health_timeout: float = 120.0,
     poll_interval: float = 1.0,
@@ -248,6 +253,8 @@ def server_runner(
             base_env=base_env,
             server_cwd=server_cwd,
             workspace=workspace,
+            database_uri=database_uri,
+            artifact_location=artifact_location,
             binding_token=binding_token or secrets.token_urlsafe(32),
             health_timeout=health_timeout,
             poll_interval=poll_interval,
