@@ -1,6 +1,6 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { FileContentResponse } from "@/hooks/useFileContent";
+import type { FileContentResponse, WorkspaceFileDownloadProgress } from "@/hooks/useFileContent";
 
 // ── Mocks ───────────────────────────────────────────────────────────────────
 //
@@ -612,20 +612,19 @@ describe("ModelViewer async cleanup", () => {
 });
 
 describe("ModelViewer loading state", () => {
-  type ProgressCallback = (progress: { receivedBytes: number; totalBytes: number | null }) => void;
+  type ProgressCallback = (progress: WorkspaceFileDownloadProgress) => void;
 
-  // Holds the uncapped download open so the downloading phase can be driven.
-  function holdDownload() {
-    const held: { onProgress?: ProgressCallback; resolve?: (buffer: ArrayBuffer) => void } = {};
+  // Holds each uncapped download open so the downloading phase can be driven.
+  function holdDownloads() {
+    const downloads: { onProgress?: ProgressCallback; resolve: (buffer: ArrayBuffer) => void }[] =
+      [];
     fetchWorkspaceFileBytesMock.mockImplementation(
-      (_conversationId: string, _path: string, options?: { onProgress?: ProgressCallback }) => {
-        held.onProgress = options?.onProgress;
-        return new Promise<ArrayBuffer>((resolve) => {
-          held.resolve = resolve;
-        });
-      },
+      (_conversationId: string, _path: string, options?: { onProgress?: ProgressCallback }) =>
+        new Promise<ArrayBuffer>((resolve) => {
+          downloads.push({ onProgress: options?.onProgress, resolve });
+        }),
     );
-    return held;
+    return downloads;
   }
 
   // Queues animation frames instead of running them, so the pre-parse paint yield stays pending.
@@ -648,27 +647,27 @@ describe("ModelViewer loading state", () => {
   });
 
   it("shows determinate download progress when the total size is known", async () => {
-    const held = holdDownload();
+    const downloads = holdDownloads();
     render(
       <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
     );
     expect(screen.getByRole("status").textContent).toBe("Downloading model…");
-    await waitFor(() => expect(held.onProgress).toBeDefined());
+    await waitFor(() => expect(downloads).toHaveLength(1));
 
-    act(() => held.onProgress?.({ receivedBytes: 512 * 1024, totalBytes: 1024 * 1024 }));
+    act(() => downloads[0].onProgress?.({ receivedBytes: 512 * 1024, totalBytes: 1024 * 1024 }));
 
     expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("50");
     expect(screen.getByText("50% · 512 KB of 1.0 MB")).toBeDefined();
   });
 
   it("shows indeterminate download progress when the total size is unknown", async () => {
-    const held = holdDownload();
+    const downloads = holdDownloads();
     render(
       <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
     );
-    await waitFor(() => expect(held.onProgress).toBeDefined());
+    await waitFor(() => expect(downloads).toHaveLength(1));
 
-    act(() => held.onProgress?.({ receivedBytes: 2 * 1024 * 1024, totalBytes: null }));
+    act(() => downloads[0].onProgress?.({ receivedBytes: 2 * 1024 * 1024, totalBytes: null }));
 
     expect(screen.getByRole("status").textContent).toBe("Downloading model…");
     expect(screen.queryByRole("progressbar")).toBeNull();
@@ -676,14 +675,14 @@ describe("ModelViewer loading state", () => {
   });
 
   it("switches to the preparing phase and yields a frame before parsing", async () => {
-    const held = holdDownload();
+    const downloads = holdDownloads();
     const frames = holdFrames();
     render(
       <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
     );
-    await waitFor(() => expect(held.resolve).toBeDefined());
+    await waitFor(() => expect(downloads).toHaveLength(1));
 
-    await act(async () => held.resolve?.(new ArrayBuffer(8)));
+    await act(async () => downloads[0].resolve(new ArrayBuffer(8)));
 
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Preparing model…"));
     expect(screen.queryByRole("progressbar")).toBeNull();
@@ -713,16 +712,16 @@ describe("ModelViewer loading state", () => {
 
   it("leaves no overlay or late update after unmounting mid-download", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    const held = holdDownload();
+    const downloads = holdDownloads();
     const { unmount } = render(
       <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
     );
-    await waitFor(() => expect(held.onProgress).toBeDefined());
+    await waitFor(() => expect(downloads[0]?.onProgress).toBeDefined());
 
     unmount();
     await act(async () => {
-      held.onProgress?.({ receivedBytes: 4, totalBytes: 8 });
-      held.resolve?.(new ArrayBuffer(8));
+      downloads[0].onProgress?.({ receivedBytes: 4, totalBytes: 8 });
+      downloads[0].resolve(new ArrayBuffer(8));
     });
 
     expect(screen.queryByRole("status")).toBeNull();
@@ -732,14 +731,7 @@ describe("ModelViewer loading state", () => {
   });
 
   it("ignores progress and bytes from a superseded download", async () => {
-    const downloads: { onProgress?: ProgressCallback; resolve: (buffer: ArrayBuffer) => void }[] =
-      [];
-    fetchWorkspaceFileBytesMock.mockImplementation(
-      (_conversationId: string, _path: string, options?: { onProgress?: ProgressCallback }) =>
-        new Promise<ArrayBuffer>((resolve) => {
-          downloads.push({ onProgress: options?.onProgress, resolve });
-        }),
-    );
+    const downloads = holdDownloads();
     const { rerender } = render(
       <ModelViewer data={makeData({ truncated: true })} path="old.3mf" conversationId="conv_1" />,
     );
