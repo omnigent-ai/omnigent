@@ -5,9 +5,10 @@ tunnel and a TCP ingress proxy. A deterministic mock LLM holds an openai-agents
 turn in flight while the proxy cuts the tunnel and returns HTTP 503. The runner
 then reconnects to the original server or a second server sharing its database.
 
-The cross-replica case also covers an unavailable conversation backend on the
-old replica. Only that store read is fault-injected; the servers, runner,
-WebSocket reconnection, shared heartbeat writes, and turn execution are real.
+The cross-replica case also covers an unavailable conversation database on the
+old replica, with metadata in a separate database. Only queries on A's
+conversation engine are fault-injected; the servers, runner, WebSocket
+reconnection, shared heartbeat writes, and turn execution are real.
 
 Run::
 
@@ -61,17 +62,17 @@ _FAILURE_SIGNATURE = re.compile(
 _HEALTH_TIMEOUT_S = 90.0
 
 # Only replica A uses this bootstrap; the file arms its backend outage after
-# the real runner has reconnected to B. Connectivity metadata remains readable.
+# the real runner has reconnected to B. The metadata database remains readable.
 _UNAVAILABLE_BACKEND_BOOTSTRAP = """
 import sys
 from pathlib import Path
 
 import grpc
-
-from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from sqlalchemy import event
+from sqlalchemy.engine import Engine, make_url
 
 fault_file = Path(sys.argv.pop(1))
-original_get_conversation = SqlAlchemyConversationStore.get_conversation
+conversation_database = make_url(sys.argv.pop(1))
 
 class BackendUnavailable(grpc.RpcError):
     def code(self):
@@ -83,12 +84,10 @@ class BackendUnavailable(grpc.RpcError):
     def __str__(self):
         return f"{self.code()}: {self.details()}"
 
-def get_conversation(self, conversation_id):
-    if fault_file.exists():
+@event.listens_for(Engine, "before_cursor_execute")
+def fail_conversation_query(connection, cursor, statement, parameters, context, executemany):
+    if connection.engine.url == conversation_database and fault_file.exists():
         raise BackendUnavailable()
-    return original_get_conversation(self, conversation_id)
-
-SqlAlchemyConversationStore.get_conversation = get_conversation
 
 from omnigent.cli import main
 
@@ -272,6 +271,7 @@ class _ReconnectStack:
         self._binding_token = uuid.uuid4().hex + uuid.uuid4().hex
         self.runner_id = token_bound_runner_id(self._binding_token)
         self._database_uri = f"sqlite:///{tmp_path / 'reconnect.db'}"
+        self._conversation_database_uri = f"sqlite:///{tmp_path / 'conversations.db'}"
         self._artifact_dir = tmp_path / "artifacts"
         self._artifact_dir.mkdir()
         self.server_log = tmp_path / "server.log"
@@ -309,6 +309,7 @@ class _ReconnectStack:
                 "-c",
                 _UNAVAILABLE_BACKEND_BOOTSTRAP,
                 str(self.conversation_read_fault),
+                self._conversation_database_uri,
             ]
         self._server_proc = subprocess.Popen(
             [
@@ -321,6 +322,8 @@ class _ReconnectStack:
                 str(self._port),
                 "--database-uri",
                 self._database_uri,
+                "--conversation-database-uri",
+                self._conversation_database_uri,
                 "--artifact-location",
                 str(self._artifact_dir),
             ],
@@ -418,6 +421,8 @@ class _Replica:
                 str(self.port),
                 "--database-uri",
                 self._stack._database_uri,
+                "--conversation-database-uri",
+                self._stack._conversation_database_uri,
                 "--artifact-location",
                 str(self._stack._artifact_dir),
             ],
@@ -624,7 +629,7 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
 
     Replica A relays the turn. Its tunnel is cut, and the runner reconnects to
     replica B (same database). Keep the turn running beyond A's grace period,
-    with A's full-conversation reads optionally raising backend UNAVAILABLE.
+    with A's conversation database queries optionally raising UNAVAILABLE.
     B's shared heartbeat must prevent A from failing the turn, and B must
     deliver both the original answer and a follow-up turn.
     """
@@ -683,7 +688,14 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
             stack.conversation_read_fault.touch()
             response = stack.client.get(f"/v1/sessions/{session_id}")
             assert response.status_code == 500, response.text
-            assert "StatusCode.UNAVAILABLE" in stack.process_log.read_text()
+            _poll_until(
+                lambda: (
+                    "StatusCode.UNAVAILABLE: injected conversation backend outage"
+                    in stack.process_log.read_text()
+                ),
+                timeout=10.0,
+                what="replica A to log the injected conversation database failure",
+            )
         assert _session_snapshot(replica_b.client, session_id).get("status") == "running"
 
         # Keep the original turn in flight until A makes its disconnect decision.
@@ -702,7 +714,7 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
         assert not failed_edges, (
             f"Replica A failed session {session_id} after the runner reconnected to "
             "replica B. The fresh heartbeat B wrote must remain readable even when "
-            "A's full-conversation backend is unavailable.\n"
+            "A's conversation database is unavailable.\n"
             f"Failure lines: {failed_edges}\n"
             f"Replica A log tail:\n{server_a_log[-4000:]}"
         )

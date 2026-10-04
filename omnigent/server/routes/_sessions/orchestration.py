@@ -7211,7 +7211,7 @@ async def _relay_runner_live_elsewhere(
     conversation_store: ConversationStore,
 ) -> bool:
     """
-    Check this relay's bound runner using shared connectivity metadata.
+    Check this relay's bound runner using shared runner metadata.
 
     A full-conversation read can depend on unrelated backends; their outage
     must not hide a fresh heartbeat from another replica. Prefer the active
@@ -7219,32 +7219,30 @@ async def _relay_runner_live_elsewhere(
     without a registered relay.
 
     :param session_id: Session/conversation identifier.
-    :param conversation_store: Store used to read connectivity metadata.
+    :param conversation_store: Store used to read runner metadata.
     :returns: ``True`` when the bound runner is confirmed live on
         another replica; ``False`` when unbound, unreadable, or not.
     """
     try:
-        connectivity = await asyncio.to_thread(
-            conversation_store.get_session_connectivity, [session_id]
-        )
+        liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, session_id)
     except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
         _logger.warning(
-            "Relay: connectivity lookup failed for session=%s",
+            "Relay: runner liveness lookup failed for session=%s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
         return False
-    row = connectivity.get(session_id)
-    if row is None:
+    if liveness is None:
         return False
+    bound_runner_id, runner_last_seen = liveness
     handle = _runner_relay_tasks.get(session_id)
-    runner_id = handle.runner_id if handle is not None else row.runner_id
+    runner_id = handle.runner_id if handle is not None else bound_runner_id
     if runner_id is None:
         return False
     reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return row.runner_id == runner_id and _runner_stamp_is_live_elsewhere(
-        stamp=row.runner_last_seen,
+    return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
+        stamp=runner_last_seen,
         reference_stamp=reference_stamp,
     )
 
