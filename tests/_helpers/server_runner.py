@@ -121,7 +121,7 @@ class ServerRunner:
                 ):
                     return
                 last = f"HTTP {response.status_code}: {response.text[:300]}"
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, ValueError) as exc:
                 last = f"{type(exc).__name__}: {exc}"
             time.sleep(self._poll_interval)
         raise AssertionError(f"{url} never became ready: {last}\n{self.log_tail()}")

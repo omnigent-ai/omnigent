@@ -45,7 +45,7 @@ def test_stack_startup_failure_closes_started_processes(
         children.append(child)
         return child
 
-    monkeypatch.setattr("tests._helpers.server_runner.subprocess.Popen", record_child)
+    monkeypatch.setattr(subprocess, "Popen", record_child)
     fail = "print('stack-startup-marker', flush=True); raise SystemExit(23)"
     with pytest.raises(AssertionError) as error:
         with server_runner(
