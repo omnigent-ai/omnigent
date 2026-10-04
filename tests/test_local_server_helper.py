@@ -46,14 +46,26 @@ def test_stack_startup_failure_closes_started_processes(
         return child
 
     monkeypatch.setattr(subprocess, "Popen", record_child)
-    fail = "print('stack-startup-marker', flush=True); raise SystemExit(23)"
+    monkeypatch.setenv("OMNIGENT_RUNNER_ID", "parent-must-not-leak")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ZYGOTE_HARNESS_FD", "9999")
+    monkeypatch.setenv("OMNIGENT_PROCESS_LOG_FILE", str(tmp_path / "parent.log"))
+    fail = """
+import os
+assert os.environ.get("OMNIGENT_RUNNER_ID") != "parent-must-not-leak"
+assert "OMNIGENT_RUNNER_ZYGOTE_HARNESS_FD" not in os.environ
+assert "OMNIGENT_PROCESS_LOG_FILE" not in os.environ
+print("stack-startup-marker", flush=True)
+raise SystemExit(23)
+"""
     with pytest.raises(AssertionError) as error:
         with server_runner(
             tmp_path,
             server_bootstrap=fail if failing_process == "server" else None,
-            health_timeout=30,
             poll_interval=0.02,
         ) as stack:
+            for key in ("HOME", "OMNIGENT_DATA_DIR"):
+                with pytest.raises(ValueError, match="owned by the isolated stack"):
+                    stack.start_runner(env={key: str(tmp_path / "outside")})
             stack.start_runner(bootstrap=fail)
             pytest.fail("a failed child must not be treated as a ready runner")
     assert "exited with code 23" in str(error.value)
