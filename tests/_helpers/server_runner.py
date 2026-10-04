@@ -7,7 +7,7 @@ import secrets
 import subprocess
 import sys
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
@@ -48,12 +48,14 @@ class ServerRunner:
         *,
         server_bootstrap: str | None,
         server_env: Mapping[str, str],
+        server_cwd: Path | None,
+        workspace: Path | None,
         binding_token: str,
         health_timeout: float,
         poll_interval: float,
     ) -> None:
         self.root = root
-        self.workspace = root / "workspace"
+        self.workspace = workspace if workspace is not None else root / "workspace"
         self.runner_home = root / "home"
         self.server_home = root / "server-home"
         for path in (self.workspace, self.runner_home, self.server_home):
@@ -69,16 +71,24 @@ class ServerRunner:
         self._poll_interval = poll_interval
         self._server_bootstrap = server_bootstrap
         self._server_env = dict(server_env)
+        self._server_cwd = server_cwd
         self.server: subprocess.Popen[bytes] | None = None
         self.runner: subprocess.Popen[bytes] | None = None
 
     def _spawn(
-        self, name: str, args: list[str], home: Path, env: Mapping[str, str]
+        self,
+        name: str,
+        args: list[str],
+        home: Path,
+        env: Mapping[str, str],
+        *,
+        cwd: Path | None = None,
     ) -> subprocess.Popen[bytes]:
         log = self._resources.enter_context((self.root / f"{name}.log").open("ab"))
         proc = subprocess.Popen(
             [sys.executable, *args],
             env=_process_env(home, env),
+            cwd=cwd,
             stdout=log,
             stderr=subprocess.STDOUT,
         )
@@ -115,6 +125,8 @@ class ServerRunner:
                     f"{self.log_tail()}"
                 )
             try:
+                if runner:
+                    self._client.get(f"{self.base_url}/health", timeout=2.0).raise_for_status()
                 response = self._client.get(url, timeout=2.0)
                 if response.status_code == 200 and (
                     not runner or response.json().get("online") is True
@@ -126,7 +138,7 @@ class ServerRunner:
             time.sleep(self._poll_interval)
         raise AssertionError(f"{url} never became ready: {last}\n{self.log_tail()}")
 
-    def start_server(self) -> None:
+    def start_server(self, *, wait_ready: bool = True) -> None:
         """Start the server, preserving its database and endpoint on restart."""
         assert self.server is None or self.server.poll() is not None
         args = ["-c", self._server_bootstrap] if self._server_bootstrap else ["-m", "omnigent.cli"]
@@ -146,8 +158,10 @@ class ServerRunner:
             ],
             self.server_home,
             {"OMNIGENT_RUNNER_TUNNEL_TOKEN": self._token, **self._server_env},
+            cwd=self._server_cwd,
         )
-        self._wait_ready()
+        if wait_ready:
+            self._wait_ready()
 
     def restart_server(self) -> None:
         """Clear in-memory server state and await the existing runner's reconnect."""
@@ -157,14 +171,20 @@ class ServerRunner:
             self._wait_ready(runner=True)
 
     def start_runner(
-        self, *, bootstrap: str | None = None, env: Mapping[str, str] | None = None
+        self,
+        *,
+        bootstrap: str | None = None,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+        python_args: Sequence[str] = (),
+        wait_ready: bool = True,
     ) -> None:
-        """Start and await the real tunnel; callers may create a parent session first."""
+        """Start the runner; callers may observe startup themselves with wait_ready=False."""
         assert self.runner is None, "runner already started"
         args = ["-c", bootstrap] if bootstrap else ["-m", "omnigent.runner._entry"]
         self.runner = self._spawn(
             "runner",
-            args,
+            [*python_args, *args],
             self.runner_home,
             {
                 "OMNIGENT_RUNNER_ID": self.runner_id,
@@ -174,8 +194,10 @@ class ServerRunner:
                 "OMNIGENT_RUNNER_WORKSPACE": str(self.workspace),
                 **(env or {}),
             },
+            cwd=cwd,
         )
-        self._wait_ready(runner=True)
+        if wait_ready:
+            self._wait_ready(runner=True)
 
 
 def _reap(scope: Path) -> None:
@@ -189,12 +211,16 @@ def server_runner(
     *,
     server_bootstrap: str | None = None,
     server_env: Mapping[str, str] | None = None,
+    server_cwd: Path | None = None,
+    workspace: Path | None = None,
     binding_token: str | None = None,
     health_timeout: float = 120.0,
     poll_interval: float = 1.0,
+    wait_ready: bool = True,
 ) -> Iterator[ServerRunner]:
     """Yield a ready server; explicitly call start_runner with scenario overrides.
 
+    Set wait_ready=False to start both processes before waiting for the runner.
     Cleanup applies even when readiness fails. Detached Omnigent descendants
     are attributed only to this stack's directories, never the whole machine.
     """
@@ -204,6 +230,8 @@ def server_runner(
             resources,
             server_bootstrap=server_bootstrap,
             server_env=server_env or {},
+            server_cwd=server_cwd,
+            workspace=workspace,
             binding_token=binding_token or secrets.token_urlsafe(32),
             health_timeout=health_timeout,
             poll_interval=poll_interval,
@@ -211,5 +239,5 @@ def server_runner(
         # Register before process callbacks so direct children terminate first.
         for scope in (root, stack.runner_home / ".omnigent", stack.server_home / ".omnigent"):
             resources.callback(_reap, scope)
-        stack.start_server()
+        stack.start_server(wait_ready=wait_ready)
         yield stack
