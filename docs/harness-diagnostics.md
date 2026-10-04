@@ -289,7 +289,10 @@ Claude transcript entries marked `isApiErrorMessage` also produce INFO
 `native_failure_observed` events, correlated by Omnigent session/response ID and
 native record ID. These observations do not publish an additional failed status.
 Transcript observations are logged before delivery so a rejected upload still
-leaves evidence. Retries can repeat them; count distinct `failure_id` values.
+leaves evidence. Each text block has its own `failure_id`; count distinct IDs to
+deduplicate retries of the same block. For transcript-record counts, group by
+session ID and `native_record_id` when available; for affected sessions, count
+distinct session IDs.
 Hook and transcript observations have separate source identities: do not sum
 their counts as failed turns or copy a nearby request ID onto a hook failure.
 The ordinary log-envelope `request_id` may refer to an Omnigent event POST; it
@@ -305,7 +308,10 @@ metadata: `diagnostic_capture_enabled`, `diagnostic_capture_state`, marker/file
 presence, last successful read time/offset, read-error class, and cumulative
 truncation/omission counts for the launch. States distinguish `disabled`,
 `not_polled`, `missing_marker`, `invalid_marker`, `missing_file`, `read_error`,
-and `ready`. `diagnostic_launch_id` matches the `launch_id` on existing bounded
+and `ready`. Malformed marker JSON is `read_error`, with
+`diagnostic_read_error_kind=JSONDecodeError`; `invalid_marker` covers decoded
+metadata that fails validation or markers exceeding the size limit.
+`diagnostic_launch_id` matches the `launch_id` on existing bounded
 `harness_diagnostic_output` events, with `diagnostic_read_offset` locating the
 consumed position. This is the collector's current launch, not proof that a
 buffered hook originated in that launch. A snapshot can lag newly written

@@ -70,6 +70,7 @@ async def test_hook_category_and_identity_survive_retry(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("marker_location", ["entry", "message"])
+@pytest.mark.parametrize("block_count", [1, 2], ids=["string", "multiple-text-blocks"])
 @pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
 @pytest.mark.parametrize("retry_after_rejection", [False, True], ids=["accepted", "retried"])
 @pytest.mark.asyncio
@@ -77,6 +78,7 @@ async def test_explicit_transcript_api_error_is_observed_without_failing_session
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     marker_location: str,
+    block_count: int,
     batch: bool,
     retry_after_rejection: bool,
 ) -> None:
@@ -92,6 +94,11 @@ async def test_explicit_transcript_api_error_is_observed_without_failing_session
         "version": "2.0.0-test",
         "message": {"role": "assistant", "model": "synthetic-model", "content": error_text},
     }
+    if block_count == 2:
+        entry["message"]["content"] = [
+            {"type": "text", "text": error_text},
+            {"type": "text", "text": "Provider failed after retrying."},
+        ]
     if marker_location == "entry":
         entry["isApiErrorMessage"] = True
     else:
@@ -99,14 +106,14 @@ async def test_explicit_transcript_api_error_is_observed_without_failing_session
     path = tmp_path / "session.jsonl"
     path.write_text(json.dumps(entry) + "\n")
     _, _, items = bridge.read_transcript_items_since(path, 0, agent_name="test-agent")
-    assert len(items) == 1
+    assert len(items) == block_count
     posted = []
 
     def handle(request: httpx.Request) -> httpx.Response:
         posted.append(json.loads(request.content))
         return httpx.Response(
             422 if retry_after_rejection and len(posted) == 1 else 202,
-            json=[{"item_id": "item-synthetic"}] if batch else {},
+            json=[{"item_id": f"item-{index}"} for index in range(block_count)] if batch else {},
             headers={"x-request-id": "omnigent-event-post-id"},
         )
 
@@ -120,12 +127,13 @@ async def test_explicit_transcript_api_error_is_observed_without_failing_session
                 await forwarder._post_external_conversation_item_batch(
                     client,
                     session_id="conv_synthetic",
-                    items=[forwarder._PendingSubagentItem(item=items[0])],
+                    items=[forwarder._PendingSubagentItem(item=item) for item in items],
                 )
             else:
-                await forwarder._post_external_conversation_item(
-                    client, session_id="conv_synthetic", item=items[0]
-                )
+                for item in items:
+                    await forwarder._post_external_conversation_item(
+                        client, session_id="conv_synthetic", item=item
+                    )
 
         if retry_after_rejection:
             with pytest.raises(httpx.HTTPStatusError):
@@ -134,16 +142,19 @@ async def test_explicit_transcript_api_error_is_observed_without_failing_session
                 getattr(r, "event_name", None) == "native_failure_observed" for r in caplog.records
             )
         await post()
-    attempts = 2 if retry_after_rejection else 1
-    events = [payload[0] if batch else payload for payload in posted]
-    assert [event["type"] for event in events] == ["external_conversation_item"] * attempts
+    observations = block_count
+    if retry_after_rejection:
+        observations += block_count if batch else 1
+    events = [event for payload in posted for event in (payload if batch else [payload])]
+    assert [event["type"] for event in events] == ["external_conversation_item"] * observations
     assert events[0]["data"]["item_data"]["content"][0]["text"] == error_text
     records = [
         r for r in caplog.records if getattr(r, "event_name", None) == "native_failure_observed"
     ]
-    assert len(records) == attempts
-    assert len({record.attributes["failure_id"] for record in records}) == 1
-    attrs = records[-1].attributes
+    assert len(records) == observations
+    assert len({record.attributes["failure_id"] for record in records}) == block_count
+    assert {record.attributes["native_record_id"] for record in records} == {"native-record"}
+    attrs = records[0].attributes
     assert attrs["native_api_error_message"] == "True"
     assert attrs["detail_source"] == "explicit_api_error"
     assert attrs["provider_error_type"] == "invalid_request_error"

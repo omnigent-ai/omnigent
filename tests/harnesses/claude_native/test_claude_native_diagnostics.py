@@ -648,9 +648,17 @@ def test_unsafe_predecessor_is_ignored_without_losing_current_evidence(
     assert sum(event["bytes_omitted"] for event in events) == 0
 
 
-@pytest.mark.parametrize("kind", ["symlink", "traversal", "oversized", "malformed"])
+@pytest.mark.parametrize(
+    ("kind", "expected_state"),
+    [
+        ("symlink", "read_error"),
+        ("traversal", "invalid_marker"),
+        ("oversized", "invalid_marker"),
+        ("malformed", "read_error"),
+    ],
+)
 def test_invalid_marker_cannot_select_other_files(
-    capture_file: Path, caplog: pytest.LogCaptureFixture, kind: str
+    capture_file: Path, caplog: pytest.LogCaptureFixture, kind: str, expected_state: str
 ) -> None:
     capture_file.write_text("should not be exported\n")
     marker = capture_file.parent / diagnostics.CLAUDE_DEBUG_LOG_MARKER
@@ -670,3 +678,8 @@ def test_invalid_marker_cannot_select_other_files(
     follower.poll("conv_test")
     follower.close("conv_test")
     assert not _events(caplog)
+    health = follower.health_snapshot()
+    assert health["diagnostic_capture_state"] == expected_state
+    assert health["diagnostic_marker_present"] is True
+    if kind == "malformed":
+        assert health["diagnostic_read_error_kind"] == "JSONDecodeError"
