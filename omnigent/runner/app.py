@@ -1786,25 +1786,29 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        exit_log = debug_event("required_terminal_exited", session_id=event.session_id)
+        exit_log["attributes"] = {
+            **{
+                key: value
+                for key, value in event.lifecycle_context.items()
+                if key not in {"event_name", "session_id", "turn_id", "user_id"}
+            },
+            "terminal_id": event.terminal_id,
+            "terminal_instance_id": event.terminal_instance_id,
+            "terminal_name": event.terminal_name,
+            "terminal_exit_status": event.exit_status,
+            "runner_shutting_down": _shutting_down.is_set(),
+            "error_code": error["code"],
+            # An unrecognized exit is the harness CLI dying under the runner.
+            "error_category": (diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
+            "error_impact": ErrorImpact.BLOCKING.value,
+        }
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
             event.session_id,
             error.get("message"),
-            extra=debug_event(
-                "required_terminal_exited",
-                session_id=event.session_id,
-                terminal_id=event.terminal_id,
-                terminal_instance_id=event.terminal_instance_id,
-                terminal_name=event.terminal_name,
-                terminal_exit_status=event.exit_status,
-                runner_shutting_down=_shutting_down.is_set(),
-                **event.lifecycle_context,
-                error_code=error["code"],
-                # An unrecognized exit is the harness CLI dying under the runner.
-                error_category=(diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
-                error_impact=ErrorImpact.BLOCKING.value,
-            ),
+            extra=exit_log,
         )
         _publish_event(
             event.session_id,

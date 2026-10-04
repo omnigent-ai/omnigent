@@ -202,7 +202,10 @@ class TerminalExitEvent:
 def _terminal_lifecycle_context(
     instance: TerminalInstance | None, resource_role: str | None
 ) -> dict[str, str]:
-    """Freeze launch-scoped evidence before cleanup, without changing exit handling."""
+    """Freeze launch evidence before cleanup without changing exit handling.
+
+    The size-bounded read assumes runner-local temporary storage for bridge files.
+    """
     if instance is None:
         return {}
     context: dict[str, object] = {}
@@ -244,12 +247,16 @@ def _terminal_lifecycle_context(
                     claude_session_end_observation_count=session_end.get("observation_count"),
                     claude_session_end_timestamp_source="hook_received",
                 )
-    except Exception:  # noqa: BLE001 - diagnostics cannot replace the terminal outcome.
+    except Exception as exc:  # noqa: BLE001 - diagnostics cannot replace the terminal outcome.
         context["lifecycle_capture_failed"] = True
+        context["lifecycle_capture_error_type"] = type(exc).__name__
     try:
         return lifecycle_log_attributes(context)
-    except Exception:  # noqa: BLE001 - even serialization must not prevent exit cleanup.
-        return {"lifecycle_capture_failed": "true"}
+    except Exception as exc:  # noqa: BLE001 - even serialization must not prevent exit cleanup.
+        return {
+            "lifecycle_capture_failed": "true",
+            "lifecycle_capture_error_type": type(exc).__name__,
+        }
 
 
 def trim_terminal_output(text: str | None) -> str | None:

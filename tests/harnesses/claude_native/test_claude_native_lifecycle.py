@@ -522,4 +522,22 @@ def test_unknown_schema_is_not_used_or_overwritten(
     assert _read(launch)["read_status"] == "unsupported_schema"
     _hook(monkeypatch, directory, "SessionEnd", 101.0, reason="prompt_input_exit")
     assert json.loads(path.read_text())["schema_version"] == 99
+
+
+@pytest.mark.parametrize(
+    ("content", "read_status"), [("[]", "unreadable"), ("{}", "unsupported_schema")]
+)
+def test_invalid_record_is_preserved_instead_of_treated_as_a_missing_file(
+    launch: tuple[Path, TerminalLifecycleTrace],
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+    read_status: str,
+) -> None:
+    directory, trace = launch
+    path = directory / f"lifecycle-{trace.launch_id}.json"
+    path.write_text(content)
+    assert _read(launch)["read_status"] == read_status
+    _hook(monkeypatch, directory, "SessionEnd", 101.0, reason="logout")
+    assert path.read_text() == content
+    assert _read(launch)["session_end_reason"] == "unknown"
     assert _read(launch)["session_end_reason"] == "unknown"

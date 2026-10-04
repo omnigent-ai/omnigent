@@ -63,12 +63,12 @@ def _path(bridge_dir: Path, launch_id: str) -> Path:
     return bridge_dir / f"lifecycle-{launch_id}.json"
 
 
-def _read(path: Path) -> dict[str, object]:
+def _read(path: Path) -> dict[str, object] | None:
     """Bound input and reject links/devices before reading any persisted evidence."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        return {}
+        return None
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
@@ -79,7 +79,9 @@ def _read(path: Path) -> dict[str, object]:
     if len(raw) > _MAX_BYTES:
         raise ValueError("Lifecycle input exceeds its size limit")
     value = json.loads(raw)
-    return value if isinstance(value, dict) else {}
+    if not isinstance(value, dict):
+        raise ValueError("Lifecycle input is not a record")
+    return value
 
 
 def _event(value: object) -> dict[str, object] | None:
@@ -176,12 +178,13 @@ def record_hook_lifecycle(
         # A stuck peer must not hold up a SessionEnd hook indefinitely.
         with FileLock(str(path) + ".lock", mode=0o600, timeout=0.5):
             previous = _read(path)
-            if previous and (
+            if previous is not None and (
                 previous.get("schema_version") != 1
                 or previous.get("terminal_instance_id") != instance_id
                 or previous.get("launch_id") != launch_id
             ):
                 return
+            previous = previous or {}
             events, omitted = _events(previous.get("events"), previous.get("events_omitted"))
             session_start = _event(previous.get("session_start"))
             if session_start is not None and session_start["event_name"] != "SessionStart":
@@ -257,7 +260,7 @@ def read_lifecycle_snapshot(
         return result
     try:
         state = _read(_path(bridge_dir, launch_id))
-        if not state:
+        if state is None:
             result["read_status"] = "not_found"
             return result
         if state.get("schema_version") != 1:

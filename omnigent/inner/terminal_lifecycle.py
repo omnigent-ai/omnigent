@@ -36,9 +36,15 @@ class TerminalLifecycleTrace:
     exit_observed_at: float | None = None
     cleanup_started_at: float | None = None
     last_activity_at: float | None = None
-    _requests: deque[dict[str, object]] = field(default_factory=lambda: deque(maxlen=8))
-    _statuses: deque[dict[str, object]] = field(default_factory=lambda: deque(maxlen=8))
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _requests: deque[dict[str, object]] = field(
+        default_factory=lambda: deque(maxlen=8), init=False, compare=False
+    )
+    _statuses: deque[dict[str, object]] = field(
+        default_factory=lambda: deque(maxlen=8), init=False, compare=False
+    )
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     def launch_environment(self, instance_id: str) -> dict[str, str]:
         """Freeze launch-time identifiers; session transfers only change the current owner."""

@@ -26,6 +26,7 @@ from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
+    TerminalExitEvent,
     TerminalLifecycle,
 )
 from omnigent.terminals import TerminalRegistry
@@ -219,7 +220,56 @@ async def test_lifecycle_capture_failure_cannot_prevent_exit_cleanup_or_failure(
     assert launch.terminals.get(_SESSION, "claude", "main") is None
     [row] = _rows(caplog, "required_terminal_exited")
     assert row["attributes"]["lifecycle_capture_failed"] == "true"
+    assert row["attributes"]["lifecycle_capture_error_type"] == "OSError"
     assert "private synthetic error" not in json.dumps(row)
+
+
+async def test_diagnostic_key_collisions_cannot_override_or_block_terminal_failure(
+    launch: _Launch, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    released = asyncio.Event()
+
+    async def release(_self, session_id: str) -> None:
+        assert session_id == _SESSION
+        released.set()
+
+    monkeypatch.setattr(_FakeProcessManager, "release", release)
+    publish_exit = launch.resources._terminal_exit_publisher
+    assert publish_exit is not None
+    publish_exit(
+        TerminalExitEvent(
+            session_id=_SESSION,
+            terminal_id="terminal_claude_main",
+            terminal_name="claude",
+            session_key="main",
+            lifecycle=TerminalLifecycle.REQUIRED,
+            command="claude",
+            exit_status=1,
+            lifecycle_context={
+                "event_name": "wrong_event",
+                "session_id": "wrong_session",
+                "terminal_name": "wrong_terminal",
+                "terminal_exit_status": "0",
+                "error_code": "wrong_code",
+                "error_impact": "wrong_impact",
+                "claude_session_end_reason": "unknown",
+            },
+        )
+    )
+    await asyncio.wait_for(released.wait(), timeout=2)
+    [row] = _rows(caplog, "required_terminal_exited")
+    assert row["session_id"] == _SESSION
+    assert row["attributes"]["terminal_name"] == "claude"
+    assert row["attributes"]["terminal_exit_status"] == "1"
+    assert row["attributes"]["error_code"] == "required_terminal_exited"
+    assert row["attributes"]["error_impact"] == "blocking"
+    assert row["attributes"]["claude_session_end_reason"] == "unknown"
+    assert any(
+        event.get("status") == "failed"
+        and event.get("error", {}).get("code") == "required_terminal_exited"
+        for event in _drain_session_event_queue(_session_event_queues_ref.get(_SESSION))
+    )
 
 
 async def test_old_terminal_exit_does_not_read_replacement_hook_evidence(
