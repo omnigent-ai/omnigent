@@ -166,11 +166,7 @@ class MobilePushService:
 
     async def _deliver_safely(self, delivery: Delivery, *, now: int | None) -> None:
         try:
-            remaining = delivery.lease_deadline - monotonic() - 1
-            if remaining <= 0:
-                raise TimeoutError
-            async with asyncio.timeout(remaining):
-                await self._deliver(delivery, now=now)
+            await self._deliver(delivery, now=now)
         except Exception as error:
             _logger.exception(
                 "Mobile push delivery failed; will retry",
@@ -185,6 +181,21 @@ class MobilePushService:
                 )
 
     async def _deliver(self, delivery: Delivery, *, now: int | None) -> None:
+        remaining = delivery.lease_deadline - monotonic() - 1
+        if remaining <= 0:
+            raise TimeoutError
+        async with asyncio.timeout(remaining):
+            result = await self._send_result(delivery, now=now)
+        assert result.outcome != "refresh"
+        await asyncio.to_thread(
+            self.store.acknowledge,
+            delivery,
+            result.outcome,
+            retry_after=result.retry_after,
+            now=now,
+        )
+
+    async def _send_result(self, delivery: Delivery, *, now: int | None) -> SendResult:
         result = SendResult("discard")
         for _ in range(2):
             token = await self.sender.authorization()
@@ -218,11 +229,4 @@ class MobilePushService:
         if result.outcome == "refresh":
             self.sender.warn_auth_failure(401)
             result = SendResult("discard")
-        assert result.outcome != "refresh"
-        await asyncio.to_thread(
-            self.store.acknowledge,
-            delivery,
-            result.outcome,
-            retry_after=result.retry_after,
-            now=now,
-        )
+        return result
