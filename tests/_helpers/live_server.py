@@ -46,7 +46,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,16 +71,19 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def local_server_env(extra: dict[str, str]) -> dict[str, str]:
+def local_server_env(
+    extra: dict[str, str], *, base_env: Mapping[str, str] | None = None
+) -> dict[str, str]:
     """Use this checkout and local header auth, stripping ambient proxy/auth settings."""
+    source = os.environ if base_env is None else base_env
     pythonpath = [
         str(_REPO_ROOT),
         str(_REPO_ROOT / "sdks" / "python-client"),
         str(_REPO_ROOT / "sdks" / "ui"),
-        *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep)),
+        *filter(None, source.get("PYTHONPATH", "").split(os.pathsep)),
     ]
     env = {
-        **os.environ,
+        **source,
         "PYTHONPATH": os.pathsep.join(pythonpath),
         "NO_PROXY": "127.0.0.1,localhost",
         "no_proxy": "127.0.0.1,localhost",

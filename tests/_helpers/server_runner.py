@@ -18,10 +18,12 @@ from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests._helpers.live_server import find_free_port, local_server_env, terminate_process
 
 
-def _process_env(home: Path, overrides: Mapping[str, str]) -> dict[str, str]:
+def _process_env(
+    home: Path, overrides: Mapping[str, str], base_env: Mapping[str, str] | None
+) -> dict[str, str]:
     if {"HOME", "OMNIGENT_DATA_DIR"} & overrides.keys():
         raise ValueError("HOME and OMNIGENT_DATA_DIR are owned by the isolated stack")
-    env = local_server_env({})
+    env = local_server_env({}, base_env=base_env)
     # A parent runner's identity, zygote FDs and logging paths cannot belong to
     # this fresh runtime. Tests opt into their required settings explicitly.
     for name in list(env):
@@ -48,6 +50,7 @@ class ServerRunner:
         *,
         server_bootstrap: str | None,
         server_env: Mapping[str, str],
+        base_env: Mapping[str, str] | None,
         server_cwd: Path | None,
         workspace: Path | None,
         binding_token: str,
@@ -71,6 +74,7 @@ class ServerRunner:
         self._poll_interval = poll_interval
         self._server_bootstrap = server_bootstrap
         self._server_env = dict(server_env)
+        self._base_env = dict(base_env) if base_env is not None else None
         self._server_cwd = server_cwd
         self.server: subprocess.Popen[bytes] | None = None
         self.runner: subprocess.Popen[bytes] | None = None
@@ -87,7 +91,7 @@ class ServerRunner:
         log = self._resources.enter_context(self.log_path(name).open("ab"))
         proc = subprocess.Popen(
             [sys.executable, *args],
-            env=_process_env(home, env),
+            env=_process_env(home, env, self._base_env),
             cwd=cwd,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -215,6 +219,7 @@ def server_runner(
     *,
     server_bootstrap: str | None = None,
     server_env: Mapping[str, str] | None = None,
+    base_env: Mapping[str, str] | None = None,
     server_cwd: Path | None = None,
     workspace: Path | None = None,
     binding_token: str | None = None,
@@ -224,6 +229,7 @@ def server_runner(
 ) -> Iterator[ServerRunner]:
     """Yield a ready server; explicitly call start_runner with scenario overrides.
 
+    A supplied base_env replaces ambient inheritance for both processes.
     Set wait_ready=False to start both processes before waiting for the runner.
     Cleanup applies even when readiness fails. Detached Omnigent descendants
     are attributed only to this stack's directories, never the whole machine.
@@ -234,6 +240,7 @@ def server_runner(
             resources,
             server_bootstrap=server_bootstrap,
             server_env=server_env or {},
+            base_env=base_env,
             server_cwd=server_cwd,
             workspace=workspace,
             binding_token=binding_token or secrets.token_urlsafe(32),
