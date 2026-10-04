@@ -28,6 +28,7 @@ import logging
 import os
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -514,6 +515,40 @@ async def test_get_client_respawns_after_crash(
             "returncode": -signal.SIGKILL,
             "tracked_response_id": response_id,
         }
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.parametrize("removed", ["sentinel", "instance_dir", "tmp_parent"])
+async def test_get_client_respawn_recreates_instance_dir_and_sentinel(
+    manager: HarnessProcessManager,
+    removed: str,
+) -> None:
+    """A respawn must not depend on start()'s dir and AP_PID sentinel surviving.
+
+    tmp cleaners delete the sentinel first and the emptied ``ap-<uuid>`` dir
+    (or its parent) later; the next spawn has to recreate them.
+    """
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        await _ping_health(client)
+        await manager.release("conv_a")
+        sentinel = manager.instance_dir / _AP_PID_FILE
+        if removed == "sentinel":
+            sentinel.unlink()
+        elif removed == "instance_dir":
+            shutil.rmtree(manager.instance_dir)
+        else:
+            shutil.rmtree(manager.instance_dir.parent)
+        assert not sentinel.exists()
+
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        await _ping_health(client)
+        assert sentinel.read_text(encoding="utf-8").strip() == str(os.getpid())
+        if sys.platform != "win32":
+            for path in (manager.instance_dir, manager.instance_dir.parent):
+                assert stat.S_IMODE(path.stat().st_mode) == 0o700, path
     finally:
         await manager.shutdown()
 

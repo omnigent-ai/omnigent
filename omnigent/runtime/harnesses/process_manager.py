@@ -686,13 +686,7 @@ class HarnessProcessManager:
             # Sweep BEFORE creating our own dir, so a crashed prior instance
             # whose dir uuid happens to collide with ours gets cleaned first.
             await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
-        self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Write the AP_PID sentinel so other instances' sweeps can
-        # tell our dir is live. Strict ``"x"`` because the dir is
-        # exclusively ours; a pre-existing sentinel would mean the
-        # uuid collided with a still-running instance — fail loud.
-        sentinel = self._instance_dir / _AP_PID_FILE
-        sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        self._ensure_instance_dir()
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -703,6 +697,24 @@ class HarnessProcessManager:
             "HarnessProcessManager started; instance_dir=%s",
             self._instance_dir,
         )
+
+    def _ensure_instance_dir(self) -> bool:
+        """
+        Create the per-instance dir and its AP_PID sentinel when missing.
+
+        tmp cleaners (macOS ``com.apple.tmp_cleaner``, systemd-tmpfiles) delete
+        the sentinel and then the emptied dir on long-lived runners, so a spawn
+        cannot rely on :meth:`start` having created them.
+
+        :returns: True if the dir or sentinel had to be (re)created.
+        """
+        sentinel = self._instance_dir / _AP_PID_FILE
+        if sentinel.is_file():
+            return False
+        self._tmp_parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        self._instance_dir.mkdir(mode=_DIR_MODE, exist_ok=True)
+        sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        return True
 
     async def get_client(
         self,
@@ -1233,6 +1245,14 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
+        if self._ensure_instance_dir():
+            _logger.warning(
+                "harness instance dir %s or its %s sentinel went missing "
+                "(tmp cleaner?); recreated before spawning for conversation %s",
+                self._instance_dir,
+                _AP_PID_FILE,
+                conversation_id,
+            )
         endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)
