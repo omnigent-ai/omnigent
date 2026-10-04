@@ -149,6 +149,13 @@ class ServerRunner:
         )
         self._wait_ready()
 
+    def restart_server(self) -> None:
+        """Clear in-memory server state and await the existing runner's reconnect."""
+        terminate_process(self.server)
+        self.start_server()
+        if self.runner is not None:
+            self._wait_ready(runner=True)
+
     def start_runner(
         self, *, bootstrap: str | None = None, env: Mapping[str, str] | None = None
     ) -> None:
