@@ -258,7 +258,7 @@ const MODEL_VIEWER_THEMES: Record<ResolvedThemeMode, ModelViewerTheme> = {
  * Map the app's resolved palette to the 3D model preview's appearance.
  *
  * @param resolved Concrete mode from `normalizeResolvedTheme`, e.g. `"dark"`.
- * @returns The background/material/light values for that mode.
+ * @returns The STL material and light values for that mode.
  */
 export function modelViewerTheme(resolved: ResolvedThemeMode): ModelViewerTheme {
   return MODEL_VIEWER_THEMES[resolved];
