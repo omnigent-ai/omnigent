@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from pathlib import Path
 
 from omnigent.host.mcp_inventory import _servers_in, _summary
 from omnigent.spec.parser import _discover_skills
@@ -27,9 +26,9 @@ def _text(value: object, limit: int) -> str | None:
 
 
 def discover_plugins() -> list[dict[str, object]]:
-    """List installed plugins in the same home scope as the Harnesses inventory."""
+    """List installed plugins using the same user scope as the MCP inventory."""
     ctx = replace(
-        skill_source_context_from_env(roots=(Path.home(),), harness="claude-native"),
+        skill_source_context_from_env(roots=(), harness="claude-native"),
         is_native=True,
     )
     enabled = _enabled_plugin_keys(ctx)

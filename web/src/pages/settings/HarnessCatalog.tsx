@@ -80,7 +80,7 @@ export function HarnessCatalog({
     searchParams.get("tab") === "settings" ? "settings" : "mcps",
   );
   const [open, setOpen] = useState<OpenPlugin | null>(null);
-  const inventory = useHarnessInventory(host, { includePluginMetadata: true });
+  const inventory = useHarnessInventory(host, { includePluginMetadata: family === "claude" });
   const back = () => setOpen(null);
 
   const { context, unavailable } = inventory;

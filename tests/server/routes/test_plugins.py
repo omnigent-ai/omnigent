@@ -85,6 +85,7 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
     "result,status",
     [
         (HostPluginsResultFrame("", "ok", plugins=_PLUGINS), 200),
+        (HostPluginsResultFrame("", "ok", plugins=None), 502),
         (HostPluginsResultFrame("", "failed", error="lookup failed"), 502),
         # Malformed metadata fails without echoing the payload.
         (

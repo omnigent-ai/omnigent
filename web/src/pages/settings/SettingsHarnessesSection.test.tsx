@@ -13,6 +13,7 @@ import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
 
+let pluginMetadataRequested = false;
 const STARTUP: HarnessStartup = {
   command: "claude",
   resolved_path: "/opt/bin/claude",
@@ -62,7 +63,10 @@ const INVENTORY: HarnessInventory = {
 let inventory: HarnessInventory = INVENTORY;
 vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
   ...(await importActual()),
-  useHarnessInventory: () => inventory,
+  useHarnessInventory: (_host: Host, options: { includePluginMetadata: boolean }) => {
+    pluginMetadataRequested = options.includePluginMetadata;
+    return inventory;
+  },
 }));
 
 // The "Set up" button is gated on the harness_install feature (like New Chat),
@@ -396,3 +400,12 @@ it("shows installed plugin metadata and disabled bundled servers", () => {
     "true",
   );
 });
+
+it.each(["codex-native", "cursor-native"])(
+  "does not request Claude plugin metadata on %s",
+  (harness) => {
+    hosts = [{ ...ONLINE, configured_harnesses: { [harness]: true } }];
+    renderHarnesses(harness);
+    expect(pluginMetadataRequested).toBe(false);
+  },
+);

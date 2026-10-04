@@ -41,6 +41,10 @@ def test_installed_plugins_scope_metadata_and_secrets(
         config / "settings.local.json",
         {"enabledPlugins": {"disabled@market": False, "managed@market": False}},
     )
+    _json(
+        tmp_path / ".claude" / "settings.local.json",
+        {"enabledPlugins": {"tools@market": False, "disabled@market": True}},
+    )
     tools = root / "cache" / "tools"
     (tools / "skills" / "review").mkdir(parents=True)
     (tools / "skills" / "review" / "SKILL.md").write_text(
