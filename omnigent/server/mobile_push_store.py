@@ -324,40 +324,6 @@ class MobilePushStore:
         self, session_id: str, *, prompts_only: bool = False, terminal_only: bool = False
     ) -> None:
         prompt_kind = encode_mobile_push_kind("needs_input")
-        with self._session("find_obsolete_notification_intents") as session:
-            root_id = self._root(session, session_id)
-            candidates = [session_id]
-            if root_id is not None and root_id != session_id and not terminal_only:
-                candidates.append(root_id)
-            for candidate in candidates:
-                query = select(SqlMobilePushOutbox.id).where(
-                    SqlMobilePushOutbox.workspace_id == current_workspace_id(),
-                    SqlMobilePushOutbox.session_id == candidate,
-                )
-                if prompts_only or candidate != session_id:
-                    query = query.where(SqlMobilePushOutbox.kind == prompt_kind)
-                elif terminal_only:
-                    query = query.where(
-                        SqlMobilePushOutbox.kind.in_(
-                            (
-                                encode_mobile_push_kind("completed"),
-                                encode_mobile_push_kind("failed"),
-                            )
-                        )
-                    )
-                if (
-                    session.scalar(
-                        query.order_by(
-                            SqlMobilePushOutbox.kind,
-                            SqlMobilePushOutbox.delivered,
-                            SqlMobilePushOutbox.id,
-                        ).limit(1)
-                    )
-                    is not None
-                ):
-                    break
-            else:
-                return
 
         def write(session: Session) -> None:
             root_id = self._root(session, session_id)
