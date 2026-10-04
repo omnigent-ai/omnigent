@@ -97,31 +97,41 @@ function initialLoadState(data: FileContentResponse): LoadState {
     : { phase: "processing" };
 }
 
+function loadLabel(state: LoadState): string {
+  return state.phase === "downloading" ? "Downloading model…" : "Preparing model…";
+}
+
+function downloadDetail({ receivedBytes, totalBytes }: WorkspaceFileDownloadProgress) {
+  if (totalBytes !== null && receivedBytes <= totalBytes) {
+    const percent = Math.floor((receivedBytes / totalBytes) * 100);
+    return {
+      percent,
+      detail: `${percent}% · ${formatBytes(receivedBytes)} of ${formatBytes(totalBytes)}`,
+    };
+  }
+  return {
+    percent: null,
+    detail: receivedBytes > 0 ? `${formatBytes(receivedBytes)} received` : null,
+  };
+}
+
 // Resolves after the next paint, so a status change shows before a long synchronous parse.
 function afterNextPaint(): Promise<void> {
+  // A hidden tab never paints; waiting would only defer the parse until the user returns.
+  if (document.visibilityState === "hidden") return Promise.resolve();
   return new Promise((resolve) => {
     requestAnimationFrame(() => setTimeout(resolve, 0));
   });
 }
 
 function ModelLoadingOverlay({ state }: { state: LoadState }) {
-  let percent: number | null = null;
-  let detail: string | null = null;
-  if (state.phase === "downloading") {
-    const { receivedBytes, totalBytes } = state;
-    if (totalBytes !== null && receivedBytes <= totalBytes) {
-      percent = Math.floor((receivedBytes / totalBytes) * 100);
-      detail = `${percent}% · ${formatBytes(receivedBytes)} of ${formatBytes(totalBytes)}`;
-    } else if (receivedBytes > 0) {
-      detail = `${formatBytes(receivedBytes)} received`;
-    }
-  }
+  const { percent, detail } =
+    state.phase === "downloading" ? downloadDetail(state) : { percent: null, detail: null };
   return (
     <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-background/80 p-8 text-center text-muted-foreground text-ui">
       <Spinner className="size-5" aria-hidden="true" />
-      <p role="status" aria-live="polite">
-        {state.phase === "downloading" ? "Downloading model…" : "Preparing model…"}
-      </p>
+      {/* Announced through the viewer's live region; this copy is visual only. */}
+      <p aria-hidden="true">{loadLabel(state)}</p>
       {percent !== null && (
         // The shared Progress wrapper drives only the bar, so the ARIA value is set here.
         <Progress
@@ -363,6 +373,10 @@ export function ModelViewer({
   const containerRef = useRef<HTMLDivElement>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<LoadState | null>(() => initialLoadState(data));
+  // Screen readers skip text that a live region already holds when it mounts, so
+  // the region mounts empty and receives the label on the next commit.
+  const [liveRegionReady, setLiveRegionReady] = useState(false);
+  useEffect(() => setLiveRegionReady(true), []);
 
   // Theme comes from the app's shared next-themes source (same hook Monaco and
   // the terminal use). `mode` is a stable "light"|"dark" string, so the theme
@@ -433,6 +447,7 @@ export function ModelViewer({
       }
     };
 
+    let shownProgress: number | string | null = null;
     const load = async () => {
       try {
         // The JSON envelope is sufficient for ordinary files. A truncated
@@ -442,7 +457,12 @@ export function ModelViewer({
           ? await fetchWorkspaceFileBytes(conversationId, path, {
               signal: abortController.signal,
               onProgress: (progress) => {
-                if (!disposed) setLoadState({ phase: "downloading", ...progress });
+                // Re-render per visible percent (or byte count when the total is unknown), not per chunk.
+                const { percent, detail } = downloadDetail(progress);
+                const shown = percent ?? detail;
+                if (disposed || shown === shownProgress) return;
+                shownProgress = shown;
+                setLoadState({ phase: "downloading", ...progress });
               },
             })
           : await fileContentToBlob(data).arrayBuffer();
@@ -541,6 +561,9 @@ export function ModelViewer({
         aria-label={`3D preview of ${filename}`}
         className="absolute inset-0 cursor-grab active:cursor-grabbing"
       />
+      <p role="status" className="sr-only">
+        {liveRegionReady && loadState ? loadLabel(loadState) : ""}
+      </p>
       {loadState && <ModelLoadingOverlay state={loadState} />}
       {errorMessage && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80 p-8 text-center text-muted-foreground text-ui">
