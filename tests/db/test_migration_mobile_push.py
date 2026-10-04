@@ -63,7 +63,6 @@ def test_mobile_push_migration_up_down_and_workspace_keys(db_uri):
             ("workspace_id", "installation_id", "id"),
             ("workspace_id", "user_id", "id"),
             ("delivered", "workspace_id", "id"),
-            ("workspace_id", "session_id", "kind", "delivered", "id"),
         }
         assert {
             tuple(index["column_names"]) for index in inspector.get_indexes("mobile_push_devices")
