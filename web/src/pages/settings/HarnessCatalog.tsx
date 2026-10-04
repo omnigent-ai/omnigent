@@ -1,8 +1,5 @@
 import { useState, type ReactNode } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import * as AccordionPrimitive from "radix-ui/accordion";
-import { ArrowLeftIcon, ChevronRightIcon, PlugIcon, SparkleIcon } from "lucide-react";
+import { ArrowLeftIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -12,10 +9,10 @@ import type { Host } from "@/hooks/useHosts";
 import {
   type InventoryMcpServer,
   type InventoryPlugin,
-  type InventorySkill,
   useHarnessInventory,
 } from "@/hooks/useHarnessInventory";
-import { type CatalogKind, MOCK_SKILL_CONTENT, mockTools } from "./harnessCatalogMocks";
+
+type CatalogKind = "mcps" | "skills" | "plugins";
 
 const KINDS: { id: CatalogKind; label: string; noun: string }[] = [
   { id: "mcps", label: "MCP servers", noun: "MCP servers" },
@@ -23,9 +20,10 @@ const KINDS: { id: CatalogKind; label: string; noun: string }[] = [
   { id: "plugins", label: "Plugins", noun: "plugins" },
 ];
 
-type OpenItem =
-  | { kind: "skills"; item: InventorySkill }
-  | { kind: "plugins"; item: InventoryPlugin; mcps: InventoryMcpServer[] };
+interface OpenPlugin {
+  plugin: InventoryPlugin;
+  mcps: InventoryMcpServer[];
+}
 
 /** "← label" row above a page title: a link when `to` is set, else a button. */
 export function BackButton({
@@ -62,8 +60,8 @@ export function BackButton({
 
 /**
  * MCP servers / Skills / Plugins tabs of a harness, listed from the host, plus a
- * Settings tab showing `settings`. Opening a row replaces the page (header
- * included) with that item's details; Back returns to the same tab.
+ * Settings tab showing `settings`. Opening a plugin replaces the page (header
+ * included) with its skills and MCP servers; Back returns to the Plugins tab.
  */
 export function HarnessCatalog({
   header,
@@ -81,7 +79,7 @@ export function HarnessCatalog({
   const [tab, setTab] = useState<CatalogKind | "settings">(
     searchParams.get("tab") === "settings" ? "settings" : "mcps",
   );
-  const [open, setOpen] = useState<OpenItem | null>(null);
+  const [open, setOpen] = useState<OpenPlugin | null>(null);
   const inventory = useHarnessInventory(host);
   const back = () => setOpen(null);
 
@@ -100,10 +98,7 @@ export function HarnessCatalog({
   const failed = (kind: CatalogKind) =>
     kind === "plugins" ? unavailable.length === 2 : unavailable.includes(kind);
 
-  if (open?.kind === "skills") return <SkillPage skill={open.item} onBack={back} />;
-  if (open?.kind === "plugins") {
-    return <PluginPage plugin={open.item} mcps={open.mcps} onBack={back} />;
-  }
+  if (open) return <PluginPage plugin={open.plugin} mcps={open.mcps} onBack={back} />;
 
   const ownList = (kind: CatalogKind, count: number, list: ReactNode) => {
     const noun = KINDS.find((k) => k.id === kind)?.noun;
@@ -152,49 +147,16 @@ export function HarnessCatalog({
           {ownList(
             "mcps",
             own.mcps.length,
-            // Radix primitives directly: the shared Accordion puts the chevron on
-            // the right and animates; this list wants it leading and instant.
-            <AccordionPrimitive.Root
-              type="multiple"
-              className="flex flex-col rounded-xl border border-border"
-            >
-              {own.mcps.map((server) => {
-                const tools = mockTools(server.name);
-                return (
-                  <AccordionPrimitive.Item
-                    key={server.id}
-                    value={server.id}
-                    className="not-last:border-b"
-                  >
-                    <AccordionPrimitive.Header className="flex">
-                      <AccordionPrimitive.Trigger
-                        className="group flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-4 py-2.5 text-left text-ui outline-none hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50"
-                        data-testid={`catalog-row-${server.name}`}
-                      >
-                        <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground group-aria-expanded:rotate-90" />
-                        <LetterAvatar name={server.name} />
-                        <span className="shrink-0 font-medium text-foreground">{server.name}</span>
-                        <span className="shrink-0 text-muted-foreground">
-                          · {plural(tools.length, "tool")}
-                        </span>
-                        {server.detail && (
-                          <span className="min-w-0 truncate text-muted-foreground">
-                            {server.detail}
-                          </span>
-                        )}
-                      </AccordionPrimitive.Trigger>
-                    </AccordionPrimitive.Header>
-                    <AccordionPrimitive.Content className="pr-4 pb-2.5 pl-10">
-                      <ul className="flex flex-col gap-1 font-mono text-xs text-muted-foreground">
-                        {tools.map((tool) => (
-                          <li key={tool}>{tool}</li>
-                        ))}
-                      </ul>
-                    </AccordionPrimitive.Content>
-                  </AccordionPrimitive.Item>
-                );
-              })}
-            </AccordionPrimitive.Root>,
+            <ul className="flex flex-col gap-2">
+              {own.mcps.map((server) => (
+                <CatalogRow
+                  key={server.id}
+                  icon={<LetterAvatar name={server.name} />}
+                  name={server.name}
+                  detail={server.detail}
+                />
+              ))}
+            </ul>,
           )}
         </TabsContent>
         <TabsContent value="skills">
@@ -208,7 +170,6 @@ export function HarnessCatalog({
                   icon={<SparkleIcon className="size-4 text-muted-foreground" />}
                   name={skill.name}
                   detail={skill.description}
-                  onOpen={() => setOpen({ kind: "skills", item: skill })}
                 />
               ))}
             </ul>,
@@ -227,7 +188,7 @@ export function HarnessCatalog({
                     icon={<PlugIcon className="size-4 text-muted-foreground" />}
                     name={plugin.name}
                     detail={`${plural(plugin.skills.length, "skill")} · ${plural(mcps.length, "MCP")}`}
-                    onOpen={() => setOpen({ kind: "plugins", item: plugin, mcps })}
+                    onOpen={() => setOpen({ plugin, mcps })}
                   />
                 );
               })}
@@ -285,7 +246,9 @@ function CatalogRow({
           {main}
         </button>
       ) : (
-        <div className={mainClass}>{main}</div>
+        <div className={mainClass} data-testid={`catalog-row-${name}`}>
+          {main}
+        </div>
       )}
     </li>
   );
@@ -299,25 +262,6 @@ function LetterAvatar({ name }: { name: string }) {
     >
       {name[0]}
     </span>
-  );
-}
-
-function SkillPage({ skill, onBack }: { skill: InventorySkill; onBack: () => void }) {
-  return (
-    <>
-      <BackButton label="Skills" onClick={onBack} />
-      <h1 className="truncate text-2xl font-semibold">{skill.name}</h1>
-      {skill.description && (
-        <>
-          <h2 className="mt-6 text-ui font-medium">Description</h2>
-          <p className="mt-1 text-ui text-muted-foreground">{skill.description}</p>
-        </>
-      )}
-      <h2 className="mt-6 text-ui font-medium">Contents</h2>
-      <div className="prose prose-sm mt-2 max-w-none rounded-xl border border-border p-5 dark:prose-invert">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{MOCK_SKILL_CONTENT}</ReactMarkdown>
-      </div>
-    </>
   );
 }
 

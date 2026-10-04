@@ -242,29 +242,20 @@ describe("Harness details", () => {
     expect(screen.getByText("AI Gateway")).toBeTruthy();
   });
 
-  it("opens a skill's page and returns to the Skills tab on Back", () => {
+  it("lists MCP servers and skills as plain rows with host-reported details only", () => {
     hosts = [ONLINE];
     renderHarnesses("claude-native");
+
+    // No tool list from the host: no count, nothing to open or expand.
+    const linear = screen.getByTestId("catalog-row-linear");
+    expect(within(linear).getByText("toolkit plugin")).toBeTruthy();
+    expect(linear.tagName).not.toBe("BUTTON");
+    expect(screen.queryByText(/\d+ tools?/)).toBeNull();
 
     selectTab("Skills · 1");
-    fireEvent.click(screen.getByTestId("catalog-row-review"));
-    expect(screen.getByRole("heading", { name: "review" })).toBeTruthy();
-    expect(screen.getByText("Review diffs.")).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
-    expect(screen.getByRole("tab", { name: "Skills · 1" }).getAttribute("aria-selected")).toBe(
-      "true",
-    );
-  });
-
-  it("expands an MCP server in place to list its tools", () => {
-    hosts = [ONLINE];
-    renderHarnesses("claude-native");
-
-    expect(screen.queryByText("search_github")).toBeNull();
-    expect(within(screen.getByTestId("catalog-row-github")).getByText("· 5 tools")).toBeTruthy();
-    fireEvent.click(screen.getByTestId("catalog-row-github"));
-    expect(screen.getByText("search_github")).toBeTruthy();
+    const review = screen.getByTestId("catalog-row-review");
+    expect(within(review).getByText("Review diffs.")).toBeTruthy();
+    expect(review.tagName).not.toBe("BUTTON");
   });
 
   it("shows a plugin's skills and bundled MCP servers", () => {
@@ -277,6 +268,11 @@ describe("Harness details", () => {
     expect(screen.getByRole("heading", { name: "toolkit" })).toBeTruthy();
     expect(screen.getByText("2 skills · 1 MCP")).toBeTruthy();
     expect(screen.getByText("lint")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Plugins" }));
+    expect(screen.getByRole("tab", { name: "Plugins · 1" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
   });
 
   it("shows loading, then a per-tab error for a listing the host couldn't report", () => {
