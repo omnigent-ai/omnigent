@@ -28,6 +28,9 @@ the header menu), and each place is a separate entry point.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app can reconnect a local host
   itself. States: reconnecting (spinner), reconnect failed (retry), host offline.
+- `message-recovery`: a message racing initial runner binding or replacement
+  reaches the available runner without a false failed turn. Native sessions
+  initialize before delivery; SDK sub-agents reuse their loaded session state.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
@@ -58,6 +61,10 @@ custom agent available, first run a session using its spec file.
 in the chat; the dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
 when a local session is stranded). In the desktop app, reconnect acts directly.
+
+**Message recovery:** send the first prompt while a runner is starting, or send
+another message after its runner restarts. Also open a sub-agent's conversation
+and send a follow-up after its parent runner is replaced.
 
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
@@ -140,6 +147,20 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`
+- **`message-recovery`, native binding races (own environment):**
+  `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
+  drives real servers, runners, and Claude/Codex CLIs with a mock model. It
+  covers first binding on a sibling replica and local runner replacement,
+  including explicit retry on the owner and exactly-once prompt/reply checks.
+- **`message-recovery`, host relaunch (server integration, plain `uv run pytest`):**
+  `tests/server/integration/test_session_host_launch.py::test_message_relaunch_classifies_replacement_runner_liveness`
+  distinguishes a replacement live on another replica from a failed launch
+  with an old heartbeat or a local heartbeat. This controls liveness evidence;
+  it does not drive an actual cross-replica host migration.
+- **`message-recovery`, SDK sub-agent (server integration, plain `uv run pytest`):**
+  `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
+  covers recovery during ancestor healing and during the final binding refresh,
+  without initializing the SDK child's already-loaded session again.
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`
 - **`recent-switcher` (manual Electron):** open at least six sessions, hold

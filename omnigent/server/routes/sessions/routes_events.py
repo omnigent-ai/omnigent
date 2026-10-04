@@ -2432,10 +2432,12 @@ def register_events_routes(
                         code=ErrorCode.WRONG_REPLICA,
                     )
                 await _raise_if_runner_re_tunnelled_to_another_replica(
-                    session_id, conv.runner_id, conversation_store
+                    session_id, expected_runner_id, conversation_store
                 )
             conv = fresh_conv
-            _runner_needs_session_init = runner_client is not None
+            _runner_needs_session_init = runner_client is not None and (
+                conv.kind != "sub_agent" or _is_native_terminal_session(conv)
+            )
         if runner_client is None:
             # A native terminal-session message must NOT be silently
             # dropped when no runner is reachable — the runner crashed

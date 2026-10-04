@@ -2145,9 +2145,11 @@ async def test_non_subagent_session_not_healed_via_parent(
     assert not heal_called, "heal must not run for a top-level session"
 
 
-async def test_sdk_subagent_heal_skips_session_init(
+@pytest.mark.parametrize("recovery_path", ["heal", "refresh"])
+async def test_sdk_subagent_recovery_skips_session_init(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    recovery_path: str,
 ) -> None:
     """
     For SDK (non-native) sub-agents, message-send after heal must NOT call
@@ -2187,8 +2189,12 @@ async def test_sdk_subagent_heal_skips_session_init(
         base_url="http://runner",
     )
 
-    async def _heal_spy(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
-        return fake_runner
+    heal_attempted = False
+
+    async def _heal_spy(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient | None:
+        nonlocal heal_attempted
+        heal_attempted = True
+        return fake_runner if recovery_path == "heal" else None
 
     init_called: list[bool] = []
 
@@ -2196,10 +2202,10 @@ async def test_sdk_subagent_heal_skips_session_init(
         init_called.append(True)
         return False
 
-    async def _runner_none(*_a: Any, **_k: Any) -> None:
-        return None
+    async def _runner_after_heal(*_a: Any, **_k: Any) -> httpx.AsyncClient | None:
+        return fake_runner if heal_attempted else None
 
-    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_none)
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_after_heal)
     monkeypatch.setattr(
         routes_events_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
     )
@@ -2214,8 +2220,9 @@ async def test_sdk_subagent_heal_skips_session_init(
     )
 
     assert resp.status_code in {200, 202}, resp.text
+    assert heal_attempted
     assert not init_called, (
-        "_ensure_runner_session_initialized must not be called for SDK sub-agents after heal"
+        "_ensure_runner_session_initialized must not be called for recovered SDK sub-agents"
     )
 
 
