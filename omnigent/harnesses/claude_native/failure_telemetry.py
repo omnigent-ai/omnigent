@@ -29,24 +29,21 @@ def claude_failure_context(
         "native_error_category": entry.get("error"),
     }
     native_agent_id = context["native_agent_id"]
-    context["native_agent_role"] = (
-        "subagent"
-        if (isinstance(native_agent_id, str) and native_agent_id)
-        or entry.get("isSidechain") is True
-        else "session_agent"
-        if entry.get("isSidechain") is False
-        else "unknown"
-    )
-    for container in (message, entry):
-        marker = container.get("isApiErrorMessage")
-        if isinstance(marker, bool):
-            context["native_api_error_message"] = (
-                context.get("native_api_error_message") is True or marker
-            )
+    if (isinstance(native_agent_id, str) and native_agent_id) or entry.get("isSidechain") is True:
+        context["native_agent_role"] = "subagent"
+    elif entry.get("isSidechain") is False:
+        context["native_agent_role"] = "session_agent"
+    else:
+        context["native_agent_role"] = "unknown"
+    markers = [container.get("isApiErrorMessage") for container in (message, entry)]
+    if any(isinstance(marker, bool) for marker in markers):
+        context["native_api_error_message"] = any(marker is True for marker in markers)
     if context.get("native_api_error_message") is True and error_text:
         context["native_error_message"] = error_text
 
-    error = entry.get("error", message.get("error"))
+    error = entry.get("error")
+    if error is None:
+        error = message.get("error")
     envelope = entry
     if isinstance(error, dict):
         context["inference_detail_source"] = "structured_error"

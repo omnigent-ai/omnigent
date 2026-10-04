@@ -227,6 +227,20 @@ def test_api_error_keeps_original_message_before_display_rewriting(tmp_path: Pat
             id="zero-code-is-preserved",
         ),
         pytest.param(
+            {
+                "error": None,
+                "message": {"error": {"code": "stream_lost", "message": "Lost stream"}},
+            },
+            None,
+            {
+                "provider_error_code": "stream_lost",
+                "native_error_message": "Lost stream",
+                "inference_detail_source": "structured_error",
+            },
+            ("native_error_category",),
+            id="null-entry-error-preserves-message-error",
+        ),
+        pytest.param(
             {"isApiErrorMessage": True, "error": {"code": "stream_lost"}},
             "Connection lost mid-response",
             {
