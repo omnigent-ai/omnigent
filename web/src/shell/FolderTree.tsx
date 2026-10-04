@@ -1087,7 +1087,7 @@ function FileRowItem({
                   {formatBytes(bytes)}
                 </span>
               )}
-              <span className="absolute inset-0 flex items-center justify-end gap-px">
+              <span className="absolute inset-0 flex items-center justify-end gap-1">
                 {!isDeleted && conversationId ? (
                   <FileDownloadButton conversationId={conversationId} path={canonicalPath} />
                 ) : (
@@ -1219,7 +1219,7 @@ function SearchDirRow({
                 ROW_MENU_SLOT_CLASS,
               )}
             >
-              <span className="absolute inset-0 flex items-center justify-end gap-0">
+              <span className="absolute inset-0 flex items-center justify-end gap-1">
                 <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
                 <CopyPathButton path={canonicalPath} label="Copy folder path" revealOnHover />
                 {moreActions}
@@ -1407,7 +1407,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
               ROW_MENU_SLOT_CLASS,
             )}
           >
-            <span className="absolute inset-0 flex items-center justify-end gap-px">
+            <span className="absolute inset-0 flex items-center justify-end gap-1">
               <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
               <CopyPathButton path={canonicalPath} label="Copy folder path" revealOnHover />
               {moreActions}

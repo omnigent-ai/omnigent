@@ -208,7 +208,7 @@ function FileListItem({
                   {formatBytes(file.bytes)}
                 </span>
               )}
-              <span className="absolute inset-0 flex items-center justify-end gap-px">
+              <span className="absolute inset-0 flex items-center justify-end gap-1">
                 {hasDownload && conversationId ? (
                   <FileDownloadButton conversationId={conversationId} path={file.path} />
                 ) : (

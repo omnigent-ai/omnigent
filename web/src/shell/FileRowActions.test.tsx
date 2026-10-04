@@ -91,7 +91,9 @@ describe("FileRowActions", () => {
     const row = screen.getByTestId("file-row");
 
     fireEvent.contextMenu(row);
-    const contextMenu = await screen.findByRole("menu");
+    const contextMenu = await screen.findByRole("menu", {
+      name: `More actions for ${file.name}`,
+    });
     const contextLabels = menuLabels(contextMenu);
     expect(contextLabels).toEqual([
       "Download",
