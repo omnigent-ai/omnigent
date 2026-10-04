@@ -13,6 +13,7 @@
 // all released so repeatedly opening model files can't leak GPU memory.
 
 import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
@@ -20,11 +21,15 @@ import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { Progress } from "@/components/ui/progress";
+import { Spinner } from "@/components/ui/spinner";
 import {
   fetchWorkspaceFileBytes,
   type FileContentResponse,
   fileContentToBlob,
+  type WorkspaceFileDownloadProgress,
 } from "@/hooks/useFileContent";
+import { formatBytes } from "./fileStatusUtils";
 import {
   type ModelFormat,
   type ModelViewerTheme,
@@ -80,6 +85,55 @@ function assertSelfContainedGltf(buffer: ArrayBuffer): void {
   if (references.some(({ uri }) => typeof uri === "string" && !/^data:/i.test(uri))) {
     throw new ExternalGltfResourceError();
   }
+}
+
+// What the loading overlay shows until the first render or an error.
+type LoadState =
+  ({ phase: "downloading" } & WorkspaceFileDownloadProgress) | { phase: "processing" };
+
+function initialLoadState(data: FileContentResponse): LoadState {
+  return data.truncated
+    ? { phase: "downloading", receivedBytes: 0, totalBytes: null }
+    : { phase: "processing" };
+}
+
+// Resolves after the next paint, so a status change shows before a long synchronous parse.
+function afterNextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => setTimeout(resolve, 0));
+  });
+}
+
+function ModelLoadingOverlay({ state }: { state: LoadState }) {
+  let percent: number | null = null;
+  let detail: string | null = null;
+  if (state.phase === "downloading") {
+    const { receivedBytes, totalBytes } = state;
+    if (totalBytes !== null && receivedBytes <= totalBytes) {
+      percent = Math.floor((receivedBytes / totalBytes) * 100);
+      detail = `${percent}% · ${formatBytes(receivedBytes)} of ${formatBytes(totalBytes)}`;
+    } else if (receivedBytes > 0) {
+      detail = `${formatBytes(receivedBytes)} received`;
+    }
+  }
+  return (
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-background/80 p-8 text-center text-muted-foreground text-ui">
+      <Spinner className="size-5" aria-hidden="true" />
+      <p role="status" aria-live="polite">
+        {state.phase === "downloading" ? "Downloading model…" : "Preparing model…"}
+      </p>
+      {percent !== null && (
+        // The shared Progress wrapper drives only the bar, so the ARIA value is set here.
+        <Progress
+          value={percent}
+          aria-valuenow={percent}
+          className="w-48 max-w-full"
+          aria-label="Model download progress"
+        />
+      )}
+      {detail && <p className="tabular-nums">{detail}</p>}
+    </div>
+  );
 }
 
 function modelErrorMessage(error: unknown): string {
@@ -308,6 +362,7 @@ export function ModelViewer({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [loadState, setLoadState] = useState<LoadState | null>(() => initialLoadState(data));
 
   // Theme comes from the app's shared next-themes source (same hook Monaco and
   // the terminal use). `mode` is a stable "light"|"dark" string, so the theme
@@ -339,11 +394,13 @@ export function ModelViewer({
     // extension still selects the right loader here.
     const format = getModelFormat(path, data.content_type);
     if (!format) {
+      setLoadState(null);
       setErrorMessage(GENERIC_MODEL_ERROR);
       return;
     }
 
     setErrorMessage(null);
+    setLoadState(initialLoadState(data));
 
     let disposed = false;
     const abortController = new AbortController();
@@ -370,7 +427,10 @@ export function ModelViewer({
       // cleanup return also calls teardownScene, which is idempotent.
       teardownScene(res);
       if (resRef.current === res) resRef.current = null;
-      if (!disposed) setErrorMessage(message);
+      if (!disposed) {
+        setLoadState(null);
+        setErrorMessage(message);
+      }
     };
 
     const load = async () => {
@@ -379,8 +439,17 @@ export function ModelViewer({
         // envelope means the model crossed the server read cap, so use the
         // existing uncapped download stream instead.
         const buffer = data.truncated
-          ? await fetchWorkspaceFileBytes(conversationId, path, { signal: abortController.signal })
+          ? await fetchWorkspaceFileBytes(conversationId, path, {
+              signal: abortController.signal,
+              onProgress: (progress) => {
+                if (!disposed) setLoadState({ phase: "downloading", ...progress });
+              },
+            })
           : await fileContentToBlob(data).arrayBuffer();
+        if (disposed) return;
+        // Commit and paint "Preparing model…" before the parse blocks the main thread.
+        flushSync(() => setLoadState({ phase: "processing" }));
+        await afterNextPaint();
         if (disposed) return;
 
         const { object, stlMaterial } = await parseModel(format, buffer, theme);
@@ -444,6 +513,7 @@ export function ModelViewer({
         };
         res.resizeObserver = new ResizeObserver(onResize);
         res.resizeObserver.observe(container);
+        setLoadState(null);
       } catch (error) {
         fail(modelErrorMessage(error));
       }
@@ -471,6 +541,7 @@ export function ModelViewer({
         aria-label={`3D preview of ${filename}`}
         className="absolute inset-0 cursor-grab active:cursor-grabbing"
       />
+      {loadState && <ModelLoadingOverlay state={loadState} />}
       {errorMessage && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80 p-8 text-center text-muted-foreground text-ui">
           {errorMessage}
