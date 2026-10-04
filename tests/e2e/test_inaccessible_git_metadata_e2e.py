@@ -110,7 +110,7 @@ def runner_under_test(
             base_url=stack.base_url,
             runner_id=stack.runner_id,
             proc=stack.runner,
-            log_path=tmp_path / "runner.log",
+            log_path=stack.log_path("runner"),
         )
 
 

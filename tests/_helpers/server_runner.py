@@ -84,7 +84,7 @@ class ServerRunner:
         *,
         cwd: Path | None = None,
     ) -> subprocess.Popen[bytes]:
-        log = self._resources.enter_context((self.root / f"{name}.log").open("ab"))
+        log = self._resources.enter_context(self.log_path(name).open("ab"))
         proc = subprocess.Popen(
             [sys.executable, *args],
             env=_process_env(home, env),
@@ -94,6 +94,10 @@ class ServerRunner:
         )
         self._resources.callback(terminate_process, proc)
         return proc
+
+    def log_path(self, name: str) -> Path:
+        """Return the captured output path for the server or runner process."""
+        return self.root / f"{name}.log"
 
     def log_tail(self) -> str:
         """Include captured output and rolling process logs in startup failures."""
