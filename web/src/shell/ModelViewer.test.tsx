@@ -57,6 +57,8 @@ interface RendererRecord {
   clearAlpha?: number;
 }
 let lastRenderer: RendererRecord | null = null;
+// The scene's `background`, which three.js paints over the clear color when set.
+let lastScene: { background: unknown } | null = null;
 
 // The mesh's material, exposed so theme tests can assert its color. Set when
 // the STL loader runs (the only format that builds its own material).
@@ -176,7 +178,24 @@ vi.mock("three", () => {
       this.record.contextLost = true;
     }
   }
+  class Color {
+    hex: unknown;
+    constructor(hex?: unknown) {
+      this.hex = hex;
+    }
+  }
   class Scene {
+    // Shared with the test so a scene background is observable after the build.
+    record: { background: unknown } = { background: null };
+    constructor() {
+      lastScene = this.record;
+    }
+    get background() {
+      return this.record.background;
+    }
+    set background(value: unknown) {
+      this.record.background = value;
+    }
     add() {}
     remove() {}
   }
@@ -193,6 +212,7 @@ vi.mock("three", () => {
     Box3,
     PerspectiveCamera,
     WebGLRenderer,
+    Color,
     Scene,
     Mesh,
     MeshStandardMaterial: class {
@@ -259,6 +279,7 @@ beforeEach(() => {
   materialTextures.normalMap = makeTextureRecord();
   parseCalls.length = 0;
   lastRenderer = null;
+  lastScene = null;
   lastMaterial = null;
   themeState.resolvedTheme = "light";
   vi.stubGlobal(
@@ -281,19 +302,21 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-// Whether the canvas paints an opaque clear color (three.js defaults to opaque
-// unless the renderer is created with `alpha: true`).
+// Whether the canvas paints its own background: an opaque clear color (three.js
+// defaults to opaque unless created with `alpha: true`) or a scene background.
 function paintsOwnBackground(record: RendererRecord | null): boolean {
   if (!record) return true;
-  return !record.alpha || (record.clearAlpha ?? 0) > 0;
+  return !record.alpha || (record.clearAlpha ?? 0) > 0 || lastScene?.background != null;
 }
 
-// `bg-*` classes on the canvas host and its ModelViewer wrappers, which would
-// cover the pane's theme background.
-function backgroundClassesAbove(host: HTMLElement): string[] {
+// `bg-*` classes and computed background colors on the canvas host and its
+// ModelViewer wrappers, which would cover the pane's theme background.
+function backgroundsAbove(host: HTMLElement): string[] {
   const found: string[] = [];
   for (let el: HTMLElement | null = host; el && el !== document.body; el = el.parentElement) {
     found.push(...Array.from(el.classList).filter((c) => c.startsWith("bg-")));
+    const color = getComputedStyle(el).backgroundColor;
+    if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") found.push(color);
   }
   return found;
 }
@@ -432,7 +455,7 @@ describe("ModelViewer theme awareness", () => {
     // The canvas is transparent and no wrapper paints its own background, so
     // the pane's theme token shows through; the STL material tracks the theme.
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
-    expect(backgroundClassesAbove(screen.getByLabelText(/3D preview of/))).toEqual([]);
+    expect(backgroundsAbove(screen.getByLabelText(/3D preview of/))).toEqual([]);
     expect(lastMaterial?.color).toBe(light.stlMaterial);
   });
 
