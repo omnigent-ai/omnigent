@@ -359,3 +359,40 @@ describe("Launch settings compatibility", () => {
     expect(startupCalls).toHaveBeenLastCalledWith("h2", "claude-native");
   });
 });
+
+it("shows installed plugin metadata and disabled bundled servers", () => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      plugins: [
+        {
+          id: "claude:hooks@market",
+          harness: "claude",
+          name: "hooks",
+          skills: [],
+          description: "Hook helpers",
+          marketplace: "market",
+          version: "1.2.3",
+          enabled: false,
+          mcp_servers: ["bundled"],
+          has_hooks: true,
+          has_commands: true,
+        },
+      ],
+    },
+  };
+  renderHarnesses("claude-native");
+  selectTab("Plugins · 1");
+  expect(screen.getByTestId("catalog-row-hooks").textContent).toContain("Disabled");
+  fireEvent.click(screen.getByTestId("catalog-row-hooks"));
+  expect(screen.getByText("Hook helpers")).toBeTruthy();
+  expect(screen.getByText(/v1.2.3 · market · Disabled/)).toBeTruthy();
+  selectTab("MCPs · 1");
+  expect(screen.getByTestId("catalog-row-bundled")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Plugins" }));
+  expect(screen.getByRole("tab", { name: "Plugins · 1" }).getAttribute("aria-selected")).toBe(
+    "true",
+  );
+});

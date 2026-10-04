@@ -33,7 +33,7 @@ function serve(routes: Routes) {
       parsed.pathname === "/v1/skills"
         ? `skills:${parsed.searchParams.get("harness")}:${parsed.searchParams.get("path")}`
         : parsed.pathname;
-    const body = routes[key];
+    const body = routes[key] ?? (key.endsWith("/plugins") ? 501 : undefined);
     if (body === undefined) throw new Error(`unexpected request ${url}`);
     if (typeof body === "number") return new Response("{}", { status: body });
     return Response.json(body);
@@ -94,7 +94,10 @@ describe("useHarnessInventory", () => {
       },
     });
 
-    const { result } = renderHook(() => useHarnessInventory(HOST), { wrapper });
+    const { result } = renderHook(
+      () => useHarnessInventory(HOST, { includePluginMetadata: true }),
+      { wrapper },
+    );
     expect(result.current.status).toBe("loading");
     await waitFor(() => expect(result.current.status).toBe("ready"));
 
@@ -131,7 +134,10 @@ describe("useHarnessInventory", () => {
       "/v1/hosts/host_1/mcp-servers": { mcp_servers: [] },
     });
     const host = { ...HOST, gateway_inference: null };
-    const { result } = renderHook(() => useHarnessInventory(host), { wrapper });
+    const { result } = renderHook(
+      () => useHarnessInventory(host, { includePluginMetadata: true }),
+      { wrapper },
+    );
     await waitFor(() => expect(result.current.status).toBe("ready"));
     expect(result.current.context.credentials).toEqual([
       { harness: "claude", source: "Signed in" },
@@ -145,9 +151,12 @@ describe("useHarnessInventory", () => {
       "skills:codex-native:~": 502,
       "/v1/hosts/host_1/mcp-servers": 501,
     });
-    const { result } = renderHook(() => useHarnessInventory(HOST), { wrapper });
+    const { result } = renderHook(
+      () => useHarnessInventory(HOST, { includePluginMetadata: true }),
+      { wrapper },
+    );
     await waitFor(() => expect(result.current.status).toBe("ready"));
-    expect(result.current.unavailable).toEqual(["mcps", "skills"]);
+    expect(result.current.unavailable).toEqual(["mcps", "skills", "plugins"]);
     expect(result.current.context.skills.map((skill) => skill.name)).toEqual(["review"]);
   });
 
@@ -159,4 +168,82 @@ describe("useHarnessInventory", () => {
     expect(result.current.isEmpty).toBe(true);
     expect(authenticatedFetchMock).not.toHaveBeenCalled();
   });
+});
+
+describe("plugin metadata", () => {
+  it.each([404, 501])("preserves derived plugins on %s", async (status) => {
+    serve({
+      "skills:claude-native:~": { skills: [{ name: "kit:review", description: "" }] },
+      "skills:codex-native:~": { skills: [] },
+      "/v1/hosts/host_1/mcp-servers": { mcp_servers: [] },
+      "/v1/hosts/host_1/plugins": status,
+    });
+    const { result } = renderHook(
+      () => useHarnessInventory(HOST, { includePluginMetadata: true }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    expect(result.current.context.plugins.map((p) => p.name)).toEqual(["kit"]);
+    expect(result.current.unavailable).toEqual([]);
+  });
+
+  it("uses installed metadata including disabled and hook-only plugins, keeping Codex", async () => {
+    const plugin = {
+      harness: "claude",
+      name: "hooks",
+      marketplace: "market",
+      version: "1.2",
+      enabled: false,
+      description: "Hook helpers",
+      skills: [],
+      mcp_servers: [],
+      has_hooks: true,
+      has_commands: false,
+    };
+    serve({
+      "skills:claude-native:~": { skills: [{ name: "stale:review", description: "" }] },
+      "skills:codex-native:~": { skills: [{ name: "codex-kit:review", description: "" }] },
+      "/v1/hosts/host_1/mcp-servers": { mcp_servers: [] },
+      "/v1/hosts/host_1/plugins": { plugins: [plugin] },
+    });
+    const { result } = renderHook(
+      () => useHarnessInventory(HOST, { includePluginMetadata: true }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    expect(result.current.context.plugins).toEqual([
+      { id: "codex:codex-kit", harness: "codex", name: "codex-kit", skills: ["review"] },
+      { ...plugin, id: "claude:hooks@market" },
+    ]);
+  });
+
+  it("reports metadata failures without fabricating Claude metadata", async () => {
+    serve({
+      "skills:claude-native:~": { skills: [{ name: "kit:review", description: "" }] },
+      "skills:codex-native:~": { skills: [] },
+      "/v1/hosts/host_1/mcp-servers": { mcp_servers: [] },
+      "/v1/hosts/host_1/plugins": 502,
+    });
+    const { result } = renderHook(
+      () => useHarnessInventory(HOST, { includePluginMetadata: true }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    expect(result.current.context.plugins).toEqual([]);
+    expect(result.current.unavailable).toEqual(["plugins"]);
+  });
+});
+
+it("keeps import review on active derived assets without fetching installed metadata", async () => {
+  serve({
+    "skills:claude-native:~": { skills: [{ name: "kit:review", description: "" }] },
+    "skills:codex-native:~": { skills: [] },
+    "/v1/hosts/host_1/mcp-servers": { mcp_servers: [] },
+  });
+  const { result } = renderHook(() => useHarnessInventory(HOST), { wrapper });
+  await waitFor(() => expect(result.current.status).toBe("ready"));
+  expect(result.current.context.plugins.map((p) => p.name)).toEqual(["kit"]);
+  expect(authenticatedFetchMock.mock.calls.some(([url]) => String(url).endsWith("/plugins"))).toBe(
+    false,
+  );
 });

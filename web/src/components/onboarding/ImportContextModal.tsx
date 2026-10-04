@@ -154,6 +154,7 @@ function AssetRows({ list }: { list: AssetList }) {
 const UNAVAILABLE_LABEL: Record<InventoryAssetKind, string> = {
   mcps: "MCP servers",
   skills: "skills and plugins",
+  plugins: "plugins",
 };
 
 /** Names the asset kinds the host couldn't report, e.g. "Couldn't read MCP servers". */

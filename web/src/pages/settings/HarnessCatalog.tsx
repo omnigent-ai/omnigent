@@ -80,7 +80,7 @@ export function HarnessCatalog({
     searchParams.get("tab") === "settings" ? "settings" : "mcps",
   );
   const [open, setOpen] = useState<OpenPlugin | null>(null);
-  const inventory = useHarnessInventory(host);
+  const inventory = useHarnessInventory(host, { includePluginMetadata: true });
   const back = () => setOpen(null);
 
   const { context, unavailable } = inventory;
@@ -92,11 +92,17 @@ export function HarnessCatalog({
     plugins: mine(context.plugins),
   };
   const pluginMcps = (plugin: InventoryPlugin) =>
-    own.mcps.filter((server) => server.plugin === plugin.name);
+    plugin.mcp_servers?.map((name) => ({
+      id: `${plugin.id}:${name}`,
+      name,
+      harness: family,
+      plugin: plugin.name,
+    })) ?? own.mcps.filter((server) => server.plugin === plugin.name);
   const loading = inventory.status === "loading";
-  // Plugins come from both the skill and MCP listings, so they fail only with both.
   const failed = (kind: CatalogKind) =>
-    kind === "plugins" ? unavailable.length === 2 : unavailable.includes(kind);
+    kind === "plugins" && family !== "claude"
+      ? unavailable.includes("skills") && unavailable.includes("mcps")
+      : unavailable.includes(kind);
 
   if (open) return <PluginPage plugin={open.plugin} mcps={open.mcps} onBack={back} />;
 
@@ -187,7 +193,9 @@ export function HarnessCatalog({
                     key={plugin.id}
                     icon={<PlugIcon className="size-4 text-muted-foreground" />}
                     name={plugin.name}
-                    detail={`${plural(plugin.skills.length, "skill")} · ${plural(mcps.length, "MCP")}`}
+                    detail={[pluginDetail(plugin, mcps.length), plugin.description]
+                      .filter(Boolean)
+                      .join(" · ")}
                     onOpen={() => setOpen({ plugin, mcps })}
                   />
                 );
@@ -265,6 +273,20 @@ function LetterAvatar({ name }: { name: string }) {
   );
 }
 
+function pluginDetail(plugin: InventoryPlugin, mcpCount: number) {
+  return [
+    plugin.version && `v${plugin.version}`,
+    plugin.marketplace,
+    plugin.enabled === undefined ? undefined : plugin.enabled ? "Enabled" : "Disabled",
+    plural(plugin.skills.length, "skill"),
+    plural(mcpCount, "MCP"),
+    plugin.has_hooks && "Hooks",
+    plugin.has_commands && "Commands",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 function PluginPage({
   plugin,
   mcps,
@@ -283,11 +305,12 @@ function PluginPage({
         </span>
         <div className="flex min-w-0 flex-col">
           <h1 className="truncate text-2xl font-semibold">{plugin.name}</h1>
-          <span className="text-ui text-muted-foreground">
-            {plural(plugin.skills.length, "skill")} · {plural(mcps.length, "MCP")}
-          </span>
+          <span className="text-ui text-muted-foreground">{pluginDetail(plugin, mcps.length)}</span>
         </div>
       </div>
+      {plugin.description && (
+        <p className="mt-4 text-ui text-muted-foreground">{plugin.description}</p>
+      )}
       <Tabs defaultValue="skills" className="mt-6 gap-4">
         <TabsList variant="line" className="w-full justify-start border-b border-border pb-1">
           <TabsTrigger value="skills" className="flex-none">

@@ -20,6 +20,7 @@ from omnigent.host.frames import (
     HostImportLocalDoneFrame,
     HostImportLocalSessionChunkFrame,
     HostLaunchRunnerResultFrame,
+    HostPluginsResultFrame,
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
@@ -1348,3 +1349,30 @@ async def test_startup_http_through_real_tunnel(startup_app, monkeypatch, reply,
         assert response.json() == expected
     assert "SECRET" not in response.text
     assert not conn.pending_harness_startup
+
+
+async def test_host_tunnel_routes_plugins_result_to_future(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A plugins_result resolves only its own pending request, and drops it."""
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+
+    loop = asyncio.get_event_loop()
+    mine: asyncio.Future[HostPluginsResultFrame] = loop.create_future()
+    other: asyncio.Future[HostPluginsResultFrame] = loop.create_future()
+    conn.pending_plugins["req_mine"] = mine
+    conn.pending_plugins["req_other"] = other
+
+    result = HostPluginsResultFrame(
+        request_id="req_mine", status="ok", plugins=[{"name": "hooks"}]
+    )
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(result)})
+
+    resolved = await asyncio.wait_for(mine, timeout=budget(2.0))
+    assert resolved.plugins == [{"name": "hooks"}]
+    assert not other.done()
+    assert list(conn.pending_plugins) == ["req_other"]

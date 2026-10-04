@@ -47,6 +47,13 @@ export interface InventoryPlugin {
   harness: BrandHarness;
   /** Its skill names, without the ``plugin:`` prefix. */
   skills: string[];
+  marketplace?: string;
+  version?: string | null;
+  description?: string | null;
+  enabled?: boolean;
+  mcp_servers?: string[];
+  has_hooks?: boolean;
+  has_commands?: boolean;
 }
 
 export interface HarnessInventoryContext {
@@ -56,7 +63,7 @@ export interface HarnessInventoryContext {
   plugins: InventoryPlugin[];
 }
 
-export type InventoryAssetKind = "mcps" | "skills";
+export type InventoryAssetKind = "mcps" | "skills" | "plugins";
 
 export type HarnessInventoryStatus = "loading" | "offline" | "ready";
 
@@ -89,6 +96,19 @@ async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<Mcp
   const body = (await response.json()) as { mcp_servers?: McpServerWire[] };
   if (!Array.isArray(body.mcp_servers)) throw new Error("Invalid host MCP servers response");
   return body.mcp_servers;
+}
+
+type PluginWire = Omit<InventoryPlugin, "id">;
+
+async function fetchPlugins(hostId: string, signal: AbortSignal): Promise<PluginWire[]> {
+  const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/plugins`, {
+    signal,
+  });
+  if (!response.ok)
+    throw new ApiError(`${response.status} ${response.statusText}`, response.status, null);
+  const body = (await response.json()) as { plugins?: PluginWire[] };
+  if (!Array.isArray(body.plugins)) throw new Error("Invalid host plugins response");
+  return body.plugins;
 }
 
 /** Harness families installed on the host; every family when readiness is unknown. */
@@ -185,6 +205,8 @@ const EMPTY_CONTEXT: HarnessInventoryContext = {
 
 interface HarnessInventoryOptions {
   enabled?: boolean;
+  /** Settings includes installed-but-disabled plugins; import review shows active assets. */
+  includePluginMetadata?: boolean;
   /**
    * Report a host that's offline, unlisted, or answering 409 as still
    * loading, for a host that's expected to connect shortly.
@@ -195,7 +217,11 @@ interface HarnessInventoryOptions {
 /** Discover what each harness on *host* carries into Omnigent sessions. */
 export function useHarnessInventory(
   host: Host | null | undefined,
-  { enabled = true, awaitConnection = false }: HarnessInventoryOptions = {},
+  {
+    enabled = true,
+    awaitConnection = false,
+    includePluginMetadata = false,
+  }: HarnessInventoryOptions = {},
 ): HarnessInventory {
   const retry = awaitConnection ? retryWhileConnecting : false;
   const online = enabled && host != null && host.status === "online";
@@ -230,7 +256,24 @@ export function useHarnessInventory(
     retryDelay: CONNECTING_RETRY_MS,
   });
 
-  const loading = online && (mcpQuery.isPending || skills.pending);
+  const pluginsQuery = useQuery({
+    queryKey: ["host-plugins", host?.host_id],
+    queryFn:
+      online && includePluginMetadata
+        ? ({ signal }) => fetchPlugins(host.host_id, signal)
+        : skipToken,
+    staleTime: 30_000,
+    retry,
+    retryDelay: CONNECTING_RETRY_MS,
+  });
+  const legacyPlugins =
+    !includePluginMetadata ||
+    (pluginsQuery.error instanceof ApiError &&
+      (pluginsQuery.error.status === 404 || pluginsQuery.error.status === 501));
+  const pluginData = pluginsQuery.data;
+  const loading =
+    online &&
+    (mcpQuery.isPending || skills.pending || (includePluginMetadata && pluginsQuery.isPending));
   const mcpData = mcpQuery.data;
   const skillData = skills.data;
   const context = useMemo(() => {
@@ -240,12 +283,28 @@ export function useHarnessInventory(
       skillsByHarness[harness] = skillData[index];
     });
     const servers = (mcpData ?? []).filter((server) => isBrandHarness(server.harness));
-    return buildInventoryContext(host, harnesses, skillsByHarness, servers);
-  }, [online, host, harnesses, mcpData, skillData]);
+    const assembled = buildInventoryContext(host, harnesses, skillsByHarness, servers);
+    // The metadata endpoint covers Claude; other families keep their existing inventory.
+    if (!legacyPlugins) {
+      assembled.plugins = assembled.plugins.filter((plugin) => plugin.harness !== "claude");
+      for (const plugin of pluginData ?? []) {
+        if (plugin.harness !== "claude" || !harnesses.includes("claude")) continue;
+        assembled.plugins.push({ ...plugin, id: `claude:${plugin.name}@${plugin.marketplace}` });
+      }
+    }
+    return assembled;
+  }, [online, host, harnesses, mcpData, skillData, pluginData, legacyPlugins]);
 
   const unavailable: InventoryAssetKind[] = [];
   if (online && mcpQuery.isError) unavailable.push("mcps");
   if (online && skills.failed) unavailable.push("skills");
+  if (
+    online &&
+    includePluginMetadata &&
+    (legacyPlugins ? mcpQuery.isError && skills.failed : pluginsQuery.isError)
+  ) {
+    unavailable.push("plugins");
+  }
   return {
     status: !online
       ? enabled && awaitConnection
