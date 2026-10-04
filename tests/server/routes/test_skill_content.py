@@ -1,4 +1,4 @@
-"""The harness startup route is owner-only and fails fast for older hosts."""
+"""The skill content route is owner-only and fails fast for older hosts."""
 
 from __future__ import annotations
 

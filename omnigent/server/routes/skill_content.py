@@ -29,9 +29,13 @@ class SkillContentResponse(BaseModel):
     model_config = ConfigDict(strict=True)
 
     name: str = Field(max_length=1024)
-    description: str = Field(max_length=8192)
+    description: str = Field(
+        max_length=8192, description="Skill description, capped at 8192 characters."
+    )
     content: str = Field(max_length=MAX_SKILL_CONTENT_BYTES)
-    truncated: bool
+    truncated: bool = Field(
+        description="Whether the SKILL.md body exceeded the 256 KiB UTF-8 limit."
+    )
 
     @field_validator("content")
     @classmethod

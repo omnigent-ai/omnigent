@@ -2353,7 +2353,7 @@ def test_skill_content_allow_list_and_correlated_malformed_result():
         "content": "body",
         "truncated": False,
     }
-    assert frame.error is None
+    assert frame.error == "private"
     payload["skill"]["truncated"] = "yes"
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostSkillContentResultFrame)

@@ -2795,6 +2795,7 @@ def _decode_skill_content_result(msg: _JsonObject) -> HostSkillContentResultFram
             request_id=request_id,
             status=_required_str(msg, "status"),
             skill=skill,
+            error=_optional_nullable_str(msg, "error"),
         )
     except ValueError:
         return HostSkillContentResultFrame(
