@@ -132,7 +132,7 @@ def credential_less_codex_rig(
     ) as stack:
         # Preserve cwd fallback: this rig has no runner-wide workspace.
         stack.start_runner(cwd=_REPO_ROOT, env={**env, "OMNIGENT_RUNNER_WORKSPACE": None})
-        yield stack.base_url, stack.runner_id, work / "runner.log"
+        yield stack.base_url, stack.runner_id, stack.log_path("runner")
 
 
 def _spec_bundle() -> bytes:

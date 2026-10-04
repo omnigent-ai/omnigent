@@ -113,6 +113,7 @@ def codex_budget_rig(
             headers={"x-omnigent-background-session-titles": "off"},
         ) as client,
     ):
+        assert stack.runner_home == native_home, "native configuration must match runner HOME"
         stack.start_runner(cwd=_REPO, env=env)
         yield client, workspace, stack.runner_id, mock_url
 

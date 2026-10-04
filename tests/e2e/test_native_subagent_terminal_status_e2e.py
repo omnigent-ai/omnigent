@@ -156,6 +156,7 @@ def rig(
             },
         ) as client,
     ):
+        assert stack.runner_home == native_home, "native configuration must match runner HOME"
         stack.start_runner(cwd=_REPO, env=env)
         yield client, stack.runner_id, mock_url
 
