@@ -373,10 +373,13 @@ export function ModelViewer({
   const containerRef = useRef<HTMLDivElement>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<LoadState | null>(() => initialLoadState(data));
-  // Screen readers skip text that a live region already holds when it mounts, so
-  // the region mounts empty and receives the label on the next commit.
+  // Screen readers skip text a live region already holds when it mounts. A mount from a
+  // click flushes effects in the same task, so the label waits for the next task.
   const [liveRegionReady, setLiveRegionReady] = useState(false);
-  useEffect(() => setLiveRegionReady(true), []);
+  useEffect(() => {
+    const timer = setTimeout(() => setLiveRegionReady(true), 0);
+    return () => clearTimeout(timer);
+  }, []);
 
   // Theme comes from the app's shared next-themes source (same hook Monaco and
   // the terminal use). `mode` is a stable "light"|"dark" string, so the theme
