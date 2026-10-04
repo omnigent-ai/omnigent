@@ -46,6 +46,8 @@ def test_host_mcp_tools(live_server: str, tmp_path: Path) -> None:
     env = {key: value for key, value in os.environ.items() if not key.startswith("OMNIGENT")}
     env.update(
         {
+            "HOME": str(tmp_path),
+            "USERPROFILE": str(tmp_path),
             "OMNIGENT_CONFIG_HOME": str(config),
             "OMNIGENT_DATA_DIR": str(tmp_path / "data"),
             "CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),

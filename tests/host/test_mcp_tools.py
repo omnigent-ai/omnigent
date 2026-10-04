@@ -18,6 +18,7 @@ from pathlib import Path
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
 Path(os.environ["PID_FILE"]).write_text(json.dumps([os.getpid(), child.pid]))
 print("synthetic-stderr-secret", file=sys.stderr, flush=True)
+filler = os.environ.get("FILLER", "x")
 if os.environ.get("HANG"):
     time.sleep(120)
 for line in sys.stdin:
@@ -30,7 +31,7 @@ for line in sys.stdin:
     elif message["method"] == "tools/list":
         second = message.get("params", {}).get("cursor") == "page2"
         result = {"tools": [{
-            "name": "tool\\x00"+str(i)+"x"*300, "description": "Read\\n"+"d"*400,
+            "name": "tool\\x00"+str(i)+filler*300, "description": "Read\\n"+filler*400,
             "inputSchema": {"type": "object", "description": "synthetic-schema-secret"}
         } for i in range(300 if not second else 220)]}
         if not second:
@@ -73,10 +74,11 @@ def _assert_reaped(tmp_path):
         assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
 
 
+@pytest.mark.parametrize("filler", ["x", "😀"])
 async def test_stdio_caps_pagination_private_output_and_cleanup(
-    tmp_path, monkeypatch, caplog, capfd
+    tmp_path, monkeypatch, caplog, capfd, filler
 ):
-    entry = _stdio(tmp_path)
+    entry = _stdio(tmp_path, FILLER=filler)
     monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [entry])
     result = await HostMcpTools().probe("claude", "docs")
     assert result["connection"] == "connected"

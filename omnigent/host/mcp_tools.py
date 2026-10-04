@@ -203,7 +203,8 @@ async def _probe_worker(payload: str) -> McpProbeResult:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
         env=env,
-        limit=2 * 1024 * 1024,
+        # Escaped astral Unicode uses up to 12 bytes per capped character.
+        limit=4 * 1024 * 1024,
         **spawn_kwargs(),
     )
     remember_process_group(process)
