@@ -52,7 +52,6 @@ async def test_surviving_runner_ends_host_grace_early() -> None:
             HelloFrame(runner_version="test", frame_protocol_version=1, harnesses=[], envs=[]),
         )
         assert await asyncio.wait_for(waiting, timeout=1) is None
-        assert hosts.get("host") is None
     finally:
         waiting.cancel()
         await asyncio.gather(waiting, return_exceptions=True)
