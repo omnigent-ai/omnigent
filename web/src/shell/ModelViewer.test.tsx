@@ -797,6 +797,28 @@ describe("ModelViewer loading state", () => {
     expect(screen.queryByText(/Preparing model/)).toBeNull();
   });
 
+  it("shows only the error overlay for an unsupported model format", async () => {
+    render(
+      <ModelViewer
+        data={makeData({ path: "part.xyz", content_type: "application/octet-stream" })}
+        path="part.xyz"
+        conversationId="conv_1"
+      />,
+    );
+    expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
+
+    // Let the delayed status-region fill run before checking it stayed empty.
+    await act(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(resolve, 0);
+        }),
+    );
+    expect(screen.getByRole("status").textContent).toBe("");
+    expect(screen.queryByText(/Preparing model/)).toBeNull();
+    expect(parseCalls).toEqual([]);
+  });
+
   it("leaves no overlay or parse after unmounting mid-download", async () => {
     const downloads = holdDownloads();
     const { unmount } = render(
