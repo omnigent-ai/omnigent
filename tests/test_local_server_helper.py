@@ -51,6 +51,7 @@ def test_stack_startup_failure_closes_started_processes(
     monkeypatch.setenv("OMNIGENT_RUNNER_ID", "parent-must-not-leak")
     monkeypatch.setenv("OMNIGENT_RUNNER_ZYGOTE_HARNESS_FD", "9999")
     monkeypatch.setenv("OMNIGENT_PROCESS_LOG_FILE", str(tmp_path / "parent.log"))
+    monkeypatch.setenv("REMOVE_TEST_SETTING", "parent")
     monkeypatch.setenv("OPENAI_API_KEY", "ambient-test-marker")
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "ambient-imports"))
     fail = f"""
@@ -61,6 +62,7 @@ assert "OMNIGENT_PROCESS_LOG_FILE" not in os.environ
 assert (os.environ.get("OPENAI_API_KEY") == "ambient-test-marker") is {inherit_env}
 assert ("ambient-imports" in os.environ["PYTHONPATH"]) is {inherit_env}
 assert os.environ["EXPLICIT_TEST_SETTING"] == "kept"
+assert "REMOVE_TEST_SETTING" not in os.environ
 print("stack-startup-marker", flush=True)
 raise SystemExit(23)
 """
@@ -69,13 +71,15 @@ raise SystemExit(23)
             tmp_path,
             server_bootstrap=fail if failing_process == "server" else None,
             base_env=None if inherit_env else {"PATH": os.environ["PATH"]},
-            server_env={"EXPLICIT_TEST_SETTING": "kept"},
+            server_env={"EXPLICIT_TEST_SETTING": "kept", "REMOVE_TEST_SETTING": None},
             poll_interval=0.02,
         ) as stack:
             for key in ("HOME", "OMNIGENT_DATA_DIR"):
                 with pytest.raises(ValueError, match="owned by the isolated stack"):
                     stack.start_runner(env={key: str(tmp_path / "outside")})
-            stack.start_runner(bootstrap=fail, env={"EXPLICIT_TEST_SETTING": "kept"})
+            stack.start_runner(
+                bootstrap=fail, env={"EXPLICIT_TEST_SETTING": "kept", "REMOVE_TEST_SETTING": None}
+            )
             pytest.fail("a failed child must not be treated as a ready runner")
     assert "exited with code 23" in str(error.value)
     assert "stack-startup-marker" in str(error.value)

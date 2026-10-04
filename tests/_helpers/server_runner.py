@@ -19,7 +19,7 @@ from tests._helpers.live_server import find_free_port, local_server_env, termina
 
 
 def _process_env(
-    home: Path, overrides: Mapping[str, str], base_env: Mapping[str, str] | None
+    home: Path, overrides: Mapping[str, str | None], base_env: Mapping[str, str] | None
 ) -> dict[str, str]:
     if {"HOME", "OMNIGENT_DATA_DIR"} & overrides.keys():
         raise ValueError("HOME and OMNIGENT_DATA_DIR are owned by the isolated stack")
@@ -36,7 +36,11 @@ def _process_env(
         OMNIGENT_LOCAL_SINGLE_USER="1",
         OMNIGENT_DISABLE_CATALOG_LOOKUP="1",
     )
-    env.update(overrides)
+    for name, value in overrides.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
     return env
 
 
@@ -49,7 +53,7 @@ class ServerRunner:
         resources: ExitStack,
         *,
         server_bootstrap: str | None,
-        server_env: Mapping[str, str],
+        server_env: Mapping[str, str | None],
         base_env: Mapping[str, str] | None,
         server_cwd: Path | None,
         workspace: Path | None,
@@ -84,7 +88,7 @@ class ServerRunner:
         name: str,
         args: list[str],
         home: Path,
-        env: Mapping[str, str],
+        env: Mapping[str, str | None],
         *,
         cwd: Path | None = None,
     ) -> subprocess.Popen[bytes]:
@@ -182,7 +186,7 @@ class ServerRunner:
         self,
         *,
         bootstrap: str | None = None,
-        env: Mapping[str, str] | None = None,
+        env: Mapping[str, str | None] | None = None,
         cwd: Path | None = None,
         python_args: Sequence[str] = (),
         wait_ready: bool = True,
@@ -218,7 +222,7 @@ def server_runner(
     root: Path,
     *,
     server_bootstrap: str | None = None,
-    server_env: Mapping[str, str] | None = None,
+    server_env: Mapping[str, str | None] | None = None,
     base_env: Mapping[str, str] | None = None,
     server_cwd: Path | None = None,
     workspace: Path | None = None,
@@ -230,6 +234,7 @@ def server_runner(
     """Yield a ready server; explicitly call start_runner with scenario overrides.
 
     A supplied base_env replaces ambient inheritance for both processes.
+    Environment overrides set values; None removes a variable.
     Set wait_ready=False to start both processes before waiting for the runner.
     Cleanup applies even when readiness fails. Detached Omnigent descendants
     are attributed only to this stack's directories, never the whole machine.

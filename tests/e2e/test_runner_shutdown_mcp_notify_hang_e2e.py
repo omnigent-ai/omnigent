@@ -143,7 +143,7 @@ def hermes_runner_rig(
                 "OMNIGENT_HERMES_PATH": str(hermes_stub),
                 "HERMES_STUB_STATE_DIR": str(state_dir),
                 # Preserve cwd fallback with no runner-wide filesystem registry.
-                "OMNIGENT_RUNNER_WORKSPACE": "",
+                "OMNIGENT_RUNNER_WORKSPACE": None,
             },
         )
         assert stack.runner is not None
