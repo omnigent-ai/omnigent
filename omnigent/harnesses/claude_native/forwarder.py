@@ -4088,6 +4088,8 @@ async def _forward_available_status_events(
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
                 failure_detail=_stop_failure_detail(record) if status == "failed" else None,
+                # The Stop hook may arrive before its final transcript item is mirrored.
+                output=record.completion_output if status == "idle" else None,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)

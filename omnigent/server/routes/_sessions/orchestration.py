@@ -3164,6 +3164,8 @@ async def _enrich_terminal_status_with_subagent_output(
     to the store, not runner memory, so the text is read here and forwarded
     with the terminal edge.
 
+    An explicit idle output wins over mirrored history, even when empty: the
+    final transcript item may not have reached the store yet.
     Failed or explicitly cancelled turns are filled only when the forwarder
     attached no output of its own. A harness-reported ``failure_detail`` wins
     over the store for failures; fallback text must belong to the current
@@ -3183,6 +3185,8 @@ async def _enrich_terminal_status_with_subagent_output(
         return data
     current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
     existing = data.get("output")
+    if status == "idle" and isinstance(existing, str):
+        return data
     if current_turn_only and isinstance(existing, str) and existing.strip():
         return data
     # The store's latest assistant text can be prose that preceded the error.

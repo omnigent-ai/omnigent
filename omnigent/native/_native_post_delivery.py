@@ -190,7 +190,8 @@ async def post_external_session_status(
     :param status: Session status value, e.g. ``"idle"`` or ``"failed"``.
     :param output: Optional text attached to ``data``. On a ``"failed"`` edge
         the server surfaces it as ``last_task_error`` so the UI shows a detail
-        instead of a bare "failed". Ignored when falsy.
+        instead of a bare "failed". ``None`` omits the field; an empty string
+        explicitly reports a turn without output.
     :param background_task_count: Background tasks (shells) still running at the
         edge, forwarded so the UI can show "N background tasks still running".
         ``None`` omits the field (server leaves its sticky tally untouched) — the
@@ -218,7 +219,7 @@ async def post_external_session_status(
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
-    if output:
+    if output is not None:
         data["output"] = output
     if failure_detail:
         data["failure_detail"] = failure_detail

@@ -949,6 +949,8 @@ class ClaudeHookRecord:
     :param failure_message: ``StopFailure`` error text Claude Code rendered
         for the turn (the payload's ``last_assistant_message``), e.g.
         ``"API Error: 500 Internal server error"``. ``None`` when absent.
+    :param completion_output: Authoritative ``Stop`` reply, including an empty
+        reply. ``None`` when absent or malformed; never truncated here.
     """
 
     event_cursor: int
@@ -972,6 +974,7 @@ class ClaudeHookRecord:
     background_tasks: list[_JsonObject] | None = None
     failure_category: str | None = None
     failure_message: str | None = None
+    completion_output: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3783,6 +3786,11 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             background_tasks = details or None
     failure_category: str | None = None
     failure_message: str | None = None
+    completion_output: str | None = None
+    if event_name == "Stop" and isinstance(payload, dict):
+        raw_output = payload.get("last_assistant_message")
+        if isinstance(raw_output, str):
+            completion_output = raw_output
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
         # The CLI renders this text for its own error, so it reads like the
@@ -3839,6 +3847,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         background_tasks=background_tasks,
         failure_category=failure_category,
         failure_message=failure_message,
+        completion_output=completion_output,
     )
 
 

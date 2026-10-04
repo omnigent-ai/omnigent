@@ -136,3 +136,10 @@ async def test_idle_enrichment_retains_its_existing_behavior() -> None:
         ],
     )
     assert result["output"] == "Completed output"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", ["Final report", ""])
+async def test_idle_preserves_authoritative_output_over_stale_history(output: str) -> None:
+    data = {"status": "idle", "response_id": "resp_current", "output": output}
+    assert await _enrich(data, [_message("assistant", "Earlier progress", "resp_current")]) == data
