@@ -1107,7 +1107,7 @@ async def test_host_reconnect_on_another_replica_redirects_without_failing_input
     session_id = await _offline_native_host_session(client, app)
     set_runner_client(None)
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
-    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.3)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", budget(2.0))
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
     pending = asyncio.create_task(
         client.post(
@@ -1207,6 +1207,104 @@ async def test_concurrent_sends_after_host_reconnect_share_one_launch(
             paths = [request.url.path for request in requests if request.method == "POST"]
             assert paths[0] == "/v1/sessions"
             assert paths.count(f"/v1/sessions/{session_id}/events") == 2
+        finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def test_send_rides_replacement_started_during_host_grace(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A send leaving host grace must join an already-booting replacement."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+    await comm.wait(timeout=budget(5.0))
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", budget(5.0))
+    in_host_grace = asyncio.Event()
+    replacement_started = asyncio.Event()
+    wait_for_host = routes_events._wait_for_host_reconnect
+
+    async def wait_until_replacement_started(*args: Any, **kwargs: Any) -> HostConnection | None:
+        in_host_grace.set()
+        connection = await wait_for_host(*args, **kwargs)
+        await replacement_started.wait()
+        return connection
+
+    monkeypatch.setattr(routes_events, "_wait_for_host_reconnect", wait_until_replacement_started)
+    store = SqlAlchemyConversationStore(db_uri)
+    requests: list[httpx.Request] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(accept), base_url="http://runner"
+    ) as runner:
+
+        async def resolve(sid: str, router: object, **kwargs: Any) -> httpx.AsyncClient | None:
+            conv = kwargs.get("conversation") or store.get_conversation(sid)
+            return runner if app.state.tunnel_registry.get(conv.runner_id) else None
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", resolve)
+        monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+
+        async def send(text: str) -> httpx.Response:
+            return await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                },
+            )
+
+        pending = [asyncio.create_task(send("waiting through host grace"))]
+        try:
+            await asyncio.wait_for(in_host_grace.wait(), timeout=budget(5.0))
+            reconnected = await _connect_host(app)
+            pending.append(asyncio.create_task(send("arriving after reconnect")))
+            launch = await _serve_one_launch(reconnected, launch_status="launched")
+            new_runner_id = token_bound_runner_id(launch.binding_token)
+            assert store.get_conversation(session_id).runner_id == new_runner_id
+
+            # Resume the first send after the second rotated the binding, but
+            # before the replacement tunnel connects. Both must await that runner.
+            replacement_started.set()
+            async with asyncio.timeout(budget(5.0)):
+                while app.state.tunnel_registry.connect_waiter_count(new_runner_id) != 2:
+                    await asyncio.sleep(0.01)
+            app.state.tunnel_registry.register(new_runner_id, _NoopRunnerWS(), _runner_hello())
+            responses = await asyncio.wait_for(asyncio.gather(*pending), timeout=budget(5.0))
+            assert all(response.status_code == 202 for response in responses), [
+                response.text for response in responses
+            ]
+            assert store.get_conversation(session_id).runner_id == new_runner_id
+            assert new_runner_id != session["runner_id"]
+            assert not await _expect_no_launch(reconnected, budget_s=budget(0.2))
+            forwarded = [
+                json.loads(request.content)["content"][0]["text"]
+                for request in requests
+                if request.method == "POST" and request.url.path.endswith("/events")
+            ]
+            assert sorted(forwarded) == [
+                "arriving after reconnect",
+                "waiting through host grace",
+            ]
         finally:
             for task in pending:
                 task.cancel()

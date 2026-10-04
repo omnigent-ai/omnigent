@@ -3548,7 +3548,8 @@ async def _wait_for_host_reconnect(
     Only reads the local registries; no database or network polling. A runner
     reconnect ends the host grace too, so a surviving runner can serve the
     input even while its host daemon remains offline. Callers re-resolve the
-    runner before launching a replacement.
+    runner before launching a replacement. Remote reconnects and changed
+    runner bindings are resolved after this grace and can take the full timeout.
 
     :param host_id: Host whose tunnel must return before a launch is possible.
     :param host_registry: Workspace-scoped registry of host connections.

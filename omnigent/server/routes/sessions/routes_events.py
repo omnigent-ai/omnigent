@@ -2351,6 +2351,8 @@ def register_events_routes(
                         runner_client = await _get_runner_client(
                             session_id, runner_router, conversation=fresh_conv
                         )
+                        # The launch helper needs the original offline binding
+                        # to recognize and join a concurrent replacement launch.
                         if runner_client is not None:
                             conv = fresh_conv
                 if runner_client is None and _host_conn is not None:
