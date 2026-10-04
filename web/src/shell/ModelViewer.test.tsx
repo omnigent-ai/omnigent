@@ -51,7 +51,10 @@ const parseCalls: string[] = [];
 interface RendererRecord {
   disposed: boolean;
   contextLost: boolean;
-  clearColor?: number;
+  // Constructor `alpha` and the last clear alpha: together they decide whether
+  // the canvas paints its own background or lets the pane show through.
+  alpha?: boolean;
+  clearAlpha?: number;
 }
 let lastRenderer: RendererRecord | null = null;
 
@@ -156,13 +159,14 @@ vi.mock("three", () => {
     domElement = document.createElement("canvas");
     // A shared record so tests can assert teardown without aliasing `this`.
     record: RendererRecord = { disposed: false, contextLost: false };
-    constructor() {
+    constructor(opts?: { alpha?: boolean }) {
+      this.record.alpha = opts?.alpha;
       lastRenderer = this.record;
     }
     setPixelRatio() {}
     setSize() {}
-    setClearColor(color: number) {
-      this.record.clearColor = color;
+    setClearColor(_color: number, alpha = 1) {
+      this.record.clearAlpha = alpha;
     }
     render() {}
     dispose() {
@@ -276,6 +280,23 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
+
+// Whether the canvas paints an opaque clear color (three.js defaults to opaque
+// unless the renderer is created with `alpha: true`).
+function paintsOwnBackground(record: RendererRecord | null): boolean {
+  if (!record) return true;
+  return !record.alpha || (record.clearAlpha ?? 0) > 0;
+}
+
+// `bg-*` classes on the canvas host and its ModelViewer wrappers, which would
+// cover the pane's theme background.
+function backgroundClassesAbove(host: HTMLElement): string[] {
+  const found: string[] = [];
+  for (let el: HTMLElement | null = host; el && el !== document.body; el = el.parentElement) {
+    found.push(...Array.from(el.classList).filter((c) => c.startsWith("bg-")));
+  }
+  return found;
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -408,8 +429,10 @@ describe("ModelViewer theme awareness", () => {
     themeState.resolvedTheme = "light";
     render(<ModelViewer data={makeData()} path="part.stl" />);
     await waitFor(() => expect(lastRenderer).not.toBeNull());
-    // Canvas clear color and STL material track the light theme.
-    expect(lastRenderer?.clearColor).toBe(light.background);
+    // The canvas is transparent and no wrapper paints its own background, so
+    // the pane's theme token shows through; the STL material tracks the theme.
+    expect(paintsOwnBackground(lastRenderer)).toBe(false);
+    expect(backgroundClassesAbove(screen.getByLabelText(/3D preview of/))).toEqual([]);
     expect(lastMaterial?.color).toBe(light.stlMaterial);
   });
 
@@ -417,10 +440,9 @@ describe("ModelViewer theme awareness", () => {
     themeState.resolvedTheme = "dark";
     render(<ModelViewer data={makeData()} path="part.stl" />);
     await waitFor(() => expect(lastRenderer).not.toBeNull());
-    expect(lastRenderer?.clearColor).toBe(dark.background);
+    expect(paintsOwnBackground(lastRenderer)).toBe(false);
     expect(lastMaterial?.color).toBe(dark.stlMaterial);
     // Dark theme brightens the lights so the mesh stays legible.
-    expect(dark.background).not.toBe(light.background);
     expect(dark.ambientIntensity).toBeGreaterThan(light.ambientIntensity);
     expect(dark.keyIntensity).toBeGreaterThan(light.keyIntensity);
   });
@@ -432,7 +454,7 @@ describe("ModelViewer theme awareness", () => {
     const stableData = makeData();
     const { rerender } = render(<ModelViewer data={stableData} path="part.stl" />);
     await waitFor(() => expect(lastRenderer).not.toBeNull());
-    expect(lastRenderer?.clearColor).toBe(light.background);
+    expect(paintsOwnBackground(lastRenderer)).toBe(false);
     const rendererBefore = lastRenderer;
     const parsesBefore = parseCalls.length;
 
@@ -440,8 +462,9 @@ describe("ModelViewer theme awareness", () => {
     // recolor in place rather than rebuild (same renderer, no extra parse).
     themeState.resolvedTheme = "dark";
     rerender(<ModelViewer data={stableData} path="part.stl" />);
-    await waitFor(() => expect(lastRenderer?.clearColor).toBe(dark.background));
-    expect(lastMaterial?.color).toBe(dark.stlMaterial);
+    await waitFor(() => expect(lastMaterial?.color).toBe(dark.stlMaterial));
+    // The toggle must not paint an opaque per-mode color over the pane.
+    expect(paintsOwnBackground(lastRenderer)).toBe(false);
     expect(lastRenderer).toBe(rendererBefore);
     expect(parseCalls.length).toBe(parsesBefore);
   });
