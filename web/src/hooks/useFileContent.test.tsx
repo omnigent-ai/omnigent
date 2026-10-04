@@ -371,6 +371,38 @@ describe("fetchWorkspaceFileBytes", () => {
     expect(signal?.aborted).toBe(true);
   });
 
+  it("reports download progress against a known Content-Length", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+        controller.enqueue(new Uint8Array([4, 5, 6]));
+        controller.close();
+      },
+    });
+    fetchMock.mockResolvedValueOnce(new Response(body, { headers: { "Content-Length": "6" } }));
+    const onProgress = vi.fn();
+
+    await fetchWorkspaceFileBytes("sess_123", "model.3mf", { onProgress });
+
+    expect(onProgress.mock.calls.map(([progress]) => progress)).toEqual([
+      { receivedBytes: 0, totalBytes: 6 },
+      { receivedBytes: 3, totalBytes: 6 },
+      { receivedBytes: 6, totalBytes: 6 },
+    ]);
+  });
+
+  it.each([
+    ["no Content-Length", {}],
+    ["a compressed body", { "Content-Length": "2", "Content-Encoding": "gzip" }],
+  ])("reports an unknown total for %s", async (_label, headers) => {
+    fetchMock.mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3, 4]), { headers }));
+    const onProgress = vi.fn();
+
+    await fetchWorkspaceFileBytes("sess_123", "model.3mf", { onProgress });
+
+    expect(onProgress).toHaveBeenLastCalledWith({ receivedBytes: 4, totalBytes: null });
+  });
+
   it("cancels a chunked response as soon as the bounded read crosses the limit", async () => {
     const cancel = vi.fn();
     const body = new ReadableStream<Uint8Array>({

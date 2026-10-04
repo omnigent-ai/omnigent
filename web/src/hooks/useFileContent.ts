@@ -163,9 +163,16 @@ export class WorkspaceFilePreviewTooLargeError extends Error {
   }
 }
 
+export interface WorkspaceFileDownloadProgress {
+  receivedBytes: number;
+  // null when the response does not state its decoded size up front.
+  totalBytes: number | null;
+}
+
 interface FetchWorkspaceFileBytesOptions {
   signal?: AbortSignal;
   maxBytes?: number;
+  onProgress?: (progress: WorkspaceFileDownloadProgress) => void;
 }
 
 /** Fetch bounded workspace bytes through the otherwise uncapped download route. */
@@ -193,6 +200,10 @@ export async function fetchWorkspaceFileBytes(
       throw new WorkspaceFilePreviewTooLargeError(maxBytes);
     }
 
+    // A compressed body's Content-Length counts encoded bytes, not the bytes read below.
+    const knownTotal =
+      contentLength > 0 && !res.headers.get("Content-Encoding") ? contentLength : null;
+
     if (!res.body) {
       const buffer = await res.arrayBuffer();
       if (buffer.byteLength > maxBytes) throw new WorkspaceFilePreviewTooLargeError(maxBytes);
@@ -202,6 +213,7 @@ export async function fetchWorkspaceFileBytes(
     const reader = res.body.getReader();
     const chunks: Uint8Array[] = [];
     let totalBytes = 0;
+    options.onProgress?.({ receivedBytes: 0, totalBytes: knownTotal });
     const readNextChunk = async (): Promise<void> => {
       const { done, value } = await reader.read();
       if (done) return;
@@ -212,6 +224,7 @@ export async function fetchWorkspaceFileBytes(
         throw new WorkspaceFilePreviewTooLargeError(maxBytes);
       }
       chunks.push(value);
+      options.onProgress?.({ receivedBytes: totalBytes, totalBytes: knownTotal });
       await readNextChunk();
     };
     await readNextChunk();
