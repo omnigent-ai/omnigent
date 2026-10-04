@@ -152,6 +152,15 @@ plain `uv run pytest`, which starts a private server for the test.
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It
   covers first binding on a sibling replica and local runner replacement,
   including explicit retry on the owner and exactly-once prompt/reply checks.
+- **`message-recovery`, native host crash (own environment, live model):**
+  `tests/e2e/test_native_host_reconnect_e2e.py::test_native_message_survives_host_restart`
+  uses a real server, host daemon, host-launched runners, and Codex CLI. After
+  a successful tool-using turn it kills the daemon, sends one follow-up, and
+  restarts the same host beyond the ten-second runner grace. The original
+  input must complete its file write exactly once on a new runner, without
+  resending or persisting a failed turn. Requires `codex`, `tmux`,
+  `OMNIGENT_E2E_CODEX_NATIVE=1`, and live `--llm-api-key` credentials (optionally
+  `--profile`). Logs and timing evidence remain in pytest's temporary directory.
 - **`message-recovery`, host relaunch (server integration, plain `uv run pytest`):**
   `tests/server/integration/test_session_host_launch.py::test_message_relaunch_classifies_replacement_runner_liveness`
   distinguishes a replacement live on another replica from a failed launch

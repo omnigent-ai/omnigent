@@ -242,6 +242,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
     _wait_for_host_bound_runner_client,
+    _wait_for_host_reconnect,
     ensure_runner_connected,
 )
 from omnigent.server.schemas import (
@@ -2307,20 +2308,52 @@ def register_events_routes(
                         timeout_s=_sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
                         runner_exit_reports=runner_exit_reports,
                     )
-            # Runner is dead or still not spawned for a host-bound
-            # session. Ask the host to launch one, then re-fetch the
-            # runner client and wait briefly for it to connect before
-            # forwarding the message. This is the relaunch path a
-            # non-sticky Stop relies on: after Stop drops the runner
-            # tunnel, the next message lands here and relaunches the
-            # session on its still-online host. Gated only on host
-            # presence — if the host is offline this falls through to
-            # the RUNNER_UNAVAILABLE raise below, the same as a
-            # disconnected CLI session.
+            # Relaunch on the session's host after runner recovery fails.
+            # An absent host needs its own grace before it can spawn a runner.
             _host_reg = getattr(request.app.state, "host_registry", None)
             if runner_client is None and _host_reg is not None:
                 _host_conn = _host_reg.get(conv.host_id)
-                if _host_conn is not None:
+                if _host_conn is None:
+                    if await _maybe_relaunch_managed_sandbox(
+                        session_id=session_id,
+                        conv=conv,
+                        app_state=request.app.state,
+                        conversation_store=conversation_store,
+                    ):
+                        conv_after_relaunch = await asyncio.to_thread(
+                            conversation_store.get_conversation, session_id
+                        )
+                        if conv_after_relaunch is None:
+                            raise _session_not_found()
+                        conv = conv_after_relaunch
+                        runner_client = await _get_runner_client(session_id, runner_router)
+                    else:
+                        _logger.info(
+                            "Waiting up to %.0fs for host %s to reconnect for session %s",
+                            _sf._HOST_RECONNECT_GRACE_S,
+                            conv.host_id,
+                            session_id,
+                        )
+                        _host_conn = await _wait_for_host_reconnect(
+                            conv.host_id,
+                            _host_reg,
+                            _tunnel_registry,
+                            runner_id=conv.runner_id,
+                            timeout_s=_sf._HOST_RECONNECT_GRACE_S,
+                        )
+                        # A surviving or concurrently replaced runner may have
+                        # connected during the host grace; reuse it if available.
+                        fresh_conv = await asyncio.to_thread(
+                            conversation_store.get_conversation, session_id
+                        )
+                        if fresh_conv is None:
+                            raise _session_not_found()
+                        runner_client = await _get_runner_client(
+                            session_id, runner_router, conversation=fresh_conv
+                        )
+                        if runner_client is not None:
+                            conv = fresh_conv
+                if runner_client is None and _host_conn is not None:
                     launch_attempt = await _launch_runner_on_host(
                         conv,
                         conversation_store,
@@ -2372,26 +2405,11 @@ def register_events_routes(
                             or _host_conn.owner is None
                             or _host_conn.owner == user_id
                         )
-                else:
-                    # The host tunnel is gone entirely. A managed
-                    # host's sandbox is relaunchable — provision a new
-                    # generation under the same host identity and ride
-                    # it; an external (laptop) host falls through to
-                    # the unavailable raise below.
-                    if await _maybe_relaunch_managed_sandbox(
-                        session_id=session_id,
-                        conv=conv,
-                        app_state=request.app.state,
-                        conversation_store=conversation_store,
-                    ):
-                        conv_after_relaunch = await asyncio.to_thread(
-                            conversation_store.get_conversation, session_id
-                        )
-                        if conv_after_relaunch is None:
-                            raise _session_not_found()
-                        conv = conv_after_relaunch
-                        runner_client = await _get_runner_client(session_id, runner_router)
-            if runner_client is None and not relaunched_launch_refused:
+            if (
+                runner_client is None
+                and relaunched_runner_id is not None
+                and not relaunched_launch_refused
+            ):
                 _logger.info(
                     "Waiting up to %.0fs for host %s to spawn a runner for session %s",
                     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
