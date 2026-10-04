@@ -10,13 +10,15 @@ def test_mobile_push_migration_deployment_contract():
     from alembic.script import ScriptDirectory
 
     script = ScriptDirectory.from_config(Config("omnigent/db/alembic.ini"))
-    assert "mp1b2c3d4e5f" in {
+    assert "0ffc4690e229" in {
         ancestor.revision for ancestor in script.iterate_revisions("heads", "base")
     }
-    revision = script.get_revision("mp1b2c3d4e5f")
+    revision = script.get_revision("0ffc4690e229")
     assert revision is not None
-    assert revision.down_revision == "mm1a2b3c4d5e"
-    assert script.get_revision(revision.down_revision) is not None
+    assert revision.down_revision == "mp1b2c3d4e5f"
+    shipped = script.get_revision(revision.down_revision)
+    assert shipped is not None
+    assert shipped.down_revision == "mm1a2b3c4d5e"
     for required in (
         "automatically migrates at startup",
         "deploy schema before feature code",
