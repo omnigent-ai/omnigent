@@ -214,8 +214,6 @@ def _terminal_lifecycle_context(
     try:
         context.update(instance.lifecycle_trace.snapshot())
         context["terminal_exit_signal"] = instance.last_exit_signal()
-        context["terminal_exit_status_source"] = "tmux_pane_dead_status"
-        context["terminal_exit_status_process"] = "launched_command"
         if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
             from omnigent.harnesses.claude_native.bridge import bridge_dir_from_launch_args
             from omnigent.harnesses.claude_native.lifecycle import read_lifecycle_snapshot
@@ -720,15 +718,18 @@ class SessionResourceRegistry:
 
     def _note_terminal_status(self, session_id: str, status: str, source: str) -> None:
         """Attach external status edges to the owning Claude terminal's history."""
-        with contextlib.suppress(Exception):
-            if self._terminal_registry is not None:
-                for entry in self._terminal_registry.list_for_conversation(session_id):
-                    terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
-                    if (
-                        self.terminal_resource_role(session_id, terminal_id)
-                        == CLAUDE_NATIVE_TERMINAL_ROLE
-                    ):
-                        entry.instance.lifecycle_trace.note_status(status, source)
+        if self._terminal_registry is None:
+            return
+        for entry in self._terminal_registry.list_for_conversation(session_id):
+            try:
+                terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+                if (
+                    self.terminal_resource_role(session_id, terminal_id)
+                    == CLAUDE_NATIVE_TERMINAL_ROLE
+                ):
+                    entry.instance.lifecycle_trace.note_status(status, source)
+            except Exception as exc:  # noqa: BLE001 - diagnostics cannot affect status handling.
+                _logger.debug("Terminal status telemetry failed (%s)", type(exc).__name__)
 
     def note_terminal_control_request(self, session_id: str, action: str) -> None:
         """Record explicit runner requests separately from process exit and cleanup."""
@@ -743,6 +744,8 @@ class SessionResourceRegistry:
                 ):
                     continue
                 entry.instance.lifecycle_trace.note_request(action, "runner_request")
+                if not _logger.isEnabledFor(logging.INFO):
+                    continue
                 _logger.info(
                     "Native terminal control requested: %s",
                     action,
@@ -1773,6 +1776,10 @@ class SessionResourceRegistry:
             with contextlib.suppress(Exception):
                 instance.lifecycle_trace.note_exit()
         lifecycle_context = _terminal_lifecycle_context(instance, resource_role)
+        lifecycle_context.update(
+            terminal_exit_status_source="tmux_pane_dead_status",
+            terminal_exit_status_process="launched_command",
+        )
         lifecycle_context["session_turn_active_before_exit"] = str(
             self.session_turn_is_active(session_id)
         ).lower()

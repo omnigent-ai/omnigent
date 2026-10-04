@@ -1309,15 +1309,17 @@ async def test_is_alive_false_when_pane_dead(
 
 @pytest.mark.parametrize("detection", ["is_alive", "async_watcher", "threaded_watcher"])
 @pytest.mark.parametrize(
-    ("final_fields", "expected_status"),
+    ("final_fields", "expected_status", "expected_signal"),
     [
-        ("1|2|", 2),
-        ("1|0|", 0),
-        ("1||TERM", None),
-        ("1||15", None),
-        ("1||", None),
-        ("malformed", None),
-        (None, None),
+        ("1|2|", 2, None),
+        ("1|0|", 0, None),
+        ("1||TERM", None, "SIGTERM"),
+        ("1||15", None, "SIGTERM"),
+        ("1||RTMIN+1", None, "RTMIN+1"),
+        ("1||999", None, "999"),
+        ("1||", None, None),
+        ("malformed", None, None),
+        (None, None, None),
     ],
 )
 async def test_dead_pane_refreshes_pending_wait_status_before_reporting_exit(
@@ -1326,6 +1328,7 @@ async def test_dead_pane_refreshes_pending_wait_status_before_reporting_exit(
     detection: str,
     final_fields: str | None,
     expected_status: int | None,
+    expected_signal: str | None,
 ) -> None:
     """PTY EOF may arrive before tmux has reaped the child and stored its status."""
     instance = TerminalInstance(
@@ -1395,9 +1398,7 @@ async def test_dead_pane_refreshes_pending_wait_status_before_reporting_exit(
 
         assert instance.running is False
         assert instance.last_exit_status() == expected_status
-        assert instance.last_exit_signal() == (
-            "SIGTERM" if final_fields in {"1||TERM", "1||15"} else None
-        )
+        assert instance.last_exit_signal() == expected_signal
         assert instance.last_exit_text() == "safe exit diagnostic"
         assert refresh_calls == (1 if final_fields == "1||" else 2)
         assert reap_requests == (0 if final_fields == "1||" else 1)

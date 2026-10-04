@@ -281,6 +281,8 @@ async def test_runner_request_is_recorded_before_native_control_dispatch(
     assert row["attributes"]["terminal_control_request_action"] == action
     assert float(row["attributes"]["terminal_control_requested_at"]) > 0
     assert "terminal_cleanup_started_at" not in row["attributes"]
+    assert "terminal_exit_status_source" not in row["attributes"]
+    assert "terminal_exit_status_process" not in row["attributes"]
     assert launch.instance.running
 
 
@@ -381,6 +383,8 @@ async def test_explicit_close_and_cleanup_are_distinct_and_sink_json_remains_par
     assert request["attributes"]["terminal_control_request_action"] == "close_terminal"
     assert "terminal_exit_observed_at" not in request["attributes"]
     assert "terminal_cleanup_started_at" not in request["attributes"]
+    assert "terminal_exit_status_source" not in request["attributes"]
+    assert "terminal_exit_status_process" not in request["attributes"]
     assert (
         json.loads(cleanup["attributes"]["terminal_control_requests"])[0]["action"]
         == "close_terminal"

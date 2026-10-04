@@ -1655,6 +1655,9 @@ def prepare_bridge_dir(
     """
     Create or refresh the bridge directory for a native Claude session.
 
+    Per-launch lifecycle files remain available to delayed exit observers until
+    session deletion or the dead-owner sweep removes the bridge directory.
+
     :param conversation_id: Omnigent conversation id, e.g.
         ``"conv_abc123"``.
     :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
@@ -1733,9 +1736,6 @@ def prepare_bridge_dir(
         ):
             with contextlib.suppress(FileNotFoundError):
                 (bridge_dir / filename).unlink()
-        # Preserve per-launch lifecycle files for delayed exit observers. The
-        # session deletion/dead-owner sweep removes them with the bridge directory.
-
         # Owner-pid marker for the periodic dead-owner prune; refreshed every
         # turn so it always names the current runner. See native_bridge_common.
         native_bridge_common.write_owner_pid_marker(bridge_dir)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 import time
@@ -416,6 +417,59 @@ def test_unreadable_evidence_and_recording_failure_do_not_fail_session_end(
     assert output.out == ""
     assert "sensitive exception text" not in output.err
     assert _read(launch)["session_end_reason"] == "unknown"
+
+
+def test_prepare_bridge_dir_preserves_launch_evidence_until_bridge_cleanup(
+    launch: tuple[Path, TerminalLifecycleTrace], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory, _ = launch
+    _hook(monkeypatch, directory, "SessionStart", 100.0, source="startup")
+    _hook(monkeypatch, directory, "SessionEnd", 101.0, reason="logout")
+    original = _read(launch)
+    transient = directory / "server.json"
+    transient.write_text("{}")
+
+    assert bridge.prepare_bridge_dir("session-a", workspace=directory.parent) == directory
+    assert not transient.exists()
+    assert not (directory / "state.json").exists()
+    assert _read(launch) == original
+    assert bridge.prune_orphaned_bridge_dirs() == 0
+
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    assert bridge.prune_orphaned_bridge_dirs() == 1
+    assert not directory.exists()
+    assert _read(launch)["read_status"] == "not_found"
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "directory", "fifo", "oversize"])
+def test_lifecycle_reader_rejects_linked_nonregular_and_oversize_input(
+    launch: tuple[Path, TerminalLifecycleTrace], monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    directory, trace = launch
+    _hook(monkeypatch, directory, "SessionStart", 100.0, source="startup")
+    _hook(monkeypatch, directory, "SessionEnd", 101.0, reason="logout")
+    path = directory / f"lifecycle-{trace.launch_id}.json"
+    if kind == "oversize":
+        path.write_bytes(path.read_bytes().ljust(lifecycle._MAX_BYTES, b" "))
+        assert _read(launch)["session_end_reason"] == "logout"
+        with path.open("ab") as stream:
+            stream.write(b" ")
+    else:
+        target = path.with_name("linked-evidence.json")
+        path.rename(target)
+        if kind == "symlink":
+            path.symlink_to(target)
+        elif kind == "hardlink":
+            path.hardlink_to(target)
+        elif kind == "directory":
+            path.mkdir()
+        else:
+            os.mkfifo(path, 0o600)
+
+    snapshot = _read(launch)
+    assert snapshot["read_status"] == "unreadable"
+    assert snapshot["session_end_reason"] == "unknown"
+    assert snapshot["session_end_evidence"] == "not_observed"
 
 
 def test_generated_session_end_command_records_evidence_in_an_isolated_process(

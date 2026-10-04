@@ -1411,6 +1411,7 @@ class TerminalInstance:
         dead, status, raw_signal = parts
         self._remember_exit_status(f"{dead} {status}")
         if dead == "1" and raw_signal:
+            self._last_exit_signal = raw_signal[:64]
             with contextlib.suppress(ValueError, KeyError):
                 self._last_exit_signal = (
                     signal.Signals(int(raw_signal)).name

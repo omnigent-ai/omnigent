@@ -257,7 +257,7 @@ class TerminalRegistry:
             sandbox_override=sandbox_override,
             conversation_link=self.conversation_link_for_id(conversation_id),
         )
-        created.instance.lifecycle_trace.session_id = conversation_id
+        created.instance.lifecycle_trace.transfer_session(conversation_id)
         await created.instance.launch(cwd=created.cwd)
         if not await created.instance.is_alive():
             created.instance.lifecycle_trace.note_exit()
