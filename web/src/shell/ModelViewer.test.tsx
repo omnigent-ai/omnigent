@@ -1,6 +1,5 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { Profiler } from "react";
-import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileContentResponse, WorkspaceFileDownloadProgress } from "@/hooks/useFileContent";
 
@@ -313,6 +312,19 @@ function makeGlbData(overrides: Partial<FileContentResponse> = {}): FileContentR
 const frameTimers = new Map<number, ReturnType<typeof setTimeout>>();
 let nextFrameId = 0;
 
+function scheduleFrame(callback: FrameRequestCallback): number {
+  nextFrameId += 1;
+  const id = nextFrameId;
+  frameTimers.set(
+    id,
+    setTimeout(() => {
+      frameTimers.delete(id);
+      callback(performance.now());
+    }, 0),
+  );
+  return id;
+}
+
 beforeEach(() => {
   behavior.mode = "valid";
   behavior.orbitThrows = false;
@@ -328,18 +340,7 @@ beforeEach(() => {
   themeState.resolvedTheme = "light";
   fetchWorkspaceFileBytesMock.mockReset();
   fetchWorkspaceFileBytesMock.mockResolvedValue(new ArrayBuffer(8));
-  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
-    nextFrameId += 1;
-    const id = nextFrameId;
-    frameTimers.set(
-      id,
-      setTimeout(() => {
-        frameTimers.delete(id);
-        callback(performance.now());
-      }, 0),
-    );
-    return id;
-  });
+  vi.stubGlobal("requestAnimationFrame", scheduleFrame);
   vi.stubGlobal("cancelAnimationFrame", (id: number) => {
     clearTimeout(frameTimers.get(id));
     frameTimers.delete(id);
@@ -641,20 +642,29 @@ describe("ModelViewer loading state", () => {
 
   it("shows a preparing status from mount and clears it once the model renders", async () => {
     render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
-    expect(screen.getByRole("status").textContent).toBe("Preparing model…");
+    expect(screen.getByText("Preparing model…")).toBeDefined();
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Preparing model…"));
 
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe(""));
     expect(screen.queryByText(/Preparing model/)).toBeNull();
   });
 
-  it("mounts the live region empty so screen readers announce the first label", () => {
-    // Server rendering runs no effects, so it shows exactly what the first commit mounts.
-    const markup = renderToStaticMarkup(
-      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+  it("fills the live region only after the mount task so screen readers announce it", async () => {
+    // A synchronous act() flushes the mount and its effects in one task, like a click.
+    act(() => {
+      render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+    });
+    expect(screen.getByRole("status").textContent).toBe("");
+    expect(screen.getByText("Preparing model…")).toBeDefined();
+
+    await act(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(resolve, 0);
+        }),
     );
-    expect(markup).toContain('<p role="status" class="sr-only"></p>');
-    expect(markup).toContain("Preparing model…");
+    expect(screen.getByRole("status").textContent).toBe("Preparing model…");
   });
 
   it("shows determinate download progress when the total size is known", async () => {
@@ -662,7 +672,7 @@ describe("ModelViewer loading state", () => {
     render(
       <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
     );
-    expect(screen.getByRole("status").textContent).toBe("Downloading model…");
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Downloading model…"));
     await waitFor(() => expect(downloads).toHaveLength(1));
 
     act(() => downloads[0].onProgress?.({ receivedBytes: 512 * 1024, totalBytes: 1024 * 1024 }));
@@ -707,12 +717,16 @@ describe("ModelViewer loading state", () => {
 
   it("commits the preparing label before requesting the pre-parse frame", async () => {
     const downloads = holdDownloads();
-    const statusAtFrameRequest: (string | null)[] = [];
+    const textAtFrameRequest: string[] = [];
+    let framesRun = 0;
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
-      statusAtFrameRequest.push(document.querySelector('[role="status"]')?.textContent ?? null);
-      return setTimeout(() => callback(performance.now()), 0) as unknown as number;
+      textAtFrameRequest.push(document.body.textContent ?? "");
+      return scheduleFrame((time) => {
+        framesRun += 1;
+        callback(time);
+      });
     });
-    render(
+    const { unmount } = render(
       <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
@@ -720,7 +734,15 @@ describe("ModelViewer loading state", () => {
     await act(async () => downloads[0].resolve(new ArrayBuffer(8)));
 
     await waitFor(() => expect(parseCalls).toEqual(["3mf"]));
-    expect(statusAtFrameRequest[0]).toBe("Preparing model…");
+    expect(textAtFrameRequest[0]).toContain("Preparing model…");
+
+    // Teardown must cancel the render loop's pending frame.
+    unmount();
+    const framesAtUnmount = framesRun;
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+    expect(framesRun).toBe(framesAtUnmount);
   });
 
   it("parses without waiting for a frame while the tab is hidden", async () => {
