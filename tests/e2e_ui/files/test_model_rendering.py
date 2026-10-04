@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 
 import httpx
 import pytest
@@ -121,7 +121,7 @@ def seeded_model_session(
     """
     base_url, session_id = seeded_session
     file_path, content = request.param
-    if isinstance(content, Callable):
+    if callable(content):
         content = content()
     file_url = (
         f"{base_url}/v1/sessions/{session_id}"
@@ -202,9 +202,8 @@ def test_large_model_shows_loading_status_until_it_renders(
     expect(preview).to_be_visible(timeout=30_000)
     expect(preview.locator("canvas")).to_be_visible(timeout=120_000)
 
-    # The status element was in the pane when the preview host mounted, before
-    # the canvas was built — DOM presence and timing, not painted visibility
-    # (the painted "Preparing model…" frame is shown in the recordings).
+    # The probe records status presence at host mount, before the canvas was
+    # built — DOM presence and timing, not painted visibility.
     probe = page.evaluate("() => window.__modelLoadProbe")
     assert probe["statusAtHostMount"] == "Preparing model…", probe
 
