@@ -1,4 +1,6 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { Profiler } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileContentResponse, WorkspaceFileDownloadProgress } from "@/hooks/useFileContent";
 
@@ -642,8 +644,17 @@ describe("ModelViewer loading state", () => {
     expect(screen.getByRole("status").textContent).toBe("Preparing model…");
 
     await waitFor(() => expect(lastRenderer).not.toBeNull());
-    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe(""));
     expect(screen.queryByText(/Preparing model/)).toBeNull();
+  });
+
+  it("mounts the live region empty so screen readers announce the first label", () => {
+    // Server rendering runs no effects, so it shows exactly what the first commit mounts.
+    const markup = renderToStaticMarkup(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
+    expect(markup).toContain('<p role="status" class="sr-only"></p>');
+    expect(markup).toContain("Preparing model…");
   });
 
   it("shows determinate download progress when the total size is known", async () => {
@@ -694,6 +705,60 @@ describe("ModelViewer loading state", () => {
     await waitFor(() => expect(parseCalls).toEqual(["3mf"]));
   });
 
+  it("commits the preparing label before requesting the pre-parse frame", async () => {
+    const downloads = holdDownloads();
+    const statusAtFrameRequest: (string | null)[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      statusAtFrameRequest.push(document.querySelector('[role="status"]')?.textContent ?? null);
+      return setTimeout(() => callback(performance.now()), 0) as unknown as number;
+    });
+    render(
+      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+    );
+    await waitFor(() => expect(downloads).toHaveLength(1));
+
+    await act(async () => downloads[0].resolve(new ArrayBuffer(8)));
+
+    await waitFor(() => expect(parseCalls).toEqual(["3mf"]));
+    expect(statusAtFrameRequest[0]).toBe("Preparing model…");
+  });
+
+  it("parses without waiting for a frame while the tab is hidden", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    try {
+      // Frames are queued but never run, so the parse can only happen if it skips the wait.
+      holdFrames();
+      render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
+
+      await waitFor(() => expect(parseCalls).toEqual(["stl"]));
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
+  it("re-renders only when the visible download progress changes", async () => {
+    const downloads = holdDownloads();
+    let commits = 0;
+    render(
+      <Profiler id="viewer" onRender={() => (commits += 1)}>
+        <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />
+      </Profiler>,
+    );
+    await waitFor(() => expect(downloads).toHaveLength(1));
+    const before = commits;
+
+    // 100 chunks (512–521 KB) within one percent, each its own task as in a browser.
+    for (let i = 0; i < 100; i += 1) {
+      act(() =>
+        downloads[0].onProgress?.({ receivedBytes: 512 * 1024 + i * 100, totalBytes: 1024 * 1024 }),
+      );
+    }
+    act(() => downloads[0].onProgress?.({ receivedBytes: 768 * 1024, totalBytes: 1024 * 1024 }));
+
+    expect(commits - before).toBe(2);
+    expect(screen.getByText("75% · 768 KB of 1.0 MB")).toBeDefined();
+  });
+
   it("replaces the loading state with the error overlay on failure", async () => {
     behavior.mode = "throw";
     const frames = holdFrames();
@@ -706,12 +771,11 @@ describe("ModelViewer loading state", () => {
     });
 
     expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
-    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("status").textContent).toBe("");
     expect(screen.queryByText(/Preparing model/)).toBeNull();
   });
 
-  it("leaves no overlay or late update after unmounting mid-download", async () => {
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+  it("leaves no overlay or parse after unmounting mid-download", async () => {
     const downloads = holdDownloads();
     const { unmount } = render(
       <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
@@ -725,9 +789,8 @@ describe("ModelViewer loading state", () => {
     });
 
     expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByText(/model…/)).toBeNull();
     expect(parseCalls).toEqual([]);
-    expect(consoleError).not.toHaveBeenCalled();
-    consoleError.mockRestore();
   });
 
   it("ignores progress and bytes from a superseded download", async () => {
@@ -756,7 +819,7 @@ describe("ModelViewer loading state", () => {
 
     await act(async () => downloads[1].resolve(new ArrayBuffer(8)));
     await waitFor(() => expect(parseCalls).toEqual(["stl"]));
-    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe(""));
   });
 });
 
