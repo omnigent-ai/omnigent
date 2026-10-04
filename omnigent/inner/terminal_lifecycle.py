@@ -30,6 +30,7 @@ class TerminalLifecycleTrace:
     """Diagnostics only: none of these observations determine terminal behavior."""
 
     session_id: str | None = None
+    launch_session_id: str | None = None
     launch_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     launched_at: float | None = None
     exit_observed_at: float | None = None
@@ -40,9 +41,10 @@ class TerminalLifecycleTrace:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def launch_environment(self, instance_id: str) -> dict[str, str]:
-        """Freeze correlation identifiers into this process's hook environment."""
+        """Freeze launch-time identifiers; session transfers only change the current owner."""
         with self._lock:
             self.launch_id = uuid.uuid4().hex
+            self.launch_session_id = self.session_id
             self.launched_at = time.time()
             self.exit_observed_at = None
             self.cleanup_started_at = None
@@ -52,8 +54,13 @@ class TerminalLifecycleTrace:
             return {
                 TERMINAL_INSTANCE_ID_ENV: instance_id,
                 TERMINAL_LAUNCH_ID_ENV: self.launch_id,
-                TERMINAL_LAUNCH_SESSION_ID_ENV: self.session_id or "",
+                TERMINAL_LAUNCH_SESSION_ID_ENV: self.launch_session_id or "",
             }
+
+    def transfer_session(self, session_id: str) -> None:
+        """Update the current owner while preserving the running child's launch identity."""
+        with self._lock:
+            self.session_id = session_id
 
     def note_request(self, action: str, source: str) -> None:
         """Record a known control request without claiming it caused an exit."""
@@ -71,7 +78,8 @@ class TerminalLifecycleTrace:
 
     def note_activity(self) -> None:
         """Remember the last pane change without treating it as a turn boundary."""
-        self.last_activity_at = time.time()
+        with self._lock:
+            self.last_activity_at = time.time()
 
     def note_exit(self) -> None:
         """Retain the first observation, including when cleanup later runs again."""
@@ -93,6 +101,8 @@ class TerminalLifecycleTrace:
             last_request = self._requests[-1] if self._requests else {}
             return {
                 "terminal_launch_id": self.launch_id,
+                "terminal_launch_session_id": self.launch_session_id,
+                "terminal_current_session_id": self.session_id,
                 "terminal_launched_at": self.launched_at,
                 "terminal_exit_observed_at": self.exit_observed_at,
                 "terminal_cleanup_started_at": self.cleanup_started_at,

@@ -451,7 +451,7 @@ class TerminalRegistry:
             if not source_slot:
                 self._by_conversation.pop(source_conversation_id, None)
             target_slot[key] = instance
-            instance.lifecycle_trace.session_id = target_conversation_id
+            instance.lifecycle_trace.transfer_session(target_conversation_id)
 
             lock = self._instance_locks.pop(source_lock_key, None)
             self._instance_locks[target_lock_key] = lock or threading.Lock()

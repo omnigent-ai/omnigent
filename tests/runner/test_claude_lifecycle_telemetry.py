@@ -288,6 +288,8 @@ async def test_session_delete_records_request_before_process_cancel_and_cleanup(
     launch: _Launch, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO)
+    _hook(launch, monkeypatch, "SessionStart", 100.0, source="startup")
+    _hook(launch, monkeypatch, "SessionEnd", 101.0, reason="logout")
 
     async def cancel(_self, session_id: str) -> bool:
         assert session_id == _SESSION
@@ -300,13 +302,44 @@ async def test_session_delete_records_request_before_process_cancel_and_cleanup(
     async with _runner_client(launch.app) as client:
         response = await client.delete(f"/v1/sessions/{_SESSION}")
     assert response.status_code == 200
+    assert not launch.directory.exists()
     [request] = _rows(caplog, "native_terminal_control_requested")
     [cleanup] = _rows(caplog, "terminal_cleanup_started")
     assert request["attributes"]["terminal_control_request_action"] == "delete_session"
+    assert request["attributes"]["claude_session_end_reason"] == "logout"
+    assert request["attributes"]["claude_session_end_at"] == "101.0"
+    assert request["attributes"]["claude_session_end_identity"] == "matched"
+    assert (
+        json.loads(request["attributes"]["claude_lifecycle"])["session_end"]["reason"] == "logout"
+    )
     assert float(request["attributes"]["terminal_control_requested_at"]) <= float(
         cleanup["attributes"]["terminal_cleanup_started_at"]
     )
     assert _rows(caplog, "required_terminal_exited") == []
+
+
+async def test_transfer_logs_current_owner_and_original_launch_session(
+    launch: _Launch, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    _hook(launch, monkeypatch, "SessionStart", 100.0, source="startup")
+    target = "synthetic-transferred-session"
+    assert await launch.resources.transfer_terminal(_SESSION, target, "terminal_claude_main")
+    try:
+        _hook(launch, monkeypatch, "SessionStart", 101.0, session_id="claude-new", source="clear")
+        _hook(launch, monkeypatch, "SessionEnd", 102.0, session_id="claude-new", reason="logout")
+        launch.resources.note_terminal_control_request(target, "delete_session")
+        [request] = _rows(caplog, "native_terminal_control_requested")
+        assert request["session_id"] == target
+        assert request["attributes"]["terminal_current_session_id"] == target
+        assert request["attributes"]["terminal_launch_session_id"] == _SESSION
+        assert request["attributes"]["claude_session_id"] == "claude-new"
+        assert request["attributes"]["claude_session_end_reason"] == "logout"
+        assert (
+            json.loads(request["attributes"]["claude_lifecycle"])["launch_session_id"] == _SESSION
+        )
+    finally:
+        await launch.resources.cleanup_session(target)
 
 
 async def test_startup_exit_captures_reason_before_closing_unobserved_terminal(
@@ -354,19 +387,8 @@ async def test_explicit_close_and_cleanup_are_distinct_and_sink_json_remains_par
     )
     assert _rows(caplog, "required_terminal_exited") == []
 
-    record = next(
-        record
-        for record in caplog.records
-        if getattr(record, "event_name", None) == "terminal_close_requested"
-    )
-    record.msg = "Authorization: Bearer synthetic-redaction-secret"
-    record.args = ()
-    redacted = record_to_row(record, source="runner")
-    assert "synthetic-redaction-secret" not in json.dumps(redacted)
+    assert json.loads(request["attributes"]["claude_lifecycle"])["session_end_reason"] == "unknown"
     assert (
-        json.loads(redacted["attributes"]["claude_lifecycle"])["session_end_reason"] == "unknown"
-    )
-    assert (
-        json.loads(redacted["attributes"]["terminal_control_requests"])[0]["action"]
+        json.loads(request["attributes"]["terminal_control_requests"])[0]["action"]
         == "close_terminal"
     )

@@ -1084,10 +1084,8 @@ class TerminalInstance:
     lifecycle_trace: TerminalLifecycleTrace = field(
         default_factory=TerminalLifecycleTrace, init=False, repr=False
     )
-    # Exit status of the launched command (possibly a wrapper), captured from tmux
-    # ``#{pane_dead_status}`` the first time a dead pane is observed (only
-    # meaningful with ``keep_alive_after_exit`` / ``remain-on-exit``). ``None``
-    # until the process exits or when tmux reports no numeric status.
+    # Launched-command status (possibly a wrapper), captured from tmux
+    # ``#{pane_dead_status}``; see ``last_exit_status`` for ``None`` semantics.
     _last_exit_status: int | None = field(default=None, repr=False)
     _last_exit_signal: str | None = field(default=None, repr=False)
     # Diagnostics for the "tmux unavailable" exit path: the stderr of the last
@@ -1542,8 +1540,10 @@ class TerminalInstance:
             TERMINAL_LAUNCH_SESSION_ID_ENV,
         ):
             env.pop(key, None)
-        with contextlib.suppress(Exception):
+        try:
             env.update(self.lifecycle_trace.launch_environment(self.diagnostic_id))
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent launch.
+            logger.debug("Terminal lifecycle correlation unavailable (%s)", type(exc).__name__)
         # Strip the runner-auth secret: native agents run their shell in
         # this tmux pane, so the binding token must never reach it.
         # After ``env.update`` so ``self.env`` can't re-admit it.
@@ -1833,7 +1833,7 @@ class TerminalInstance:
 
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
-        with contextlib.suppress(Exception):
+        try:
             if self.lifecycle_trace.note_cleanup():
                 logger.info(
                     "Terminal cleanup started",
@@ -1846,6 +1846,8 @@ class TerminalInstance:
                         **self.lifecycle_trace.log_attributes(),
                     ),
                 )
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent cleanup.
+            logger.debug("Terminal cleanup telemetry failed (%s)", type(exc).__name__)
         # Cancel both idle-watcher variants first so they don't race
         # the socket teardown. Order doesn't matter — they're
         # independent.

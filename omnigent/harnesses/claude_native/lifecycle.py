@@ -38,6 +38,7 @@ _ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\Z")
 _LAUNCH_ID = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_EVENTS = 16
 _MAX_BYTES = 32768
+_MAX_OBSERVATIONS = 1_000_000
 
 
 def _identifier(value: object) -> str | None:
@@ -50,8 +51,9 @@ def _known(value: object, values: set[str]) -> str | None:
 
 def _timestamp(value: object) -> float | None:
     if isinstance(value, (float, int)) and not isinstance(value, bool):
-        if math.isfinite(value) and value > 0:
-            return float(value)
+        with contextlib.suppress(OverflowError):
+            if math.isfinite(value) and value > 0:
+                return float(value)
     return None
 
 
@@ -98,6 +100,9 @@ def _event(value: object) -> dict[str, object] | None:
     }
     if name == "SessionStart":
         event["source"] = _known(value.get("source"), _SOURCES) or "unknown"
+        event["identity_started_at"] = min(
+            _timestamp(value.get("identity_started_at")) or recorded_at, recorded_at
+        )
     if name == "SessionEnd":
         event["reason"] = _known(value.get("reason"), _REASONS) or "unknown"
         event["reason_status"] = (
@@ -107,14 +112,21 @@ def _event(value: object) -> dict[str, object] | None:
         event["signal"] = _known(value.get("signal"), _SIGNALS)
         event["last_recorded_at"] = _timestamp(value.get("last_recorded_at")) or recorded_at
         count = value.get("observation_count")
-        event["observation_count"] = count if type(count) is int and 1 <= count <= 1000000 else 1
+        event["observation_count"] = (
+            count if type(count) is int and 1 <= count <= _MAX_OBSERVATIONS else 1
+        )
     return event
 
 
-def _events(value: object) -> list[dict[str, object]]:
+def _events(value: object, omitted: object) -> tuple[list[dict[str, object]], int]:
+    """Bound valid history and count malformed and overflow records once."""
+    omitted_count = max(0, omitted) if type(omitted) is int else 0
     if not isinstance(value, list):
-        return []
-    return [event for item in value[-_MAX_EVENTS:] if (event := _event(item)) is not None]
+        return [], omitted_count
+    events = [event for item in value if (event := _event(item)) is not None]
+    events.sort(key=lambda item: cast(float, item["recorded_at"]))
+    retained = events[-_MAX_EVENTS:]
+    return retained, omitted_count + len(value) - len(retained)
 
 
 def record_hook_lifecycle(
@@ -162,7 +174,7 @@ def record_hook_lifecycle(
         if projected is None:
             return
         # A stuck peer must not hold up a SessionEnd hook indefinitely.
-        with FileLock(str(path) + ".lock", timeout=0.1):
+        with FileLock(str(path) + ".lock", mode=0o600, timeout=0.5):
             previous = _read(path)
             if previous and (
                 previous.get("schema_version") != 1
@@ -170,11 +182,21 @@ def record_hook_lifecycle(
                 or previous.get("launch_id") != launch_id
             ):
                 return
-            events = _events(previous.get("events"))
+            events, omitted = _events(previous.get("events"), previous.get("events_omitted"))
             session_start = _event(previous.get("session_start"))
+            if session_start is not None and session_start["event_name"] != "SessionStart":
+                session_start = None
             if name == "SessionStart" and (
                 session_start is None or recorded_at >= cast(float, session_start["recorded_at"])
             ):
+                if (
+                    session_start is not None
+                    and projected["source"] == "compact"
+                    and projected["claude_session_id"] is not None
+                    and projected["claude_session_id"] == session_start["claude_session_id"]
+                ):
+                    # Compaction continues this identity's existing turn history.
+                    projected["identity_started_at"] = session_start["identity_started_at"]
                 session_start = projected
             if (
                 name == "SessionEnd"
@@ -194,11 +216,12 @@ def record_hook_lifecycle(
                 last = events[-1]
                 last["recorded_at"] = min(cast(float, last["recorded_at"]), recorded_at)
                 last["last_recorded_at"] = max(cast(float, last["last_recorded_at"]), recorded_at)
-                last["observation_count"] = min(cast(int, last["observation_count"]) + 1, 1000000)
+                last["observation_count"] = min(
+                    cast(int, last["observation_count"]) + 1, _MAX_OBSERVATIONS
+                )
             else:
                 events.append(projected)
             events.sort(key=lambda item: cast(float, item["recorded_at"]))
-            omitted = previous.get("events_omitted", 0)
             _write_json_file(
                 path,
                 {
@@ -210,8 +233,7 @@ def record_hook_lifecycle(
                     ),
                     "session_start": session_start,
                     "events": events[-_MAX_EVENTS:],
-                    "events_omitted": (omitted if type(omitted) is int else 0)
-                    + max(0, len(events) - _MAX_EVENTS),
+                    "events_omitted": omitted + max(0, len(events) - _MAX_EVENTS),
                 },
             )
     except Exception:  # noqa: BLE001 - telemetry must never block Claude's shutdown.
@@ -244,16 +266,14 @@ def read_lifecycle_snapshot(
         if state.get("launch_id") != launch_id or state.get("terminal_instance_id") != instance_id:
             result["read_status"] = "identity_mismatch"
             return result
-        events = sorted(
-            _events(state.get("events")), key=lambda item: cast(float, item["recorded_at"])
-        )
+        events, omitted = _events(state.get("events"), state.get("events_omitted"))
         session_start = _event(state.get("session_start"))
         if session_start is not None and session_start["event_name"] != "SessionStart":
             session_start = None
         current_session = (
             _identifier(session_start["claude_session_id"]) if session_start else None
         )
-        started_at = cast(float, session_start["recorded_at"]) if session_start else 0.0
+        started_at = cast(float, session_start["identity_started_at"]) if session_start else 0.0
         identity_verified = current_session is not None
         current_end: dict[str, object] | None = None
         turn_in_progress: bool | None = None
@@ -262,9 +282,15 @@ def read_lifecycle_snapshot(
                 continue
             name = event["event_name"]
             if name == "SessionStart":
+                continues_turn = (
+                    event["source"] == "compact"
+                    and current_session is not None
+                    and event["claude_session_id"] == current_session
+                )
                 current_session = _identifier(event["claude_session_id"])
                 current_end = None
-                turn_in_progress = None
+                if not continues_turn:
+                    turn_in_progress = None
                 continue
             if current_session is None and session_start is None:
                 current_session = _identifier(event["claude_session_id"])
@@ -283,9 +309,7 @@ def read_lifecycle_snapshot(
             session_start=session_start,
             hook_turn_in_progress=turn_in_progress,
             recent_hooks=events,
-            events_omitted=state.get("events_omitted")
-            if type(state.get("events_omitted")) is int
-            else 0,
+            events_omitted=omitted,
         )
         if current_end is not None:
             result.update(

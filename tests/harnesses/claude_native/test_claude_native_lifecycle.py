@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from filelock import FileLock
 
 from omnigent._platform import stable_user_id
 from omnigent.harnesses.claude_native import bridge, hook, lifecycle
@@ -144,6 +145,145 @@ def test_long_session_keeps_identity_anchor_outside_recent_history(
     assert snapshot["events_omitted"] > 0
     assert len(snapshot["recent_hooks"]) == lifecycle._MAX_EVENTS
     assert all(event["event_name"] != "SessionStart" for event in snapshot["recent_hooks"])
+
+
+@pytest.mark.parametrize("turn_end", [None, "Stop", "StopFailure"])
+def test_same_identity_compaction_preserves_active_or_ended_turn(
+    launch: tuple[Path, TerminalLifecycleTrace],
+    monkeypatch: pytest.MonkeyPatch,
+    turn_end: str | None,
+) -> None:
+    directory, _ = launch
+    _hook(monkeypatch, directory, "SessionStart", 100.0, source="startup")
+    _hook(monkeypatch, directory, "UserPromptSubmit", 101.0)
+    if turn_end is not None:
+        _hook(monkeypatch, directory, turn_end, 102.0)
+    _hook(monkeypatch, directory, "PreCompact", 103.0)
+    _hook(monkeypatch, directory, "SessionStart", 104.0, source="compact")
+    _hook(monkeypatch, directory, "SessionStart", 105.0, source="compact")
+    _hook(monkeypatch, directory, "SessionEnd", 106.0, reason="signal")
+
+    snapshot = _read(launch)
+    assert snapshot["hook_turn_in_progress"] is (turn_end is None)
+    assert snapshot["session_start"]["recorded_at"] == 105.0
+    assert snapshot["session_start"]["identity_started_at"] == 100.0
+    assert snapshot["session_end_reason"] == "signal"
+    assert snapshot["session_end_identity"] == "matched"
+
+
+@pytest.mark.parametrize(
+    ("source", "session_id"),
+    [("compact", "claude-b"), ("clear", "claude-a"), ("resume", "claude-a")],
+)
+def test_new_identity_or_non_compacting_start_resets_turn_context(
+    launch: tuple[Path, TerminalLifecycleTrace],
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    session_id: str,
+) -> None:
+    directory, _ = launch
+    _hook(monkeypatch, directory, "SessionStart", 100.0, source="startup")
+    _hook(monkeypatch, directory, "UserPromptSubmit", 101.0)
+    _hook(monkeypatch, directory, "SessionStart", 102.0, source=source, session_id=session_id)
+    _hook(monkeypatch, directory, "SessionEnd", 103.0, session_id=session_id, reason="logout")
+
+    snapshot = _read(launch)
+    assert snapshot["claude_session_id"] == session_id
+    assert snapshot["hook_turn_in_progress"] is None
+    assert snapshot["session_start"]["identity_started_at"] == 102.0
+    assert snapshot["session_end_reason"] == "logout"
+    assert snapshot["session_end_identity"] == "matched"
+
+
+@pytest.mark.parametrize(
+    ("stored_omitted", "previous_omitted"), [(7, 7), (-4, 0), (True, 0), ("bad", 0), (None, 0)]
+)
+def test_malformed_tail_preserves_valid_end_and_counts_omissions_once(
+    launch: tuple[Path, TerminalLifecycleTrace],
+    monkeypatch: pytest.MonkeyPatch,
+    stored_omitted: object,
+    previous_omitted: int,
+) -> None:
+    directory, trace = launch
+    _hook(monkeypatch, directory, "SessionStart", 100.0, source="startup")
+    _hook(monkeypatch, directory, "UserPromptSubmit", 101.0)
+    _hook(monkeypatch, directory, "Stop", 102.0)
+    _hook(monkeypatch, directory, "SessionEnd", 103.0, reason="logout")
+    end = _read(launch)["session_end"]
+    path = directory / f"lifecycle-{trace.launch_id}.json"
+    state = json.loads(path.read_text())
+    older_valid = [
+        {"event_name": "PreCompact", "recorded_at": 50.0 + i, "claude_session_id": "claude-a"}
+        for i in range(15)
+    ]
+    malformed = [
+        None,
+        {},
+        {"event_name": "SessionEnd", "recorded_at": 10**400},
+        {"event_name": "SessionEnd", "recorded_at": False},
+        {"event_name": "unsupported", "recorded_at": 104.0},
+    ] * 4
+    state["events"] = older_valid + state["events"] + malformed
+    state["events_omitted"] = stored_omitted
+    path.write_text(json.dumps(state))
+
+    snapshot = _read(launch)
+    assert snapshot["session_end_reason"] == "logout"
+    assert snapshot["session_end"]["event_id"] == end["event_id"]
+    assert len(snapshot["recent_hooks"]) == lifecycle._MAX_EVENTS
+    # Twenty malformed and three excess valid records are omitted.
+    assert snapshot["events_omitted"] == previous_omitted + 23
+    assert _read(launch) == snapshot
+
+    _hook(monkeypatch, directory, "SessionEnd", 104.0, reason="logout")
+    snapshot = _read(launch)
+    assert snapshot["session_end"]["event_id"] == end["event_id"]
+    assert snapshot["session_end"]["observation_count"] == 2
+    assert snapshot["events_omitted"] == previous_omitted + 23
+    assert len(json.loads(path.read_text())["events"]) == lifecycle._MAX_EVENTS
+
+    _hook(monkeypatch, directory, "PreCompact", 105.0)
+    snapshot = _read(launch)
+    assert snapshot["session_end_reason"] == "logout"
+    assert snapshot["events_omitted"] == previous_omitted + 24
+
+
+def test_contended_lifecycle_lock_is_bounded_and_session_end_can_recover(
+    launch: tuple[Path, TerminalLifecycleTrace],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    directory, trace = launch
+    _hook(monkeypatch, directory, "SessionStart", 100.0, source="startup")
+    path = directory / f"lifecycle-{trace.launch_id}.json"
+    with FileLock(str(path) + ".lock", mode=0o600, timeout=0):
+        started = time.monotonic()
+        _hook(monkeypatch, directory, "SessionEnd", 101.0, reason="logout")
+        assert time.monotonic() - started < 3
+    assert _read(launch)["session_end_reason"] == "unknown"
+    assert "could not record hook evidence" in capsys.readouterr().err
+
+    _hook(monkeypatch, directory, "SessionEnd", 102.0, reason="logout")
+    assert _read(launch)["session_end_reason"] == "logout"
+
+
+def test_lifecycle_lock_is_private_while_writing_evidence(
+    launch: tuple[Path, TerminalLifecycleTrace], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory, trace = launch
+    lifecycle_path = directory / f"lifecycle-{trace.launch_id}.json"
+    lock_modes: list[int] = []
+    write_json_file = bridge._write_json_file
+
+    def write(path: Path, value: object) -> None:
+        if path == lifecycle_path:
+            lock_modes.append(path.with_suffix(".json.lock").stat().st_mode & 0o777)
+        write_json_file(path, value)
+
+    monkeypatch.setattr(bridge, "_write_json_file", write)
+    _hook(monkeypatch, directory, "SessionEnd", 100.0, reason="logout")
+    assert lock_modes == [0o600]
+    assert _read(launch)["session_end_reason"] == "logout"
 
 
 @pytest.mark.parametrize("source", ["clear", "resume"])

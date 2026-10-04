@@ -1733,6 +1733,9 @@ def prepare_bridge_dir(
         ):
             with contextlib.suppress(FileNotFoundError):
                 (bridge_dir / filename).unlink()
+        # Preserve per-launch lifecycle files for delayed exit observers. The
+        # session deletion/dead-owner sweep removes them with the bridge directory.
+
         # Owner-pid marker for the periodic dead-owner prune; refreshed every
         # turn so it always names the current runner. See native_bridge_common.
         native_bridge_common.write_owner_pid_marker(bridge_dir)

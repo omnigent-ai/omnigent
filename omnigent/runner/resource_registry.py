@@ -228,7 +228,6 @@ def _terminal_lifecycle_context(
             context.update(
                 claude_lifecycle=evidence,
                 claude_lifecycle_read_status=evidence.get("read_status"),
-                terminal_launch_session_id=evidence.get("launch_session_id"),
                 claude_session_id=evidence.get("claude_session_id"),
                 claude_session_end_reason=evidence["session_end_reason"],
                 claude_session_end_evidence=evidence["session_end_evidence"],
@@ -733,10 +732,10 @@ class SessionResourceRegistry:
 
     def note_terminal_control_request(self, session_id: str, action: str) -> None:
         """Record explicit runner requests separately from process exit and cleanup."""
-        with contextlib.suppress(Exception):
-            if self._terminal_registry is None:
-                return
-            for entry in self._terminal_registry.list_for_conversation(session_id):
+        if self._terminal_registry is None:
+            return
+        for entry in self._terminal_registry.list_for_conversation(session_id):
+            try:
                 terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
                 if (
                     self.terminal_resource_role(session_id, terminal_id)
@@ -753,9 +752,11 @@ class SessionResourceRegistry:
                         terminal_id=terminal_id,
                         terminal_instance_id=entry.instance.diagnostic_id,
                         action=action,
-                        **entry.instance.lifecycle_trace.log_attributes(),
+                        **_terminal_lifecycle_context(entry.instance, CLAUDE_NATIVE_TERMINAL_ROLE),
                     ),
                 )
+            except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent control requests.
+                _logger.debug("Native terminal control telemetry failed (%s)", type(exc).__name__)
 
     @property
     def terminal_registry(self) -> TerminalRegistry | None:
