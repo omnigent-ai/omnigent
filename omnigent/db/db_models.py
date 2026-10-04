@@ -641,14 +641,6 @@ class SqlMobilePushOutbox(OmnigentBase):
         Index("ix_mobile_push_outbox_expiry", "expires_at", "workspace_id", "id"),
         Index("ix_mobile_push_outbox_device", "workspace_id", "installation_id", "id"),
         Index("ix_mobile_push_outbox_user", "workspace_id", "user_id", "id"),
-        Index(
-            "ix_mobile_push_outbox_activity",
-            "workspace_id",
-            "session_id",
-            "kind",
-            "delivered",
-            "id",
-        ),
         Index("ix_mobile_push_outbox_tenants", "delivered", "workspace_id", "id"),
         CheckConstraint("kind IN (1, 2, 3)", name="ck_mobile_push_kind"),
     )
