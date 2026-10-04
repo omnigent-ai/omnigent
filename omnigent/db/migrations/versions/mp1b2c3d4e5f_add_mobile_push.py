@@ -99,11 +99,6 @@ def upgrade() -> None:
         "mobile_push_outbox",
         ["delivered", "workspace_id", "id"],
     )
-    op.create_index(
-        "ix_mobile_push_outbox_activity",
-        "mobile_push_outbox",
-        ["workspace_id", "session_id", "kind", "delivered", "id"],
-    )
 
 
 def downgrade() -> None:
