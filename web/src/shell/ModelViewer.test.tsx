@@ -882,6 +882,25 @@ describe("ModelViewer loading state", () => {
     expect(parseCalls).toEqual([]);
   });
 
+  it("skips the parse when unmounted during the pre-parse paint wait", async () => {
+    const frames = holdFrames();
+    const { unmount } = render(
+      <ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />,
+    );
+    await waitFor(() => expect(frames).toHaveLength(1));
+
+    unmount();
+    await act(async () => {
+      frames.splice(0).forEach((frame) => frame(performance.now()));
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(parseCalls).toEqual([]);
+    expect(lastRenderer).toBeNull();
+  });
+
   it("ignores progress and bytes from a superseded download", async () => {
     const downloads = holdDownloads();
     const { rerender } = render(
