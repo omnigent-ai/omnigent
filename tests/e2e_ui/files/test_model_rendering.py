@@ -84,9 +84,9 @@ def _large_ascii_stl(min_bytes: int = 9 * 1024 * 1024 + 512 * 1024) -> str:
     return "".join(parts)
 
 
-# Installed before the SPA boots. Records what the loading status said at the
-# moment the preview host first appeared; read from inside the page because the
-# synchronous parse that follows blocks the main thread.
+# Installed before the SPA boots. Records whether the loading status was in the
+# DOM when the preview host first mounted, catching that transient state without
+# external polling.
 _LOAD_PROBE_JS = """
 (() => {
   window.__modelLoadProbe = { statusAtHostMount: undefined };
@@ -202,8 +202,9 @@ def test_large_model_shows_loading_status_until_it_renders(
     expect(preview).to_be_visible(timeout=30_000)
     expect(preview.locator("canvas")).to_be_visible(timeout=120_000)
 
-    # The status was already in the pane when the preview host mounted, so the
-    # user never saw an empty pane while the model was decoded, parsed and built.
+    # The status element was in the pane when the preview host mounted, before
+    # the canvas was built — DOM presence and timing, not painted visibility
+    # (the painted "Preparing model…" frame is shown in the recordings).
     probe = page.evaluate("() => window.__modelLoadProbe")
     assert probe["statusAtHostMount"] == "Preparing model…", probe
 
