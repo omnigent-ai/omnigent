@@ -11,6 +11,7 @@ import pytest
 
 from omnigent.harnesses.claude_native import bridge, forwarder
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
+from omnigent.native.failure_telemetry import FailureContext
 
 
 @pytest.mark.asyncio
@@ -69,11 +70,15 @@ async def test_hook_category_and_identity_survive_retry(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("marker_location", ["entry", "message"])
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+@pytest.mark.parametrize("retry_after_rejection", [False, True], ids=["accepted", "retried"])
 @pytest.mark.asyncio
 async def test_explicit_transcript_api_error_is_observed_without_failing_session(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     marker_location: str,
+    batch: bool,
+    retry_after_rejection: bool,
 ) -> None:
     error_text = (
         'API Error: 400 {"error":{"type":"invalid_request_error","code":"invalid_user",'
@@ -99,21 +104,46 @@ async def test_explicit_transcript_api_error_is_observed_without_failing_session
 
     def handle(request: httpx.Request) -> httpx.Response:
         posted.append(json.loads(request.content))
-        return httpx.Response(204, headers={"x-request-id": "omnigent-event-post-id"})
+        return httpx.Response(
+            422 if retry_after_rejection and len(posted) == 1 else 202,
+            json=[{"item_id": "item-synthetic"}] if batch else {},
+            headers={"x-request-id": "omnigent-event-post-id"},
+        )
 
     caplog.set_level(logging.INFO, logger=forwarder.__name__)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handle), base_url="http://test"
     ) as client:
-        await forwarder._post_external_conversation_item(
-            client, session_id="conv_synthetic", item=items[0]
-        )
-    assert [event["type"] for event in posted] == ["external_conversation_item"]
-    assert posted[0]["data"]["item_data"]["content"][0]["text"] == error_text
-    (record,) = [
+
+        async def post() -> None:
+            if batch:
+                await forwarder._post_external_conversation_item_batch(
+                    client,
+                    session_id="conv_synthetic",
+                    items=[forwarder._PendingSubagentItem(item=items[0])],
+                )
+            else:
+                await forwarder._post_external_conversation_item(
+                    client, session_id="conv_synthetic", item=items[0]
+                )
+
+        if retry_after_rejection:
+            with pytest.raises(httpx.HTTPStatusError):
+                await post()
+            assert any(
+                getattr(r, "event_name", None) == "native_failure_observed" for r in caplog.records
+            )
+        await post()
+    attempts = 2 if retry_after_rejection else 1
+    events = [payload[0] if batch else payload for payload in posted]
+    assert [event["type"] for event in events] == ["external_conversation_item"] * attempts
+    assert events[0]["data"]["item_data"]["content"][0]["text"] == error_text
+    records = [
         r for r in caplog.records if getattr(r, "event_name", None) == "native_failure_observed"
     ]
-    attrs = record.attributes
+    assert len(records) == attempts
+    assert len({record.attributes["failure_id"] for record in records}) == 1
+    attrs = records[-1].attributes
     assert attrs["native_api_error_message"] == "True"
     assert attrs["detail_source"] == "explicit_api_error"
     assert attrs["provider_error_type"] == "invalid_request_error"
@@ -172,23 +202,76 @@ def test_api_error_keeps_original_message_before_display_rewriting(tmp_path: Pat
     assert items[0].failure_context["native_error_message"] == "Prompt is too long"
 
 
-def test_numeric_provider_code_is_preserved() -> None:
-    context = claude_failure_context({"error": {"code": 400}})
-    assert context["provider_error_code"] == "400"
-
-
-def test_partial_structured_error_keeps_explicit_api_error_text() -> None:
-    context = claude_failure_context(
-        {"isApiErrorMessage": True, "error": {"code": "stream_lost"}},
-        error_text="Connection lost mid-response",
-    )
-    assert context["native_error_message"] == "Connection lost mid-response"
-    assert context["provider_error_code"] == "stream_lost"
-
-
-def test_synthetic_model_is_not_reported_as_the_inference_model() -> None:
-    context = claude_failure_context({"message": {"model": "<synthetic>"}})
-    assert "native_model" not in context
+@pytest.mark.parametrize(
+    ("entry", "error_text", "expected", "absent"),
+    [
+        pytest.param(
+            {"error": {"code": 400}},
+            None,
+            {"provider_error_code": "400"},
+            (),
+            id="numeric-provider-code",
+        ),
+        pytest.param(
+            {"error": {"code": None, "error_code": "stream_lost"}},
+            None,
+            {"provider_error_code": "stream_lost"},
+            (),
+            id="null-code-falls-back",
+        ),
+        pytest.param(
+            {"error": {"code": 0, "error_code": "ignored"}},
+            None,
+            {"provider_error_code": "0"},
+            (),
+            id="zero-code-is-preserved",
+        ),
+        pytest.param(
+            {"isApiErrorMessage": True, "error": {"code": "stream_lost"}},
+            "Connection lost mid-response",
+            {
+                "native_error_message": "Connection lost mid-response",
+                "provider_error_code": "stream_lost",
+            },
+            (),
+            id="partial-structured-error-retains-explicit-text",
+        ),
+        pytest.param(
+            {"message": {"model": "<synthetic>"}},
+            None,
+            {},
+            ("native_model",),
+            id="synthetic-model-is-unavailable",
+        ),
+        pytest.param(
+            {
+                "error": {"type": "server_error", "code": "overloaded", "param": None},
+                "status_code": 503,
+                "gateway_request_id": "gateway-id",
+                "provider_request_id": "provider-id",
+            },
+            None,
+            {
+                "http_status": 503,
+                "provider_error_code": "overloaded",
+                "inference_detail_source": "structured_error",
+                "gateway_request_id": "gateway-id",
+                "provider_request_id": "provider-id",
+            },
+            ("native_error_category", "provider_error_param"),
+            id="structured-error-and-request-ownership",
+        ),
+    ],
+)
+def test_native_error_extraction(
+    entry: dict[str, object],
+    error_text: str | None,
+    expected: FailureContext,
+    absent: tuple[str, ...],
+) -> None:
+    context = claude_failure_context(entry, error_text=error_text)
+    assert {key: context[key] for key in expected} == expected
+    assert not (set(absent) & context.keys())
 
 
 def test_hook_inference_fields_are_parsed_before_display_truncation(tmp_path: Path) -> None:
@@ -216,21 +299,3 @@ def test_hook_inference_fields_are_parsed_before_display_truncation(tmp_path: Pa
     assert record.failure_context["provider_error_type"] == "invalid_request_error"
     assert record.failure_context["provider_error_param"] == "user"
     assert len(record.failure_context["native_error_message"]) == 1024
-
-
-def test_structured_error_fields_and_explicit_request_ownership() -> None:
-    context = claude_failure_context(
-        {
-            "error": {"type": "server_error", "code": "overloaded", "param": None},
-            "status_code": 503,
-            "gateway_request_id": "gateway-id",
-            "provider_request_id": "provider-id",
-        }
-    )
-    assert context["http_status"] == 503
-    assert context["provider_error_code"] == "overloaded"
-    assert context["inference_detail_source"] == "structured_error"
-    assert context["gateway_request_id"] == "gateway-id"
-    assert context["provider_request_id"] == "provider-id"
-    assert "native_error_category" not in context
-    assert "provider_error_param" not in context

@@ -9,6 +9,7 @@ from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
 
 _API_ERROR = re.compile(r"^\s*API Error:\s*([1-5][0-9]{2})\b")
+_API_ERROR_BODY_MAX_CHARS = 16384
 
 
 def claude_failure_context(
@@ -49,14 +50,17 @@ def claude_failure_context(
     envelope = entry
     if isinstance(error, dict):
         context["inference_detail_source"] = "structured_error"
-    elif error_text is not None and (match := _API_ERROR.match(error_text[:16384])) is not None:
+    elif (
+        error_text is not None
+        and (match := _API_ERROR.match(error_text[:_API_ERROR_BODY_MAX_CHARS])) is not None
+    ):
         context["http_status"] = int(match[1])
         context["inference_detail_source"] = "api_error_text"
         context["native_error_message"] = error_text
-        body = error_text[match.end() : 16385].strip()
-        if body.startswith("{") and len(error_text) <= 16384:
+        if len(error_text) <= _API_ERROR_BODY_MAX_CHARS:
+            body = error_text[match.end() :].strip()
             try:
-                decoded = json.loads(body)
+                decoded = json.loads(body) if body.startswith("{") else None
             except (ValueError, RecursionError):
                 decoded = None
             if isinstance(decoded, dict):
@@ -65,7 +69,9 @@ def claude_failure_context(
     if isinstance(error, dict):
         context.update(
             provider_error_type=error.get("type"),
-            provider_error_code=error.get("code", error.get("error_code")),
+            provider_error_code=(
+                error["code"] if error.get("code") is not None else error.get("error_code")
+            ),
             provider_error_param=error.get("param"),
         )
         error_message = error.get("message")

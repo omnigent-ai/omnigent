@@ -57,6 +57,7 @@ def test_context_is_bounded_redacted_and_cannot_override_canonical_fields() -> N
     assert "native_error_category" not in missing
     assert "provider_request_id" in missing
     assert "native_api_error_message" in missing
+    assert "launch_id" not in missing
 
 
 def test_explicit_false_marker_is_distinct_from_unavailable() -> None:

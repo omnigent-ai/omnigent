@@ -78,6 +78,7 @@ from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -4904,8 +4905,6 @@ def _publish_status(
         # for <id>: <detail>" shape so existing detail-matching stays valid.
         origin = failure_origin or "unattributed"
         failure_code = error.code if error is not None else "none"
-        from omnigent.native.failure_telemetry import failure_log_attributes
-
         _logger.error(
             "session turn failed for %s (origin=%s code=%s prev=%s): %s",
             session_id,

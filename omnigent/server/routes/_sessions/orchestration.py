@@ -68,6 +68,7 @@ from omnigent.host.frames import (
 )
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -3181,10 +3182,9 @@ async def _enrich_terminal_status_with_subagent_output(
     """
     if status not in ("idle", "failed"):
         return data
-    from omnigent.native.failure_telemetry import normalize_failure_context
-
-    context = normalize_failure_context(data.get("failure_context"))
+    context: FailureContext = {}
     if status == "failed":
+        context = normalize_failure_context(data.get("failure_context"))
         context.setdefault("failure_source", "external_status")
         data = {**data, "failure_context": context}
     current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"

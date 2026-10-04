@@ -3579,8 +3579,10 @@ def _stop_failure_context(
     if reason and len(parent_claude_session_ids) == 1:
         context["native_parent_session_id"] = next(iter(parent_claude_session_ids))
     if diagnostic_health is not None:
-        with contextlib.suppress(Exception):
+        try:
             context.update(diagnostic_health())
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot interrupt forwarding
+            _logger.debug("Claude diagnostic health snapshot failed: %s", type(exc).__name__)
     return normalize_failure_context(context)
 
 
@@ -3588,7 +3590,7 @@ def _log_transcript_failure(session_id: str, item: ClaudeTranscriptItem) -> None
     """Observe explicit API errors without manufacturing a failed status edge."""
     if item.failure_context is None:
         return
-    with contextlib.suppress(Exception):
+    try:
         context = {
             **item.failure_context,
             "failure_id": native_failure_id("claude_transcript", session_id, item.source_id),
@@ -3607,6 +3609,8 @@ def _log_transcript_failure(session_id: str, item: ClaudeTranscriptItem) -> None
                 **failure_log_attributes(context),
             ),
         )
+    except Exception as exc:  # noqa: BLE001 - telemetry cannot interrupt forwarding
+        _logger.debug("Claude transcript failure telemetry failed: %s", type(exc).__name__)
 
 
 def _is_fork_hook_record(record: ClaudeHookRecord) -> bool:
@@ -3916,7 +3920,7 @@ async def _forward_available_status_events(
             record, parent_claude_session_ids=parent_claude_session_ids
         ):
             if status == "failed":
-                with contextlib.suppress(Exception):
+                try:
                     _logger.info(
                         "Claude native subagent failure suppressed; session=%s",
                         session_id,
@@ -3933,6 +3937,10 @@ async def _forward_available_status_events(
                                 )
                             ),
                         ),
+                    )
+                except Exception as exc:  # noqa: BLE001 - telemetry must not affect status
+                    _logger.debug(
+                        "Claude subagent failure telemetry failed: %s", type(exc).__name__
                     )
             _logger.debug(
                 "Skipping subagent hook status; session=%s event=%s status=%s transcript=%s",

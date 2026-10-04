@@ -288,6 +288,8 @@ output, it records `detail_source=missing`.
 Claude transcript entries marked `isApiErrorMessage` also produce INFO
 `native_failure_observed` events, correlated by Omnigent session/response ID and
 native record ID. These observations do not publish an additional failed status.
+Transcript observations are logged before delivery so a rejected upload still
+leaves evidence. Retries can repeat them; count distinct `failure_id` values.
 Hook and transcript observations have separate source identities: do not sum
 their counts as failed turns or copy a nearby request ID onto a hook failure.
 The ordinary log-envelope `request_id` may refer to an Omnigent event POST; it

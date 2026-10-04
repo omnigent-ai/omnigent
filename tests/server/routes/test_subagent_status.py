@@ -328,7 +328,13 @@ async def test_external_session_status_still_forwards_to_runner(
     path, body = route.forwarded[0]
     assert path == f"/v1/sessions/{sid}/events"
     assert body["type"] == "external_session_status"
-    assert body["data"] == data
+    expected_data: dict[str, object] = dict(data)
+    if status == "failed":
+        expected_data["failure_context"] = {
+            "failure_source": "external_status",
+            "detail_source": "external_status_output",
+        }
+    assert body["data"] == expected_data
     assert route.telemetry.call_count == (0 if status == "running" else 1)
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -45,6 +46,7 @@ async def test_forwarder_ignores_subagent_stop_failure_hook(
     ``failed`` is the only mapped status left, so this is the surviving
     subagent-skip case.)
     """
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
