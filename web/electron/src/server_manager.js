@@ -331,7 +331,9 @@ async function ensureServerAuth(cliCommand, serverUrl, { onLogin } = {}) {
   const probe = await cli.probeServerAuth(serverUrl);
   // Already authed, or unreachable — in the unreachable case skip a doomed login
   // and let the connect attempt surface the real (connectivity) error.
-  if (probe.authed || !probe.reachable) return { ok: true };
+  const managedOmni = cli.cliCommandParts(cliCommand).displayName === "isaac omni";
+  // A legacy token can pass /v1/me but cannot supply the managed host's OAuth grant.
+  if ((!managedOmni && probe.authed) || !probe.reachable) return { ok: true };
   onLogin?.();
   const res = await cli.loginServer(cliCommand, serverUrl);
   if (res.ok) return { ok: true };

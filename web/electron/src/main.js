@@ -310,6 +310,8 @@ const arcaConnectFlow = createArcaConnectFlow({
   pagePath: path.join(__dirname, "..", "arca-connect", "index.html"),
   preloadPath: path.join(__dirname, "arca_connect_preload.js"),
   startConnect: (serverUrl, onOutput) => arca.startArcaConnect(serverUrl, { onOutput }),
+  startLogin: (serverUrl) => arca.startArcaLogin(serverUrl),
+  loginCommandLine: (serverUrl) => `arca ${arca.buildLoginArgs(serverUrl).join(" ")}`,
   commandLine: (serverUrl) => {
     try {
       return `arca ${arca.buildConnectArgs(serverUrl).join(" ")}`;
@@ -410,10 +412,11 @@ const onboardingArcaOptIn = { pending: 0, baseline: undefined, succeeded: false 
  *
  * @param {string} serverUrl
  * @param {(line: string) => void} log
- * @param {() => boolean} isClosed Whether the setup window has closed.
+ * @param {Electron.WebContents} sender The shell-owned setup page.
  * @returns {Promise<{ ok: boolean, canceled?: boolean, alreadyRunning?: boolean, error?: string }>}
  */
-async function connectOnboardingArca(serverUrl, log, isClosed) {
+async function connectOnboardingArca(serverUrl, log, sender) {
+  const isClosed = () => sender.isDestroyed();
   const optIn = onboardingArcaOptIn;
   const settings = loadSettings();
   if (optIn.pending === 0) {
@@ -434,11 +437,32 @@ async function connectOnboardingArca(serverUrl, log, isClosed) {
       if (current.command && (current.state === "idle" || current.state === "failed")) {
         log(`$ ${current.command}`);
       }
-      const status =
+      let status =
         current.state === "failed"
           ? await arcaAutoConnect.retry(serverUrl, log)
           : await arcaAutoConnect.ensure(serverUrl, log);
-      result =
+      if (status.state === "failed" && status.errorKind === "omni-auth" && !isClosed()) {
+        // The setup page's Install click authorizes sign-in; passive auto-connect never does.
+        log(`$ arca ${arca.buildLoginArgs(serverUrl).join(" ")}`);
+        log("Signing in on Arca. If a browser window opens, finish signing in there.");
+        const login = arca.startArcaLogin(serverUrl);
+        sender.once("destroyed", login.cancel);
+        let auth;
+        try {
+          auth = await login.promise;
+        } finally {
+          sender.removeListener("destroyed", login.cancel);
+        }
+        if (isClosed()) {
+          result = { ok: false, canceled: true };
+        } else if (auth.ok) {
+          log("Signed in. Connecting Arca…");
+          status = await arcaAutoConnect.retry(serverUrl, log);
+        } else {
+          result = auth;
+        }
+      }
+      result ??=
         status.state === "online"
           ? { ok: true, alreadyRunning: status.alreadyRunning === true }
           : {
@@ -3930,7 +3954,7 @@ function registerIpc() {
       if (!databricksInternalFeaturesEnabled() || !isDatabricksManagedServerUrl(target)) {
         return { ok: false, error: "A remote environment isn't available for this server." };
       }
-      const result = await connectOnboardingArca(target, log, () => event.sender.isDestroyed());
+      const result = await connectOnboardingArca(target, log, event.sender);
       if (result.ok) rememberOnboardingRunner(target, runner);
       return result;
     }
@@ -4526,6 +4550,9 @@ function registerIpc() {
     const autoRun = arcaAutoConnect.inFlight(arcaServerUrl);
     if (autoRun) {
       const status = await autoRun;
+      if (status.errorKind === "omni-auth" && isPinnedOriginSender(event) && !win.isDestroyed()) {
+        return arcaConnectFlow.run(win, arcaServerUrl);
+      }
       return status.state === "online"
         ? { ok: true, alreadyRunning: status.alreadyRunning === true }
         : {
