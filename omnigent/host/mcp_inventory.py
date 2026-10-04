@@ -1,6 +1,6 @@
 """Host-owned inventory of the user-level MCP servers each harness loads.
 
-Only names and non-secret metadata leave this module: ``env``, headers, stdio
+Only names and non-secret metadata leave the inventory response: ``env``, headers, stdio
 ``command``/``args`` and full URLs routinely carry tokens, so they are dropped.
 """
 
@@ -11,6 +11,7 @@ import os
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -30,6 +31,15 @@ MCP_INVENTORY_CACHE_TTL_SECONDS = 60.0
 OMNIGENT_RELAY_SERVER = "omnigent"
 
 McpServerSummary = dict[str, str]
+
+
+@dataclass
+class ConfiguredMcpServer:
+    """Raw configuration stays on the host; only summary is sent to the server."""
+
+    summary: McpServerSummary
+    config: Mapping[str, object]
+    plugin_root: Path | None = None
 
 
 def _summary(
@@ -77,15 +87,16 @@ def _read_config(path: Path, harness: str) -> Mapping[str, object] | None:
     return data
 
 
-def _claude_servers(home: Path, env: Mapping[str, str]) -> list[McpServerSummary]:
+def _claude_servers(home: Path, env: Mapping[str, str]) -> list[ConfiguredMcpServer]:
     """User-scope ``mcpServers`` plus servers bundled by enabled Claude plugins."""
     configured = env.get("CLAUDE_CONFIG_DIR")
     config_dir = Path(configured).expanduser() if configured else None
     data = _read_config((config_dir or home) / ".claude.json", "claude")
     out = [
-        summary
+        ConfiguredMcpServer(summary, config)
         for name, config in _servers_in(data).items()
-        if (summary := _summary(name, config, "claude")) is not None
+        if isinstance(config, Mapping)
+        and (summary := _summary(name, config, "claude")) is not None
     ]
     ctx = SkillSourceContext(
         roots=(),
@@ -103,13 +114,17 @@ def _claude_servers(home: Path, env: Mapping[str, str]) -> list[McpServerSummary
         for table in tables:
             for name, config in table.items():
                 summary = _summary(name, config, "claude", plugin)
-                if summary is not None and summary["name"] not in seen:
+                if (
+                    isinstance(config, Mapping)
+                    and summary is not None
+                    and summary["name"] not in seen
+                ):
                     seen.add(summary["name"])
-                    out.append(summary)
+                    out.append(ConfiguredMcpServer(summary, config, install_path))
     return out
 
 
-def _codex_servers() -> list[McpServerSummary]:
+def _codex_servers() -> list[ConfiguredMcpServer]:
     """``[mcp_servers.*]`` tables from the user's Codex ``config.toml``."""
     from omnigent.inner.codex_executor import _codex_home_config_source_from_env
 
@@ -125,23 +140,24 @@ def _codex_servers() -> list[McpServerSummary]:
     if not isinstance(servers, Mapping):
         return []
     return [
-        summary
+        ConfiguredMcpServer(summary, table)
         for name, table in servers.items()
-        if (summary := _summary(name, table, "codex")) is not None
+        if isinstance(table, Mapping) and (summary := _summary(name, table, "codex")) is not None
     ]
 
 
-def _cursor_servers(home: Path) -> list[McpServerSummary]:
+def _cursor_servers(home: Path) -> list[ConfiguredMcpServer]:
     """Global ``~/.cursor/mcp.json``, shared by the Cursor app and ``cursor-agent``."""
     data = _read_config(home / ".cursor" / "mcp.json", "cursor")
     return [
-        summary
+        ConfiguredMcpServer(summary, config)
         for name, config in _servers_in(data).items()
-        if (summary := _summary(name, config, "cursor")) is not None
+        if isinstance(config, Mapping)
+        and (summary := _summary(name, config, "cursor")) is not None
     ]
 
 
-def discover_mcp_servers() -> list[McpServerSummary]:
+def configured_mcp_servers() -> list[ConfiguredMcpServer]:
     """List user-level MCP servers across Claude, Codex, and Cursor on this host.
 
     Each harness is read independently, so a missing or broken config for one
@@ -153,13 +169,17 @@ def discover_mcp_servers() -> list[McpServerSummary]:
         ("codex", _codex_servers),
         ("cursor", lambda: _cursor_servers(home)),
     )
-    out: list[McpServerSummary] = []
+    out: list[ConfiguredMcpServer] = []
     for harness, read in readers:
         try:
             out.extend(read())
         except Exception:
             _logger.exception("MCP inventory failed for %s", harness)
     return out
+
+
+def discover_mcp_servers() -> list[McpServerSummary]:
+    return [server.summary for server in configured_mcp_servers()]
 
 
 class HostMcpInventory:

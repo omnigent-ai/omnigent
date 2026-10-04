@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
@@ -21,6 +22,8 @@ from omnigent.host.frames import (
     HostImportLocalDoneFrame,
     HostImportLocalSessionChunkFrame,
     HostLaunchRunnerResultFrame,
+    HostMcpToolsFrame,
+    HostMcpToolsResultFrame,
     HostPluginsResultFrame,
     HostSkillContentFrame,
     HostSkillContentResultFrame,
@@ -31,6 +34,7 @@ from omnigent.host.frames import (
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
+from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
 from omnigent.stores.host_store import HostStore
 from tests.budgets import budget
@@ -1458,4 +1462,85 @@ async def test_malformed_skill_content_reply_returns_502(
     assert response.status_code == 502
     assert response.json() == {"detail": "host skill content lookup failed"}
     assert not conn.pending_skill_content
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_host_tunnel_routes_mcp_tools_result_to_future(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A mcp_tools_result resolves only its own pending request, and drops it."""
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+
+    loop = asyncio.get_event_loop()
+    mine: asyncio.Future[HostMcpToolsResultFrame] = loop.create_future()
+    other: asyncio.Future[HostMcpToolsResultFrame] = loop.create_future()
+    conn.pending_mcp_tools["req_mine"] = mine
+    conn.pending_mcp_tools["req_other"] = other
+
+    tools = [{"name": "read", "description": None}]
+    result = HostMcpToolsResultFrame(request_id="req_mine", status="ok", tools=tools)
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(result)})
+
+    resolved = await asyncio.wait_for(mine, timeout=budget(2.0))
+    assert (resolved.status, resolved.tools and resolved.tools[0]["name"]) == (
+        "ok",
+        "read",
+    )
+    assert not other.done()
+    assert list(conn.pending_mcp_tools) == ["req_other"]
+
+
+@pytest.mark.parametrize(
+    "invalid", [{"tools": "private"}, {"truncated": "no"}, {"connection": None}]
+)
+async def test_malformed_mcp_tools_reply_returns_502(
+    host_app: tuple[FastAPI, HostRegistry, HostStore], invalid: dict[str, object]
+) -> None:
+    import json
+
+    import httpx
+
+    app, registry, store = host_app
+    app.include_router(create_mcp_tools_router(registry, store), prefix="/v1")
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities.append(CAP_MCP_TOOLS)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        task = asyncio.create_task(
+            client.post(
+                f"/v1/hosts/{_HOST_ID}/mcp-servers/tools",
+                json={"harness": "claude", "server": "docs"},
+            )
+        )
+        sent = await comm.receive_output(timeout=budget(2.0))
+        request = decode_host_frame(sent["text"])
+        assert isinstance(request, HostMcpToolsFrame)
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": json.dumps(
+                    {
+                        "kind": "host.mcp_tools_result",
+                        "request_id": request.request_id,
+                        "status": "ok",
+                        "tools": [],
+                        "connection": "connected",
+                        "truncated": False,
+                        **invalid,
+                    }
+                ),
+            }
+        )
+        response = await asyncio.wait_for(task, timeout=budget(2.0))
+    assert response.status_code == 502
+    assert response.json() == {"detail": "host MCP tools lookup failed"}
+    assert not conn.pending_mcp_tools
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})

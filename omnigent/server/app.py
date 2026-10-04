@@ -3708,6 +3708,7 @@ def create_app(
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
         from omnigent.server.routes.mcp_servers import create_mcp_servers_router
+        from omnigent.server.routes.mcp_tools import create_mcp_tools_router
         from omnigent.server.routes.plugins import create_plugins_router
         from omnigent.server.routes.skill_content import create_skill_content_router
         from omnigent.server.routes.skills import create_skills_router
@@ -3768,6 +3769,11 @@ def create_app(
         )
         app.include_router(
             create_skill_content_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_mcp_tools_router(host_registry, host_store, auth_provider=auth_provider),
             prefix="/v1",
             tags=["hosts"],
         )

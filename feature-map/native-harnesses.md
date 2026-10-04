@@ -37,6 +37,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
 
+- `mcp-tools`: expand a configured or plugin MCP server to probe its tools,
+  with connected/auth/timeout/unreachable/unsupported and mixed-version states.
+
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
 
 ## How to get to it (user POV)
@@ -51,6 +54,10 @@ without a session ID to resume.
 **Skill contents:** Settings → Harnesses → configured harness card (or gear),
 then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
 list or plugin. Requires `harness_settings_ui`.
+
+**MCP tools:** Settings → Harnesses → configured harness card (or gear),
+then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
+Probes run only on expansion; requires `harness_settings_ui`.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -127,6 +134,19 @@ Cross-harness journeys:
   404 from the contents route and verify the list remains with nonclickable
   skill rows. A 502/504 shows a generic failure. Bodies must be absent from
   the skills listing and host/server logs, with no other files or paths returned.
+
+- **`mcp-tools`:** run `tests/host/test_mcp_tools.py`,
+  `tests/server/routes/test_mcp_tools.py`, and the real-host test
+  `tests/e2e/test_host_mcp_tools_e2e.py::test_host_mcp_tools` with plain pytest.
+  Web coverage is in `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  From both card and gear entry points, expand a standalone and a plugin server;
+  verify the left chevron, immediate expansion, names, count and status dot.
+  Collapsed rows must not send probes or start processes. Reopen within five
+  minutes to reuse results. Test an HTTP 401, a hanging stdio process and a
+  missing executable; expect auth, timeout and unreachable states.
+  A 501 shows an update hint; inject a 404 from the tools route to retain plain
+  rows without expansion. Confirm no raw config, schemas or synthetic secrets
+  appear in responses/logs and no probe processes survive cancellation/timeout.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.

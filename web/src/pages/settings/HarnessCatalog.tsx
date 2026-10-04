@@ -1,5 +1,7 @@
+import * as AccordionPrimitive from "radix-ui/accordion";
+import { useMcpServerTools, type McpServerTools } from "@/hooks/useMcpServerTools";
 import { useEffect, useState, type ReactNode } from "react";
-import { ArrowLeftIcon, PlugIcon, SparkleIcon } from "lucide-react";
+import { ArrowLeftIcon, ChevronRightIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -186,20 +188,7 @@ export function HarnessCatalog({
         </TabsList>
         <TabsContent value="settings">{settings}</TabsContent>
         <TabsContent value="mcps">
-          {ownList(
-            "mcps",
-            own.mcps.length,
-            <ul className="flex flex-col gap-2">
-              {own.mcps.map((server) => (
-                <CatalogRow
-                  key={server.id}
-                  icon={<LetterAvatar name={server.name} />}
-                  name={server.name}
-                  detail={server.detail}
-                />
-              ))}
-            </ul>,
-          )}
+          {ownList("mcps", own.mcps.length, <McpList host={host} servers={own.mcps} />)}
         </TabsContent>
         <TabsContent value="skills">
           {ownList(
@@ -384,17 +373,7 @@ function PluginPage({
           </ul>
         </TabsContent>
         <TabsContent value="mcps">
-          <ul className="flex flex-col gap-2">
-            {mcps.length === 0 && <Notice>No MCPs found.</Notice>}
-            {mcps.map((server) => (
-              <CatalogRow
-                key={server.id}
-                icon={<LetterAvatar name={server.name} />}
-                name={server.name}
-                detail={server.detail}
-              />
-            ))}
-          </ul>
+          <McpList host={host} servers={mcps} />
         </TabsContent>
       </Tabs>
     </>
@@ -465,3 +444,141 @@ const SKILL_MARKDOWN_COMPONENTS: Components = {
     </a>
   ),
 };
+
+function McpList({ host, servers }: { host: Host; servers: InventoryMcpServer[] }) {
+  const [expanded, setExpanded] = useState<string[]>([]);
+  const [supported, setSupported] = useState(true);
+  if (servers.length === 0) return <Notice>No MCPs found.</Notice>;
+  if (!supported)
+    return (
+      <ul className="flex flex-col gap-2">
+        {servers.map((server) => (
+          <CatalogRow
+            key={server.id}
+            icon={<LetterAvatar name={server.name} />}
+            name={server.name}
+            detail={server.detail}
+          />
+        ))}
+      </ul>
+    );
+  // Leading chevron and instant expansion match the harness catalog.
+  return (
+    <AccordionPrimitive.Root
+      type="multiple"
+      value={expanded}
+      onValueChange={setExpanded}
+      className="flex flex-col rounded-xl border border-border"
+    >
+      {servers.map((server) => (
+        <McpRow
+          key={server.id}
+          host={host}
+          server={server}
+          expanded={expanded.includes(server.id)}
+          onUnavailable={() => setSupported(false)}
+        />
+      ))}
+    </AccordionPrimitive.Root>
+  );
+}
+
+const CONNECTION_LABELS: Record<McpServerTools["connection"], string> = {
+  connected: "Connected",
+  needs_auth:
+    "Authentication required. Harness sign-in credentials cannot be reused for this probe.",
+  unreachable: "Couldn't reach this MCP server.",
+  timeout: "MCP probe timed out.",
+  unsupported: "This MCP configuration cannot be probed from the host.",
+};
+
+function McpRow({
+  host,
+  server,
+  expanded,
+  onUnavailable,
+}: {
+  host: Host;
+  server: InventoryMcpServer;
+  expanded: boolean;
+  onUnavailable: () => void;
+}) {
+  const query = useMcpServerTools(host.host_id, server.harness, server.name, server.plugin, {
+    enabled: expanded,
+  });
+  const missingRoute = query.error instanceof ApiError && query.error.status === 404;
+  useEffect(() => {
+    if (missingRoute) onUnavailable();
+  }, [missingRoute, onUnavailable]);
+  const data = query.data;
+  return (
+    <AccordionPrimitive.Item value={server.id} className="not-last:border-b">
+      <AccordionPrimitive.Header className="flex">
+        <AccordionPrimitive.Trigger
+          className="group flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-4 py-2.5 text-left text-ui outline-none hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50"
+          data-testid={`catalog-row-${server.name}`}
+        >
+          <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground group-aria-expanded:rotate-90" />
+          <LetterAvatar name={server.name} />
+          <span className="shrink-0 font-medium text-foreground">{server.name}</span>
+          {data?.connection === "connected" && (
+            <span className="shrink-0 text-muted-foreground">
+              · {data.tools.length}
+              {data.truncated ? "+" : ""} {data.tools.length === 1 ? "tool" : "tools"}
+            </span>
+          )}
+          {server.detail && (
+            <span className="min-w-0 truncate text-muted-foreground">{server.detail}</span>
+          )}
+          {data && (
+            <span
+              role="img"
+              aria-label={CONNECTION_LABELS[data.connection]}
+              title={CONNECTION_LABELS[data.connection]}
+              className={cn(
+                "ml-auto size-2 shrink-0 rounded-full",
+                data.connection === "connected" ? "bg-success" : "bg-destructive",
+              )}
+            />
+          )}
+        </AccordionPrimitive.Trigger>
+      </AccordionPrimitive.Header>
+      <AccordionPrimitive.Content className="pr-4 pb-2.5 pl-10">
+        {query.isPending ? (
+          <Notice>Loading tools…</Notice>
+        ) : query.error ? (
+          <Notice>
+            {query.error instanceof ApiError && query.error.status === 501
+              ? `Update ${host.name} to list tools.`
+              : `Couldn't reach ${server.name}.`}
+          </Notice>
+        ) : data ? (
+          <>
+            <p className="mb-2 text-xs text-muted-foreground">
+              Tools reported when probed from this host. Workspace overrides and harness sign-in
+              credentials are not used.
+            </p>
+            {data.connection !== "connected" ? (
+              <Notice>{CONNECTION_LABELS[data.connection]}</Notice>
+            ) : (
+              <>
+                {data.tools.length === 0 && <Notice>No tools reported.</Notice>}
+                {data.truncated && <Notice>Showing the first 500 tools.</Notice>}
+                <ul className="flex flex-col gap-1 text-xs text-muted-foreground">
+                  {data.tools.map((tool, index) => (
+                    // Capped names can collide; these display-only rows have no state.
+                    // eslint-disable-next-line react/no-array-index-key
+                    <li key={index}>
+                      <span className="font-mono">{tool.name}</span>
+                      {tool.description && <span className="ml-2">{tool.description}</span>}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </>
+        ) : null}
+      </AccordionPrimitive.Content>
+    </AccordionPrimitive.Item>
+  );
+}

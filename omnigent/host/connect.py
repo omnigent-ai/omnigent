@@ -91,6 +91,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
+    HostMcpToolsFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
     HostPluginsFrame,
@@ -1127,6 +1129,9 @@ class HostProcess:
         from omnigent.host.mcp_inventory import HostMcpInventory
 
         self._mcp_inventory = HostMcpInventory()
+        from omnigent.host.mcp_tools import HostMcpTools
+
+        self._mcp_tools = HostMcpTools()
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -3240,6 +3245,15 @@ class HostProcess:
             )
         return HostSkillContentResultFrame(request_id=frame.request_id, status="ok", skill=skill)
 
+    async def _handle_mcp_tools(self, frame: HostMcpToolsFrame) -> HostMcpToolsResultFrame:
+        try:
+            result = await self._mcp_tools.probe(frame.harness, frame.server, frame.plugin)
+        except Exception:  # noqa: BLE001 — transport failures must not expose private config
+            return HostMcpToolsResultFrame(
+                request_id=frame.request_id, status="failed", error="MCP tools lookup failed"
+            )
+        return HostMcpToolsResultFrame(request_id=frame.request_id, status="ok", **result)
+
     def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
@@ -4779,6 +4793,9 @@ class HostProcess:
         elif isinstance(frame, HostSkillContentFrame):
             content_result = await asyncio.to_thread(self._handle_skill_content, frame)
             await ws.send(encode_host_frame(content_result))
+        elif isinstance(frame, HostMcpToolsFrame):
+            tools_result = await self._handle_mcp_tools(frame)
+            await ws.send(encode_host_frame(tools_result))
         elif isinstance(frame, HostHarnessStartupFrame):
             startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
             await ws.send(encode_host_frame(startup_result))

@@ -3366,6 +3366,103 @@
         "title": "McpServersResponse",
         "type": "object"
       },
+      "McpToolSummary": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 300,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "maxLength": 256,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "McpToolSummary",
+        "type": "object"
+      },
+      "McpToolsRequest": {
+        "properties": {
+          "harness": {
+            "enum": [
+              "claude",
+              "codex",
+              "cursor"
+            ],
+            "title": "Harness",
+            "type": "string"
+          },
+          "plugin": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugin"
+          },
+          "server": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Server",
+            "type": "string"
+          }
+        },
+        "required": [
+          "harness",
+          "server"
+        ],
+        "title": "McpToolsRequest",
+        "type": "object"
+      },
+      "McpToolsResponse": {
+        "properties": {
+          "connection": {
+            "enum": [
+              "connected",
+              "needs_auth",
+              "unreachable",
+              "timeout",
+              "unsupported"
+            ],
+            "title": "Connection",
+            "type": "string"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/McpToolSummary"
+            },
+            "maxItems": 500,
+            "title": "Tools",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "tools",
+          "connection",
+          "truncated"
+        ],
+        "title": "McpToolsResponse",
+        "type": "object"
+      },
       "MessageData": {
         "description": "Data for a message item (user or assistant).\n\n**Parameters**\n\n- `agent` \u2014 Agent name (required for assistant messages, absent for user). Serialized as `\"model\"` in JSON.",
         "properties": {
@@ -10495,6 +10592,58 @@
           }
         },
         "summary": "Get Mcp Servers",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/mcp-servers/tools": {
+      "post": {
+        "operationId": "get_mcp_tools_v1_hosts__host_id__mcp_servers_tools_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpToolsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpToolsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Mcp Tools",
         "tags": [
           "hosts"
         ]
