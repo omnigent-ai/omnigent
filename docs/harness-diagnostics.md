@@ -316,6 +316,8 @@ metadata that fails validation or markers exceeding the size limit.
 consumed position. This is the collector's current launch, not proof that a
 buffered hook originated in that launch. A snapshot can lag newly written
 diagnostics by one poll; it does not force another file read.
+Presence and capture metadata are separate observations within a poll. Concurrent
+marker replacement can temporarily skew the state until the next poll.
 Disabled capture creates no follower and reads no diagnostic files or markers.
 Absent CLI versions and IDs remain explicit in the missing-fields list; this
 telemetry never runs an extra CLI process to discover them.

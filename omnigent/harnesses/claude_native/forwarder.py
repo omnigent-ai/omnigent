@@ -4191,6 +4191,17 @@ async def _forward_available_status_events(
         retry_key = f"hook:{record.event_cursor}:{record.byte_offset}:{status}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return durable
+        failure_context: FailureContext | None = None
+        if status == "failed":
+            try:
+                failure_context = _stop_failure_context(
+                    record,
+                    session_id=session_id,
+                    parent_claude_session_ids=parent_claude_session_ids,
+                    diagnostic_health=diagnostic_health,
+                )
+            except Exception as exc:  # noqa: BLE001 - telemetry must not prevent status delivery
+                _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)
         try:
             await post_external_session_status(
                 client,
@@ -4215,16 +4226,7 @@ async def _forward_available_status_events(
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
                 failure_detail=_stop_failure_detail(record) if status == "failed" else None,
-                failure_context=(
-                    _stop_failure_context(
-                        record,
-                        session_id=session_id,
-                        parent_claude_session_ids=parent_claude_session_ids,
-                        diagnostic_health=diagnostic_health,
-                    )
-                    if status == "failed"
-                    else None
-                ),
+                failure_context=failure_context,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)

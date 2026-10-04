@@ -75,7 +75,8 @@ def claude_failure_context(
         if isinstance(error_message, str) and error_message.strip():
             context["native_error_message"] = error_message
     # An unqualified request_id in an error body has no proven provider ownership.
-    context["native_error_request_id"] = envelope.get("request_id")
+    if envelope is not entry:
+        context["native_error_request_id"] = envelope.get("request_id")
     context["gateway_request_id"] = envelope.get(
         "gateway_request_id", entry.get("gateway_request_id")
     )

@@ -69,6 +69,65 @@ async def test_hook_category_and_identity_survive_retry(tmp_path: Path) -> None:
     assert "native_api_error_message" not in second["failure_context"]
 
 
+@pytest.mark.asyncio
+async def test_hook_telemetry_failure_does_not_block_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge.record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "native-session",
+            "error": "server_error",
+            "last_assistant_message": "Generation failed.",
+        },
+    )
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise TypeError("synthetic-private-telemetry-data")
+
+    monkeypatch.setattr(forwarder, "_stop_failure_context", fail)
+    caplog.set_level(logging.DEBUG, logger=forwarder.__name__)
+    requests = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        for _ in range(2):
+            state = await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv_synthetic",
+                bridge_dir=bridge_dir,
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+                response_id="resp_synthetic",
+            )
+    assert state.event_cursor == 1
+    assert state.byte_offset == (bridge_dir / "hooks.jsonl").stat().st_size
+    assert requests == [
+        {
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "response_id": "resp_synthetic",
+                "failure_detail": "Generation failed.",
+            },
+        }
+    ]
+    assert "Claude hook failure telemetry failed: TypeError" in caplog.text
+    assert "synthetic-private-telemetry-data" not in caplog.text
+
+
 @pytest.mark.parametrize("marker_location", ["entry", "message"])
 @pytest.mark.parametrize("block_count", [1, 2], ids=["string", "multiple-text-blocks"])
 @pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
@@ -91,6 +150,7 @@ async def test_explicit_transcript_api_error_is_observed_without_failing_session
         "uuid": "native-record",
         "sessionId": "native-session",
         "requestId": "native-request",
+        "request_id": "unqualified-record-request",
         "version": "2.0.0-test",
         "message": {"role": "assistant", "model": "synthetic-model", "content": error_text},
     }
@@ -236,6 +296,17 @@ def test_api_error_keeps_original_message_before_display_rewriting(tmp_path: Pat
             {"provider_error_code": "0"},
             (),
             id="zero-code-is-preserved",
+        ),
+        pytest.param(
+            {
+                "requestId": "native-request",
+                "request_id": "unqualified-record-request",
+                "error": {"code": "stream_lost"},
+            },
+            None,
+            {"native_request_id": "native-request", "provider_error_code": "stream_lost"},
+            ("native_error_request_id", "gateway_request_id", "provider_request_id"),
+            id="record-request-id-is-not-error-body-evidence",
         ),
         pytest.param(
             {

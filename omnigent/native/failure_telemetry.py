@@ -124,10 +124,10 @@ def failure_log_attributes(value: object) -> dict[str, str]:
         result["failure_context_missing_fields"] = ",".join(
             field for field in _AVAILABILITY_FIELDS if field not in result
         )
-    return {key: str(value) for key, value in result.items()}
+    return {key: str(field_value) for key, field_value in result.items()}
 
 
-def native_failure_id(source: str, *identity: object) -> str:
+def native_failure_id(source: str, *identity: str | int | float | None) -> str:
     """Derive an observation ID from durable source identity, never a retry timestamp."""
     key = json.dumps([source, *identity], separators=(",", ":"), ensure_ascii=True)
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "omnigent:native-failure:" + key))
