@@ -210,6 +210,54 @@ def test_fine_pointer_actions_slot_stays_stable_and_size_tracks_visible_actions(
     page.keyboard.press("Escape")
 
 
+def test_fine_pointer_row_action_targets_meet_spacing_exception(
+    page: Page,
+    seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+) -> None:
+    """Undersized adjacent action targets keep 24px spacing on fine pointers."""
+    base_url, session_id = seeded_session
+    _seed_file(page, base_url, session_id, request)
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role("tab", name=re.compile("^Files")).click()
+    row = _row(panel)
+    row.hover()
+
+    targets = [
+        row.get_by_role("button", name=re.compile(r"^Download ")),
+        row.get_by_role("button", name=re.compile(r"^Copy path:")),
+        row.get_by_role("button", name=f"More actions for {_FILE_NAME}"),
+    ]
+    boxes = [target.bounding_box() for target in targets]
+    assert all(box is not None for box in boxes), "all file action targets should be rendered"
+    measured = [box for box in boxes if box is not None]
+
+    def separated(left: dict[str, float], right: dict[str, float]) -> bool:
+        left_small = left["width"] < 24 or left["height"] < 24
+        right_small = right["width"] < 24 or right["height"] < 24
+        if not left_small and not right_small:
+            return True
+        left_center = (left["x"] + left["width"] / 2, left["y"] + left["height"] / 2)
+        right_center = (right["x"] + right["width"] / 2, right["y"] + right["height"] / 2)
+        if left_small and right_small:
+            return (right_center[0] - left_center[0]) ** 2 + (
+                right_center[1] - left_center[1]
+            ) ** 2 >= 24**2
+        small_center, target, target_center = (
+            (left_center, right, right_center) if left_small else (right_center, left, left_center)
+        )
+        dx = max(abs(small_center[0] - target_center[0]) - target["width"] / 2, 0)
+        dy = max(abs(small_center[1] - target_center[1]) - target["height"] / 2, 0)
+        return dx**2 + dy**2 >= 12**2
+
+    assert separated(measured[0], measured[1]), (
+        f"Download/Copy targets overlap spacing: {measured}"
+    )
+    assert separated(measured[1], measured[2]), f"Copy/kebab targets overlap spacing: {measured}"
+
+
 @pytest.fixture
 def touch_files_page(
     browser: Browser,
