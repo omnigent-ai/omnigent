@@ -59,6 +59,10 @@ def test_rename_dialog_preselects_name_so_typing_replaces(
 ) -> None:
     """The current name opens fully selected, so typing replaces it."""
     name_input = _open_rename_dialog(page, seeded_session)
+    old_name = name_input.input_value()
+    expect(name_input).to_be_focused()
+    expect(name_input).to_have_js_property("selectionStart", 0)
+    expect(name_input).to_have_js_property("selectionEnd", len(old_name))
     new_name = f"Renamed-{uuid.uuid4().hex[:6]}"
     page.keyboard.type(new_name)
     expect(name_input).to_have_value(new_name)
