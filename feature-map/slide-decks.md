@@ -18,6 +18,12 @@ slide to PDF, and a Source toggle back to the code view.
   hidden when the browser has no Fullscreen API.
 - `deck-print`: "Print / Save as PDF" opens the print dialog with every slide on
   its own landscape page.
+- `deck-export`: "Download HTML" saves `<deck>.html`, one file with the deck,
+  the kit or design-system style the viewer rendered, the print rules, and a
+  small navigation script (arrow keys, PageUp, PageDown, Space, click, `#n` in
+  the URL). With JavaScript off it reads as a scrolling page of slides. It is
+  disabled while branding loads, for a truncated deck, and when a kit or design
+  system notice is showing.
 - `deck-source`: the Source button switches to the existing code view; the
   toolbar's "View preview" returns to the deck.
 - `deck-empty`: a deck with no top-level sections shows a "No slides yet" empty
@@ -73,6 +79,13 @@ doctor`) and the built web UI.
   controls step through slides.
 - Print: no test (the print dialog is native). Choose "Print / Save as PDF" and
   check the preview shows one landscape page per slide.
+- Export contents, the no-JS stacked fallback, navigation keys, `#n`, and the
+  disabled states: `cd web && pnpm exec vitest run src/shell/SlidesViewer.test.tsx`;
+  the button in the file viewer: `src/shell/CodeViewer.test.tsx`.
+- Export by hand: in the file viewer and in the Design studio, choose
+  "Download HTML", open the saved file from disk, and step through it with
+  the arrow keys, Space, and clicks; add `#2` to its URL to land on slide 2,
+  and open it with JavaScript disabled to see every slide stacked.
 - Design kit applied over a deck's own colors, fonts, and layout class:
   `tests/e2e_ui/files/test_slides_viewer.py::test_slides_viewer_applies_design_kit`
   seeds the sample kit and checks computed styles inside the deck iframe.
@@ -121,3 +134,6 @@ doctor`) and the built web UI.
   branding, and a sandboxed session needs a read grant for the folder.
 - `ds:` paths use the same character rules as kit paths; remote `url()`
   values in `colors_and_type.css` are dropped.
+- The exported file keeps the deck's own markup as written, so a deck that
+  links remote fonts or scripts still needs the network. Its slides fill the
+  browser window rather than a fixed 16:9 stage.
