@@ -809,6 +809,18 @@ _policy_evaluation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
 )
 
 
+@dataclass(frozen=True)
+class _RelayStatusSnapshot:
+    """Saved status and diagnostics without retaining a full conversation's payloads."""
+
+    live_status: str
+    kind: str
+    parent_conversation_id: str | None
+    runner_id: str
+    host_id: str | None
+    updated_at: int
+
+
 @dataclass
 class _RelayHandle:
     """
@@ -821,11 +833,14 @@ class _RelayHandle:
     :param ready: Event set after the relay observes the runner
         stream's ready heartbeat, proving the runner-side
         no-replay subscription is registered.
+    :param status_snapshot: Saved status read when adopting this binding,
+        used only when live status and a fresh row are unavailable.
     """
 
     runner_id: str
     task: asyncio.Task[None]
     ready: asyncio.Event
+    status_snapshot: _RelayStatusSnapshot | None = None
 
 
 _runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()
@@ -1162,6 +1177,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_RelayStatusSnapshot",
     "_RunnerStatusProbeBackoff",
     "_browser_action_claim_events",
     "_browser_action_claims",

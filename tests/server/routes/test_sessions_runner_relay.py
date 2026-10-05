@@ -6,14 +6,16 @@ import asyncio
 import contextlib
 import json
 import logging
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
-from types import SimpleNamespace, TracebackType
+from types import TracebackType
 from typing import Any
 
 import httpx
 import pytest
 
+from omnigent.entities import Conversation
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -743,13 +745,17 @@ class _RecordingLabelStore:
     def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
         return self._runner_liveness.get(conversation_id)
 
-    def get_conversation(self, conversation_id: str) -> Any:
+    def get_conversation(self, conversation_id: str) -> Conversation:
         """Return a conversation-shaped object exposing the read fields.
 
         ``.labels`` is read by the recovery guard, ``.live_status`` by the
         mid-turn check when the in-memory status cache is cold.
         """
-        return SimpleNamespace(
+        return Conversation(
+            id=conversation_id,
+            root_conversation_id=conversation_id,
+            created_at=0,
+            updated_at=0,
             labels=dict(self.labels.get(conversation_id, {})),
             live_status=self.live_status,
         )
@@ -1572,11 +1578,332 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
 
 
 @pytest.mark.asyncio
-async def test_relay_reports_the_drop_when_the_live_status_read_fails(
+@pytest.mark.parametrize(
+    ("adopted_status", "later_lookup", "live_status", "expect_failed", "status_source"),
+    [
+        ("idle", "missing", None, False, "relay_snapshot"),
+        ("idle", "error", None, False, "relay_snapshot"),
+        ("running", "error", None, True, "relay_snapshot"),
+        ("waiting", "missing", None, True, "relay_snapshot"),
+        (None, "missing", None, True, "unknown"),
+        ("idle", "running", None, True, "persisted"),
+        ("idle", "waiting", None, True, "persisted"),
+        ("running", "idle", None, False, "persisted"),
+        ("idle", "idle", "running", True, "cache"),
+        ("running", "running", "idle", False, "cache"),
+    ],
+)
+async def test_relay_disconnect_status_after_adoption(
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    adopted_status: str | None,
+    later_lookup: str,
+    live_status: str | None,
+    expect_failed: bool,
+    status_source: str,
+) -> None:
+    """Saved adoption state is a fallback; newer state still decides interruptions."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, runner_id="runner_adopted"
+    )
+    if adopted_status is not None:
+        store.set_session_live_status(child.id, adopted_status)
+    snapshot = store.get_conversation(child.id)
+    assert snapshot is not None
+    gate = asyncio.Event()
+    frames = (
+        [f'data: {{"type": "session.status", "status": "{live_status}"}}\n\n']
+        if live_status is not None
+        else []
+    )
+    runner = _ScriptedThenDropRunnerClient(frames, gate)
+    get_conversation = store.get_conversation
+    lookup_attempted = False
+
+    def disconnect_lookup(conversation_id: str) -> Conversation | None:
+        nonlocal lookup_attempted
+        if conversation_id == child.id and not lookup_attempted:
+            # Fail only the disconnect read so genuine failures can still fan out.
+            lookup_attempted = True
+            if later_lookup == "error":
+                raise RuntimeError("status lookup unavailable")
+            if later_lookup == "missing":
+                return None
+        return get_conversation(conversation_id)
+
+    handle = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            child.id,
+            child.runner_id,
+            runner,  # type: ignore[arg-type]
+            store,
+            conversation=snapshot,
+        )
+        assert handle is not None
+        assert sessions_module._session_status_cache.get(child.id) is None
+        if later_lookup not in {"missing", "error"}:
+            store.set_session_live_status(child.id, later_lookup)
+        monkeypatch.setattr(store, "get_conversation", disconnect_lookup)
+
+        with capture_debug_rows("server") as rows:
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        refreshed = get_conversation(child.id)
+        assert refreshed is not None
+        error = sessions_module._last_task_error_from_labels(refreshed.labels)
+        if expect_failed:
+            assert sessions_module._session_status_cache[child.id] == "failed"
+            assert error is not None and error["code"] == "runner_disconnected"
+            items = store.list_items(parent.id).data
+            assert len(items) == 1 and items[0].data.resource["status"] == "failed"
+        else:
+            assert sessions_module._session_status_cache.get(child.id) != "failed"
+            assert error is None
+            assert store.list_items(parent.id).data == []
+            assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+        decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert decision["attributes"]["status_source"] == status_source
+        assert decision["attributes"]["decision"] == (
+            "failed_mid_turn" if expect_failed else "idle_no_failure"
+        )
+        if adopted_status is not None:
+            assert decision["attributes"]["snapshot_session_status"] == adopted_status
+    finally:
+        gate.set()
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handle.task
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(child.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "expect_failed"),
+    [
+        ("wrong_session", True),
+        ("wrong_runner", True),
+        ("rebind", True),
+        ("caller_mutation", False),
+        ("healthy_reuse", False),
+    ],
+)
+async def test_relay_adoption_snapshot_lifetime(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expect_failed: bool,
+) -> None:
+    """The fallback belongs to one relay binding, independent of caller mutations."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner_original")
+    store.set_session_live_status(conv.id, "idle")
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+    if scenario == "wrong_session":
+        snapshot.id = "another_session"
+    elif scenario == "wrong_runner":
+        snapshot.runner_id = "another_runner"
+    gate = asyncio.Event()
+    runner = _TunnelCloseRunnerClient(gate)
+    get_conversation = store.get_conversation
+    lookup_attempted = False
+
+    def missing_disconnect_lookup(conversation_id: str) -> Conversation | None:
+        nonlocal lookup_attempted
+        if conversation_id == conv.id and not lookup_attempted:
+            lookup_attempted = True
+            return None
+        return get_conversation(conversation_id)
+
+    handle = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            conv.id,
+            conv.runner_id,
+            runner,  # type: ignore[arg-type]
+            store,
+            conversation=snapshot,
+        )
+        assert handle is not None
+        if scenario == "rebind":
+            original = handle
+            store.replace_runner_id(conv.id, "runner_replacement")
+            handle = await sessions_module._ensure_runner_relay_ready(
+                conv.id,
+                "runner_replacement",
+                runner,  # type: ignore[arg-type]
+                store,
+                conversation=snapshot,
+            )
+            assert handle is not None and handle is not original
+            with contextlib.suppress(asyncio.CancelledError):
+                await original.task
+        elif scenario in {"caller_mutation", "healthy_reuse"}:
+            snapshot.live_status = "running"
+            if scenario == "healthy_reuse":
+                reused = await sessions_module._ensure_runner_relay_ready(
+                    conv.id,
+                    conv.runner_id,
+                    runner,  # type: ignore[arg-type]
+                    store,
+                    conversation=snapshot,
+                )
+                assert reused is handle
+        monkeypatch.setattr(store, "get_conversation", missing_disconnect_lookup)
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        assert lookup_attempted
+        assert (sessions_module._session_status_cache.get(conv.id) == "failed") == expect_failed
+    finally:
+        gate.set()
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handle.task
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_path", ["relay", "sweep"])
+@pytest.mark.parametrize("lookup_result", ["found", "missing", "error"])
+@pytest.mark.parametrize(
+    ("persisted_status", "arriving_status", "expect_failed"),
+    [("running", "idle", False), ("idle", "running", True), ("idle", "waiting", True)],
+)
+async def test_disconnect_uses_status_arriving_during_lookup(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_path: str,
+    lookup_result: str,
+    persisted_status: str,
+    arriving_status: str,
+    expect_failed: bool,
+) -> None:
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    store.set_session_live_status(child.id, persisted_status)
+    snapshot = store.get_conversation(child.id)
+    assert snapshot is not None
+    read_started = asyncio.Event()
+    release_read = threading.Event()
+    loop = asyncio.get_running_loop()
+    get_conversation = store.get_conversation
+
+    def delayed_get(conversation_id: str) -> Conversation | None:
+        conv = get_conversation(conversation_id)
+        if conversation_id == child.id and not release_read.is_set():
+            # Hold the real DB snapshot while a newer lifecycle edge arrives.
+            loop.call_soon_threadsafe(read_started.set)
+            assert release_read.wait(_TASK_TIMEOUT_S)
+            if lookup_result == "error":
+                raise RuntimeError("status lookup unavailable")
+            if lookup_result == "missing":
+                return None
+        return conv
+
+    monkeypatch.setattr(store, "get_conversation", delayed_get)
+    gate = asyncio.Event()
+    gate.set()
+    # Only the runner transport is scripted; the relay and persistence are real.
+    runner = _ScriptedThenDropRunnerClient([], gate)
+    origin = "runner_disconnected_mid_turn" if failure_path == "relay" else "runner_offline_sweep"
+    task = None
+    try:
+        with capture_debug_rows("server") as rows:
+            task = asyncio.create_task(
+                sessions_module._relay_runner_stream(
+                    child.id,
+                    runner,  # type: ignore[arg-type]
+                    store,
+                )
+                if failure_path == "relay"
+                else sessions_module._mark_runner_sessions_offline(
+                    [snapshot],
+                    ErrorDetail(code="runner_disconnected", message="Disconnected"),
+                    store,
+                )
+            )
+            await asyncio.wait_for(read_started.wait(), timeout=_TASK_TIMEOUT_S)
+            sessions_module._publish_status(child.id, arriving_status)
+            release_read.set()
+            await asyncio.wait_for(task, timeout=_TASK_TIMEOUT_S)
+
+        expected = "failed" if expect_failed else arriving_status
+        assert sessions_module._session_status_cache[child.id] == expected
+        refreshed = get_conversation(child.id)
+        assert refreshed is not None
+        error = sessions_module._last_task_error_from_labels(refreshed.labels)
+        if expect_failed:
+            assert error is not None and error["code"] == "runner_disconnected"
+            items = store.list_items(parent.id).data
+            assert len(items) == 1
+            assert items[0].data.resource["status"] == "failed"
+        else:
+            assert error is None
+            assert store.list_items(parent.id).data == []
+            assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+
+        decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert decision["level"] == "WARNING"
+        assert (
+            decision["attributes"].items()
+            >= {
+                "origin": origin,
+                "decision": "failed_mid_turn" if expect_failed else "idle_no_failure",
+                "status_source": "cache",
+                "cached_session_status": arriving_status,
+                "status_lookup": lookup_result,
+            }.items()
+        )
+        if lookup_result == "found":
+            assert decision["attributes"]["persisted_session_status"] == persisted_status
+            assert decision["attributes"]["parent_session_id"] == parent.id
+            assert decision["attributes"]["session_kind"] == "sub_agent"
+    finally:
+        release_read.set()
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(child.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_row", [False, True])
+async def test_relay_reports_the_drop_when_live_status_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_row: bool,
 ) -> None:
     """
-    An unreadable row reports the drop instead of killing the relay.
+    An unreadable or missing row still reports the drop.
 
     The cold-cache fallback reads the row from inside the disconnect
     handler. A store error there must not escape: an exception thrown out of
@@ -1596,11 +1923,12 @@ async def test_relay_reports_the_drop_when_the_live_status_read_fails(
     gate = asyncio.Event()
     fake_runner = _ScriptedThenDropRunnerClient([], gate)
     store = _RecordingLabelStore()
-    monkeypatch.setattr(
-        store,
-        "get_conversation",
-        lambda conversation_id: (_ for _ in ()).throw(RuntimeError("db blip")),
-    )
+
+    def unavailable_conversation(conversation_id: str) -> None:
+        if not missing_row:
+            raise RuntimeError("db blip")
+
+    monkeypatch.setattr(store, "get_conversation", unavailable_conversation)
     session_id = "abcdef0123456789abcdef0123456789"
 
     try:
@@ -1726,26 +2054,6 @@ async def test_relay_retries_transport_drop_within_grace(
         sessions_module._session_status_cache.pop(session_id, None)
 
 
-def _bound_conv(
-    session_id: str,
-    *,
-    kind: str = "default",
-    live_status: str | None = None,
-) -> Any:
-    """
-    Build a conversation-shaped row for the offline-reconciliation helper.
-
-    ``_mark_runner_sessions_offline`` reads only ``id``, ``kind`` and
-    ``live_status`` off each row, so a namespace is enough.
-
-    :param session_id: Conversation identifier.
-    :param kind: ``"default"`` (top-level) or ``"sub_agent"``.
-    :param live_status: Persisted live status, read only on a cache miss.
-    :returns: A conversation-shaped namespace.
-    """
-    return SimpleNamespace(id=session_id, kind=kind, live_status=live_status)
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("kind", "cached", "live_status", "intentional_stop", "fail_idle_top_level", "expect_failed"),
@@ -1761,8 +2069,14 @@ def _bound_conv(
         ("default", "idle", None, False, False, False),
         # Cache miss falls back to the persisted row value.
         ("default", None, "running", False, False, True),
+        ("sub_agent", None, "running", False, False, True),
+        ("sub_agent", None, "waiting", False, False, True),
+        ("sub_agent", None, "idle", False, False, False),
         ("default", None, "idle", False, False, False),
         ("default", None, None, False, False, False),
+        # Local turn edges can be ahead of asynchronous persistence.
+        ("sub_agent", "idle", "running", False, False, False),
+        ("sub_agent", "running", "idle", False, False, True),
         # Stop / archive drop the tunnel on purpose; the relay owns that path.
         ("default", "running", None, True, False, False),
         # A crash report also covers the runner that died before it could run
@@ -1778,6 +2092,7 @@ def _bound_conv(
     ],
 )
 async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
+    db_uri: str,
     kind: str,
     cached: str | None,
     live_status: str | None,
@@ -1798,8 +2113,14 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.schemas import ErrorDetail
 
-    session_id = "b04d1f3c9a5e4f7a8c2b6d0e1f3a5c79"
-    store = _RecordingLabelStore()
+    store = SqlAlchemyConversationStore(db_uri)
+    parent_id = store.create_conversation().id if kind == "sub_agent" else None
+    conv = store.create_conversation(kind=kind, parent_conversation_id=parent_id)
+    session_id = conv.id
+    if live_status is not None:
+        store.set_session_live_status(session_id, live_status)
+    snapshot = store.get_conversation(session_id)
+    assert snapshot is not None
     error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
     if cached is not None:
         sessions_module._session_status_cache[session_id] = cached
@@ -1808,22 +2129,23 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
 
     try:
         await sessions_module._mark_runner_sessions_offline(
-            [_bound_conv(session_id, kind=kind, live_status=live_status)],
+            [snapshot],
             error,
-            store,  # type: ignore[arg-type]
+            store,
             fail_idle_top_level=fail_idle_top_level,
         )
 
         status = sessions_module._session_status_cache.get(session_id)
-        persisted = store.labels.get(session_id)
+        refreshed = store.get_conversation(session_id)
+        assert refreshed is not None
+        persisted = sessions_module._last_task_error_from_labels(refreshed.labels)
         if expect_failed:
             assert status == "failed"
             # The cause must be durable: it is what lets the UI render a
             # benign "Disconnected" and what
             # ``_publish_runner_recovered_status`` matches on to clear the
             # failure when the runner comes back.
-            assert persisted is not None
-            assert sessions_module._last_task_error_from_labels(persisted) == {
+            assert persisted == {
                 "code": "runner_disconnected",
                 "message": "Runner disconnected unexpectedly.",
             }
@@ -2123,6 +2445,59 @@ async def test_relay_still_fails_mid_turn_session_without_handoff_evidence(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_persist_error_once_emits_debug_row() -> None:
+    """_relay_persist_error_once logs an error_item_persisted debug row on success."""
+    from unittest.mock import MagicMock
+
+    from omnigent.entities.conversation import ConversationItem, ErrorData, NewConversationItem
+    from omnigent.server.routes._sessions.helpers import _relay_persist_error_once
+
+    # Minimal fake store: list_items returns nothing (no duplicate), append returns
+    # a list with one ConversationItem so the function can complete.
+    persisted_item = ConversationItem(
+        id="item_test",
+        type="error",
+        status="completed",
+        response_id="resp_test",
+        created_at=1753900000,
+        data=ErrorData(
+            source="execution",
+            code="pi_credentials_unresolved",
+            message="credential warning; do not log this",
+        ),
+    )
+    fake_store = MagicMock()
+    fake_store.list_items.return_value = MagicMock(data=[])
+    fake_store.append.return_value = [persisted_item]
+
+    item = NewConversationItem(
+        type="error",
+        response_id="resp_test",
+        data=ErrorData(
+            source="execution",
+            code="pi_credentials_unresolved",
+            message="credential warning; do not log this",
+        ),
+    )
+
+    with capture_debug_rows("server") as rows:
+        result = await _relay_persist_error_once(fake_store, "conv_test", item)
+
+    assert result == "persisted"
+    persist_rows = [r for r in rows if r.get("event_name") == "error_item_persisted"]
+    assert len(persist_rows) == 1
+    row = persist_rows[0]
+    assert row["session_id"] == "conv_test"
+    assert row["attributes"]["code"] == "pi_credentials_unresolved"
+    assert row["attributes"]["source"] == "execution"
+    # level is None for a destructive error; it must not appear in attributes.
+    assert "level" not in row["attributes"] or row["attributes"]["level"] is None
+    # message text must never reach the debug table
+    assert "credential warning" not in str(row)
+    assert "do not log" not in str(row)
 
 
 def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:

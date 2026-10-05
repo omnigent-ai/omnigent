@@ -29,6 +29,9 @@ _HOST_ID = "a828988dc0b441fb8d04dad3761773b9"
 _URL = f"/v1/hosts/{_HOST_ID}/plugins"
 _PLUGINS = [
     {
+        "id": "a" * 64,
+        "skill_entries": [{"id": "b" * 64, "name": "review"}],
+        "mcp_entries": [],
         "harness": "claude",
         "name": "toolkit",
         "marketplace": "market",

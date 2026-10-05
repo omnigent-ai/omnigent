@@ -12,6 +12,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.spec.skill_sources import _plugin_asset_id
+
 
 @pytest.mark.min_server_version("0.17.0")
 def test_host_plugin_inventory(live_server: str, tmp_path: Path) -> None:
@@ -86,6 +88,9 @@ def test_host_plugin_inventory(live_server: str, tmp_path: Path) -> None:
                 assert response.json() == {
                     "plugins": [
                         {
+                            "id": _plugin_asset_id("hooks@test-market", "plugin"),
+                            "skill_entries": [],
+                            "mcp_entries": [],
                             "harness": "claude",
                             "name": "hooks",
                             "marketplace": "test-market",

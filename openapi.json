@@ -3318,6 +3318,17 @@
             "title": "Scope",
             "type": "string"
           },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
           "transport": {
             "description": "`stdio` for a local process, `http` for a remote server.",
             "enum": [
@@ -3364,6 +3375,115 @@
           "mcp_servers"
         ],
         "title": "McpServersResponse",
+        "type": "object"
+      },
+      "McpToolSummary": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 300,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "maxLength": 256,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "McpToolSummary",
+        "type": "object"
+      },
+      "McpToolsRequest": {
+        "properties": {
+          "harness": {
+            "enum": [
+              "claude",
+              "codex",
+              "cursor"
+            ],
+            "title": "Harness",
+            "type": "string"
+          },
+          "plugin": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugin"
+          },
+          "server": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Server",
+            "type": "string"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          }
+        },
+        "required": [
+          "harness",
+          "server"
+        ],
+        "title": "McpToolsRequest",
+        "type": "object"
+      },
+      "McpToolsResponse": {
+        "properties": {
+          "connection": {
+            "enum": [
+              "connected",
+              "needs_auth",
+              "unreachable",
+              "timeout",
+              "unsupported"
+            ],
+            "title": "Connection",
+            "type": "string"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/McpToolSummary"
+            },
+            "maxItems": 500,
+            "title": "Tools",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "tools",
+          "connection",
+          "truncated"
+        ],
+        "title": "McpToolsResponse",
         "type": "object"
       },
       "MessageData": {
@@ -3890,6 +4010,26 @@
         "title": "PermissionObject",
         "type": "object"
       },
+      "PluginAsset": {
+        "properties": {
+          "id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "PluginAsset",
+        "type": "object"
+      },
       "PluginSummary": {
         "description": "Installed Claude plugin metadata, without paths or executable configuration.",
         "properties": {
@@ -3922,10 +4062,37 @@
             "title": "Has Hooks",
             "type": "boolean"
           },
+          "id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
           "marketplace": {
             "maxLength": 256,
             "title": "Marketplace",
             "type": "string"
+          },
+          "mcp_entries": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PluginAsset"
+                },
+                "maxItems": 128,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Entries"
           },
           "mcp_servers": {
             "items": {
@@ -3941,6 +4108,21 @@
             "minLength": 1,
             "title": "Name",
             "type": "string"
+          },
+          "skill_entries": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PluginAsset"
+                },
+                "maxItems": 128,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skill Entries"
           },
           "skills": {
             "items": {
@@ -4923,6 +5105,11 @@
         "properties": {
           "accounts_enabled": {
             "title": "Accounts Enabled",
+            "type": "boolean"
+          },
+          "archive_worktree_cleanup": {
+            "default": true,
+            "title": "Archive Worktree Cleanup",
             "type": "boolean"
           },
           "branding": {
@@ -8069,6 +8256,39 @@
         "title": "SetSharingRequest",
         "type": "object"
       },
+      "SkillContentResponse": {
+        "properties": {
+          "content": {
+            "maxLength": 262144,
+            "title": "Content",
+            "type": "string"
+          },
+          "description": {
+            "description": "Skill description, capped at 8192 characters.",
+            "maxLength": 8192,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 1024,
+            "title": "Name",
+            "type": "string"
+          },
+          "truncated": {
+            "description": "Whether the SKILL.md body exceeded the 256 KiB UTF-8 limit.",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "content",
+          "truncated"
+        ],
+        "title": "SkillContentResponse",
+        "type": "object"
+      },
       "SkillSummary": {
         "description": "Safe subset of a discovered skill for API exposure.\n\nSurfaces the skill name and one-line description so clients\n(e.g. the web composer's slash-command menu) can list which\nskills the session has access to. The full skill `content`\nis intentionally omitted \u2014 it's only loaded server-side when\nthe harness invokes the skill, and it can be large.",
         "properties": {
@@ -8713,6 +8933,12 @@
             ],
             "description": "Per-session cost-control switch: `\"on\"` activates the spec's configured cost-control mode, `\"off\"` disables cost control for this session. Explicit JSON `null` clears the override back to the spec default; omitting the field leaves it unchanged (`\"off\"` is a real value here, so the field's *presence* \u2014 not a clear alias \u2014 is the clear signal, unlike `model_override`).",
             "title": "Cost Control Mode Override"
+          },
+          "delete_worktree": {
+            "default": false,
+            "description": "With `archived=True`, also remove the session's server-created git worktree directory once the archive teardown runs (after the Undo grace). The branch is kept. Ignored for sessions with no worktree; rejected (400) without `archived=True`.",
+            "title": "Delete Worktree",
+            "type": "boolean"
           },
           "external_session_id": {
             "anyOf": [
@@ -10246,6 +10472,83 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/harnesses/{harness}/skills/{name}": {
+      "get": {
+        "operationId": "get_skill_content_v1_hosts__host_id__harnesses__harness__skills__name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillContentResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Skill Content",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/harnesses/{harness}/startup": {
       "get": {
         "description": "Read the binary, source, and argument count; never argument values.",
@@ -10336,6 +10639,58 @@
           }
         },
         "summary": "Get Mcp Servers",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/mcp-servers/tools": {
+      "post": {
+        "operationId": "get_mcp_tools_v1_hosts__host_id__mcp_servers_tools_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpToolsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpToolsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Mcp Tools",
         "tags": [
           "hosts"
         ]

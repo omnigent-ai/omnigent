@@ -42,6 +42,7 @@ function InventoryModal({
       context={inventory.context}
       status={inventory.status}
       unavailable={inventory.unavailable}
+      mcpUnsupported={inventory.mcpUnsupported}
       hostName={hostName}
       loadingMessage={loadingMessage}
     />

@@ -205,7 +205,7 @@ async def restore_active_children(
                         resume_interrupted_turn=_interrupted(child),
                     )
                     response.raise_for_status()
-                _ensure_runner_relay(child.id, parent.runner_id, client, store)
+                _ensure_runner_relay(child.id, parent.runner_id, client, store, conversation=child)
                 # Only execution status can clear the interruption. Initialization
                 # may return before a native continuation emits its first running edge.
                 restored.add(child.id)

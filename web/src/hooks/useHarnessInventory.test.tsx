@@ -147,21 +147,25 @@ describe("useHarnessInventory", () => {
     expect(result.current.isEmpty).toBe(true);
   });
 
-  it("keeps skills when the MCP route fails, e.g. on an older host", async () => {
-    serve({
-      "/v1/hosts/host_1/plugins": 501,
-      "skills:claude-native:~": { skills: [{ name: "review", description: "" }] },
-      "skills:codex-native:~": 502,
-      "/v1/hosts/host_1/mcp-servers": 501,
-    });
-    const { result } = renderHook(
-      () => useHarnessInventory(HOST, { includePluginMetadata: true }),
-      { wrapper },
-    );
-    await waitFor(() => expect(result.current.status).toBe("ready"));
-    expect(result.current.unavailable).toEqual(["mcps", "skills", "plugins"]);
-    expect(result.current.context.skills.map((skill) => skill.name)).toEqual(["review"]);
-  });
+  it.each([404, 409, 501, 502])(
+    "keeps skills and identifies unsupported MCP inventory (%s)",
+    async (status) => {
+      serve({
+        "/v1/hosts/host_1/plugins": 501,
+        "skills:claude-native:~": { skills: [{ name: "review", description: "" }] },
+        "skills:codex-native:~": 502,
+        "/v1/hosts/host_1/mcp-servers": status,
+      });
+      const { result } = renderHook(
+        () => useHarnessInventory(HOST, { includePluginMetadata: true }),
+        { wrapper },
+      );
+      await waitFor(() => expect(result.current.status).toBe("ready"));
+      expect(result.current.unavailable).toEqual(["mcps", "skills", "plugins"]);
+      expect(result.current.mcpUnsupported).toBe(status === 501);
+      expect(result.current.context.skills.map((skill) => skill.name)).toEqual(["review"]);
+    },
+  );
 
   it("reports an offline host without requesting anything", () => {
     const { result } = renderHook(() => useHarnessInventory({ ...HOST, status: "offline" }), {
@@ -192,6 +196,9 @@ describe("plugin metadata", () => {
 
   it("uses installed metadata including disabled and hook-only plugins, keeping Codex", async () => {
     const plugin = {
+      id: "plugin-source-id",
+      skill_entries: [{ id: "skill-source-id", name: "hidden" }],
+      mcp_entries: [{ id: "mcp-source-id", name: "docs" }],
       harness: "claude",
       name: "hooks",
       marketplace: "market",
@@ -216,7 +223,7 @@ describe("plugin metadata", () => {
     await waitFor(() => expect(result.current.status).toBe("ready"));
     expect(result.current.context.plugins).toEqual([
       { id: "codex:codex-kit", harness: "codex", name: "codex-kit", skills: ["review"] },
-      { ...plugin, id: "claude:hooks@market" },
+      plugin,
     ]);
   });
 

@@ -353,7 +353,7 @@ async def test_message_handshake_does_not_wait_for_child_initialization(
     row = child()
     entered, release, restored = asyncio.Event(), asyncio.Event(), asyncio.Event()
     requests = []
-    relay.side_effect = lambda *_args: restored.set()
+    relay.side_effect = lambda *_args, **_kwargs: restored.set()
 
     async def respond(request: httpx.Request) -> httpx.Response:
         session_id = json.loads(request.content)["session_id"]
@@ -459,7 +459,9 @@ async def test_parent_recovery_published_before_descendant_store_failure(
 
     def fail_lookup(*_args: Any) -> None:
         recovered.assert_awaited_once_with(parent.id, store)
-        ready.assert_awaited_once_with(parent.id, parent.runner_id, client, store)
+        ready.assert_awaited_once_with(
+            parent.id, parent.runner_id, client, store, conversation=parent
+        )
         raise failure
 
     monkeypatch.setattr(store, "list_child_conversation_ids_by_parent", fail_lookup)

@@ -2349,6 +2349,11 @@ class UpdateSessionRequest(BaseModel):
         session from the default sidebar listing), ``False`` unarchives,
         ``None`` leaves unchanged. Owner-only (unlike ``title``, which
         needs only edit access).
+    :param delete_worktree: With ``archived=True``, also remove the
+        session's server-created git worktree directory once the archive
+        teardown runs (after the Undo grace). The branch is kept. Ignored
+        for sessions with no worktree; rejected (400) without
+        ``archived=True``.
     :param project_id: File this session into a first-class project (see
         ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
         that project; the empty string ``""`` unfiles it. **Omitting** the
@@ -2373,6 +2378,7 @@ class UpdateSessionRequest(BaseModel):
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
+    delete_worktree: bool = False
     project_id: str | None = None
     silent: bool = False
 

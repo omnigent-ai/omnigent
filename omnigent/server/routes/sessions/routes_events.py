@@ -549,6 +549,7 @@ async def _recover_retry_session(
             conv.runner_id,
             runner_client,
             conversation_store,
+            conversation=conv,
         )
         return {
             "queued": False,
@@ -562,6 +563,7 @@ async def _recover_retry_session(
             conv.runner_id,
             runner_client,
             conversation_store,
+            conversation=conv,
         )
         return {"queued": False, "recovered": True, "recovery": "runner_relaunched"}
 
@@ -1325,6 +1327,7 @@ def register_events_routes(
                 wake_conv.runner_id,
                 _client,
                 conversation_store,
+                conversation=wake_conv,
             )
             return wake_conv, _client
 
@@ -2660,6 +2663,7 @@ def register_events_routes(
             conv.runner_id,
             runner_client,
             conversation_store,
+            conversation=conv,
         )
         _agent = agent_store.get(conv.agent_id) if conv.agent_id else None
         # Determine whether the agent has MCP servers so the runner's
@@ -2842,6 +2846,7 @@ def register_events_routes(
             conv.runner_id,
             runner_client,
             conversation_store,
+            conversation=conv,
         )
 
         async def _resource_snapshot() -> list[dict[str, Any]]:
@@ -3067,7 +3072,7 @@ def register_events_routes(
                 worktree_path=conv.workspace,
                 branch=conv.git_branch,
                 delete_branch=True,
-                request=request,
+                host_registry=getattr(request.app.state, "host_registry", None),
                 reason="session-delete",
                 expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                 conversation_store=conversation_store,
