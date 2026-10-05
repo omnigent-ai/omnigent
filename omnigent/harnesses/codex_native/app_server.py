@@ -4246,14 +4246,40 @@ async def preload_codex_thread_for_resume(
                 )
             )
             params["cwd"] = str(effective_cwd)
-        await client.request(
-            "thread/resume",
-            {
-                "threadId": thread_id,
-                "excludeTurns": True,
-                **params,
-            },
-        )
+        resume_params: CodexParams = {
+            "threadId": thread_id,
+            "excludeTurns": True,
+            **params,
+        }
+        try:
+            await client.request("thread/resume", resume_params)
+        except CodexAppServerResponseError as exc:
+            missing_provider = re.fullmatch(
+                r"failed to load configuration: Model provider `([^`]*)` not found",
+                exc.message or "",
+            )
+            if exc.code != -32600 or missing_provider is None:
+                raise
+
+            response = await client.request(
+                "config/read", {"includeLayers": False, "cwd": str(effective_cwd)}
+            )
+            result = response.get("result")
+            config = result.get("config") if isinstance(result, dict) else None
+            if not isinstance(config, dict) or "model_provider" not in config:
+                raise exc
+            provider = config["model_provider"]
+            if provider is None:
+                provider = "openai"
+            if not isinstance(provider, str) or not provider or provider == missing_provider[1]:
+                raise exc
+            _logger.info(
+                "Resuming Codex thread %s with configured provider %s; "
+                "saved provider is unavailable",
+                thread_id,
+                provider,
+            )
+            await client.request("thread/resume", {**resume_params, "modelProvider": provider})
         if retain_client:
             retained = True
             return client

@@ -112,6 +112,120 @@ def test_preload_codex_thread_for_resume_manages_subscription(
     assert retained is (fake_client if retain_client else None)
 
 
+@pytest.mark.parametrize("provider", ["current-provider", None])
+def test_preload_codex_thread_recovers_removed_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider: str | None,
+) -> None:
+    """A removed saved provider retries through the current Codex provider."""
+    from unittest.mock import AsyncMock, call
+
+    fake_client = _FakeCodexAppServerClient()
+    missing_provider = codex_native_app_server.CodexAppServerResponseError(
+        {
+            "code": -32600,
+            "message": "failed to load configuration: Model provider `legacy-provider` not found",
+        }
+    )
+    request = AsyncMock(
+        side_effect=[
+            missing_provider,
+            {"result": {"config": {"model_provider": provider}}},
+            {"result": {"thread": {"id": "thread_test"}}},
+        ]
+    )
+    monkeypatch.setattr(fake_client, "request", request)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    asyncio.run(
+        codex_native_app_server.preload_codex_thread_for_resume(
+            "ws://127.0.0.1:1234",
+            "thread_test",
+            terminal_launch_args=["--sandbox", "read-only", "--ask-for-approval", "untrusted"],
+            cwd=tmp_path,
+        )
+    )
+
+    params = {
+        "threadId": "thread_test",
+        "excludeTurns": True,
+        "sandbox": "read-only",
+        "approvalPolicy": "untrusted",
+    }
+    assert request.await_args_list == [
+        call("thread/resume", params),
+        call("config/read", {"includeLayers": False, "cwd": str(tmp_path)}),
+        call("thread/resume", {**params, "modelProvider": provider or "openai"}),
+    ]
+    assert fake_client.closed
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        (-32600, "thread already has an active writer"),
+        (-32600, "failed to load configuration: invalid configuration"),
+        (-32603, "failed to load configuration: Model provider `legacy-provider` not found"),
+    ],
+)
+def test_preload_codex_thread_does_not_retry_unrelated_errors(
+    monkeypatch: pytest.MonkeyPatch, code: int, message: str
+) -> None:
+    """Only the exact missing-provider response triggers config recovery."""
+    fake_client = _FakeCodexAppServerClient()
+    error = codex_native_app_server.CodexAppServerResponseError({"code": code, "message": message})
+    fake_client.error = error
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as caught:
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:1234", "thread_test", retain_client=True
+            )
+        )
+
+    assert caught.value is error
+    assert len(fake_client.requests) == 1
+    assert fake_client.closed
+
+
+@pytest.mark.parametrize("config", [None, {}, {"model_provider": ""}, {"model_provider": 12}])
+def test_preload_codex_thread_rethrows_when_replacement_provider_is_unusable(
+    monkeypatch: pytest.MonkeyPatch, config: object
+) -> None:
+    """A malformed effective config cannot turn into an unrelated provider guess."""
+    from unittest.mock import AsyncMock
+
+    fake_client = _FakeCodexAppServerClient()
+    error = codex_native_app_server.CodexAppServerResponseError(
+        {
+            "code": -32600,
+            "message": "failed to load configuration: Model provider `legacy-provider` not found",
+        }
+    )
+    request = AsyncMock(side_effect=[error, {"result": {"config": config}}])
+    monkeypatch.setattr(fake_client, "request", request)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as caught:
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:1234", "thread_test", retain_client=True
+            )
+        )
+
+    assert caught.value is error
+    assert request.await_count == 2
+    assert fake_client.closed
+
+
 @pytest.mark.parametrize("retain_client", [False, True])
 @pytest.mark.parametrize("stage", ["connect", "request"])
 @pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
