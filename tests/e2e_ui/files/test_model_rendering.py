@@ -113,14 +113,18 @@ def _open_model_preview(page: Page, base_url: str, session_id: str, file_path: s
     # The pane animates open and the resize observer then re-fits the canvas,
     # which resets its buffer; wait for the box to settle, then two frames so
     # the render loop has cleared it again (a fresh WebGL canvas is transparent).
+    # Bounded so a layout that never settles fails with its last box instead of hanging.
     canvas.evaluate(
-        """el => new Promise(resolve => {
+        """el => new Promise((resolve, reject) => {
             let last = el.getBoundingClientRect();
+            let frames = 0;
             const tick = () => {
                 const box = el.getBoundingClientRect();
                 const same = ["x", "y", "width", "height"].every(k => box[k] === last[k]);
                 last = box;
                 if (same) requestAnimationFrame(() => requestAnimationFrame(resolve));
+                else if (++frames >= 120)
+                    reject(new Error("canvas box never settled: " + JSON.stringify(box)));
                 else requestAnimationFrame(tick);
             };
             requestAnimationFrame(tick);
@@ -189,8 +193,8 @@ _TOLERANCE = 2
 
 def _apply_theme_preferences(page: Page, mode: str, extra: dict[str, str]) -> None:
     """Seed the Appearance localStorage keys the Settings controls write before the
-    SPA boots; ``omnigent:default-workspace-panel`` opens the files rail on load."""
-    store = {"web-theme": mode, "omnigent:default-workspace-panel": "open", **extra}
+    SPA boots."""
+    store = {"web-theme": mode, **extra}
     page.add_init_script(
         ";".join(
             f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)})" for k, v in store.items()
@@ -215,15 +219,13 @@ def _pixels_across_top_edge(
 @pytest.mark.parametrize("seeded_model_session", [_MODELS["stl"]], ids=["stl"], indirect=True)
 @pytest.mark.parametrize("mode, extra", list(_THEMES.values()), ids=list(_THEMES))
 def test_model_preview_canvas_matches_pane_background(
-    request: pytest.FixtureRequest,
+    page: Page,
     seeded_model_session: tuple[str, str, str],
     mode: str,
     extra: dict[str, str],
 ) -> None:
     """The 3D preview canvas blends with the themed file pane instead of showing a box."""
     base_url, session_id, file_path = seeded_model_session
-    page: Page = request.getfixturevalue("page")
-
     _apply_theme_preferences(page, mode, extra)
     canvas = _open_model_preview(page, base_url, session_id, file_path)
 
