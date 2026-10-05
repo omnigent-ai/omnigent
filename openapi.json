@@ -3890,6 +3890,26 @@
         "title": "PermissionObject",
         "type": "object"
       },
+      "PluginAsset": {
+        "properties": {
+          "id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "PluginAsset",
+        "type": "object"
+      },
       "PluginSummary": {
         "description": "Installed Claude plugin metadata, without paths or executable configuration.",
         "properties": {
@@ -3922,10 +3942,37 @@
             "title": "Has Hooks",
             "type": "boolean"
           },
+          "id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
           "marketplace": {
             "maxLength": 256,
             "title": "Marketplace",
             "type": "string"
+          },
+          "mcp_entries": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PluginAsset"
+                },
+                "maxItems": 128,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Entries"
           },
           "mcp_servers": {
             "items": {
@@ -3941,6 +3988,21 @@
             "minLength": 1,
             "title": "Name",
             "type": "string"
+          },
+          "skill_entries": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PluginAsset"
+                },
+                "maxItems": 128,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skill Entries"
           },
           "skills": {
             "items": {
@@ -8056,6 +8118,39 @@
         "title": "SetSharingRequest",
         "type": "object"
       },
+      "SkillContentResponse": {
+        "properties": {
+          "content": {
+            "maxLength": 262144,
+            "title": "Content",
+            "type": "string"
+          },
+          "description": {
+            "description": "Skill description, capped at 8192 characters.",
+            "maxLength": 8192,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 1024,
+            "title": "Name",
+            "type": "string"
+          },
+          "truncated": {
+            "description": "Whether the SKILL.md body exceeded the 256 KiB UTF-8 limit.",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "content",
+          "truncated"
+        ],
+        "title": "SkillContentResponse",
+        "type": "object"
+      },
       "SkillSummary": {
         "description": "Safe subset of a discovered skill for API exposure.\n\nSurfaces the skill name and one-line description so clients\n(e.g. the web composer's slash-command menu) can list which\nskills the session has access to. The full skill `content`\nis intentionally omitted \u2014 it's only loaded server-side when\nthe harness invokes the skill, and it can be large.",
         "properties": {
@@ -10228,6 +10323,83 @@
           }
         },
         "summary": "Get Host Model Options",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/skills/{name}": {
+      "get": {
+        "operationId": "get_skill_content_v1_hosts__host_id__harnesses__harness__skills__name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillContentResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Skill Content",
         "tags": [
           "hosts"
         ]

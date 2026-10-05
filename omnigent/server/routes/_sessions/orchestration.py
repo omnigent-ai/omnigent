@@ -1608,7 +1608,8 @@ def _persist_native_cumulative_usage(
       in* ``cumulative_input_tokens`` (e.g. codex-native's
       ``tokenUsage.total.cachedInputTokens``). Split out of the input total
       so :func:`compute_llm_cost` prices it at the cache-read rate rather
-      than the full input rate. Absent for harnesses that don't report it.
+      than the full input rate. Absent for harnesses that don't report it;
+      a token report that omits it keeps the persisted cached count.
     - ``model`` — LLM model id to price with (e.g. ``"databricks-gpt-5-5"``);
       falls back to the agent spec's model when absent.
 
@@ -1668,7 +1669,23 @@ def _persist_native_cumulative_usage(
         # ``input_tokens`` keeps only the non-cached remainder (its contract).
         # Clamp cached to the total so a malformed report never makes
         # ``input_tokens`` negative.
-        cached = min(int(ccache), int(cin)) if ccache is not None else 0
+        if ccache is None:
+            # Cumulative cache counts never shrink: a report that omits the
+            # field keeps the persisted split instead of re-billing earlier
+            # cache reads at the full input rate.
+            ccache = int(current.get("cache_read_input_tokens", 0) or 0)
+        cached = min(int(ccache), int(cin))
+        if int(ccache) > int(cin):
+            # Reported or carried cache reads exceed the input total; surface it
+            # so operators can spot a malformed or shrunken cumulative report
+            # instead of silently clamping.
+            _logger.warning(
+                "Cumulative cache reads (%d) exceed the reported input total (%d) "
+                "for session %r; clamping cache reads to the input total.",
+                int(ccache),
+                int(cin),
+                session_id,
+            )
         current["cache_read_input_tokens"] = cached
         current["input_tokens"] = int(cin) - cached
     if cout is not None:
@@ -7173,11 +7190,14 @@ class _RelayTransportLost(Exception):
     :param intentional: Whether the session carried the intentional-stop
         marker when the transport dropped, snapshotted before the relay
         teardown consumes it.
+    :param stream_ready: Whether this attempt received the runner's ready
+        heartbeat before losing its transport.
     """
 
-    def __init__(self, *, intentional: bool) -> None:
+    def __init__(self, *, intentional: bool, stream_ready: bool = False) -> None:
         super().__init__("runner stream transport lost")
         self.intentional = intentional
+        self.stream_ready = stream_ready
 
 
 def _relinquish_session_live_state(session_id: str) -> None:
@@ -7348,9 +7368,9 @@ async def _relay_runner_stream(
             return
         except _RelayTransportLost as lost:
             now = loop.time()
-            # An attempt that streamed longer than the grace was a live
-            # tunnel dropping anew — give the new outage a fresh window.
-            if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
+            # A ready heartbeat confirms recovery, even on a brief connection.
+            # Its next disconnect starts a new outage with a full grace window.
+            if deadline is None or lost.stream_ready or now - started > RUNNER_DISCONNECT_GRACE_S:
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
                 outage_started = now
                 retries = 0
@@ -7561,6 +7581,7 @@ async def _relay_runner_stream_once(
     # past the grace, fails the session). ``connect`` stays at httpx's
     # default (5s); ``write``/``pool`` are not rate-limiting here.
     _relay_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
+    heartbeat_seen = False
     try:
         async with runner_client.stream(
             "GET",
@@ -7574,7 +7595,6 @@ async def _relay_runner_stream_once(
                 extra=debug_event("runner_stream_connected", session_id=session_id),
             )
             buffer = ""
-            heartbeat_seen = False
             async for chunk in resp.aiter_text():
                 buffer += chunk
                 while "\n\n" in buffer:
@@ -8241,7 +8261,10 @@ async def _relay_runner_stream_once(
         # treat the same as HTTPError. The finally below consumes the
         # intentional-stop marker, so snapshot it now for the supervisor's
         # retry-vs-quiet-exit decision.
-        raise _RelayTransportLost(intentional=session_id in _intentional_stop_sessions) from exc
+        raise _RelayTransportLost(
+            intentional=session_id in _intentional_stop_sessions,
+            stream_ready=heartbeat_seen,
+        ) from exc
     except asyncio.CancelledError:
         raise
     finally:

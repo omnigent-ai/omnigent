@@ -2125,6 +2125,59 @@ async def test_relay_still_fails_mid_turn_session_without_handoff_evidence(
         session_stream.close(session_id)
 
 
+@pytest.mark.asyncio
+async def test_relay_persist_error_once_emits_debug_row() -> None:
+    """_relay_persist_error_once logs an error_item_persisted debug row on success."""
+    from unittest.mock import MagicMock
+
+    from omnigent.entities.conversation import ConversationItem, ErrorData, NewConversationItem
+    from omnigent.server.routes._sessions.helpers import _relay_persist_error_once
+
+    # Minimal fake store: list_items returns nothing (no duplicate), append returns
+    # a list with one ConversationItem so the function can complete.
+    persisted_item = ConversationItem(
+        id="item_test",
+        type="error",
+        status="completed",
+        response_id="resp_test",
+        created_at=1753900000,
+        data=ErrorData(
+            source="execution",
+            code="pi_credentials_unresolved",
+            message="credential warning; do not log this",
+        ),
+    )
+    fake_store = MagicMock()
+    fake_store.list_items.return_value = MagicMock(data=[])
+    fake_store.append.return_value = [persisted_item]
+
+    item = NewConversationItem(
+        type="error",
+        response_id="resp_test",
+        data=ErrorData(
+            source="execution",
+            code="pi_credentials_unresolved",
+            message="credential warning; do not log this",
+        ),
+    )
+
+    with capture_debug_rows("server") as rows:
+        result = await _relay_persist_error_once(fake_store, "conv_test", item)
+
+    assert result == "persisted"
+    persist_rows = [r for r in rows if r.get("event_name") == "error_item_persisted"]
+    assert len(persist_rows) == 1
+    row = persist_rows[0]
+    assert row["session_id"] == "conv_test"
+    assert row["attributes"]["code"] == "pi_credentials_unresolved"
+    assert row["attributes"]["source"] == "execution"
+    # level is None for a destructive error; it must not appear in attributes.
+    assert "level" not in row["attributes"] or row["attributes"]["level"] is None
+    # message text must never reach the debug table
+    assert "credential warning" not in str(row)
+    assert "do not log" not in str(row)
+
+
 def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
     """The grace must outlast the runner's worst-case jittered reconnect delay.
 

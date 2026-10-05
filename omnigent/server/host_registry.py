@@ -45,6 +45,7 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostMcpServersResultFrame,
     HostPluginsResultFrame,
+    HostSkillContentResultFrame,
     HostSkillsResultFrame,
 )
 from omnigent.host.harness_startup import HarnessStartup
@@ -266,6 +267,14 @@ def _fail_pending_plugins(conn: HostConnection) -> None:
             future.set_exception(ConnectionError(f"host '{conn.host_id}' disconnected"))
 
 
+def _fail_pending_skill_content(conn: HostConnection) -> None:
+    """Settle lookups immediately when their host connection disappears."""
+    while conn.pending_skill_content:
+        _request_id, future = conn.pending_skill_content.popitem()
+        if not future.done():
+            future.set_exception(ConnectionError("host disconnected"))
+
+
 # How long a runner exit report stays answerable, and how many are kept.
 # Reports only matter while a client is still waiting for the runner to
 # come online (a 60s window today); 10 minutes covers slow retries with
@@ -467,6 +476,7 @@ class HostConnection:
         model catalogs resolved by the selected host.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
     :param pending_mcp_servers: Per-``request_id`` futures for MCP inventory requests.
+    :param pending_skill_content: Per-request futures for transient SKILL.md reads.
     """
 
     workspace_id: int
@@ -536,6 +546,9 @@ class HostConnection:
         default_factory=dict
     )
     pending_plugins: dict[str, asyncio.Future[HostPluginsResultFrame]] = field(
+        default_factory=dict
+    )
+    pending_skill_content: dict[str, asyncio.Future[HostSkillContentResultFrame]] = field(
         default_factory=dict
     )
     pending_mcp_servers: dict[str, asyncio.Future[HostMcpServersResultFrame]] = field(
@@ -644,6 +657,7 @@ class HostRegistry:
                 _fail_pending_imports(old)
                 _fail_pending_harness_startup(old)
                 _fail_pending_plugins(old)
+                _fail_pending_skill_content(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -688,6 +702,7 @@ class HostRegistry:
         _fail_pending_imports(removed)
         _fail_pending_harness_startup(removed)
         _fail_pending_plugins(removed)
+        _fail_pending_skill_content(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

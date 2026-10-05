@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { ArrowLeftIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -7,10 +7,16 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { BrandHarness } from "@/components/onboarding/harnessBrand";
 import type { Host } from "@/hooks/useHosts";
 import {
+  INVENTORY_HARNESS_IDS,
   type InventoryMcpServer,
   type InventoryPlugin,
   useHarnessInventory,
 } from "@/hooks/useHarnessInventory";
+
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { useSkillContent } from "@/hooks/useSkillContent";
+import { ApiError } from "@/lib/sessionsApi";
 
 type CatalogKind = "mcps" | "skills" | "plugins";
 
@@ -80,6 +86,10 @@ export function HarnessCatalog({
     searchParams.get("tab") === "settings" ? "settings" : "mcps",
   );
   const [open, setOpen] = useState<OpenPlugin | null>(null);
+  const [selectedSkill, setSelectedSkill] = useState<{ name: string; sourceId?: string } | null>(
+    null,
+  );
+  const [contentSupported, setContentSupported] = useState(true);
   const inventory = useHarnessInventory(host, { includePluginMetadata: family === "claude" });
   const back = () => setOpen(null);
 
@@ -104,7 +114,33 @@ export function HarnessCatalog({
       ? unavailable.includes("skills") && unavailable.includes("mcps")
       : unavailable.includes(kind);
 
-  if (open) return <PluginPage plugin={open.plugin} mcps={open.mcps} onBack={back} />;
+  if (selectedSkill !== null)
+    return (
+      <SkillPage
+        host={host}
+        harness={INVENTORY_HARNESS_IDS[family]}
+        name={selectedSkill.name}
+        sourceId={selectedSkill.sourceId}
+        backLabel={open ? open.plugin.name : "Skills"}
+        onBack={() => setSelectedSkill(null)}
+        onUnavailable={() => {
+          setContentSupported(false);
+          setSelectedSkill(null);
+        }}
+      />
+    );
+  if (open)
+    return (
+      <PluginPage
+        host={host}
+        plugin={open.plugin}
+        mcps={open.mcps}
+        onBack={back}
+        onSkillOpen={
+          contentSupported ? (name, sourceId) => setSelectedSkill({ name, sourceId }) : undefined
+        }
+      />
+    );
 
   const ownList = (kind: CatalogKind, count: number, list: ReactNode) => {
     const noun = KINDS.find((k) => k.id === kind)?.noun;
@@ -176,6 +212,9 @@ export function HarnessCatalog({
                   icon={<SparkleIcon className="size-4 text-muted-foreground" />}
                   name={skill.name}
                   detail={skill.description}
+                  onOpen={
+                    contentSupported ? () => setSelectedSkill({ name: skill.name }) : undefined
+                  }
                 />
               ))}
             </ul>,
@@ -288,14 +327,20 @@ function pluginDetail(plugin: InventoryPlugin, mcpCount: number) {
 }
 
 function PluginPage({
+  host,
   plugin,
   mcps,
   onBack,
+  onSkillOpen,
 }: {
+  host: Host;
   plugin: InventoryPlugin;
   mcps: InventoryMcpServer[];
   onBack: () => void;
+  onSkillOpen?: (name: string, sourceId?: string) => void;
 }) {
+  const needsUpdate = plugin.marketplace !== undefined && !plugin.skill_entries;
+  const skills = plugin.skill_entries ?? plugin.skills.map((name) => ({ name, id: undefined }));
   return (
     <>
       <BackButton label="Plugins" onClick={onBack} />
@@ -321,18 +366,26 @@ function PluginPage({
           </TabsTrigger>
         </TabsList>
         <TabsContent value="skills">
+          {needsUpdate && <Notice>Update {host.name} to read installed plugin skills.</Notice>}
           <ul className="flex flex-col gap-2">
-            {plugin.skills.map((name) => (
+            {plugin.skills.length === 0 && <Notice>No skills found.</Notice>}
+            {skills.map(({ name, id }) => (
               <CatalogRow
-                key={name}
+                key={id ?? name}
                 icon={<SparkleIcon className="size-4 text-muted-foreground" />}
                 name={name}
+                onOpen={
+                  onSkillOpen && !needsUpdate
+                    ? () => onSkillOpen(`${plugin.name}:${name}`, id)
+                    : undefined
+                }
               />
             ))}
           </ul>
         </TabsContent>
         <TabsContent value="mcps">
           <ul className="flex flex-col gap-2">
+            {mcps.length === 0 && <Notice>No MCPs found.</Notice>}
             {mcps.map((server) => (
               <CatalogRow
                 key={server.id}
@@ -347,3 +400,68 @@ function PluginPage({
     </>
   );
 }
+
+function SkillPage({
+  host,
+  harness,
+  name,
+  sourceId,
+  backLabel,
+  onBack,
+  onUnavailable,
+}: {
+  host: Host;
+  harness: string;
+  name: string;
+  sourceId?: string;
+  backLabel: string;
+  onBack: () => void;
+  onUnavailable: () => void;
+}) {
+  const query = useSkillContent(host.host_id, harness, name, { enabled: true, sourceId });
+  const missingRoute = query.error instanceof ApiError && query.error.status === 404;
+  useEffect(() => {
+    if (missingRoute) onUnavailable();
+  }, [missingRoute, onUnavailable]);
+  return (
+    <>
+      <BackButton label={backLabel} onClick={onBack} />
+      <h1 className="truncate text-2xl font-semibold">{name}</h1>
+      {query.isPending ? (
+        <Notice>Loading skill contents…</Notice>
+      ) : query.error ? (
+        <Notice>
+          {query.error instanceof ApiError && query.error.status === 501
+            ? `Update ${host.name} to see skill contents.`
+            : "Couldn't load skill contents."}
+        </Notice>
+      ) : query.data ? (
+        <>
+          {query.data.description && (
+            <p className="mt-4 text-ui text-muted-foreground">{query.data.description}</p>
+          )}
+          <h2 className="mt-6 text-ui font-medium">Contents</h2>
+          {query.data.truncated && <Notice>Contents truncated (256 KiB limit).</Notice>}
+          <div className="prose prose-sm mt-2 max-w-none overflow-x-auto rounded-xl border border-border p-5 dark:prose-invert">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              skipHtml
+              components={SKILL_MARKDOWN_COMPONENTS}
+            >
+              {query.data.content}
+            </ReactMarkdown>
+          </div>
+        </>
+      ) : null}
+    </>
+  );
+}
+
+const SKILL_MARKDOWN_COMPONENTS: Components = {
+  img: ({ alt }) => <span>{alt}</span>,
+  a: ({ href, children }) => (
+    <a href={href} rel="noreferrer" target="_blank">
+      {children}
+    </a>
+  ),
+};

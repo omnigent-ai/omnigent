@@ -7996,6 +7996,18 @@ async def _relay_persist_error_once(
             session_id,
             [item],
         )
+        _logger.info(
+            "Relay: error item persisted for session=%s code=%s",
+            session_id,
+            item.data.code,
+            extra=debug_event(
+                "error_item_persisted",
+                session_id=session_id,
+                code=item.data.code,
+                level=item.data.level,
+                source=item.data.source,
+            ),
+        )
         return "persisted"
     except Exception:  # noqa: BLE001
         _logger.exception(

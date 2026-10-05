@@ -1,4 +1,4 @@
-"""The plugin inventory route is owner-only and fails fast for older hosts."""
+"""The skill content route is owner-only and fails fast for older hosts."""
 
 from __future__ import annotations
 
@@ -12,38 +12,27 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
-    CAP_PLUGINS,
+    CAP_SKILL_CONTENT,
     HostHelloFrame,
-    HostPluginsFrame,
-    HostPluginsResultFrame,
+    HostSkillContentFrame,
+    HostSkillContentResultFrame,
     decode_host_frame,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry
-from omnigent.server.routes.plugins import (
-    create_plugins_router,
-    request_host_plugins,
+from omnigent.server.routes.skill_content import (
+    create_skill_content_router,
+    request_host_skill_content,
 )
 from omnigent.stores.host_store import HostStore
 
 _HOST_ID = "a828988dc0b441fb8d04dad3761773b9"
-_URL = f"/v1/hosts/{_HOST_ID}/plugins"
-_PLUGINS = [
-    {
-        "id": "a" * 64,
-        "skill_entries": [{"id": "b" * 64, "name": "review"}],
-        "mcp_entries": [],
-        "harness": "claude",
-        "name": "toolkit",
-        "marketplace": "market",
-        "version": "1.0",
-        "description": "Useful tools",
-        "enabled": True,
-        "skills": ["review"],
-        "mcp_servers": [],
-        "has_hooks": True,
-        "has_commands": False,
-    }
-]
+_URL = f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/skills/toolkit%3Alint"
+_SKILL = {
+    "name": "toolkit:lint",
+    "description": "Lint",
+    "content": "# Instructions",
+    "truncated": False,
+}
 
 
 class _Auth:
@@ -66,12 +55,14 @@ def _register(registry: HostRegistry, *capabilities: str) -> HostConnection:
 
 
 @pytest.fixture
-def plugins_app(db_uri: str) -> tuple[FastAPI, HostRegistry, HostStore]:
+def content_app(db_uri: str) -> tuple[FastAPI, HostRegistry, HostStore]:
     registry = HostRegistry()
     hosts = HostStore(db_uri)
     hosts.upsert_on_connect(_HOST_ID, "laptop", "owner")
     app = FastAPI()
-    app.include_router(create_plugins_router(registry, hosts, auth_provider=_Auth()), prefix="/v1")
+    app.include_router(
+        create_skill_content_router(registry, hosts, auth_provider=_Auth()), prefix="/v1"
+    )
 
     @app.exception_handler(OmnigentError)
     async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
@@ -87,57 +78,74 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
 @pytest.mark.parametrize(
     "result,status",
     [
-        (HostPluginsResultFrame("", "ok", plugins=_PLUGINS), 200),
-        (HostPluginsResultFrame("", "ok", plugins=None), 502),
-        (HostPluginsResultFrame("", "failed", error="lookup failed"), 502),
-        # Malformed metadata fails without echoing the payload.
+        (HostSkillContentResultFrame("", "ok", skill=_SKILL), 200),
+        (HostSkillContentResultFrame("", "failed", error="lookup failed"), 502),
+        # A malformed reply is a host failure.
         (
-            HostPluginsResultFrame("", "ok", plugins=[{**_PLUGINS[0], "enabled": "secret"}]),
+            HostSkillContentResultFrame("", "ok", skill={**_SKILL, "content": 5}),
             502,
         ),
     ],
 )
-async def test_owner_gets_plugins(
-    plugins_app, result: HostPluginsResultFrame, status: int
+async def test_owner_gets_skill_content(
+    content_app, result: HostSkillContentResultFrame, status: int
 ) -> None:
-    app, registry, _ = plugins_app
-    conn = _register(registry, CAP_PLUGINS)
+    app, registry, _ = content_app
+    conn = _register(registry, CAP_SKILL_CONTENT)
     async with _client(app) as client:
-        task = asyncio.create_task(client.get(_URL, headers={"x-test-user": "owner"}))
+        task = asyncio.create_task(
+            client.get(_URL, params={"source_id": "a" * 64}, headers={"x-test-user": "owner"})
+        )
         frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
-        assert isinstance(frame, HostPluginsFrame)
+        assert isinstance(frame, HostSkillContentFrame)
+        assert frame.harness == "claude-native"
+        assert frame.name == "toolkit:lint"
+        assert frame.source_id == "a" * 64
         result.request_id = frame.request_id
-        conn.pending_plugins[frame.request_id].set_result(result)
+        conn.pending_skill_content[frame.request_id].set_result(result)
         response = await task
     assert response.status_code == status
     if status == 200:
-        assert response.json() == {"plugins": _PLUGINS}
-    assert "secret" not in response.text
-    assert not conn.pending_plugins
+        assert response.json() == _SKILL
+        assert response.headers["cache-control"] == "no-store"
+    assert not conn.pending_skill_content
 
 
 @pytest.mark.parametrize("user,status", [("stranger", 403), (None, 401)])
 async def test_non_owner_does_not_reach_the_host(
-    plugins_app, user: str | None, status: int
+    content_app, user: str | None, status: int
 ) -> None:
-    app, registry, _ = plugins_app
-    conn = _register(registry, CAP_PLUGINS)
+    app, registry, _ = content_app
+    conn = _register(registry, CAP_SKILL_CONTENT)
     async with _client(app) as client:
         response = await client.get(_URL, headers={"x-test-user": user} if user else {})
     assert response.status_code == status
     assert conn.outbound_queue.empty()
 
 
-async def test_offline_host_is_a_conflict(plugins_app) -> None:
-    app, _, hosts = plugins_app
+@pytest.mark.parametrize("harness", ["pi-native", "antigravity-native", "opencode-native"])
+async def test_unsupported_harness_does_not_reach_the_host(content_app, harness: str) -> None:
+    app, registry, _ = content_app
+    conn = _register(registry, CAP_SKILL_CONTENT)
+    async with _client(app) as client:
+        response = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/{harness}/skills/toolkit%3Alint",
+            headers={"x-test-user": "owner"},
+        )
+    assert response.status_code == 404
+    assert conn.outbound_queue.empty()
+
+
+async def test_offline_host_is_a_conflict(content_app) -> None:
+    app, _, hosts = content_app
     hosts.set_offline(_HOST_ID)
     async with _client(app) as client:
         response = await client.get(_URL, headers={"x-test-user": "owner"})
     assert response.status_code == 409
 
 
-async def test_older_host_fails_fast_without_a_frame(plugins_app) -> None:
-    app, registry, _ = plugins_app
+async def test_older_host_fails_fast_without_a_frame(content_app) -> None:
+    app, registry, _ = content_app
     conn = _register(registry)
     async with _client(app) as client:
         response = await client.get(_URL, headers={"x-test-user": "owner"})
@@ -151,38 +159,48 @@ async def test_proxy_cleans_up_unanswered_requests(
     monkeypatch: pytest.MonkeyPatch, outcome: str, status: int
 ) -> None:
     registry = HostRegistry()
-    conn = _register(registry, CAP_PLUGINS)
+    conn = _register(registry, CAP_SKILL_CONTENT)
     if outcome == "timeout":
-        monkeypatch.setattr("omnigent.server.routes.plugins._PLUGINS_TIMEOUT_S", 0.01)
+        monkeypatch.setattr("omnigent.server.routes.skill_content._SKILL_CONTENT_TIMEOUT_S", 0.01)
     else:
         registry.deregister(conn.host_id)
     with pytest.raises(HTTPException) as exc_info:
-        await request_host_plugins(host_registry=registry, host_conn=conn)
+        await request_host_skill_content(
+            host_registry=registry, host_conn=conn, harness="claude-native", name="toolkit:lint"
+        )
     assert exc_info.value.status_code == status
-    assert conn.pending_plugins == {}
+    assert conn.pending_skill_content == {}
 
 
 async def test_replacing_the_connection_after_sending_fails_fast() -> None:
     """A host reconnecting mid-request fails the old request (502) at once."""
     registry = HostRegistry()
-    conn = _register(registry, CAP_PLUGINS)
-    task = asyncio.create_task(request_host_plugins(host_registry=registry, host_conn=conn))
+    conn = _register(registry, CAP_SKILL_CONTENT)
+    task = asyncio.create_task(
+        request_host_skill_content(
+            host_registry=registry, host_conn=conn, harness="claude", name="toolkit:lint"
+        )
+    )
     await asyncio.wait_for(conn.outbound_queue.get(), 2)  # the request went out
-    _register(registry, CAP_PLUGINS)  # the same host reconnects
+    _register(registry, CAP_SKILL_CONTENT)  # the same host reconnects
     with pytest.raises(HTTPException) as exc_info:
         await asyncio.wait_for(task, 2)
     assert exc_info.value.status_code == 502
-    assert conn.pending_plugins == {}
+    assert conn.pending_skill_content == {}
 
 
 async def test_disconnect_after_sending_fails_fast() -> None:
     """A host dropping mid-request is a lost connection (502) now, not a 504 later."""
     registry = HostRegistry()
-    conn = _register(registry, CAP_PLUGINS)
-    task = asyncio.create_task(request_host_plugins(host_registry=registry, host_conn=conn))
+    conn = _register(registry, CAP_SKILL_CONTENT)
+    task = asyncio.create_task(
+        request_host_skill_content(
+            host_registry=registry, host_conn=conn, harness="claude", name="toolkit:lint"
+        )
+    )
     await asyncio.wait_for(conn.outbound_queue.get(), 2)  # the request went out
     registry.deregister(conn.host_id)
     with pytest.raises(HTTPException) as exc_info:
         await asyncio.wait_for(task, 2)  # well under the 15s timeout
     assert exc_info.value.status_code == 502
-    assert conn.pending_plugins == {}
+    assert conn.pending_skill_content == {}

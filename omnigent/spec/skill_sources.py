@@ -12,6 +12,7 @@ per-family provider. Unknown harnesses fall back to the generic host walk
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -375,6 +376,11 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
     # cannot be overridden by a user/project enabledPlugins toggle, so union
     # them on top of the settings-derived set (force-enable, never disable).
     return enabled | _managed_plugin_keys(ctx)
+
+
+def _plugin_asset_id(key: str, kind: str, source: str = "") -> str:
+    """Stable inventory identity without exposing a plugin asset's filesystem path."""
+    return hashlib.sha256(json.dumps([key, kind, source]).encode()).hexdigest()
 
 
 def _plugin_install_paths(

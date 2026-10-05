@@ -1,4 +1,4 @@
-"""Installed plugin metadata travels from a real host daemon through the REST API."""
+"""Skill contents travels from a real host daemon through the REST API."""
 
 from __future__ import annotations
 
@@ -12,29 +12,23 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.spec.skill_sources import _plugin_asset_id
-
 
 @pytest.mark.min_server_version("0.17.0")
-def test_host_plugin_inventory(live_server: str, tmp_path: Path) -> None:
-    root = tmp_path / "claude" / "plugins"
-    plugin = root / "cache" / "hooks"
-    (plugin / ".claude-plugin").mkdir(parents=True)
-    (plugin / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps(
-            {
-                "version": "1.2.3",
-                "description": "Test hook plugin",
-                "hooks": {"command": "synthetic-private-command"},
-            }
-        )
+def test_host_skill_content(live_server: str, tmp_path: Path) -> None:
+    skill = tmp_path / "claude" / "skills" / "review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: review\ndescription: Review diffs.\n---\n# Synthetic private instructions"
     )
-    (root / "installed_plugins.json").write_text(
-        json.dumps(
-            {
-                "plugins": {"hooks@test-market": [{"installPath": str(plugin)}]},
-            }
-        )
+    (skill / "other.md").write_text("synthetic-other-file-secret")
+    plugin = tmp_path / "claude" / "plugins" / "cache" / "toolkit"
+    bundled = plugin / "skills" / "lint"
+    bundled.mkdir(parents=True)
+    (bundled / "SKILL.md").write_text(
+        "---\nname: lint\ndescription: Installed\nuser-invocable: false\n---\nPlugin private body"
+    )
+    (tmp_path / "claude" / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"plugins": {"toolkit@test": [{"installPath": str(plugin)}]}})
     )
     config = tmp_path / "config"
     config.mkdir()
@@ -83,28 +77,30 @@ def test_host_plugin_inventory(live_server: str, tmp_path: Path) -> None:
                         break
                     time.sleep(0.1)
                 assert host_id, "test host never connected"
-                response = client.get(f"/v1/hosts/{host_id}/plugins")
+                listing = client.get(f"/v1/skills?host_id={host_id}&harness=claude-native&path=~")
+                assert listing.status_code == 200
+                assert "Synthetic private instructions" not in listing.text
+                response = client.get(f"/v1/hosts/{host_id}/harnesses/claude-native/skills/review")
                 assert response.status_code == 200, response.text
                 assert response.json() == {
-                    "plugins": [
-                        {
-                            "id": _plugin_asset_id("hooks@test-market", "plugin"),
-                            "skill_entries": [],
-                            "mcp_entries": [],
-                            "harness": "claude",
-                            "name": "hooks",
-                            "marketplace": "test-market",
-                            "version": "1.2.3",
-                            "description": "Test hook plugin",
-                            "enabled": False,
-                            "skills": [],
-                            "mcp_servers": [],
-                            "has_hooks": True,
-                            "has_commands": False,
-                        }
-                    ]
+                    "name": "review",
+                    "description": "Review diffs.",
+                    "content": "# Synthetic private instructions",
+                    "truncated": False,
                 }
-                assert "synthetic-private-command" not in response.text
+                assert response.headers["cache-control"] == "no-store"
+                assert "synthetic-other-file-secret" not in response.text
+                assert str(tmp_path) not in response.text
+                plugins = client.get(f"/v1/hosts/{host_id}/plugins").json()["plugins"]
+                assert plugins[0]["enabled"] is False
+                asset = plugins[0]["skill_entries"][0]
+                response = client.get(
+                    f"/v1/hosts/{host_id}/harnesses/claude-native/skills/toolkit:lint",
+                    params={"source_id": asset["id"]},
+                )
+                assert response.status_code == 200, response.text
+                assert response.json()["content"] == "Plugin private body"
+                assert response.headers["cache-control"] == "no-store"
                 assert str(tmp_path) not in response.text
             finally:
                 child.terminate()
@@ -113,4 +109,5 @@ def test_host_plugin_inventory(live_server: str, tmp_path: Path) -> None:
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait(timeout=5)
-    assert "synthetic-private-command" not in (tmp_path / "host.log").read_text()
+    assert "Synthetic private instructions" not in (tmp_path / "host.log").read_text()
+    assert "Plugin private body" not in (tmp_path / "host.log").read_text()

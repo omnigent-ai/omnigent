@@ -49,6 +49,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillContentFrame,
+    HostSkillContentResultFrame,
     HostSkillsFrame,
     HostSkillsResultFrame,
     HostStatFrame,
@@ -2314,6 +2316,8 @@ def test_plugins_result_allow_list_and_malformed_payload() -> None:
                 "plugins": [
                     {
                         "name": "tool",
+                        "skill_entries": [{"id": "a" * 64, "name": "lint", "path": "/private"}],
+                        "mcp_entries": [{"id": "b" * 64, "name": "docs", "env": "secret"}],
                         "env": {"TOKEN": "secret"},
                         "installPath": "/private",
                         "commands": "secret",
@@ -2323,7 +2327,13 @@ def test_plugins_result_allow_list_and_malformed_payload() -> None:
         )
     )
     assert isinstance(frame, HostPluginsResultFrame)
-    assert frame.plugins == [{"name": "tool"}]
+    assert frame.plugins == [
+        {
+            "name": "tool",
+            "skill_entries": [{"id": "a" * 64, "name": "lint"}],
+            "mcp_entries": [{"id": "b" * 64, "name": "docs"}],
+        }
+    ]
     malformed = decode_host_frame(
         json.dumps(
             {"kind": "host.plugins_result", "request_id": "p", "status": "ok", "plugins": "secret"}
@@ -2331,3 +2341,48 @@ def test_plugins_result_allow_list_and_malformed_payload() -> None:
     )
     assert isinstance(malformed, HostPluginsResultFrame)
     assert malformed.plugins is None
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostSkillContentFrame("s", "claude-native", "plugin:skill"),
+        HostSkillContentFrame("s", "claude-native", "plugin:skill", "a" * 64),
+        HostSkillContentResultFrame(
+            "s", "ok", {"name": "skill", "description": "", "content": "body", "truncated": False}
+        ),
+        HostSkillContentResultFrame("s", "failed"),
+    ],
+)
+def test_skill_content_round_trip(frame):
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_skill_content_allow_list_and_correlated_malformed_result():
+    payload = {
+        "kind": "host.skill_content_result",
+        "request_id": "s",
+        "status": "ok",
+        "skill": {
+            "name": "skill",
+            "description": "",
+            "content": "body",
+            "truncated": False,
+            "skill_dir": "/private",
+            "files": "secret",
+        },
+        "error": "private",
+    }
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostSkillContentResultFrame)
+    assert frame.skill == {
+        "name": "skill",
+        "description": "",
+        "content": "body",
+        "truncated": False,
+    }
+    assert frame.error == "private"
+    payload["skill"]["truncated"] = "yes"
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostSkillContentResultFrame)
+    assert (frame.request_id, frame.status, frame.skill) == ("s", "failed", None)

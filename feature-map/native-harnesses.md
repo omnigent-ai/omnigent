@@ -34,6 +34,8 @@ implements them separately, so a fix for one harness does not reach the others.
   configured argument count, read-only. Argument and environment values stay
   on the host. Workspace config can override these host defaults. Behind
   `harness_settings_ui`; other harnesses keep their credential card only.
+- `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
+  with loading, truncation, unavailable-host, and older-server states.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
 
@@ -45,6 +47,10 @@ view appear in the session.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Skill contents:** Settings → Harnesses → configured harness card (or gear),
+then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
+list or plugin. Requires `harness_settings_ui`.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -108,6 +114,19 @@ Cross-harness journeys:
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
 - **`chat-render`, `steer`, per harness:** use the matrix.
+- **`skill-contents`:** run `tests/host/test_skill_content.py`,
+  `tests/server/routes/test_skill_content.py`, and the real-host test
+  `tests/e2e/test_host_skill_content_e2e.py::test_host_skill_content` with plain
+  pytest. Web coverage is in `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  Open installed plugin skills while the plugin is disabled and when the skill
+  is not user-invocable. With matching names in two marketplaces or a plain skill,
+  verify each plugin page shows its own instructions.
+  For both card and gear entry points, open a plain skill and a plugin skill;
+  verify markdown, Back, and the truncation note for a body over 256 KiB.
+  Remote markdown images must not load. A 501 shows an update hint; inject a
+  404 from the contents route and verify the list remains with nonclickable
+  skill rows. A 502/504 shows a generic failure. Bodies must be absent from
+  the skills listing and host/server logs, with no other files or paths returned.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.

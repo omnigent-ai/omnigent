@@ -29,7 +29,7 @@ struct WebShellView: View {
   private var isWorkspace: Bool {
     ServerAuthentication(origin: initialURL.omnigentOrigin) == .databricksWorkspace
   }
-  private var showsServerSwitcher: Bool { isWorkspace || !model.serverSwitcherHidden }
+  private var showsServerSwitcher: Bool { !model.serverSwitcherHidden }
 
   var body: some View {
     GeometryReader { geometry in

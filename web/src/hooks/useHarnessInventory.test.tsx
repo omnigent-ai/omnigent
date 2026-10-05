@@ -192,6 +192,9 @@ describe("plugin metadata", () => {
 
   it("uses installed metadata including disabled and hook-only plugins, keeping Codex", async () => {
     const plugin = {
+      id: "plugin-source-id",
+      skill_entries: [{ id: "skill-source-id", name: "hidden" }],
+      mcp_entries: [{ id: "mcp-source-id", name: "docs" }],
       harness: "claude",
       name: "hooks",
       marketplace: "market",
@@ -216,7 +219,7 @@ describe("plugin metadata", () => {
     await waitFor(() => expect(result.current.status).toBe("ready"));
     expect(result.current.context.plugins).toEqual([
       { id: "codex:codex-kit", harness: "codex", name: "codex-kit", skills: ["review"] },
-      { ...plugin, id: "claude:hooks@market" },
+      plugin,
     ]);
   });
 
