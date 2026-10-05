@@ -233,3 +233,17 @@ describe("resolveServerInfo branding", () => {
     expect(malformed.branding).toBeNull();
   });
 });
+
+describe("resolveServerInfo design_kit", () => {
+  it("keeps the organization kit name", async () => {
+    expect((await probe({ design_kit: { name: "Acme Kit" } })).design_kit).toEqual({
+      name: "Acme Kit",
+    });
+  });
+
+  it("reads a missing or malformed kit as null", async () => {
+    expect((await probe({})).design_kit).toBeNull();
+    vi.resetModules();
+    expect((await probe({ design_kit: { name: "" } })).design_kit).toBeNull();
+  });
+});

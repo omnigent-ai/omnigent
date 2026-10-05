@@ -12,14 +12,16 @@ import {
   readWorkspaceFileSearch,
   requestWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { DESIGN_KIT_DIR, kitText } from "@/shell/codeViewerHelpers";
+import { DESIGN_KIT_DIR, bytesToBase64, kitText, parseDesignKit } from "@/shell/codeViewerHelpers";
 import {
   DESIGN_SYSTEM_IMPORT_DIR,
   DESIGN_SYSTEM_POINTER,
   isAbsoluteDesignSystemPath,
   parseDesignSystemPointer,
+  type DesignDefault,
   type DesignSystemRef,
 } from "./designSystem";
+import { DS_ASSET_MAX_BYTES, DS_DECK_MAX_BYTES } from "./designSystemInjection";
 import {
   importDesignSystem,
   listDesignSystemSource,
@@ -156,4 +158,68 @@ export async function reconcileDesignIndex(sessionId: string, paths: string[]): 
       body: JSON.stringify({ paths: paths.filter((p) => designKind(p) === kind), kind }),
     }).catch(() => undefined);
   }
+}
+
+const DESIGN_DEFAULT_URL = "/v1/me/preferences/design-default";
+
+/** The user's New design default, or `null` when unset or unavailable (flag off, older server). */
+export async function fetchDesignDefault(): Promise<DesignDefault | null> {
+  const res = await authenticatedFetch(DESIGN_DEFAULT_URL);
+  if (!res.ok) return null;
+  const { design_default: value } = (await res.json()) as {
+    design_default: { kind: string; host_id?: string; path?: string; name?: string } | null;
+  };
+  if (!value) return null;
+  if (value.kind === "none") return { kind: "none" };
+  try {
+    const ref = parseDesignSystemPointer(JSON.stringify(value));
+    return value.host_id ? { ...ref, hostId: value.host_id } : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveDesignDefault(value: DesignDefault): Promise<void> {
+  const body =
+    value.kind === "none"
+      ? value
+      : { kind: value.kind, host_id: value.hostId, path: value.path, name: value.name };
+  const res = await authenticatedFetch(DESIGN_DEFAULT_URL, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ design_default: body }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+}
+
+const MB = 1024 * 1024;
+
+async function readOrgKitFile(rel: string): Promise<Uint8Array> {
+  const res = await authenticatedFetch(
+    `/v1/design-kit/${rel.split("/").map(encodeURIComponent).join("/")}`,
+  );
+  if (!res.ok) throw new Error(`${rel}: ${res.status} ${res.statusText}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.length > DS_ASSET_MAX_BYTES) {
+    throw new Error(`${rel} is larger than ${DS_ASSET_MAX_BYTES / MB} MB`);
+  }
+  return bytes;
+}
+
+/**
+ * Copy the organization kit into the session's `.omnigent/design-kit/`: the
+ * files its kit.json uses, read in full first, then written with kit.json last.
+ */
+export async function materializeOrgKit(sessionId: string): Promise<void> {
+  const kitJson = await readOrgKitFile("kit.json");
+  const kit = parseDesignKit(new TextDecoder().decode(kitJson));
+  const used = [kit.css, kit.logo?.src, kit.fonts.heading?.src, kit.fonts.body?.src];
+  const rels = [...new Set(used.filter((rel): rel is string => !!rel))];
+  const assets = await Promise.all(rels.map(readOrgKitFile));
+  const total = assets.reduce((sum, bytes) => sum + bytes.length, kitJson.length);
+  if (total > DS_DECK_MAX_BYTES) throw new Error(`over the ${DS_DECK_MAX_BYTES / MB} MB total`);
+  const write = (rel: string, bytes: Uint8Array) =>
+    writeFileContent(sessionId, `${DESIGN_KIT_DIR}/${rel}`, bytesToBase64(bytes), "base64");
+  await Promise.all(rels.map((rel, i) => write(rel, assets[i])));
+  await write("kit.json", kitJson);
 }

@@ -1,12 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchFileContent } from "@/hooks/useFileContent";
+import { writeFileContent } from "@/hooks/useWriteFileContent";
 import * as workspaceFiles from "@/hooks/useWorkspaceChangedFiles";
 import {
+  fetchDesignDefault,
   fetchDesignSearch,
   fetchDesignIndex,
   fetchImportTarget,
   fetchKitIndicator,
+  materializeOrgKit,
   reconcileDesignIndex,
+  saveDesignDefault,
 } from "./designDeckApi";
 import { authenticatedFetch } from "./identity";
 import { getSessionSlim } from "./sessionsApi";
@@ -14,6 +18,7 @@ import { getSessionSlim } from "./sessionsApi";
 const { requestWorkspaceFileSearch } = workspaceFiles;
 
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
+vi.mock("@/hooks/useWriteFileContent", () => ({ writeFileContent: vi.fn() }));
 vi.mock("./identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("./sessionsApi", () => ({ getSessionSlim: vi.fn() }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importActual) => ({
@@ -25,6 +30,7 @@ const searchMock = vi.mocked(requestWorkspaceFileSearch);
 const contentMock = vi.mocked(fetchFileContent);
 const fetchMock = vi.mocked(authenticatedFetch);
 const sessionMock = vi.mocked(getSessionSlim);
+const writeMock = vi.mocked(writeFileContent);
 
 function response(status: number, body: unknown = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -41,6 +47,7 @@ beforeEach(() => {
   searchMock.mockReset();
   contentMock.mockReset();
   fetchMock.mockReset();
+  writeMock.mockReset();
 });
 
 describe("fetchDesignSearch", () => {
@@ -275,5 +282,98 @@ describe("reconcileDesignIndex", () => {
   it("swallows failures; the index is best-effort", async () => {
     fetchMock.mockRejectedValue(new Error("offline"));
     await expect(reconcileDesignIndex("conv_a", [])).resolves.toBeUndefined();
+  });
+});
+
+describe("design default", () => {
+  const system = { kind: "full", host_id: "h1", path: "/ds/brand", name: "Brand" };
+
+  it("reads a stored system, none, or unset", async () => {
+    fetchMock.mockResolvedValueOnce(response(200, { design_default: system }));
+    expect(await fetchDesignDefault()).toEqual({
+      kind: "full",
+      hostId: "h1",
+      path: "/ds/brand",
+      name: "Brand",
+    });
+    fetchMock.mockResolvedValueOnce(response(200, { design_default: { kind: "none" } }));
+    expect(await fetchDesignDefault()).toEqual({ kind: "none" });
+    fetchMock.mockResolvedValueOnce(response(200, { design_default: null }));
+    expect(await fetchDesignDefault()).toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith("/v1/me/preferences/design-default");
+  });
+
+  it("reads an unavailable preference (flag off, older server) as unset", async () => {
+    fetchMock.mockResolvedValue(response(404, { detail: "not found" }));
+    expect(await fetchDesignDefault()).toBeNull();
+  });
+
+  it("saves a system in the wire shape and throws on failure", async () => {
+    fetchMock.mockResolvedValue(response(200, { design_default: system }));
+    await saveDesignDefault({ kind: "full", hostId: "h1", path: "/ds/brand", name: "Brand" });
+    expect(fetchMock).toHaveBeenCalledWith("/v1/me/preferences/design-default", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ design_default: system }),
+    });
+    fetchMock.mockResolvedValue(response(422));
+    await expect(saveDesignDefault({ kind: "none" })).rejects.toThrow("422");
+  });
+});
+
+describe("materializeOrgKit", () => {
+  const kitJson = JSON.stringify({
+    name: "Acme",
+    css: "layouts.css",
+    logo: { src: "img/logo.svg" },
+    fonts: {
+      heading: { family: "Acme", src: "fonts/a.woff2" },
+      body: { family: "Acme", src: "fonts/a.woff2" },
+    },
+  });
+  const files: Record<string, string> = {
+    "kit.json": kitJson,
+    "layouts.css": ".x{}",
+    "img/logo.svg": "<svg/>",
+    "fonts/a.woff2": "wOF2",
+  };
+  const serve = (overrides: Record<string, Response> = {}) =>
+    fetchMock.mockImplementation(async (url) => {
+      const rel = decodeURIComponent(String(url).replace("/v1/design-kit/", ""));
+      return overrides[rel] ?? new Response(files[rel] ?? "", { status: files[rel] ? 200 : 404 });
+    });
+
+  it("copies each file the kit uses once, writing kit.json last", async () => {
+    serve();
+    await materializeOrgKit("conv_a");
+    expect(writeMock.mock.calls.map(([, path]) => path)).toEqual([
+      ".omnigent/design-kit/layouts.css",
+      ".omnigent/design-kit/img/logo.svg",
+      ".omnigent/design-kit/fonts/a.woff2",
+      ".omnigent/design-kit/kit.json",
+    ]);
+    for (const [conv, path, content, encoding] of writeMock.mock.calls) {
+      expect(conv).toBe("conv_a");
+      expect(encoding).toBe("base64");
+      expect(atob(content)).toBe(files[path.replace(".omnigent/design-kit/", "")]);
+    }
+  });
+
+  it("writes nothing when a file is missing or kit.json is invalid", async () => {
+    serve({ "img/logo.svg": new Response("", { status: 404 }) });
+    await expect(materializeOrgKit("conv_a")).rejects.toThrow("img/logo.svg");
+    expect(writeMock.mock.calls.map(([, path]) => path)).not.toContain(
+      ".omnigent/design-kit/kit.json",
+    );
+    writeMock.mockReset();
+    serve({ "kit.json": new Response("{}") });
+    await expect(materializeOrgKit("conv_a")).rejects.toThrow("name");
+    expect(writeMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a file over the per-asset cap", async () => {
+    serve({ "layouts.css": new Response(new Uint8Array(2 * 1024 * 1024 + 1)) });
+    await expect(materializeOrgKit("conv_a")).rejects.toThrow("larger than 2 MB");
+    expect(writeMock).not.toHaveBeenCalled();
   });
 });

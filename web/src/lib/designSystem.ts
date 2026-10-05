@@ -23,6 +23,9 @@ export interface DesignSystemRef {
   importedFrom?: string;
 }
 
+/** The user's stored New design default: a system on one host, or explicitly none. */
+export type DesignDefault = { kind: "none" } | (DesignSystemRef & { hostId: string });
+
 const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 

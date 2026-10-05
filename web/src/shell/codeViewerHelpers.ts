@@ -926,16 +926,19 @@ export function kitText(file: KitFile, path: string): string {
   return file.content;
 }
 
+export function bytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
 export function kitDataUri(file: KitFile, path: string, mime: string): string {
   checkKitFile(file, path);
   let b64 = file.content.replace(/\s/g, "");
   if (file.encoding === "utf-8") {
-    const bytes = new TextEncoder().encode(file.content);
-    let bin = "";
-    for (let i = 0; i < bytes.length; i += 0x8000) {
-      bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-    }
-    b64 = btoa(bin);
+    b64 = bytesToBase64(new TextEncoder().encode(file.content));
   } else if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
     throw new Error(`${path} is not valid base64`);
   }

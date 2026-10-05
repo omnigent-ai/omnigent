@@ -211,6 +211,8 @@ export interface ServerInfo {
   agent_install?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
+  /** The organization design kit served from `/v1/design-kit/`, or null. */
+  design_kit?: { name: string } | null;
 }
 
 function parseBranding(raw: unknown): Branding | null {
@@ -372,6 +374,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           agent_install: data.agent_install === true,
           branding: parseBranding(data.branding),
+          design_kit:
+            typeof data.design_kit?.name === "string" && data.design_kit.name
+              ? { name: data.design_kit.name }
+              : null,
         };
         return cachedServerInfo;
       }
