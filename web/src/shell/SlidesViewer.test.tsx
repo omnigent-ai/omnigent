@@ -687,7 +687,7 @@ describe("SlidesViewer design system", () => {
     text(serializeDesignSystemPointer({ path: FOLDER, kind, name: "Fixture Brand" }));
   const serveSystem = (
     kind: "full" | "skill",
-    opts: { owner?: boolean; fail?: string; hang?: boolean } = {},
+    opts: { owner?: boolean; fail?: string; hang?: boolean; logoGate?: Promise<void> } = {},
   ) => {
     vi.mocked(getSessionSlim).mockResolvedValue({
       permissionLevel: opts.owner === false ? 1 : null,
@@ -696,6 +696,8 @@ describe("SlidesViewer design system", () => {
       if (path === DESIGN_SYSTEM_POINTER) return { ...pointerFile(kind), path } as never;
       if (path.startsWith(`${FOLDER}/`)) {
         if (opts.hang) await new Promise(() => {});
+        if (opts.logoGate && path.endsWith("/logo.svg")) await opts.logoGate;
+        if (path === `${FOLDER}/assets/extra.svg`) return { ...text("<svg/>"), path } as never;
         if (opts.fail) throw new Error(opts.fail);
         const f = readFixtureFile(path.slice(FOLDER.length + 1));
         if (f) return { ...f, path } as never;
@@ -782,5 +784,38 @@ describe("SlidesViewer design system", () => {
     const reads = vi.mocked(fetchFileContent).mock.calls.map(([, p]) => p);
     expect(reads.filter((p) => p === `${FOLDER}/colors_and_type.css`)).toHaveLength(1);
     expect(reads.filter((p) => p === DESIGN_SYSTEM_POINTER)).toHaveLength(2);
+  });
+
+  it("stops reading design-system assets once the load times out", async () => {
+    vi.useFakeTimers();
+    try {
+      let release = () => {};
+      serveSystem("full", { logoGate: new Promise<void>((r) => (release = r)) });
+      render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+      await act(() => vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS + DESIGN_SYSTEM_TIMEOUT_MS));
+      expect(screen.getByRole("status")).toHaveTextContent("design system timed out");
+      release();
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const reads = vi.mocked(fetchFileContent).mock.calls.map(([, p]) => p);
+      expect(reads).toContain(`${FOLDER}/assets/logo.svg`);
+      expect(reads).not.toContain(`${FOLDER}/fonts/fixture-sans.woff2`);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops cached assets the current deck no longer uses", async () => {
+    serveSystem("full");
+    const extraUri = `data:image/svg+xml;base64,${btoa("<svg/>")}`;
+    const withExtra = DS_DECK.replace("<h1>One</h1>", '<h1>One</h1><img src="ds:assets/extra.svg">');
+    const { rerender } = render(<SlidesViewer content={withExtra} conversationId="conv_1" />);
+    expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
+    rerender(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+    await vi.waitFor(() => expect(srcdoc()).not.toContain(extraUri));
+    rerender(<SlidesViewer content={withExtra} conversationId="conv_1" />);
+    await vi.waitFor(() => expect(srcdoc()).toContain(extraUri));
+    const reads = vi.mocked(fetchFileContent).mock.calls.map(([, p]) => p);
+    expect(reads.filter((p) => p === `${FOLDER}/assets/extra.svg`)).toHaveLength(2);
+    expect(reads.filter((p) => p === `${FOLDER}/assets/logo.svg`)).toHaveLength(1);
   });
 });

@@ -198,6 +198,46 @@ describe("injectDesignSystem", () => {
     await expect(injectDesignSystem(repeated, reader(files))).resolves.toBeTruthy();
   });
 
+  it("fails on more than 200 distinct assets before reading anything", async () => {
+    const reads: string[] = [];
+    const deck201 = Array.from({ length: 201 }, (_, i) => `<img src="ds:a/p${i}.svg">`).join("");
+    await expect(
+      injectDesignSystem(deck201, async (p) => (reads.push(p), text("<svg/>"))),
+    ).rejects.toThrow("references more than 200 design-system assets");
+    expect(reads).toEqual([]);
+  });
+
+  it("counts stylesheet assets toward the 200 cap before reading them", async () => {
+    const reads: string[] = [];
+    const deck200 = Array.from({ length: 200 }, (_, i) => `<img src="ds:a/p${i}.svg">`).join("");
+    const files = { "colors_and_type.css": text(".x{background:url(a/extra.svg)}") };
+    await expect(
+      injectDesignSystem(deck200, async (p) => (reads.push(p), reader(files)(p))),
+    ).rejects.toThrow("references more than 200 design-system assets");
+    expect(reads).toEqual(["colors_and_type.css"]);
+  });
+
+  it("reads assets one at a time and stops once over 20 MB", async () => {
+    const piece = text("x".repeat(Math.floor(DS_ASSET_MAX_BYTES * 0.7)));
+    const count = Math.ceil(DS_DECK_MAX_BYTES / (piece.content.length * (4 / 3)));
+    const refs = Array.from({ length: count * 2 }, (_, i) => `<img src="ds:a/p${i}.svg">`);
+    const reads: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const read = async (p: string) => {
+      reads.push(p);
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      await Promise.resolve();
+      inFlight--;
+      return p === "colors_and_type.css" ? null : piece;
+    };
+    await expect(injectDesignSystem(refs.join(""), read)).rejects.toThrow(
+      "design-system assets are larger than 20 MB",
+    );
+    expect(maxInFlight).toBe(1);
+    expect(reads.length).toBeLessThanOrEqual(count + 1);
+  });
+
   it("propagates a failed read", async () => {
     await expect(
       injectDesignSystem(deck, () => Promise.reject(new Error("403 Forbidden"))),

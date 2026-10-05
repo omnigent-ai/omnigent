@@ -115,10 +115,14 @@ export function SlidesViewer({
       systemReads.current = { id: conversationId, files: new Map() };
     }
     const cache = systemReads.current.files;
+    const used = new Set<string>();
+    let cancelled = false;
     const read = (path: string) => {
       if (path === DESIGN_SYSTEM_POINTER || path.startsWith(`${DESIGN_KIT_DIR}/`)) {
         return readKitFile(conversationId, path);
       }
+      if (cancelled) return Promise.reject(new Error("design system load cancelled"));
+      used.add(path);
       let file = cache.get(path);
       if (!file) {
         file = readKitFile(conversationId, path);
@@ -127,10 +131,11 @@ export function SlidesViewer({
       }
       return file;
     };
-    let cancelled = false;
     const finish = (b: DeckBranding) => {
       if (cancelled) return;
       cancelled = true;
+      // Keep only what this deck read, so the cache never outgrows one deck.
+      for (const path of cache.keys()) if (!used.has(path)) cache.delete(path);
       setLoaded({ id: conversationId, branding: b });
     };
     let timer = setTimeout(() => finish(KIT_TIMED_OUT), DESIGN_KIT_TIMEOUT_MS);

@@ -15,6 +15,7 @@ import {
 export const DS_STYLESHEET = "colors_and_type.css";
 export const DS_ASSET_MAX_BYTES = 2 * 1024 * 1024;
 export const DS_DECK_MAX_BYTES = 20 * 1024 * 1024;
+export const DS_MAX_ASSETS = 200;
 
 const DS_MIME: Record<string, string> = { ...IMAGE_MIME, ...FONT_MIME };
 const DS_PATH_RE = /^[\w.-]+(?:\/[\w.-]+)*$/;
@@ -45,48 +46,38 @@ export function resolveDsPath(ref: string): string {
   return path;
 }
 
-/** Data URIs per path, each read once, with the per-asset and per-deck caps. */
-function assetLoader(read: DesignSystemRead): AssetUri {
-  const uris = new Map<string, Promise<string>>();
+/** Data URIs per path, read one at a time so the per-deck cap stops further reads. */
+async function loadAssets(paths: Iterable<string>, read: DesignSystemRead) {
+  const uris = new Map<string, string>();
   let total = 0;
-  return (path) => {
-    let uri = uris.get(path);
-    if (!uri) {
-      uri = (async () => {
-        const file = await read(path);
-        if (!file) throw new Error(`${path} not found in the design system`);
-        const encoded = kitDataUri(file, path, DS_MIME[extension(path)]);
-        if (encoded.length > DS_ASSET_MAX_BYTES) {
-          throw new Error(`${path} is larger than ${DS_ASSET_MAX_BYTES / 1024 / 1024} MB`);
-        }
-        total += encoded.length;
-        if (total > DS_DECK_MAX_BYTES) {
-          throw new Error(
-            `design-system assets are larger than ${DS_DECK_MAX_BYTES / 1024 / 1024} MB`,
-          );
-        }
-        return encoded;
-      })();
-      uris.set(path, uri);
+  for (const path of paths) {
+    const file = await read(path);
+    if (!file) throw new Error(`${path} not found in the design system`);
+    const encoded = kitDataUri(file, path, DS_MIME[extension(path)]);
+    if (encoded.length > DS_ASSET_MAX_BYTES) {
+      throw new Error(`${path} is larger than ${DS_ASSET_MAX_BYTES / 1024 / 1024} MB`);
     }
-    return uri;
-  };
+    total += encoded.length;
+    if (total > DS_DECK_MAX_BYTES) {
+      throw new Error(`design-system assets are larger than ${DS_DECK_MAX_BYTES / 1024 / 1024} MB`);
+    }
+    uris.set(path, encoded);
+  }
+  return uris;
 }
 
-/** Run `replace` over every match of `re`, awaiting all replacements first. */
+/** Run `replace` over every match of `re`, one match at a time. */
 async function replaceAsync(
   text: string,
   re: RegExp,
   replace: (match: RegExpExecArray) => Promise<string>,
 ): Promise<string> {
-  const matches = [...text.matchAll(re)];
-  const values = await Promise.all(matches.map((m) => replace(m as RegExpExecArray)));
   let out = "";
   let at = 0;
-  matches.forEach((m, i) => {
-    out += text.slice(at, m.index) + values[i];
+  for (const m of text.matchAll(re)) {
+    out += text.slice(at, m.index) + (await replace(m as RegExpExecArray));
     at = m.index + m[0].length;
-  });
+  }
   return out + text.slice(at);
 }
 
@@ -145,12 +136,23 @@ export async function injectDesignSystem(
   content: string,
   read: DesignSystemRead,
 ): Promise<DesignSystemInjection> {
-  const asset = assetLoader(read);
+  // A dry pass validates and counts every path before any asset is read.
+  const paths = new Set<string>();
+  const collect: AssetUri = async (path) => {
+    paths.add(path);
+    if (paths.size > DS_MAX_ASSETS) {
+      throw new Error(`the deck references more than ${DS_MAX_ASSETS} design-system assets`);
+    }
+    return "data:,";
+  };
+  await rewriteDsReferences(content, collect);
   const sheet = await read(DS_STYLESHEET);
-  const [css, rewritten] = await Promise.all([
-    sheet ? processDesignSystemCss(kitText(sheet, DS_STYLESHEET), asset) : "",
-    rewriteDsReferences(content, asset),
-  ]);
+  const source = sheet ? kitText(sheet, DS_STYLESHEET) : "";
+  if (source) await processDesignSystemCss(source, collect);
+  const uris = await loadAssets(paths, read);
+  const asset: AssetUri = async (path) => uris.get(path)!;
+  const css = source ? await processDesignSystemCss(source, asset) : "";
+  const rewritten = await rewriteDsReferences(content, asset);
   return {
     style: css ? `<style data-omnigent-design-system>\n${css}\n</style>` : "",
     content: rewritten,
