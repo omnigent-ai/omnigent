@@ -30,6 +30,8 @@ interface CopyPathButtonProps {
    * Tailwind ``group`` class. Omit for always-visible placements (the header).
    */
   revealOnHover?: boolean;
+  /** Tooltip placement for constrained surfaces such as the Info dialog. */
+  tooltipSide?: "top" | "right" | "bottom" | "left";
 }
 
 /**
@@ -49,6 +51,7 @@ export function CopyPathButton({
   command,
   label: labelProp,
   revealOnHover = false,
+  tooltipSide = "bottom",
 }: CopyPathButtonProps) {
   // With a menu action, the same text as the menu copies, with feedback in place on the row.
   const target = useFileCommandTarget(path);
@@ -121,7 +124,7 @@ export function CopyPathButton({
           {copied ? <CheckIcon /> : <CopyIcon />}
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom">
+      <TooltipContent side={tooltipSide}>
         {copyError ? "Copy failed" : copied ? "Copied" : label}
       </TooltipContent>
     </Tooltip>

@@ -61,7 +61,7 @@ def test_file_row_context_menu_kebab_info_and_copy(
     info = page.get_by_role("dialog", name="File info")
     expect(info).to_contain_text(_FILE_NAME)
     expect(info).to_contain_text(f"{len(_FILE_CONTENT)} B")
-    expect(info).to_contain_text("file")
+    expect(info).to_contain_text("File (.txt)")
     expect(info).to_contain_text("Changes")
     info.get_by_role("button", name="Close").click()
     expect(panel.get_by_role("button", name=_FILE_NAME, exact=True)).to_be_focused()
@@ -89,6 +89,66 @@ def test_file_row_context_menu_kebab_info_and_copy(
         arg=_FILE_NAME,
     )
     assert page.evaluate("() => navigator.clipboard.readText()") == _FILE_NAME
+
+
+def test_info_copy_tooltip_stays_within_dialog_at_desktop_and_mobile_widths(
+    page: Page,
+    seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> None:
+    """The copy tooltip remains fully visible inside Info at both panel widths."""
+    base_url, session_id = seeded_session
+    _seed_file(page, base_url, session_id, request)
+    screenshots = tmp_path / "tooltip-bounds"
+    screenshots.mkdir()
+    failures: list[str] = []
+
+    def capture_tooltip(view: str, state: str, info: Locator) -> None:
+        button = info.get_by_role("button", name=f"Copy path: {_FILE_NAME}")
+        if state == "hover":
+            button.hover()
+        else:
+            button.focus()
+        tooltip = page.get_by_role("tooltip")
+        expect(tooltip).to_have_text("Copy path")
+        page.wait_for_timeout(700)
+        page.screenshot(path=str(screenshots / f"{view}-{state}.png"))
+        dialog_box = info.bounding_box()
+        tooltip_box = tooltip.bounding_box()
+        assert dialog_box is not None and tooltip_box is not None
+        if (
+            tooltip_box["x"] < dialog_box["x"]
+            or tooltip_box["x"] + tooltip_box["width"] > dialog_box["x"] + dialog_box["width"]
+        ):
+            failures.append(f"{view}-{state}: dialog={dialog_box}, tooltip={tooltip_box}")
+
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role("tab", name="Files").click()
+    row = _row(panel)
+    row.click(button="right")
+    page.get_by_role("menuitem", name="File info").click()
+    info = page.get_by_role("dialog", name="File info")
+    capture_tooltip("desktop", "hover", info)
+    capture_tooltip("desktop", "focus", info)
+
+    page.set_viewport_size({"width": 360, "height": 740})
+    page.goto(f"{base_url}/c/{session_id}")
+    page.get_by_role("button", name="Conversation actions").click()
+    page.get_by_role("menuitem", name="Files", exact=True).click()
+    drawer = page.get_by_test_id("files-panel-drawer")
+    drawer.get_by_role("searchbox", name="Search all files").click()
+    row = _row(drawer)
+    row.click(button="right")
+    page.get_by_role("menuitem", name="File info").click()
+    info = page.get_by_role("dialog", name="File info")
+    capture_tooltip("mobile", "hover", info)
+    capture_tooltip("mobile", "focus", info)
+
+    assert not failures, "copy tooltip must fit within Info dialog bounds: " + "; ".join(failures)
 
 
 def test_size_does_not_overlap_actions_on_keyboard_focus_or_open_menu(
@@ -210,12 +270,12 @@ def test_fine_pointer_actions_slot_stays_stable_and_size_tracks_visible_actions(
     page.keyboard.press("Escape")
 
 
-def test_fine_pointer_row_action_targets_meet_spacing_exception(
+def test_fine_pointer_inline_action_controls_have_spacing(
     page: Page,
     seeded_session: tuple[str, str],
     request: pytest.FixtureRequest,
 ) -> None:
-    """Undersized adjacent action targets keep 24px spacing on fine pointers."""
+    """Download, Copy, and kebab controls keep clear spacing on fine pointers."""
     base_url, session_id = seeded_session
     _seed_file(page, base_url, session_id, request)
     page.goto(f"{base_url}/c/{session_id}")
@@ -234,7 +294,7 @@ def test_fine_pointer_row_action_targets_meet_spacing_exception(
     assert all(box is not None for box in boxes), "all file action targets should be rendered"
     measured = [box for box in boxes if box is not None]
 
-    def separated(left: dict[str, float], right: dict[str, float]) -> bool:
+    def controls_have_spacing(left: dict[str, float], right: dict[str, float]) -> bool:
         left_small = left["width"] < 24 or left["height"] < 24
         right_small = right["width"] < 24 or right["height"] < 24
         if not left_small and not right_small:
@@ -252,10 +312,12 @@ def test_fine_pointer_row_action_targets_meet_spacing_exception(
         dy = max(abs(small_center[1] - target_center[1]) - target["height"] / 2, 0)
         return dx**2 + dy**2 >= 12**2
 
-    assert separated(measured[0], measured[1]), (
-        f"Download/Copy targets overlap spacing: {measured}"
+    assert controls_have_spacing(measured[0], measured[1]), (
+        f"Download and Copy inline controls lack spacing: {measured}"
     )
-    assert separated(measured[1], measured[2]), f"Copy/kebab targets overlap spacing: {measured}"
+    assert controls_have_spacing(measured[1], measured[2]), (
+        f"Copy and kebab inline controls lack spacing: {measured}"
+    )
 
 
 @pytest.fixture

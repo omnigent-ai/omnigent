@@ -166,19 +166,88 @@ it("shows only available client-side file metadata and copies its canonical path
   render(<FileInfoDialog info={info} onOpenChange={onOpenChange} returnFocus={null} />);
 
   expect(screen.getByRole("dialog", { name: "File info (last known)" })).toBeInTheDocument();
-  expect(screen.getByText("same name # Ω.txt", { selector: "dd" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { level: 2, name: "same name # Ω.txt" })).toBeInTheDocument();
   expect(screen.getByText("deep/same name # Ω.txt")).toBeInTheDocument();
-  expect(screen.getByText("file", { selector: "dd" })).toBeInTheDocument();
-  expect(screen.getAllByText("Not available")).toHaveLength(2);
-  expect(screen.getByText("Deleted (last known)")).toBeInTheDocument();
-  expect(screen.getByText("3", { selector: "dd" })).toBeInTheDocument();
+  expect(screen.getByText("Path", { selector: "dt" })).toBeInTheDocument();
+  expect(screen.getByText("File (.txt)", { selector: "dd" })).toBeInTheDocument();
+  expect(screen.getByText("Deleted · −3 lines")).toBeInTheDocument();
+  expect(
+    screen.getByText(/With Git, changes compare the workspace with the last commit/),
+  ).toBeInTheDocument();
+  expect(screen.queryByText("Size", { selector: "dt" })).not.toBeInTheDocument();
+  expect(screen.queryByText("Modified", { selector: "dt" })).not.toBeInTheDocument();
+  expect(screen.queryByText(/Lines added|Lines removed/)).not.toBeInTheDocument();
   expect(screen.queryByText(/mode|owner|target|mime|children|recursive/i)).not.toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Copy path: same name # Ω.txt" }));
   expect(copyTextMock).toHaveBeenCalledWith("deep/same name # Ω.txt");
   expect(fetchSpy).not.toHaveBeenCalled();
 });
 
-it("uses Not available for unknown folder metadata", () => {
+it("shows exact bytes, root location, and a timezone on an ordinary file", () => {
+  render(
+    <FileInfoDialog
+      info={{
+        name: "app.ts",
+        path: "app.ts",
+        kind: "file",
+        bytes: 231_424,
+        modifiedAt: 1_759_608_000,
+        status: "modified",
+        linesAdded: 12,
+        linesRemoved: 3,
+      }}
+      onOpenChange={vi.fn()}
+      returnFocus={null}
+    />,
+  );
+  expect(screen.getByText("Location", { selector: "dt" })).toBeInTheDocument();
+  expect(screen.getByText("Workspace root", { selector: "code" })).toBeInTheDocument();
+  expect(screen.getByText("TypeScript file (.ts)")).toBeInTheDocument();
+  expect(screen.getByText("226 KB (231,424 bytes)")).toBeInTheDocument();
+  expect(screen.getByText("Modified · +12 −3 lines")).toBeInTheDocument();
+  const modified = screen.getByText("Modified", { selector: "dt" }).nextElementSibling;
+  expect(modified?.textContent).toMatch(/\b(?:UTC|GMT|[A-Z]{2,5})\b/);
+});
+
+it("shows Host path and copy retains the absolute canonical path", async () => {
+  const user = userEvent.setup();
+  render(
+    <FileInfoDialog
+      info={{ name: "outside.pdf", path: "/tmp/outside.pdf", kind: "file", bytes: 5 }}
+      onOpenChange={vi.fn()}
+      returnFocus={null}
+    />,
+  );
+  expect(screen.getByText("Host path", { selector: "dt" })).toBeInTheDocument();
+  expect(screen.getByText("PDF document (.pdf)")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Copy path: outside.pdf" }));
+  expect(copyTextMock).toHaveBeenCalledWith("/tmp/outside.pdf");
+});
+
+it("labels a changed folder without file status wording or counts", () => {
+  render(
+    <FileInfoDialog
+      info={{
+        name: "models",
+        path: "models",
+        kind: "folder",
+        status: "created",
+        linesAdded: 12,
+        linesRemoved: 3,
+      }}
+      onOpenChange={vi.fn()}
+      returnFocus={null}
+    />,
+  );
+  expect(screen.getByRole("dialog", { name: "Folder info" })).toBeInTheDocument();
+  expect(screen.getByText("Folder", { selector: "dd" })).toBeInTheDocument();
+  expect(screen.getByText("Contains changes")).toBeInTheDocument();
+  expect(screen.queryByText(/New file|\+12|−3/)).not.toBeInTheDocument();
+  expect(screen.queryByText("Size", { selector: "dt" })).not.toBeInTheDocument();
+  expect(screen.queryByText("Modified", { selector: "dt" })).not.toBeInTheDocument();
+});
+
+it("uses Not available for metadata without known changes", () => {
   render(
     <FileInfoDialog
       info={{ name: "empty", path: "/tmp/empty", kind: "folder", modifiedAt: null }}
@@ -187,7 +256,8 @@ it("uses Not available for unknown folder metadata", () => {
     />,
   );
   expect(screen.getByRole("dialog", { name: "Folder info" })).toBeInTheDocument();
-  expect(screen.getAllByText("Not available")).toHaveLength(2);
+  expect(screen.getByText("Not available")).toBeInTheDocument();
+  expect(screen.getByText("Host path", { selector: "dt" })).toBeInTheDocument();
   expect(screen.queryByText(/size/i)).not.toBeInTheDocument();
 });
 

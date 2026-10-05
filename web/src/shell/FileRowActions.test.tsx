@@ -3,14 +3,16 @@ import userEvent from "@testing-library/user-event";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { copyTextMock, downloadMock, revealMock } = vi.hoisted(() => ({
+const { copyTextMock, downloadMock, revealMock, toastSuccessMock } = vi.hoisted(() => ({
   copyTextMock: vi.fn(() => Promise.resolve()),
   downloadMock: vi.fn(() => Promise.resolve()),
   revealMock: vi.fn(),
+  toastSuccessMock: vi.fn(),
 }));
 
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 vi.mock("@/hooks/useFileContent", () => ({ downloadWorkspaceFile: downloadMock }));
+vi.mock("sonner", () => ({ toast: { success: toastSuccessMock, error: vi.fn() } }));
 vi.mock("./RevealInFileManager", () => ({
   revealInFileManager: revealMock,
   revealLabel: (directory: boolean) => (directory ? "Open in Finder" : "Show in Finder"),
@@ -201,6 +203,7 @@ describe("FileRowActions", () => {
     expect(menuLabels(menu)).toEqual(["Download", "Copy absolute path", "File info"]);
     await user.click(within(menu).getByRole("menuitem", { name: "Copy absolute path" }));
     expect(copyTextMock).toHaveBeenCalledWith("/tmp/duplicate #.txt");
+    expect(toastSuccessMock).toHaveBeenCalledWith("Copied to clipboard.");
 
     fireEvent.contextMenu(screen.getByTestId("file-row"));
     await user.click(await screen.findByRole("menuitem", { name: "Download" }));
