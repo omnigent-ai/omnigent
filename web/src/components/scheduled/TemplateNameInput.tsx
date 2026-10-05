@@ -77,16 +77,17 @@ export function TemplateNameInput({
           {parts.map((part) => {
             const key = offset;
             offset += part.text.length;
+            const displayedText = part.text.replace(/[\r\n]/g, "");
             return part.kind === "placeholder" ? (
               <mark
                 key={key}
                 className="rounded-sm bg-accent/50 text-accent-foreground"
                 data-template-placeholder
               >
-                {part.text}
+                {displayedText}
               </mark>
             ) : (
-              <span key={key}>{part.text}</span>
+              <span key={key}>{displayedText}</span>
             );
           })}
         </span>
@@ -95,7 +96,7 @@ export function TemplateNameInput({
         {...inputProps}
         className={cn(
           className,
-          "text-transparent caret-foreground selection:bg-accent selection:text-accent-foreground",
+          "relative bg-transparent dark:bg-transparent text-transparent caret-foreground selection:bg-accent selection:text-accent-foreground",
         )}
         onScroll={syncScroll}
         value={value}
