@@ -617,16 +617,28 @@ export function countSlideSections(html: string): number {
     .length;
 }
 
-// Screen: show only the active section. Print: every section, one landscape page each.
-const SLIDES_STYLE = `<style>
-html,body{margin:0;width:100%;height:100%;overflow:hidden}
-@media screen{body>section:not([data-omnigent-active]){display:none!important}}
-@media print{
+const SLIDES_PRINT = `@media print{
 @page{size:landscape;margin:0}
 html,body{height:auto;overflow:visible}
 body>section{break-after:page;break-inside:avoid}
 body>section:last-of-type{break-after:auto}
+}`;
+
+// Screen: show only the active section. Print: every section, one landscape page each.
+const SLIDES_STYLE = `<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden}
+@media screen{body>section:not([data-omnigent-active]){display:none!important}}
+${SLIDES_PRINT}
+</style>`;
+
+// The export shows one slide only once its script marks <html>; without JS it scrolls.
+const SLIDES_EXPORT_STYLE = `<style>
+html,body{margin:0}
+@media screen{
+html[data-omnigent-deck],html[data-omnigent-deck] body{width:100%;height:100%;overflow:hidden}
+html[data-omnigent-deck] body>section:not([data-omnigent-active]){display:none!important}
 }
+${SLIDES_PRINT}
 </style>`;
 
 /** Navigation keys inside these targets belong to the control, not the deck. */
@@ -660,6 +672,31 @@ parent.postMessage({source:S,type:"key",key:e.key},"*");
 })();
 </script>`;
 
+// Standalone navigation for the exported file: keys, click, and `#n` in the URL.
+const SLIDES_EXPORT_SCRIPT = `<script>
+(function(){
+var E=${JSON.stringify(SLIDES_EDITABLE_SELECTOR)},C=E+", a, button, label, summary";
+var PREV=["ArrowLeft","PageUp"],NEXT=["ArrowRight","PageDown"," "],i=0;
+function show(n){var s=document.querySelectorAll("body > section");i=Math.max(0,Math.min(s.length-1,n));for(var k=0;k<s.length;k++)s[k].toggleAttribute("data-omnigent-active",k===i);}
+function hash(){var m=/^#(\\d+)$/.exec(location.hash);show(m?m[1]-1:i);}
+function inside(e,sel){return e.target&&e.target.closest&&e.target.closest(sel);}
+document.documentElement.setAttribute("data-omnigent-deck","");
+hash();
+addEventListener("load",hash);
+addEventListener("hashchange",hash);
+addEventListener("keydown",function(e){
+if(e.defaultPrevented||e.altKey||e.metaKey||e.ctrlKey||inside(e,E))return;
+var d=PREV.indexOf(e.key)>=0?-1:NEXT.indexOf(e.key)>=0?1:0;
+if(!d)return;
+e.preventDefault();
+show(i+d);
+});
+addEventListener("click",function(e){
+if(!e.defaultPrevented&&!e.button&&!inside(e,C))show(i+1);
+});
+})();
+</script>`;
+
 /** Index of the last `</body>` outside HTML comments, or -1. */
 function lastBodyCloseIndex(doc: string): number {
   const comments = Array.from(doc.matchAll(/<!--[\s\S]*?(?:-->|$)/g), (m) => [
@@ -682,12 +719,23 @@ function lastBodyCloseIndex(doc: string): number {
  * them, so the deck's own rules still apply.
  */
 export function prepareSlidesDoc(html: string, kitStyle = "", systemStyle = ""): string {
+  return injectSlides(html, systemStyle, SLIDES_STYLE + kitStyle + SLIDES_SCRIPT);
+}
+
+/**
+ * The standalone `.html` export: the same deck and styles the viewer rendered,
+ * with its own navigation script instead of the frame script.
+ */
+export function prepareSlidesExport(html: string, kitStyle = "", systemStyle = ""): string {
+  return injectSlides(html, systemStyle, SLIDES_EXPORT_STYLE + kitStyle + SLIDES_EXPORT_SCRIPT);
+}
+
+function injectSlides(html: string, systemStyle: string, injection: string): string {
   let doc = prepareHtmlPreviewDoc(html);
   if (systemStyle) {
     const at = Math.max(startTagEnd(doc, "head"), 0) + HTML_PREVIEW_HEAD.length;
     doc = doc.slice(0, at) + systemStyle + doc.slice(at);
   }
-  const injection = SLIDES_STYLE + kitStyle + SLIDES_SCRIPT;
   const at = lastBodyCloseIndex(doc);
   return at === -1 ? doc + injection : doc.slice(0, at) + injection + doc.slice(at);
 }

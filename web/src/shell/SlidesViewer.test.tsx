@@ -16,6 +16,7 @@ import {
   loadDesignKit,
   parseDesignKit,
   prepareSlidesDoc,
+  prepareSlidesExport,
   type KitFile,
 } from "./codeViewerHelpers";
 import { DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer } from "@/lib/designSystem";
@@ -181,6 +182,116 @@ describe("injected deck script", () => {
       { source: SLIDES_MSG_SOURCE, type: "key", key: "PageDown" },
       "*",
     );
+  });
+});
+
+describe("prepareSlidesExport", () => {
+  const KIT = "<style data-omnigent-kit>k</style>";
+  const DS = "<style data-omnigent-design-system>d</style>";
+
+  it("holds the deck, print rules, and both styles, without the frame script", () => {
+    const doc = prepareSlidesExport(DECK, KIT, DS);
+    expect(doc).toContain("<section><h1>Three</h1></section>");
+    expect(doc).toContain("@page{size:landscape;margin:0}");
+    expect(doc.indexOf(DS)).toBeLessThan(doc.indexOf("<title>"));
+    expect(doc.indexOf(KIT)).toBeGreaterThan(doc.indexOf("<h1>Three</h1>"));
+    expect(doc.indexOf(KIT)).toBeLessThan(doc.indexOf("</body>"));
+    expect(doc.match(/<script>/g)).toHaveLength(1);
+    expect(doc).not.toContain(SLIDES_MSG_SOURCE);
+    expect(doc).not.toContain("postMessage");
+  });
+});
+
+describe("exported deck", () => {
+  const listeners: Record<string, (e: unknown) => void> = {};
+  const location = { hash: "" };
+  const sections = () => Array.from(document.querySelectorAll("body > section"));
+  const visible = () =>
+    sections()
+      .filter((s) => getComputedStyle(s).display !== "none")
+      .map((s) => s.textContent);
+
+  // Loads the export into the test document with its script inert, as with JS off.
+  function load(inner: string) {
+    const parsed = new DOMParser().parseFromString(prepareSlidesExport(body(inner)), "text/html");
+    const script = parsed.querySelector("script")!;
+    script.remove();
+    document.head.replaceChildren(...parsed.head.childNodes);
+    document.body.replaceChildren(...parsed.body.childNodes);
+    return () =>
+      new Function("document", "addEventListener", "location", script.textContent!)(
+        document,
+        (type: string, fn: (e: unknown) => void) => (listeners[type] = fn),
+        location,
+      );
+  }
+  const key = (k: string, extra: Record<string, unknown> = {}) => {
+    const e = { key: k, defaultPrevented: false, preventDefault: vi.fn(), target: null, ...extra };
+    listeners.keydown(e);
+    return e;
+  };
+  const THREE = "<section>a</section><section>b</section><section>c</section>";
+
+  afterEach(() => {
+    document.documentElement.removeAttribute("data-omnigent-deck");
+    document.head.replaceChildren();
+    document.body.replaceChildren();
+    location.hash = "";
+  });
+
+  it("reads as a stacked document until the script runs", () => {
+    const run = load(THREE);
+    expect(visible()).toEqual(["a", "b", "c"]);
+    run();
+    expect(visible()).toEqual(["a"]);
+  });
+
+  it("steps with arrow, page, and space keys and stops at the ends", () => {
+    load(THREE)();
+    expect(key("ArrowRight").preventDefault).toHaveBeenCalled();
+    key(" ");
+    expect(visible()).toEqual(["c"]);
+    key("PageDown");
+    expect(visible()).toEqual(["c"]);
+    key("PageUp");
+    key("ArrowLeft");
+    key("ArrowLeft");
+    expect(visible()).toEqual(["a"]);
+  });
+
+  it("ignores modified keys and keys typed in form fields", () => {
+    load("<section><input /><textarea></textarea></section><section>b</section>")();
+    for (const target of document.querySelectorAll("input, textarea")) key(" ", { target });
+    key("ArrowRight", { altKey: true });
+    key("ArrowRight", { metaKey: true });
+    key("ArrowRight", { ctrlKey: true });
+    key("ArrowRight", { defaultPrevented: true });
+    expect(key("Enter").preventDefault).not.toHaveBeenCalled();
+    expect(visible()).toEqual([""]);
+  });
+
+  it("advances on a click but not on links or controls", () => {
+    load('<section><a href="#x">l</a><button>b</button></section><section>b</section>')();
+    for (const target of document.querySelectorAll("a, button")) {
+      listeners.click({ target, button: 0, defaultPrevented: false });
+    }
+    expect(visible()).toEqual(["lb"]);
+    listeners.click({ target: sections()[0], button: 0, defaultPrevented: false });
+    expect(visible()).toEqual(["b"]);
+  });
+
+  it("opens at #n and follows hash changes", () => {
+    location.hash = "#2";
+    load(THREE)();
+    expect(visible()).toEqual(["b"]);
+    location.hash = "#3";
+    listeners.hashchange({});
+    expect(visible()).toEqual(["c"]);
+    location.hash = "#99";
+    listeners.hashchange({});
+    expect(visible()).toEqual(["c"]);
+    key("ArrowLeft");
+    expect(visible()).toEqual(["b"]);
   });
 });
 
