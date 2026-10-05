@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from omnigent.harness_aliases import canonicalize_harness
@@ -60,6 +60,7 @@ def create_skill_content_router(
         host_id: str,
         harness: str,
         name: str,
+        source_id: str | None = Query(default=None, pattern=r"^[0-9a-f]{64}$"),
     ) -> SkillContentResponse:
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(
@@ -83,6 +84,7 @@ def create_skill_content_router(
             host_conn=conn,
             harness=harness,
             name=name,
+            source_id=source_id,
         )
         if result.status != "ok" or result.skill is None:
             raise HTTPException(status_code=502, detail="host skill content lookup failed")
@@ -101,7 +103,12 @@ def create_skill_content_router(
 
 
 async def request_host_skill_content(
-    *, host_registry: HostRegistry, host_conn: HostConnection, harness: str, name: str
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    harness: str,
+    name: str,
+    source_id: str | None = None,
 ) -> HostSkillContentResultFrame:
     """Request one skill's contents over the host tunnel, with bounded waiting and cleanup."""
     request_id = secrets.token_hex(8)
@@ -113,7 +120,9 @@ async def request_host_skill_content(
         host_registry.send_text(
             host_conn,
             encode_host_frame(
-                HostSkillContentFrame(request_id=request_id, harness=harness, name=name)
+                HostSkillContentFrame(
+                    request_id=request_id, harness=harness, name=name, source_id=source_id
+                )
             ),
         )
         return await asyncio.wait_for(future, timeout=_SKILL_CONTENT_TIMEOUT_S)

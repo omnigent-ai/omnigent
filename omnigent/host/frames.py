@@ -1085,6 +1085,7 @@ class HostSkillContentFrame:
     request_id: str
     harness: str
     name: str
+    source_id: str | None = None
 
 
 @dataclass
@@ -1696,6 +1697,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "harness": frame.harness,
                 "name": frame.name,
+                "source_id": frame.source_id,
             }
         )
     if isinstance(frame, HostSkillContentResultFrame):
@@ -2135,6 +2137,7 @@ def _decode_known_host_frame(
                 request_id=_required_str(msg, "request_id"),
                 harness=_required_str(msg, "harness"),
                 name=_required_str(msg, "name"),
+                source_id=_optional_nullable_str(msg, "source_id"),
             )
         case HostFrameKind.SKILL_CONTENT_RESULT:
             return _decode_skill_content_result(msg)
@@ -2754,6 +2757,9 @@ def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:
 
 
 _PLUGIN_FIELDS = (
+    "id",
+    "skill_entries",
+    "mcp_entries",
     "harness",
     "name",
     "marketplace",
@@ -2773,6 +2779,16 @@ def _decode_plugins_result(msg: _JsonObject) -> HostPluginsResultFrame:
     plugins = None
     if isinstance(raw, list) and all(isinstance(item, dict) for item in raw):
         plugins = [{key: item[key] for key in _PLUGIN_FIELDS if key in item} for item in raw]
+        for plugin in plugins:
+            for field_name in ("skill_entries", "mcp_entries"):
+                entries = plugin.get(field_name)
+                if isinstance(entries, list):
+                    plugin[field_name] = [
+                        {key: entry[key] for key in ("id", "name") if key in entry}
+                        if isinstance(entry, dict)
+                        else entry
+                        for entry in entries
+                    ]
     return HostPluginsResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),

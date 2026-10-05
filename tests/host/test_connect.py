@@ -8348,15 +8348,16 @@ async def test_host_answers_skill_content_over_the_tunnel(monkeypatch):
         "truncated": False,
     }
 
-    def read(harness, name):
-        assert (harness, name) == ("claude-native", "toolkit:lint")
+    def read(harness, name, source_id):
+        assert (harness, name, source_id) == ("claude-native", "toolkit:lint", "a" * 64)
         return skill
 
     monkeypatch.setattr("omnigent.host.skill_content.read_skill_content", read)
     host = _make_host_process()
     ws = _RecordingWS()
     host._start_frame_task(
-        ws, encode_host_frame(HostSkillContentFrame("s", "claude-native", "toolkit:lint"))
+        ws,
+        encode_host_frame(HostSkillContentFrame("s", "claude-native", "toolkit:lint", "a" * 64)),
     )
     await _drain_frame_tasks(host)
     result = decode_host_frame(ws.sent[-1])
@@ -8365,7 +8366,7 @@ async def test_host_answers_skill_content_over_the_tunnel(monkeypatch):
 
 
 async def test_host_skill_content_failure_is_private(monkeypatch, caplog):
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError("synthetic-private-body")
 
     monkeypatch.setattr("omnigent.host.skill_content.read_skill_content", fail)

@@ -3231,7 +3231,7 @@ class HostProcess:
         from omnigent.host.skill_content import read_skill_content
 
         try:
-            skill = read_skill_content(frame.harness, frame.name)
+            skill = read_skill_content(frame.harness, frame.name, source_id=frame.source_id)
         except Exception:  # noqa: BLE001 — file contents must never enter exception logs
             return HostSkillContentResultFrame(
                 request_id=frame.request_id,

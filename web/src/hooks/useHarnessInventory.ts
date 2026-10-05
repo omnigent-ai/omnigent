@@ -41,12 +41,19 @@ export interface InventorySkill {
   description?: string;
 }
 
+export interface PluginAsset {
+  id: string;
+  name: string;
+}
+
 export interface InventoryPlugin {
   id: string;
   name: string;
   harness: BrandHarness;
   /** Its skill names, without the ``plugin:`` prefix. */
   skills: string[];
+  skill_entries?: PluginAsset[] | null;
+  mcp_entries?: PluginAsset[] | null;
   marketplace?: string;
   version?: string | null;
   description?: string | null;
@@ -98,7 +105,7 @@ async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<Mcp
   return body.mcp_servers;
 }
 
-type PluginWire = Omit<InventoryPlugin, "id"> & { marketplace: string };
+type PluginWire = Omit<InventoryPlugin, "id"> & { id?: string | null; marketplace: string };
 
 async function fetchPlugins(hostId: string, signal: AbortSignal): Promise<PluginWire[]> {
   const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/plugins`, {
@@ -289,7 +296,10 @@ export function useHarnessInventory(
       assembled.plugins = assembled.plugins.filter((plugin) => plugin.harness !== "claude");
       for (const plugin of pluginData ?? []) {
         if (plugin.harness !== "claude" || !harnesses.includes("claude")) continue;
-        assembled.plugins.push({ ...plugin, id: `claude:${plugin.name}@${plugin.marketplace}` });
+        assembled.plugins.push({
+          ...plugin,
+          id: plugin.id ?? `claude:${plugin.name}@${plugin.marketplace}`,
+        });
       }
     }
     return assembled;

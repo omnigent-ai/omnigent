@@ -3890,6 +3890,26 @@
         "title": "PermissionObject",
         "type": "object"
       },
+      "PluginAsset": {
+        "properties": {
+          "id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "PluginAsset",
+        "type": "object"
+      },
       "PluginSummary": {
         "description": "Installed Claude plugin metadata, without paths or executable configuration.",
         "properties": {
@@ -3922,10 +3942,37 @@
             "title": "Has Hooks",
             "type": "boolean"
           },
+          "id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
           "marketplace": {
             "maxLength": 256,
             "title": "Marketplace",
             "type": "string"
+          },
+          "mcp_entries": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PluginAsset"
+                },
+                "maxItems": 128,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Entries"
           },
           "mcp_servers": {
             "items": {
@@ -3941,6 +3988,21 @@
             "minLength": 1,
             "title": "Name",
             "type": "string"
+          },
+          "skill_entries": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PluginAsset"
+                },
+                "maxItems": 128,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skill Entries"
           },
           "skills": {
             "items": {
@@ -10295,6 +10357,23 @@
             "schema": {
               "title": "Name",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Id"
             }
           }
         ],

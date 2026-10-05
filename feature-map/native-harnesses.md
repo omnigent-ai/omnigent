@@ -118,6 +118,9 @@ Cross-harness journeys:
   `tests/server/routes/test_skill_content.py`, and the real-host test
   `tests/e2e/test_host_skill_content_e2e.py::test_host_skill_content` with plain
   pytest. Web coverage is in `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  Open installed plugin skills while the plugin is disabled and when the skill
+  is not user-invocable. With matching names in two marketplaces or a plain skill,
+  verify each plugin page shows its own instructions.
   For both card and gear entry points, open a plain skill and a plugin skill;
   verify markdown, Back, and the truncation note for a body over 256 KiB.
   Remote markdown images must not load. A 501 shows an update hint; inject a

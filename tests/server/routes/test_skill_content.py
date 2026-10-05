@@ -93,11 +93,14 @@ async def test_owner_gets_skill_content(
     app, registry, _ = content_app
     conn = _register(registry, CAP_SKILL_CONTENT)
     async with _client(app) as client:
-        task = asyncio.create_task(client.get(_URL, headers={"x-test-user": "owner"}))
+        task = asyncio.create_task(
+            client.get(_URL, params={"source_id": "a" * 64}, headers={"x-test-user": "owner"})
+        )
         frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
         assert isinstance(frame, HostSkillContentFrame)
         assert frame.harness == "claude-native"
         assert frame.name == "toolkit:lint"
+        assert frame.source_id == "a" * 64
         result.request_id = frame.request_id
         conn.pending_skill_content[frame.request_id].set_result(result)
         response = await task

@@ -13,13 +13,13 @@ export function useSkillContent(
   hostId: string,
   harness: string,
   name: string,
-  { enabled = true } = {},
+  { enabled = true, sourceId }: { enabled?: boolean; sourceId?: string } = {},
 ) {
   return useQuery({
-    queryKey: ["skill-content", hostId, harness, name],
+    queryKey: ["skill-content", hostId, harness, name, sourceId],
     queryFn: async ({ signal }): Promise<SkillContent> => {
       const response = await authenticatedFetch(
-        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/skills/${encodeURIComponent(name)}`,
+        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/skills/${encodeURIComponent(name)}${sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : ""}`,
         { signal, cache: "no-store" },
       );
       if (!response.ok)

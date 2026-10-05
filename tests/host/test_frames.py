@@ -2297,6 +2297,8 @@ def test_plugins_result_allow_list_and_malformed_payload() -> None:
                 "plugins": [
                     {
                         "name": "tool",
+                        "skill_entries": [{"id": "a" * 64, "name": "lint", "path": "/private"}],
+                        "mcp_entries": [{"id": "b" * 64, "name": "docs", "env": "secret"}],
                         "env": {"TOKEN": "secret"},
                         "installPath": "/private",
                         "commands": "secret",
@@ -2306,7 +2308,13 @@ def test_plugins_result_allow_list_and_malformed_payload() -> None:
         )
     )
     assert isinstance(frame, HostPluginsResultFrame)
-    assert frame.plugins == [{"name": "tool"}]
+    assert frame.plugins == [
+        {
+            "name": "tool",
+            "skill_entries": [{"id": "a" * 64, "name": "lint"}],
+            "mcp_entries": [{"id": "b" * 64, "name": "docs"}],
+        }
+    ]
     malformed = decode_host_frame(
         json.dumps(
             {"kind": "host.plugins_result", "request_id": "p", "status": "ok", "plugins": "secret"}
@@ -2320,6 +2328,7 @@ def test_plugins_result_allow_list_and_malformed_payload() -> None:
     "frame",
     [
         HostSkillContentFrame("s", "claude-native", "plugin:skill"),
+        HostSkillContentFrame("s", "claude-native", "plugin:skill", "a" * 64),
         HostSkillContentResultFrame(
             "s", "ok", {"name": "skill", "description": "", "content": "body", "truncated": False}
         ),

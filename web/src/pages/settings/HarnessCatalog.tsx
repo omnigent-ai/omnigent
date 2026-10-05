@@ -86,7 +86,9 @@ export function HarnessCatalog({
     searchParams.get("tab") === "settings" ? "settings" : "mcps",
   );
   const [open, setOpen] = useState<OpenPlugin | null>(null);
-  const [skillName, setSkillName] = useState<string | null>(null);
+  const [selectedSkill, setSelectedSkill] = useState<{ name: string; sourceId?: string } | null>(
+    null,
+  );
   const [contentSupported, setContentSupported] = useState(true);
   const inventory = useHarnessInventory(host, { includePluginMetadata: family === "claude" });
   const back = () => setOpen(null);
@@ -112,27 +114,31 @@ export function HarnessCatalog({
       ? unavailable.includes("skills") && unavailable.includes("mcps")
       : unavailable.includes(kind);
 
-  if (skillName !== null)
+  if (selectedSkill !== null)
     return (
       <SkillPage
         host={host}
         harness={INVENTORY_HARNESS_IDS[family]}
-        name={skillName}
+        name={selectedSkill.name}
+        sourceId={selectedSkill.sourceId}
         backLabel={open ? open.plugin.name : "Skills"}
-        onBack={() => setSkillName(null)}
+        onBack={() => setSelectedSkill(null)}
         onUnavailable={() => {
           setContentSupported(false);
-          setSkillName(null);
+          setSelectedSkill(null);
         }}
       />
     );
   if (open)
     return (
       <PluginPage
+        host={host}
         plugin={open.plugin}
         mcps={open.mcps}
         onBack={back}
-        onSkillOpen={contentSupported ? setSkillName : undefined}
+        onSkillOpen={
+          contentSupported ? (name, sourceId) => setSelectedSkill({ name, sourceId }) : undefined
+        }
       />
     );
 
@@ -206,7 +212,9 @@ export function HarnessCatalog({
                   icon={<SparkleIcon className="size-4 text-muted-foreground" />}
                   name={skill.name}
                   detail={skill.description}
-                  onOpen={contentSupported ? () => setSkillName(skill.name) : undefined}
+                  onOpen={
+                    contentSupported ? () => setSelectedSkill({ name: skill.name }) : undefined
+                  }
                 />
               ))}
             </ul>,
@@ -319,16 +327,20 @@ function pluginDetail(plugin: InventoryPlugin, mcpCount: number) {
 }
 
 function PluginPage({
+  host,
   plugin,
   mcps,
   onBack,
   onSkillOpen,
 }: {
+  host: Host;
   plugin: InventoryPlugin;
   mcps: InventoryMcpServer[];
   onBack: () => void;
-  onSkillOpen?: (name: string) => void;
+  onSkillOpen?: (name: string, sourceId?: string) => void;
 }) {
+  const needsUpdate = plugin.marketplace !== undefined && !plugin.skill_entries;
+  const skills = plugin.skill_entries ?? plugin.skills.map((name) => ({ name, id: undefined }));
   return (
     <>
       <BackButton label="Plugins" onClick={onBack} />
@@ -354,14 +366,19 @@ function PluginPage({
           </TabsTrigger>
         </TabsList>
         <TabsContent value="skills">
+          {needsUpdate && <Notice>Update {host.name} to read installed plugin skills.</Notice>}
           <ul className="flex flex-col gap-2">
             {plugin.skills.length === 0 && <Notice>No skills found.</Notice>}
-            {plugin.skills.map((name) => (
+            {skills.map(({ name, id }) => (
               <CatalogRow
-                key={name}
+                key={id ?? name}
                 icon={<SparkleIcon className="size-4 text-muted-foreground" />}
                 name={name}
-                onOpen={onSkillOpen ? () => onSkillOpen(`${plugin.name}:${name}`) : undefined}
+                onOpen={
+                  onSkillOpen && !needsUpdate
+                    ? () => onSkillOpen(`${plugin.name}:${name}`, id)
+                    : undefined
+                }
               />
             ))}
           </ul>
@@ -388,6 +405,7 @@ function SkillPage({
   host,
   harness,
   name,
+  sourceId,
   backLabel,
   onBack,
   onUnavailable,
@@ -395,11 +413,12 @@ function SkillPage({
   host: Host;
   harness: string;
   name: string;
+  sourceId?: string;
   backLabel: string;
   onBack: () => void;
   onUnavailable: () => void;
 }) {
-  const query = useSkillContent(host.host_id, harness, name, { enabled: true });
+  const query = useSkillContent(host.host_id, harness, name, { enabled: true, sourceId });
   const missingRoute = query.error instanceof ApiError && query.error.status === 404;
   useEffect(() => {
     if (missingRoute) onUnavailable();

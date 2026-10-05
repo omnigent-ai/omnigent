@@ -20,14 +20,18 @@ it("fetches an encoded skill only while enabled, with no browser cache", async (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
   const { result, rerender, unmount } = renderHook(
-    ({ enabled }) => useSkillContent("host id", "claude-native", "plugin:a/b", { enabled }),
+    ({ enabled }) =>
+      useSkillContent("host id", "claude-native", "plugin:a/b", {
+        enabled,
+        sourceId: "a".repeat(64),
+      }),
     { wrapper, initialProps: { enabled: false } },
   );
   expect(authenticatedFetch).not.toHaveBeenCalled();
   rerender({ enabled: true });
   await waitFor(() => expect(result.current.data?.content).toBe("body"));
   expect(authenticatedFetch).toHaveBeenCalledWith(
-    "/v1/hosts/host%20id/harnesses/claude-native/skills/plugin%3Aa%2Fb",
+    `/v1/hosts/host%20id/harnesses/claude-native/skills/plugin%3Aa%2Fb?source_id=${"a".repeat(64)}`,
     expect.objectContaining({ cache: "no-store", signal: expect.any(AbortSignal) }),
   );
   unmount();

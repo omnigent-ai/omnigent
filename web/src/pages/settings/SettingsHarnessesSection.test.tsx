@@ -27,9 +27,16 @@ let contentQuery: { data?: SkillContent; error?: unknown; isPending: boolean } =
   isPending: false,
 };
 let contentLookup: [string, string, string] | null = null;
+let contentSource: string | undefined;
 vi.mock("@/hooks/useSkillContent", () => ({
-  useSkillContent: (hostId: string, harness: string, name: string) => {
+  useSkillContent: (
+    hostId: string,
+    harness: string,
+    name: string,
+    { sourceId }: { sourceId?: string },
+  ) => {
     contentLookup = [hostId, harness, name];
+    contentSource = sourceId;
     return contentQuery;
   },
 }));
@@ -146,6 +153,7 @@ const ONLINE: Host = {
 afterEach(() => {
   contentQuery = { data: CONTENT, isPending: false };
   contentLookup = null;
+  contentSource = undefined;
   cleanup();
   hosts = [];
   inventory = INVENTORY;
@@ -486,4 +494,53 @@ it("disables plain and plugin skill links after an old-server 404", () => {
   selectTab("Plugins · 1");
   fireEvent.click(screen.getByTestId("catalog-row-toolkit"));
   expect(screen.getByTestId("catalog-row-lint").tagName).not.toBe("BUTTON");
+});
+
+it.each([false, true])("opens installed plugin skill IDs when enabled=%s", (enabled) => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      plugins: ["first", "second"].map((marketplace) => ({
+        id: marketplace,
+        name: "toolkit",
+        harness: "claude",
+        marketplace,
+        enabled,
+        skills: ["lint"],
+        skill_entries: [{ id: `${marketplace}-skill`, name: "lint" }],
+      })),
+    },
+  };
+  renderHarnesses("claude-native");
+  selectTab("Plugins · 2");
+  fireEvent.click(screen.getAllByTestId("catalog-row-toolkit")[1]);
+  fireEvent.click(screen.getByTestId("catalog-row-lint"));
+  expect(contentSource).toBe("second-skill");
+  expect(contentLookup).toEqual([ONLINE.host_id, "claude-native", "toolkit:lint"]);
+  expect(screen.getByRole("heading", { name: "Instructions" })).toBeTruthy();
+});
+
+it("requests a host update instead of guessing installed skill identity", () => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      plugins: [
+        {
+          ...INVENTORY.context.plugins[0],
+          marketplace: "market",
+          enabled: true,
+        },
+      ],
+    },
+  };
+  renderHarnesses("claude-native");
+  selectTab("Plugins · 1");
+  fireEvent.click(screen.getByTestId("catalog-row-toolkit"));
+  expect(screen.getByText("Update my-laptop to read installed plugin skills.")).toBeTruthy();
+  expect(screen.getByTestId("catalog-row-lint").tagName).not.toBe("BUTTON");
+  expect(contentLookup).toBeNull();
 });

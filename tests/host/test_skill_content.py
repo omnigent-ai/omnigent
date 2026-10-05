@@ -69,3 +69,52 @@ def test_content_byte_cap(monkeypatch, content, truncated):
     assert len(body.encode("utf-8")) <= MAX_SKILL_CONTENT_BYTES
     assert content.startswith(body)
     assert result["truncated"] is truncated
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_installed_skill_identity_survives_collisions_and_invocation_filters(
+    tmp_path, monkeypatch, enabled
+):
+    from omnigent.host.plugins import discover_plugins
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    claude = tmp_path / ".claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
+    plain = claude / "skills" / "plain"
+    plain.mkdir(parents=True)
+    (plain / "SKILL.md").write_text("---\nname: toolkit:lint\ndescription: Plain\n---\nplain body")
+    installs = {}
+    for market in ("first", "second"):
+        plugin = claude / "plugins" / "cache" / market
+        installs[f"toolkit@{market}"] = [{"installPath": str(plugin)}]
+        for directory in ("lint", "same-name"):
+            skill = plugin / "skills" / directory
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: lint\ndescription: Installed\nuser-invocable: false\n---\n"
+                f"{market}/{directory} body"
+            )
+    (claude / "plugins" / "installed_plugins.json").write_text(json.dumps({"plugins": installs}))
+    (claude / "settings.json").write_text(
+        json.dumps({"enabledPlugins": dict.fromkeys(installs, enabled)})
+    )
+    plugins = discover_plugins()
+    assert len({plugin["id"] for plugin in plugins}) == 2
+    ids = set()
+    for plugin in plugins:
+        assert plugin["enabled"] is enabled
+        bodies = set()
+        for entry in plugin["skill_entries"]:
+            ids.add(entry["id"])
+            result = read_skill_content("claude-native", "toolkit:lint", entry["id"])
+            bodies.add(result["content"])
+            assert str(tmp_path) not in json.dumps(result)
+        assert bodies == {
+            f"{plugin['marketplace']}/{directory} body" for directory in ("lint", "same-name")
+        }
+    assert len(ids) == 4
+    assert read_skill_content("claude-native", "toolkit:lint")["content"] == "plain body"
+    with pytest.raises(LookupError):
+        read_skill_content("claude-native", "toolkit:lint", "0" * 64)
+    with pytest.raises(LookupError):
+        read_skill_content("codex-native", "toolkit:lint", next(iter(ids)))

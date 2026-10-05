@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.host.plugins import MAX_PLUGIN_DESCRIPTION, discover_plugins
+from omnigent.spec.skill_sources import _plugin_asset_id
 
 
 def _json(path: Path, value: object) -> None:
@@ -72,6 +73,11 @@ def test_installed_plugins_scope_metadata_and_secrets(
     assert plugins["managed"]["enabled"] is True
     assert plugins["hooks-only"]["skills"] == []
     assert plugins["tools"] == {
+        "id": _plugin_asset_id("tools@market", "plugin"),
+        "skill_entries": [
+            {"id": _plugin_asset_id("tools@market", "skill", "skills/review"), "name": "review"}
+        ],
+        "mcp_entries": [{"id": _plugin_asset_id("tools@market", "mcp", "docs"), "name": "docs"}],
         "harness": "claude",
         "name": "tools",
         "marketplace": "market",
