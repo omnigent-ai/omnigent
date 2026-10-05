@@ -6,7 +6,8 @@ description: Turn a product idea or flow the user describes into a clickable, re
 # wireframes: clickable screens the viewer renders in device frames
 
 Use when the user asks for a wireframe, mockup, screen flow, or UI sketch of
-an app or site, rather than slides.
+an app or site as a `*.wireframe.html` design, rather than slides. Do not use
+it when they want production UI code in their repository.
 
 ## Wireframe format
 
