@@ -63,10 +63,12 @@ export function parseAdherence(text: string): BrandRules | null {
   }
   if (!isObject(raw)) return null;
   const rule = isObject(raw.rules) ? raw.rules["no-restricted-syntax"] : null;
+  // Cap the raw selector list first so a huge rules file never compiles more than the budget.
   const patterns = (Array.isArray(rule) ? rule : [])
     .map((e) => (typeof e === "string" ? e : isObject(e) ? e.selector : null))
-    .flatMap((s) => (typeof s === "string" ? (compileSelector(s) ?? []) : []))
-    .slice(0, BRAND_MAX_PATTERNS);
+    .filter((s): s is string => typeof s === "string" && SELECTOR_REGEX.test(s))
+    .slice(0, BRAND_MAX_PATTERNS)
+    .flatMap((s) => compileSelector(s) ?? []);
   const omelette = isObject(raw["x-omelette"]) ? raw["x-omelette"] : {};
   const fonts = Array.isArray(omelette.fontFamilies) ? names(omelette.fontFamilies) : [];
   if (!patterns.length && !fonts.length) return null;
@@ -110,7 +112,15 @@ function* declarationFindings(text: string, where: string, rules: BrandRules, bu
     const tokens = value.replace(/"[^"]*"|'[^']*'/g, " ").split(/[\s,/()]+/);
     for (const token of tokens) {
       if (!token || token.length > MAX_TOKEN || /^0+(?:\.0+)?px$/i.test(token)) continue;
-      if (/^1px$/i.test(token) && /^(?:border|outline)/.test(property)) continue;
+      // Hairline widths only - not border-radius, outline-offset, colors, etc.
+      if (
+        /^1px$/i.test(token) &&
+        /^(?:border(?:-(?:(?:top|right|bottom|left|block(?:-start|-end)?|inline(?:-start|-end)?)(?:-width)?|width))?|outline(?:-width)?)$/.test(
+          property,
+        )
+      ) {
+        continue;
+      }
       if (rules.patterns.some((p) => p.test(token))) yield found(token);
     }
   }
@@ -201,13 +211,22 @@ const spawnScanWorker = (): ScanWorker | null =>
 
 /**
  * Scan in a worker, since a hostile pattern can still backtrack for seconds.
- * Null (no badge) without a Worker, on error, or once `timeoutMs` passes.
+ * Null (no badge) without a Worker, on error, once `timeoutMs` passes, or when
+ * `signal` aborts (content change / unmount).
  */
 export function runBrandScan(
   input: BrandScanInput,
-  timeoutMs = BRAND_SCAN_TIMEOUT_MS,
-  spawn: () => ScanWorker | null = spawnScanWorker,
+  {
+    timeoutMs = BRAND_SCAN_TIMEOUT_MS,
+    spawn = spawnScanWorker,
+    signal,
+  }: {
+    timeoutMs?: number;
+    spawn?: () => ScanWorker | null;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<BrandWarning[] | null> {
+  if (signal?.aborted) return Promise.resolve(null);
   let worker: ScanWorker | null;
   try {
     worker = spawn();
@@ -217,12 +236,18 @@ export function runBrandScan(
   if (!worker) return Promise.resolve(null);
   const w = worker;
   return new Promise((resolve) => {
+    let settled = false;
     const done = (result: BrandWarning[] | null) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       w.terminate();
       resolve(result);
     };
+    const onAbort = () => done(null);
     const timer = setTimeout(() => done(null), timeoutMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
     w.onmessage = (e: MessageEvent) => done(Array.isArray(e.data) ? e.data : null);
     w.onerror = () => done(null);
     w.postMessage(input);

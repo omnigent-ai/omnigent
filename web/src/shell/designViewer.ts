@@ -148,6 +148,7 @@ export function useBrandWarnings(
     }
     const entry = rules.current;
     let cancelled = false;
+    const abort = new AbortController();
     const finish = (warnings: BrandWarning[] | null) => {
       if (!cancelled) setState({ id: conversationId, path: systemPath, content, warnings });
     };
@@ -156,9 +157,18 @@ export function useBrandWarnings(
       if (rules.current === entry) rules.current = null;
       finish(null);
       cancelled = true;
+      abort.abort();
     }, BRAND_WARNINGS_TIMEOUT_MS);
     void entry.files
-      .then((files) => (files ? runBrandScan({ ...files, deck: styleSources(content) }) : null))
+      .then((files) => {
+        if (cancelled) return null;
+        // A failed or empty read must not stick for the whole mount.
+        if (!files) {
+          if (rules.current === entry) rules.current = null;
+          return null;
+        }
+        return runBrandScan({ ...files, deck: styleSources(content) }, { signal: abort.signal });
+      })
       .then((warnings) => {
         clearTimeout(timer);
         finish(warnings);
@@ -166,6 +176,7 @@ export function useBrandWarnings(
     return () => {
       cancelled = true;
       clearTimeout(timer);
+      abort.abort();
     };
   }, [conversationId, content, systemPath]);
   const current =

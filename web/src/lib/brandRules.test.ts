@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BrandScanThread } from "@/test/brandScanWorker";
 import {
   BRAND_MAX_PATTERN_LENGTH,
+  BRAND_MAX_PATTERNS,
   handleBrandScan,
   parseAdherence,
   runBrandScan,
@@ -74,6 +75,19 @@ describe("parseAdherence", () => {
     const rules = parseAdherence(config([HEX, 7, null], { tokens: 3, fontFamilies: [1, "Ok"] }))!;
     expect(rules).toMatchObject({ tokens: [], fonts: ["Ok"] });
   });
+
+  it("compiles at most BRAND_MAX_PATTERNS patterns from a large rules file", () => {
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      selector: `Literal[value=/^p${i}$/]`,
+    }));
+    const spy = vi.spyOn(globalThis, "RegExp");
+    const before = spy.mock.calls.length;
+    const rules = parseAdherence(config(many))!;
+    const compiles = spy.mock.calls.length - before;
+    spy.mockRestore();
+    expect(rules.patterns).toHaveLength(BRAND_MAX_PATTERNS);
+    expect(compiles).toBe(BRAND_MAX_PATTERNS);
+  });
 });
 
 describe("scanBrandWarnings", () => {
@@ -101,9 +115,17 @@ describe("scanBrandWarnings", () => {
     expect(values(deck(":root{--x:#ff0000;--y:12px}h1{color:var(--x, #00ff00)}"))).toEqual([]);
   });
 
-  it("ignores 0px and 1px borders and outlines, but not other 1px values", () => {
-    const css = "h1{margin:0px;border:1px solid var(--x);outline-width:1px;padding:1px}";
-    expect(scan(deck(css))).toEqual([{ value: "1px", property: "padding", where: "<style> h1" }]);
+  it("ignores 0px and 1px border/outline widths, but not radius, offset, or padding", () => {
+    expect(values(deck("h1{margin:0px;border:1px solid var(--x);outline-width:1px}"))).toEqual([]);
+    expect(scan(deck("h1{border-radius:1px}"))).toEqual([
+      { value: "1px", property: "border-radius", where: "<style> h1" },
+    ]);
+    expect(scan(deck("h1{outline-offset:1px}"))).toEqual([
+      { value: "1px", property: "outline-offset", where: "<style> h1" },
+    ]);
+    expect(scan(deck("h1{padding:1px}"))).toEqual([
+      { value: "1px", property: "padding", where: "<style> h1" },
+    ]);
   });
 
   it("allows generic families and system tokens as fonts", () => {
@@ -155,11 +177,10 @@ describe("runBrandScan", () => {
 
   it("scans in a worker thread", async () => {
     const thread = new BrandScanThread();
-    const result = await runBrandScan(
-      input(config(), deck("h1{color:#ff0000}")),
-      30_000,
-      () => thread,
-    );
+    const result = await runBrandScan(input(config(), deck("h1{color:#ff0000}")), {
+      timeoutMs: 30_000,
+      spawn: () => thread,
+    });
     expect(result).toEqual([{ value: "#ff0000", property: "color", where: "<style> h1" }]);
     expect(thread.terminated).toBe(true);
   });
@@ -172,16 +193,34 @@ describe("runBrandScan", () => {
     let ticks = 0;
     const tick = setInterval(() => ticks++, 20);
     const started = performance.now();
-    const result = await runBrandScan(
-      input(adherence, deck(`h1{width:${"1".repeat(40)}}`)),
-      500,
-      () => thread,
-    );
+    const result = await runBrandScan(input(adherence, deck(`h1{width:${"1".repeat(40)}}`)), {
+      timeoutMs: 500,
+      spawn: () => thread,
+    });
     clearInterval(tick);
     expect(result).toBeNull();
     expect(thread.terminated).toBe(true);
     expect(performance.now() - started).toBeLessThan(5000);
     expect(ticks).toBeGreaterThan(5);
+  });
+
+  it("aborts mid-scan by terminating the worker before the 500 ms budget", async () => {
+    const adherence = config([CATASTROPHIC]);
+    const thread = new BrandScanThread();
+    const abort = new AbortController();
+    const started = performance.now();
+    const pending = runBrandScan(input(adherence, deck(`h1{width:${"1".repeat(40)}}`)), {
+      timeoutMs: 30_000,
+      spawn: () => thread,
+      signal: abort.signal,
+    });
+    await new Promise<void>((r) => {
+      setTimeout(r, 40);
+    });
+    abort.abort();
+    expect(await pending).toBeNull();
+    expect(thread.terminated).toBe(true);
+    expect(performance.now() - started).toBeLessThan(500);
   });
 
   it("resolves null without a Worker instead of scanning on the main thread", async () => {
