@@ -9,7 +9,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +88,13 @@ _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_MAX_DELAY_SECONDS = 30.0
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _DURABLE_ITEM_POST_TIMEOUT_SECONDS = 5.0
+# Rotation retries are limited to idempotent reads and same-value target
+# metadata writes. Session creation and terminal transfer remain one-shot.
+_ROTATION_REQUEST_TIMEOUT_SECONDS = 30.0
+_ROTATION_REQUEST_MAX_ATTEMPTS = 3
+_ROTATION_RETRY_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+_ROTATION_RETRY_DELAY_SECONDS = 0.25
+_ROTATION_RETRY_MAX_DELAY_SECONDS = 1.0
 _SOURCE_ID_MAX_CHARS = 256
 # Startup dead-letter replay budget (#1579). Bounded so a large dead-letter file
 # or a slow/hung server cannot stall forwarder startup: each re-POST is a single
@@ -2051,6 +2058,62 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+def _rotation_transport_error_is_retryable(exc: httpx.HTTPError) -> bool:
+    """Return whether a rotation read/write transport error may clear."""
+    return isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.RemoteProtocolError,
+        ),
+    )
+
+
+async def _codex_rotation_retry_sleep(seconds: float) -> None:
+    """Sleep between safe rotation request retries; patched by focused tests."""
+    await asyncio.sleep(seconds)
+
+
+async def _codex_rotation_request(
+    operation: str,
+    request: Callable[[], Awaitable[httpx.Response]],
+) -> httpx.Response:
+    """Run one bounded retryable rotation read or idempotent metadata write."""
+    for attempt in range(1, _ROTATION_REQUEST_MAX_ATTEMPTS + 1):
+        last_attempt = attempt == _ROTATION_REQUEST_MAX_ATTEMPTS
+        try:
+            response = await request()
+        except httpx.HTTPError as exc:
+            if last_attempt or not _rotation_transport_error_is_retryable(exc):
+                raise
+            _logger.warning(
+                "Transient Codex rotation %s error (attempt %d/%d); retrying: %s",
+                operation,
+                attempt,
+                _ROTATION_REQUEST_MAX_ATTEMPTS,
+                type(exc).__name__,
+            )
+        else:
+            if response.status_code not in _ROTATION_RETRY_STATUS_CODES or last_attempt:
+                return response
+            _logger.warning(
+                "Transient Codex rotation %s status %d (attempt %d/%d); retrying",
+                operation,
+                response.status_code,
+                attempt,
+                _ROTATION_REQUEST_MAX_ATTEMPTS,
+            )
+        delay = min(
+            _ROTATION_RETRY_DELAY_SECONDS * (2 ** (attempt - 1)),
+            _ROTATION_RETRY_MAX_DELAY_SECONDS,
+        )
+        await _codex_rotation_retry_sleep(delay)
+    raise AssertionError("Codex rotation retry loop exhausted without a result")
+
+
 async def supervise_forwarder(
     *,
     base_url: str,
@@ -2458,15 +2521,23 @@ async def _create_thread_replacement_session(
         raise RuntimeError("Codex thread replacement response did not include id")
 
     if isinstance(runner_id, str) and runner_id:
-        bind_resp = await client.patch(
-            f"/v1/sessions/{url_component(new_session_id)}",
-            json={"runner_id": runner_id},
+        bind_resp = await _codex_rotation_request(
+            "target runner bind",
+            lambda: client.patch(
+                f"/v1/sessions/{url_component(new_session_id)}",
+                json={"runner_id": runner_id},
+                timeout=_ROTATION_REQUEST_TIMEOUT_SECONDS,
+            ),
         )
         bind_resp.raise_for_status()
 
-    external_resp = await client.patch(
-        f"/v1/sessions/{url_component(new_session_id)}",
-        json={"external_session_id": new_thread_id},
+    external_resp = await _codex_rotation_request(
+        "target external-session binding",
+        lambda: client.patch(
+            f"/v1/sessions/{url_component(new_session_id)}",
+            json={"external_session_id": new_thread_id},
+            timeout=_ROTATION_REQUEST_TIMEOUT_SECONDS,
+        ),
     )
     external_resp.raise_for_status()
 
@@ -2523,7 +2594,13 @@ async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) ->
     :raises httpx.HTTPStatusError: If Omnigent rejects the request.
     :raises RuntimeError: If the response is not a JSON object.
     """
-    resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
+    resp = await _codex_rotation_request(
+        "old-session snapshot",
+        lambda: client.get(
+            f"/v1/sessions/{url_component(session_id)}",
+            timeout=_ROTATION_REQUEST_TIMEOUT_SECONDS,
+        ),
+    )
     resp.raise_for_status()
     payload = resp.json()
     if not isinstance(payload, dict):

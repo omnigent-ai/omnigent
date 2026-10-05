@@ -82,6 +82,7 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
 
 
 def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
@@ -99,6 +100,17 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     fake_client = _FakeCodexAppServerClient()
     requests: list[tuple[str, str, dict[str, Any] | None]] = []
     posted_events: list[tuple[str, dict[str, Any]]] = []
+    old_snapshot_attempts = 0
+    target_patch_attempts = 0
+
+    async def no_rotation_retry_sleep(_seconds: float) -> None:
+        """Keep the transient-rotation regression deterministic and fast."""
+
+    monkeypatch.setattr(
+        codex_native_forwarder,
+        "_codex_rotation_retry_sleep",
+        no_rotation_retry_sleep,
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
@@ -110,6 +122,10 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         body = json.loads(request.content) if request.content else None
         requests.append((request.method, request.url.path, body))
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_old":
+            nonlocal old_snapshot_attempts
+            old_snapshot_attempts += 1
+            if old_snapshot_attempts == 1:
+                return httpx.Response(503, json={"error": "temporary outage"})
             return httpx.Response(
                 200,
                 json={
@@ -128,6 +144,11 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
             "/v1/sessions/conv_new",
             "/v1/sessions/conv_old",
         }:
+            if request.url.path == "/v1/sessions/conv_new":
+                nonlocal target_patch_attempts
+                target_patch_attempts += 1
+                if target_patch_attempts == 1:
+                    return httpx.Response(503, json={"error": "temporary outage"})
             return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1]})
         if request.method == "POST" and request.url.path == (
             "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer"
@@ -248,6 +269,9 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer",
         {"target_session_id": "conv_new"},
     ) in requests
+    assert old_snapshot_attempts == 2
+    assert target_patch_attempts == 3  # bind retry + external-id patch
+    assert sum(method == "POST" and path == "/v1/sessions" for method, path, _ in requests) == 1
     assert [
         payload["data"]["status"]
         for _, payload in posted_events
@@ -364,6 +388,150 @@ def test_forwarder_rotation_failure_preserves_old_target(
     assert fake_usage_coalescer.flushed
     assert not fake_delta_coalescer.closed
     assert not fake_usage_coalescer.closed
+
+
+@pytest.mark.parametrize("failure_stage", ["create", "transfer"])
+def test_rotation_does_not_retry_non_idempotent_mutations(
+    failure_stage: str,
+    tmp_path: Path,
+) -> None:
+    """Create and terminal transfer stay one-shot after an AP failure."""
+    _write_forwarder_bridge(
+        tmp_path,
+        session_id="conv_old",
+        thread_id="thread_old",
+        active_turn_id=None,
+    )
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "ag_codex",
+                    "runner_id": "runner_123",
+                    "labels": {},
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            if failure_stage == "create":
+                return httpx.Response(503, json={"error": "temporary outage"})
+            return httpx.Response(201, json={"id": "conv_new"})
+        if request.method == "PATCH":
+            return httpx.Response(200, json={"id": "conv_new"})
+        if request.url.path.endswith("/transfer"):
+            if failure_stage == "transfer":
+                return httpx.Response(503, json={"error": "temporary outage"})
+            return httpx.Response(200, json={"id": "terminal_codex_main"})
+        return httpx.Response(500, json={"error": "unexpected request"})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await codex_native_forwarder._create_thread_replacement_session(
+                    client=client,
+                    old_session_id="conv_old",
+                    bridge_dir=tmp_path,
+                    app_server_url="ws://127.0.0.1:9876",
+                    new_thread_id="thread_new",
+                )
+
+    asyncio.run(run())
+    create_calls = [path for method, path in calls if method == "POST" and path == "/v1/sessions"]
+    transfer_calls = [path for method, path in calls if path.endswith("/transfer")]
+    assert len(create_calls) == 1
+    assert len(transfer_calls) == (1 if failure_stage == "transfer" else 0)
+
+
+@pytest.mark.parametrize("failure_stage", ["snapshot", "target_patch"])
+def test_rotation_does_not_retry_permanent_errors(
+    failure_stage: str,
+    tmp_path: Path,
+) -> None:
+    """Auth/validation responses fail immediately rather than entering backoff."""
+    _write_forwarder_bridge(
+        tmp_path,
+        session_id="conv_old",
+        thread_id="thread_old",
+        active_turn_id=None,
+    )
+    attempts: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append((request.method, request.url.path))
+        if request.method == "GET":
+            status = 401 if failure_stage == "snapshot" else 200
+            return httpx.Response(
+                status,
+                json=(
+                    {"error": "unauthorized"}
+                    if status >= 400
+                    else {
+                        "id": "conv_old",
+                        "agent_id": "ag_codex",
+                        "runner_id": "runner_123",
+                        "labels": {},
+                    }
+                ),
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(201, json={"id": "conv_new"})
+        if request.method == "PATCH":
+            return httpx.Response(
+                400 if failure_stage == "target_patch" else 200,
+                json={"error": "invalid target"},
+            )
+        return httpx.Response(500, json={"error": "unexpected request"})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await codex_native_forwarder._create_thread_replacement_session(
+                    client=client,
+                    old_session_id="conv_old",
+                    bridge_dir=tmp_path,
+                    app_server_url="ws://127.0.0.1:9876",
+                    new_thread_id="thread_new",
+                )
+
+    asyncio.run(run())
+    if failure_stage == "snapshot":
+        assert attempts == [("GET", "/v1/sessions/conv_old")]
+    else:
+        assert attempts.count(("PATCH", "/v1/sessions/conv_new")) == 1
+
+
+@pytest.mark.asyncio
+async def test_rotation_retry_honors_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry backoff can be cancelled without blocking rotation teardown."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_sleep(_seconds: float) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(codex_native_forwarder, "_codex_rotation_retry_sleep", blocked_sleep)
+
+    async def request() -> httpx.Response:
+        return httpx.Response(503)
+
+    task = asyncio.create_task(codex_native_forwarder._codex_rotation_request("test", request))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @dataclass(frozen=True)
