@@ -965,6 +965,9 @@ describe("SlidesViewer design system", () => {
       serveSystem("full");
       render(<SlidesViewer content={OFF_BRAND} conversationId="conv_1" />);
       fireEvent.click(await screen.findByRole("button", { name: "2 brand warnings" }));
+      expect(
+        screen.getByRole("dialog", { name: "Values outside the design system" }),
+      ).toBeVisible();
       const items = screen.getAllByRole("listitem").map((li) => li.textContent);
       expect(items).toEqual([
         expect.stringMatching(/#FF0000.*color.*<style> h2/),

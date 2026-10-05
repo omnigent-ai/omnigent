@@ -2,7 +2,15 @@
 // rendered in the same sandboxed srcdoc iframe as the HTML preview. The parent
 // only talks to the deck over postMessage (the iframe has an opaque origin).
 
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -67,6 +75,7 @@ export function slidesExportFilename(path?: string | null): string {
 /** Toolbar badge for raw values outside a full design system; never blocks the deck. */
 function BrandWarnings({ warnings }: { warnings: BrandWarning[] }) {
   const label = `${warnings.length} brand warning${warnings.length === 1 ? "" : "s"}`;
+  const headingId = useId();
   return (
     <Popover>
       <PopoverTrigger asChild>
@@ -82,8 +91,10 @@ function BrandWarnings({ warnings }: { warnings: BrandWarning[] }) {
           <span className="hidden sm:inline">{label}</span>
         </Button>
       </PopoverTrigger>
-      <PopoverContent align="end" className="w-80">
-        <p className="font-medium text-foreground">Values outside the design system</p>
+      <PopoverContent align="end" className="w-80" aria-labelledby={headingId}>
+        <p id={headingId} className="font-medium text-foreground">
+          Values outside the design system
+        </p>
         <ul className="flex max-h-64 flex-col gap-1 overflow-auto">
           {warnings.map((w) => (
             <li key={w.value} className="flex min-w-0 items-baseline gap-2">
