@@ -6930,6 +6930,14 @@ async def _stop_session_via_runner_impl(
     return True
 
 
+@dataclass
+class _HostRunnerStopAttempt:
+    """Track frame handoff and explicit rejection across caller cancellation."""
+
+    dispatched: bool = False
+    rejected: bool = False
+
+
 async def _stop_session_host_runner(
     session_id: str,
     host_id: str,
@@ -6937,6 +6945,7 @@ async def _stop_session_host_runner(
     host_registry: Any,
     *,
     expect_already_stopped: bool = False,
+    attempt: _HostRunnerStopAttempt | None = None,
 ) -> bool:
     """
     Terminate the host-launched runner backing a host-spawned session.
@@ -6978,11 +6987,11 @@ async def _stop_session_host_runner(
         instead of warning, for callers that race another reaper for the same
         runner (the relaunch belt: see
         :func:`_spawn_superseded_runner_stop`). Delivery failures still warn.
-    :returns: ``True`` when the stop was delivered and acknowledged (the
-        runner is exiting, so a tunnel drop is expected); ``False`` on any
-        best-effort early-out (no host registry, host offline/replaced,
-        ack timeout, or host-reported failure) where the runner may keep
-        running and no tunnel drop will follow.
+    :param attempt: Optional caller-owned progress record that survives cancellation.
+    :returns: ``True`` after a successful acknowledgement; ``False`` for an
+        unavailable host, rejected send, timeout, or host-reported failure.
+        A dispatched stop can still finish after a timeout or cancellation;
+        ``attempt`` distinguishes that uncertainty from definitive rejection.
     """
     if host_registry is None:
         return False
@@ -7007,33 +7016,38 @@ async def _stop_session_host_runner(
         HostStopRunnerFrame(request_id=request_id, runner_id=runner_id),
     )
     try:
-        host_registry.send_text(conn, stop_frame)
-    except ConnectionError:
+        try:
+            host_registry.send_text(conn, stop_frame)
+        except ConnectionError:
+            _logger.warning(
+                "Cannot stop runner %s for session %s: host %s connection was replaced",
+                runner_id,
+                session_id,
+                host_id,
+                extra={"session_id": session_id},
+            )
+            return False
+        if attempt is not None:
+            attempt.dispatched = True
+        try:
+            result = await asyncio.wait_for(
+                future,
+                timeout=_STOP_RUNNER_RESULT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            _logger.warning(
+                "Host %s did not acknowledge stop of runner %s for session %s",
+                host_id,
+                runner_id,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            return False
+    finally:
         conn.pending_stops.pop(request_id, None)
-        _logger.warning(
-            "Cannot stop runner %s for session %s: host %s connection was replaced",
-            runner_id,
-            session_id,
-            host_id,
-            extra={"session_id": session_id},
-        )
-        return False
-    try:
-        result = await asyncio.wait_for(
-            future,
-            timeout=_STOP_RUNNER_RESULT_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        conn.pending_stops.pop(request_id, None)
-        _logger.warning(
-            "Host %s did not acknowledge stop of runner %s for session %s",
-            host_id,
-            runner_id,
-            session_id,
-            extra={"session_id": session_id},
-        )
-        return False
     if result.get("status") == "failed":
+        if attempt is not None:
+            attempt.rejected = True
         # An unknown runner means someone already reaped it. Expected for the
         # relaunch belt, which the host's own supersession normally beats, so
         # a warning there would report a successful reap as a failure.

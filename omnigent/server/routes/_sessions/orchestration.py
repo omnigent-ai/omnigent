@@ -258,6 +258,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _handle_advise_models_mcp,
+    _HostRunnerStopAttempt,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
@@ -753,8 +754,8 @@ async def _stop_host_runner_intentionally(
     """Carry stop intent to the active sessions sharing the terminated runner.
 
     Relays consume their own markers; the disconnect sweep settles sessions
-    without a relay. A rejected or cancelled teardown removes every marker it
-    added, so a later unexpected disconnect still reports a failure.
+    without a relay. Definitive rejection removes newly added markers, while
+    an unacknowledged dispatch retains intent through timeout or cancellation.
     """
     from omnigent.server.routes import sessions as _facade
 
@@ -802,17 +803,18 @@ async def _stop_host_runner_intentionally(
                 marked.add(related_id)
                 _intentional_stop_sessions[related_id] = runner_id
 
-        delivered = False
+        acknowledged = False
+        attempt = _HostRunnerStopAttempt()
         try:
-            delivered = await _facade._stop_session_host_runner(
-                session_id, host_id, runner_id, host_registry
+            acknowledged = await _facade._stop_session_host_runner(
+                session_id, host_id, runner_id, host_registry, attempt=attempt
             )
         finally:
-            if not delivered:
+            if not acknowledged and (not attempt.dispatched or attempt.rejected):
                 for related_id in marked:
                     if _intentional_stop_sessions.get(related_id) == runner_id:
                         _intentional_stop_sessions.pop(related_id, None)
-        return delivered
+        return acknowledged
 
 
 async def _archive_stop(
@@ -3607,6 +3609,9 @@ async def _publish_runner_recovered_status_impl(
     await _persist_session_status_error_labels(session_id, None, conversation_store)
 
 
+_RUNNER_OFFLINE_RETRY_DELAYS_S = (0.5, 1.0)
+
+
 async def _mark_runner_sessions_offline_impl(
     convs: list[Conversation],
     error: ErrorDetail,
@@ -3633,6 +3638,10 @@ async def _mark_runner_sessions_offline_impl(
     runner comes back — that helper only clears a failure it can identify
     as a disconnect.
 
+    Retry transient binding and settlement errors after reconciling the
+    other sessions. Each retry rechecks current intent and runner ownership;
+    a persistent metadata outage leaves state untouched after three attempts.
+
     :param convs: Conversations bound to the departed runner, from
         :meth:`ConversationStore.list_conversations_by_runner_id`.
     :param error: The cause to publish and persist, e.g.
@@ -3646,6 +3655,30 @@ async def _mark_runner_sessions_offline_impl(
         children are skipped either way.
     :returns: None.
     """
+    pending = convs
+    for delay in (0.0, *_RUNNER_OFFLINE_RETRY_DELAYS_S):
+        if delay:
+            await asyncio.sleep(delay)
+        pending = await _mark_runner_sessions_offline_once(
+            pending, error, conversation_store, fail_idle_top_level=fail_idle_top_level
+        )
+        if not pending:
+            return
+    _logger.warning(
+        "Runner offline reconciliation exhausted metadata retries for %d session(s)",
+        len(pending),
+    )
+
+
+async def _mark_runner_sessions_offline_once(
+    convs: list[Conversation],
+    error: ErrorDetail,
+    conversation_store: ConversationStore,
+    *,
+    fail_idle_top_level: bool,
+) -> list[Conversation]:
+    """Reconcile each session once and return the ones blocked by metadata errors."""
+    retry: list[Conversation] = []
     for conv in convs:
         handle = _runner_relay_tasks.get(conv.id)
         stopped_runner_id = _intentional_stop_sessions.get(conv.id)
@@ -3664,6 +3697,7 @@ async def _mark_runner_sessions_offline_impl(
                     exc_info=True,
                     extra={"session_id": conv.id},
                 )
+                retry.append(conv)
                 continue
             if binding is None or binding[0] != conv.runner_id:
                 continue
@@ -3685,6 +3719,7 @@ async def _mark_runner_sessions_offline_impl(
                         )
                     )
                     if settled is None:
+                        retry.append(conv)
                         continue
                     current_handle = _runner_relay_tasks.get(conv.id)
                     if (
@@ -3716,6 +3751,7 @@ async def _mark_runner_sessions_offline_impl(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
+    return retry
 
 
 async def _wait_for_host_reconnect(
