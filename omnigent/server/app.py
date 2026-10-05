@@ -98,6 +98,7 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
+from omnigent.server.routes.design import create_design_router
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.extension_assets import create_extension_assets_router
 from omnigent.server.routes.extensions import create_extensions_router
@@ -3159,6 +3160,16 @@ def create_app(
         ),
         prefix="/v1",
         tags=["usage"],
+    )
+    app.include_router(
+        create_design_router(
+            conversation_store,
+            permission_store,
+            auth_provider=auth_provider,
+            feature_flags=resolved_feature_flags,
+        ),
+        prefix="/v1",
+        tags=["design"],
     )
     # Server agent discovery for the new-session picker
     # (designs/BUILTIN_AGENTS.md), plus user agents (``omnigent agent add``).

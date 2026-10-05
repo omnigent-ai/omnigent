@@ -1513,6 +1513,92 @@
         "title": "DailyCost",
         "type": "object"
       },
+      "DesignArtifactEntry": {
+        "description": "One indexed Design page artifact, with the session it was written through.",
+        "properties": {
+          "kind": {
+            "description": "`\"deck\"` or `\"wireframe\"`.",
+            "enum": [
+              "deck",
+              "wireframe"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "path": {
+            "description": "Path relative to the session's workspace.",
+            "title": "Path",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "Session to read the file through.",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "session_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session's title, if it has one.",
+            "title": "Session Title"
+          },
+          "updated_at": {
+            "description": "Unix epoch seconds of the last recorded change.",
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session's workspace path, if it has one.",
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "session_id",
+          "path",
+          "kind",
+          "updated_at"
+        ],
+        "title": "DesignArtifactEntry",
+        "type": "object"
+      },
+      "DesignArtifactList": {
+        "description": "Design page artifacts across the sessions the caller can see, newest first.",
+        "properties": {
+          "data": {
+            "description": "Indexed artifacts.",
+            "items": {
+              "$ref": "#/components/schemas/DesignArtifactEntry"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "DesignArtifactList",
+        "type": "object"
+      },
       "ElicitationRequestEvent": {
         "description": "Synchronous request for a decision from upstream.\n\nEmitted by Omnigent (or, under the new contract, by a harness)\nwhen the LLM / a tool / a policy needs a verdict before\nproceeding. The consumer replies via\n`POST /v1/sessions/{session_id}/events` with\n`type == \"approval\"` and\n`omnigent.server.schemas.ElicitationResult` fields in\n`data`. This preserves MCP request/reply correlation by id\nwithout threading elicitations through PATCH.\n\nWire shape matches the existing emit at\n`omnigent/runtime/policies/approval.py:175`.",
         "properties": {
@@ -4642,6 +4728,25 @@
           "delta"
         ],
         "title": "ReasoningTextDeltaEvent",
+        "type": "object"
+      },
+      "ReplaceDesignArtifactsRequest": {
+        "description": "Every artifact path a workspace scan found for one session.",
+        "properties": {
+          "paths": {
+            "description": "Workspace-relative paths; non-artifact paths are ignored.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10000,
+            "title": "Paths",
+            "type": "array"
+          }
+        },
+        "required": [
+          "paths"
+        ],
+        "title": "ReplaceDesignArtifactsRequest",
         "type": "object"
       },
       "ResetSessionModelOverrideRequest": {
@@ -9833,6 +9938,60 @@
         "summary": "Branding Logo"
       }
     },
+    "/v1/design/artifacts": {
+      "get": {
+        "description": "List indexed decks and wireframes in sessions the caller can see.\n\nVisibility is the session list's: the rows are filtered through\n`list_conversations` with the caller as `accessible_by`, which\nalso drops archived sessions and sub-agents.",
+        "operationId": "list_design_artifacts_v1_design_artifacts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "deck",
+                    "wireframe"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesignArtifactList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Design Artifacts",
+        "tags": [
+          "design"
+        ]
+      }
+    },
     "/v1/extensions": {
       "get": {
         "description": "List extensions installed and enabled when the server started.\n\nV1 treats operator installation as enablement. Installing, removing, or\nupgrading a package requires a server restart to refresh this snapshot.",
@@ -13450,6 +13609,52 @@
         "summary": "Update Comment",
         "tags": [
           "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/design-artifacts": {
+      "put": {
+        "description": "Replace a session's indexed artifacts with a scan's full path set.",
+        "operationId": "replace_design_artifacts_v1_sessions__session_id__design_artifacts_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplaceDesignArtifactsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Replace Design Artifacts",
+        "tags": [
+          "design"
         ]
       }
     },

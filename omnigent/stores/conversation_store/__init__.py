@@ -1534,7 +1534,7 @@ class ConversationStore(ABC):
         Replace a session's artifact rows with exactly *paths*.
 
         Rows for paths already indexed keep their ``updated_at``; new paths
-        are stamped *now*. Paths that are not artifacts are ignored.
+        are stamped *now*. Non-artifact and over-long paths are ignored.
 
         :param session_id: Session whose workspace was scanned.
         :param paths: Every artifact path the scan found.

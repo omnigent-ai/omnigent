@@ -87,7 +87,11 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
-from omnigent.entities.design_artifact import DesignArtifact, design_artifact_kind
+from omnigent.entities.design_artifact import (
+    DESIGN_ARTIFACT_PATH_MAX,
+    DesignArtifact,
+    design_artifact_kind,
+)
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
@@ -3860,7 +3864,12 @@ class SqlAlchemyConversationStore(ConversationStore):
     ) -> None:
         """Replace a session's artifact rows with *paths*. See the abstract method."""
         stamp = now if now is not None else now_epoch()
-        wanted = {path: kind for path in paths if (kind := design_artifact_kind(path)) is not None}
+        wanted = {
+            path: kind
+            for path in paths
+            if len(path) <= DESIGN_ARTIFACT_PATH_MAX
+            and (kind := design_artifact_kind(path)) is not None
+        }
 
         def write(session: Session) -> None:
             rows = session.execute(

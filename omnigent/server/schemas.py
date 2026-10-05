@@ -2929,6 +2929,47 @@ class UsageReport(BaseModel):
 # ── Permissions ────────────────────────────────────────────────────
 
 
+class DesignArtifactEntry(BaseModel):
+    """
+    One indexed Design page artifact, with the session it was written through.
+
+    :param session_id: Session to read the file through.
+    :param path: Path relative to the session's workspace.
+    :param kind: ``"deck"`` or ``"wireframe"``.
+    :param updated_at: Unix epoch seconds of the last recorded change.
+    :param session_title: The session's title, if it has one.
+    :param workspace: The session's workspace path, if it has one.
+    """
+
+    session_id: str
+    path: str
+    kind: Literal["deck", "wireframe"]
+    updated_at: int
+    session_title: str | None = None
+    workspace: str | None = None
+
+
+class DesignArtifactList(BaseModel):
+    """
+    Design page artifacts across the sessions the caller can see, newest first.
+
+    :param data: Indexed artifacts.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[DesignArtifactEntry]
+
+
+class ReplaceDesignArtifactsRequest(BaseModel):
+    """
+    Every artifact path a workspace scan found for one session.
+
+    :param paths: Workspace-relative paths; non-artifact paths are ignored.
+    """
+
+    paths: list[str] = Field(max_length=10_000)
+
+
 class GrantPermissionRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{id}/permissions``.
