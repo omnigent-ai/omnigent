@@ -48,7 +48,7 @@ export function RunnerStep({
         <label htmlFor="runner-remote">
           <Card
             className={cn(
-              "cursor-pointer flex-row pl-4 border-transparent",
+              "cursor-pointer flex-row pl-4 border-transparent items-center",
               runner === "remote" ? "shadow-sm" : "shadow-none",
             )}
           >
@@ -58,6 +58,7 @@ export function RunnerStep({
               name="runner"
               checked={runner === "remote"}
               onChange={() => setRunner("remote")}
+              className="size-[13px] shrink-0 appearance-none rounded-full border border-foreground text-foreground checked:bg-[radial-gradient(circle_at_center,currentColor_0_3px,transparent_3.5px)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
             />
             <span className="flex items-center justify-center gap-1">
               <Cloud className="size-4" aria-hidden />
@@ -70,7 +71,7 @@ export function RunnerStep({
       <label htmlFor="runner-local">
         <Card
           className={cn(
-            "cursor-pointer flex-row pl-4",
+            "cursor-pointer flex-row pl-4 items-center",
             runner === "local" ? "shadow-sm" : "shadow-none",
           )}
         >
@@ -80,6 +81,7 @@ export function RunnerStep({
             name="runner"
             checked={runner === "local"}
             onChange={() => setRunner("local")}
+            className="size-[13px] shrink-0 appearance-none rounded-full border border-foreground text-foreground checked:bg-[radial-gradient(circle_at_center,currentColor_0_3px,transparent_3.5px)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
           />
           <div className="flex flex-col">
             <span className="flex items-center justify-start gap-1">
