@@ -405,7 +405,8 @@ export function useTerminals(
       for (const t of fetched) byId.set(t.id, t);
       return [...byId.values()];
     },
-    enabled: conversationId !== null,
+    // Hold the runner-proxied seed until online; SSE cache writes still land.
+    enabled: conversationId !== null && runnerOnline === true,
     staleTime: Infinity,
     // One light retry covers a transient network blip during the
     // initial load without hammering an unreachable runner.

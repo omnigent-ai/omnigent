@@ -16,6 +16,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
+vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useSessionRunnerOnline: vi.fn(() => true),
+}));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 import { showToast } from "@/components/ui/toast";
 
