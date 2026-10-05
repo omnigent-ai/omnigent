@@ -19,7 +19,8 @@ export const DS_MAX_ASSETS = 200;
 
 const DS_MIME: Record<string, string> = { ...IMAGE_MIME, ...FONT_MIME };
 const DS_PATH_RE = /^[\w.-]+(?:\/[\w.-]+)*$/;
-const CSS_URL_RE = /url\(\s*("[^"]*"|'[^']*'|[^)'"\s]*)\s*\)/gi;
+// CSS whitespace only; `\s` also matches NBSP, U+FEFF, U+2028 and \v.
+const CSS_URL_RE = /url\([ \t\n\r\f]*("[^"]*"|'[^']*'|[^)'" \t\n\r\f]*)[ \t\n\r\f]*\)/gi;
 const ATTR_DS_RE = /(\s(?:src|href)\s*=\s*)(?:"ds:([^"]*)"|'ds:([^']*)'|ds:([^\s"'>]+))/gi;
 const URL_DS_RE = /url\(\s*(["']?)ds:([^"')\s]*)\1\s*\)/gi;
 
@@ -92,7 +93,7 @@ export async function processDesignSystemCss(css: string, asset: AssetUri): Prom
   const stripped = css.replace(/@import\b[^;]*;?/gi, "");
   const out = await replaceAsync(stripped, CSS_URL_RE, async ([whole, arg]) => {
     const quote = /^["']/.test(arg) ? arg[0] : "";
-    const value = (quote ? arg.slice(1, -1) : arg).trim();
+    const value = (quote ? arg.slice(1, -1) : arg).replace(/^[ \t\n\r\f]+|[ \t\n\r\f]+$/g, "");
     if (/^data:/i.test(value)) return whole;
     if (!/^ds:/i.test(value) && /^(?:[a-z][\w+.-]*:|\/)/i.test(value)) return "none";
     return `url(${quote}${await asset(resolveDsPath(value.replace(/^\.\//, "")))}${quote})`;
@@ -111,10 +112,10 @@ function assertSafeCss(css: string, final: boolean): void {
   };
   if (/<\/style/i.test(css)) fail('must not contain "</style"');
   if (css.includes("\\")) fail("must not contain backslash escapes");
-  if (/image-set\(/i.test(css)) fail("must not use image-set()");
+  if (/(?:image-set|image|src)\(/i.test(css)) fail("must not use image-set(), image(), or src()");
   if (!final) return;
   if (/@import/i.test(css)) fail("must not use @import");
-  if (/url\((?!\s*["']?data:)/i.test(css)) fail("has a url() that is not a data: URI");
+  if (/url\((?![ \t\n\r\f]*["']?data:)/i.test(css)) fail("has a url() that is not a data: URI");
 }
 
 /** Rewrite `ds:` in `src` and `href` attributes and CSS `url()` to data: URIs. */

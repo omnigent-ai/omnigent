@@ -76,6 +76,8 @@ guidance from the user's chosen source.
 - The viewer injects the system's `colors_and_type.css` (tokens and fonts)
   before the deck's styles, so use its tokens and font families rather than
   raw values, and do not copy that file in.
+- Design-system CSS must not use backslash escapes (e.g. `content:"\2022"`),
+  or the viewer rejects the whole stylesheet; use the literal character.
 - Reference fonts and images as `ds:<path relative to the design system>`,
   for example `ds:assets/brand/logo-white.svg` in `src`, `href`, or CSS
   `url()`. The viewer resolves them; only image and font files inside the

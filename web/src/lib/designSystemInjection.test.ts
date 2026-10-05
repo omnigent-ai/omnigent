@@ -95,6 +95,24 @@ describe("processDesignSystemCss", () => {
     );
   });
 
+  it.each([".a{background:src(https://evil.example/a.png)}", '.a{background:IMAGE("x.png")}'])(
+    "rejects the string-accepting image function in %s",
+    async (input) => {
+      await expect(processDesignSystemCss(input, asset)).rejects.toThrow(
+        "must not use image-set(), image(), or src()",
+      );
+    },
+  );
+
+  it.each(["\u00a0", "\ufeff", "\u2028", "\v"])(
+    "does not treat %j as CSS whitespace before a data: url",
+    async (ws) => {
+      await expect(
+        processDesignSystemCss(`.a{background:url(${ws}data:/../../v1/x)}`, asset),
+      ).rejects.toThrow();
+    },
+  );
+
   it.each([
     '.a{background:url("https://evil.example/a)b")}',
     `.a{background:url("https://e/x'y")}`,
