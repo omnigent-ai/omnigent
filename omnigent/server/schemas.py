@@ -2982,6 +2982,47 @@ class ReplaceDesignArtifactsRequest(BaseModel):
         return paths
 
 
+class DesignDefaultNone(BaseModel):
+    """Start new designs without a design system."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["none"]
+
+
+class DesignDefaultSystem(BaseModel):
+    """
+    A design-system folder on one of the user's hosts.
+
+    :param kind: ``"full"`` or ``"skill"``, as detected from the folder.
+    :param host_id: Host the folder lives on.
+    :param path: The folder, with no ``.`` or ``..`` segments.
+    :param name: Display name.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["full", "skill"]
+    host_id: str = Field(min_length=1, max_length=256)
+    path: str = Field(min_length=1, max_length=4096)
+    name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("path")
+    @classmethod
+    def _plain_path(cls, path: str) -> str:
+        if "\0" in path or any(s in (".", "..") for s in re.split(r"[/\\]", path)):
+            raise ValueError('path must not contain NUL, "." or ".." segments')
+        return path
+
+
+class DesignDefaultBody(BaseModel):
+    """The user's New design default; ``null`` when they have not chosen one."""
+
+    design_default: (
+        Annotated[DesignDefaultNone | DesignDefaultSystem, Field(discriminator="kind")] | None
+    ) = Field(...)
+
+
 class GrantPermissionRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{id}/permissions``.

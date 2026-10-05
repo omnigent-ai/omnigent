@@ -1599,6 +1599,102 @@
         "title": "DesignArtifactList",
         "type": "object"
       },
+      "DesignDefaultBody": {
+        "description": "The user's New design default; `null` when they have not chosen one.",
+        "properties": {
+          "design_default": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "full": "#/components/schemas/DesignDefaultSystem",
+                    "none": "#/components/schemas/DesignDefaultNone",
+                    "skill": "#/components/schemas/DesignDefaultSystem"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/DesignDefaultNone"
+                  },
+                  {
+                    "$ref": "#/components/schemas/DesignDefaultSystem"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Design Default"
+          }
+        },
+        "required": [
+          "design_default"
+        ],
+        "title": "DesignDefaultBody",
+        "type": "object"
+      },
+      "DesignDefaultNone": {
+        "additionalProperties": false,
+        "description": "Start new designs without a design system.",
+        "properties": {
+          "kind": {
+            "const": "none",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "DesignDefaultNone",
+        "type": "object"
+      },
+      "DesignDefaultSystem": {
+        "additionalProperties": false,
+        "description": "A design-system folder on one of the user's hosts.",
+        "properties": {
+          "host_id": {
+            "description": "Host the folder lives on.",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Host Id",
+            "type": "string"
+          },
+          "kind": {
+            "description": "`\"full\"` or `\"skill\"`, as detected from the folder.",
+            "enum": [
+              "full",
+              "skill"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "description": "Display name.",
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "description": "The folder, with no `.` or `..` segments.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "host_id",
+          "path",
+          "name"
+        ],
+        "title": "DesignDefaultSystem",
+        "type": "object"
+      },
       "ElicitationRequestEvent": {
         "description": "Synchronous request for a decision from upstream.\n\nEmitted by Omnigent (or, under the new contract, by a harness)\nwhen the LLM / a tool / a policy needs a verdict before\nproceeding. The consumer replies via\n`POST /v1/sessions/{session_id}/events` with\n`type == \"approval\"` and\n`omnigent.server.schemas.ElicitationResult` fields in\n`data`. This preserves MCP request/reply correlation by id\nwithout threading elicitations through PATCH.\n\nWire shape matches the existing emit at\n`omnigent/runtime/policies/approval.py:175`.",
         "properties": {
@@ -11353,6 +11449,68 @@
         "summary": "Me",
         "tags": [
           "system"
+        ]
+      }
+    },
+    "/v1/me/preferences/design-default": {
+      "get": {
+        "description": "Read the caller's New design default; an invalid stored value reads as unset.",
+        "operationId": "get_design_default_v1_me_preferences_design_default_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesignDefaultBody"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Design Default",
+        "tags": [
+          "design"
+        ]
+      },
+      "put": {
+        "description": "Replace the caller's New design default; `null` clears it.",
+        "operationId": "save_design_default_v1_me_preferences_design_default_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesignDefaultBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesignDefaultBody"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Design Default",
+        "tags": [
+          "design"
         ]
       }
     },
