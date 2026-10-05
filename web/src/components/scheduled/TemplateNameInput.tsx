@@ -54,13 +54,13 @@ export function TemplateNameInput({
   value,
   ...inputProps
 }: TemplateNameInputProps) {
-  const backdropRef = useRef<HTMLDivElement>(null);
+  const backdropTextRef = useRef<HTMLSpanElement>(null);
   const parts = splitNameTemplate(value);
   let offset = 0;
 
   const syncScroll = (event: UIEvent<HTMLInputElement>) => {
-    if (backdropRef.current) {
-      backdropRef.current.scrollLeft = event.currentTarget.scrollLeft;
+    if (backdropTextRef.current) {
+      backdropTextRef.current.style.transform = `translateX(-${event.currentTarget.scrollLeft}px)`;
     }
     onScroll?.(event);
   };
@@ -68,12 +68,11 @@ export function TemplateNameInput({
   return (
     <div className="relative w-full">
       <div
-        ref={backdropRef}
         aria-hidden="true"
         className="pointer-events-none absolute inset-0 flex items-center overflow-hidden whitespace-pre rounded-lg border border-transparent bg-transparent px-2.5 py-1 text-ui text-foreground dark:bg-input/30"
         data-testid="task-name-template-overlay"
       >
-        <span className="w-max shrink-0 whitespace-pre">
+        <span ref={backdropTextRef} className="w-max shrink-0 whitespace-pre">
           {parts.map((part) => {
             const key = offset;
             offset += part.text.length;
