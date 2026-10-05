@@ -83,12 +83,14 @@ function nextReconnectDelay(failedAttempts: number): number {
  * @returns The fully-qualified WebSocket URL.
  */
 function buildUpdatesUrl(): string {
-  const path = "/v1/sessions/updates";
-  if (!getOmnigentHostConfig().fetcher) return resolveWebSocketUrl(path);
-  const sliceKey = modalHostId();
-  return resolveWebSocketUrl(
-    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
-  );
+  // Browsers can't set headers on a WebSocket, so advertise the comment
+  // permission level (see PERMISSION_LEVELS_HEADER) as a query parameter.
+  const params = new URLSearchParams({ omnigent_permission_levels: "comment" });
+  if (getOmnigentHostConfig().fetcher) {
+    const sliceKey = modalHostId();
+    if (sliceKey) params.set("omnigent_slice_key", sliceKey);
+  }
+  return resolveWebSocketUrl(`/v1/sessions/updates?${params.toString()}`);
 }
 
 /**

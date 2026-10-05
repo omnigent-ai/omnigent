@@ -667,8 +667,10 @@ class SqlSessionPermission(OmnigentBase):
     :param conversation_id: The session being shared, e.g.
         ``"conv_e4f5a6b7..."``.
     :param level: Numeric permission level: ``1`` = read,
-        ``2`` = edit, ``3`` = manage. Each level subsumes the
-        ones below it (comparison is ``>=``).
+        ``2`` = edit, ``3`` = manage, ``4`` = owner, ``5`` = comment.
+        Each level subsumes the ones ranked below it; ``5`` ranks between
+        read and edit, so compare through
+        :func:`omnigent.server.auth.level_satisfies`, never ``>=``.
     """
 
     __tablename__ = "session_permissions"
@@ -692,7 +694,7 @@ class SqlSessionPermission(OmnigentBase):
     level: Mapped[int] = mapped_column(Integer, nullable=False)
 
     __table_args__ = (
-        CheckConstraint("level IN (1, 2, 3, 4)", name="ck_session_permissions_level"),
+        CheckConstraint("level IN (1, 2, 3, 4, 5)", name="ck_session_permissions_level"),
         # Lookups by conversation (get_session_owner) filter workspace_id +
         # conversation_id; user_id trails to complete the PK.
         Index(

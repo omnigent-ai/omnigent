@@ -8,7 +8,11 @@ import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/hooks/usePermissions", () => {
+  const useCanEdit = vi.fn();
+  // A read-only viewer can't comment either; comment-only tests override this.
+  return { useCanEdit, useCanComment: vi.fn((id: string) => useCanEdit(id)) };
+});
 // Stub Shiki so the highlighting effect never fires an async callback that
 // would mutate state after the test cleans up.
 vi.mock("@/components/ai-elements/code-block", () => ({
@@ -40,6 +44,7 @@ vi.mock("./ModelViewer", () => ({
 }));
 
 import * as permissions from "@/hooks/usePermissions";
+import { useChatStore } from "@/store/chatStore";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -144,6 +149,7 @@ function fireCopyEvent(): ReturnType<typeof vi.fn> {
 
 beforeEach(() => {
   vi.mocked(permissions.useCanEdit).mockReturnValue(true);
+  vi.mocked(permissions.useCanComment).mockImplementation((id) => permissions.useCanEdit(id));
 });
 
 afterEach(() => {
@@ -416,6 +422,13 @@ describe("CodeViewer markdown preview comment hint", () => {
     expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
   });
 
+  it("shows the hint to comment-only collaborators, who can comment but not edit", () => {
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    vi.mocked(permissions.useCanComment).mockReturnValue(true);
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    expect(screen.getByRole("button", { name: /switch to edit mode/i })).toBeInTheDocument();
+  });
+
   it("shows no hint when the editor isn't reachable (no callback)", () => {
     renderViewer("# doc", true, "notes.md", { viewMode: "preview" });
     expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
@@ -433,6 +446,54 @@ describe("CodeViewer markdown preview comment hint", () => {
       onRequestEditMode: () => {},
     });
     expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+});
+
+describe("CodeViewer selection actions", () => {
+  // jsdom has no layout, so Range rects are missing; the buttons position
+  // themselves from the selection's first client rect.
+  const rect = { left: 10, top: 10, right: 50, bottom: 20, width: 40, height: 10, x: 10, y: 10 };
+  const originalGetClientRects = Range.prototype.getClientRects;
+  const originalGetBoundingClientRect = Range.prototype.getBoundingClientRect;
+
+  beforeEach(() => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    Range.prototype.getClientRects = () => [rect] as unknown as DOMRectList;
+    Range.prototype.getBoundingClientRect = () => rect as DOMRect;
+  });
+
+  afterEach(() => {
+    useChatStore.setState({ sessionHarness: null });
+    window.getSelection()?.removeAllRanges();
+    Range.prototype.getClientRects = originalGetClientRects;
+    Range.prototype.getBoundingClientRect = originalGetBoundingClientRect;
+  });
+
+  function selectFirstLine(container: HTMLElement) {
+    const line = container.querySelector<HTMLElement>('[data-line="1"]');
+    if (!line) throw new Error("line 1 not rendered");
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    fireEvent.mouseUp(line);
+  }
+
+  it("offers editors Attach to agent beside Add comment", () => {
+    const { container } = renderViewer("hello world");
+    selectFirstLine(container);
+    expect(screen.getByRole("button", { name: /add comment/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /attach to agent/i })).toBeInTheDocument();
+  });
+
+  it("lets a comment-only collaborator comment without attaching to the agent", () => {
+    // WHY: comment access must never become a path to message the agent.
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    vi.mocked(permissions.useCanComment).mockReturnValue(true);
+    const { container } = renderViewer("hello world");
+    selectFirstLine(container);
+    expect(screen.getByRole("button", { name: /add comment/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /attach to agent/i })).toBeNull();
   });
 });
 

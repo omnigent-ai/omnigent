@@ -27,12 +27,14 @@ import pytest
 from omnigent.entities.conversation import Conversation
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.server.auth import (
+    LEVEL_COMMENT,
     LEVEL_EDIT,
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     env_var_is_truthy,
+    level_satisfies,
 )
 from omnigent.server.permissions import (
     check_is_manager,
@@ -94,10 +96,10 @@ class _StubPermissionStore:
         if user_id is None:
             return False
         grant = self.get(user_id, conversation_id)
-        if grant is not None and grant.level >= required_level:
+        if grant is not None and level_satisfies(grant.level, required_level):
             return True
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None and public_grant.level >= required_level:
+        if public_grant is not None and level_satisfies(public_grant.level, required_level):
             return True
         return False
 
@@ -937,6 +939,17 @@ def test_resolved_allows_public_grant_satisfies_access() -> None:
     """A sufficient ``__public__`` grant allows even with no user grant."""
     access = ResolvedAccess(is_admin=False, user_grant_level=None, public_grant_level=LEVEL_READ)
     assert resolved_allows(access, LEVEL_READ) is True
+    assert resolved_allows(access, LEVEL_EDIT) is False
+
+
+def test_resolved_allows_public_comment_grant_ranks_below_edit() -> None:
+    """A ``__public__`` COMMENT grant ranks between READ and EDIT, even though
+    its stored value (5) is numerically above owner."""
+    access = ResolvedAccess(
+        is_admin=False, user_grant_level=None, public_grant_level=LEVEL_COMMENT
+    )
+    assert resolved_allows(access, LEVEL_READ) is True
+    assert resolved_allows(access, LEVEL_COMMENT) is True
     assert resolved_allows(access, LEVEL_EDIT) is False
 
 

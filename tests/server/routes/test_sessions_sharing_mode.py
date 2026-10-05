@@ -21,6 +21,7 @@ lifespan) since none of these paths need the runtime.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -31,6 +32,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import sharing_settings
 from omnigent.server.app import create_app
 from omnigent.server.auth import (
+    LEVEL_COMMENT,
     LEVEL_EDIT,
     LEVEL_MANAGE,
     LEVEL_OWNER,
@@ -41,6 +43,7 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
     workspace_sharing_blocked,
 )
+from omnigent.server.client_capabilities import PERMISSION_LEVELS_HEADER
 from omnigent.server.sharing_settings import (
     read_public_sharing_override,
     read_sharing_mode_override,
@@ -79,6 +82,7 @@ def _build_app(
     public_sharing: bool | object | None = None,
     permission_store: SqlAlchemyPermissionStore | None = None,
     auth_provider: AuthProvider | None = None,
+    comment_sharing: bool | Callable[[], bool] | None = None,
 ) -> FastAPI:
     """Build a real ``create_app`` wired to per-test SQLite stores."""
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -92,6 +96,7 @@ def _build_app(
         auth_provider=auth_provider,
         sharing_mode=sharing_mode,
         public_sharing=public_sharing,
+        comment_sharing=comment_sharing,
     )
 
 
@@ -112,6 +117,7 @@ def _seed_owned_session(
     sharing_mode: SharingMode = SharingMode.ON,
     public_sharing: bool | object | None = None,
     workspace: str | None = None,
+    comment_sharing: bool | None = None,
 ) -> tuple[FastAPI, str]:
     """Build an app whose ``_OWNER`` identity manages a real session.
 
@@ -134,6 +140,7 @@ def _seed_owned_session(
         public_sharing=public_sharing,
         permission_store=permission_store,
         auth_provider=UnifiedAuthProvider(source="header"),
+        comment_sharing=comment_sharing,
     )
     return app, conv.id
 
@@ -401,22 +408,24 @@ def test_workspace_sharing_blocked_false(workspace: str | None) -> None:
 # ── RESTRICTED_READ_ONLY gate — home/root cwd blocked entirely ───────
 
 
+@pytest.mark.parametrize("level", [LEVEL_READ, LEVEL_COMMENT])
 @pytest.mark.parametrize("blocked_workspace", ["/", "/home/alice", "/root"])
 async def test_restricted_blocks_home_or_root_session_even_read(
-    db_uri: str, tmp_path: Path, blocked_workspace: str
+    db_uri: str, tmp_path: Path, blocked_workspace: str, level: int
 ) -> None:
-    """RESTRICTED_READ_ONLY rejects *all* grants (even read) on a session
-    whose cwd is a home dir or the filesystem root."""
+    """RESTRICTED_READ_ONLY rejects *all* grants (even read or comment) on a
+    session whose cwd is a home dir or the filesystem root."""
     app, sid = _seed_owned_session(
         db_uri,
         tmp_path,
         sharing_mode=SharingMode.RESTRICTED_READ_ONLY,
         workspace=blocked_workspace,
+        comment_sharing=True,
     )
     async with _client(app, _OWNER) as c:
         resp = await c.put(
             f"/v1/sessions/{sid}/permissions",
-            json={"user_id": _GRANTEE, "level": LEVEL_READ},
+            json={"user_id": _GRANTEE, "level": level},
         )
         assert resp.status_code == 403, resp.text
         assert "cannot be shared" in resp.text.lower()
@@ -804,3 +813,111 @@ async def test_read_only_grantee_cannot_edit_other_labels(db_uri: str, tmp_path:
             json={"labels": {"omnigent.pinned": "1721760000000", "omni_project": "Moonshot"}},
         )
         assert resp.status_code == 403, resp.text
+
+
+# ── Comment-only grants (level 5) ─────────────────────────────────────
+
+
+async def test_info_reports_comment_sharing(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Off by default (the release feature is unset); a static value wins."""
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    async with _client(_build_app(db_uri, tmp_path)) as c:
+        assert (await c.get("/v1/info")).json()["comment_sharing_enabled"] is False
+    async with _client(_build_app(db_uri, tmp_path, comment_sharing=True)) as c:
+        assert (await c.get("/v1/info")).json()["comment_sharing_enabled"] is True
+
+
+def test_comment_sharing_follows_release_feature(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", "comment_sharing")
+    assert _build_app(db_uri, tmp_path).state.comment_sharing() is True
+
+
+def test_comment_sharing_callable_is_resolved_per_request(db_uri: str, tmp_path: Path) -> None:
+    enabled = {"value": False}
+    app = _build_app(db_uri, tmp_path, comment_sharing=lambda: enabled["value"])
+    assert app.state.comment_sharing() is False
+    enabled["value"] = True
+    assert app.state.comment_sharing() is True
+
+
+async def test_comment_grant_rejected_when_comment_sharing_off(
+    db_uri: str, tmp_path: Path
+) -> None:
+    app, sid = _seed_owned_session(db_uri, tmp_path, comment_sharing=False)
+    async with _client(app, _OWNER) as c:
+        resp = await c.put(
+            f"/v1/sessions/{sid}/permissions",
+            json={"user_id": _GRANTEE, "level": LEVEL_COMMENT},
+        )
+        assert resp.status_code == 403, resp.text
+        assert "comment access is not enabled" in resp.text.lower()
+
+
+@pytest.mark.parametrize(
+    "mode", [SharingMode.ON, SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY]
+)
+async def test_comment_grant_allowed_wherever_read_is(
+    db_uri: str, tmp_path: Path, mode: SharingMode
+) -> None:
+    """COMMENT is capped like READ, so the read-only sharing modes allow it."""
+    app, sid = _seed_owned_session(
+        db_uri, tmp_path, sharing_mode=mode, workspace="/srv/project", comment_sharing=True
+    )
+    async with _client(app, _OWNER) as c:
+        resp = await c.put(
+            f"/v1/sessions/{sid}/permissions",
+            json={"user_id": _GRANTEE, "level": LEVEL_COMMENT},
+            headers={PERMISSION_LEVELS_HEADER: "comment"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["level"] == LEVEL_COMMENT
+
+
+async def test_comment_grants_read_as_read_to_clients_without_the_capability(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """An older Share dialog only knows read/edit; the stored grant stays 5."""
+    app, sid = _seed_owned_session(db_uri, tmp_path, comment_sharing=True)
+    capable = {PERMISSION_LEVELS_HEADER: "comment"}
+    async with _client(app, _OWNER) as c:
+        grant = {"user_id": _GRANTEE, "level": LEVEL_COMMENT}
+        legacy_grant = await c.put(f"/v1/sessions/{sid}/permissions", json=grant)
+        assert legacy_grant.status_code == 200, legacy_grant.text
+        assert legacy_grant.json()["level"] == LEVEL_READ
+
+        def grantee_level(body: dict) -> int:
+            return next(p["level"] for p in body["permissions"] if p["user_id"] == _GRANTEE)
+
+        legacy_list = await c.get(f"/v1/sessions/{sid}/permissions")
+        assert grantee_level(legacy_list.json()) == LEVEL_READ
+        capable_list = await c.get(f"/v1/sessions/{sid}/permissions", headers=capable)
+        assert grantee_level(capable_list.json()) == LEVEL_COMMENT
+
+
+async def test_public_comment_grant_rejected(db_uri: str, tmp_path: Path) -> None:
+    """Public access stays read-only even though COMMENT outranks READ only slightly."""
+    app, sid = _seed_owned_session(db_uri, tmp_path, comment_sharing=True)
+    async with _client(app, _OWNER) as c:
+        resp = await c.put(
+            f"/v1/sessions/{sid}/permissions",
+            json={"user_id": RESERVED_USER_PUBLIC, "level": LEVEL_COMMENT},
+        )
+        assert resp.status_code == 400, resp.text
+        assert "read-only" in resp.text.lower()
+
+
+@pytest.mark.parametrize("level", [0, LEVEL_OWNER, 6])
+async def test_grant_rejects_levels_outside_the_grantable_set(
+    db_uri: str, tmp_path: Path, level: int
+) -> None:
+    app, sid = _seed_owned_session(db_uri, tmp_path, comment_sharing=True)
+    async with _client(app, _OWNER) as c:
+        resp = await c.put(
+            f"/v1/sessions/{sid}/permissions",
+            json={"user_id": _GRANTEE, "level": level},
+        )
+        assert resp.status_code == 422, resp.text

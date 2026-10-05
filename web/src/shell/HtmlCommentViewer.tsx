@@ -13,7 +13,7 @@ import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment } from "@/hooks/usePermissions";
 import { getEmbedRoot } from "@/lib/host";
 import { randomUUID } from "@/lib/randomUUID";
 import { type ActiveSelection, HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
@@ -80,7 +80,7 @@ export function HtmlCommentViewer({
   activeSelection,
   onSetActiveSelection,
 }: HtmlCommentViewerProps) {
-  const canEdit = useCanEdit(conversationId);
+  const canComment = useCanComment(conversationId);
 
   // A fresh nonce + srcDoc per content load. Changing srcDoc reloads the iframe
   // document, which re-runs the bridge and (via the new nonce) re-establishes
@@ -249,7 +249,7 @@ export function HtmlCommentViewer({
       {truncated && <TruncatedBanner />}
       <div className="min-h-0 flex-1">{preview}</div>
       {floating &&
-        canEdit &&
+        canComment &&
         createPortal(
           <button
             data-add-comment-btn

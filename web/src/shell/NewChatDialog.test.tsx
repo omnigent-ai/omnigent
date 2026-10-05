@@ -1282,6 +1282,7 @@ function renderLanding(
     enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
+    comment_sharing_enabled: false,
     server_version: null,
     smart_routing_enabled: false,
     // Default stub: the external AI-Gateway router alone, which is the world the

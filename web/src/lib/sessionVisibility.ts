@@ -1,4 +1,5 @@
 import type { Conversation } from "@/hooks/useConversations";
+import { canReadLevel, isOwnerLevel } from "@/lib/permissionsApi";
 
 /** Infer ownership independently of the server's visibility query parameter. */
 export function sessionVisibility(
@@ -7,8 +8,8 @@ export function sessionVisibility(
 ): "mine" | "shared" {
   // Admin permissions do not change who owns a session.
   if (viewerId !== null && row.owner) return row.owner === viewerId ? "mine" : "shared";
-  if (row.permission_level != null && row.permission_level > 0 && row.permission_level < 4)
-    return "shared";
+  const level = row.permission_level;
+  if (level != null && canReadLevel(level) && !isOwnerLevel(level)) return "shared";
   // Older single-user servers omit ownership; unknown rows must not appear as shared.
   return "mine";
 }

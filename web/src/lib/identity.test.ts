@@ -189,6 +189,18 @@ describe("authenticatedFetch", () => {
     expect(headers.get("X-Forwarded-Email")).toBe("alice");
   });
 
+  it("advertises the comment permission level on every request", async () => {
+    // Servers report level 5 as read unless the client asks for it.
+    const { authenticatedFetch } = await import("./identity");
+
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    await authenticatedFetch("/v1/sessions", { headers: { Accept: "application/json" } });
+
+    const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+    expect(headers.get("X-Omnigent-Permission-Levels")).toBe("comment");
+    expect(headers.get("Accept")).toBe("application/json");
+  });
+
   it("does NOT inject the header when identity is unresolved", async () => {
     // Before `resolveIdentity()` runs, the cache is null. We must not
     // send `X-Forwarded-Email: null` (which the server would reject in

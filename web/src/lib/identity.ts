@@ -429,11 +429,17 @@ async function _isWrongReplica(res: Response): Promise<boolean> {
   }
 }
 
+/** Request header advertising the permission levels this client understands. */
+export const PERMISSION_LEVELS_HEADER = "X-Omnigent-Permission-Levels";
+
 export async function authenticatedFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> {
   const headers = new Headers(init?.headers);
+  // Ask for the comment permission level (5); servers show it as read to
+  // clients that don't send this, since older bundles read 5 as edit/owner.
+  if (!headers.has(PERMISSION_LEVELS_HEADER)) headers.set(PERMISSION_LEVELS_HEADER, "comment");
   if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
     headers.set("X-Forwarded-Email", currentUserId);
   }

@@ -55,7 +55,8 @@ interface MarkdownCommentPluginProps {
     sel: { start_index: number; end_index: number; anchor_content: string } | null,
   ) => void;
   pendingBodyRef?: RefObject<string>;
-  canEdit?: boolean;
+  /** Whether the viewer may start a comment (editors and comment-only collaborators). */
+  canComment?: boolean;
 }
 
 export function MarkdownCommentPlugin({
@@ -67,7 +68,7 @@ export function MarkdownCommentPlugin({
   activeSelection,
   onSetActiveSelection,
   pendingBodyRef,
-  canEdit = true,
+  canComment = true,
 }: MarkdownCommentPluginProps): ReactElement | null {
   const [buttonPos, setButtonPos] = useState<{ top: number; left: number } | null>(null);
 
@@ -87,10 +88,10 @@ export function MarkdownCommentPlugin({
     isDirtyRef.current = isDirty;
   }, [isDirty]);
 
-  const canEditRef = useRef(canEdit);
+  const canCommentRef = useRef(canComment);
   useEffect(() => {
-    canEditRef.current = canEdit;
-  }, [canEdit]);
+    canCommentRef.current = canComment;
+  }, [canComment]);
 
   // Tracks the PM range of the in-progress (pending) comment highlight.
   const pendingRangeRef = useRef<{ from: number; to: number } | null>(null);
@@ -167,7 +168,7 @@ export function MarkdownCommentPlugin({
     if (!editor) return;
 
     const updateButton = () => {
-      if (isDirtyRef.current || !canEditRef.current) {
+      if (isDirtyRef.current || !canCommentRef.current) {
         setButtonPos(null);
         return;
       }

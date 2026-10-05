@@ -55,7 +55,11 @@ vi.mock("./TipTapCommentExtension", () => ({
 vi.mock("./MarkdownCommentPlugin", () => ({ MarkdownCommentPlugin: () => null }));
 vi.mock("./MarkdownEditorToolbar", () => ({ ToolbarPlugin: () => null }));
 
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/hooks/usePermissions", () => {
+  const useCanEdit = vi.fn();
+  // A read-only viewer can't comment either; comment-only tests override this.
+  return { useCanEdit, useCanComment: vi.fn((id: string) => useCanEdit(id)) };
+});
 vi.mock("./useMarkdownEditorSync", () => ({ useMarkdownEditorSync: vi.fn() }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({

@@ -15,7 +15,7 @@ import {
   subscribeCodeFont,
 } from "@/lib/codeFontPreferences";
 import type { Comment } from "@/hooks/useComments";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment, useCanEdit } from "@/hooks/usePermissions";
 import { detectLang, type ActiveSelection } from "./codeViewerHelpers";
 import {
   ensureLanguage,
@@ -84,7 +84,7 @@ interface MonacoDiffViewerProps {
 
 /**
  * Render a file's before/after diff in Monaco, with the comment layer on the
- * modified side. Comments are gated on edit permission; the diff itself is
+ * modified side. Comments are gated on comment permission; the diff itself is
  * always read-only.
  *
  * @param props See {@link MonacoDiffViewerProps}.
@@ -107,6 +107,7 @@ export function MonacoDiffViewer({
   onSearchHandled,
 }: MonacoDiffViewerProps) {
   const canEdit = useCanEdit(conversationId);
+  const canComment = useCanComment(conversationId);
   const lang = detectLang(path);
   const monacoTheme = resolvedThemeToMonaco(useResolvedThemeMode());
 
@@ -268,14 +269,15 @@ export function MonacoDiffViewer({
   }, []);
 
   // Comments anchor into the current ("after") content == the saved file, so
-  // they're always offset-valid here; gate only on edit permission.
+  // they're always offset-valid here; gate only on comment permission.
   const commentButton = useMonacoCommentLayer({
     editorRef: modifiedEditorRef,
     mounted,
     comments,
     activeSelection,
     onSetActiveSelection,
-    canComment: canEdit,
+    canComment,
+    canMessageAgent: canEdit,
     pendingBodyRef,
     path,
   });

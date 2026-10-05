@@ -30,6 +30,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_COMMENT,
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
@@ -137,12 +138,20 @@ def register_permissions_routes(
                     "cannot be shared on this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-        if (
-            _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY)
-            and body.level > LEVEL_READ
-        ):
+        if _sharing_mode in (
+            SharingMode.READ_ONLY,
+            SharingMode.RESTRICTED_READ_ONLY,
+        ) and body.level not in (LEVEL_READ, LEVEL_COMMENT):
             raise OmnigentError(
                 "Sharing is limited to read-only access on this Omnigent server.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if (
+            body.level == LEVEL_COMMENT
+            and not getattr(request.app.state, "comment_sharing", lambda: False)()
+        ):
+            raise OmnigentError(
+                "Comment access is not enabled on this Omnigent server.",
                 code=ErrorCode.FORBIDDEN,
             )
         if permission_store is None:
@@ -165,7 +174,7 @@ def register_permissions_routes(
                     "Public access has been disabled for this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-            if body.level > LEVEL_READ:
+            if body.level != LEVEL_READ:
                 raise OmnigentError(
                     "Public access is limited to read-only (level 1)",
                     code=ErrorCode.INVALID_INPUT,

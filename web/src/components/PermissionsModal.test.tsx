@@ -104,6 +104,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
+    comment_sharing_enabled: false,
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
@@ -340,6 +341,116 @@ describe("PermissionsModal", () => {
       await waitFor(() => expect(screen.queryByRole("listbox")).not.toBeInTheDocument());
     }
     /* oxlint-enable no-await-in-loop */
+  });
+
+  /** Open each level dropdown in turn and return its option labels. */
+  async function levelOptionsPerDropdown(): Promise<string[][]> {
+    const result: string[][] = [];
+    // Only one listbox can be open, so each interaction must finish first.
+    /* oxlint-disable no-await-in-loop */
+    for (const trigger of screen.getAllByRole("combobox")) {
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      const listbox = await screen.findByRole("listbox");
+      result.push(
+        within(listbox)
+          .getAllByRole("option")
+          .map((o) => o.textContent ?? ""),
+      );
+      fireEvent.keyDown(listbox, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("listbox")).not.toBeInTheDocument());
+    }
+    /* oxlint-enable no-await-in-loop */
+    return result;
+  }
+
+  describe("comment level", () => {
+    it("offers Comment between Read and Edit in every dropdown when the server enables it", async () => {
+      listMock.mockResolvedValue([
+        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
+      ]);
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ comment_sharing_enabled: true }),
+      });
+      await waitFor(() => expect(screen.getByText("bob@example.com")).toBeInTheDocument());
+      // bob's row + the add-grant form.
+      expect(await levelOptionsPerDropdown()).toEqual([
+        ["Read", "Comment", "Edit"],
+        ["Read", "Comment", "Edit"],
+      ]);
+    });
+
+    it("grants level 5 when Comment is picked in the add form", async () => {
+      listMock.mockResolvedValue([]);
+      grantMock.mockResolvedValue({
+        user_id: "carol@example.com",
+        conversation_id: "conv_abc",
+        level: 5,
+      });
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ comment_sharing_enabled: true }),
+      });
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+      fireEvent.change(screen.getByLabelText("User ID"), {
+        target: { value: "carol@example.com" },
+      });
+      const trigger = screen.getByRole("combobox");
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: "Comment" }));
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      await waitFor(() =>
+        expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol@example.com", 5),
+      );
+    });
+
+    it("hides Comment when the server leaves comment sharing off", async () => {
+      listMock.mockResolvedValue([]);
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ comment_sharing_enabled: false }),
+      });
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+      expect(await levelOptionsPerDropdown()).toEqual([["Read", "Edit"]]);
+    });
+
+    it("still renders an existing comment grant after the server turns comment sharing off", async () => {
+      listMock.mockResolvedValue([
+        { user_id: "dana@example.com", conversation_id: "conv_abc", level: 5 },
+      ]);
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ comment_sharing_enabled: false }),
+      });
+      await waitFor(() => expect(screen.getByText("dana@example.com")).toBeInTheDocument());
+      expect(screen.getAllByRole("combobox").some((el) => el.textContent === "Comment")).toBe(true);
+    });
+
+    it("offers Read and Comment (not Edit) under read-only sharing", async () => {
+      listMock.mockResolvedValue([]);
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ sharing_mode: "read_only", comment_sharing_enabled: true }),
+      });
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+      expect(
+        screen.getByText(
+          "This server allows read-only sharing — invite others to view or comment on this session.",
+        ),
+      ).toBeInTheDocument();
+      expect(await levelOptionsPerDropdown()).toEqual([["Read", "Comment"]]);
+    });
+
+    it("shows an existing comment grant as a fixed Comment label under read-only sharing", async () => {
+      listMock.mockResolvedValue([
+        { user_id: "dana@example.com", conversation_id: "conv_abc", level: 5 },
+      ]);
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ sharing_mode: "read_only", comment_sharing_enabled: true }),
+      });
+      await waitFor(() => expect(screen.getByText("dana@example.com")).toBeInTheDocument());
+      // Read-only sharing renders existing grants as fixed labels, not selects.
+      const row = screen.getByTitle("dana@example.com").parentElement!;
+      expect(within(row).getByText("Comment")).toBeInTheDocument();
+      expect(within(row).queryByRole("combobox")).not.toBeInTheDocument();
+    });
   });
 
   it("does not fetch permissions when closed", () => {

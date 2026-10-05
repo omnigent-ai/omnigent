@@ -15,6 +15,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    case,
     delete,
     desc,
     func,
@@ -1988,7 +1989,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         self, conversation_id: str, *, owner_only: bool = False
     ) -> AccountAuthority | None:
         """Read the owner grant and registration together, including external identities."""
-        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
+        from omnigent.server.auth import LEVEL_OWNER, LEVEL_RANKS, RESERVED_USER_PUBLIC
 
         query = (
             select(SqlSessionPermission.user_id, SqlUser.account_generation)
@@ -2003,11 +2004,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             .where(SqlSessionPermission.conversation_id == conversation_id)
             .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
             .where(SqlUser.deleted_at.is_(None))
-            .order_by(SqlSessionPermission.level.desc())
+            .order_by(case(LEVEL_RANKS, value=SqlSessionPermission.level, else_=0).desc())
             .limit(1)
         )
         if owner_only:
-            query = query.where(SqlSessionPermission.level >= LEVEL_OWNER)
+            query = query.where(SqlSessionPermission.level == LEVEL_OWNER)
         with self._session("select_session_owner") as session:
             row = session.execute(query).one_or_none()
             if row is None:
@@ -2639,7 +2640,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             select(SqlSessionPermission.conversation_id).where(
                                 SqlSessionPermission.workspace_id == current_workspace_id(),
                                 SqlSessionPermission.user_id == owned_by,
-                                SqlSessionPermission.level >= LEVEL_OWNER,
+                                SqlSessionPermission.level == LEVEL_OWNER,
                             )
                         ).scalars()
                     )
@@ -2687,7 +2688,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlSessionPermission.conversation_id
                             == SqlConversationLabel.conversation_id,
                             SqlSessionPermission.user_id == owned_by,
-                            SqlSessionPermission.level >= LEVEL_OWNER,
+                            SqlSessionPermission.level == LEVEL_OWNER,
                         )
                         .exists()
                     )
@@ -2874,7 +2875,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             select(SqlSessionPermission.conversation_id).where(
                                 SqlSessionPermission.workspace_id == current_workspace_id(),
                                 SqlSessionPermission.user_id == owner_user,
-                                SqlSessionPermission.level >= LEVEL_OWNER,
+                                SqlSessionPermission.level == LEVEL_OWNER,
                             )
                         ).scalars()
                     )
@@ -2939,7 +2940,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlSessionPermission.workspace_id == SqlConversation.workspace_id,
                             SqlSessionPermission.conversation_id == SqlConversation.id,
                             SqlSessionPermission.user_id == owner_user,
-                            SqlSessionPermission.level >= LEVEL_OWNER,
+                            SqlSessionPermission.level == LEVEL_OWNER,
                         )
                         .exists()
                     )
@@ -2950,7 +2951,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlSessionPermission.workspace_id == SqlConversation.workspace_id,
                             SqlSessionPermission.conversation_id == SqlConversation.id,
                             SqlSessionPermission.user_id == owned_by,
-                            SqlSessionPermission.level >= LEVEL_OWNER,
+                            SqlSessionPermission.level == LEVEL_OWNER,
                         )
                         .exists()
                     )

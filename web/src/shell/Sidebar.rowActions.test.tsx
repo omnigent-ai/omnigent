@@ -197,6 +197,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
+    comment_sharing_enabled: false,
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },

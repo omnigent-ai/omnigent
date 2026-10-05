@@ -1,7 +1,8 @@
 """Permission store — manages session-level access grants.
 
 Each grant is a ``(user_id, conversation_id, level)`` triple where
-level is an integer: 1=read, 2=edit, 3=manage. The ``"__public__"``
+level is an integer: 1=read, 2=edit, 3=manage, 4=owner, 5=comment (ranked
+between read and edit; see :func:`omnigent.server.auth.level_rank`). The ``"__public__"``
 sentinel user ID represents public read access.
 """
 

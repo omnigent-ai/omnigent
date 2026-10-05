@@ -9,6 +9,7 @@
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
+import { useChatStore } from "@/store/chatStore";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
 
@@ -111,8 +112,10 @@ interface HookProps {
   activeSelection?: ActiveSelection | null;
   onSetActiveSelection?: (sel: ActiveSelection | null) => void;
   canComment?: boolean;
+  canMessageAgent?: boolean;
   pendingBodyRef?: React.RefObject<string>;
   mounted?: boolean;
+  path?: string;
 }
 
 // Host component: calls the hook and renders its returned ReactNode (the
@@ -126,7 +129,9 @@ function Host(props: HookProps & { editorRef: React.RefObject<CodeEditorInstance
     activeSelection: props.activeSelection ?? null,
     onSetActiveSelection: props.onSetActiveSelection ?? (() => {}),
     canComment: props.canComment ?? true,
+    canMessageAgent: props.canMessageAgent ?? true,
     pendingBodyRef: props.pendingBodyRef,
+    path: props.path,
   }) as React.ReactElement | null;
 }
 
@@ -197,6 +202,31 @@ describe("useMonacoCommentLayer — decorations", () => {
     const fake = makeFakeEditor(CONTENT);
     renderLayer(fake, { mounted: false, comments: [mkComment({})] });
     expect(fake.editor.createDecorationsCollection).not.toHaveBeenCalled();
+  });
+});
+
+describe("useMonacoCommentLayer — attach-to-agent button", () => {
+  afterEach(() => useChatStore.setState({ sessionHarness: null }));
+
+  it("offers Attach to agent beside Add comment for editors on a native coding agent", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    const fake = makeFakeEditor(CONTENT);
+    fake.setSelection(1, 3);
+    renderLayer(fake, { canComment: true, canMessageAgent: true, path: "a.ts" });
+    act(() => fake.fire("selection"));
+    expect(document.querySelector("[data-add-comment-btn]")).not.toBeNull();
+    expect(document.querySelector("[data-attach-agent-btn]")).not.toBeNull();
+  });
+
+  it("lets a comment-only collaborator comment without attaching to the agent", () => {
+    // WHY: comment access must never become a path to message the agent.
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    const fake = makeFakeEditor(CONTENT);
+    fake.setSelection(1, 3);
+    renderLayer(fake, { canComment: true, canMessageAgent: false, path: "a.ts" });
+    act(() => fake.fire("selection"));
+    expect(document.querySelector("[data-add-comment-btn]")).not.toBeNull();
+    expect(document.querySelector("[data-attach-agent-btn]")).toBeNull();
   });
 });
 

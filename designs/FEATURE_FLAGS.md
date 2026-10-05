@@ -28,6 +28,7 @@ lifecycle metadata.
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
 | `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |
+| `comment_sharing` | Off | Sharing | 0.19.0 | Allows granting the comment-only session level (read plus writing your own review comments; no editing or messaging the agent). Reported as `/v1/info` `comment_sharing_enabled`; `create_app(comment_sharing=...)` overrides it per request. |
 
 At the review release, each flag must be removed by making the feature
 unconditional, removing the feature, or moving a genuinely permanent operator

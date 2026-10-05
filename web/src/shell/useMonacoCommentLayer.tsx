@@ -93,11 +93,16 @@ interface UseMonacoCommentLayerOptions {
   activeSelection: ActiveSelection | null;
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /**
-   * Whether a new comment may be started right now (e.g. `canEdit && !isDirty`
-   * for the editor, `canEdit` for the read-only diff). Controls the floating
+   * Whether a new comment may be started right now (e.g. `canComment && !isDirty`
+   * for the editor, `canComment` for the read-only diff). Controls the floating
    * "Add comment" button; existing comments stay highlighted/navigable either way.
    */
   canComment: boolean;
+  /**
+   * Whether the viewer may feed the agent (edit access). Gates "Attach to
+   * agent" so comment-only collaborators can comment without messaging it.
+   */
+  canMessageAgent: boolean;
   /** In-progress comment body; clicking away won't clear an active draft. */
   pendingBodyRef?: React.RefObject<string>;
   /**
@@ -121,11 +126,13 @@ export function useMonacoCommentLayer({
   activeSelection,
   onSetActiveSelection,
   canComment,
+  canMessageAgent,
   pendingBodyRef,
   path,
 }: UseMonacoCommentLayerOptions): React.ReactNode {
   const sessionHarness = useChatStore((s) => s.sessionHarness);
-  const canAttachToAgent = !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  const canAttachToAgent =
+    canMessageAgent && !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
   const decorationsRef = useRef<DecorationsCollection | null>(null);
   // Floating "Add comment" button position in viewport coords, or null.
   const [buttonPos, setButtonPos] = useState<{ left: number; top: number } | null>(null);

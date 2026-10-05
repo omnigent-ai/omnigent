@@ -5131,12 +5131,13 @@ async def _session_share_via_rest(
             }
         )
     # Friendly level name -> the server's numeric permission level
-    # (GrantPermissionRequest accepts 1=read, 2=edit, 3=manage).
-    level_by_name = {"read": 1, "edit": 2, "manage": 3}
+    # (see GrantPermissionRequest; comment is 5, not between read and edit).
+    # "manage" is no longer advertised but still accepted from older callers.
+    level_by_name = {"read": 1, "edit": 2, "comment": 5, "manage": 3}
     level_name = args.get("level", "read")
     if level_name not in level_by_name:
         return json.dumps(
-            {"error": f"sys_session_share: level must be one of {sorted(level_by_name)}"}
+            {"error": "sys_session_share: level must be one of ['comment', 'edit', 'read']"}
         )
     try:
         resp = await server_client.put(
@@ -5149,7 +5150,13 @@ async def _session_share_via_rest(
     if resp.status_code == 404:
         return json.dumps({"error": "session_not_found", "session_id": target})
     if resp.status_code in (401, 403):
-        return json.dumps({"error": "access_denied", "session_id": target})
+        denied: dict[str, str] = {"error": "access_denied", "session_id": target}
+        # A 403 isn't always about ownership — e.g. the server refuses comment
+        # grants while comment sharing is off — so pass its reason along.
+        detail = _omnigent_error_message(resp)
+        if detail is not None:
+            denied["detail"] = detail
+        return json.dumps(denied)
     if resp.status_code >= 400:
         # Surface the server's own message when present — e.g. the 400
         # rejecting a __public__ grant above read level carries "Public

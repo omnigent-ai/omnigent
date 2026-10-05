@@ -123,6 +123,39 @@ LEVEL_READ = 1
 LEVEL_EDIT = 2
 LEVEL_MANAGE = 3
 LEVEL_OWNER = 4
+# Ranks between READ and EDIT, but takes the next free value so stored 1-4
+# grants and existing clients keep their meaning. Never compare level ints
+# directly; order them through :func:`level_rank` / :func:`level_satisfies`.
+LEVEL_COMMENT = 5
+
+LEVEL_RANKS: dict[int, int] = {
+    LEVEL_READ: 1,
+    LEVEL_COMMENT: 2,
+    LEVEL_EDIT: 3,
+    LEVEL_MANAGE: 4,
+    LEVEL_OWNER: 5,
+}
+
+
+def level_rank(level: int | None) -> int:
+    """Order permission levels by privilege; ``None`` or unknown ranks lowest.
+
+    :param level: Stored numeric level, e.g. ``LEVEL_COMMENT``.
+    :returns: Privilege rank, ``0`` for no access or an unrecognized level.
+    """
+    return LEVEL_RANKS.get(level, 0) if level is not None else 0
+
+
+def level_satisfies(granted: int | None, required: int) -> bool:
+    """Whether a *granted* level meets a *required* level.
+
+    :param granted: The caller's grant level, or ``None`` for no grant.
+    :param required: Minimum level the action needs, e.g. ``LEVEL_EDIT``.
+    :returns: ``True`` if *granted* ranks at or above *required*; ``False`` for
+        an unknown *required* level, so a typo can never open access.
+    """
+    required_rank = level_rank(required)
+    return required_rank > 0 and level_rank(granted) >= required_rank
 
 
 class SharingMode(str, Enum):

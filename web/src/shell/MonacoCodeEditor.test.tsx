@@ -48,7 +48,7 @@ vi.mock("./monacoSetup", () => ({
 }));
 
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(), useCanComment: vi.fn() }));
 vi.mock("./useMarkdownEditorSync", () => ({ useMarkdownEditorSync: vi.fn() }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
@@ -106,6 +106,8 @@ const CONTENT = "abc\ndefgh\nij";
 function setupHooks(
   overrides: {
     canEdit?: boolean;
+    // Defaults to canEdit: a read-only viewer can't comment either.
+    canComment?: boolean;
     isDirty?: boolean;
     // Write-mutation state — the save-status chip is derived from these.
     isPending?: boolean;
@@ -118,6 +120,9 @@ function setupHooks(
   } = {},
 ) {
   vi.mocked(permissions.useCanEdit).mockReturnValue(overrides.canEdit ?? true);
+  vi.mocked(permissions.useCanComment).mockReturnValue(
+    overrides.canComment ?? overrides.canEdit ?? true,
+  );
   vi.mocked(syncHook.useMarkdownEditorSync).mockReturnValue({
     editorKey: 1,
     isDirty: overrides.isDirty ?? false,
