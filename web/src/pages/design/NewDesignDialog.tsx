@@ -120,6 +120,7 @@ export function NewDesignDialog({
     hostId !== null &&
     folder !== "" &&
     !submitting &&
+    !decksListing.isLoading &&
     !decksListing.isPlaceholderData;
 
   // Nested pickers portal outside the dialog; keep their clicks from closing it.

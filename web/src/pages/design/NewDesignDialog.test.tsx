@@ -236,6 +236,25 @@ describe("NewDesignDialog create", () => {
     );
   });
 
+  it("waits for the first decks/ listing before Create", async () => {
+    filesystemMock.mockImplementation(
+      (_host, path) =>
+        (path === "/work/site/decks" && !listings[path]
+          ? { data: undefined, error: null, isLoading: true }
+          : listing(path)) as unknown as ReturnType<typeof useHostFilesystem>,
+    );
+    const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+    expect(screen.getByRole("button", { name: "Create" })).toBeDisabled();
+
+    listings["/work/site/decks"] = ["pitch-deck.slides.html"];
+    typePrompt("Pitch deck");
+    expect(screen.getByRole("button", { name: "Create" })).toBeEnabled();
+    create();
+    await waitFor(() =>
+      expect(onCreated).toHaveBeenCalledWith("conv_new", "decks/pitch-deck-2.slides.html"),
+    );
+  });
+
   it("keeps the dialog, the error, and the prompt when create fails", async () => {
     createMock.mockRejectedValueOnce(new Error("Workspace not found"));
     const { onCreated } = renderDialog({ initialPrompt: "Pitch deck" });
