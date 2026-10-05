@@ -3584,6 +3584,7 @@ def _build_host_daemon_env(
         _RUNNER_ENV_ALLOWLIST,
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
     )
+    from omnigent.host.extension import HOST_EXTENSION_ENV_VAR
     from omnigent.host.identity import (
         HOST_ID_ENV_VAR,
         HOST_NAME_ENV_VAR,
@@ -3607,6 +3608,7 @@ def _build_host_daemon_env(
             or key in _LOCAL_DAEMON_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key == HOST_EXTENSION_ENV_VAR
             or key.startswith(daemon_env_prefixes)
         }
     else:
@@ -3621,6 +3623,7 @@ def _build_host_daemon_env(
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key == HOST_EXTENSION_ENV_VAR
             or key.startswith(daemon_env_prefixes)
         }
     # The daemon outlives the dispatch that spawned it and is reused by later

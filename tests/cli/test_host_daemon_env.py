@@ -35,6 +35,30 @@ _PROXY_ENV: Final = {
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_extension_and_harness_temp_root_cross_daemon_boundary(
+    monkeypatch: pytest.MonkeyPatch, server_url: str | None
+) -> None:
+    monkeypatch.setenv("OMNIGENT_HOST_EXTENSION", "example")
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", "/tmp/example-harness")
+    monkeypatch.delenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, raising=False)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    assert daemon_env["OMNIGENT_HOST_EXTENSION"] == "example"
+    assert daemon_env["OMNIGENT_HARNESS_TMP_PARENT"] == "/tmp/example-harness"
+
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_example",
+        binding_token="synthetic-binding-token",
+        workspace="/tmp/example-workspace",
+        parent_pid=12345,
+    )
+    assert "OMNIGENT_HOST_EXTENSION" not in runner_env
+    assert runner_env["OMNIGENT_HARNESS_TMP_PARENT"] == "/tmp/example-harness"
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
 @pytest.mark.parametrize("codex_path", [None, "/selected install/bin/codex"])
 def test_codex_executable_selection_survives_daemon_and_runner_boundaries(
     monkeypatch: pytest.MonkeyPatch,
