@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { BrandScanThread } from "@/test/brandScanWorker";
 import {
   BRAND_MAX_PATTERN_LENGTH,
+  handleBrandScan,
   parseAdherence,
+  runBrandScan,
   scanBrandWarnings,
+  styleSources,
   templateBaseline,
   type BrandRules,
 } from "./brandRules";
@@ -21,8 +25,10 @@ const config = (patterns: unknown[] = [HEX, PX, FONT], omelette: unknown = undef
 const RULES = parseAdherence(config()) as BrandRules;
 const deck = (style: string, body = "<section><h1>Hi</h1></section>") =>
   `<html><head><style>${style}</style></head><body>${body}</body></html>`;
+const scan = (html: string, rules = RULES, baseline?: Set<string>) =>
+  scanBrandWarnings(styleSources(html), rules, baseline);
 const values = (html: string, rules = RULES, baseline?: Set<string>) =>
-  scanBrandWarnings(html, rules, baseline).map((w) => w.value);
+  scan(html, rules, baseline).map((w) => w.value);
 
 describe("parseAdherence", () => {
   it("reads the value patterns, tokens, and fonts", () => {
@@ -57,6 +63,13 @@ describe("parseAdherence", () => {
     expect(rules.patterns).toHaveLength(1);
   });
 
+  it("skips only font-family selectors, keeping other font rules", () => {
+    const fontSize = { selector: "Property[key.name='fontSize'] > Literal[value=/^\\d+px$/]" };
+    const fontFamily = { selector: "Property[key.name='font-family'] > Literal[value=/x/]" };
+    const rules = parseAdherence(config([fontSize, fontFamily, FONT]))!;
+    expect(rules.patterns.map((p) => p.source)).toEqual(["^\\d+px$"]);
+  });
+
   it("ignores fields of the wrong shape", () => {
     const rules = parseAdherence(config([HEX, 7, null], { tokens: 3, fontFamilies: [1, "Ok"] }))!;
     expect(rules).toMatchObject({ tokens: [], fonts: ["Ok"] });
@@ -66,7 +79,7 @@ describe("parseAdherence", () => {
 describe("scanBrandWarnings", () => {
   it("flags raw hex colors, pixel sizes, and unlisted fonts", () => {
     const html = deck("h1{color:#FF0000;margin:12px;font-family:'Comic Sans', Fixture Sans}");
-    expect(scanBrandWarnings(html, RULES)).toEqual([
+    expect(scan(html)).toEqual([
       { value: "#FF0000", property: "color", where: "<style> h1" },
       { value: "12px", property: "margin", where: "<style> h1" },
       { value: "Comic Sans", property: "font-family", where: "<style> h1" },
@@ -75,9 +88,7 @@ describe("scanBrandWarnings", () => {
 
   it("scans style attributes and names the slide", () => {
     const html = deck("", '<section></section><section><p style="color:#123456">x</p></section>');
-    expect(scanBrandWarnings(html, RULES)).toEqual([
-      { value: "#123456", property: "color", where: "slide 2 <p>" },
-    ]);
+    expect(scan(html)).toEqual([{ value: "#123456", property: "color", where: "slide 2 <p>" }]);
   });
 
   it("never scans slide text or scripts", () => {
@@ -92,9 +103,7 @@ describe("scanBrandWarnings", () => {
 
   it("ignores 0px and 1px borders and outlines, but not other 1px values", () => {
     const css = "h1{margin:0px;border:1px solid var(--x);outline-width:1px;padding:1px}";
-    expect(scanBrandWarnings(deck(css), RULES)).toEqual([
-      { value: "1px", property: "padding", where: "<style> h1" },
-    ]);
+    expect(scan(deck(css))).toEqual([{ value: "1px", property: "padding", where: "<style> h1" }]);
   });
 
   it("allows generic families and system tokens as fonts", () => {
@@ -103,17 +112,12 @@ describe("scanBrandWarnings", () => {
 
   it("counts each distinct value once, keeping where it first appears", () => {
     const html = deck("h1{color:#abc}h2{background:#ABC}", '<p style="color:#abc">x</p>');
-    expect(scanBrandWarnings(html, RULES)).toEqual([
-      { value: "#abc", property: "color", where: "<style> h1" },
-    ]);
+    expect(scan(html)).toEqual([{ value: "#abc", property: "color", where: "<style> h1" }]);
   });
 
   it("allows property and value pairs from the template baseline", () => {
     const baseline = templateBaseline(
-      [
-        { path: "templates/title.html", text: deck(".t{color:#0B5FFF;margin:24px}") },
-        { path: "templates/grid.css", text: ".g{gap:16px}" },
-      ],
+      [styleSources(deck(".t{color:#0B5FFF;margin:24px}")), [{ text: ".g{gap:16px}" }]],
       RULES,
     );
     const html = deck("h1{color:#0b5fff;gap:16px;margin:16px;padding:24px}");
@@ -128,5 +132,60 @@ describe("scanBrandWarnings", () => {
   it("skips overlong tokens so a slow pattern only sees short input", () => {
     const rules = parseAdherence(config([{ selector: "Literal[value=/^a+b$/]" }]))!;
     expect(values(deck(`h1{content:${"a".repeat(70)}b;x:aab}`), rules)).toEqual(["aab"]);
+  });
+});
+
+describe("runBrandScan", () => {
+  const CATASTROPHIC = { selector: "Literal[value=/^\\d*\\d*\\d*\\d*\\d*\\d*\\d*\\d*x$/]" };
+  const input = (adherence: string, html: string) => ({
+    adherence,
+    deck: styleSources(html),
+    templates: [],
+  });
+
+  it("is the pure scan in the worker: parse, baseline, then warnings", () => {
+    const result = handleBrandScan({
+      adherence: config(),
+      deck: styleSources(deck("h1{color:#0b5fff;margin:12px}")),
+      templates: [[{ text: ".t{color:#0B5FFF}" }]],
+    });
+    expect(result?.map((w) => w.value)).toEqual(["12px"]);
+    expect(handleBrandScan({ adherence: "{", deck: [], templates: [] })).toBeNull();
+  });
+
+  it("scans in a worker thread", async () => {
+    const thread = new BrandScanThread();
+    const result = await runBrandScan(
+      input(config(), deck("h1{color:#ff0000}")),
+      30_000,
+      () => thread,
+    );
+    expect(result).toEqual([{ value: "#ff0000", property: "color", where: "<style> h1" }]);
+    expect(thread.terminated).toBe(true);
+  });
+
+  it("terminates a catastrophic pattern and resolves null without blocking", async () => {
+    const adherence = config([CATASTROPHIC]);
+    // The static screen lets this one through; the worker budget is what stops it.
+    expect(parseAdherence(adherence)!.patterns).toHaveLength(1);
+    const thread = new BrandScanThread();
+    let ticks = 0;
+    const tick = setInterval(() => ticks++, 20);
+    const started = performance.now();
+    const result = await runBrandScan(
+      input(adherence, deck(`h1{width:${"1".repeat(40)}}`)),
+      500,
+      () => thread,
+    );
+    clearInterval(tick);
+    expect(result).toBeNull();
+    expect(thread.terminated).toBe(true);
+    expect(performance.now() - started).toBeLessThan(5000);
+    expect(ticks).toBeGreaterThan(5);
+  });
+
+  it("resolves null without a Worker instead of scanning on the main thread", async () => {
+    expect(typeof Worker).toBe("undefined");
+    expect(await runBrandScan(input(config(), deck("h1{color:#ff0000}")))).toBeNull();
   });
 });

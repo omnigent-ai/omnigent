@@ -26,6 +26,7 @@ import {
 import { DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer } from "@/lib/designSystem";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { fetchWorkspaceDirectory } from "@/hooks/useWorkspaceChangedFiles";
+import { FakeBrandScanWorker } from "@/test/brandScanWorker";
 import { listFixtureDir, readFixtureFile } from "@/test/designSystemFixture";
 import {
   DESIGN_KIT_TIMEOUT_MS,
@@ -929,6 +930,37 @@ describe("SlidesViewer design system", () => {
   const warningsButton = () => screen.queryByRole("button", { name: /brand warning/ });
 
   describe("brand warnings", () => {
+    beforeEach(() => vi.stubGlobal("Worker", FakeBrandScanWorker));
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("renders the branded deck without a notice or badge while the template listing stalls", async () => {
+      vi.useFakeTimers();
+      try {
+        serveSystem("full");
+        vi.mocked(fetchWorkspaceDirectory).mockReturnValue(new Promise(() => {}));
+        render(<SlidesViewer content={OFF_BRAND} conversationId="conv_1" />);
+        await act(() => vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS));
+        expect(srcdoc()).toContain("data-omnigent-design-system");
+        await act(() => vi.advanceTimersByTimeAsync(DESIGN_SYSTEM_TIMEOUT_MS * 2));
+        expect(srcdoc()).toContain("data-omnigent-design-system");
+        expect(screen.queryByRole("status")).not.toBeInTheDocument();
+        expect(warningsButton()).not.toBeInTheDocument();
+        expect(downloadButton()).toBeEnabled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("drops the badge as soon as the deck content changes", async () => {
+      serveSystem("full");
+      const { rerender } = render(<SlidesViewer content={OFF_BRAND} conversationId="conv_1" />);
+      expect(await screen.findByRole("button", { name: "2 brand warnings" })).toBeInTheDocument();
+      rerender(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+      expect(warningsButton()).not.toBeInTheDocument();
+      await vi.waitFor(() => expect(srcdoc()).not.toContain("#FF0000"));
+      expect(warningsButton()).not.toBeInTheDocument();
+    });
+
     it("lists raw values outside a full system and still renders and exports", async () => {
       serveSystem("full");
       render(<SlidesViewer content={OFF_BRAND} conversationId="conv_1" />);

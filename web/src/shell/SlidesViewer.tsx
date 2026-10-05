@@ -28,7 +28,7 @@ import {
   prepareSlidesDoc,
   prepareSlidesExport,
 } from "./codeViewerHelpers";
-import { useDesignBranding, useFullscreen } from "./designViewer";
+import { useBrandWarnings, useDesignBranding, useFullscreen } from "./designViewer";
 import { TruncatedBanner } from "./TruncatedBanner";
 
 export { DESIGN_KIT_TIMEOUT_MS, DESIGN_SYSTEM_TIMEOUT_MS } from "./designViewer";
@@ -123,6 +123,7 @@ export function SlidesViewer({
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const sourceTotal = useMemo(() => countSlideSections(content), [content]);
   const branding = useDesignBranding(conversationId, content);
+  const brandWarnings = useBrandWarnings(conversationId, content, branding?.systemPath ?? null);
   const brandingReady = branding !== null;
   const deckContent = branding?.content ?? content;
   const kitStyle = branding?.kitStyle ?? "";
@@ -332,9 +333,7 @@ export function SlidesViewer({
                 <span className="max-w-32 truncate max-sm:sr-only">{branding.badge.name}</span>
               </span>
             )}
-            {!!branding?.brandWarnings?.length && (
-              <BrandWarnings warnings={branding.brandWarnings} />
-            )}
+            {!!brandWarnings?.length && <BrandWarnings warnings={brandWarnings} />}
             <Button
               type="button"
               variant="ghost"

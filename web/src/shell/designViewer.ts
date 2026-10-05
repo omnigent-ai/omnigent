@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import { fetchWorkspaceDirectory } from "@/hooks/useWorkspaceChangedFiles";
+import { runBrandScan, styleSources, type BrandWarning } from "@/lib/brandRules";
 import { DESIGN_SYSTEM_POINTER } from "@/lib/designSystem";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { getSessionSlim } from "@/lib/sessionsApi";
@@ -12,6 +13,7 @@ import {
   NO_BRANDING,
   dsNotApplied,
   kitNotApplied,
+  loadBrandRuleFiles,
   loadDeckBranding,
   withNotice,
   type DeckBranding,
@@ -21,6 +23,8 @@ import {
 // design system loads more files, so it gets longer once it is found.
 export const DESIGN_KIT_TIMEOUT_MS = 2000;
 export const DESIGN_SYSTEM_TIMEOUT_MS = 10_000;
+/** Brand-rule reads and the scan together; past it there is just no badge. */
+export const BRAND_WARNINGS_TIMEOUT_MS = 10_000;
 const KIT_TIMED_OUT = withNotice(kitNotApplied("design kit timed out"));
 const SYSTEM_TIMED_OUT = withNotice(dsNotApplied("design system timed out"));
 
@@ -96,7 +100,6 @@ export function useDesignBranding(
       {
         read,
         isOwner: () => isSessionOwner(conversationId),
-        list: (path) => listKitDir(conversationId, path),
         onDesignSystem: () => {
           clearTimeout(timer);
           timer = setTimeout(() => finish(SYSTEM_TIMED_OUT), DESIGN_SYSTEM_TIMEOUT_MS);
@@ -111,6 +114,66 @@ export function useDesignBranding(
   }, [conversationId, content, sections]);
   if (!conversationId) return NO_BRANDING;
   return loaded?.id === conversationId ? loaded.branding : null;
+}
+
+type RuleFiles = ReturnType<typeof loadBrandRuleFiles>;
+
+/**
+ * Brand warnings for `content` on the full system at `systemPath`, apart from
+ * branding so they never hold up the deck; `null` (no badge) until they load
+ * for this exact session, system, and content, and on any failure.
+ */
+export function useBrandWarnings(
+  conversationId: string | undefined,
+  content: string,
+  systemPath: string | null,
+): BrandWarning[] | null {
+  const [state, setState] = useState<{
+    id: string;
+    path: string;
+    content: string;
+    warnings: BrandWarning[] | null;
+  } | null>(null);
+  // The rules file and templates are read once per session and system.
+  const rules = useRef<{ key: string; files: RuleFiles } | null>(null);
+  useEffect(() => {
+    if (!conversationId || !systemPath) return;
+    const key = `${conversationId}\n${systemPath}`;
+    if (rules.current?.key !== key) {
+      const files = loadBrandRuleFiles(systemPath, {
+        read: (path) => readKitFile(conversationId, path),
+        list: (path) => listKitDir(conversationId, path),
+      });
+      rules.current = { key, files };
+    }
+    const entry = rules.current;
+    let cancelled = false;
+    const finish = (warnings: BrandWarning[] | null) => {
+      if (!cancelled) setState({ id: conversationId, path: systemPath, content, warnings });
+    };
+    const timer = setTimeout(() => {
+      // A stalled read is retried on the next content change.
+      if (rules.current === entry) rules.current = null;
+      finish(null);
+      cancelled = true;
+    }, BRAND_WARNINGS_TIMEOUT_MS);
+    void entry.files
+      .then((files) => (files ? runBrandScan({ ...files, deck: styleSources(content) }) : null))
+      .then((warnings) => {
+        clearTimeout(timer);
+        finish(warnings);
+      });
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [conversationId, content, systemPath]);
+  const current =
+    !!state &&
+    state.id === conversationId &&
+    state.path === systemPath &&
+    state.content === content;
+  return current ? state.warnings : null;
 }
 
 /** Fullscreen for `ref`'s element; `supported` is false without the Fullscreen API. */

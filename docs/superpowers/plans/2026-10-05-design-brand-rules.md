@@ -62,3 +62,16 @@ Contract: `### Brand-rule warnings` under `## Later phases` in
 
 `pnpm type-check`, `pnpm lint`, targeted vitest (shell, lib, pages/design),
 one full `pnpm test`, `test_load_skill`, `pre-commit run --files`.
+
+## Review amendments
+
+- The static pattern screen misses shapes like `^\d*\d*...x$`, which
+  backtrack for seconds on 40 digits. Scans run in a Web Worker
+  (`brandRules.worker.ts`) terminated after 500 ms; no `Worker` means no
+  badge, never a main-thread scan. `DOMParser` is not available in workers,
+  so the inert parse stays on the main thread (`styleSources`) and the worker
+  gets only style text.
+- Warnings no longer hold up branding: `loadDeckBranding` returns
+  `systemPath`, and `useBrandWarnings` (decks only) loads the rules and
+  templates once per session and system, scans per content, and has its own
+  timeout that only ever means no badge.
