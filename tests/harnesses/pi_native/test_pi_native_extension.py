@@ -803,6 +803,211 @@ def test_message_without_streamed_text_posts_no_delta(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+_DURABILITY_HARNESS = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const tmpDir = process.argv[2];
+const configPath = path.join(tmpDir, "config.json");
+fs.writeFileSync(
+  configPath,
+  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1" }),
+);
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+const posted = [];
+const responses = [];
+let fetchCalls = 0;
+global.fetch = async (_url, request) => {
+  posted.push(JSON.parse(request.body));
+  fetchCalls += 1;
+  if (responses.length) return responses.shift();
+  return { ok: true, status: 204 };
+};
+global.setInterval = () => ({ fakeInterval: true });
+
+const handlers = {};
+const pi = {
+  registerCommand() {},
+  on(name, handler) { handlers[name] = handler; },
+};
+require(extensionPath)(pi);
+
+const ctx = { ui: { setTitle() {}, setStatus() {}, notify() {} } };
+function items(type) {
+  return posted.filter(
+    (event) =>
+      event.type === "external_conversation_item" &&
+      (!type || event.data.item_type === type),
+  );
+}
+"""
+
+
+def test_durable_item_retries_non_2xx_and_reuses_source_id(tmp_path: Path) -> None:
+    """A transient HTTP failure retries the same source-keyed item."""
+    script = (
+        _DURABILITY_HARNESS
+        + r"""
+(async () => {
+  // Deliberately report an inconsistent `ok` value: status is authoritative.
+  responses.push({ ok: true, status: 503 }, { ok: true, status: 204 });
+  const result = {
+    toolCallId: "call-1",
+    content: [{ type: "text", text: "done" }],
+  };
+  await handlers.tool_result(result, ctx);
+
+  assert.equal(fetchCalls, 2, JSON.stringify(posted));
+  const outputs = items("function_call_output");
+  assert.equal(outputs.length, 2, JSON.stringify(outputs));
+  assert.ok(outputs[0].data.source_id);
+  assert.equal(outputs[0].data.source_id, outputs[1].data.source_id);
+
+  // The successful post advances the dedup state; a duplicate lifecycle
+  // callback must not issue another request.
+  await handlers.tool_execution_end(result, ctx);
+  assert.equal(fetchCalls, 2, JSON.stringify(posted));
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_durable_item_surfaces_terminal_failure_after_bounded_retries(
+    tmp_path: Path,
+) -> None:
+    """A permanent item failure rejects the lifecycle callback after three tries."""
+    script = (
+        _DURABILITY_HARNESS
+        + r"""
+(async () => {
+  global.fetch = async (_url, request) => {
+    posted.push(JSON.parse(request.body));
+    fetchCalls += 1;
+    return { ok: false, status: 503 };
+  };
+  const message = {
+    id: "assistant-1",
+    role: "assistant",
+    content: [{ type: "text", text: "final answer" }],
+  };
+  let failure;
+  try {
+    await handlers.message_end({ message }, ctx);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, "terminal persistence failure must reject");
+  assert.match(String(failure && failure.message), /HTTP 503/);
+  assert.equal(fetchCalls, 3, JSON.stringify(posted));
+  const messages = items("message");
+  assert.equal(messages.length, 3, JSON.stringify(messages));
+  const sourceIds = new Set(messages.map((event) => event.data.source_id));
+  assert.equal(sourceIds.size, 1, JSON.stringify(messages));
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_duplicate_lifecycle_callbacks_persist_one_assistant_and_tool_item(
+    tmp_path: Path,
+) -> None:
+    """Repeated Pi callbacks do not create duplicate durable transcript items."""
+    script = (
+        _DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const message = {
+    id: "assistant-1",
+    role: "assistant",
+    content: [{ type: "text", text: "final answer" }],
+  };
+  await handlers.message_end({ message }, ctx);
+  await handlers.message_end({ message }, ctx);
+
+  const result = {
+    toolCallId: "call-1",
+    content: [{ type: "text", text: "tool output" }],
+  };
+  await handlers.tool_result(result, ctx);
+  await handlers.tool_execution_end(result, ctx);
+
+  assert.equal(items("message").length, 1, JSON.stringify(posted));
+  assert.equal(
+    items("function_call_output").length,
+    1,
+    JSON.stringify(posted),
+  );
+  assert.equal(fetchCalls, 2, JSON.stringify(posted));
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_distinct_user_inputs_with_same_text_remain_distinct(tmp_path: Path) -> None:
+    """Only a repeated callback for the same input object is deduplicated."""
+    script = (
+        _DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const input = { text: "repeat" };
+  await handlers.input(input, ctx);
+  await handlers.input(input, ctx);
+  await handlers.input({ text: "repeat" }, ctx);
+
+  const messages = items("message");
+  assert.equal(messages.length, 2, JSON.stringify(posted));
+  assert.notEqual(messages[0].data.source_id, messages[1].data.source_id);
+  assert.equal(fetchCalls, 2, JSON.stringify(posted));
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_non_durable_event_failures_remain_best_effort(tmp_path: Path) -> None:
+    """Preview and status failures do not reject Pi lifecycle callbacks."""
+    script = (
+        _DURABILITY_HARNESS
+        + r"""
+(async () => {
+  global.fetch = async () => ({ ok: false, status: 503 });
+  await handlers.agent_start({}, ctx);
+  await handlers.message_update(
+    { assistantMessageEvent: { type: "text_delta", delta: "live" } },
+    ctx,
+  );
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_registers_omnigent_tools_and_execute_round_trips(tmp_path: Path) -> None:
     """The extension registers config.tools and execute() round-trips via /mcp.
 
