@@ -124,6 +124,24 @@ describe("isConversationUnseen", () => {
   });
 });
 
+describe("unseen suppression during Undo restore", () => {
+  it("holds the dot off while a restore is in flight, then reads normally again", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
+    // The unarchive bumps updated_at past the baseline, which normally reads unseen.
+    expect(mod.isConversationUnseen("conv-1", 2_000, "idle")).toBe(true);
+    // Suppress the self-initiated bump during restore.
+    mod.beginUnseenSuppression("conv-1");
+    expect(mod.isConversationUnseen("conv-1", 2_000, "idle")).toBe(false);
+    // Other sessions are unaffected by the hold.
+    mod.seedReadState([{ id: "conv-2", viewer_last_seen: 1_000 }]);
+    expect(mod.isConversationUnseen("conv-2", 2_000, "idle")).toBe(true);
+    // Resume normal detection after the seen anchor lands.
+    mod.endUnseenSuppression("conv-1");
+    expect(mod.isConversationUnseen("conv-1", 2_000, "idle")).toBe(true);
+  });
+});
+
 describe("markConversationSeen", () => {
   it("does nothing before the first seed (reload-clobber guard)", async () => {
     const mod = await loadFresh();
