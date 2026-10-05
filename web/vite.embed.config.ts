@@ -29,6 +29,7 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import postcss from "postcss";
 import { defineConfig, type Plugin } from "vite";
+import { htmlCommentBridgeAsset } from "./vite.htmlCommentBridge";
 
 const SCOPE = ".omnigent-app";
 
@@ -296,6 +297,7 @@ export default defineConfig({
     react(),
     tailwindcss(),
     scopeOmnigentCss(),
+    htmlCommentBridgeAsset(),
     resolveExternalCjsRequire(SHARED_EXTERNALS),
     inlineWorkerUrlForHost(),
   ],

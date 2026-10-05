@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   anchorOccurrence,
   BRIDGE_MSG,
+  BRIDGE_SCRIPT_URL,
   BRIDGE_SOURCE,
-  buildBridgeScript,
   findAnchorInSource,
   injectCommentBridge,
   parseBridgeMessage,
 } from "./htmlCommentBridge";
+import bridgeFrameSource from "./htmlCommentBridgeFrame.js?raw";
 
 // ---------------------------------------------------------------------------
 // injectCommentBridge — script/style placement (mirrors prepareHtmlPreviewDoc)
@@ -15,21 +16,21 @@ import {
 
 describe("injectCommentBridge", () => {
   const NONCE = "test-nonce-123";
+  const SCRIPT_TAG = "<script src=";
 
   it("injects the bridge script before </body> when present", () => {
     const html = "<html><head></head><body><p>hi</p></body></html>";
     const out = injectCommentBridge(html, NONCE);
-    const scriptAt = out.indexOf("<script>");
+    const scriptAt = out.indexOf(SCRIPT_TAG);
     const bodyCloseAt = out.indexOf("</body>");
     expect(scriptAt).toBeGreaterThan(-1);
     expect(scriptAt).toBeLessThan(bodyCloseAt);
-    expect(out).toContain(NONCE);
   });
 
   it("falls back to before </html> when there is no body", () => {
     const html = "<html><head></head><p>hi</p></html>";
     const out = injectCommentBridge(html, NONCE);
-    expect(out.indexOf("<script>")).toBeLessThan(out.indexOf("</html>"));
+    expect(out.indexOf(SCRIPT_TAG)).toBeLessThan(out.indexOf("</html>"));
   });
 
   it("appends to a bare fragment with no body/html", () => {
@@ -38,7 +39,7 @@ describe("injectCommentBridge", () => {
     // then appended at the end since there's no </body>/</html> to inject before.
     expect(out).toContain("<p>just a fragment</p>");
     const fragAt = out.indexOf("<p>just a fragment</p>");
-    expect(out.indexOf("<script>")).toBeGreaterThan(fragAt);
+    expect(out.indexOf(SCRIPT_TAG)).toBeGreaterThan(fragAt);
   });
 
   it("preserves the prepared <base target=_blank> link behavior", () => {
@@ -52,20 +53,36 @@ describe("injectCommentBridge", () => {
     expect(out).toContain("::highlight(omni-comment-active)");
   });
 
-  it("substitutes the nonce, source tag, and message types into the script", () => {
-    const script = buildBridgeScript(NONCE);
-    expect(script).toContain(NONCE);
-    expect(script).toContain(BRIDGE_SOURCE);
-    expect(script).toContain(BRIDGE_MSG.selection);
-    // Placeholders must be fully replaced.
-    expect(script).not.toContain("__OMNI_NONCE__");
-    expect(script).not.toContain("__OMNI_TYPES__");
+  it("loads the bridge by URL with the nonce attribute, never as an inline script", () => {
+    // Inline scripts are blocked in the srcdoc frame wherever the embedder's CSP
+    // forbids them (the Databricks console), which silently disables commenting.
+    const out = injectCommentBridge("<body></body>", NONCE);
+    expect(out).toContain(
+      `<script src="${BRIDGE_SCRIPT_URL}" data-omni-nonce="${NONCE}"></script>`,
+    );
+    expect(out).not.toContain("<script>");
   });
 
-  it("produces a syntactically valid script (guards template-literal escaping)", () => {
-    // The script body is a template literal; regex/backslash content in it can
-    // silently break parsing. new Function throws on a syntax error.
-    expect(() => new Function(buildBridgeScript(NONCE))).not.toThrow();
+  it("escapes the nonce for the attribute", () => {
+    const out = injectCommentBridge("<body></body>", 'a"b&c');
+    expect(out).toContain('data-omni-nonce="a&quot;b&amp;c"');
+  });
+});
+
+describe("bridge frame script", () => {
+  it("is syntactically valid", () => {
+    expect(() => new Function(bridgeFrameSource)).not.toThrow();
+  });
+
+  it("uses the same source tag and message types as the parent", () => {
+    expect(bridgeFrameSource).toContain(`var SRC = ${JSON.stringify(BRIDGE_SOURCE)};`);
+    for (const [key, type] of Object.entries(BRIDGE_MSG)) {
+      expect(bridgeFrameSource).toContain(`${key}: ${JSON.stringify(type)},`);
+    }
+  });
+
+  it("reads its nonce from the data-omni-nonce attribute", () => {
+    expect(bridgeFrameSource).toContain('getAttribute("data-omni-nonce")');
   });
 });
 

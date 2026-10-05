@@ -4,6 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
+import { htmlCommentBridgeAsset } from "./vite.htmlCommentBridge";
 import { shikiManualChunk } from "./vite.shiki";
 import { streamdownManualChunk } from "./vite.streamdown";
 
@@ -227,7 +228,7 @@ export default defineConfig(({ command }) => ({
   // `{base}/assets/...` at serve time (see `_rewrite_web_ui_index` in
   // omnigent/server/app.py). Dev (`vite serve`) stays at root.
   base: command === "build" ? "./" : "/",
-  plugins: [safariLookbehindWorkarounds(), react(), tailwindcss()],
+  plugins: [safariLookbehindWorkarounds(), react(), tailwindcss(), htmlCommentBridgeAsset()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

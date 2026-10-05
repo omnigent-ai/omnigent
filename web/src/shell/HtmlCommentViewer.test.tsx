@@ -1,6 +1,7 @@
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
+import { BRIDGE_SCRIPT_URL } from "./htmlCommentBridge";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
@@ -36,8 +37,8 @@ describe("HtmlCommentViewer", () => {
     const { container } = renderViewer("<html><head></head><body><p>doc</p></body></html>");
     const iframe = container.querySelector('iframe[title="HTML preview"]') as HTMLIFrameElement;
     const srcDoc = iframe.getAttribute("srcdoc") ?? "";
-    expect(srcDoc).toContain("<script>");
-    expect(srcDoc).toContain("omni-html-comment");
+    expect(srcDoc).toContain(`<script src="${BRIDGE_SCRIPT_URL}"`);
+    expect(srcDoc).toContain("data-omni-nonce=");
     expect(srcDoc).toContain('<base target="_blank">');
   });
 
