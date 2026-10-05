@@ -949,6 +949,8 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param background_agent_count: Number of running agent-type background
+        tasks from the same ``Stop`` hook, separate from shell tasks.
     :param failure_category: ``StopFailure`` error category, e.g.
         ``"rate_limit"``. ``None`` for other events or when absent.
     :param failure_message: ``StopFailure`` error text Claude Code rendered
@@ -976,6 +978,7 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    background_agent_count: int = 0
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
@@ -3766,6 +3769,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status = "completed"
     background_task_count = 0
     background_tasks: list[_JsonObject] | None = None
+    background_agent_count = 0
     if event_name == "Stop" and isinstance(payload, dict):
         raw_bg = payload.get("background_tasks")
         if isinstance(raw_bg, list):
@@ -3792,6 +3796,13 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 if (detail := _normalize_background_task(task)) is not None
             ]
             background_tasks = details or None
+            background_agent_count = sum(
+                1
+                for task in raw_bg
+                if isinstance(task, dict)
+                and not _is_background_shell(task)
+                and task.get("status") not in _TERMINAL_BACKGROUND_TASK_STATUSES
+            )
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
@@ -3854,6 +3865,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        background_agent_count=background_agent_count,
         failure_category=failure_category,
         failure_message=failure_message,
         failure_context=failure_context,

@@ -525,6 +525,8 @@ export interface SessionStatusEvent {
    * absent when the edge carries no detail.
    */
   backgroundTasks?: BackgroundTaskInfo[];
+  /** Background agents still running after a Claude Stop edge. */
+  backgroundAgentCount?: number;
   /**
    * Short phrase naming what a still-`running` session is parked on, e.g.
    * "permission prompt". Terminal-backed agents can block on a dialog the

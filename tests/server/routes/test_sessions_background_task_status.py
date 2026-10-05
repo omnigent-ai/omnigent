@@ -49,11 +49,13 @@ def _clear_caches() -> None:
     _sessions_mod._session_status_cache.pop(_SID, None)
     _sessions_mod._session_background_task_count_cache.pop(_SID, None)
     _sessions_mod._session_background_tasks_cache.pop(_SID, None)
+    _sessions_mod._session_background_agent_count_cache.pop(_SID, None)
     _sessions_mod._session_active_response_cache.pop(_SID, None)
     yield
     _sessions_mod._session_status_cache.pop(_SID, None)
     _sessions_mod._session_background_task_count_cache.pop(_SID, None)
     _sessions_mod._session_background_tasks_cache.pop(_SID, None)
+    _sessions_mod._session_background_agent_count_cache.pop(_SID, None)
     _sessions_mod._session_active_response_cache.pop(_SID, None)
 
 
@@ -111,6 +113,20 @@ def test_failure_clears_tally_and_wins_over_count() -> None:
     assert _SID not in _sessions_mod._session_background_task_count_cache
     # ``failed`` is authoritative for the list row, never masked by a tally.
     assert _session_status_with_child_rollup(_SID, []) == "failed"
+
+
+def test_background_agent_count_is_sticky_and_clears_authoritatively() -> None:
+    _publish_status(_SID, "idle", background_agent_count=2)
+    _publish_status(_SID, "idle")
+    assert _sessions_mod._session_background_agent_count_cache.get(_SID) == 2
+    _publish_status(_SID, "idle", background_agent_count=0)
+    assert _SID not in _sessions_mod._session_background_agent_count_cache
+
+
+def test_background_agent_count_clears_on_failure() -> None:
+    _publish_status(_SID, "idle", background_agent_count=2)
+    _publish_status(_SID, "failed")
+    assert _SID not in _sessions_mod._session_background_agent_count_cache
 
 
 # ── background-task detail rides with the tally ─────────────────────────────

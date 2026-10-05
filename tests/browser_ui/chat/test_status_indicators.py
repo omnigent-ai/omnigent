@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 from playwright.sync_api import Locator, Page, expect
@@ -44,6 +45,7 @@ def _background_status(
     chat: ChatSessionContract,
     count: int,
     tasks: list[dict[str, str]] | None = None,
+    agent_count: int | None = None,
 ) -> None:
     data: dict[str, object] = {
         "conversation_id": chat.session_id,
@@ -52,6 +54,8 @@ def _background_status(
     }
     if tasks is not None:
         data["background_tasks"] = tasks
+    if agent_count is not None:
+        data["background_agent_count"] = agent_count
     chat.emit({"event": "session.status", "data": data})
 
 
@@ -60,6 +64,38 @@ def _pill(page: Page, count: int) -> Locator:
     return page.get_by_role(
         "button", name=f"{count} background task{plural} still running", exact=True
     )
+
+
+def _agent_pill(page: Page, count: int) -> Locator:
+    plural = "" if count == 1 else "s"
+    return page.get_by_role(
+        "button", name=f"{count} background agent{plural} still running", exact=True
+    )
+
+
+def test_background_agent_indicator_shows_fixture_count_and_clears(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    output_path: str,
+) -> None:
+    """The browser consumes the optional agent count and clears on zero."""
+    chat = chat_session_contract
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+
+    _background_status(chat, 0, agent_count=2)
+    pill = _agent_pill(page, 2)
+    expect(pill).to_have_text("2", timeout=10_000)
+    pill.click()
+    panel = page.get_by_role("dialog", name="2 background agents", exact=True)
+    expect(panel).to_contain_text("Switch to the terminal tab")
+    expect(panel).to_be_visible()
+    page.screenshot(path=str(Path(output_path) / "background-agents.png"), animations="disabled")
+
+    _background_status(chat, 0, agent_count=0)
+    expect(pill).to_have_count(0, timeout=10_000)
+    page.screenshot(path=str(Path(output_path) / "background-agents-cleared.png"))
 
 
 def test_bare_idle_clears_the_live_working_indicator(

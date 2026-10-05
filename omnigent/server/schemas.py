@@ -2186,6 +2186,7 @@ class SessionResponse(BaseModel):
     status: Literal["idle", "running", "waiting", "failed"]
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
+    background_agent_count: int | None = None
     created_at: int
     updated_at: int | None = None
     title: str | None = None
@@ -3116,6 +3117,7 @@ class SessionStatusEvent(_SSEEventBase):
     error: ErrorDetail | None = None
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
+    background_agent_count: int | None = None
     blocked_on: str | None = None
 
 

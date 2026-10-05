@@ -228,6 +228,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _read_explicit_unread,
     _read_last_seen,
     _session_active_response_cache,
+    _session_background_agent_count_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_mcp_startup_cache,
@@ -4806,6 +4807,7 @@ def _publish_status(
     response_id: str | None = None,
     background_task_count: int | None = None,
     background_tasks: list[BackgroundTaskInfo] | None = None,
+    background_agent_count: int | None = None,
     blocked_on: str | None = None,
     persist_live_status: bool = True,
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
@@ -4962,6 +4964,13 @@ def _publish_status(
     elif status == "failed":
         _session_background_task_count_cache.pop(session_id, None)
         _session_background_tasks_cache.pop(session_id, None)
+    if background_agent_count is not None:
+        if background_agent_count > 0:
+            _session_background_agent_count_cache[session_id] = background_agent_count
+        else:
+            _session_background_agent_count_cache.pop(session_id, None)
+    elif status == "failed":
+        _session_background_agent_count_cache.pop(session_id, None)
     event = SessionStatusEvent(
         type="session.status",
         conversation_id=session_id,
@@ -4970,6 +4979,7 @@ def _publish_status(
         error=error,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        background_agent_count=background_agent_count,
         blocked_on=blocked_on,
     )
     payload = event.model_dump()
@@ -4977,6 +4987,8 @@ def _publish_status(
         payload.pop("response_id", None)
     if background_task_count is None:
         payload.pop("background_task_count", None)
+    if background_agent_count is None:
+        payload.pop("background_agent_count", None)
     # Only put detail on the wire when there's something to show — an absent or
     # empty list stays off (the count alone drives the pill; the client clears
     # its detail when the count clears).

@@ -660,6 +660,8 @@ export interface ConversationState {
    * tracked (or an older runner reported only the count).
    */
   backgroundTasks: BackgroundTaskInfo[];
+  /** Background agents still running after the foreground turn ends. */
+  backgroundAgentCount: number;
   /**
    * Why a still-`running` session is parked, e.g. "permission prompt".
    * Terminal-backed agents can block on a dialog the web UI does not
@@ -1828,6 +1830,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionStatus: "idle",
   backgroundTaskCount: 0,
   backgroundTasks: [],
+  backgroundAgentCount: 0,
   blockedOn: null,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
@@ -2439,6 +2442,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
             patch.backgroundTasks = [];
+            patch.backgroundAgentCount = 0;
           }
           return patch;
         });
@@ -2572,6 +2576,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           sessionStatus: "idle",
           backgroundTaskCount: 0,
           backgroundTasks: [],
+          backgroundAgentCount: 0,
         });
       } else {
         // Sent alongside an already-streaming turn (or a stranded latch): the
@@ -2670,6 +2675,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
             patch.backgroundTasks = [];
+            patch.backgroundAgentCount = 0;
           }
           return patch;
         });
@@ -2758,6 +2764,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         sessionStatus: "idle",
         backgroundTaskCount: 0,
         backgroundTasks: [],
+        backgroundAgentCount: 0,
         blockedOn: null,
       };
       if (s.activeResponse?.state === "streaming") {
@@ -4358,6 +4365,7 @@ async function bindStream(
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         backgroundTasks: session.backgroundTasks ?? [],
+        backgroundAgentCount: session.backgroundAgentCount ?? 0,
         blockedOn: null,
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
@@ -4595,6 +4603,7 @@ function reconnectStatusPatch(
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
+  patch.backgroundAgentCount = session.backgroundAgentCount ?? 0;
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -4701,6 +4710,7 @@ async function reconcileActiveSessionStatus(
     current.activeResponse !== stateBeforeFetch.activeResponse ||
     current.backgroundTaskCount !== stateBeforeFetch.backgroundTaskCount ||
     current.backgroundTasks !== stateBeforeFetch.backgroundTasks ||
+    current.backgroundAgentCount !== stateBeforeFetch.backgroundAgentCount ||
     current.mcpStartup !== stateBeforeFetch.mcpStartup ||
     current.contextWindow !== stateBeforeFetch.contextWindow ||
     current.tokensUsed !== stateBeforeFetch.tokensUsed ||
@@ -7115,6 +7125,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         } else if (event.status === "failed") {
           patch.backgroundTaskCount = 0;
           patch.backgroundTasks = [];
+        }
+        if (event.backgroundAgentCount !== undefined) {
+          patch.backgroundAgentCount = event.backgroundAgentCount;
+        } else if (event.status === "failed") {
+          patch.backgroundAgentCount = 0;
         }
         if (event.status === "failed" && s.blocks.some(isLiveProvisionalBlock)) {
           patch.blocks = s.blocks.map((block) =>

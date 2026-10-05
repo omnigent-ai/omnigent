@@ -212,7 +212,12 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     # no background tasks) so a finished shell clears the indicator.
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
+        "data": {
+            "status": "idle",
+            "background_task_count": 0,
+            "background_agent_count": 0,
+            "turn_completed": True,
+        },
     }
 
     submitted = [
@@ -410,6 +415,12 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
                     "description": "Wait for CI",
                     "command": "sleep 120",
                 },
+                {
+                    "id": "agent123",
+                    "type": "local_agent",
+                    "status": "running",
+                    "description": "Review the change",
+                },
             ],
         },
     )
@@ -442,6 +453,7 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
             "status": "idle",
             "turn_completed": True,
             "background_task_count": 1,
+            "background_agent_count": 1,
             # Per-shell detail rides alongside the count so the UI can name the
             # running shells (see BackgroundTaskInfo / _normalize_background_task).
             "background_tasks": [
@@ -545,6 +557,7 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
                 "status": "idle",
                 "turn_completed": True,
                 "background_task_count": 0,
+                "background_agent_count": 0,
                 "response_id": "resp_turn_1",
             },
         }

@@ -311,6 +311,8 @@ export interface Session {
    * the count).
    */
   backgroundTasks?: BackgroundTaskInfo[];
+  /** Background agents still running after a Claude Stop edge. */
+  backgroundAgentCount?: number;
   createdAt: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a

@@ -616,6 +616,11 @@ _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScoped
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
+# Background agents still running after a Claude Stop hook. Sticky like the
+# shell count so snapshots can restore the indicator after reconnects.
+_session_background_agent_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+
 # Per-shell detail behind the tally above, kept sticky in lockstep with it (see
 # ``_publish_status``) so a reload/reconnect can restore it. Absent when the
 # count cache is absent, or when a runner reported only the count with no detail.
@@ -1190,6 +1195,7 @@ __all__ = [
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
+    "_session_background_agent_count_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_mcp_startup_cache",

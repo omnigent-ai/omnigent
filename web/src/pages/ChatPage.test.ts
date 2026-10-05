@@ -931,6 +931,10 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("idle", opts({ backgroundTaskCount: 0 }))).toBe(false);
   });
 
+  it("background agents keep the indicator lit after the turn settles", () => {
+    expect(computeShowsWorking("idle", opts({ backgroundAgentCount: 2 }))).toBe(true);
+  });
+
   it("a known-offline runner suppresses the indicator for an idle session with background shells", () => {
     // For a session that is NOT actively working, known-offline beats a stale
     // shell count: a dead session must not keep spinning on a background tally.
@@ -1113,6 +1117,7 @@ describe("isBackgroundTasksOnly", () => {
     // Turn over (not working) + shells linger → the pill owns the state.
     expect(isBackgroundTasksOnly(2, null, false)).toBe(true);
     expect(isBackgroundTasksOnly(0, null, false)).toBe(false);
+    expect(isBackgroundTasksOnly(0, null, false, 2)).toBe(true);
   });
 
   it("yields while the turn is still active so the shimmer shows too", () => {

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { BackgroundTaskInfo } from "@/lib/types";
 
-import { BackgroundTaskIndicator } from "./BackgroundTaskIndicator";
+import { BackgroundAgentIndicator, BackgroundTaskIndicator } from "./BackgroundTaskIndicator";
 
 function setBackground(
   count: number,
@@ -14,8 +14,13 @@ function setBackground(
   useChatStore.setState({
     backgroundTaskCount: count,
     backgroundTasks: tasks,
+    backgroundAgentCount: 0,
     conversationId,
   });
+}
+
+function setBackgroundAgents(count: number, conversationId: string | null = "conv-1") {
+  useChatStore.setState({ backgroundAgentCount: count, conversationId });
 }
 
 function badge(name: string | RegExp = /background tasks? still running/) {
@@ -414,6 +419,26 @@ describe("BackgroundTaskIndicator", () => {
     expect(trigger).toHaveAttribute("type", "button");
     fireEvent.click(trigger);
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+});
+
+describe("BackgroundAgentIndicator", () => {
+  it("renders the count and stays hidden at zero", () => {
+    setBackgroundAgents(0);
+    const { container } = render(<BackgroundAgentIndicator />);
+    expect(container).toBeEmptyDOMElement();
+
+    act(() => setBackgroundAgents(2));
+    expect(
+      screen.getByRole("button", { name: "2 background agents still running" }),
+    ).toHaveTextContent("2");
+  });
+
+  it("explains how to monitor the agents in the terminal", () => {
+    setBackgroundAgents(1);
+    render(<BackgroundAgentIndicator />);
+    fireEvent.click(screen.getByRole("button", { name: "1 background agent still running" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("Switch to the terminal tab");
   });
 });
 

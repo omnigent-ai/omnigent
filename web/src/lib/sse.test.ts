@@ -306,6 +306,28 @@ describe("parseEvent — session.status (background_task_count)", () => {
   });
 });
 
+describe("parseEvent — session.status (background_agent_count)", () => {
+  function bgAgentCount(data: Record<string, unknown>): number | undefined {
+    const ev = parseEvent("session.status", {
+      conversation_id: "conv_a",
+      status: "idle",
+      ...data,
+    });
+    return (ev as SessionStatusEvent | null)?.backgroundAgentCount;
+  }
+
+  it("preserves positive and authoritative zero counts", () => {
+    expect(bgAgentCount({ background_agent_count: 2 })).toBe(2);
+    expect(bgAgentCount({ background_agent_count: 0 })).toBe(0);
+  });
+
+  it("ignores missing, negative, and non-numeric counts", () => {
+    expect(bgAgentCount({})).toBeUndefined();
+    expect(bgAgentCount({ background_agent_count: -1 })).toBeUndefined();
+    expect(bgAgentCount({ background_agent_count: "2" })).toBeUndefined();
+  });
+});
+
 describe("parseEvent — session.status (background_tasks detail)", () => {
   function bgTasks(data: Record<string, unknown>) {
     const ev = parseEvent("session.status", { conversation_id: "conv_a", status: "idle", ...data });

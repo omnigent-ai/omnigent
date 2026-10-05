@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { ChevronRightIcon, SquareTerminalIcon } from "lucide-react";
+import { BotIcon, ChevronRightIcon, SquareTerminalIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -209,6 +209,80 @@ export function BackgroundTaskIndicator() {
               {countLabel} — details unavailable
             </p>
           )}
+        </PopoverContent>
+      </Popover>
+    </>
+  );
+}
+
+/** Show the number of Claude background agents still running after a turn. */
+export function BackgroundAgentIndicator() {
+  const agentCount = useChatStore((s) => s.backgroundAgentCount);
+  const conversationId = useChatStore((s) => s.conversationId);
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const closeReasonRef = useRef<"session-change" | "escape" | null>(null);
+
+  useEffect(() => {
+    if (agentCount <= 0) setOpen(false);
+  }, [agentCount]);
+  useEffect(() => {
+    closeReasonRef.current = "session-change";
+    setOpen(false);
+  }, [conversationId]);
+
+  if (agentCount <= 0) return null;
+  const countLabel = `${agentCount} background agent${agentCount === 1 ? "" : "s"}`;
+
+  return (
+    <>
+      <span role="status" className="sr-only">
+        {countLabel} still running
+      </span>
+      <Popover
+        modal={false}
+        open={open}
+        onOpenChange={(next) => {
+          if (next) closeReasonRef.current = null;
+          setOpen(next);
+        }}
+      >
+        <PopoverTrigger asChild>
+          <Button
+            ref={triggerRef}
+            type="button"
+            variant="ghost"
+            size="xs"
+            data-testid="background-agent-pill"
+            aria-label={`${countLabel} still running`}
+            className="shrink-0 gap-1 px-1 font-normal tabular-nums text-muted-foreground md:px-2"
+          >
+            <BotIcon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
+            {agentCount}
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent
+          side="top"
+          align="end"
+          collisionPadding={8}
+          aria-label={countLabel}
+          onEscapeKeyDown={() => {
+            if (open) closeReasonRef.current = "escape";
+          }}
+          onCloseAutoFocus={(event) => {
+            if (closeReasonRef.current === "session-change") {
+              event.preventDefault();
+            } else if (closeReasonRef.current === "escape") {
+              event.preventDefault();
+              triggerRef.current?.focus();
+            }
+            closeReasonRef.current = null;
+          }}
+          className="w-[min(20rem,calc(100vw-2rem))] p-3"
+        >
+          <p className="text-sm text-muted-foreground">
+            {countLabel} running in the background. Switch to the terminal tab to monitor them.
+          </p>
         </PopoverContent>
       </Popover>
     </>

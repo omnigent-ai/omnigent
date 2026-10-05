@@ -9670,6 +9670,7 @@ def test_hook_record_stop_excludes_backgrounded_subagents() -> None:
     )
 
     assert record.background_task_count == 1
+    assert record.background_agent_count == 1
     assert record.background_tasks == [
         {
             "id": "bash-task",

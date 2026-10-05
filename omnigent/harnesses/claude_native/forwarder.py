@@ -4225,6 +4225,9 @@ async def _forward_available_status_events(
                 # the UI can name the shells. Dropped on ``failed`` for the same
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
+                background_agent_count=(
+                    None if status == "failed" else record.background_agent_count
+                ),
                 failure_detail=_stop_failure_detail(record) if status == "failed" else None,
                 failure_context=failure_context,
             )

@@ -176,6 +176,7 @@ async def post_external_session_status(
     output: str | None = None,
     background_task_count: int | None = None,
     background_tasks: list[dict[str, object]] | None = None,
+    background_agent_count: int | None = None,
     response_id: str | None = None,
     failure_detail: str | None = None,
     failure_context: object = None,
@@ -232,6 +233,8 @@ async def post_external_session_status(
         data["background_task_count"] = background_task_count
     if background_tasks is not None:
         data["background_tasks"] = background_tasks
+    if background_agent_count is not None:
+        data["background_agent_count"] = background_agent_count
     if response_id is not None:
         data["response_id"] = response_id
     if turn_completed is not None:
