@@ -11,8 +11,9 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from urllib.parse import parse_qs, urlparse
 
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Locator, Page, Response, expect
 
 from tests.e2e_ui.sessions.unread_helpers import append_assistant_message
 
@@ -66,6 +67,19 @@ def _wait_viewer_unread(page: Page, base_url: str, session_id: str, expected: bo
     raise AssertionError(f"viewer_unread should become {expected!r}, got {last!r}")
 
 
+def _mine_sessions_response(response: Response) -> bool:
+    """Match the unpinned Inbox sidebar list projection response."""
+    parsed = urlparse(response.url)
+    query = parse_qs(parsed.query)
+    return (
+        parsed.path == "/v1/sessions"
+        and response.request.method == "GET"
+        and query.get("visibility") == ["mine"]
+        and "pinned" not in query
+        and response.status == 200
+    )
+
+
 def _mark_unread_from_header(page: Page) -> None:
     page.get_by_test_id("header-conversation-actions").click()
     page.get_by_test_id("header-mark-unread-conversation").click()
@@ -116,9 +130,21 @@ def test_row_mark_read_clears_the_dot_and_syncs_the_viewer_state(
     seeded_session: tuple[str, str],
 ) -> None:
     base_url, session_id = seeded_session
-    page.goto(f"{base_url}/c/{session_id}")
+    with page.expect_response(_mine_sessions_response, timeout=30_000):
+        page.goto(f"{base_url}/c/{session_id}")
     row = _row(page, session_id)
-    _mark_unread_from_row(page, row)
+    row.hover()
+    row.get_by_test_id("conversation-actions").click()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PUT"
+            and response.url.endswith(f"/v1/sessions/{session_id}/read-state")
+            and response.request.post_data_json["unread"] is True
+            and response.status == 204
+        ),
+        timeout=30_000,
+    ):
+        page.get_by_test_id("mark-unread-conversation").click()
     expect(_dot(row)).to_be_visible()
 
     # Read the same row from the inactive Inbox route; this keeps the row-menu
@@ -126,11 +152,25 @@ def test_row_mark_read_clears_the_dot_and_syncs_the_viewer_state(
     # racing the active-row read lifecycle.
     page.get_by_test_id("inbox-button").click()
     expect(page).to_have_url(f"{base_url}/inbox")
+    # The URL commits before AppShell replaces the active ChatPage tree. Wait
+    # for the rendered Inbox route before interacting with the sidebar again.
+    expect(page.get_by_role("heading", name="Inbox", exact=True)).to_be_visible(
+        timeout=30_000,
+    )
     row = _row(page, session_id)
     row.hover()
     row.get_by_test_id("conversation-actions").click()
     expect(page.get_by_test_id("mark-read-conversation")).to_be_visible()
-    page.get_by_test_id("mark-read-conversation").click()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PUT"
+            and response.url.endswith(f"/v1/sessions/{session_id}/read-state")
+            and response.request.post_data_json["unread"] is False
+            and response.status == 204
+        ),
+        timeout=30_000,
+    ):
+        page.get_by_test_id("mark-read-conversation").click()
 
     expect(_dot(row)).to_have_count(0)
     _wait_viewer_unread(page, base_url, session_id, False)
