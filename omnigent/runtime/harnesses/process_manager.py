@@ -809,6 +809,8 @@ class HarnessProcessManager:
                     },
                 )
                 await self._close_entry(entry)
+                # The retired process cannot emit its terminal stream edge.
+                self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
             if entry is not None and harness != "any" and entry.harness != harness:
                 # The harness is fixed at spawn time (it selects which runner
@@ -832,6 +834,7 @@ class HarnessProcessManager:
                 )
                 replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
             if (
@@ -846,6 +849,7 @@ class HarnessProcessManager:
                 )
                 replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
             if entry is not None and not (
@@ -866,6 +870,7 @@ class HarnessProcessManager:
                     )
                     replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                     await self._close_entry(entry)
+                    self._in_flight_response_ids.pop(conversation_id, None)
                     entry = None
                     respawn_reason = "harness_respawn_model_switch"
             if entry is None:
@@ -1149,6 +1154,7 @@ class HarnessProcessManager:
                     self._release_generations.get(conversation_id, 0) + 1
                 )
                 entry = self._entries.pop(conversation_id, None)
+                self._in_flight_response_ids.pop(conversation_id, None)
                 # NOTE: ``_spawn_locks[conversation_id]`` intentionally
                 # NOT popped — see this method's docstring for the
                 # per-conv lock-identity invariant rationale.
