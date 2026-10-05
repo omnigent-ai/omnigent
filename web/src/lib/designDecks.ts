@@ -6,6 +6,7 @@ import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import { isTopLevelActive } from "@/canvas/canvasSessions";
 import { DESIGN_KIT_MAX_BYTES, parseDesignKit, type KitFile } from "@/shell/codeViewerHelpers";
 import { conversationDisplayLabel, sessionBelongsToProject } from "@/shell/sidebarNav";
+import type { DesignSystemKind } from "./designSystem";
 
 /** Only this many recent sessions are scanned; a server index replaces the scan later. */
 export const DESIGN_SESSION_CAP = 50;
@@ -32,8 +33,12 @@ export interface DesignDeck {
   sessionTitle: string;
 }
 
+/** The group header badge: a design-system pointer when present, else the kit. */
 export type KitIndicator =
-  { status: "none" } | { status: "ok"; name: string } | { status: "invalid"; reason: string };
+  | { status: "none" }
+  | { status: "ok"; name: string }
+  | { status: "system"; name: string; kind: DesignSystemKind }
+  | { status: "invalid"; reason: string; system?: true };
 
 export type KitIndicatorState = KitIndicator | { status: "loading" };
 

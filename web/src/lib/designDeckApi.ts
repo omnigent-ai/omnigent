@@ -7,7 +7,8 @@ import {
   readWorkspaceFileSearch,
   requestWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { DESIGN_KIT_DIR } from "@/shell/codeViewerHelpers";
+import { DESIGN_KIT_DIR, kitText } from "@/shell/codeViewerHelpers";
+import { DESIGN_SYSTEM_POINTER, parseDesignSystemPointer } from "./designSystem";
 import {
   DECK_INCLUDE_GLOB,
   DECK_SEARCH_QUERY,
@@ -41,8 +42,25 @@ export async function fetchDeckSearch(sessionId: string): Promise<DeckSearchResu
   };
 }
 
-/** The kit indicator for a workspace, reading `kit.json` only (no assets). */
+/**
+ * The group indicator for a workspace: its design-system pointer when there is
+ * one, else its kit from `kit.json` alone (no assets).
+ */
 export async function fetchKitIndicator(sessionId: string): Promise<KitIndicator> {
+  // A failed pointer read falls through to the kit read, which names the failure.
+  const pointer = await fetchFileContent(sessionId, DESIGN_SYSTEM_POINTER).catch(() => null);
+  if (pointer) {
+    try {
+      const ref = parseDesignSystemPointer(kitText(pointer, "design-system.json"));
+      return { status: "system", name: ref.name, kind: ref.kind };
+    } catch (e) {
+      return {
+        status: "invalid",
+        reason: e instanceof Error ? e.message : String(e),
+        system: true,
+      };
+    }
+  }
   try {
     return kitIndicator(await fetchFileContent(sessionId, `${DESIGN_KIT_DIR}/kit.json`));
   } catch (e) {

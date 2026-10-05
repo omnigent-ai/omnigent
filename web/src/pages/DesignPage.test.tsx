@@ -230,6 +230,9 @@ describe("DesignPage list", () => {
   it.each([
     [{ status: "ok", name: "Acme" } as const, "Acme"],
     [{ status: "invalid", reason: "kit.json is not valid JSON" } as const, "Kit invalid"],
+    [{ status: "system", name: "Brand", kind: "full" } as const, "Brand"],
+    [{ status: "system", name: "Brand", kind: "skill" } as const, "Skill-only"],
+    [{ status: "invalid", reason: "bad", system: true } as const, "Design system invalid"],
   ])("shows the kit indicator %j", async (kit, label) => {
     stubSessions([row("a", 1)]);
     searchMock.mockResolvedValue({ status: "ok", paths: ["d.slides.html"], truncated: false });
@@ -239,6 +242,17 @@ describe("DesignPage list", () => {
 
     expect(await within(group("a")).findByText(label)).toBeInTheDocument();
     expect(kitMock).toHaveBeenCalledWith("a");
+  });
+
+  it("titles a design-system badge with its name and kind", async () => {
+    stubSessions([row("a", 1)]);
+    searchMock.mockResolvedValue({ status: "ok", paths: ["d.slides.html"] });
+    kitMock.mockResolvedValue({ status: "system", name: "Brand", kind: "full" });
+
+    renderPage();
+
+    const badge = await within(group("a")).findByTitle("Design system: Brand (full)");
+    expect(badge).toHaveTextContent("BrandFull");
   });
 
   it("links No kit to the sample kit instructions", async () => {

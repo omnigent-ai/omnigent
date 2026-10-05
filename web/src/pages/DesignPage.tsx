@@ -356,6 +356,17 @@ function KitBadge({ kit }: { kit: KitIndicatorState }) {
       </span>
     );
   }
+  if (kit.status === "system") {
+    return (
+      <span className={badge} title={`Design system: ${kit.name} (${kit.kind})`}>
+        <PaletteIcon className="size-3.5" aria-hidden />
+        <span className="max-w-32 truncate">{kit.name}</span>
+        <span className="rounded border border-border px-1 text-xs">
+          {kit.kind === "full" ? "Full" : "Skill-only"}
+        </span>
+      </span>
+    );
+  }
   if (kit.status === "none") {
     return (
       <a
@@ -371,7 +382,7 @@ function KitBadge({ kit }: { kit: KitIndicatorState }) {
   if (kit.status === "invalid") {
     return (
       <span className={cn(badge, "text-destructive")} title={kit.reason}>
-        Kit invalid
+        {kit.system ? "Design system invalid" : "Kit invalid"}
       </span>
     );
   }

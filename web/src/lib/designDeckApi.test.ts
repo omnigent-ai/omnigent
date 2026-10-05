@@ -97,19 +97,50 @@ describe("fetchDeckSearch", () => {
 });
 
 describe("fetchKitIndicator", () => {
-  it("reads only kit.json and names the kit", async () => {
-    contentMock.mockResolvedValue({
-      object: "session.environment.filesystem.file_content",
-      path: ".omnigent/design-kit/kit.json",
-      content_type: "application/json",
-      encoding: "utf-8",
-      content: '{"name":"Acme","logo":{"src":"logo.svg"}}',
-      bytes: 40,
+  const json = (path: string, content: string) => ({
+    object: "session.environment.filesystem.file_content" as const,
+    path,
+    content_type: "application/json",
+    encoding: "utf-8" as const,
+    content,
+    bytes: content.length,
+  });
+  const serve = (files: Record<string, string>) =>
+    contentMock.mockImplementation(async (_id, path) => {
+      if (files[path] === undefined) throw new Error("404 Not Found");
+      return json(path, files[path]);
     });
 
+  it("reads only the pointer and kit.json and names the kit", async () => {
+    serve({ ".omnigent/design-kit/kit.json": '{"name":"Acme","logo":{"src":"logo.svg"}}' });
+
     expect(await fetchKitIndicator("conv_a")).toEqual({ status: "ok", name: "Acme" });
+    expect(contentMock.mock.calls).toEqual([
+      ["conv_a", ".omnigent/design-system.json"],
+      ["conv_a", ".omnigent/design-kit/kit.json"],
+    ]);
+  });
+
+  it("names a design system in place of the kit", async () => {
+    serve({
+      ".omnigent/design-system.json": '{"path":"/brand","kind":"skill","name":"Brand"}',
+      ".omnigent/design-kit/kit.json": '{"name":"Acme"}',
+    });
+    expect(await fetchKitIndicator("conv_a")).toEqual({
+      status: "system",
+      name: "Brand",
+      kind: "skill",
+    });
     expect(contentMock).toHaveBeenCalledTimes(1);
-    expect(contentMock).toHaveBeenCalledWith("conv_a", ".omnigent/design-kit/kit.json");
+  });
+
+  it("is an invalid design system when the pointer does not parse", async () => {
+    serve({ ".omnigent/design-system.json": '{"path":"/brand","kind":"kit"}' });
+    expect(await fetchKitIndicator("conv_a")).toEqual({
+      status: "invalid",
+      reason: '"kind" must be "full" or "skill"',
+      system: true,
+    });
   });
 
   it("is none when kit.json does not exist", async () => {
