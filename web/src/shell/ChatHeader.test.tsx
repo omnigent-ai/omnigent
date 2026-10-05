@@ -58,6 +58,9 @@ const mobileMenu = {
   onOpenSubagents: () => {},
   githubPanelOpen: false,
   onOpenGithub: () => {},
+  sideChatsPanelOpen: false,
+  showSideChats: false,
+  onOpenSideChats: () => {},
   onOpenMainExecutionLog: () => {},
 };
 
@@ -901,6 +904,25 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Files" }));
     expect(onOpenFiles).toHaveBeenCalled();
+  });
+
+  it("opens the side-chats drawer from the kebab when the harness supports it", () => {
+    const onOpenSideChats = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      mobileMenu: { ...mobileMenu, showSideChats: true, onOpenSideChats },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+    expect(onOpenSideChats).toHaveBeenCalled();
   });
 
   it("keeps the rail entries reachable when the session isn't owner-managed", () => {

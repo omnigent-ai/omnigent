@@ -96,6 +96,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { isTempConvId, useChatStore } from "@/store/chatStore";
+import { supportsSideChat } from "@/lib/sideChat";
 import {
   STARTING_GRACE_S,
   livenessRowFromSession,
@@ -438,6 +439,7 @@ export function AppShell() {
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
   const [githubPanelOpen, setGithubPanelOpen] = useState(false);
+  const [sideChatsPanelOpen, setSideChatsPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
   // state per session. A brand-new session (no saved `open`) follows the
   // Appearance "Workspace panel" default; reopening a session restores how
@@ -1091,6 +1093,7 @@ export function AppShell() {
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
     setGithubPanelOpen(false);
+    setSideChatsPanelOpen(false);
     setFilesPanelShowHidden(true);
     // Drop shell interaction state carried from the outgoing session: a
     // still-armed create ref would otherwise auto-focus an unrelated shell in
@@ -1800,7 +1803,10 @@ export function AppShell() {
   useEffect(() => {
     if (sideChatToOpen === null) return;
     setRightPanelOpenAnimated(true);
+    // Phones hide the rail, so the side chat opens in its drawer instead.
+    if (isMobileViewport()) setSideChatsPanelOpen(true);
   }, [sideChatToOpen, setRightPanelOpenAnimated]);
+  const showSideChats = supportsSideChat(useChatStore((s) => s.sessionHarness));
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -2394,6 +2400,8 @@ export function AppShell() {
                       subagentsPanelOpen,
                       shellsPanelOpen,
                       githubPanelOpen,
+                      sideChatsPanelOpen,
+                      showSideChats,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2411,6 +2419,7 @@ export function AppShell() {
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
                       onOpenGithub: openGithubPanel,
+                      onOpenSideChats: () => setSideChatsPanelOpen(true),
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -2494,6 +2503,8 @@ export function AppShell() {
                     liveness={liveness}
                     onShellCreateStart={markShellCreateStarted}
                     onShellCreateFailed={clearShellCreatePending}
+                    mobileSideChatsOpen={sideChatsPanelOpen}
+                    onMobileSideChatsOpenChange={setSideChatsPanelOpen}
                   />
                 )}
               </div>

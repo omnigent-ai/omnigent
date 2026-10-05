@@ -307,6 +307,53 @@ def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
     assert question not in str(_items(base_url, session_id))
 
 
+def test_side_chat_opens_in_a_drawer_on_mobile(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """Phones hide the Workspace rail, so a side chat opens in a full-screen drawer."""
+    base_url, session_id = seeded_session
+    parent_reply = "Retry the upload with exponential backoff."
+    side_reply = "Backoff spreads the retries out so the server can recover."
+    question = f"mobile-side-{session_id}: why backoff?"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": parent_reply}],
+        key=f"mobile-main-{session_id}",
+        match=f"mobile-main-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": side_reply}],
+        key=f"mobile-side-{session_id}",
+        match=f"mobile-side-{session_id}",
+    )
+
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(f"{base_url}/c/{session_id}")
+    _send_parent(page, f"mobile-main-{session_id}: how should I retry?", parent_reply)
+    page.locator(_ASSISTANT).get_by_text(parent_reply).select_text()
+    page.get_by_role("button", name="Ask in side chat", exact=True).click()
+
+    drawer = page.get_by_test_id("side-chats-panel-drawer")
+    expect(drawer).to_have_attribute("data-state", "open")
+    expect(drawer.get_by_test_id("composer-reply-quote")).to_contain_text(parent_reply)
+    drawer.get_by_test_id("side-chat-input").fill(question)
+    drawer.get_by_test_id("side-chat-send").click()
+    expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
+    assert len(side_chat_forks) == 1
+
+    # Closing the drawer keeps the side chat; the header menu brings it back.
+    drawer.get_by_role("button", name="Close", exact=True).click()
+    expect(drawer).to_have_attribute("data-state", "closed")
+    page.get_by_role("button", name="Conversation actions").click()
+    page.get_by_role("menuitem", name="Side chats").click()
+    expect(drawer).to_have_attribute("data-state", "open")
+    expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible()
+
+
 def test_running_empty_side_chat_shows_working(
     page: Page,
     seeded_session: tuple[str, str],
