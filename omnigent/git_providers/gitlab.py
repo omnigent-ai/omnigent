@@ -170,8 +170,13 @@ class GitLabProvider:
                 and not parsed.fragment
             ):
                 ssh_host, path = parsed.hostname.lower(), parsed.path
-            elif parsed.scheme == "https" and not parsed.query and not parsed.fragment:
-                authority = instance_authority(f"https://{parsed.netloc}")
+            elif (
+                parsed.scheme == "https"
+                and parsed.password is None
+                and not parsed.query
+                and not parsed.fragment
+            ):
+                authority = instance_authority(f"https://{parsed.netloc.rsplit('@', 1)[-1]}")
                 if authority not in self.authorities(instances):
                     return None
                 path = parsed.path
@@ -192,7 +197,7 @@ class GitLabProvider:
         repository = path.strip("/").removesuffix(".git")
         if authority is None or not _valid_project(repository):
             return None
-        return ParsedRemote(provider=self.id, host=authority, repository=repository)
+        return ParsedRemote(provider=self.id, host=authority, repository=repository.lower())
 
     def parse_pr_url(self, url: str, instances: Instances) -> ParsedPullRequest | None:
         """Parse an MR IID, not its instance-global ID, on a trusted instance."""
@@ -212,12 +217,13 @@ class GitLabProvider:
             number = int(match[2])
         except ValueError:
             return None
+        repository = match[1].lower()
         return ParsedPullRequest(
             provider=self.id,
             host=authority,
-            repository=match[1],
+            repository=repository,
             number=number,
-            url=f"https://{authority}/{match[1]}/-/merge_requests/{number}",
+            url=f"https://{authority}/{repository}/-/merge_requests/{number}",
         )
 
 

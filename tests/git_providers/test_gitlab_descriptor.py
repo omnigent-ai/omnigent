@@ -29,6 +29,7 @@ def configured_instances(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
             "git.example.test:8443",
         ),
         ("https://GITLAB.COM:443/team/sub/project/-/merge_requests/42/", "gitlab.com"),
+        ("https://gitlab.com/Team/Sub/Project/-/merge_requests/42", "gitlab.com"),
     ],
 )
 def test_merge_request(url: str, host: str) -> None:
@@ -48,6 +49,7 @@ def test_merge_request(url: str, host: str) -> None:
     [
         "http://gitlab.com/team/project/-/merge_requests/1",
         "https://user:token@gitlab.com/team/project/-/merge_requests/1",
+        "https://alice@gitlab.com/team/project/-/merge_requests/1",
         "https://gitlab.com.evil.test/team/project/-/merge_requests/1",
         "https://git.example.test/team/project/-/merge_requests/1",
         "https://git.example.test:9443/team/project/-/merge_requests/1",
@@ -69,7 +71,11 @@ def test_rejects_untrusted_or_invalid_mr(url: str) -> None:
     "url,host",
     [
         ("git@gitlab.com:team/sub/project.git", "gitlab.com"),
+        ("git@gitlab.com:Team/Sub/Project.git", "gitlab.com"),
+        ("https://alice@gitlab.com/team/sub/project.git", "gitlab.com"),
+        ("https://alice@GITLAB.COM:443/Team/Sub/Project.git", "gitlab.com"),
         ("https://git.example.test:8443/team/sub/project.git", "git.example.test:8443"),
+        ("https://alice@git.example.test:8443/team/sub/project.git", "git.example.test:8443"),
         ("ssh://git@git.example.test:2222/team/sub/project.git", "git.example.test:8443"),
         ("git@git.example.test:team/sub/project.git", "git.example.test:8443"),
     ],
@@ -78,6 +84,25 @@ def test_remote_preserves_nested_project_and_api_port(url: str, host: str) -> No
     parsed = GitLabProvider().parse_remote_url(url, EnvInstances())
     assert parsed is not None
     assert (parsed.host, parsed.repository) == (host, "team/sub/project")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://alice:token@gitlab.com/team/project.git",
+        "https://alice:@gitlab.com/team/project.git",
+        "http://alice@gitlab.com/team/project.git",
+        "https://gitlab.com@unknown.test/team/project.git",
+        "https://alice@gitlab.com.evil.test/team/project.git",
+        "https://alice@git.example.test/team/project.git",
+        "https://alice@git.example.test:9443/team/project.git",
+        "https://alice@gitlab.com:bad/team/project.git",
+        "https://alice@gitlab.com/team/project.git?token=example",
+        "https://alice@gitlab.com/team/project.git#fragment",
+    ],
+)
+def test_remote_rejects_passwords_and_untrusted_authorities(url: str) -> None:
+    assert GitLabProvider().parse_remote_url(url, EnvInstances()) is None
 
 
 def test_ssh_cannot_guess_between_instances_on_one_hostname(

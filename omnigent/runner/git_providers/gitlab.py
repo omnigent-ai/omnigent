@@ -90,7 +90,7 @@ def _mr(client: GitLabClient, reference: PullRequestRef) -> dict[str, Any]:
         or not isinstance(mr.get("state"), str)
         or mr["state"] not in _STATES
         or returned is None
-        or returned.url != reference.url
+        or returned.url != reference.url.lower()
     ):
         raise ValueError("GitLab returned an invalid merge request identity or state.")
     return mr
@@ -102,7 +102,7 @@ def _source_remote(root: str, remotes: list[ParsedRemote]) -> ParsedRemote:
     if not push.strip():
         _, push = _git(root, ["config", "remote.pushDefault"])
     named = dict(local_git.remote_urls(lambda args: _git(root, args)))
-    url = named.get(push.strip()) or named.get("origin")
+    url = named.get(push.strip())
     source = GitLabProvider().parse_remote_url(url, EnvInstances()) if url else None
     return source or remotes[0]
 

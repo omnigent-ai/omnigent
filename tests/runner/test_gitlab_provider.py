@@ -186,6 +186,128 @@ def test_explicit_reference_keeps_live_branch_and_uses_iid(root: str, api: Mock)
     api.object.assert_called_once_with("projects/team%2Fsub%2Fproject/merge_requests/7")
 
 
+@pytest.mark.parametrize("remote_project", ["team/sub/project", "Team/Sub/Project"])
+def test_discovery_accepts_project_path_case(
+    root: str, api: Mock, mr: dict, remote_project: str
+) -> None:
+    from omnigent.runner import pr_resource
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            root,
+            "remote",
+            "add",
+            "upstream",
+            f"https://gitlab.com/{remote_project}.git",
+        ],
+        check=True,
+    )
+    mr["web_url"] = URL.replace("team/sub/project", "Team/Sub/Project")
+    info = pr_resource.pr_info(root)
+    assert info["pr"] is not None, info["warnings"]
+    assert info["pr"]["url"] == URL and not info["warnings"]
+    assert info["repo"]["name_with_owner"] == "team/sub/project"
+
+
+@pytest.mark.parametrize("stored_mixed_case", [False, True])
+def test_attached_mr_and_title_accept_project_path_case(
+    root: str,
+    api: Mock,
+    mr: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored_mixed_case: bool,
+) -> None:
+    from omnigent.runner import pr_resource
+    from omnigent.runner.session_prs import SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    mixed_url = URL.replace("team/sub/project", "Team/Sub/Project")
+    reference = ref()
+    if stored_mixed_case:
+        reference = reference.model_copy(
+            update={"repository": "Team/Sub/Project", "url": mixed_url}
+        )
+    else:
+        mr["web_url"] = mixed_url
+    info = module.PULL_REQUESTS.reference_info(root, reference)
+    assert info["pr"] is not None, info["warnings"]
+    assert info["pr"]["url"] == reference.url
+    assert module.PULL_REQUESTS.pr_title(root, reference, time.monotonic() + 8) == (
+        mr["title"],
+        False,
+    )
+    for url in (mixed_url, URL):
+        attached = pr_resource.update_session_pr(root, "case-mr", url, "attach")
+        assert attached["pr"]["url"] == URL
+    assert [entry.url for entry in SessionPrRegistry("case-mr").list()] == [URL]
+
+
+@pytest.mark.parametrize(
+    "tracking,push_default,push_remote",
+    [("fork", None, None), ("origin", "fork", None), ("origin", "origin", "fork")],
+    ids=["push-u-fork", "push-default", "branch-push-override"],
+)
+def test_fork_mr_discovery_follows_push_remote_precedence(
+    root: str,
+    api: Mock,
+    mr: dict,
+    tracking: str,
+    push_default: str | None,
+    push_remote: str | None,
+) -> None:
+    from omnigent.runner import pr_resource
+
+    for args in (
+        ["remote", "set-url", "origin", "https://gitlab.com/team/sub/project.git"],
+        ["remote", "add", "fork", "https://gitlab.com/fork/sub/project.git"],
+        ["config", "branch.feature.remote", tracking],
+        ["config", "branch.feature.merge", "refs/heads/feature"],
+    ):
+        subprocess.run(["git", "-C", root, *args], check=True)
+    for key, value in (
+        ("remote.pushDefault", push_default),
+        ("branch.feature.pushRemote", push_remote),
+    ):
+        if value:
+            subprocess.run(["git", "-C", root, "config", key, value], check=True)
+    original = api.object.side_effect
+
+    def response(path: str, **query):
+        if path == "projects/team%2Fsub%2Fproject":
+            return {"id": mr["target_project_id"]}
+        return original(path, **query)
+
+    api.object.side_effect = response
+    info = pr_resource.pr_info(root)
+    assert info["pr"] is not None, info["warnings"]
+    assert info["pr"]["url"] == URL and not info["warnings"]
+    assert api.object.call_args_list[0].args == ("projects/fork%2Fsub%2Fproject",)
+
+
+def test_https_username_remote_resolves_through_generic_panel(root: str, api: Mock) -> None:
+    from omnigent.runner import pr_resource
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            root,
+            "remote",
+            "set-url",
+            "origin",
+            "https://alice@gitlab.com/fork/sub/project.git",
+        ],
+        check=True,
+    )
+    info = pr_resource.pr_info(root)
+    assert info["provider"] == "gitlab" and info["pr"] is not None
+    assert info["pr"]["url"] == URL and not info["warnings"]
+    assert "alice@" not in str(info) and "alice@" not in str(api.mock_calls)
+
+
 def test_no_oauth_or_cli_failure_hides_checkout(
     root: str, api: Mock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -525,11 +647,17 @@ def test_private_port_remote_resolves_through_generic_panel(
         {"state": "invalid"},
         {"iid": 8},
         {"web_url": URL.replace("team/sub/project", "other/project")},
+        {"web_url": URL.replace("gitlab.com", "git.example.test:8443")},
+        {"web_url": URL.replace("gitlab.com", "gitlab.com:8443")},
+        {"web_url": URL.replace("gitlab.com", "alice@gitlab.com")},
     ],
 )
 def test_invalid_identity_or_state_is_not_served(
-    root: str, api: Mock, mr: dict, fields: dict
+    root: str, api: Mock, mr: dict, fields: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv(
+        "OMNIGENT_GIT_PROVIDER_GITLAB_HOSTS", "git.example.test:8443,gitlab.com:8443"
+    )
     mr.update(fields)
     info = module.PULL_REQUESTS.reference_info(root, ref())
     assert info["pr"] is None and info["warnings"]
