@@ -312,6 +312,48 @@ describe("side-chat interrupt", () => {
   });
 });
 
+describe("seeded /side question survives an unmount before the child binds", () => {
+  // Closing the mobile side-chats drawer, or switching rail tabs, unmounts this
+  // pane. The question must not die with it: it stays in the store until the
+  // send actually dispatches, which needs the child's agent binding.
+  it("defers the send while unbound, then sends exactly once on remount", async () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null });
+    useChatStore.setState({ sideChatDrafts: { [childId]: "why backoff?" } });
+
+    const first = renderPane(<SideChatPane childId={childId} />);
+    expect(send).not.toHaveBeenCalled();
+    // Unmount before the binding arrives (drawer closed / tab switched).
+    first.unmount();
+    expect(useChatStore.getState().sideChatDrafts[childId]).toBe("why backoff?");
+
+    // Remount with the binding known: the held question goes out, once.
+    conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" });
+    renderPane(<SideChatPane childId={childId} />);
+
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith("why backoff?", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+    // Consumed, so a later remount can't send it a second time.
+    expect(useChatStore.getState().sideChatDrafts[childId]).toBeUndefined();
+    cleanup();
+    renderPane(<SideChatPane childId={childId} />);
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+  });
+
+  it("sends once when the binding arrives while still mounted", async () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null });
+    useChatStore.setState({ sideChatDrafts: { [childId]: "why?" } });
+    renderPane(<SideChatPane childId={childId} />);
+    expect(send).not.toHaveBeenCalled();
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(useChatStore.getState().sideChatDrafts[childId]).toBeUndefined();
+  });
+});
+
 describe("side chat sealed by the server", () => {
   it("is read-only once the server marks the child closed", () => {
     sessionLabels.current = { "omnigent.closed": "true" };

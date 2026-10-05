@@ -1043,6 +1043,19 @@ describe("WorkspacePanel mobile side chats", () => {
     expect(onMobileSideChatsOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("keeps the side chat mounted while the drawer is closed", () => {
+    // Dismissing the drawer must not unmount the pane: a seeded `/side`
+    // question still waiting on the child's agent binding has to go out, and
+    // unsent composer text has to survive — as behind a collapsed desktop rail.
+    isMobileMock.mockReturnValue(true);
+    openTabs();
+    renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: false });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+  });
+
   it("keeps the side chat in the rail on desktop", () => {
     openTabs();
     renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });

@@ -348,41 +348,37 @@ function SideChatComposer({
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<File[]>([]);
-  const [autoSend, setAutoSend] = useState<string | null>(null);
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceSnapshotRef = useRef("");
   const dictation = useDictationInsert(text, setText, textareaRef);
-  // A pending tab opened by "Ask in side chat" carries the selection to quote.
-  const quote = useChatStore((s) => (pending ? s.sideChatDrafts[childId] : undefined));
+  // This tab's seeded text: on a pending tab the "Ask in side chat" selection
+  // to QUOTE, on a live tab the `/side` question to SEND.
+  const draft = useChatStore((s) => s.sideChatDrafts[childId]);
+  const quote = pending ? draft : undefined;
+  const autoSend = pending ? undefined : draft;
   useEffect(() => {
     if (quote !== undefined) textareaRef.current?.focus();
   }, [quote]);
-
-  // A `/side <question>` that opened this side chat seeds a draft to SEND (not
-  // just populate). Consumed once on mount; the send waits until the child's
-  // agent binding is known. Live tabs only (a pending tab has no child yet).
-  useEffect(() => {
-    if (pending) return;
-    const draft = useChatStore.getState().sideChatDrafts[childId];
-    if (draft) {
-      clearSideChatDraft(childId);
-      setAutoSend(draft);
-    }
-  }, [pending, childId, clearSideChatDraft]);
   // Re-read the labels so a side chat the server just sealed turns read-only.
   const refreshLabels = useCallback(
     () => void queryClient.invalidateQueries({ queryKey: ["session", childId] }),
     [queryClient, childId],
   );
+  // Send the seeded question once the child's agent binding is known. The text
+  // stays in the store until this dispatches — never copied into component
+  // state first — so unmounting in the meantime (closing the mobile drawer,
+  // switching tabs) defers the send instead of discarding the only copy.
   useEffect(() => {
-    if (autoSend === null || agentId === null) return;
+    if (autoSend === undefined || agentId === null) return;
+    // Clear before sending: the store drop re-renders this with no draft, so a
+    // second run of this effect can't send the same question twice.
+    clearSideChatDraft(childId);
     void send(autoSend, agentId, undefined, { pinnedConversationId: childId }).finally(
       refreshLabels,
     );
-    setAutoSend(null);
-  }, [autoSend, agentId, send, childId, refreshLabels]);
+  }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels]);
 
   const ready = pending ? !starting : agentId !== null;
   const canSend = text.trim().length > 0 || (!pending && files.length > 0);

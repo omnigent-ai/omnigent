@@ -1475,6 +1475,11 @@ function WorkspacePanelImpl({
             title="Side chats"
             onClose={() => onMobileSideChatsOpenChange?.(false)}
             testId="side-chats-panel-drawer"
+            // A side chat is live: a seeded `/side` question still waiting on
+            // the child's agent binding must still send, and unsent composer
+            // text must survive, when the drawer is dismissed — the same as
+            // behind a collapsed desktop rail.
+            keepMounted
           >
             <div
               role="tablist"

@@ -31,9 +31,18 @@ interface MobilePanelDrawerProps {
   onClose: () => void;
   /**
    * Panel content. Mounted only while ``open`` so panels that poll
-   * (e.g. ``SubagentsPanel``) don't keep running behind a closed drawer.
+   * (e.g. ``SubagentsPanel``) don't keep running behind a closed drawer —
+   * unless ``keepMounted`` is set.
    */
   children: ReactNode;
+  /**
+   * Keep ``children`` mounted while the drawer is closed. Opt-in, for content
+   * that owns live work the user expects to continue once the drawer is
+   * dismissed — a side chat's in-flight turn and unsent composer text, which
+   * the desktop rail also keeps alive when collapsed. Leave unset for panels
+   * whose only job is display: unmounting stops their polling.
+   */
+  keepMounted?: boolean;
   /** Optional test id applied to the root ``aside`` for assertions. */
   testId?: string;
 }
@@ -46,6 +55,7 @@ interface MobilePanelDrawerProps {
  * @param onClose - Called to dismiss the drawer.
  * @param children - The panel body, mounted only while open.
  * @param testId - Optional ``data-testid`` for the root element.
+ * @param keepMounted - Keep the body mounted while closed (live content).
  */
 export function MobilePanelDrawer({
   open,
@@ -53,6 +63,7 @@ export function MobilePanelDrawer({
   onClose,
   children,
   testId,
+  keepMounted = false,
 }: MobilePanelDrawerProps) {
   return (
     <aside
@@ -76,7 +87,9 @@ export function MobilePanelDrawer({
           <XIcon className="size-4" />
         </Button>
       </header>
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{open && children}</div>
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {(open || keepMounted) && children}
+      </div>
     </aside>
   );
 }
