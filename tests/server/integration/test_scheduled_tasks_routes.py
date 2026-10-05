@@ -16,6 +16,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.db.db_models import SCHEDULED_TASK_NAME_MAX_LEN
 from omnigent.db.utils import builtin_agent_id
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
@@ -256,6 +257,7 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
         b = to_managed.json()
         assert b["execution_target"] == "managed_sandbox"
         assert b["host_id"] is None and b["workspace"] is None
+        assert b["name"] == created["name"]
 
         back = await auth_client.patch(
             f"/v1/scheduled-tasks/{tid}",
@@ -264,6 +266,7 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
         )
         assert back.status_code == 200, back.text
         assert back.json()["execution_target"] == "connected_host"
+        assert back.json()["name"] == created["name"]
     finally:
         auth_app.state.sandbox_config = None
 
@@ -1749,3 +1752,109 @@ async def test_run_now_503_when_scheduler_not_running(
     auth_app.state.scheduled_task_run_now = None
     resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
     assert resp.status_code == 503, resp.text
+
+
+# ``scheduled_tasks.name`` is String(256). A blank or over-long name is a 400
+# with a readable message (like an invalid rrule) so the dialog shows it inline.
+_NAME_COLUMN_LIMIT = SCHEDULED_TASK_NAME_MAX_LEN
+_INVALID_NAMES = [
+    pytest.param("n" * (_NAME_COLUMN_LIMIT + 1), id="over-long"),
+    pytest.param("", id="empty"),
+    pytest.param("   ", id="blank"),
+]
+
+
+def _assert_name_rejected(resp: httpx.Response) -> None:
+    assert resp.status_code == 400, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "invalid_input", error
+    assert str(_NAME_COLUMN_LIMIT) in error["message"], error
+
+
+async def test_create_accepts_name_at_column_limit(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    name = "n" * _NAME_COLUMN_LIMIT
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(name=name), headers=_headers()
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == name
+
+
+@pytest.mark.parametrize("name", _INVALID_NAMES)
+async def test_create_rejects_blank_or_over_long_name(
+    auth_client: httpx.AsyncClient, db_uri: str, name: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(name=name), headers=_headers()
+    )
+    _assert_name_rejected(resp)
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert listed.json()["scheduled_tasks"] == []
+
+
+async def test_update_accepts_name_at_column_limit(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    name = "n" * _NAME_COLUMN_LIMIT
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}", json={"name": name}, headers=_headers()
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == name
+
+
+@pytest.mark.parametrize("name", _INVALID_NAMES)
+async def test_update_rejects_invalid_name_and_keeps_previous(
+    auth_client: httpx.AsyncClient, db_uri: str, name: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}", json={"name": name}, headers=_headers()
+    )
+    _assert_name_rejected(resp)
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert got.status_code == 200
+    assert got.json()["name"] == "nightly triage"
+
+
+async def test_update_with_null_name_keeps_previous(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}", json={"name": None}, headers=_headers()
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "nightly triage"
+
+
+async def test_create_and_update_trim_surrounding_whitespace(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(name="  padded  "), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["name"] == "padded"
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}",
+        json={"name": "  renamed  "},
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "renamed"

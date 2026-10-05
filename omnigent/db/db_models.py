@@ -1499,6 +1499,11 @@ class SqlUserDailyCost(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+# Width of ``scheduled_tasks.name``. Exported so the REST layer rejects a longer
+# name up front instead of letting PostgreSQL/MySQL raise ``DataError`` on write.
+SCHEDULED_TASK_NAME_MAX_LEN = 256
+
+
 class SqlScheduledTask(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_tasks`` table.
@@ -1577,7 +1582,7 @@ class SqlScheduledTask(OmnigentBase):
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
-    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    name: Mapped[str] = mapped_column(String(SCHEDULED_TASK_NAME_MAX_LEN), nullable=False)
     # Opaque free text, never SQL-queried — stored compressed (CompressedText).
     prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
     # RFC 5545 recurrence rule, e.g. "FREQ=DAILY;BYHOUR=9;BYMINUTE=0".
