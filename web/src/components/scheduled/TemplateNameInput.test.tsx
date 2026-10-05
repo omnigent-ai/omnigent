@@ -57,6 +57,24 @@ describe("TemplateNameInput", () => {
     expect(backdropText.style.transform).toBe("translateX(-1237px)");
   });
 
+  it("resyncs the backdrop after the value changes without a scroll event", () => {
+    const initialValue = `Long automation name ${"weekly release ".repeat(16)}{{MMM DD}}`;
+    const { rerender } = render(
+      <TemplateNameInput aria-label="Name" value={initialValue} onChange={vi.fn()} />,
+    );
+
+    const input = screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement;
+    const backdropText = screen.getByTestId("task-name-template-overlay")
+      .firstElementChild as HTMLElement;
+
+    input.scrollLeft = 1237;
+    rerender(
+      <TemplateNameInput aria-label="Name" value={`${initialValue} updated`} onChange={vi.fn()} />,
+    );
+
+    expect(backdropText.style.transform).toBe("translateX(-1237px)");
+  });
+
   it.each(["First\nSecond {{YYYY}}", "First\rSecond {{YYYY}}", "First {{YYYY\nMM}} Second"])(
     "keeps the backdrop aligned with the native single-line value (%s)",
     (name) => {
