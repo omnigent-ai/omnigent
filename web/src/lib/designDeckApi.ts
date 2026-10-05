@@ -2,7 +2,11 @@
 // APIs, so a user only sees decks in workspaces they can already read.
 
 import { fetchFileContent } from "@/hooks/useFileContent";
+import { fetchHostFilesystem } from "@/hooks/useHostFilesystem";
+import { writeFileContent } from "@/hooks/useWriteFileContent";
 import { authenticatedFetch } from "./identity";
+import { isOwnerLevel } from "./permissionsApi";
+import { getSessionSlim } from "./sessionsApi";
 import {
   WORKSPACE_FILE_SEARCH_LIMIT,
   readWorkspaceFileSearch,
@@ -12,8 +16,16 @@ import { DESIGN_KIT_DIR, kitText } from "@/shell/codeViewerHelpers";
 import {
   DESIGN_SYSTEM_IMPORT_DIR,
   DESIGN_SYSTEM_POINTER,
+  isAbsoluteDesignSystemPath,
   parseDesignSystemPointer,
+  type DesignSystemRef,
 } from "./designSystem";
+import {
+  importDesignSystem,
+  listDesignSystemSource,
+  planDesignSystemImport,
+  type ImportPlan,
+} from "./designSystemImport";
 import {
   DECK_INCLUDE_GLOB,
   DECK_SEARCH_QUERY,
@@ -86,6 +98,49 @@ export async function fetchDesignIndex(): Promise<DesignIndexEntry[] | null> {
   const res = await authenticatedFetch("/v1/design/artifacts?kind=deck");
   if (!res.ok) return null;
   return ((await res.json()) as { data: DesignIndexEntry[] }).data;
+}
+
+/**
+ * The outside design system a session's owner can import, or `null` when the
+ * pointer is missing, invalid, already imported, or the viewer is not the owner.
+ */
+export async function fetchImportTarget(
+  sessionId: string,
+): Promise<{ hostId: string; source: DesignSystemRef } | null> {
+  const [session, pointer] = await Promise.all([
+    getSessionSlim(sessionId),
+    fetchFileContent(sessionId, DESIGN_SYSTEM_POINTER).catch(() => null),
+  ]);
+  if (!pointer || !session.hostId || !isOwnerLevel(session.permissionLevel)) return null;
+  try {
+    const source = parseDesignSystemPointer(kitText(pointer, "design-system.json"));
+    return isAbsoluteDesignSystemPath(source.path) ? { hostId: session.hostId, source } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The import plan for a design-system folder on a host. */
+export async function planDesignSystemImportFrom(
+  hostId: string,
+  folder: string,
+): Promise<ImportPlan> {
+  const listing = await listDesignSystemSource(folder, (dir) => fetchHostFilesystem(hostId, dir));
+  return planDesignSystemImport(listing);
+}
+
+/** Copy `plan` from `source` into the session's workspace, then point the design at the copy. */
+export function runDesignSystemImport(
+  sessionId: string,
+  plan: ImportPlan,
+  source: DesignSystemRef,
+  onProgress: (done: number, total: number) => void,
+) {
+  return importDesignSystem(plan, source, {
+    read: (rel) => fetchFileContent(sessionId, `${source.path.replace(/[/\\]+$/, "")}/${rel}`),
+    write: (path, content, encoding) => writeFileContent(sessionId, path, content, encoding),
+    onProgress,
+  });
 }
 
 /** Replace a session's indexed decks with a successful scan's paths. Best-effort. */

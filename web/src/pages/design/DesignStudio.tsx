@@ -9,6 +9,7 @@ import {
   ArrowRightIcon,
   ChevronLeftIcon,
   MessageSquareIcon,
+  PaletteIcon,
   XIcon,
 } from "lucide-react";
 import { WorkingIndicator, computeIsTurnActive } from "@/components/chat/chatBubbleParts";
@@ -19,12 +20,14 @@ import { Spinner } from "@/components/ui/spinner";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { fetchImportTarget } from "@/lib/designDeckApi";
 import { deckName } from "@/lib/designDecks";
 import { deckPreviewState, type StudioView } from "@/lib/designStudio";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { SlidesViewer } from "@/shell/SlidesViewer";
 import { ensureConversationStreamed } from "@/store/chatStore";
+import { ImportDesignSystemDialog } from "./DesignSystemImport";
 
 // The app defaults to a 30 s stale time without focus refetch; decks change
 // while agents work, so the deck read refreshes on every mount and focus.
@@ -96,6 +99,14 @@ export function DesignStudio({
         : "error"
       : "loading";
   const preview = deckPreviewState({ file, turnEnded });
+  const importTarget = useQuery({
+    queryKey: ["design-import-target", sessionId],
+    queryFn: () => fetchImportTarget(sessionId),
+    retry: false,
+  });
+  const [importOpen, setImportOpen] = useState(false);
+  // Remounts the viewer so it rereads the pointer after an import.
+  const [viewerKey, setViewerKey] = useState(0);
 
   const showChat = isMobile ? view === "chat" : view !== "full";
   const showPreview = !isMobile || view !== "chat";
@@ -162,6 +173,33 @@ export function DesignStudio({
               Chat
             </Button>
           ))}
+        {importTarget.data && !(isMobile && view === "chat") && (
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={() => setImportOpen(true)}
+              componentId="design.studio.import_system"
+            >
+              <PaletteIcon className="size-4" />
+              <span className={cn(isMobile && "sr-only")}>Import design system</span>
+            </Button>
+            <ImportDesignSystemDialog
+              open={importOpen}
+              onOpenChange={setImportOpen}
+              sessionId={sessionId}
+              hostId={importTarget.data.hostId}
+              source={importTarget.data.source}
+              onImported={() => {
+                setViewerKey((k) => k + 1);
+                void queryClient.invalidateQueries({
+                  queryKey: ["design-import-target", sessionId],
+                });
+              }}
+            />
+          </>
+        )}
         {!(isMobile && view === "chat") && (
           <Button asChild variant="ghost" size="sm" className="shrink-0 text-sm">
             <Link to={sessionFileHref(sessionId, path)} componentId="design.open_in_session">
@@ -188,6 +226,7 @@ export function DesignStudio({
           <section aria-label="Deck preview" className="flex min-h-0 min-w-0 flex-1 flex-col">
             {preview === "deck" && deck.data ? (
               <SlidesViewer
+                key={viewerKey}
                 content={deck.data.content}
                 truncated={deck.data.truncated}
                 conversationId={sessionId}

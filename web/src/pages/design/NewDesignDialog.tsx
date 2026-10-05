@@ -29,7 +29,9 @@ import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHosts } from "@/hooks/useHosts";
 import { deleteFileContent, writeFileContent } from "@/hooks/useWriteFileContent";
 import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
+import { planDesignSystemImportFrom, runDesignSystemImport } from "@/lib/designDeckApi";
 import { DECK_SUFFIX, deckName } from "@/lib/designDecks";
+import type { ImportError, ImportPlan } from "@/lib/designSystemImport";
 import {
   DESIGN_SYSTEM_POINTER,
   DS_MANIFEST,
@@ -56,6 +58,7 @@ import { createSession, postEvent } from "@/lib/sessionsApi";
 import { DESIGN_KIT_DIR } from "@/shell/codeViewerHelpers";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
+import { ImportProgress, ImportSummary } from "./DesignSystemImport";
 
 function joinPath(folder: string, rel: string): string {
   return `${folder.replace(/\/+$/, "")}/${rel}`;
@@ -65,6 +68,13 @@ const SYSTEM_NONE = "none";
 const SYSTEM_KIT = "kit";
 const SYSTEM_CHOOSE = "choose";
 const systemValue = (ref: DesignSystemRef) => `ds:${ref.path}`;
+const errorText = (e: unknown) => (e instanceof Error && e.message ? e.message : String(e));
+
+/** An import of the chosen system, keyed by its folder. */
+type ImportChoice =
+  | { path: string; status: "planning" }
+  | { path: string; status: "confirm" | "confirmed"; plan: ImportPlan }
+  | { path: string; status: "error"; message: string };
 
 /** The manifest or SKILL.md name, read through the new session; else the known name. */
 async function resolveSystemName(sessionId: string, ref: DesignSystemRef): Promise<string> {
@@ -110,6 +120,10 @@ export function NewDesignDialog({
   const [pickedSystem, setPickedSystem] = useState<string | null>(null);
   const [systemFolder, setSystemFolder] = useState<string | null>(null);
   const [systemBrowserOpen, setSystemBrowserOpen] = useState(false);
+  const [importChoice, setImportChoice] = useState<ImportChoice | null>(null);
+  const [copy, setCopy] = useState<{ done: number; total: number; errors: ImportError[] } | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   // A session created by a Create whose first message then failed; a retry
@@ -125,6 +139,8 @@ export function NewDesignDialog({
       setPickedFolder(null);
       setPickedSystem(null);
       setSystemFolder(null);
+      setImportChoice(null);
+      setCopy(null);
       setError(null);
       created.current = null;
     }
@@ -195,6 +211,20 @@ export function NewDesignDialog({
   const systemChoice =
     pickedSystem && systemOptions.includes(pickedSystem) ? pickedSystem : defaultSystem;
   const system = systems.find((s) => systemValue(s) === systemChoice);
+  const importing = system && importChoice?.path === system.path ? importChoice : null;
+
+  async function planImport(source: DesignSystemRef) {
+    if (!hostId) return;
+    const path = source.path;
+    const settle = (next: ImportChoice) =>
+      setImportChoice((current) => (current?.path === path ? next : current));
+    setImportChoice({ path, status: "planning" });
+    try {
+      settle({ path, status: "confirm", plan: await planDesignSystemImportFrom(hostId, path) });
+    } catch (e) {
+      settle({ path, status: "error", message: errorText(e) });
+    }
+  }
 
   const canCreate =
     prompt.trim() !== "" &&
@@ -202,6 +232,8 @@ export function NewDesignDialog({
     hostId !== null &&
     folder !== "" &&
     !submitting &&
+    importing?.status !== "planning" &&
+    importing?.status !== "confirm" &&
     !decksListing.isLoading &&
     !decksListing.isPlaceholderData;
 
@@ -246,9 +278,27 @@ export function NewDesignDialog({
         sessionId = session.id;
         created.current = { key, id: sessionId };
       }
-      const ref = system && { ...system, name: await resolveSystemName(sessionId, system) };
-      if (ref) {
-        await writeFileContent(sessionId, DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer(ref));
+      const named = system && { ...system, name: await resolveSystemName(sessionId, system) };
+      let ref = named;
+      if (named && importing?.status === "confirmed") {
+        const { plan } = importing;
+        setCopy({ done: 0, total: plan.files.length, errors: [] });
+        const result = await runDesignSystemImport(sessionId, plan, named, (done, total) =>
+          setCopy({ done, total, errors: [] }),
+        );
+        if (!result.ref) {
+          setCopy({ done: plan.files.length, total: plan.files.length, errors: result.errors });
+          throw new Error(
+            `Couldn't import ${result.errors.length} of ${plan.files.length} design-system files.`,
+          );
+        }
+        ref = result.ref;
+      } else if (named) {
+        await writeFileContent(
+          sessionId,
+          DESIGN_SYSTEM_POINTER,
+          serializeDesignSystemPointer(named),
+        );
       } else {
         // A pointer left from an earlier design would override the folder kit.
         await deleteFileContent(sessionId, DESIGN_SYSTEM_POINTER);
@@ -261,13 +311,14 @@ export function NewDesignDialog({
         },
       });
       rememberDesignDefaults(agent.id, hostId, folder);
-      if (ref) rememberDesignSystem(hostId, ref);
+      if (named) rememberDesignSystem(hostId, named);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       onCreated(sessionId, path);
       onOpenChange(false);
     } catch (e) {
       setError(e instanceof Error && e.message ? e.message : "Couldn't create the design.");
     } finally {
+      setCopy((c) => (c?.errors.length ? c : null));
       setSubmitting(false);
     }
   }
@@ -448,13 +499,67 @@ export function NewDesignDialog({
                 }}
               />
               {system && (
-                <p
-                  className="truncate font-mono text-sm text-muted-foreground"
-                  data-testid="design-system-path"
-                >
-                  {system.path}
-                </p>
+                <div className="flex items-center gap-2">
+                  <p
+                    className="min-w-0 flex-1 truncate font-mono text-sm text-muted-foreground"
+                    data-testid="design-system-path"
+                  >
+                    {system.path}
+                  </p>
+                  {(!importing || importing.status === "error") && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={submitting}
+                      onClick={() => void planImport(system)}
+                      componentId="design.new.system_import"
+                    >
+                      Import
+                    </Button>
+                  )}
+                </div>
               )}
+              {importing?.status === "planning" && (
+                <p className="text-sm text-muted-foreground">Listing design-system files...</p>
+              )}
+              {importing?.status === "error" && (
+                <p className="text-sm text-destructive">{`Couldn't import: ${importing.message}`}</p>
+              )}
+              {(importing?.status === "confirm" || importing?.status === "confirmed") && (
+                <div className="flex flex-col gap-2 rounded-md border border-border p-2">
+                  <ImportSummary plan={importing.plan} />
+                  {importing.status === "confirmed" && (
+                    <p className="text-sm text-muted-foreground">
+                      The copy is made when you create the design.
+                    </p>
+                  )}
+                  <div className="flex justify-end gap-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={submitting}
+                      onClick={() => setImportChoice(null)}
+                      componentId="design.new.system_import_cancel"
+                    >
+                      {importing.status === "confirmed" ? "Don't import" : "Cancel"}
+                    </Button>
+                    {importing.status === "confirm" && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={importing.plan.files.length === 0}
+                        onClick={() => setImportChoice({ ...importing, status: "confirmed" })}
+                        componentId="design.new.system_import_confirm"
+                      >
+                        Import a copy
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              )}
+              {copy && <ImportProgress done={copy.done} total={copy.total} errors={copy.errors} />}
               {systemProblem && <p className="text-sm text-destructive">{systemProblem}</p>}
             </div>
           )}

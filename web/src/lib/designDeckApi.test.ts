@@ -4,15 +4,18 @@ import * as workspaceFiles from "@/hooks/useWorkspaceChangedFiles";
 import {
   fetchDeckSearch,
   fetchDesignIndex,
+  fetchImportTarget,
   fetchKitIndicator,
   reconcileDesignIndex,
 } from "./designDeckApi";
 import { authenticatedFetch } from "./identity";
+import { getSessionSlim } from "./sessionsApi";
 
 const { requestWorkspaceFileSearch } = workspaceFiles;
 
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
 vi.mock("./identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("./sessionsApi", () => ({ getSessionSlim: vi.fn() }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importActual) => ({
   ...(await importActual<typeof workspaceFiles>()),
   requestWorkspaceFileSearch: vi.fn(),
@@ -21,6 +24,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importActual) => ({
 const searchMock = vi.mocked(requestWorkspaceFileSearch);
 const contentMock = vi.mocked(fetchFileContent);
 const fetchMock = vi.mocked(authenticatedFetch);
+const sessionMock = vi.mocked(getSessionSlim);
 
 function response(status: number, body: unknown = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -121,6 +125,41 @@ describe("fetchDeckSearch", () => {
   it("throws on any other failure", async () => {
     searchMock.mockResolvedValue(new Response("boom", { status: 500, statusText: "Server Error" }));
     await expect(fetchDeckSearch("conv_a")).rejects.toThrow("500 Server Error");
+  });
+});
+
+describe("fetchImportTarget", () => {
+  const session = (permissionLevel: number | null, hostId: string | null = "host_1") =>
+    sessionMock.mockResolvedValue({ permissionLevel, hostId } as Awaited<
+      ReturnType<typeof getSessionSlim>
+    >);
+  const pointer = (path: string) =>
+    contentMock.mockResolvedValue({
+      object: "session.environment.filesystem.file_content",
+      path: ".omnigent/design-system.json",
+      content_type: "application/json",
+      encoding: "utf-8",
+      content: JSON.stringify({ path, kind: "full", name: "Acme" }),
+      bytes: 10,
+    });
+
+  it("offers the owner an outside system on the session's host", async () => {
+    session(null);
+    pointer("/brand/acme");
+    expect(await fetchImportTarget("conv_a")).toEqual({
+      hostId: "host_1",
+      source: { path: "/brand/acme", kind: "full", name: "Acme" },
+    });
+  });
+
+  it.each([
+    ["an imported system", () => (session(null), pointer(".omnigent/design-system"))],
+    ["a viewer who is not the owner", () => (session(1), pointer("/brand/acme"))],
+    ["a session without a host", () => (session(null, null), pointer("/brand/acme"))],
+    ["no pointer", () => (session(null), contentMock.mockRejectedValue(new Error("404")))],
+  ])("offers nothing for %s", async (_label, arrange) => {
+    arrange();
+    expect(await fetchImportTarget("conv_a")).toBeNull();
   });
 });
 

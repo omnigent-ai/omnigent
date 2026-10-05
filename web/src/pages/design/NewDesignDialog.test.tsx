@@ -7,7 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { useHostFilesystem } from "@/hooks/useHostFilesystem";
+import { fetchHostFilesystem, useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import { deleteFileContent, writeFileContent } from "@/hooks/useWriteFileContent";
@@ -20,6 +20,7 @@ import { readDesignDefaults, rememberDesignDefaults } from "@/lib/designStudio";
 import { nativeWrapperLabelsForAgent } from "@/lib/nativeCodingAgents";
 import { createSession, postEvent } from "@/lib/sessionsApi";
 import { testAgent } from "@/test/agentFixtures";
+import { readFixtureFile } from "@/test/designSystemFixture";
 import { NewDesignDialog } from "./NewDesignDialog";
 
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
@@ -29,7 +30,10 @@ vi.mock("@/hooks/useWriteFileContent", () => ({
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
-vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
+vi.mock("@/hooks/useHostFilesystem", () => ({
+  useHostFilesystem: vi.fn(),
+  fetchHostFilesystem: vi.fn(),
+}));
 vi.mock("@/lib/sessionsApi", () => ({ createSession: vi.fn(), postEvent: vi.fn() }));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
 vi.mock("@/shell/WorkspacePicker", () => ({
@@ -421,6 +425,122 @@ describe("NewDesignDialog design system", () => {
     expect(screen.getByLabelText("Prompt")).toHaveValue("Pitch");
     expect(postMock).not.toHaveBeenCalled();
     expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  describe("import", () => {
+    const tree: Record<string, [string, "file" | "directory", number][]> = {
+      "/brand/acme": [
+        ["SKILL.md", "file", 152],
+        ["_ds_manifest.json", "file", 57],
+        ["colors_and_type.css", "file", 289],
+        ["fonts", "directory", 0],
+        ["uploads", "directory", 0],
+      ],
+      "/brand/acme/fonts": [
+        ["fixture-sans.woff2", "file", 25],
+        ["huge.ttf", "file", 3 * 1024 * 1024],
+      ],
+    };
+    beforeEach(() => {
+      rememberDesignSystem("host_1", ACME);
+      vi.mocked(fetchHostFilesystem).mockImplementation(async (_host, dir) => ({
+        truncated: false,
+        entries: (tree[dir] ?? []).map(([name, type, bytes]) => ({
+          name,
+          path: `${dir}/${name}`,
+          type,
+          bytes,
+          modified_at: 1,
+        })),
+      }));
+      vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
+        const file = path.startsWith("/brand/acme/") && readFixtureFile(path.slice(12));
+        if (!file) throw new Error("404 Not Found");
+        return file as never;
+      });
+    });
+    const writtenPaths = () => writeMock.mock.calls.map(([, path]) => path);
+
+    async function confirmImport() {
+      fireEvent.click(screen.getByRole("button", { name: "Import" }));
+      expect(await screen.findByTestId("design-system-import-summary")).toHaveTextContent(
+        "Copies 4 files (523 B) into .omnigent/design-system.",
+      );
+      expect(screen.getByText("fonts/huge.ttf: larger than 2 MB")).toBeInTheDocument();
+      expect(screen.getByText("uploads/: never imported")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Create" })).toBeDisabled();
+      fireEvent.click(screen.getByRole("button", { name: "Import a copy" }));
+    }
+
+    it("copies after the session exists, writes the pointer last, then sends the instruction", async () => {
+      const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+      await confirmImport();
+      create();
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+
+      expect(writtenPaths().slice(0, 4).sort()).toEqual([
+        ".omnigent/design-system/SKILL.md",
+        ".omnigent/design-system/_ds_manifest.json",
+        ".omnigent/design-system/colors_and_type.css",
+        ".omnigent/design-system/fonts/fixture-sans.woff2",
+      ]);
+      expect(writeMock.mock.calls.find(([, p]) => p.endsWith(".woff2"))?.[3]).toBe("base64");
+      const imported = {
+        path: ".omnigent/design-system",
+        kind: "full",
+        name: "Fixture Brand",
+        importedFrom: "/brand/acme",
+      } as const;
+      expect(writeMock.mock.calls.at(-1)).toEqual([
+        "conv_new",
+        ".omnigent/design-system.json",
+        serializeDesignSystemPointer(imported),
+        "utf-8",
+      ]);
+      expect(writeMock.mock.invocationCallOrder.at(-1)).toBeLessThan(
+        postMock.mock.invocationCallOrder[0],
+      );
+      expect(sentText()).toContain(
+        "Follow the design system at `.omnigent/design-system` (`full`).",
+      );
+      expect(readRecentDesignSystems("host_1")[0].path).toBe("/brand/acme");
+    });
+
+    it("shows per-file errors and never writes the pointer or sends the message", async () => {
+      writeMock.mockImplementation(async (_id, path) => {
+        if (path.endsWith(".woff2")) throw new Error("507 Insufficient Storage");
+      });
+      const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+      await confirmImport();
+      create();
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Couldn't import 1 of 4 design-system files.",
+      );
+      expect(
+        screen.getByText("fonts/fixture-sans.woff2: 507 Insufficient Storage"),
+      ).toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Copied 4 of 4 files");
+      expect(writtenPaths()).not.toContain(".omnigent/design-system.json");
+      expect(postMock).not.toHaveBeenCalled();
+      expect(onCreated).not.toHaveBeenCalled();
+    });
+
+    it("drops a confirmed import with Don't import", async () => {
+      const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+      await confirmImport();
+      fireEvent.click(screen.getByRole("button", { name: "Don't import" }));
+      create();
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(writtenPaths()).toEqual([".omnigent/design-system.json"]);
+      expect(sentText()).toContain("Follow the design system at `/brand/acme`");
+    });
+
+    it("names a listing failure", async () => {
+      vi.mocked(fetchHostFilesystem).mockRejectedValue(new Error("Host offline"));
+      renderDialog({ initialPrompt: "Pitch" });
+      fireEvent.click(screen.getByRole("button", { name: "Import" }));
+      expect(await screen.findByText("Couldn't import: Host offline")).toBeInTheDocument();
+    });
   });
 
   it.each([

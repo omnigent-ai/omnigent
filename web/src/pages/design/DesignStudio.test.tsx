@@ -9,10 +9,19 @@ import type * as ChatStoreModule from "@/store/chatStore";
 import { fetchFileContent, type FileContentResponse } from "@/hooks/useFileContent";
 import { ensureConversationStreamed } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import {
+  fetchImportTarget,
+  planDesignSystemImportFrom,
+  runDesignSystemImport,
+} from "@/lib/designDeckApi";
 import type { StudioView } from "@/lib/designStudio";
+import type { ImportPlan } from "@/lib/designSystemImport";
 import { DesignStudio } from "./DesignStudio";
 
-const { mobileRef } = vi.hoisted(() => ({ mobileRef: { current: false } }));
+const { mobileRef, viewerMounts } = vi.hoisted(() => ({
+  mobileRef: { current: false },
+  viewerMounts: { count: 0 },
+}));
 
 vi.mock("@/store/chatStore", async (importOriginal) => ({
   ...(await importOriginal<typeof ChatStoreModule>()),
@@ -31,10 +40,19 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     />
   ),
 }));
-vi.mock("@/shell/SlidesViewer", () => ({
-  SlidesViewer: ({ content }: { content: string }) => (
-    <div data-testid="slides-viewer">{content}</div>
-  ),
+vi.mock("@/shell/SlidesViewer", async () => {
+  const { useState } = await import("react");
+  return {
+    SlidesViewer: ({ content }: { content: string }) => {
+      useState(() => (viewerMounts.count += 1));
+      return <div data-testid="slides-viewer">{content}</div>;
+    },
+  };
+});
+vi.mock("@/lib/designDeckApi", () => ({
+  fetchImportTarget: vi.fn(),
+  planDesignSystemImportFrom: vi.fn(),
+  runDesignSystemImport: vi.fn(),
 }));
 
 const SESSION = "conv_a";
@@ -87,6 +105,8 @@ beforeEach(() => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   conversationRegistry.clear();
   contentMock.mockResolvedValue(deckFile("<section>Title</section>"));
+  vi.mocked(fetchImportTarget).mockResolvedValue(null);
+  viewerMounts.count = 0;
 });
 
 afterEach(() => {
@@ -133,6 +153,70 @@ describe("DesignStudio on desktop", () => {
     const { onBack } = renderStudio();
     fireEvent.click(screen.getByRole("link", { name: "Back to designs" }));
     expect(onBack).toHaveBeenCalled();
+  });
+});
+
+describe("DesignStudio design-system import", () => {
+  const source = { path: "/brand/acme", kind: "full" as const, name: "Acme" };
+  const plan: ImportPlan = {
+    files: [
+      { path: "SKILL.md", bytes: 10 },
+      { path: "fonts/a.woff2", bytes: 20 },
+    ],
+    skipped: [{ path: "preview/", reason: "never imported" }],
+    totalBytes: 30,
+  };
+  const importButton = () => screen.findByRole("button", { name: "Import design system" });
+  beforeEach(() => {
+    vi.mocked(fetchImportTarget).mockResolvedValue({ hostId: "host_1", source });
+    vi.mocked(planDesignSystemImportFrom).mockResolvedValue(plan);
+  });
+
+  it("is not offered without an outside system the viewer owns", async () => {
+    vi.mocked(fetchImportTarget).mockResolvedValue(null);
+    renderStudio();
+    expect(await screen.findByTestId("slides-viewer")).toBeInTheDocument();
+    await waitFor(() => expect(fetchImportTarget).toHaveBeenCalledWith(SESSION));
+    expect(screen.queryByRole("button", { name: "Import design system" })).toBeNull();
+  });
+
+  it("confirms, copies, and reloads the preview", async () => {
+    vi.mocked(runDesignSystemImport).mockImplementation(async (_s, _p, _r, onProgress) => {
+      onProgress(1, 2);
+      onProgress(2, 2);
+      return { errors: [], ref: { ...source, path: ".omnigent/design-system" } };
+    });
+    renderStudio();
+    expect(await screen.findByTestId("slides-viewer")).toBeInTheDocument();
+    fireEvent.click(await importButton());
+    expect(planDesignSystemImportFrom).toHaveBeenCalledWith("host_1", "/brand/acme");
+    expect(await screen.findByTestId("design-system-import-summary")).toHaveTextContent(
+      "Copies 2 files (30 B) into .omnigent/design-system.",
+    );
+    expect(screen.getByText("preview/: never imported")).toBeInTheDocument();
+    vi.mocked(fetchImportTarget).mockResolvedValue(null);
+    fireEvent.click(screen.getByRole("button", { name: "Import" }));
+
+    await waitFor(() => expect(screen.queryByTestId("import-design-system-dialog")).toBeNull());
+    expect(runDesignSystemImport).toHaveBeenCalledWith(SESSION, plan, source, expect.any(Function));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Import design system" })).toBeNull(),
+    );
+    expect(viewerMounts.count).toBe(2);
+  });
+
+  it("lists per-file errors and offers Retry", async () => {
+    vi.mocked(runDesignSystemImport).mockResolvedValue({
+      errors: [{ path: "fonts/a.woff2", message: "507 Insufficient Storage" }],
+      ref: null,
+    });
+    renderStudio();
+    fireEvent.click(await importButton());
+    fireEvent.click(await screen.findByRole("button", { name: "Import" }));
+    expect(await screen.findByText("fonts/a.woff2: 507 Insufficient Storage")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Copied 2 of 2 files");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(runDesignSystemImport).toHaveBeenCalledTimes(2));
   });
 });
 
