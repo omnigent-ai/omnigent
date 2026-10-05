@@ -51,6 +51,7 @@ async function loadAssets(paths: Iterable<string>, read: DesignSystemRead) {
   const uris = new Map<string, string>();
   let total = 0;
   for (const path of paths) {
+    // oxlint-disable-next-line no-await-in-loop
     const file = await read(path);
     if (!file) throw new Error(`${path} not found in the design system`);
     const encoded = kitDataUri(file, path, DS_MIME[extension(path)]);
@@ -75,6 +76,7 @@ async function replaceAsync(
   let out = "";
   let at = 0;
   for (const m of text.matchAll(re)) {
+    // oxlint-disable-next-line no-await-in-loop
     out += text.slice(at, m.index) + (await replace(m as RegExpExecArray));
     at = m.index + m[0].length;
   }

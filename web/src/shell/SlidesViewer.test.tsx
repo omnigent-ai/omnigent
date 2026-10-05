@@ -790,9 +790,15 @@ describe("SlidesViewer design system", () => {
     vi.useFakeTimers();
     try {
       let release = () => {};
-      serveSystem("full", { logoGate: new Promise<void>((r) => (release = r)) });
+      serveSystem("full", {
+        logoGate: new Promise<void>((r) => {
+          release = r;
+        }),
+      });
       render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
-      await act(() => vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS + DESIGN_SYSTEM_TIMEOUT_MS));
+      await act(() =>
+        vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS + DESIGN_SYSTEM_TIMEOUT_MS),
+      );
       expect(screen.getByRole("status")).toHaveTextContent("design system timed out");
       release();
       await act(() => vi.advanceTimersByTimeAsync(0));
@@ -807,7 +813,10 @@ describe("SlidesViewer design system", () => {
   it("drops cached assets the current deck no longer uses", async () => {
     serveSystem("full");
     const extraUri = `data:image/svg+xml;base64,${btoa("<svg/>")}`;
-    const withExtra = DS_DECK.replace("<h1>One</h1>", '<h1>One</h1><img src="ds:assets/extra.svg">');
+    const withExtra = DS_DECK.replace(
+      "<h1>One</h1>",
+      '<h1>One</h1><img src="ds:assets/extra.svg">',
+    );
     const { rerender } = render(<SlidesViewer content={withExtra} conversationId="conv_1" />);
     expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
     rerender(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);

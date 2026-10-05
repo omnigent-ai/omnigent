@@ -95,15 +95,18 @@ describe("processDesignSystemCss", () => {
     );
   });
 
-  it.each(['.a{background:url("https://evil.example/a)b")}', `.a{background:url("https://e/x'y")}`])(
-    "drops the quoted remote url in %s",
-    async (input) => {
-      expect(await processDesignSystemCss(input, asset)).toBe(".a{background:none}");
-    },
-  );
+  it.each([
+    '.a{background:url("https://evil.example/a)b")}',
+    `.a{background:url("https://e/x'y")}`,
+  ])("drops the quoted remote url in %s", async (input) => {
+    expect(await processDesignSystemCss(input, asset)).toBe(".a{background:none}");
+  });
 
   it("applies the synthetic design-system stylesheet", async () => {
-    const css = await processDesignSystemCss(readFixtureFile("colors_and_type.css")!.content, asset);
+    const css = await processDesignSystemCss(
+      readFixtureFile("colors_and_type.css")!.content,
+      asset,
+    );
     expect(css).toContain('url("data:x/fonts/fixture-sans.woff2")');
     expect(css).toContain("url(data:x/assets/logo.svg)");
   });
