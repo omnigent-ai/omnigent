@@ -231,6 +231,7 @@ it("labels a changed folder without file status wording or counts", () => {
         name: "models",
         path: "models",
         kind: "folder",
+        modifiedAt: 1_759_608_000,
         status: "created",
         linesAdded: 12,
         linesRemoved: 3,
@@ -244,7 +245,8 @@ it("labels a changed folder without file status wording or counts", () => {
   expect(screen.getByText("Contains changes")).toBeInTheDocument();
   expect(screen.queryByText(/New file|\+12|−3/)).not.toBeInTheDocument();
   expect(screen.queryByText("Size", { selector: "dt" })).not.toBeInTheDocument();
-  expect(screen.queryByText("Modified", { selector: "dt" })).not.toBeInTheDocument();
+  const modified = screen.getByText("Modified", { selector: "dt" }).nextElementSibling;
+  expect(modified?.textContent).toMatch(/\b(?:UTC|GMT|[A-Z]{2,5})\b/);
 });
 
 it("uses Not available for metadata without known changes", () => {
@@ -256,7 +258,8 @@ it("uses Not available for metadata without known changes", () => {
     />,
   );
   expect(screen.getByRole("dialog", { name: "Folder info" })).toBeInTheDocument();
-  expect(screen.getByText("Not available")).toBeInTheDocument();
+  const modifiedLabel = screen.getByText("Modified", { selector: "dt" });
+  expect(modifiedLabel.nextElementSibling).toHaveTextContent("Not available");
   expect(screen.getByText("Host path", { selector: "dt" })).toBeInTheDocument();
   expect(screen.queryByText(/size/i)).not.toBeInTheDocument();
 });
