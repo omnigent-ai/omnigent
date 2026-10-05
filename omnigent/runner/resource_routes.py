@@ -1455,6 +1455,41 @@ def register_resource_routes(
             },
         )
 
+    @app.post(
+        "/v1/sessions/{session_id}/resources/environments"
+        "/{environment_id}/filesystem/{relative_path:path}"
+    )
+    async def create_environment_file(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Create a new file atomically without replacing an existing path."""
+        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+        agent_spec = await _require_os_env(session_id)
+        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        fs = CallerProcessFilesystem(env)
+        body = await request.json()
+        content_str = body.get("content", "")
+        encoding = body.get("encoding", "utf-8")
+        content_bytes = content_str.encode(encoding)
+        result = await fs.create(relative_path, content_bytes)
+        if filesystem_registry is not None:
+            filesystem_registry.record_change(relative_path, "created", session_id)
+        return JSONResponse(
+            status_code=201,
+            content={
+                "object": "session.environment.filesystem.create_result",
+                "operation": result.operation,
+                "path": result.path,
+                "created": result.created,
+                "bytes_written": result.bytes_written,
+                "entry": _fs_entry_to_dict(result.entry) if result.entry else None,
+            },
+        )
+
     @app.patch(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"

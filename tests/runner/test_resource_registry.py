@@ -54,6 +54,10 @@ class _FakeOSEnvironment(OSEnvironment):
         del path, content
         return {}
 
+    async def create(self, path: str, content: str) -> OpResult:
+        del path, content
+        return {}
+
     async def edit(
         self,
         path: str,

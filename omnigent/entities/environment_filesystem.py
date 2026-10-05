@@ -63,9 +63,10 @@ class FileContent:
 
 @dataclass(frozen=True)
 class WriteFileResult:
-    """Result of a file write operation.
+    """Result of a file write or create operation.
 
-    :param operation: Always ``"write"``.
+    :param operation: ``"write"`` for replacement or ``"create"`` for an
+        atomic create-only operation.
     :param path: Relative path within the environment.
     :param created: Whether the file was newly created.
     :param bytes_written: Number of bytes written.
@@ -73,7 +74,7 @@ class WriteFileResult:
     """
 
     path: str
-    operation: Literal["write"] = "write"
+    operation: Literal["write", "create"] = "write"
     created: bool = False
     bytes_written: int = 0
     entry: FilesystemEntry | None = None
@@ -231,6 +232,18 @@ class FilesystemPathNotFound(ResourceError):
     """
 
     code = "path_not_found"
+
+
+class FilesystemPathAlreadyExists(ResourceError):
+    """The requested create-only path already exists."""
+
+    code = "already_exists"
+
+
+class FilesystemOperationUnsupported(ResourceError):
+    """The backing environment does not implement the requested operation."""
+
+    code = "unsupported"
 
 
 class DirectoryNotEmpty(ResourceError):

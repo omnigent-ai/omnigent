@@ -27,6 +27,34 @@ async function writeFileContent(
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
 }
 
+async function createFileContent(
+  conversationId: string,
+  path: string,
+  content: string,
+): Promise<void> {
+  const encodedPath = browseLocationSegment(path);
+  const base = browseLocationBase(path);
+  const url =
+    `/v1/sessions/${encodeURIComponent(conversationId)}` +
+    `/resources/environments/default/filesystem/${encodedPath}` +
+    (base ? `?base=${base}` : "");
+  const res = await authenticatedFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content, encoding: "utf-8" }),
+  });
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { detail?: string; error?: { message?: string } };
+      detail = body.error?.message ?? body.detail ?? detail;
+    } catch {
+      // Keep the status when older servers return a non-JSON error.
+    }
+    throw new Error(detail);
+  }
+}
+
 /**
  * Write the content of a workspace file for the given conversation.
  * Invalidates the file-content query on success so the viewer refreshes.
@@ -41,6 +69,20 @@ export function useWriteFileContent(conversationId: string) {
         ["file-content", conversationId, path],
         (old) => (old ? { ...old, content } : undefined),
       );
+      queryClient.invalidateQueries({ queryKey: ["file-content", conversationId, path] });
+      queryClient.invalidateQueries({ queryKey: ["workspace-changed-files", conversationId] });
+    },
+  });
+}
+
+/** Create a new file without replacing an existing path. */
+export function useCreateFileContent(conversationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ path, content }: { path: string; content: string }) =>
+      createFileContent(conversationId, path, content),
+    onSuccess: (_, { path }) => {
+      queryClient.invalidateQueries({ queryKey: ["workspace-all-files", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["file-content", conversationId, path] });
       queryClient.invalidateQueries({ queryKey: ["workspace-changed-files", conversationId] });
     },

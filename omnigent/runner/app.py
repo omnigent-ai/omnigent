@@ -2117,6 +2117,8 @@ def create_runner_app(
         del request
         from omnigent.entities.environment_filesystem import (
             DirectoryNotEmpty,
+            FilesystemOperationUnsupported,
+            FilesystemPathAlreadyExists,
             FilesystemPathNotFound,
             FileTooLarge,
             InvalidPath,
@@ -2128,6 +2130,10 @@ def create_runner_app(
         error: dict[str, object] = {"code": exc.code, "message": exc.message}
         if isinstance(exc, FilesystemPathNotFound):
             status = 404
+        elif isinstance(exc, FilesystemPathAlreadyExists):
+            status = 409
+        elif isinstance(exc, FilesystemOperationUnsupported):
+            status = 501
         elif isinstance(exc, PathUnreachable):
             # 403, not 400: the path is well-formed, the caller just may not
             # see it. Carries the reachable roots so a UI can say what IS

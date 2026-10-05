@@ -56,6 +56,12 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
+// The "Markdown file" item's create hook pulls in react-query (file listing +
+// write); stub it to a no-op callback — its own logic is covered by
+// useCreateMarkdownFile.test.tsx.
+vi.mock("@/hooks/useCreateMarkdownFile", () => ({
+  useCreateMarkdownFile: () => ({ create: () => {}, disabled: false }),
+}));
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 
 const useTerminalsMock = vi.mocked(useTerminals);
@@ -91,6 +97,7 @@ function renderWorkspace(
     changedCount?: number;
     showGithubTab?: boolean;
     showBrowserTab?: boolean;
+    showFilesPanel?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
     maximized?: boolean;
@@ -127,7 +134,7 @@ function renderWorkspace(
         }}
         rightRailTab={overrides.rightRailTab ?? "files"}
         onRightRailTabChange={onRightRailTabChange}
-        showFilesPanel
+        showFilesPanel={overrides.showFilesPanel ?? true}
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
         onBrowserTabOpened={onBrowserTabOpened}
@@ -569,10 +576,21 @@ describe('WorkspacePanel "+" new-tab menu', () => {
       typeof useSessionAgent
     >);
 
-  it("is hidden when the agent has no terminal access", () => {
-    // No declared terminals (default mock: data undefined) → nothing to open.
-    renderWorkspace({ showBrowserTab: false });
+  it("is hidden when nothing can be opened", () => {
+    // No declared terminals (default mock: data undefined), no browser, and no
+    // on-disk workspace → nothing to open.
+    renderWorkspace({ showBrowserTab: false, showFilesPanel: false });
     expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
+  });
+
+  it("offers Markdown file from a workspace even without terminals", async () => {
+    // A session with an on-disk workspace can always create a note, so the "+"
+    // shows "Markdown file" even with no terminals or browser.
+    renderWorkspace({ showBrowserTab: false });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    expect(await screen.findByRole("menuitem", { name: "Markdown file" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Browser" })).toBeNull();
   });
 
   it("shows the Browser and Shell shortcuts as keycaps", async () => {
@@ -955,10 +973,14 @@ describe("WorkspacePanel browser tab", () => {
     expect(await screen.findByRole("menuitem", { name: "Browser" })).toBeInTheDocument();
   });
 
-  it("omits Browser entirely when showBrowserTab is false", () => {
+  it("omits Browser entirely when showBrowserTab is false", async () => {
     renderWorkspace({ showBrowserTab: false });
     expect(screen.queryByRole("tab", { name: /browser/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
+    // The "+" still opens (a workspace is present → "Markdown file"), but it
+    // offers no Browser entry when the browser bridge is off.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    expect(await screen.findByRole("menuitem", { name: "Markdown file" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Browser" })).toBeNull();
   });
 
   it("mounts the browser pane when a browser soft tab is selected", () => {

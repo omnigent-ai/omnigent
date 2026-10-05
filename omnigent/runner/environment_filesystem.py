@@ -25,6 +25,8 @@ from omnigent.entities.environment_filesystem import (
     EditFileResult,
     FileContent,
     FilesystemEntry,
+    FilesystemOperationUnsupported,
+    FilesystemPathAlreadyExists,
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
@@ -35,6 +37,7 @@ from omnigent.entities.pagination import PagedList
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.inner.os_env import (
+    _create_impl,
     _edit_impl,
     _read_impl,
     _write_impl,
@@ -1196,6 +1199,38 @@ print(json.dumps({'r': results, 't': truncated}))
             path=path,
             created=created,
             bytes_written=bytes_written,
+            entry=entry,
+        )
+
+    async def create(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        create_parents: bool = True,  # noqa: ARG002
+    ) -> WriteFileResult:
+        """Create a file atomically without replacing an existing path."""
+        target, direct = self._write_route(path)
+        content_str = content.decode("utf-8")
+
+        if direct is not None:
+            result = await _run_impl_direct(_create_impl, direct, content_str)
+        else:
+            result = await _run_os_env_async(self._os_env.create, target, content_str)
+        if "error" in result:
+            if result.get("error_code") == "already_exists":
+                raise FilesystemPathAlreadyExists(result["error"])
+            if result.get("error_code") == "unsupported":
+                raise FilesystemOperationUnsupported(result["error"])
+            raise FilesystemPathNotFound(result.get("error", f"Create failed for {path!r}"))
+
+        full = self._resolve(path, need_write=True)
+        entry = _entry_from_stat(self._root, full, self._entry_path(full))
+        return WriteFileResult(
+            operation="create",
+            path=path,
+            created=True,
+            bytes_written=result.get("bytes_written", len(content)),
             entry=entry,
         )
 

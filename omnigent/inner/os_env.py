@@ -329,6 +329,14 @@ class OSEnvironment(ABC):
     async def write(self, path: str, content: str) -> OpResult:
         raise NotImplementedError
 
+    async def create(self, path: str, content: str) -> OpResult:
+        """Create a new file, or report that the backend does not support it."""
+        del path, content
+        return {
+            "error": "This OS environment does not support create-only file operations",
+            "error_code": "unsupported",
+        }
+
     @abstractmethod
     async def edit(
         self,
@@ -930,6 +938,17 @@ class CallerProcessOSEnvironment(OSEnvironment):
         )
         return cast(OpResult, result)
 
+    async def create(self, path: str, content: str) -> OpResult:
+        result = await run_sync_on_thread(
+            self._helper.request,
+            {
+                "op": "create",
+                "path": path,
+                "content": content,
+            },
+        )
+        return cast(OpResult, result)
+
     async def edit(
         self,
         path: str,
@@ -1095,6 +1114,25 @@ def _handle_helper_request(
         else:
             return {"error": "content must be a string"}
         return _write_impl(path, content)
+
+    if op == "create":
+        raw_path = request.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return {"error": "path must be a non-empty string"}
+        path = _resolve_path(cwd, raw_path)
+        try:
+            _assert_within_reach(cwd, sandbox, path, need_write=True)
+            _assert_write_allowed(sandbox, path)
+        except PermissionError as exc:
+            return {"error": str(exc)}
+        raw_content = request.get("content")
+        if raw_content is None:
+            content = ""
+        elif isinstance(raw_content, str):
+            content = raw_content
+        else:
+            return {"error": "content must be a string"}
+        return _create_impl(path, content)
 
     if op == "edit":
         raw_path = request.get("path")
@@ -1437,6 +1475,22 @@ def _write_impl(path: Path, content: str) -> OpResult:
         "path": str(path),
         "bytes_written": len(content.encode("utf-8")),
         "created": not existed,
+    }
+
+
+def _create_impl(path: Path, content: str) -> OpResult:
+    """Create *path* atomically, preserving any existing file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    except FileExistsError:
+        return {"error": f"Path {path} already exists", "error_code": "already_exists"}
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return {
+        "path": str(path),
+        "bytes_written": len(content.encode("utf-8")),
+        "created": True,
     }
 
 

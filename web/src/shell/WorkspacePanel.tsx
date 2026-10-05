@@ -2,6 +2,7 @@ import type { FilePosition } from "./FileViewerContext";
 import {
   BotIcon,
   FileIcon,
+  FilePlusIcon,
   FolderTreeIcon,
   FileDiffIcon,
   GlobeIcon,
@@ -14,6 +15,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { toast } from "sonner";
+import { useCreateMarkdownFile } from "@/hooks/useCreateMarkdownFile";
 import {
   type CSSProperties,
   type KeyboardEvent,
@@ -163,6 +165,8 @@ function NewTabMenu({
   onOpenTerminal,
   onOpenBrowser,
   onOpenSideChat,
+  onNewMarkdownFile,
+  newMarkdownFileDisabled = false,
   onCreateStart,
   onCreateError,
   triggerClassName,
@@ -175,6 +179,10 @@ function NewTabMenu({
   /** Open a new side chat (a fork of this conversation) as a rail tab. Absent
    *  when the session can't host one (e.g. Codex uses its typed `/side`). */
   onOpenSideChat?: () => void;
+  /** Create a new empty markdown file at the workspace root and open it. */
+  onNewMarkdownFile?: () => void;
+  /** Disable creation while the root listing is unresolved or a create is pending. */
+  newMarkdownFileDisabled?: boolean;
   /** Called when a shell create is initiated (before the POST resolves), so
    *  the shell can be focused as soon as its tab appears in the list. */
   onCreateStart?: () => void;
@@ -200,7 +208,7 @@ function NewTabMenu({
   // declare a non-empty ``terminals:`` block.
   const declaredTerminals = agent?.terminals ?? [];
   const canOpenShell = declaredTerminals.length > 0;
-  if (!canOpenShell && !onOpenBrowser && !onOpenSideChat) return null;
+  if (!canOpenShell && !onOpenBrowser && !onOpenSideChat && !onNewMarkdownFile) return null;
 
   // The default launched by the primary segment: the remembered pick when it
   // is still a declared type, else the first declared name. Non-null here since
@@ -301,6 +309,16 @@ function NewTabMenu({
           <DropdownMenuItem onSelect={onOpenSideChat} className="cursor-pointer">
             <MessagesSquareIcon className="size-4" />
             Side chat
+          </DropdownMenuItem>
+        )}
+        {onNewMarkdownFile && (
+          <DropdownMenuItem
+            onSelect={onNewMarkdownFile}
+            disabled={newMarkdownFileDisabled}
+            className="cursor-pointer"
+          >
+            <FilePlusIcon className="size-4" />
+            Markdown file
           </DropdownMenuItem>
         )}
         {canOpenShell &&
@@ -785,6 +803,8 @@ function WorkspacePanelImpl({
   onShellCreateFailed,
 }: WorkspacePanelProps) {
   const browsers = useBrowserTabs(conversationId);
+  // "Markdown file" rail action: create a unique untitled[-N].md and open it.
+  const markdownFileAction = useCreateMarkdownFile(conversationId, openFileViewer);
   const closeBrowserTab = async (tabId: string) => {
     const closed = await browsers.close(tabId);
     if (!closed) toast.error("Couldn't close browser tab. Try again.");
@@ -1312,6 +1332,8 @@ function WorkspacePanelImpl({
                 conversationId={conversationId}
                 onOpenBrowser={showBrowserTab ? addBrowser : undefined}
                 onOpenSideChat={onNewSideChat}
+                onNewMarkdownFile={showFilesPanel ? markdownFileAction.create : undefined}
+                newMarkdownFileDisabled={markdownFileAction.disabled}
                 onCreateError={onShellCreateFailed}
                 onOpenTerminal={openTerminalTab}
                 onCreateStart={onShellCreateStart}
@@ -1329,6 +1351,8 @@ function WorkspacePanelImpl({
               conversationId={conversationId}
               onOpenBrowser={showBrowserTab ? addBrowser : undefined}
               onOpenSideChat={onNewSideChat}
+              onNewMarkdownFile={showFilesPanel ? markdownFileAction.create : undefined}
+              newMarkdownFileDisabled={markdownFileAction.disabled}
               onOpenTerminal={openTerminalTab}
               onCreateStart={onShellCreateStart}
               onCreateError={onShellCreateFailed}

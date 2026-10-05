@@ -14284,6 +14284,63 @@
           "session_resources"
         ]
       },
+      "post": {
+        "description": "Create a file atomically without replacing an existing path.",
+        "operationId": "create_environment_file_v1_sessions__session_id__resources_environments__environment_id__filesystem__relative_path__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "relative_path",
+            "required": true,
+            "schema": {
+              "title": "Relative Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Environment File",
+        "tags": [
+          "session_resources"
+        ]
+      },
       "put": {
         "description": "Write/replace a file in an environment.\n\n**Returns:** Write result.",
         "operationId": "write_environment_file_v1_sessions__session_id__resources_environments__environment_id__filesystem__relative_path__put",

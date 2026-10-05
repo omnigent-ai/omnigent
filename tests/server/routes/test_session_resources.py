@@ -3179,6 +3179,18 @@ def _fs_write_payload() -> dict[str, object]:
     }
 
 
+def _fs_create_payload() -> dict[str, object]:
+    """Canned runner response for filesystem create."""
+    return {
+        "object": "session.environment.filesystem.create_result",
+        "operation": "create",
+        "path": "untitled.md",
+        "created": True,
+        "bytes_written": 0,
+        "entry": None,
+    }
+
+
 def _fs_edit_payload() -> dict[str, object]:
     """Canned runner response for filesystem edit."""
     return {
@@ -3712,6 +3724,43 @@ async def test_filesystem_write_proxies_to_runner(
             "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/new.txt",
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_create_proxies_post_to_runner(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST create uses the runner's create route, never the PUT writer."""
+    fake_runner = _FakeRunnerClient(payload=_fs_create_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    path = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/untitled.md"
+    )
+
+    resp = await client.post(path, json={"content": "", "encoding": "utf-8"})
+
+    assert resp.status_code == 200
+    assert resp.json()["operation"] == "create"
+    assert fake_runner.calls == [("POST", path)]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_create_without_runner_is_unavailable(
+    client: httpx.AsyncClient,
+) -> None:
+    """Create does not fall back to host reads or the replacement PUT path."""
+    set_runner_router(None)
+    set_runner_client(None)
+    path = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/untitled.md"
+    )
+
+    resp = await client.post(path, json={"content": "", "encoding": "utf-8"})
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "no runner available for resource access"
 
 
 @pytest.mark.asyncio

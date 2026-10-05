@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,14 +16,55 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.entities.environment_filesystem import FilesystemPathNotFound
+from omnigent.entities.environment_filesystem import (
+    FilesystemOperationUnsupported,
+    FilesystemPathNotFound,
+)
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import create_os_environment
+from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment, create_os_environment
 from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from tests.runner.helpers import NullServerClient
+
+
+class _LegacyOSEnvironment(OSEnvironment):
+    """Pre-create API environment: inherited create must fail closed."""
+
+    async def read(
+        self,
+        path: str,
+        offset: int = 1,
+        limit: int | None = None,
+        max_bytes: int | None = None,
+    ) -> OpResult:
+        del path, offset, limit, max_bytes
+        return {}
+
+    async def write(self, path: str, content: str) -> OpResult:
+        del path, content
+        return {}
+
+    async def edit(
+        self,
+        path: str,
+        *,
+        old_text: str | None = None,
+        new_text: str | None = None,
+        edits: Sequence[EditEntry] | None = None,
+    ) -> OpResult:
+        del path, old_text, new_text, edits
+        return {}
+
+    async def shell(
+        self,
+        command: str,
+        timeout: int | None = None,
+        max_output: int | None = None,
+    ) -> OpResult:
+        del command, timeout, max_output
+        return {}
 
 
 @pytest.fixture
@@ -294,6 +336,85 @@ async def test_write_file(
     assert body["created"] is True
     assert body["bytes_written"] == 11
     assert (workspace / "new.txt").read_text() == "new content"
+
+
+@pytest.mark.asyncio
+async def test_create_file_is_atomic_and_never_overwrites(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """POST creates a file once and preserves an occupied path on retry."""
+    first = await client.post(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/untitled.md",
+        json={"content": "created", "encoding": "utf-8"},
+    )
+    assert first.status_code == 201
+    assert first.json()["created"] is True
+    assert (workspace / "untitled.md").read_text() == "created"
+
+    second = await client.post(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/untitled.md",
+        json={"content": "must not replace", "encoding": "utf-8"},
+    )
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "already_exists"
+    assert (workspace / "untitled.md").read_text() == "created"
+
+    (workspace / "occupied-dir").mkdir()
+    directory = await client.post(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/occupied-dir",
+        json={"content": "must not replace", "encoding": "utf-8"},
+    )
+    assert directory.status_code == 409
+    assert directory.json()["error"]["code"] == "already_exists"
+    assert (workspace / "occupied-dir").is_dir()
+
+    results = await asyncio.gather(
+        *(
+            client.post(
+                f"/v1/sessions/conv_test/resources/environments"
+                f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/race.md",
+                json={"content": f"winner-{index}", "encoding": "utf-8"},
+            )
+            for index in range(2)
+        )
+    )
+    assert sorted(response.status_code for response in results) == [201, 409]
+    assert (workspace / "race.md").read_text() in {"winner-0", "winner-1"}
+
+    changes = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    )
+    assert changes.status_code == 200
+    assert (
+        next(item for item in changes.json()["data"] if item["path"] == "untitled.md")["status"]
+        == "created"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_os_environment_create_is_unsupported_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Backends predating create fail clearly and never touch the path."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    env = _LegacyOSEnvironment(
+        spec=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+        cwd=workspace,
+    )
+    fs = CallerProcessFilesystem(env)
+
+    with pytest.raises(FilesystemOperationUnsupported, match="does not support"):
+        await fs.create("legacy.md", b"must not be written")
+    assert not (workspace / "legacy.md").exists()
 
 
 @pytest.mark.asyncio

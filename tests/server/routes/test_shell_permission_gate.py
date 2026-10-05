@@ -465,6 +465,38 @@ async def test_filesystem_denies_edit_collaborator_writing_outside_the_workspace
 
 
 @pytest.mark.asyncio
+async def test_filesystem_create_denies_edit_collaborator_writing_outside_the_workspace(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """The create-only route keeps the absolute-path owner gate."""
+    resp = await client.post(
+        _FS_ABSOLUTE,
+        json={"content": "pwn", "encoding": "utf-8"},
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_filesystem_create_denies_view_only_collaborator_inside_workspace(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """The create-only route requires edit access inside the workspace."""
+    resp = await client.post(
+        _FS_RELATIVE,
+        json={"content": "pwn", "encoding": "utf-8"},
+        headers={"X-Forwarded-Email": "viewer@example.com"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
 async def test_filesystem_denies_read_only_collaborator_outside_the_workspace(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,

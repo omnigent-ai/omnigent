@@ -2746,6 +2746,31 @@ def register_resources_routes(
             required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
         )
 
+    @router.post(
+        "/sessions/{session_id}/resources/environments"
+        "/{environment_id}/filesystem/{relative_path:path}",
+        response_model=None,
+    )
+    async def create_environment_file(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        request: Request,
+    ) -> Any:
+        """Create a file atomically without replacing an existing path."""
+        body = await request.json()
+        _, relative_path = _resolve_browse_path(request, relative_path)
+        path = _mutating_runner_path(session_id, environment_id, relative_path)
+        return await _proxy_fs_response(
+            session_id,
+            "POST",
+            path,
+            body,
+            request=request,
+            environment_id=environment_id,
+            required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
+        )
+
     @router.patch(
         "/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}",
