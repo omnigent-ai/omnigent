@@ -71,19 +71,7 @@ class RunnerSessionInitializer:
         agent_id = conversation.agent_id
         if runner_id is None or agent_id is None:
             raise ValueError("runner session initialization requires runner_id and agent_id")
-        connection = self._registry.get(runner_id)
-        # Production routed clients always have a registry entry. The client
-        # identity fallback keeps embedded/test transports usable without
-        # weakening the real tunnel-generation key.
-        generation = id(connection) if connection is not None else id(runner_client)
-        key = (
-            runner_id,
-            generation,
-            conversation.id,
-            agent_id,
-            conversation.sub_agent_name,
-            resume_interrupted_turn,
-        )
+        key = self._key(conversation, runner_id, agent_id, runner_client, resume_interrupted_turn)
         task = self._tasks.get(key)
         if task is None:
             recovery_id = (
@@ -167,6 +155,45 @@ class RunnerSessionInitializer:
         if response.status_code >= 400 and self._tasks.get(key) is task:
             self._tasks.pop(key, None)
         return response
+
+    def _key(
+        self,
+        conversation: Conversation,
+        runner_id: str,
+        agent_id: str,
+        runner_client: httpx.AsyncClient,
+        resume_interrupted_turn: bool,
+    ) -> tuple[str, int, str, str, str | None, bool]:
+        """Return the readiness key for one session on the current tunnel generation."""
+        connection = self._registry.get(runner_id)
+        # Production routed clients always have a registry entry. The client
+        # identity fallback keeps embedded/test transports usable without
+        # weakening the real tunnel-generation key.
+        generation = id(connection) if connection is not None else id(runner_client)
+        return (
+            runner_id,
+            generation,
+            conversation.id,
+            agent_id,
+            conversation.sub_agent_name,
+            resume_interrupted_turn,
+        )
+
+    def init_in_flight(self, conversation: Conversation, runner_client: httpx.AsyncClient) -> bool:
+        """
+        Return whether this session's init on the current tunnel is still running.
+
+        :param conversation: Session whose init to look up.
+        :param runner_client: Client routed to the session's runner.
+        :returns: ``True`` while the shared init request has not finished.
+        """
+        if conversation.runner_id is None or conversation.agent_id is None:
+            return False
+        key = self._key(
+            conversation, conversation.runner_id, conversation.agent_id, runner_client, False
+        )
+        task = self._tasks.get(key)
+        return task is not None and not task.done()
 
     def invalidate_session(self, session_id: str) -> None:
         """A new binding needs fresh readiness and a new continuation identity."""

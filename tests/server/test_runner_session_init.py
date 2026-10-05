@@ -94,6 +94,32 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_initializer_reports_init_in_flight_until_it_finishes() -> None:
+    registry = _Registry()
+    client = _Client()
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        registry,
+        server_version="0.6.0.dev0",
+    )
+    conversation = _conversation()
+
+    assert not initializer.init_in_flight(conversation, client)  # type: ignore[arg-type]
+    pending = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    await client.entered.wait()
+    assert initializer.init_in_flight(conversation, client)  # type: ignore[arg-type]
+
+    # A new tunnel generation is a different init, not the one in flight.
+    original = registry.connection
+    registry.connection = object()
+    assert not initializer.init_in_flight(conversation, client)  # type: ignore[arg-type]
+    registry.connection = original
+
+    client.release.set()
+    await pending
+    assert not initializer.init_in_flight(conversation, client)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
 async def test_initializer_evicts_rejected_result_for_retry() -> None:
     registry = _Registry()
     client = _Client()

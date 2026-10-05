@@ -2632,6 +2632,18 @@ def register_events_routes(
                     runner_router=runner_router,
                 )
         native_terminal_ready = False
+        _initializer = getattr(request.app.state, "runner_session_initializer", None)
+        if (
+            not _runner_needs_session_init
+            and runner_client is not None
+            and _initializer is not None
+            and _is_native_terminal_session(conv)
+            and _initializer.init_in_flight(conv, runner_client)
+        ):
+            # The runner just connected and its init is still creating the native
+            # terminal (e.g. a side chat's first message). Wait for it rather than
+            # sending a terminal ensure that would race init to build a second one.
+            _runner_needs_session_init = True
         if _runner_needs_session_init:
             # The runner was unavailable when this request began, so its
             # connect callback may still be racing us. Await the handshake
@@ -2654,7 +2666,7 @@ def register_events_routes(
                 conv,
                 runner_client,
                 conversation_store,
-                initializer=getattr(request.app.state, "runner_session_initializer", None),
+                initializer=_initializer,
                 suppress_recovery_turn=True,
             )
         await _ensure_runner_relay_ready(
