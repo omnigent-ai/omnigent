@@ -7530,7 +7530,8 @@ async def _relay_runner_stream_once(
     One connection attempt: transport loss raises
     :class:`_RelayTransportLost` for the :func:`_relay_runner_stream`
     supervisor, which retries inside the disconnect grace and owns the
-    terminal failure / quiet-stop handling.
+    terminal failure / quiet-stop handling. A natural HTTP EOF without the
+    runner's ``[DONE]`` sentinel is transport loss too.
 
     Long-lived background task that opens
     ``GET /v1/sessions/{id}/stream`` on the runner and publishes
@@ -8244,6 +8245,13 @@ async def _relay_runner_stream_once(
                             )
                         continue
                     session_stream.publish(session_id, event)
+
+            # Treat a bare EOF without ``[DONE]`` as a tunnel drop.
+            # Route it through the existing bounded recovery path.
+            raise _RelayTransportLost(
+                intentional=session_id in _intentional_stop_sessions,
+                stream_ready=heartbeat_seen,
+            )
 
     except (httpx.HTTPError, ConnectionError) as exc:
         if isinstance(exc, httpx.HTTPStatusError):

@@ -12,6 +12,7 @@ import pytest
 from omnigent.runtime import session_stream
 from omnigent.server.routes._sessions import orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.server.helpers import start_session_stream_collector
 
 
 class _RelayClock:
@@ -43,6 +44,17 @@ class _InterruptedStream(httpx.AsyncByteStream):
         raise httpx.ReadError("test stream interrupted")
 
 
+class _NaturalEofStream(httpx.AsyncByteStream):
+    """Stream that ends without a terminal SSE sentinel."""
+
+    def __init__(self, *frames: bytes) -> None:
+        self.frames = frames
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for frame in self.frames:
+            yield frame
+
+
 @pytest.fixture
 def relay_clock(monkeypatch: pytest.MonkeyPatch) -> _RelayClock:
     clock = _RelayClock()
@@ -53,6 +65,112 @@ def relay_clock(monkeypatch: pytest.MonkeyPatch) -> _RelayClock:
     monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 10.0)
     monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 1.0)
     return clock
+
+
+@pytest.mark.asyncio
+async def test_natural_eof_reconnects_and_recovers_lifecycle(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An abrupt successful HTTP EOF must use the relay recovery window."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    session_id = conversation.id
+    orchestration._session_status_cache.pop(session_id, None)
+    attempts = 0
+    collector = await start_session_stream_collector(session_id)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal attempts
+        attempts += 1
+        heartbeat = b'data: {"type":"session.heartbeat"}\n\n'
+        if attempts == 1:
+            # The runner reported a live turn, then the HTTP body ended before
+            # its terminal lifecycle event or the stream's [DONE] sentinel.
+            return httpx.Response(
+                200,
+                stream=_NaturalEofStream(
+                    heartbeat,
+                    b'data: {"type":"session.status","status":"running"}\n\n',
+                ),
+            )
+        return httpx.Response(
+            200,
+            stream=_NaturalEofStream(
+                heartbeat,
+                b'data: {"type":"session.status","status":"idle"}\n\n',
+                b"data: [DONE]\n\n",
+            ),
+        )
+
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 10.0)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.0)
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://runner", transport=httpx.MockTransport(respond)
+        ) as client:
+            task = asyncio.create_task(
+                orchestration._relay_runner_stream(session_id, client, store)
+            )
+            try:
+                statuses: list[str] = []
+                while len(statuses) < 2:
+                    event = await collector.next_event(timeout=10.0)
+                    if event.get("type") == "session.status":
+                        statuses.append(event["status"])
+                await asyncio.wait_for(task, timeout=10.0)
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        assert attempts == 2
+        assert statuses == ["running", "idle"]
+        assert orchestration._session_status_cache[session_id] == "idle"
+    finally:
+        await collector.stop()
+        orchestration._session_status_cache.pop(session_id, None)
+        orchestration._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_persistent_natural_eof_exhausts_disconnect_grace(
+    db_uri: str, relay_clock: _RelayClock
+) -> None:
+    """Repeated EOFs fail through the existing bounded grace decision."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    session_id = conversation.id
+    orchestration._session_status_cache[session_id] = "running"
+    attempts = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal attempts
+        attempts += 1
+        relay_clock.now += 4.0
+        return httpx.Response(
+            200,
+            stream=_NaturalEofStream(b'data: {"type":"session.status","status":"running"}\n\n'),
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://runner", transport=httpx.MockTransport(respond)
+        ) as client:
+            await asyncio.wait_for(
+                orchestration._relay_runner_stream(session_id, client, store), timeout=10
+            )
+        assert attempts == 3
+        assert orchestration._session_status_cache[session_id] == "failed"
+        persisted = store.get_conversation(session_id)
+        assert persisted is not None
+        assert persisted.labels["omnigent.last_task_error_code"] == "runner_disconnected"
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+        orchestration._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
 
 
 @pytest.mark.asyncio
