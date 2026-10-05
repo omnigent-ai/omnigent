@@ -96,16 +96,17 @@ The stored name keeps its template in Automations; each session title expands
 placeholders at worker start in the automation's timezone. Month and weekday
 names are English, and the prompt is never templated.
 
-Tokens are case-sensitive: YYYY (year), MMMM / MMM (month name), MM (month
-number), DD (day), dddd / ddd (weekday), HH (hour), and mm (minute). Mon is an
-alias for MMM. Minutes need HH in the same placeholder; use {{HH:mm}} (MM means
-month). Separate whole tokens with spaces or - / . : , _; compact runs like
-{{YYYYMMDD}} are invalid, so use adjacent placeholders: {{YYYY}}{{MM}}{{DD}}.
-Write \{{ for a literal {{.
+Tokens are case-sensitive: `YYYY` (year), `MMMM` / `MMM` (month name), `MM`
+(month number), `DD` (day), `dddd` / `ddd` (weekday), `HH` (hour), and `mm`
+(minute). `Mon` is an alias for `MMM`. Minutes need `HH` in the same
+placeholder; use `{{HH:mm}}` (`MM` means month). Separate whole tokens with
+spaces or `-` / `/` / `.` / `:` / `,` / `_`; compact runs like `{{YYYYMMDD}}`
+are invalid, so use adjacent placeholders: `{{YYYY}}{{MM}}{{DD}}`. Write `\{{`
+for a literal `{{`.
 
-Names without {{ stay unchanged. Invalid templates return HTTP 400 on create or
-rename with the supported-token list. If a stored name cannot render, the whole
-literal name is used and the run continues.
+Names without `{{` stay unchanged. Invalid templates return HTTP 400 on create
+or rename with the supported-token list. If a stored name cannot render, the
+whole literal name is used and the run continues.
 
 ## Schedules are RRULEs, not cron
 

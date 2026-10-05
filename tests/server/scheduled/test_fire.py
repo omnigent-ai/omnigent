@@ -18,6 +18,7 @@ unit-tested without a live host/runner.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -586,8 +587,9 @@ async def test_session_name_uses_worker_start_in_task_timezone(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["invalid", "timezone", "unexpected"])
 async def test_session_name_failure_uses_literal_name(
-    monkeypatch: pytest.MonkeyPatch, failure: str
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
 ) -> None:
+    caplog.set_level(logging.WARNING, logger=fire_mod.__name__)
     task = _task(name="Deploy {{env}} {{YYYY}}")
     if failure == "timezone":
         task = _task(name="Deploy {{YYYY}}", timezone="unknown/timezone")
@@ -604,6 +606,16 @@ async def test_session_name_failure_uses_literal_name(
     assert conversations.created[0]["title"] == task.name
     assert store.runs[0]["status"] == "running"
     launch.assert_awaited_once()
+    record = next(
+        record for record in caplog.records if "name rendering failed" in record.getMessage()
+    )
+    expected_level, expected_exc_info = {
+        "invalid": (logging.WARNING, False),
+        "timezone": (logging.WARNING, False),
+        "unexpected": (logging.ERROR, True),
+    }[failure]
+    assert record.levelno == expected_level
+    assert (record.exc_info is not None) is expected_exc_info
 
 
 async def _drain() -> None:
