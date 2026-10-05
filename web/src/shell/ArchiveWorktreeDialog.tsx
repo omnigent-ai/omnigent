@@ -103,6 +103,7 @@ function ArchiveWorktreeDialog({
     >
       {open && (
         <DialogContent
+          className="sm:max-w-lg"
           // Keep dialog clicks off a surrounding sidebar row Link.
           onClick={(e) => e.stopPropagation()}
           data-testid="archive-worktree-dialog"
@@ -131,9 +132,7 @@ function ArchiveWorktreeDialog({
               </label>
             </div>
             <p className="pl-6 text-sm text-muted-foreground">
-              {remember
-                ? "The button you pick becomes your setting. Change it any time in Settings › Git."
-                : "You can change this any time in Settings › Git."}
+              You can change this any time in Settings › Git.
             </p>
           </div>
           <DialogFooter className="border-t-0 bg-transparent">
