@@ -4,6 +4,8 @@ import { readFixtureFile } from "@/test/designSystemFixture";
 import { DESIGN_SYSTEM_POINTER, parseDesignSystemPointer } from "./designSystem";
 import {
   IMPORT_CONCURRENCY,
+  MAX_LISTED_ENTRIES,
+  MAX_WALK_DEPTH,
   importDesignSystem,
   listDesignSystemSource,
   planDesignSystemImport,
@@ -14,7 +16,7 @@ import { DS_ASSET_MAX_BYTES, DS_DECK_MAX_BYTES } from "./designSystemInjection";
 
 const SOURCE = "/Users/me/brand/acme";
 const MB = 1024 * 1024;
-const file = (path: string, bytes = 10): SourceFile => ({ path, bytes });
+const file = (path: string, bytes: number | null = 10): SourceFile => ({ path, bytes });
 
 /** A host listing over a synthetic tree: folder path to entries. */
 function hostTree(tree: Record<string, [string, "file" | "directory", number?][]>) {
@@ -69,6 +71,75 @@ describe("listDesignSystemSource", () => {
     await expect(listDesignSystemSource(SOURCE, list)).rejects.toThrow(
       `${SOURCE} has too many files to import`,
     );
+  });
+
+  it("stops a symlinked folder loop at the depth cap, a few listings at a time", async () => {
+    let active = 0;
+    let peak = 0;
+    let calls = 0;
+    // fonts/self -> .. is followed by the host listing, so every level repeats.
+    const list = vi.fn(async (dir: string) => {
+      calls += 1;
+      if (calls > 500) throw new Error("runaway walk");
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((r) => {
+        setTimeout(r, 1);
+      });
+      active -= 1;
+      const names: [string, "file" | "directory"][] =
+        dir === SOURCE
+          ? [["fonts", "directory"]]
+          : [
+              ["a.woff2", "file"],
+              ["self", "directory"],
+              ["other", "directory"],
+            ];
+      return {
+        truncated: false,
+        entries: names.map(([name, type]): HostFilesystemEntry => ({
+          name,
+          path: `${dir}/${name}`,
+          type,
+          bytes: type === "file" ? 10 : null,
+          modified_at: 1,
+        })),
+      };
+    });
+    const source = await listDesignSystemSource(SOURCE, list);
+    const deepest = Math.max(...source.files.map((f) => f.path.split("/").length - 1));
+    expect(deepest).toBe(MAX_WALK_DEPTH);
+    expect(
+      source.skipped?.some((s) => s.reason === `nested deeper than ${MAX_WALK_DEPTH} folders`),
+    ).toBe(true);
+    expect(peak).toBeLessThanOrEqual(IMPORT_CONCURRENCY);
+    expect(list.mock.calls.length).toBeLessThanOrEqual(2 ** MAX_WALK_DEPTH);
+  });
+
+  it("stops walking once the listed entries pass the cap", async () => {
+    const many = (n: number) =>
+      Array.from({ length: n }, (_, i): [string, "file"] => [`${i}.svg`, "file"]);
+    const list = hostTree({
+      [SOURCE]: [["assets", "directory"]],
+      [`${SOURCE}/assets`]: [
+        ["a", "directory"],
+        ["b", "directory"],
+        ["c", "directory"],
+      ],
+      [`${SOURCE}/assets/a`]: many(900),
+      [`${SOURCE}/assets/b`]: many(900),
+      [`${SOURCE}/assets/c`]: many(900),
+    });
+    const source = await listDesignSystemSource(SOURCE, list);
+    expect(source.files.length).toBeLessThanOrEqual(MAX_LISTED_ENTRIES);
+    expect(source.skipped).toContainEqual({
+      path: "assets/c/",
+      reason: `over the ${MAX_LISTED_ENTRIES}-entry listing limit`,
+    });
+    expect(planDesignSystemImport(source).skipped).toContainEqual({
+      path: "assets/c/",
+      reason: `over the ${MAX_LISTED_ENTRIES}-entry listing limit`,
+    });
   });
 });
 
@@ -128,6 +199,19 @@ describe("planDesignSystemImport", () => {
       ...big.slice(9).map((f) => ({ path: f.path, reason: "over the 20 MB total" })),
       { path: "fonts/huge.ttf", reason: "larger than 2 MB" },
     ]);
+  });
+
+  it("treats a missing listing size as unknown, not zero", async () => {
+    const list = hostTree({ [SOURCE]: [["fonts", "directory"]], [`${SOURCE}/fonts`]: [] });
+    list.mockResolvedValueOnce({
+      truncated: false,
+      entries: [
+        { name: "SKILL.md", path: `${SOURCE}/SKILL.md`, type: "file", bytes: null, modified_at: 1 },
+      ],
+    });
+    const source = await listDesignSystemSource(SOURCE, list);
+    expect(source.files).toEqual([file("SKILL.md", null)]);
+    expect(planDesignSystemImport(source).files).toEqual([file("SKILL.md", null)]);
   });
 
   it("rejects names that could leave the import folder", () => {
@@ -207,6 +291,33 @@ describe("importDesignSystem", () => {
       { path: "assets/logo.svg", message: "507 Insufficient Storage" },
     ]);
     expect(write.mock.calls.map(([p]) => p)).not.toContain(DESIGN_SYSTEM_POINTER);
+    expect(write.mock.calls.map(([p]) => p)).not.toContain(".omnigent/design-system/SKILL.md");
+  });
+
+  it("checks the read size against the caps, not the listing", async () => {
+    const twoMb = "x".repeat(2 * MB);
+    const grown: ImportPlan = {
+      files: [
+        file("SKILL.md", null),
+        ...Array.from({ length: 11 }, (_, i) => file(`assets/${i}.svg`)),
+      ],
+      skipped: [],
+      totalBytes: 100,
+    };
+    const write = vi.fn(async (_path: string) => {});
+    const result = await importDesignSystem(grown, ref, {
+      read: async (rel) => ({
+        encoding: "utf-8",
+        content: rel === "SKILL.md" ? `${twoMb}x` : twoMb,
+        bytes: 10,
+      }),
+      write,
+      onProgress: () => {},
+    });
+    expect(result.ref).toBeNull();
+    expect(result.errors).toContainEqual({ path: "SKILL.md", message: "larger than 2 MB" });
+    expect(result.errors.filter((e) => e.message === "over the 20 MB total")).toHaveLength(1);
+    expect(write).toHaveBeenCalledTimes(10);
     expect(write.mock.calls.map(([p]) => p)).not.toContain(".omnigent/design-system/SKILL.md");
   });
 

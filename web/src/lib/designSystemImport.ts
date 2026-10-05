@@ -18,6 +18,8 @@ export const IMPORT_FILES = [DS_SKILL, "README.md", DS_MANIFEST, DS_STYLESHEET];
 export const IMPORT_FOLDERS = ["fonts", "assets", "templates", "slides"];
 export const NEVER_IMPORTED = ["uploads", "ui_kits", "preview"];
 export const IMPORT_CONCURRENCY = 4;
+export const MAX_WALK_DEPTH = 8;
+export const MAX_LISTED_ENTRIES = 2000;
 // The viewer's image and font types, plus the text the agent and viewer read.
 const IMPORT_EXTENSIONS = new Set([
   ...Object.keys(IMAGE_MIME),
@@ -29,21 +31,28 @@ const IMPORT_EXTENSIONS = new Set([
 ]);
 const MB = 1024 * 1024;
 
-/** A file relative to the design-system folder. */
+/** A file relative to the design-system folder; `bytes` is `null` when unknown. */
 export interface SourceFile {
   path: string;
-  bytes: number;
+  bytes: number | null;
+}
+
+interface Skipped {
+  path: string;
+  reason: string;
 }
 
 export interface SourceListing {
   files: SourceFile[];
   /** Top-level folder names, so never-imported ones can be reported. */
   folders: string[];
+  /** Folders the walk stopped at (too deep, or past the entry cap). */
+  skipped?: Skipped[];
 }
 
 export interface ImportPlan {
   files: SourceFile[];
-  skipped: { path: string; reason: string }[];
+  skipped: Skipped[];
   totalBytes: number;
 }
 
@@ -60,17 +69,69 @@ async function listAll(dir: string, list: ListHostDir) {
   return listing.entries;
 }
 
-async function walk(dir: string, rel: string, list: ListHostDir): Promise<SourceFile[]> {
-  const entries = await listAll(dir, list);
-  const files = entries
-    .filter((e) => e.type === "file")
-    .map((e) => ({ path: `${rel}/${e.name}`, bytes: e.bytes ?? 0 }));
-  const nested = await Promise.all(
-    entries
-      .filter((e) => e.type === "directory")
-      .map((e) => walk(e.path, `${rel}/${e.name}`, list)),
-  );
-  return [...files, ...nested.flat()];
+/** Run `fn` over `items` a few at a time. */
+async function eachLimited<T>(items: T[], fn: (item: T, index: number) => Promise<void>) {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++;
+      // oxlint-disable-next-line no-await-in-loop
+      await fn(items[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: IMPORT_CONCURRENCY }, worker));
+}
+
+interface Dir {
+  path: string;
+  rel: string;
+}
+
+// Breadth-first and capped, since the host listing follows symlinked folders.
+async function walk(roots: Dir[], list: ListHostDir) {
+  const files: SourceFile[] = [];
+  const skipped: Skipped[] = [];
+  let listed = 0;
+  let level = roots;
+  for (let depth = 1; level.length; depth++) {
+    const found: { files: SourceFile[]; dirs: Dir[] }[] = [];
+    // oxlint-disable-next-line no-await-in-loop
+    await eachLimited(level, async (dir, i) => {
+      if (listed > MAX_LISTED_ENTRIES) return;
+      const entries = await listAll(dir.path, list);
+      listed += entries.length;
+      if (listed > MAX_LISTED_ENTRIES) {
+        skipped.push({
+          path: `${dir.rel}/`,
+          reason: `over the ${MAX_LISTED_ENTRIES}-entry listing limit`,
+        });
+        return;
+      }
+      found[i] = {
+        files: entries
+          .filter((e) => e.type === "file")
+          .map((e) => ({ path: `${dir.rel}/${e.name}`, bytes: e.bytes })),
+        dirs: entries
+          .filter((e) => e.type === "directory")
+          .map((e) => ({ path: e.path, rel: `${dir.rel}/${e.name}` })),
+      };
+    });
+    const next: Dir[] = [];
+    for (const f of found) {
+      if (!f) continue;
+      files.push(...f.files);
+      if (depth < MAX_WALK_DEPTH) next.push(...f.dirs);
+      else
+        skipped.push(
+          ...f.dirs.map((d) => ({
+            path: `${d.rel}/`,
+            reason: `nested deeper than ${MAX_WALK_DEPTH} folders`,
+          })),
+        );
+    }
+    level = listed > MAX_LISTED_ENTRIES ? [] : next;
+  }
+  return { files, skipped };
 }
 
 /** List the allowlisted files under `folder`; other folders are never walked. */
@@ -81,12 +142,17 @@ export async function listDesignSystemSource(
   const top = await listAll(folder, list);
   const files = top
     .filter((e) => e.type === "file" && IMPORT_FILES.includes(e.name))
-    .map((e) => ({ path: e.name, bytes: e.bytes ?? 0 }));
+    .map((e) => ({ path: e.name, bytes: e.bytes }));
   const dirs = top.filter((e) => e.type === "directory");
-  const nested = await Promise.all(
-    dirs.filter((e) => IMPORT_FOLDERS.includes(e.name)).map((e) => walk(e.path, e.name, list)),
+  const nested = await walk(
+    dirs.filter((e) => IMPORT_FOLDERS.includes(e.name)).map((e) => ({ path: e.path, rel: e.name })),
+    list,
   );
-  return { files: [...files, ...nested.flat()], folders: dirs.map((e) => e.name) };
+  return {
+    files: [...files, ...nested.files],
+    folders: dirs.map((e) => e.name),
+    skipped: nested.skipped,
+  };
 }
 
 function skipReason(file: SourceFile): string | null {
@@ -106,18 +172,20 @@ export function planDesignSystemImport(source: SourceListing): ImportPlan {
   const sorted = [...source.files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   for (const file of sorted) {
     let reason = skipReason(file);
-    if (!reason && file.bytes > DS_ASSET_MAX_BYTES) {
+    const bytes = file.bytes ?? 0;
+    if (!reason && bytes > DS_ASSET_MAX_BYTES) {
       reason = `larger than ${DS_ASSET_MAX_BYTES / MB} MB`;
-    } else if (!reason && plan.totalBytes + file.bytes > DS_DECK_MAX_BYTES) {
+    } else if (!reason && plan.totalBytes + bytes > DS_DECK_MAX_BYTES) {
       reason = `over the ${DS_DECK_MAX_BYTES / MB} MB total`;
     }
     if (reason) {
       plan.skipped.push({ path: file.path, reason });
     } else {
       plan.files.push(file);
-      plan.totalBytes += file.bytes;
+      plan.totalBytes += bytes;
     }
   }
+  plan.skipped.push(...(source.skipped ?? []));
   for (const name of [...source.folders].sort()) {
     if (NEVER_IMPORTED.includes(name))
       plan.skipped.push({ path: `${name}/`, reason: "never imported" });
@@ -133,10 +201,22 @@ export interface ImportDeps {
   onProgress: (done: number, total: number) => void;
 }
 
-async function copyOne(file: SourceFile, deps: ImportDeps): Promise<void> {
+function decodedBytes({ content, encoding }: KitFile): number {
+  if (encoding === "utf-8") return new TextEncoder().encode(content).length;
+  return Math.floor((content.length * 3) / 4) - (content.match(/=*$/)?.[0].length ?? 0);
+}
+
+// Sizes are checked on the read content, since a listing size can be missing or stale.
+async function copyOne(file: SourceFile, deps: ImportDeps, total: { bytes: number }) {
   const found = await deps.read(file.path);
   if (!found) throw new Error("not found");
   if (found.truncated) throw new Error("too long to import (the read was truncated)");
+  const bytes = decodedBytes(found);
+  if (bytes > DS_ASSET_MAX_BYTES) throw new Error(`larger than ${DS_ASSET_MAX_BYTES / MB} MB`);
+  if (total.bytes + bytes > DS_DECK_MAX_BYTES) {
+    throw new Error(`over the ${DS_DECK_MAX_BYTES / MB} MB total`);
+  }
+  total.bytes += bytes;
   await deps.write(`${DESIGN_SYSTEM_IMPORT_DIR}/${file.path}`, found.content, found.encoding);
 }
 
@@ -150,23 +230,17 @@ export async function importDesignSystem(
   deps: ImportDeps,
 ): Promise<{ errors: ImportError[]; ref: DesignSystemRef | null }> {
   const failed = new Map<number, ImportError>();
-  let next = 0;
+  const total = { bytes: 0 };
   let done = 0;
-  const worker = async () => {
-    while (next < plan.files.length) {
-      const index = next++;
-      const file = plan.files[index];
-      try {
-        // oxlint-disable-next-line no-await-in-loop
-        await copyOne(file, deps);
-      } catch (e) {
-        failed.set(index, { path: file.path, message: e instanceof Error ? e.message : String(e) });
-      }
-      done += 1;
-      deps.onProgress(done, plan.files.length);
+  await eachLimited(plan.files, async (file, index) => {
+    try {
+      await copyOne(file, deps, total);
+    } catch (e) {
+      failed.set(index, { path: file.path, message: e instanceof Error ? e.message : String(e) });
     }
-  };
-  await Promise.all(Array.from({ length: IMPORT_CONCURRENCY }, worker));
+    done += 1;
+    deps.onProgress(done, plan.files.length);
+  });
   const errors = [...failed.entries()].sort(([a], [b]) => a - b).map(([, e]) => e);
   if (errors.length) return { errors, ref: null };
   const ref: DesignSystemRef = {
