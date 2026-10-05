@@ -286,6 +286,7 @@ export function SideChatPane({
                   bubble={bubble}
                   isLastAssistant={index === lastAssistantIndex}
                   showsWorking={showsWorking}
+                  recoveryDisabled={readOnly}
                 />
               ))}
               {shouldShowWorkingIndicator(showsWorking, bubbles) && <WorkingIndicator />}
