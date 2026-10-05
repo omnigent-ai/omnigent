@@ -458,7 +458,14 @@ async function runInteractiveLogin(origin, { signal } = {}) {
   return { tokens, issuerOrigin };
 }
 
+/** Resolves once any refresh already running for `origin` has persisted or failed. */
+async function whenRefreshSettled(origin) {
+  await inflightRefresh.get(tokenStore.key(origin))?.catch(() => {});
+}
+
 module.exports = {
+  deleteStoredToken,
+  whenRefreshSettled,
   runInteractiveLogin,
   getValidStoredToken,
   expireStoredAccessToken,

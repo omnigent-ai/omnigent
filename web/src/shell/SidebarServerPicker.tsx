@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { CheckIcon, ChevronUpIcon, PlusIcon, ServerIcon } from "lucide-react";
+import { CheckIcon, ChevronUpIcon, LogOutIcon, PlusIcon, ServerIcon } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -12,6 +13,7 @@ import {
 import {
   getServerPicker,
   openServerSetup,
+  signOutOfServer,
   switchServer,
   type ServerPickerInfo,
 } from "@/lib/nativeBridge";
@@ -76,7 +78,8 @@ function serverKey(url: string): string | null {
  * A sidebar row (server glyph + current host + an upward chevron) that opens a
  * menu of organization-provided and recently-connected servers — selecting one
  * re-points the whole window via the shell — plus "Connect to new server…",
- * which returns the window to the shell's setup page.
+ * which returns the window to the shell's setup page, and "Sign out" when the
+ * shell owns the current server's sign-in.
  *
  * This deliberately lives at the bottom of the sidebar rather than in the
  * chat surface's top strip. The macOS shell hides the native title bar
@@ -265,6 +268,24 @@ export function SidebarServerPicker() {
             <PlusIcon className="size-4 shrink-0" />
             Connect to new server…
           </DropdownMenuItem>
+          {info.canSignOut ? (
+            // The next Connect signs in through the browser, which is how a
+            // user switches accounts.
+            <DropdownMenuItem
+              className="gap-2"
+              onSelect={() =>
+                void signOutOfServer().then((ok) => {
+                  // On success the shell navigates every window away; only a
+                  // failure leaves this page to report it.
+                  if (!ok) toast.error(`Couldn't sign out of ${currentHost}`);
+                })
+              }
+              data-testid="sidebar-server-sign-out"
+            >
+              <LogOutIcon className="size-4 shrink-0" />
+              <span className="min-w-0 truncate">Sign out of {currentHost}</span>
+            </DropdownMenuItem>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
