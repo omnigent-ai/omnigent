@@ -1,9 +1,10 @@
 # Design page
 
 The Design page (`/design`, "Design" in the sidebar under Inbox and Canvas)
-shows every `*.slides.html` deck found in the workspaces of the 50 most recent
-top-level sessions as cards grouped by workspace, lets the user ask for a new
-deck without leaving the page, and opens any deck in a studio: the session's
+shows every `*.slides.html` deck and `*.wireframe.html` wireframe found in the
+workspaces of the 50 most recent top-level sessions as cards grouped by
+workspace, lets the user ask for a new deck or wireframe without leaving the
+page, and opens any design in a studio: the session's
 compact chat beside a live preview that updates as the agent writes. It is
 behind the default-off `design` release feature (`OMNIGENT_FEATURES=design`).
 Deck reads use the existing session, host filesystem, and file APIs; the
@@ -16,13 +17,15 @@ server deck index (`GET /v1/design/artifacts`) lists decks across sessions.
 - `design-landing`: the header ("Design", "Slides your agents made, on brand",
   Refresh, New design) above deck cards in a responsive grid, one group per
   workspace labelled with the session's project name or the folder name. A card
-  shows the deck name, its path, and the session title. Decks under
-  `.worktrees/` or `node_modules/` are left out.
+  shows the design name, a "Slides" or "Wireframe" badge, its path, and the
+  session title. Designs under `.worktrees/`, `node_modules/`, or
+  `.omnigent/design-system/` are left out.
 - `design-index`: the server records every `*.slides.html` and
   `*.wireframe.html` written through `sys_os_write`, `sys_os_edit`, the file
   PUT/PATCH/DELETE routes, or a native harness file tool. The landing lists
-  decks from it, scans only sessions whose runner or host is live, and sends
-  each successful scan to `PUT /v1/sessions/{id}/design-artifacts`. Decks of
+  both kinds from it, scans only sessions whose runner or host is live (one
+  search for both suffixes), and sends each successful scan to
+  `PUT /v1/sessions/{id}/design-artifacts` once per kind. Decks of
   offline sessions show under an "Unavailable" row; a deck read that returns
   404 drops it from the index. An older server (404) falls back to the scan.
   Covered by `tests/server/routes/test_design_artifacts.py`,
@@ -66,19 +69,22 @@ server deck index (`GET /v1/design/artifacts`) lists decks across sessions.
   written, as `{"path": ".omnigent/design-system", "imported_from": "<folder>"}`,
   so collaborators with workspace file access see the branding. Decks inside
   the copy are left out of the landing and the server index.
-- `design-new`: the New design dialog takes a prompt, an agent (the last one
+- `design-new`: the New design dialog takes Slides or Wireframe (Slides by
+  default), a prompt, an agent (the last one
   used for a design, else the default), an online host, and a folder (the last
   one used on that host). It shows "Kit found" or "No kit" for the folder,
   creates the session, sends the prompt plus the slide-decks instructions for
-  `decks/<slug>.slides.html` (with `-2`, `-3` when the name is taken), and opens
-  the studio. A failure keeps the dialog, the prompt, and the error; a failed
+  `decks/<slug>.slides.html` or the wireframes instructions for
+  `wireframes/<slug>.wireframe.html` (with `-2`, `-3` when the name is taken),
+  and opens the studio. A failure keeps the dialog, the prompt, and the error; a failed
   first message retries on the same session.
 - `design-studio`: "Back to designs", the session's chat (full history) beside
-  the deck preview, and "Open in session".
+  the deck or wireframe preview (the viewer in `feature-map/wireframes.md` for
+  `*.wireframe.html`), and "Open in session".
 - `design-full`: the Preview | Full toggle hides the chat; it is kept in the URL
   as `view=full`. The viewer's own fullscreen button still presents.
-- `design-waiting`: until the deck exists the preview shows "Waiting for the
-  first slide" with the working indicator; after the turn ends without it,
+- `design-waiting`: until the design exists the preview shows "Waiting for the
+  first slide" ("first screen" for a wireframe) with the working indicator; after the turn ends without it,
   "The agent has not written `<path>` yet", with the chat still usable.
 - `design-live`: the session's changed-files event refetches the open deck
   about a second after each write, and the deck refetches when the turn ends.
@@ -91,7 +97,8 @@ server deck index (`GET /v1/design/artifacts`) lists decks across sessions.
   returns to the preview.
 - `design-loading`: each group shows a skeleton while its search runs; finished
   groups render without waiting for the rest.
-- `design-empty`: no decks anywhere shows "No decks yet..." and the chips.
+- `design-empty`: no designs anywhere shows "No designs yet. Ask an agent for
+  a slide deck or a wireframe; ..." and the chips.
 - `design-unavailable`: a workspace whose search returns 404 or 503 shows
   "Unavailable: open the session to start its runner" with a session link.
 - `design-error`: any other search failure shows the error and a Retry button.
@@ -142,6 +149,11 @@ need the flag set.
 - Nav and route gating: `cd web && pnpm exec vitest run src/shell/Sidebar.test.tsx src/App.test.tsx`.
 - Desktop app: no test. Launch with `just electron-dev` against the instance,
   choose Design, open a card, and check the chat, preview, and Full toggle.
+- Wireframe, by hand: choose New design, then Wireframe, enter "Sign-up flow",
+  create, and check the first message names the wireframes skill and
+  `wireframes/sign-up-flow.wireframe.html`, the preview waits for the first
+  screen and then shows the wireframe viewer, and the landing card has the
+  Wireframe badge. Create a second one with the same prompt to get `-2`.
 - Live build, by hand: choose New design with a real agent and host, create,
   and watch the preview go from "Waiting for the first slide" to one slide, then
   grow a slide at a time while the counter updates and the current slide stays.
@@ -191,9 +203,9 @@ need the flag set.
 - The indicator reads `kit.json` alone, so a kit whose assets are missing can
   show its name here and still show "Design kit not applied" in the viewer.
 - Search returns at most 500 matches per workspace.
-- The slug check uses the landing's decks for that folder plus the folder's
-  `decks/` listing on the host; a deck elsewhere in the folder with the same
-  name does not count.
+- The slug check uses the landing's designs of the chosen kind for that folder
+  plus the folder's `decks/` or `wireframes/` listing on the host; a design
+  elsewhere in the folder with the same name does not count.
 - The changed-files event only arrives while the session's stream is bound;
   the studio keeps it bound even in Full mode and on the phone preview.
 - The flag is read at page boot; reload after changing `OMNIGENT_FEATURES`.
