@@ -30,7 +30,7 @@ import { useHosts } from "@/hooks/useHosts";
 import { deleteFileContent, writeFileContent } from "@/hooks/useWriteFileContent";
 import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
 import { planDesignSystemImportFrom, runDesignSystemImport } from "@/lib/designDeckApi";
-import { DECK_SUFFIX, deckName } from "@/lib/designDecks";
+import { DECK_SUFFIX, designName, type DesignKind } from "@/lib/designDecks";
 import type { ImportError, ImportPlan } from "@/lib/designSystemImport";
 import {
   DESIGN_SYSTEM_POINTER,
@@ -97,14 +97,14 @@ export function NewDesignDialog({
   open,
   onOpenChange,
   initialPrompt,
-  takenDeckNames,
+  takenNames,
   onCreated,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   initialPrompt?: string;
-  /** Deck names the landing already lists for a workspace folder. */
-  takenDeckNames: (folder: string) => readonly string[];
+  /** Design names of a kind the landing already lists for a workspace folder. */
+  takenNames: (folder: string, kind: DesignKind) => readonly string[];
   onCreated: (sessionId: string, path: string) => void;
 }) {
   const queryClient = useQueryClient();
@@ -264,8 +264,8 @@ export function NewDesignDialog({
     try {
       const inFolder = (decksListing.data?.entries ?? [])
         .filter((e) => e.name.endsWith(DECK_SUFFIX))
-        .map((e) => deckName(e.name));
-      const path = designDeckPath(deckSlug(prompt, [...takenDeckNames(folder), ...inFolder]));
+        .map((e) => designName(e.name));
+      const path = designDeckPath(deckSlug(prompt, [...takenNames(folder, "deck"), ...inFolder]));
       const key = `${agent.id}\0${hostId}\0${folder}`;
       let sessionId = created.current?.key === key ? created.current.id : null;
       if (sessionId === null) {

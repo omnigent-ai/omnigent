@@ -53,6 +53,11 @@ vi.mock("@/shell/SlidesViewer", async () => {
     },
   };
 });
+vi.mock("@/shell/WireframeViewer", () => ({
+  WireframeViewer: ({ content }: { content: string }) => (
+    <div data-testid="wireframe-viewer">{content}</div>
+  ),
+}));
 vi.mock("@/lib/designDeckApi", () => ({
   fetchImportTarget: vi.fn(),
   planDesignSystemImportFrom: vi.fn(),
@@ -75,7 +80,7 @@ function deckFile(content: string): FileContentResponse {
   };
 }
 
-function renderStudio(props: { view?: StudioView; fresh?: boolean } = {}): {
+function renderStudio(props: { view?: StudioView; fresh?: boolean; path?: string } = {}): {
   onView: ReturnType<typeof vi.fn>;
   onBack: ReturnType<typeof vi.fn>;
 } {
@@ -86,7 +91,7 @@ function renderStudio(props: { view?: StudioView; fresh?: boolean } = {}): {
       <MemoryRouter>
         <DesignStudio
           sessionId={SESSION}
-          path={PATH}
+          path={props.path ?? PATH}
           view={props.view ?? "preview"}
           fresh={props.fresh ?? false}
           onView={onView}
@@ -158,6 +163,30 @@ describe("DesignStudio on desktop", () => {
     const { onBack } = renderStudio();
     fireEvent.click(screen.getByRole("link", { name: "Back to designs" }));
     expect(onBack).toHaveBeenCalled();
+  });
+});
+
+describe("DesignStudio for a wireframe", () => {
+  const WIREFRAME = "wireframes/sign-up.wireframe.html";
+
+  it("previews it in the wireframe viewer with wireframe wording", async () => {
+    renderStudio({ path: WIREFRAME });
+    expect(await screen.findByTestId("wireframe-viewer")).toHaveTextContent(
+      "<section>Title</section>",
+    );
+    expect(screen.queryByTestId("slides-viewer")).toBeNull();
+    expect(screen.getByRole("heading", { name: "sign-up" })).toBeInTheDocument();
+    expect(screen.getByTestId("side-chat")).toHaveAttribute(
+      "data-placeholder",
+      "Ask for changes to this wireframe",
+    );
+    expect(screen.getByRole("region", { name: "Wireframe preview" })).toBeInTheDocument();
+  });
+
+  it("waits for the first screen", async () => {
+    contentMock.mockRejectedValue(new Error("404 Not Found"));
+    renderStudio({ path: WIREFRAME, fresh: true });
+    expect(await screen.findByText("Waiting for the first screen")).toBeInTheDocument();
   });
 });
 

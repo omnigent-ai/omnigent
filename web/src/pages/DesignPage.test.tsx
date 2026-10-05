@@ -12,7 +12,7 @@ import { useCanvasSessions } from "@/canvas/canvasSessions";
 import type * as conversationsHook from "@/hooks/useConversations";
 import { useProjects, type Conversation } from "@/hooks/useConversations";
 import {
-  fetchDeckSearch,
+  fetchDesignSearch,
   fetchDesignIndex,
   fetchKitIndicator,
   reconcileDesignIndex,
@@ -29,7 +29,7 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
 }));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "me" }));
 vi.mock("@/lib/designDeckApi", () => ({
-  fetchDeckSearch: vi.fn(),
+  fetchDesignSearch: vi.fn(),
   fetchDesignIndex: vi.fn(),
   fetchKitIndicator: vi.fn(),
   reconcileDesignIndex: vi.fn(),
@@ -64,13 +64,16 @@ vi.mock("./design/NewDesignDialog", () => ({
   NewDesignDialog: (props: {
     open: boolean;
     initialPrompt?: string;
-    takenDeckNames: (folder: string) => readonly string[];
+    takenNames: (folder: string, kind: "deck" | "wireframe") => readonly string[];
     onCreated: (sessionId: string, path: string) => void;
   }) =>
     props.open ? (
       <div role="dialog" aria-label="New design">
         <span data-testid="dialog-prompt">{props.initialPrompt ?? ""}</span>
-        <span data-testid="dialog-taken">{props.takenDeckNames("/work/a/").join(",")}</span>
+        <span data-testid="dialog-taken">{props.takenNames("/work/a/", "deck").join(",")}</span>
+        <span data-testid="dialog-taken-wireframes">
+          {props.takenNames("/work/a/", "wireframe").join(",")}
+        </span>
         <button type="button" onClick={() => props.onCreated("conv_new", "decks/new.slides.html")}>
           dialog-create
         </button>
@@ -80,7 +83,7 @@ vi.mock("./design/NewDesignDialog", () => ({
 
 const sessionsMock = vi.mocked(useCanvasSessions);
 const projectsMock = vi.mocked(useProjects);
-const searchMock = vi.mocked(fetchDeckSearch);
+const searchMock = vi.mocked(fetchDesignSearch);
 const kitMock = vi.mocked(fetchKitIndicator);
 const indexMock = vi.mocked(fetchDesignIndex);
 const reconcileMock = vi.mocked(reconcileDesignIndex);
@@ -200,15 +203,18 @@ describe("DesignPage list", () => {
 
     renderPage();
 
-    expect(await screen.findByText(/No decks yet\. Ask an agent for a slide deck/)).toBeVisible();
+    expect(
+      await screen.findByText(/No designs yet\. Ask an agent for a slide deck or a wireframe/),
+    ).toBeVisible();
     expect(screen.getByText(".slides.html")).toBeInTheDocument();
+    expect(screen.getByText(".wireframe.html")).toBeInTheDocument();
   });
 
   it("does not claim empty while the session list is still loading", () => {
     stubSessions([], { loaded: false, loadingMore: true });
     renderPage();
     expect(screen.getByRole("status", { name: "Loading sessions" })).toBeInTheDocument();
-    expect(screen.queryByText(/No decks yet/)).toBeNull();
+    expect(screen.queryByText(/No designs yet/)).toBeNull();
   });
 
   it("keeps an unavailable workspace visible with a link to its session", async () => {
@@ -239,6 +245,25 @@ describe("DesignPage list", () => {
     expect(await within(a).findByText(/500 Server Error/, {}, { timeout: 4000 })).toBeVisible();
     fireEvent.click(within(a).getByRole("button", { name: "Retry" }));
     expect(await within(a).findByText("fixed")).toBeInTheDocument();
+  });
+
+  it("lists wireframes beside decks with a kind badge on each card", async () => {
+    stubSessions([row("a", 1)]);
+    searchMock.mockResolvedValue({
+      status: "ok",
+      paths: ["decks/q3.slides.html", "wireframes/sign-up.wireframe.html"],
+    });
+
+    renderPage();
+
+    const deck = await within(group("a")).findByRole("link", { name: /q3/ });
+    const wireframe = within(group("a")).getByRole("link", { name: /sign-up/ });
+    expect(within(deck).getByText("Slides")).toBeInTheDocument();
+    expect(within(wireframe).getByText("Wireframe")).toBeInTheDocument();
+    expect(wireframe).toHaveAttribute(
+      "href",
+      "/design?session=a&file=wireframes%2Fsign-up.wireframe.html",
+    );
   });
 
   it.each([
@@ -285,7 +310,7 @@ describe("DesignPage list", () => {
 
     renderPage();
 
-    await screen.findByText(/No decks yet/);
+    await screen.findByText(/No designs yet/);
     expect(kitMock).not.toHaveBeenCalled();
   });
 
@@ -324,7 +349,10 @@ describe("DesignPage landing", () => {
     searchMock.mockImplementation((id) =>
       Promise.resolve({
         status: "ok",
-        paths: id === "a" ? ["decks/pitch.slides.html"] : ["roadmap.slides.html"],
+        paths:
+          id === "a"
+            ? ["decks/pitch.slides.html", "wireframes/flow.wireframe.html"]
+            : ["roadmap.slides.html"],
         truncated: false,
       }),
     );
@@ -362,12 +390,13 @@ describe("DesignPage landing", () => {
     fireEvent.click(screen.getByRole("button", { name: "Weekly status update" }));
     expect(screen.getByTestId("dialog-prompt")).toHaveTextContent("Weekly status update");
     expect(screen.getByTestId("dialog-taken")).toHaveTextContent("pitch");
+    expect(screen.getByTestId("dialog-taken-wireframes")).toHaveTextContent(/^flow$/);
   });
 
   it("shows chips in the empty state", async () => {
     searchMock.mockResolvedValue({ status: "ok", paths: [] });
     renderPage();
-    await screen.findByText(/No decks yet/);
+    await screen.findByText(/No designs yet/);
     fireEvent.click(screen.getByRole("button", { name: "Product launch" }));
     expect(screen.getByTestId("dialog-prompt")).toHaveTextContent("Product launch");
   });
@@ -460,10 +489,11 @@ describe("DesignPage server index", () => {
       indexed("asleep", "decks/old.slides.html", "/work/asleep"),
       indexed("a", "decks/stale.slides.html", "/work/a"),
       indexed("ancient", "pitch.slides.html", "/work/ancient"),
+      { ...indexed("ancient", "app.wireframe.html", "/work/ancient"), kind: "wireframe" as const },
     ]);
     searchMock.mockResolvedValue({
       status: "ok",
-      paths: ["decks/q3.slides.html", "node_modules/x/y.slides.html"],
+      paths: ["decks/q3.slides.html", "w/flow.wireframe.html", "node_modules/x/y.slides.html"],
     });
 
     renderPage();
@@ -471,7 +501,12 @@ describe("DesignPage server index", () => {
     expect(await within(group("a")).findByText("q3")).toBeInTheDocument();
     expect(within(group("a")).queryByText("stale")).toBeNull();
     expect(searchMock).toHaveBeenCalledTimes(1);
-    await waitFor(() => expect(reconcileMock).toHaveBeenCalledWith("a", ["decks/q3.slides.html"]));
+    await waitFor(() =>
+      expect(reconcileMock).toHaveBeenCalledWith("a", [
+        "decks/q3.slides.html",
+        "w/flow.wireframe.html",
+      ]),
+    );
 
     const asleep = group("asleep");
     expect(within(asleep).getByText(/Unavailable/)).toBeInTheDocument();
@@ -479,7 +514,10 @@ describe("DesignPage server index", () => {
       "href",
       expect.stringContaining("session=asleep"),
     );
-    expect(within(group("ancient")).getByText("Indexed ancient")).toBeInTheDocument();
+    expect(within(group("ancient")).getAllByText("Indexed ancient")).toHaveLength(2);
+    expect(within(group("ancient")).getByRole("link", { name: /app/ })).toHaveTextContent(
+      "Wireframe",
+    );
     expect(kitMock).toHaveBeenCalledTimes(1);
   });
 });

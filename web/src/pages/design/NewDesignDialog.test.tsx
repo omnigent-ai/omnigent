@@ -100,7 +100,7 @@ function renderDialog(
       <NewDesignDialog
         open
         onOpenChange={vi.fn()}
-        takenDeckNames={() => []}
+        takenNames={() => []}
         onCreated={onCreated}
         {...props}
       />
@@ -248,7 +248,7 @@ describe("NewDesignDialog create", () => {
     listings["/work/site/decks"] = ["pitch-deck-2.slides.html", "notes.md"];
     const { onCreated } = renderDialog({
       initialPrompt: "Pitch deck",
-      takenDeckNames: (folder) => (folder === "/work/site" ? ["pitch-deck"] : []),
+      takenNames: (folder) => (folder === "/work/site" ? ["pitch-deck"] : []),
     });
     create();
     await waitFor(() =>

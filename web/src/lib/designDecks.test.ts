@@ -4,10 +4,11 @@ import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import {
   DESIGN_SESSION_CAP,
   buildDesignGroups,
-  deckName,
+  designKind,
+  designName,
   filterDesignGroups,
   indexDesignGroups,
-  isDeckPath,
+  isDesignPath,
   isDesignListEmpty,
   isSessionLive,
   kitIndicator,
@@ -118,21 +119,30 @@ describe("selectDesignWorkspaces", () => {
   });
 });
 
-describe("deck paths", () => {
-  it("accepts slide decks and drops nested worktrees and dependencies", () => {
-    expect(isDeckPath("decks/q3.slides.html")).toBe(true);
-    expect(isDeckPath("q3.slides.html")).toBe(true);
-    expect(isDeckPath("q3.html")).toBe(false);
-    expect(isDeckPath("slides.html")).toBe(false);
-    expect(isDeckPath("decks/.slides.html")).toBe(false);
-    expect(isDeckPath(".worktrees/feature/q3.slides.html")).toBe(false);
-    expect(isDeckPath("web/node_modules/pkg/demo.slides.html")).toBe(false);
-    expect(isDeckPath("my.worktrees/q3.slides.html")).toBe(true);
+describe("design paths", () => {
+  it("accepts slide decks and wireframes and drops nested worktrees and dependencies", () => {
+    expect(isDesignPath("decks/q3.slides.html")).toBe(true);
+    expect(isDesignPath("q3.slides.html")).toBe(true);
+    expect(isDesignPath("wireframes/app.wireframe.html")).toBe(true);
+    expect(isDesignPath("q3.html")).toBe(false);
+    expect(isDesignPath("slides.html")).toBe(false);
+    expect(isDesignPath("decks/.slides.html")).toBe(false);
+    expect(isDesignPath("wireframes/.wireframe.html")).toBe(false);
+    expect(isDesignPath(".worktrees/feature/q3.slides.html")).toBe(false);
+    expect(isDesignPath("web/node_modules/pkg/demo.wireframe.html")).toBe(false);
+    expect(isDesignPath("my.worktrees/q3.slides.html")).toBe(true);
   });
 
-  it("names a deck by its file name without the suffix", () => {
-    expect(deckName("decks/Q3 review.slides.html")).toBe("Q3 review");
-    expect(deckName("pitch.slides.html")).toBe("pitch");
+  it("knows the kind from the file name", () => {
+    expect(designKind("decks/q3.slides.html")).toBe("deck");
+    expect(designKind("wireframes/app.wireframe.html")).toBe("wireframe");
+    expect(designKind("app.html")).toBeNull();
+  });
+
+  it("names a design by its file name without the suffix", () => {
+    expect(designName("decks/Q3 review.slides.html")).toBe("Q3 review");
+    expect(designName("pitch.slides.html")).toBe("pitch");
+    expect(designName("wireframes/sign-up.wireframe.html")).toBe("sign-up");
   });
 });
 
@@ -168,7 +178,13 @@ describe("buildDesignGroups", () => {
     const searches: DeckSearchState[] = [
       {
         status: "ok",
-        paths: ["z.slides.html", ".worktrees/x/z.slides.html", "a/b.slides.html", "notes.md"],
+        paths: [
+          "z.slides.html",
+          ".worktrees/x/z.slides.html",
+          "a/b.slides.html",
+          "notes.md",
+          "w/app.wireframe.html",
+        ],
         truncated: false,
       },
     ];
@@ -181,8 +197,27 @@ describe("buildDesignGroups", () => {
     expect(group.truncated).toBe(false);
     expect(group.kit).toEqual({ status: "ok", name: "Acme" });
     expect(group.decks).toEqual([
-      { sessionId: "a", path: "a/b.slides.html", name: "b", sessionTitle: "Pitch work" },
-      { sessionId: "a", path: "z.slides.html", name: "z", sessionTitle: "Pitch work" },
+      {
+        sessionId: "a",
+        path: "a/b.slides.html",
+        name: "b",
+        kind: "deck",
+        sessionTitle: "Pitch work",
+      },
+      {
+        sessionId: "a",
+        path: "w/app.wireframe.html",
+        name: "app",
+        kind: "wireframe",
+        sessionTitle: "Pitch work",
+      },
+      {
+        sessionId: "a",
+        path: "z.slides.html",
+        name: "z",
+        kind: "deck",
+        sessionTitle: "Pitch work",
+      },
     ]);
   });
 
@@ -286,7 +321,7 @@ function indexed(
   return {
     session_id: sessionId,
     path,
-    kind: "deck",
+    kind: path.endsWith(".wireframe.html") ? "wireframe" : "deck",
     updated_at: updatedAt,
     session_title: `Indexed ${sessionId}`,
     workspace,
@@ -312,6 +347,7 @@ describe("indexDesignGroups", () => {
         indexed("old2", "decks/b.slides.html", 7, "/work/old/"),
         indexed("old2", "decks/a.slides.html", 6, "/work/old"),
         indexed("old", ".worktrees/x/c.slides.html", 5),
+        indexed("old", "wireframes/app.wireframe.html", 5),
         indexed("gone", "decks/z.slides.html", 4, ""),
       ],
       scanned,
@@ -326,8 +362,27 @@ describe("indexDesignGroups", () => {
     expect(group.offline).toBe(true);
     expect(group.workspace.label).toBe("old");
     expect(group.decks).toEqual([
-      { sessionId: "old2", path: "decks/a.slides.html", name: "a", sessionTitle: "Indexed old2" },
-      { sessionId: "old", path: "decks/b.slides.html", name: "b", sessionTitle: "Indexed old" },
+      {
+        sessionId: "old2",
+        path: "decks/a.slides.html",
+        name: "a",
+        kind: "deck",
+        sessionTitle: "Indexed old2",
+      },
+      {
+        sessionId: "old",
+        path: "decks/b.slides.html",
+        name: "b",
+        kind: "deck",
+        sessionTitle: "Indexed old",
+      },
+      {
+        sessionId: "old",
+        path: "wireframes/app.wireframe.html",
+        name: "app",
+        kind: "wireframe",
+        sessionTitle: "Indexed old",
+      },
     ]);
   });
 

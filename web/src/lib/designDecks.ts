@@ -1,6 +1,7 @@
 // Pure helpers for the Design page (`/design`): pick the workspaces to scan
-// from recent sessions and turn their deck searches and kit reads into
-// render-ready groups. Free of React and fetch so it is unit-testable.
+// from recent sessions and turn their design searches (slide decks and
+// wireframes) and kit reads into render-ready groups. Free of React and fetch
+// so it is unit-testable.
 
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import { isTopLevelActive } from "@/canvas/canvasSessions";
@@ -11,9 +12,18 @@ import type { DesignSystemKind } from "./designSystem";
 /** Only this many recent sessions are scanned; the server index lists the rest. */
 export const DESIGN_SESSION_CAP = 50;
 export const DECK_SUFFIX = ".slides.html";
-/** The search endpoint needs a name substring; the glob narrows it to decks. */
-export const DECK_SEARCH_QUERY = DECK_SUFFIX;
-export const DECK_INCLUDE_GLOB = `**/*${DECK_SUFFIX}`;
+export const WIREFRAME_SUFFIX = ".wireframe.html";
+/** The index's kinds: `deck` is a slide deck. */
+export type DesignKind = "deck" | "wireframe";
+export const DESIGN_SUFFIXES: Record<DesignKind, string> = {
+  deck: DECK_SUFFIX,
+  wireframe: WIREFRAME_SUFFIX,
+};
+/** The search endpoint needs a name substring; the globs narrow it to designs. */
+export const DESIGN_SEARCH_QUERY = ".html";
+export const DESIGN_INCLUDE_GLOB = Object.values(DESIGN_SUFFIXES)
+  .map((suffix) => `**/*${suffix}`)
+  .join(",");
 const EXCLUDED_SEGMENTS = new Set([".worktrees", "node_modules"]);
 
 /** One workspace to scan, read through its most recent session. */
@@ -25,11 +35,13 @@ export interface DesignWorkspace {
   label: string;
 }
 
+/** One design (a deck or a wireframe); named for the decks it first listed. */
 export interface DesignDeck {
   sessionId: string;
   /** Path relative to the workspace. */
   path: string;
   name: string;
+  kind: DesignKind;
   sessionTitle: string;
 }
 
@@ -65,7 +77,7 @@ export interface DesignGroup {
 export interface DesignIndexEntry {
   session_id: string;
   path: string;
-  kind: "deck" | "wireframe";
+  kind: DesignKind;
   updated_at: number;
   session_title: string | null;
   workspace: string | null;
@@ -119,16 +131,29 @@ function workspaceLabel(
   return project?.name ?? folderName(path);
 }
 
-/** A `*.slides.html` file outside nested worktrees and dependencies. */
-export function isDeckPath(path: string): boolean {
-  const segments = path.split("/");
-  const name = segments.at(-1) ?? "";
-  if (!name.endsWith(DECK_SUFFIX) || name === DECK_SUFFIX) return false;
-  return !segments.some((segment) => EXCLUDED_SEGMENTS.has(segment));
+/** The kind a file name ends with, or `null` for any other file. */
+export function designKind(path: string): DesignKind | null {
+  const name = path.split("/").at(-1) ?? "";
+  for (const [kind, suffix] of Object.entries(DESIGN_SUFFIXES)) {
+    if (name.endsWith(suffix) && name !== suffix) return kind as DesignKind;
+  }
+  return null;
 }
 
-export function deckName(path: string): string {
-  return (path.split("/").at(-1) ?? path).slice(0, -DECK_SUFFIX.length);
+/** A deck or wireframe outside nested worktrees and dependencies. */
+export function isDesignPath(path: string): boolean {
+  if (!designKind(path)) return false;
+  return !path.split("/").some((segment) => EXCLUDED_SEGMENTS.has(segment));
+}
+
+export function designName(path: string): string {
+  const name = path.split("/").at(-1) ?? path;
+  const kind = designKind(path);
+  return kind ? name.slice(0, -DESIGN_SUFFIXES[kind].length) : name;
+}
+
+function design(sessionId: string, path: string, sessionTitle: string): DesignDeck {
+  return { sessionId, path, name: designName(path), kind: designKind(path)!, sessionTitle };
 }
 
 /** Kit indicator from `kit.json` alone (`null` when the file does not exist). */
@@ -176,14 +201,9 @@ export function buildDesignGroups(
     }
     const sessionTitle = conversationDisplayLabel(workspace.session);
     const decks = search.paths
-      .filter(isDeckPath)
+      .filter(isDesignPath)
       .sort((a, b) => a.localeCompare(b))
-      .map((path) => ({
-        sessionId: workspace.session.id,
-        path,
-        name: deckName(path),
-        sessionTitle,
-      }));
+      .map((path) => design(workspace.session.id, path, sessionTitle));
     // Keep a truncated empty group so the user sees the search hit its cap.
     if (decks.length > 0 || search.truncated) {
       groups.push({
@@ -214,7 +234,7 @@ export function indexDesignGroups(
   const loaded = new Map(sessions.map((s) => [s.id, s]));
   const groups = new Map<string, DesignGroup>();
   for (const entry of entries) {
-    if (!entry.workspace || !isDeckPath(entry.path)) continue;
+    if (!entry.workspace || !isDesignPath(entry.path)) continue;
     const path = trimSlashes(entry.workspace);
     if (covered.has(path)) continue;
     const known = loaded.get(entry.session_id);
@@ -241,12 +261,7 @@ export function indexDesignGroups(
       groups.set(path, group);
     }
     if (group.decks.some((deck) => deck.path === entry.path)) continue;
-    group.decks.push({
-      sessionId: entry.session_id,
-      path: entry.path,
-      name: deckName(entry.path),
-      sessionTitle: conversationDisplayLabel(session),
-    });
+    group.decks.push(design(entry.session_id, entry.path, conversationDisplayLabel(session)));
   }
   for (const group of groups.values()) group.decks.sort((a, b) => a.path.localeCompare(b.path));
   return [...groups.values()];

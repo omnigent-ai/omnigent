@@ -27,10 +27,13 @@ import {
   type ImportPlan,
 } from "./designSystemImport";
 import {
-  DECK_INCLUDE_GLOB,
-  DECK_SEARCH_QUERY,
+  DESIGN_INCLUDE_GLOB,
+  DESIGN_SEARCH_QUERY,
+  DESIGN_SUFFIXES,
+  designKind,
   kitIndicator,
   type DesignIndexEntry,
+  type DesignKind,
   type KitIndicator,
 } from "./designDecks";
 
@@ -38,14 +41,14 @@ export type DeckSearchResult =
   { status: "ok"; paths: string[]; truncated: boolean } | { status: "unavailable" };
 
 /**
- * Every `*.slides.html` path in a session's workspace. A 404 (no file
- * environment) or 503 (runner offline) is "unavailable" rather than empty;
- * any other failure throws.
+ * Every `*.slides.html` and `*.wireframe.html` path in a session's workspace.
+ * A 404 (no file environment) or 503 (runner offline) is "unavailable" rather
+ * than empty; any other failure throws.
  */
-export async function fetchDeckSearch(sessionId: string): Promise<DeckSearchResult> {
+export async function fetchDesignSearch(sessionId: string): Promise<DeckSearchResult> {
   const res = await requestWorkspaceFileSearch(sessionId, {
-    query: DECK_SEARCH_QUERY,
-    include: DECK_INCLUDE_GLOB,
+    query: DESIGN_SEARCH_QUERY,
+    include: DESIGN_INCLUDE_GLOB,
   });
   if (res.status === 404 || res.status === 503) return { status: "unavailable" };
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -91,11 +94,11 @@ export async function fetchKitIndicator(sessionId: string): Promise<KitIndicator
 }
 
 /**
- * The server's deck index, or `null` when it is unavailable (an older server,
- * the `design` flag off, or a failure) so the page falls back to scanning.
+ * The server's index of every kind, or `null` when it is unavailable (an older
+ * server, the `design` flag off, or a failure) so the page falls back to scanning.
  */
 export async function fetchDesignIndex(): Promise<DesignIndexEntry[] | null> {
-  const res = await authenticatedFetch("/v1/design/artifacts?kind=deck");
+  const res = await authenticatedFetch("/v1/design/artifacts");
   if (!res.ok) return null;
   return ((await res.json()) as { data: DesignIndexEntry[] }).data;
 }
@@ -143,11 +146,14 @@ export function runDesignSystemImport(
   });
 }
 
-/** Replace a session's indexed decks with a successful scan's paths. Best-effort. */
+/** Replace a session's indexed rows of each kind with a successful scan's paths. Best-effort. */
 export async function reconcileDesignIndex(sessionId: string, paths: string[]): Promise<void> {
-  await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/design-artifacts`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ paths, kind: "deck" }),
-  }).catch(() => undefined);
+  for (const kind of Object.keys(DESIGN_SUFFIXES) as DesignKind[]) {
+    // oxlint-disable-next-line no-await-in-loop
+    await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/design-artifacts`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths: paths.filter((p) => designKind(p) === kind), kind }),
+    }).catch(() => undefined);
+  }
 }

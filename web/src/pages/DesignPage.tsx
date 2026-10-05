@@ -1,6 +1,6 @@
 /**
- * Design page (`/design`): a landing of every slide deck agents produced
- * across recent sessions, and a studio for one deck.
+ * Design page (`/design`): a landing of every slide deck and wireframe agents
+ * produced across recent sessions, and a studio for one design.
  *
  * - Landing: deck cards grouped by workspace, a search, suggestion chips, and
  *   New design, which creates a session in place. The server deck index lists
@@ -27,8 +27,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type ProjectSummary } from "@/hooks/useConversations";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
-  fetchDeckSearch,
   fetchDesignIndex,
+  fetchDesignSearch,
   fetchKitIndicator,
   reconcileDesignIndex,
   type DeckSearchResult,
@@ -37,13 +37,14 @@ import {
   buildDesignGroups,
   filterDesignGroups,
   indexDesignGroups,
-  isDeckPath,
   isDesignListEmpty,
+  isDesignPath,
   isSessionLive,
   selectDesignWorkspaces,
   type DeckSearchState,
   type DesignDeck,
   type DesignGroup,
+  type DesignKind,
   type KitIndicatorState,
 } from "@/lib/designDecks";
 import {
@@ -141,9 +142,9 @@ function DesignLanding() {
     queries: workspaces.map((workspace) => ({
       queryKey: ["design-deck-search", workspace.session.id],
       queryFn: async () => {
-        const result = await fetchDeckSearch(workspace.session.id);
+        const result = await fetchDesignSearch(workspace.session.id);
         if (index && result.status === "ok") {
-          void reconcileDesignIndex(workspace.session.id, result.paths.filter(isDeckPath));
+          void reconcileDesignIndex(workspace.session.id, result.paths.filter(isDesignPath));
         }
         return result;
       },
@@ -159,7 +160,7 @@ function DesignLanding() {
       return {
         queryKey: ["design-kit", workspace.session.id],
         queryFn: () => fetchKitIndicator(workspace.session.id),
-        enabled: search?.status === "ok" && search.paths.some(isDeckPath),
+        enabled: search?.status === "ok" && search.paths.some(isDesignPath),
         retry: false,
         ...LIVE_QUERY,
       };
@@ -188,9 +189,10 @@ function DesignLanding() {
     setPrefill(prompt);
     setDialogOpen(true);
   };
-  const takenDeckNames = (folder: string) => {
+  const takenNames = (folder: string, kind: DesignKind) => {
     const path = folder.replace(/[/\\]+$/, "");
-    return groups.find((g) => g.workspace.path === path)?.decks.map((d) => d.name) ?? [];
+    const designs = groups.find((g) => g.workspace.path === path)?.decks ?? [];
+    return designs.filter((d) => d.kind === kind).map((d) => d.name);
   };
   const openCreated = (sessionId: string, path: string) => {
     void refresh();
@@ -238,8 +240,9 @@ function DesignLanding() {
         <div className="flex flex-col items-center gap-2 py-12 text-center text-ui text-muted-foreground">
           <PresentationIcon className="size-8 text-muted-foreground/50" />
           <p>
-            No decks yet. Ask an agent for a slide deck; files ending in{" "}
-            <code className="font-mono text-sm">.slides.html</code> appear here.
+            No designs yet. Ask an agent for a slide deck or a wireframe; files ending in{" "}
+            <code className="font-mono text-sm">.slides.html</code> or{" "}
+            <code className="font-mono text-sm">.wireframe.html</code> appear here.
           </p>
           <Suggestions onPick={openDialog} showHeading={false} className="mt-3 border-t-0 pt-0" />
         </div>
@@ -262,7 +265,7 @@ function DesignLanding() {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         initialPrompt={prefill}
-        takenDeckNames={takenDeckNames}
+        takenNames={takenNames}
         onCreated={openCreated}
       />
     </PageScroll>
@@ -342,7 +345,12 @@ function DeckCard({ deck }: { deck: DesignDeck }) {
       componentId="design.deck.open"
       className="flex h-full flex-col gap-0.5 rounded-lg border border-border bg-card px-3 py-2 outline-none transition-colors hover:bg-muted focus-visible:ring-1 focus-visible:ring-ring"
     >
-      <span className="truncate text-ui font-medium">{deck.name}</span>
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="truncate text-ui font-medium">{deck.name}</span>
+        <span className="ml-auto shrink-0 rounded border border-border px-1 text-xs text-muted-foreground">
+          {deck.kind === "wireframe" ? "Wireframe" : "Slides"}
+        </span>
+      </span>
       <span className="truncate font-mono text-sm text-muted-foreground">{deck.path}</span>
       <span className="truncate text-sm text-muted-foreground">{deck.sessionTitle}</span>
     </Link>

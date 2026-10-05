@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import * as workspaceFiles from "@/hooks/useWorkspaceChangedFiles";
 import {
-  fetchDeckSearch,
+  fetchDesignSearch,
   fetchDesignIndex,
   fetchImportTarget,
   fetchKitIndicator,
@@ -43,24 +43,28 @@ beforeEach(() => {
   fetchMock.mockReset();
 });
 
-describe("fetchDeckSearch", () => {
-  it("searches the workspace for slide decks and returns file paths", async () => {
+describe("fetchDesignSearch", () => {
+  it("searches the workspace for decks and wireframes and returns file paths", async () => {
     searchMock.mockResolvedValue(
       response(200, {
         object: "list",
-        data: [entry("decks/q3.slides.html"), entry("decks", "directory")],
+        data: [
+          entry("decks/q3.slides.html"),
+          entry("wireframes/app.wireframe.html"),
+          entry("decks", "directory"),
+        ],
         has_more: false,
       }),
     );
 
-    expect(await fetchDeckSearch("conv_a")).toEqual({
+    expect(await fetchDesignSearch("conv_a")).toEqual({
       status: "ok",
-      paths: ["decks/q3.slides.html"],
+      paths: ["decks/q3.slides.html", "wireframes/app.wireframe.html"],
       truncated: false,
     });
     expect(searchMock).toHaveBeenCalledWith("conv_a", {
-      query: ".slides.html",
-      include: "**/*.slides.html",
+      query: ".html",
+      include: "**/*.slides.html,**/*.wireframe.html",
     });
   });
 
@@ -74,7 +78,7 @@ describe("fetchDeckSearch", () => {
       }),
     );
 
-    expect(await fetchDeckSearch("conv_a")).toEqual({
+    expect(await fetchDesignSearch("conv_a")).toEqual({
       status: "ok",
       paths: ["decks/q3.slides.html"],
       truncated: true,
@@ -91,7 +95,7 @@ describe("fetchDeckSearch", () => {
       }),
     );
 
-    expect(await fetchDeckSearch("conv_a")).toEqual({
+    expect(await fetchDesignSearch("conv_a")).toEqual({
       status: "ok",
       paths: ["decks/q3.slides.html"],
       truncated: true,
@@ -105,12 +109,13 @@ describe("fetchDeckSearch", () => {
         data: [
           entry(".omnigent/design-system/slides/title.slides.html"),
           entry("decks/.omnigent/design-system/x.slides.html"),
+          entry(".omnigent/design-system/templates/app.wireframe.html"),
           entry("q3.slides.html"),
         ],
         has_more: false,
       }),
     );
-    expect(await fetchDeckSearch("conv_a")).toEqual({
+    expect(await fetchDesignSearch("conv_a")).toEqual({
       status: "ok",
       paths: ["q3.slides.html"],
       truncated: false,
@@ -119,12 +124,12 @@ describe("fetchDeckSearch", () => {
 
   it.each([404, 503])("reads a %s as an unavailable workspace", async (status) => {
     searchMock.mockResolvedValue(response(status, { error: { code: "runner_unavailable" } }));
-    expect(await fetchDeckSearch("conv_a")).toEqual({ status: "unavailable" });
+    expect(await fetchDesignSearch("conv_a")).toEqual({ status: "unavailable" });
   });
 
   it("throws on any other failure", async () => {
     searchMock.mockResolvedValue(new Response("boom", { status: 500, statusText: "Server Error" }));
-    await expect(fetchDeckSearch("conv_a")).rejects.toThrow("500 Server Error");
+    await expect(fetchDesignSearch("conv_a")).rejects.toThrow("500 Server Error");
   });
 });
 
@@ -234,10 +239,11 @@ describe("fetchDesignIndex", () => {
     workspace: "/work/a",
   };
 
-  it("returns the indexed decks", async () => {
-    fetchMock.mockResolvedValue(response(200, { object: "list", data: [indexed] }));
-    expect(await fetchDesignIndex()).toEqual([indexed]);
-    expect(fetchMock).toHaveBeenCalledWith("/v1/design/artifacts?kind=deck");
+  it("returns the indexed decks and wireframes", async () => {
+    const wireframe = { ...indexed, path: "app.wireframe.html", kind: "wireframe" };
+    fetchMock.mockResolvedValue(response(200, { object: "list", data: [indexed, wireframe] }));
+    expect(await fetchDesignIndex()).toEqual([indexed, wireframe]);
+    expect(fetchMock).toHaveBeenCalledWith("/v1/design/artifacts");
   });
 
   it("returns null when the server has no index, so the page falls back to the scan", async () => {
@@ -249,14 +255,21 @@ describe("fetchDesignIndex", () => {
 });
 
 describe("reconcileDesignIndex", () => {
-  it("replaces the session's deck rows with the scan's paths", async () => {
+  it("replaces the session's rows of each kind with the scan's paths of that kind", async () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
-    await reconcileDesignIndex("conv a", ["q3.slides.html"]);
-    expect(fetchMock).toHaveBeenCalledWith("/v1/sessions/conv%20a/design-artifacts", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ paths: ["q3.slides.html"], kind: "deck" }),
-    });
+    await reconcileDesignIndex("conv a", ["q3.slides.html", "w/app.wireframe.html", "x.html"]);
+    const put = (paths: string[], kind: string) => [
+      "/v1/sessions/conv%20a/design-artifacts",
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paths, kind }),
+      },
+    ];
+    expect(fetchMock.mock.calls).toEqual([
+      put(["q3.slides.html"], "deck"),
+      put(["w/app.wireframe.html"], "wireframe"),
+    ]);
   });
 
   it("swallows failures; the index is best-effort", async () => {

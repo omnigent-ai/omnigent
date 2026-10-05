@@ -1,6 +1,7 @@
-// Design studio: one deck's compact chat beside its live preview. The chat is
-// the session's side chat pane with full history; the preview refetches on the
-// session's changed-files event (see chatStore) and when the agent's turn ends.
+// Design studio: one design's compact chat beside its live preview (the deck
+// or wireframe viewer, by kind). The chat is the session's side chat pane with
+// full history; the preview refetches on the session's changed-files event
+// (see chatStore) and when the agent's turn ends.
 
 import { useEffect, useRef, useState, type MouseEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -21,11 +22,12 @@ import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { fetchImportTarget } from "@/lib/designDeckApi";
-import { deckName } from "@/lib/designDecks";
+import { designKind, designName } from "@/lib/designDecks";
 import { deckPreviewState, type StudioView } from "@/lib/designStudio";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { SlidesViewer } from "@/shell/SlidesViewer";
+import { WireframeViewer } from "@/shell/WireframeViewer";
 import { ensureConversationStreamed } from "@/store/chatStore";
 import { ImportDesignSystemDialog } from "./DesignSystemImport";
 
@@ -42,6 +44,11 @@ function sessionFileHref(sessionId: string, path: string): string {
 }
 
 const isMissing = (error: Error | null) => error?.message.startsWith("404") ?? false;
+
+const WORDS = {
+  deck: { noun: "deck", part: "slide" },
+  wireframe: { noun: "wireframe", part: "screen" },
+} as const;
 
 export function DesignStudio({
   sessionId,
@@ -61,6 +68,8 @@ export function DesignStudio({
 }) {
   const isMobile = useIsMobileViewport();
   const queryClient = useQueryClient();
+  const kind = designKind(path) ?? "deck";
+  const { noun, part } = WORDS[kind];
   // Keep the stream bound even while the chat is hidden (Full, phone preview).
   useEffect(() => {
     void ensureConversationStreamed(sessionId);
@@ -128,7 +137,7 @@ export function DesignStudio({
           <span className={cn(isMobile && "sr-only")}>Back to designs</span>
         </Link>
         <div className="min-w-0 flex-1">
-          <h2 className="truncate text-ui font-medium">{deckName(path)}</h2>
+          <h2 className="truncate text-ui font-medium">{designName(path)}</h2>
           <p className="truncate font-mono text-sm text-muted-foreground">{path}</p>
         </div>
         {!isMobile && (
@@ -218,13 +227,23 @@ export function DesignStudio({
             <SideChatPane
               childId={sessionId}
               fullHistory
-              placeholder="Ask for changes to this deck"
+              placeholder={`Ask for changes to this ${noun}`}
             />
           </aside>
         )}
         {showPreview && (
-          <section aria-label="Deck preview" className="flex min-h-0 min-w-0 flex-1 flex-col">
-            {preview === "deck" && deck.data ? (
+          <section
+            aria-label={kind === "deck" ? "Deck preview" : "Wireframe preview"}
+            className="flex min-h-0 min-w-0 flex-1 flex-col"
+          >
+            {preview === "deck" && deck.data && kind === "wireframe" ? (
+              <WireframeViewer
+                key={viewerKey}
+                content={deck.data.content}
+                truncated={deck.data.truncated}
+                conversationId={sessionId}
+              />
+            ) : preview === "deck" && deck.data ? (
               <SlidesViewer
                 key={viewerKey}
                 content={deck.data.content}
@@ -234,11 +253,11 @@ export function DesignStudio({
               />
             ) : preview === "loading" ? (
               <div className="flex h-full items-center justify-center">
-                <Spinner className="size-5 text-muted-foreground" aria-label="Loading deck" />
+                <Spinner className="size-5 text-muted-foreground" aria-label={`Loading ${noun}`} />
               </div>
             ) : preview === "waiting" ? (
               <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center text-ui">
-                <p className="text-muted-foreground">Waiting for the first slide</p>
+                <p className="text-muted-foreground">{`Waiting for the first ${part}`}</p>
                 {turnActive && (
                   <ConversationScopeContext.Provider value={sessionId}>
                     <WorkingIndicator />
@@ -255,7 +274,7 @@ export function DesignStudio({
               <div className="flex h-full flex-col items-center justify-center gap-2 p-8 text-center text-ui">
                 <AlertTriangleIcon className="size-6 text-destructive" />
                 <p>
-                  {`Couldn't open this deck: ${deck.error?.message ?? "it is not a text file"}`}
+                  {`Couldn't open this ${noun}: ${deck.error?.message ?? "it is not a text file"}`}
                 </p>
               </div>
             )}
