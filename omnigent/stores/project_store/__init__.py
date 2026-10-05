@@ -145,6 +145,16 @@ class ProjectStore(ABC):
         """Save owned IDs; unranked projects append. Null retains IDs in alphabetical mode."""
         raise NotImplementedError
 
+    @abstractmethod
+    def get_design_default(self, *, user_id: str | None) -> dict[str, Any] | None:
+        """Read the stored New design default, or None when unset or unreadable."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def save_design_default(self, value: dict[str, Any] | None, *, user_id: str | None) -> None:
+        """Store an already validated New design default; None clears it."""
+        raise NotImplementedError
+
 
 _T = TypeVar("_T")
 

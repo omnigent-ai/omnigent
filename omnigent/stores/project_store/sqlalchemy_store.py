@@ -8,7 +8,7 @@ import re
 from typing import Any
 
 import zstandard
-from sqlalchemy import LargeBinary, asc, select, type_coerce, update
+from sqlalchemy import LargeBinary, asc, delete, select, type_coerce, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -36,6 +36,7 @@ from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
 # still capping abuse.
 _CONFIG_MAX_SERIALIZED_LEN = 64 * 1024
 _PROJECT_ORDER_KEY = "project_order"
+_DESIGN_DEFAULT_KEY = "design_default"
 _PREFERENCE_MAX_STORED_BYTES = 65535
 
 
@@ -383,40 +384,81 @@ class SqlAlchemyProjectStore(ProjectStore):
                 "sort_mode": "manual",
                 "ordered_project_ids": ids,
             }
-            encoded = _encode_order(preference)
-            values = {
-                "workspace_id": workspace_id,
-                "user_id": preference_user_id,
-                "key": _PROJECT_ORDER_KEY,
-                "value": encoded,
-            }
-            dialect = self._engine.dialect.name
-            stmt: Insert
-            if dialect == "mysql":
-                stmt = (
-                    mysql_insert(SqlPreference)
-                    .values(**values)
-                    .on_duplicate_key_update(value=encoded)
-                )
-            elif dialect == "sqlite":
-                stmt = (
-                    sqlite_insert(SqlPreference)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "key"],
-                        set_={"value": encoded},
-                    )
-                )
-            else:
-                stmt = (
-                    pg_insert(SqlPreference)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "key"],
-                        set_={"value": encoded},
-                    )
-                )
-            session.execute(stmt)
+            self._upsert_preference(
+                session, preference_user_id, _PROJECT_ORDER_KEY, _encode_order(preference)
+            )
             return preference
 
         return run_write_transaction(self._session_immediate, "save_project_order", write)
+
+    def _upsert_preference(self, session: Session, user_id: str, key: str, encoded: str) -> None:
+        values = {
+            "workspace_id": current_workspace_id(),
+            "user_id": user_id,
+            "key": key,
+            "value": encoded,
+        }
+        dialect = self._engine.dialect.name
+        stmt: Insert
+        if dialect == "mysql":
+            stmt = (
+                mysql_insert(SqlPreference).values(**values).on_duplicate_key_update(value=encoded)
+            )
+        elif dialect == "sqlite":
+            stmt = (
+                sqlite_insert(SqlPreference)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=["workspace_id", "user_id", "key"],
+                    set_={"value": encoded},
+                )
+            )
+        else:
+            stmt = (
+                pg_insert(SqlPreference)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=["workspace_id", "user_id", "key"],
+                    set_={"value": encoded},
+                )
+            )
+        session.execute(stmt)
+
+    def get_design_default(self, *, user_id: str | None) -> dict[str, Any] | None:
+        """Read the New design default from the user's preferences."""
+        preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
+        with self._session("read_design_default") as session:
+            raw = session.scalar(
+                select(type_coerce(SqlPreference.value, LargeBinary)).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == preference_user_id,
+                    SqlPreference.key == _DESIGN_DEFAULT_KEY,
+                )
+            )
+        if raw is None:
+            return None
+        try:
+            decoded = json.loads(decode(raw, max_decoded_bytes=_PREFERENCE_MAX_STORED_BYTES) or "")
+        except (ValueError, zstandard.ZstdError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
+    def save_design_default(self, value: dict[str, Any] | None, *, user_id: str | None) -> None:
+        """Replace or clear the user's New design default."""
+        preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
+
+        def write(session: Session) -> None:
+            require_active_account(session, user_id)
+            if value is None:
+                session.execute(
+                    delete(SqlPreference).where(
+                        SqlPreference.workspace_id == current_workspace_id(),
+                        SqlPreference.user_id == preference_user_id,
+                        SqlPreference.key == _DESIGN_DEFAULT_KEY,
+                    )
+                )
+                return
+            encoded = json.dumps(value, separators=(",", ":"))
+            self._upsert_preference(session, preference_user_id, _DESIGN_DEFAULT_KEY, encoded)
+
+        run_write_transaction(self._session_immediate, "save_design_default", write)

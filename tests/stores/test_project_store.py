@@ -673,3 +673,51 @@ def test_apply_order_deduplicates_and_appends_unranked_projects() -> None:
     assert apply_project_order(
         ["b", "c", "a"], ["a", "deleted", "a"], project_id=str, project_name=str
     ) == ["a", "b", "c"]
+
+
+# ── design default preference ─────────────────────────────────────────────
+
+_DESIGN_DEFAULT = {"kind": "full", "host_id": "h1", "path": "/ds/brand", "name": "Brand"}
+
+
+def test_design_default_round_trip_and_clear(store: SqlAlchemyProjectStore) -> None:
+    assert store.get_design_default(user_id="alice") is None
+    store.save_design_default(_DESIGN_DEFAULT, user_id="alice")
+    assert store.get_design_default(user_id="alice") == _DESIGN_DEFAULT
+    store.save_design_default({"kind": "none"}, user_id="alice")
+    assert store.get_design_default(user_id="alice") == {"kind": "none"}
+    store.save_design_default(None, user_id="alice")
+    assert store.get_design_default(user_id="alice") is None
+    store.save_design_default(None, user_id="alice")
+    assert store.get_design_default(user_id="alice") is None
+
+
+def test_design_default_is_per_user_and_keeps_project_order(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    project = store.create(_uid("dd-order"), "A", None)
+    store.save_order([project.id], user_id=None)
+    store.save_design_default(_DESIGN_DEFAULT, user_id=None)
+    assert store.get_design_default(user_id="local") == _DESIGN_DEFAULT
+    assert store.get_design_default(user_id="bob") is None
+    store.save_design_default(None, user_id=None)
+    assert store.get_order(user_id=None) == [project.id]
+
+
+@pytest.mark.parametrize("raw", [b"not json", b'["a"]', b'"none"'])
+def test_corrupt_design_default_reads_as_unset(store: SqlAlchemyProjectStore, raw: bytes) -> None:
+    from sqlalchemy import LargeBinary, bindparam, update
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlPreference
+
+    store.save_design_default(_DESIGN_DEFAULT, user_id="alice")
+    with Session(store._engine) as session:
+        session.execute(
+            update(SqlPreference)
+            .where(SqlPreference.user_id == "alice", SqlPreference.key == "design_default")
+            .values(value=bindparam("raw", type_=LargeBinary)),
+            {"raw": raw},
+        )
+        session.commit()
+    assert store.get_design_default(user_id="alice") is None
