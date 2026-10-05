@@ -62,6 +62,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceEnvironment: vi.fn(() => ({ data: undefined, isLoading: true })),
+  useWorkspaceAllFiles: vi.fn(() => ({ data: undefined, isLoading: true })),
   useWorkspaceChangedFiles: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
 
