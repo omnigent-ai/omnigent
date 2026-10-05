@@ -30,6 +30,7 @@ Resolution order for the config path:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import warnings
@@ -617,11 +618,40 @@ def _validated_image(path: Path) -> BrandingAsset | None:
     return BrandingAsset(path=path, media_type=media_type, content=content)
 
 
+def _config_dir() -> Path:
+    config_path = resolve_config_path()
+    return config_path.parent if config_path is not None else resolve_data_dir()
+
+
 def _branding_assets_dir() -> Path:
     """Return the dedicated branding-assets directory for the resolved config."""
-    config_path = resolve_config_path()
-    config_dir = config_path.parent if config_path is not None else resolve_data_dir()
-    return config_dir / BRANDING_ASSETS_DIRNAME
+    return _config_dir() / BRANDING_ASSETS_DIRNAME
+
+
+def _confined_path(name: str, root: Path, label: str) -> Path | None:
+    """Resolve *name* to an existing path inside *root* with no symlink on the way."""
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        logger.warning("%s %r escapes %s - ignoring", label, name, root)
+        return None
+    if root.is_symlink():
+        logger.warning("%s directory %s is a symlink - ignoring", label, root)
+        return None
+    try:
+        root_resolved = root.resolve(strict=True)
+        path = root_resolved.joinpath(relative)
+        for parent in (path, *path.parents):
+            if parent == root_resolved.parent:
+                break
+            if parent.is_symlink():
+                logger.warning("%s %r traverses a symlink - ignoring", label, name)
+                return None
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root_resolved)
+    except (FileNotFoundError, OSError, ValueError):
+        logger.warning("%s %r is outside or missing from %s - ignoring", label, name, root)
+        return None
+    return resolved
 
 
 def _resolve_branding_asset(
@@ -631,30 +661,8 @@ def _resolve_branding_asset(
     validated_assets: dict[Path, BrandingAsset | None],
 ) -> BrandingAsset | None:
     """Resolve a validated image below the dedicated branding-assets directory."""
-    relative = Path(name)
-    if relative.is_absolute() or ".." in relative.parts:
-        logger.warning("branding.logo %r escapes %s - ignoring", name, assets_dir)
-        return None
-    if assets_dir.is_symlink():
-        logger.warning("branding assets directory %s is a symlink - ignoring", assets_dir)
-        return None
-    try:
-        assets_root = assets_dir.resolve(strict=True)
-        path = assets_root.joinpath(relative)
-        for parent in (path, *path.parents):
-            if parent == assets_root.parent:
-                break
-            if parent.is_symlink():
-                logger.warning("branding.logo %r traverses a symlink - ignoring", name)
-                return None
-        resolved = path.resolve(strict=True)
-        resolved.relative_to(assets_root)
-    except (FileNotFoundError, OSError, ValueError):
-        logger.warning(
-            "branding.logo %r is outside or missing from %s - ignoring", name, assets_dir
-        )
-        return None
-    if not resolved.is_file():
+    resolved = _confined_path(name, assets_dir, "branding.logo")
+    if resolved is None or not resolved.is_file():
         return None
     if resolved in validated_assets:
         return validated_assets[resolved]
@@ -713,3 +721,88 @@ def branding_logo_asset(variant: str = "main") -> BrandingAsset | None:
 def branding_config() -> dict[str, Any]:
     """Branding block surfaced by ``GET /v1/info`` for the web UI."""
     return load_branding_snapshot().config()
+
+
+DESIGN_KIT_DIRNAME = "design-kit"
+DESIGN_KIT_ASSET_MAX_BYTES = 2 * 1024 * 1024
+DESIGN_KIT_TOTAL_MAX_BYTES = 20 * 1024 * 1024
+DESIGN_KIT_NAME_MAX = 80
+# The kit.json, stylesheet, font, and image types the slide viewer loads.
+DESIGN_KIT_MEDIA_TYPES = {
+    ".json": "application/json",
+    ".css": "text/css",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+@dataclass(frozen=True)
+class DesignKitSnapshot:
+    """The organization design kit, validated once at startup."""
+
+    name: str
+    assets: Mapping[str, BrandingAsset]
+
+
+def _design_kit_assets(root: Path) -> dict[str, BrandingAsset] | None:
+    """Every kit file by relative POSIX path, or None when any check fails."""
+    if root.is_symlink() or not root.is_dir():
+        logger.warning("design kit directory %s is missing or a symlink - ignoring", root)
+        return None
+    assets: dict[str, BrandingAsset] = {}
+    total = 0
+    for current, dirs, files in os.walk(root):
+        for entry in [*dirs, *files]:
+            if (Path(current) / entry).is_symlink():
+                logger.warning("design kit %s contains a symlink - ignoring", root)
+                return None
+        for entry in files:
+            rel = (Path(current) / entry).relative_to(root).as_posix()
+            media_type = DESIGN_KIT_MEDIA_TYPES.get(Path(entry).suffix.lower())
+            if media_type is None:
+                continue
+            path = _confined_path(rel, root, "design kit file")
+            if path is None:
+                return None
+            try:
+                size = path.stat().st_size
+                if size > DESIGN_KIT_ASSET_MAX_BYTES:
+                    logger.warning("design kit file %r is over 2 MB - ignoring the kit", rel)
+                    return None
+                content = path.read_bytes()
+            except OSError:
+                return None
+            total += len(content)
+            if total > DESIGN_KIT_TOTAL_MAX_BYTES:
+                logger.warning("design kit %s is over 20 MB - ignoring", root)
+                return None
+            assets[rel] = BrandingAsset(path=path, media_type=media_type, content=content)
+    return assets
+
+
+def load_design_kit(config: Mapping[str, Any] | None = None) -> DesignKitSnapshot | None:
+    """Load the ``design_kit: true`` kit from ``{config_dir}/design-kit/``, else None."""
+    loaded_config = load_server_config() if config is None else config
+    if loaded_config.get("design_kit") is not True:
+        return None
+    root = _config_dir() / DESIGN_KIT_DIRNAME
+    assets = _design_kit_assets(root)
+    if assets is None:
+        return None
+    try:
+        kit = json.loads(assets["kit.json"].content)
+        name = kit["name"].strip()[:DESIGN_KIT_NAME_MAX]
+    except (KeyError, TypeError, AttributeError, ValueError):
+        name = ""
+    if not name:
+        logger.warning('design kit %s needs a kit.json with a "name" - ignoring', root)
+        return None
+    return DesignKitSnapshot(name=name, assets=MappingProxyType(assets))

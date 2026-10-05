@@ -22,10 +22,12 @@ from omnigent.server.server_config import (
     BRANDING_ASSET_MAX_DIMENSION,
     BRANDING_ASSET_MAX_FRAMES,
     BRANDING_ASSETS_DIRNAME,
+    DESIGN_KIT_DIRNAME,
     branding_config,
     branding_logo_asset,
     config_str_list,
     load_branding_snapshot,
+    load_design_kit,
     load_server_config,
     resolve_config_path,
     session_title_instructions,
@@ -628,3 +630,105 @@ def test_branding_logo_rejects_symlinked_assets_directory(
     (tmp_path / BRANDING_ASSETS_DIRNAME).symlink_to(external, target_is_directory=True)
 
     assert branding_logo_asset() is None
+
+
+def _write_kit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, enabled: str = "true") -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    config = tmp_path / "config.yaml"
+    config.write_text(f"design_kit: {enabled}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    kit = tmp_path / DESIGN_KIT_DIRNAME
+    (kit / "fonts").mkdir(parents=True)
+    (kit / "kit.json").write_text('{"name": "  Acme Kit  ", "css": "layouts.css"}')
+    (kit / "layouts.css").write_text(".layout-title { color: red; }")
+    (kit / "fonts" / "acme.woff2").write_bytes(b"wOF2")
+    (kit / "README.md").write_text("not served")
+    return kit
+
+
+def test_design_kit_unset_or_not_true_is_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for enabled in ("false", "design-kit", "'.'"):
+        _write_kit(monkeypatch, tmp_path / enabled.strip("'"), enabled=enabled)
+        assert load_design_kit() is None
+    assert load_design_kit({}) is None
+
+
+def test_design_kit_loads_allowed_files_with_types(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _write_kit(monkeypatch, tmp_path)
+    kit = load_design_kit()
+    assert kit is not None
+    assert kit.name == "Acme Kit"
+    assert {path: a.media_type for path, a in kit.assets.items()} == {
+        "kit.json": "application/json",
+        "layouts.css": "text/css",
+        "fonts/acme.woff2": "font/woff2",
+    }
+    assert kit.assets["fonts/acme.woff2"].content == b"wOF2"
+
+
+@pytest.mark.parametrize(
+    "kit_json", [None, "not json", "[]", '{"name": ""}', '{"name": 3}', '{"css": "a.css"}']
+)
+def test_design_kit_needs_a_named_kit_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kit_json: str | None
+) -> None:
+    kit = _write_kit(monkeypatch, tmp_path)
+    if kit_json is None:
+        (kit / "kit.json").unlink()
+    else:
+        (kit / "kit.json").write_text(kit_json)
+    assert load_design_kit() is None
+
+
+def test_design_kit_rejects_a_file_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kit = _write_kit(monkeypatch, tmp_path)
+    secret = tmp_path / "config.yaml"
+    (kit / "leak.css").symlink_to(secret)
+    assert load_design_kit() is None
+
+
+def test_design_kit_rejects_a_directory_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kit = _write_kit(monkeypatch, tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.css").write_text("a{}")
+    (kit / "more").symlink_to(outside, target_is_directory=True)
+    assert load_design_kit() is None
+
+
+def test_design_kit_rejects_a_symlinked_kit_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real = _write_kit(monkeypatch, tmp_path / "real")
+    config = tmp_path / "config.yaml"
+    config.write_text("design_kit: true\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    (tmp_path / DESIGN_KIT_DIRNAME).symlink_to(real, target_is_directory=True)
+    assert load_design_kit() is None
+
+
+def test_design_kit_rejects_an_oversized_asset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kit = _write_kit(monkeypatch, tmp_path)
+    (kit / "big.png").write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+    assert load_design_kit() is None
+
+
+def test_design_kit_rejects_more_than_the_total_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kit = _write_kit(monkeypatch, tmp_path)
+    for i in range(10):
+        (kit / f"img{i}.png").write_bytes(b"x" * (2 * 1024 * 1024))
+    assert load_design_kit() is None
+    (kit / "img9.png").unlink()
+    assert load_design_kit() is not None
