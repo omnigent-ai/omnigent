@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shutil
+import urllib.parse
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -332,3 +334,156 @@ def test_new_design_creates_a_session_and_opens_the_studio(
     text = event["data"]["content"][0]["text"]
     assert text.startswith("Weekly status update\n\nUse the slide-decks skill.")
     assert "`decks/weekly-status-update.slides.html`" in text
+
+
+_DS_FIXTURE = _REPO_ROOT / "web" / "src" / "test" / "fixtures" / "design-system"
+_DS_FOLDER = "/brand/fixture"
+_DS_DECK = """\
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>h1 { color: var(--fx-primary, #000); font-family: var(--fx-font, serif); }</style>
+  </head>
+  <body>
+    <section id="s1"><h1>Branded</h1><img id="logo" src="ds:assets/logo.svg" alt="" /></section>
+  </body>
+</html>
+"""
+
+
+def _file_content(path: str, data: bytes, content_type: str) -> dict[str, object]:
+    text = data.decode("utf-8", errors="strict") if b"\0" not in data else None
+    return {
+        "object": "session.environment.filesystem.file_content",
+        "path": path,
+        "content_type": content_type,
+        "encoding": "utf-8" if text is not None else "base64",
+        "content": text if text is not None else base64.b64encode(data).decode(),
+        "bytes": len(data),
+    }
+
+
+def _design_system_files(route: Route) -> None:
+    """Serve a deck, a full design-system pointer, and the fixture under ``_DS_FOLDER``."""
+    url = urllib.parse.urlsplit(route.request.url)
+    path = urllib.parse.unquote(url.path.split("/filesystem/", 1)[1])
+    if "base=host" in url.query and f"/{path}".startswith(f"{_DS_FOLDER}/"):
+        file = _DS_FIXTURE / f"/{path}".removeprefix(f"{_DS_FOLDER}/")
+        if file.is_file():
+            route.fulfill(
+                json=_file_content(f"/{path}", file.read_bytes(), "application/octet-stream")
+            )
+            return
+    elif path == "decks/pitch.slides.html":
+        route.fulfill(json=_file_content(path, _DS_DECK.encode(), "text/html"))
+        return
+    elif path == ".omnigent/design-system.json":
+        pointer = {"path": _DS_FOLDER, "kind": "full", "name": "Fixture Brand"}
+        route.fulfill(json=_file_content(path, json.dumps(pointer).encode(), "application/json"))
+        return
+    route.fulfill(status=404, json={"error": {"code": "not_found"}})
+
+
+def test_design_system_brands_the_landing_and_the_deck(
+    page: Page,
+    live_server: str,
+    tmp_path: Path,
+) -> None:
+    """A full design-system pointer names the group and injects tokens, fonts, and ds: assets."""
+    _stub_landing(page, [_session("online", "/work/site", 2)])
+    page.route("**/resources/environments/default/filesystem/**", _design_system_files)
+    page.route(
+        "**/v1/sessions/online?*",
+        lambda route: route.fulfill(json=_session("online", "/work/site", 2)),
+    )
+    page.set_viewport_size({"width": 1400, "height": 900})
+
+    page.goto(f"{live_server}/design")
+    site = page.get_by_role("region", name="site")
+    badge = site.get_by_title("Design system: Fixture Brand (full)")
+    expect(badge).to_be_visible(timeout=30_000)
+    expect(badge).to_contain_text("Full")
+    site.get_by_role("link", name=re.compile("pitch")).click()
+
+    preview = page.get_by_role("region", name="Deck preview")
+    expect(preview.get_by_title("Design system: Fixture Brand")).to_be_visible(timeout=15_000)
+    deck = preview.frame_locator('iframe[title="Slide deck"]')
+    heading = deck.get_by_role("heading", name="Branded")
+    expect(heading).to_have_css("color", "rgb(11, 95, 255)")
+    expect(heading).to_have_css("font-family", re.compile("Fixture Sans"))
+    logo = deck.locator("#logo")
+    expect(logo).to_have_attribute("src", re.compile(r"^data:image/svg\+xml;base64,"))
+    assert logo.evaluate("img => img.complete && img.naturalWidth") == 10
+    expect(preview.get_by_role("status")).to_have_count(0)
+    page.screenshot(path=str(tmp_path / "design-system-studio.png"))
+
+
+def test_new_design_with_a_design_system_writes_the_pointer(
+    page: Page,
+    live_server: str,
+    tmp_path: Path,
+) -> None:
+    """A recent design system is offered, its pointer is written, and the agent follows it."""
+    _stub_landing(page, [_session("online", "/work/site", 2)])
+    page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": [_HOST]}))
+    page.route("**/v1/hosts/host_e2e/filesystem/**", _host_listing)
+    posted: dict[str, object] = {}
+
+    def _create(route: Route) -> None:
+        if route.request.method != "POST":
+            route.fallback()
+            return
+        route.fulfill(
+            json={"id": "conv_design", "agent_id": "ag", "status": "idle", "created_at": 1}
+        )
+
+    def _write(route: Route) -> None:
+        if route.request.method != "PUT":
+            route.fallback()
+            return
+        posted["write"] = (route.request.url, route.request.post_data_json)
+        route.fulfill(json={"object": "session.environment.filesystem.write_result"})
+
+    def _event(route: Route) -> None:
+        posted["event"] = route.request.post_data_json
+        route.fulfill(status=202, json={"queued": True})
+
+    page.route("**/v1/sessions", _create)
+    page.route("**/v1/sessions/conv_design/resources/environments/default/filesystem/**", _write)
+    page.route("**/v1/sessions/conv_design/events", _event)
+    page.add_init_script(
+        "localStorage.setItem('omnigent.design.defaults', JSON.stringify("
+        "{hostId: 'host_e2e', folders: {host_e2e: '/work/plain'}}));"
+        "localStorage.setItem('omnigent.design.systems', JSON.stringify("
+        "{host_e2e: [{path: '/brand/acme', kind: 'full', name: 'Acme'}]}))"
+    )
+    page.set_viewport_size({"width": 1400, "height": 900})
+
+    page.goto(f"{live_server}/design")
+    expect(page.get_by_role("link", name=re.compile("pitch"))).to_be_visible(timeout=30_000)
+    page.get_by_role("button", name="New design").click()
+
+    dialog = page.get_by_role("dialog", name="New design")
+    dialog.get_by_label("Prompt").fill("Quarterly review")
+    # The stubbed host reports a kit in the folder, so the kit is the default.
+    expect(dialog.get_by_label("Design system")).to_contain_text("Folder kit")
+    dialog.get_by_label("Design system").click()
+    expect(page.get_by_role("option", name="Choose folder")).to_be_visible()
+    expect(page.get_by_role("option", name="None")).to_be_visible()
+    page.get_by_role("option", name="Acme (full)").click()
+    expect(dialog.get_by_label("Design system")).to_contain_text("Acme (full)")
+    page.screenshot(path=str(tmp_path / "design-new-dialog-system.png"))
+    dialog.get_by_role("button", name="Create").click()
+
+    expect(page).to_have_url(re.compile(r"/design\?session=conv_design&file="), timeout=15_000)
+    url, body = posted["write"]  # type: ignore[misc]
+    assert str(url).split("?")[0].endswith("/filesystem/.omnigent/design-system.json")
+    assert isinstance(body, dict)
+    assert json.loads(body["content"]) == {"path": "/brand/acme", "kind": "full", "name": "Acme"}
+    event = posted["event"]
+    assert isinstance(event, dict)
+    text = event["data"]["content"][0]["text"]
+    assert text.endswith(
+        "Follow the design system at `/brand/acme` (`full`). Read its SKILL.md first."
+    )

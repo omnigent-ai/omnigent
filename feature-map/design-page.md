@@ -122,6 +122,12 @@ need the flag set.
 - Kit applied, by hand: copy `examples/design-kits/sample` to
   `.omnigent/design-kit` in a deck's workspace, choose Refresh, and check the
   header shows the kit name and the deck uses the kit's colors and logo.
+- Design system header badge and a branded deck in the studio (tokens, font,
+  `ds:` logo), against a stubbed API serving the synthetic fixture:
+  `tests/e2e_ui/design/test_design_page.py::test_design_system_brands_the_landing_and_the_deck`.
+- New design with a recent design system: the field's options, the pointer
+  write, and the first-message instruction, against a stubbed API:
+  `tests/e2e_ui/design/test_design_page.py::test_new_design_with_a_design_system_writes_the_pointer`.
 - Design system field and pointer write:
   `cd web && pnpm exec vitest run src/pages/design/NewDesignDialog.test.tsx`;
   header badges: `pnpm exec vitest run src/pages/DesignPage.test.tsx src/lib/designDeckApi.test.ts`.
