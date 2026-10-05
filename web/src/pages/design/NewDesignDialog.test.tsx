@@ -11,10 +11,13 @@ import { fetchHostFilesystem, useHostFilesystem } from "@/hooks/useHostFilesyste
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import { deleteFileContent, writeFileContent } from "@/hooks/useWriteFileContent";
+import type * as designDeckApi from "@/lib/designDeckApi";
+import { materializeOrgKit, saveDesignDefault } from "@/lib/designDeckApi";
 import {
   readRecentDesignSystems,
   rememberDesignSystem,
   serializeDesignSystemPointer,
+  type DesignDefault,
 } from "@/lib/designSystem";
 import { readDesignDefaults, rememberDesignDefaults } from "@/lib/designStudio";
 import { nativeWrapperLabelsForAgent } from "@/lib/nativeCodingAgents";
@@ -35,6 +38,17 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   fetchHostFilesystem: vi.fn(),
 }));
 vi.mock("@/lib/sessionsApi", () => ({ createSession: vi.fn(), postEvent: vi.fn() }));
+let userDefault: DesignDefault | null;
+let orgKitName: string | null;
+vi.mock("@/lib/designDeckApi", async (importActual) => ({
+  ...(await importActual<typeof designDeckApi>()),
+  useDesignDefault: () => ({ data: userDefault, isPending: false }),
+  saveDesignDefault: vi.fn(),
+  materializeOrgKit: vi.fn(),
+}));
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({ design_kit: orgKitName ? { name: orgKitName } : null }),
+}));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
 vi.mock("@/shell/WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),
@@ -119,6 +133,10 @@ function create() {
 
 beforeEach(() => {
   listings = {};
+  userDefault = null;
+  orgKitName = null;
+  vi.mocked(saveDesignDefault).mockResolvedValue(undefined);
+  vi.mocked(materializeOrgKit).mockResolvedValue(undefined);
   vi.mocked(useAvailableAgents).mockReturnValue({
     data: [POLLY, CLAUDE],
   } as unknown as ReturnType<typeof useAvailableAgents>);
@@ -399,14 +417,136 @@ describe("NewDesignDialog design system", () => {
     ]);
   });
 
-  it("defaults to the host's most recent system without a kit, else None", () => {
+  it("offers recents without defaulting to them", () => {
     rememberDesignSystem("host_1", ACME);
-    const { unmount } = renderDialog();
-    expect(trigger()).toHaveTextContent("Acme (full)");
-    unmount();
-    localStorage.removeItem("omnigent.design.systems");
     renderDialog();
     expect(trigger()).toHaveTextContent("None");
+  });
+
+  describe("precedence", () => {
+    const mine = { ...ACME, hostId: "host_1" };
+    beforeEach(() => {
+      listings["/work/site/.omnigent/design-kit"] = "missing";
+    });
+
+    it("uses the folder kit over the user default and the org kit", () => {
+      listings["/work/site/.omnigent/design-kit"] = ["kit.json"];
+      userDefault = mine;
+      orgKitName = "Org";
+      renderDialog();
+      expect(trigger()).toHaveTextContent("Folder kit");
+      openSystems();
+      expect(screen.queryByRole("option", { name: "Org (organization)" })).toBeNull();
+    });
+
+    it("then the user default for this host, then the org kit, then None", () => {
+      userDefault = mine;
+      orgKitName = "Org";
+      const { unmount } = renderDialog();
+      expect(trigger()).toHaveTextContent("Acme (full)");
+      unmount();
+      userDefault = { ...mine, hostId: "host_2" };
+      const second = renderDialog();
+      expect(trigger()).toHaveTextContent("Org (organization)");
+      second.unmount();
+      orgKitName = null;
+      renderDialog();
+      expect(trigger()).toHaveTextContent("None");
+    });
+
+    it("lets a stored None beat the org kit", () => {
+      userDefault = { kind: "none" };
+      orgKitName = "Org";
+      renderDialog();
+      expect(trigger()).toHaveTextContent("None");
+    });
+
+    it("keeps an explicit choice over every default", () => {
+      userDefault = mine;
+      renderDialog();
+      openSystems();
+      fireEvent.click(screen.getByRole("option", { name: "None" }));
+      expect(trigger()).toHaveTextContent("None");
+    });
+  });
+
+  it("offers the org kit only once the folder is known to have no kit", () => {
+    orgKitName = "Org";
+    renderDialog();
+    expect(trigger()).toHaveTextContent("None");
+  });
+
+  it("copies the org kit into the folder before the first message", async () => {
+    listings["/work/site/.omnigent/design-kit"] = "missing";
+    orgKitName = "Org";
+    const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+    create();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(materializeOrgKit).toHaveBeenCalledWith("conv_new");
+    expect(vi.mocked(materializeOrgKit).mock.invocationCallOrder[0]).toBeLessThan(
+      postMock.mock.invocationCallOrder[0],
+    );
+    expect(writeMock).not.toHaveBeenCalled();
+    expect(sentText()).not.toContain("Follow the design system");
+  });
+
+  it("applies the user default and copies the org kit for a wireframe too", async () => {
+    listings["/work/site/.omnigent/design-kit"] = "missing";
+    userDefault = { ...ACME, hostId: "host_2" };
+    orgKitName = "Org";
+    const { onCreated } = renderDialog({ initialPrompt: "Sign-up flow" });
+    fireEvent.click(screen.getByRole("button", { name: "Wireframe" }));
+    expect(trigger()).toHaveTextContent("Org (organization)");
+    create();
+    await waitFor(() =>
+      expect(onCreated).toHaveBeenCalledWith("conv_new", "wireframes/sign-up-flow.wireframe.html"),
+    );
+    expect(materializeOrgKit).toHaveBeenCalledWith("conv_new");
+    expect(sentText()).toContain("Use the wireframes skill.");
+  });
+
+  it("keeps the dialog when the org kit copy fails", async () => {
+    listings["/work/site/.omnigent/design-kit"] = "missing";
+    orgKitName = "Org";
+    vi.mocked(materializeOrgKit).mockRejectedValueOnce(new Error("kit.json: 404 Not Found"));
+    const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+    create();
+    expect(await screen.findByRole("alert")).toHaveTextContent("kit.json: 404 Not Found");
+    expect(postMock).not.toHaveBeenCalled();
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  it("saves the chosen system as the default only when asked", async () => {
+    rememberDesignSystem("host_1", ACME);
+    const { onCreated, unmount } = renderDialog({ initialPrompt: "Pitch" });
+    openSystems();
+    fireEvent.click(screen.getByRole("option", { name: "Acme (full)" }));
+    create();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(saveDesignDefault).not.toHaveBeenCalled();
+    unmount();
+
+    const again = renderDialog({ initialPrompt: "Pitch" });
+    openSystems();
+    fireEvent.click(screen.getByRole("option", { name: "Acme (full)" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Make this my default" }));
+    create();
+    await waitFor(() => expect(again.onCreated).toHaveBeenCalled());
+    expect(saveDesignDefault).toHaveBeenCalledWith({ ...ACME, hostId: "host_1" });
+  });
+
+  it("can save None as the default, and offers no checkbox for a kit", async () => {
+    const { onCreated, unmount } = renderDialog({ initialPrompt: "Pitch" });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Make this my default" }));
+    create();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(saveDesignDefault).toHaveBeenCalledWith({ kind: "none" });
+    unmount();
+    listings["/work/site/.omnigent/design-kit"] = "missing";
+    orgKitName = "Org";
+    renderDialog();
+    expect(trigger()).toHaveTextContent("Org (organization)");
+    expect(screen.queryByRole("checkbox", { name: "Make this my default" })).toBeNull();
   });
 
   it("accepts a chosen folder with SKILL.md as a skill-only system", () => {
@@ -455,7 +595,7 @@ describe("NewDesignDialog design system", () => {
   });
 
   it("keeps a recent's name when the system files cannot be read", async () => {
-    rememberDesignSystem("host_1", ACME);
+    userDefault = { ...ACME, hostId: "host_1" };
     vi.mocked(fetchFileContent).mockRejectedValue(new Error("403 Forbidden"));
     const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
     create();
@@ -468,7 +608,7 @@ describe("NewDesignDialog design system", () => {
   });
 
   it("keeps the dialog and the prompt when the pointer write fails", async () => {
-    rememberDesignSystem("host_1", ACME);
+    userDefault = { ...ACME, hostId: "host_1" };
     writeMock.mockRejectedValueOnce(new Error("503 Service Unavailable"));
     const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
     create();
@@ -493,7 +633,7 @@ describe("NewDesignDialog design system", () => {
       ],
     };
     beforeEach(() => {
-      rememberDesignSystem("host_1", ACME);
+      userDefault = { ...ACME, hostId: "host_1" };
       vi.mocked(fetchHostFilesystem).mockImplementation(async (_host, dir) => ({
         truncated: false,
         entries: (tree[dir] ?? []).map(([name, type, bytes]) => ({
@@ -629,6 +769,8 @@ describe("NewDesignDialog design system", () => {
   it("does not clear the pointer when a system is chosen", async () => {
     rememberDesignSystem("host_1", ACME);
     const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+    openSystems();
+    fireEvent.click(screen.getByRole("option", { name: "Acme (full)" }));
     create();
     await waitFor(() => expect(onCreated).toHaveBeenCalled());
     expect(deleteMock).not.toHaveBeenCalled();

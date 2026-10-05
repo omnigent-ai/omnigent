@@ -109,6 +109,31 @@ export function designSystemInstruction(ref: DesignSystemRef): string {
   return `Follow the design system at \`${ref.path}\` (\`${ref.kind}\`). Read its SKILL.md first.`;
 }
 
+/** The user default as a plain ref when it is a system on `hostId`. */
+export function hostDesignDefault(
+  value: DesignDefault | null,
+  hostId: string | null,
+): DesignSystemRef | null {
+  if (!value || value.kind === "none" || value.hostId !== hostId) return null;
+  const { hostId: _, ...ref } = value;
+  return ref;
+}
+
+/**
+ * The New design dialog's default, applied once: the folder's kit, then the
+ * user default on this host (a stored none stops here), then the org kit.
+ */
+export function defaultDesignChoice(o: {
+  folderKit: boolean;
+  userDefault: DesignDefault | null;
+  hostId: string | null;
+  orgKit: boolean;
+}): "kit" | "org-kit" | "none" | DesignSystemRef {
+  if (o.folderKit) return "kit";
+  if (o.userDefault?.kind === "none") return "none";
+  return hostDesignDefault(o.userDefault, o.hostId) ?? (o.orgKit ? "org-kit" : "none");
+}
+
 function readAllRecents(): Record<string, unknown> {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(RECENTS_KEY) ?? "{}");

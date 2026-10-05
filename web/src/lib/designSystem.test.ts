@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   DESIGN_SYSTEM_IMPORT_DIR,
   DESIGN_SYSTEM_RECENTS_MAX,
+  defaultDesignChoice,
   designSystemInstruction,
   designSystemName,
   detectDesignSystemKind,
@@ -153,5 +154,39 @@ describe("recent design systems", () => {
       JSON.stringify({ h1: [{ path: "/ok", kind: "full", name: "Ok" }, { path: 3 }, "x"] }),
     );
     expect(readRecentDesignSystems("h1")).toEqual([{ path: "/ok", kind: "full", name: "Ok" }]);
+  });
+});
+
+describe("defaultDesignChoice", () => {
+  const mine = { ...ACME, hostId: "host_1" };
+  const pick = (over: Partial<Parameters<typeof defaultDesignChoice>[0]> = {}) =>
+    defaultDesignChoice({
+      folderKit: false,
+      userDefault: null,
+      hostId: "host_1",
+      orgKit: false,
+      ...over,
+    });
+
+  it("prefers the folder's kit over every default", () => {
+    expect(pick({ folderKit: true, userDefault: mine, orgKit: true })).toBe("kit");
+  });
+
+  it("then the user default on this host, without its host id", () => {
+    expect(pick({ userDefault: mine, orgKit: true })).toEqual(ACME);
+  });
+
+  it("then the org kit, when the default is unset or on another host", () => {
+    expect(pick({ orgKit: true })).toBe("org-kit");
+    expect(pick({ userDefault: { ...mine, hostId: "host_2" }, orgKit: true })).toBe("org-kit");
+  });
+
+  it("lets a stored none beat the org kit", () => {
+    expect(pick({ userDefault: { kind: "none" }, orgKit: true })).toBe("none");
+  });
+
+  it("falls back to none", () => {
+    expect(pick()).toBe("none");
+    expect(pick({ userDefault: { ...mine, hostId: "host_2" } })).toBe("none");
   });
 });

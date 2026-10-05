@@ -7,6 +7,7 @@ import { FolderOpenIcon, PaletteIcon, TriangleAlertIcon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Label } from "@/components/scheduled/Label";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -29,7 +30,15 @@ import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHosts } from "@/hooks/useHosts";
 import { deleteFileContent, writeFileContent } from "@/hooks/useWriteFileContent";
 import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
-import { planDesignSystemImportFrom, runDesignSystemImport } from "@/lib/designDeckApi";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import {
+  DESIGN_DEFAULT_QUERY_KEY,
+  materializeOrgKit,
+  planDesignSystemImportFrom,
+  runDesignSystemImport,
+  saveDesignDefault,
+  useDesignDefault,
+} from "@/lib/designDeckApi";
 import { DESIGN_SUFFIXES, designName, type DesignKind } from "@/lib/designDecks";
 import type { ImportError, ImportPlan } from "@/lib/designSystemImport";
 import {
@@ -37,9 +46,11 @@ import {
   DS_MANIFEST,
   DS_SKILL,
   NOT_A_DESIGN_SYSTEM,
+  defaultDesignChoice,
   designSystemName,
   detectDesignSystemKind,
   folderName,
+  hostDesignDefault,
   readRecentDesignSystems,
   rememberDesignSystem,
   serializeDesignSystemPointer,
@@ -68,6 +79,7 @@ function joinPath(folder: string, rel: string): string {
 
 const SYSTEM_NONE = "none";
 const SYSTEM_KIT = "kit";
+const SYSTEM_ORG_KIT = "org-kit";
 const SYSTEM_CHOOSE = "choose";
 const systemValue = (ref: DesignSystemRef) => `ds:${ref.path}`;
 const errorText = (e: unknown) => (e instanceof Error && e.message ? e.message : String(e));
@@ -128,8 +140,9 @@ export function NewDesignDialog({
   // null: use the remembered folder for the selected host.
   const [pickedFolder, setPickedFolder] = useState<string | null>(null);
   const [browserOpen, setBrowserOpen] = useState(false);
-  // null: the default (folder kit, else the host's most recent system, else none).
+  // null: the default from `defaultDesignChoice`.
   const [pickedSystem, setPickedSystem] = useState<string | null>(null);
+  const [makeDefault, setMakeDefault] = useState(false);
   const [systemFolder, setSystemFolder] = useState<string | null>(null);
   const [systemBrowserOpen, setSystemBrowserOpen] = useState(false);
   const [importChoice, setImportChoice] = useState<ImportChoice | null>(null);
@@ -151,6 +164,7 @@ export function NewDesignDialog({
       setPickedHostId(null);
       setPickedFolder(null);
       setPickedSystem(null);
+      setMakeDefault(false);
       setSystemFolder(null);
       setImportChoice(null);
       setCopy(null);
@@ -215,19 +229,34 @@ export function NewDesignDialog({
         : systemListed && !chosenKind
           ? NOT_A_DESIGN_SYSTEM
           : null;
-  const systems =
-    chosen && !recents.some((r) => r.path === chosen.path) ? [chosen, ...recents] : recents;
+  const designDefault = useDesignDefault(open);
+  const userDefault = designDefault.data ?? null;
+  const hostDefault = hostDesignDefault(userDefault, hostId);
+  const systems = [chosen, hostDefault, ...recents].filter(
+    (r, i, all): r is DesignSystemRef => !!r && all.findIndex((o) => o?.path === r.path) === i,
+  );
   const kitFound = kitHint === "Kit found";
+  const serverInfo = useServerInfo();
+  // An org kit is offered only once the folder is known to have no kit of its own.
+  const orgKit = kitHint === "No kit" && serverInfo !== "loading" ? serverInfo.design_kit : null;
   const systemOptions = [
     SYSTEM_NONE,
     ...(kitFound ? [SYSTEM_KIT] : []),
+    ...(orgKit ? [SYSTEM_ORG_KIT] : []),
     ...systems.map(systemValue),
   ];
-  const defaultSystem = kitFound ? SYSTEM_KIT : systems[0] ? systemValue(systems[0]) : SYSTEM_NONE;
+  const fallback = defaultDesignChoice({
+    folderKit: kitFound,
+    userDefault,
+    hostId,
+    orgKit: !!orgKit,
+  });
+  const defaultSystem = typeof fallback === "string" ? fallback : systemValue(fallback);
   const systemChoice =
     pickedSystem && systemOptions.includes(pickedSystem) ? pickedSystem : defaultSystem;
   const system = systems.find((s) => systemValue(s) === systemChoice);
   const importing = system && importChoice?.path === system.path ? importChoice : null;
+  const canMakeDefault = systemChoice === SYSTEM_NONE || system !== undefined;
 
   async function planImport(source: DesignSystemRef) {
     if (!hostId) return;
@@ -251,7 +280,8 @@ export function NewDesignDialog({
     importing?.status !== "planning" &&
     importing?.status !== "confirm" &&
     !designsListing.isLoading &&
-    !designsListing.isPlaceholderData;
+    !designsListing.isPlaceholderData &&
+    !designDefault.isPending;
 
   // Nested pickers portal outside the dialog; keep their clicks from closing it.
   const selectOpenCount = useRef(0);
@@ -319,6 +349,7 @@ export function NewDesignDialog({
       } else {
         // A pointer left from an earlier design would override the folder kit.
         await deleteFileContent(sessionId, DESIGN_SYSTEM_POINTER);
+        if (systemChoice === SYSTEM_ORG_KIT) await materializeOrgKit(sessionId);
       }
       await postEvent(sessionId, {
         type: "message",
@@ -329,6 +360,12 @@ export function NewDesignDialog({
       });
       rememberDesignDefaults(agent.id, hostId, folder);
       if (named) rememberDesignSystem(hostId, named);
+      if (makeDefault && canMakeDefault) {
+        void saveDesignDefault(named ? { ...named, hostId } : { kind: "none" }).then(
+          () => queryClient.invalidateQueries({ queryKey: DESIGN_DEFAULT_QUERY_KEY }),
+          () => undefined,
+        );
+      }
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       onCreated(sessionId, path);
       onOpenChange(false);
@@ -520,6 +557,11 @@ export function NewDesignDialog({
                 <SelectContent position="popper" align="start">
                   <SelectItem value={SYSTEM_NONE}>None</SelectItem>
                   {kitFound && <SelectItem value={SYSTEM_KIT}>Folder kit</SelectItem>}
+                  {orgKit && (
+                    <SelectItem
+                      value={SYSTEM_ORG_KIT}
+                    >{`${orgKit.name} (organization)`}</SelectItem>
+                  )}
                   {systems.map((s) => (
                     <SelectItem key={s.path} value={systemValue(s)}>
                       {`${s.name} (${s.kind})`}
@@ -538,6 +580,16 @@ export function NewDesignDialog({
                   setPickedSystem(`ds:${path}`);
                 }}
               />
+              {canMakeDefault && (
+                <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Checkbox
+                    checked={makeDefault}
+                    onCheckedChange={(checked) => setMakeDefault(checked === true)}
+                    componentId="design.new.make_default"
+                  />
+                  Make this my default
+                </label>
+              )}
               {system && (
                 <div className="flex items-center gap-2">
                   <p

@@ -1,6 +1,7 @@
 // Reads for the Design page. Deck and kit reads go through the existing file
 // APIs, so a user only sees decks in workspaces they can already read.
 
+import { useQuery } from "@tanstack/react-query";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import { fetchHostFilesystem } from "@/hooks/useHostFilesystem";
 import { writeFileContent } from "@/hooks/useWriteFileContent";
@@ -177,6 +178,17 @@ export async function fetchDesignDefault(): Promise<DesignDefault | null> {
   } catch {
     return null;
   }
+}
+
+export const DESIGN_DEFAULT_QUERY_KEY = ["design-default"];
+
+export function useDesignDefault(enabled: boolean) {
+  return useQuery({
+    queryKey: DESIGN_DEFAULT_QUERY_KEY,
+    queryFn: fetchDesignDefault,
+    enabled,
+    retry: false,
+  });
 }
 
 export async function saveDesignDefault(value: DesignDefault): Promise<void> {
