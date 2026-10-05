@@ -25,12 +25,19 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Add and conservatively initialize the visible-message watermark."""
-    existing = {c["name"] for c in sa.inspect(op.get_bind()).get_columns("conversations")}
+    bind = op.get_bind()
+    existing = {c["name"] for c in sa.inspect(bind).get_columns("conversations")}
     if "last_message_at" not in existing:
         op.add_column(
             "conversations",
             sa.Column("last_message_at", sa.Integer(), nullable=True),
         )
+    if bind.dialect.name == "cockroachdb":
+        # CockroachDB publishes ADD COLUMN asynchronously. Commit the schema
+        # change before the backfill, then run the data write in a fresh
+        # serializable transaction so it cannot observe a column mid-backfill.
+        bind.commit()
+        bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
     op.execute(
         sa.text(
             "UPDATE conversations SET last_message_at = updated_at WHERE last_message_at IS NULL"

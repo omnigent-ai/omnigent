@@ -358,6 +358,7 @@ function startDisplayCapture(recordDir, display) {
  *   this, so the shell auto-connects on launch.
  * @param {string} [opts.userDataDir] Override the isolated userData dir
  *   (defaults to a fresh temp dir).
+ * @param {NodeJS.ProcessEnv} [opts.env] Isolated environment for the desktop process.
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
  *   window: import("playwright").Page, userDataDir: string,
  *   stopDisplayCapture: () => Promise<void> }>} `stopDisplayCapture` must be
@@ -416,7 +417,7 @@ async function launchDesktop(opts) {
       recordVideo: { dir: opts.recordDir },
       // Dev builds read dev-app-update.yml and would try to reach the update
       // endpoint; a version override keeps the app off the update path.
-      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
+      env: { ...(opts.env ?? process.env), OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
     });
   } catch (err) {
     await stopDisplayCapture();

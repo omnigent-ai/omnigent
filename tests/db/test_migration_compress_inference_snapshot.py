@@ -16,7 +16,6 @@ from alembic.operations import Operations
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.compression import decode, encode
 from omnigent.db.utils import _build_alembic_config, get_or_create_engine
-from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 _TABLE = "omnigent_conversation_metadata"
 _PREVIOUS = "kk1a2b3c4d5e"
@@ -39,6 +38,17 @@ def _rows(engine: sa.Engine) -> dict[tuple[int, bytes], sa.Row]:
         return {
             (row.workspace_id, bytes(row.id)): row
             for row in connection.execute(sa.text(f"SELECT * FROM {_TABLE}"))
+        }
+
+
+def _conversation_titles(engine: sa.Engine) -> dict[tuple[int, bytes], str]:
+    """Read titles without the current ORM model at an older revision."""
+    with engine.connect() as connection:
+        return {
+            (row.workspace_id, bytes(row.id)): row.title
+            for row in connection.execute(
+                sa.text("SELECT workspace_id, id, title FROM conversations")
+            )
         }
 
 
@@ -150,16 +160,16 @@ def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
         assert columns["inference_snapshot"]["nullable"]
         assert isinstance(columns["inference_snapshot"]["type"], sa.LargeBinary)
         assert not any(name.startswith("_inference_snapshot") for name in columns)
-        store = SqlAlchemyConversationStore(db_uri)
+        titles = _conversation_titles(engine)
         for (workspace_id, row_id), value in original.items():
             if workspace_id != 0:
                 continue
-            conversation = store.get_conversation(row_id.hex())
-            assert conversation is not None
-            assert conversation.title == "Preserve conversation"
+            assert titles[(workspace_id, row_id)] == "Preserve conversation"
             expected = None if value is None or value == oversized else json.loads(value)
-            assert conversation.inference_snapshot == expected
-            assert conversation.session_state == {"untouched": True}
+            row = after[(workspace_id, row_id)]
+            decoded_snapshot = decode(row.inference_snapshot)
+            assert (None if decoded_snapshot is None else json.loads(decoded_snapshot)) == expected
+            assert json.loads(decode(row.session_state)) == {"untouched": True}
 
         _migrate(engine, _PREVIOUS, downgrade=True)
         for key, row in _rows(engine).items():
