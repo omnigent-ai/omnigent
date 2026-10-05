@@ -80,6 +80,8 @@ guidance from the user's chosen source.
   for example `ds:assets/brand/logo-white.svg` in `src`, `href`, or CSS
   `url()`. The viewer resolves them; only image and font files inside the
   folder load. Never embed base64 copies of design-system files.
+- The viewer reads the design system when a deck opens, so reopen the deck to
+  see edits made only to design-system files.
 - Ignore `uploads/`, `ui_kits/`, and `preview/`.
 - A skill-only system (kind `skill`) has no viewer support beyond its name:
   follow its `SKILL.md` and inline everything as usual.
