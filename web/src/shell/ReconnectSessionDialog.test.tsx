@@ -82,6 +82,36 @@ describe("buildReconnectCommand", () => {
     expect(cmd).not.toContain("path/to/agent.yaml");
   });
 
+  it("uses the `isaac omni` prefix for a Databricks deployment", () => {
+    // Databricks deployments invoke the CLI as `isaac omni`, so a copy-pasted
+    // reconnect command must match — in every command form.
+    expect(
+      buildReconnectCommand({
+        conversationId: "conv_db_host",
+        serverUrl: "https://x.databricksapps.com",
+        state: "host_offline",
+        prefix: "isaac omni",
+      }),
+    ).toContain("isaac omni host");
+    expect(
+      buildReconnectCommand({
+        conversationId: "conv_db_claude",
+        serverUrl: "https://x.databricksapps.com",
+        wrapper: "claude-code-native-ui",
+        state: "local_stranded",
+        prefix: "isaac omni",
+      }),
+    ).toContain("isaac omni claude");
+    expect(
+      buildReconnectCommand({
+        conversationId: "conv_db_run",
+        serverUrl: "https://x.databricksapps.com",
+        state: "local_stranded",
+        prefix: "isaac omni",
+      }),
+    ).toContain("isaac omni run path/to/agent.yaml");
+  });
+
   it("prefers `omnigent host` for a host_offline claude-native session", () => {
     // A claude-native session can still be host-bound; while the host is
     // down the host relaunches whatever runtime it needs, so host wins.
