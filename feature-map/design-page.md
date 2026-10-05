@@ -47,13 +47,29 @@ server deck index (`GET /v1/design/artifacts`) lists decks across sessions.
   the host (kept in localStorage), and "Choose folder" (the host folder
   picker). A folder with `_ds_manifest.json` is a full system, one with only
   `SKILL.md` is skill-only, and anything else shows "Not a design system: no
-  SKILL.md or _ds_manifest.json". The default is the folder kit, else the
-  host's most recent system, else None. On create the dialog reads the name
+  SKILL.md or _ds_manifest.json". The default is `design-default` below.
+  On create the dialog reads the name
   (manifest `namespace`, else `SKILL.md` `name`, else the folder name) through
   the new session, writes `.omnigent/design-system.json` through the existing
   workspace file write, and adds "Follow the design system at `<path>`
   (`<kind>`). Read its SKILL.md first." to the first message. The deck viewer
   behavior is `deck-design-system` in `feature-map/slide-decks.md`.
+- `design-default`: the Design system field's default, applied once: the
+  user's explicit choice, then "Folder kit", then the user default when it
+  is on the selected host, then the org kit, then None. "Make this my
+  default" (shown for None or a design system) saves the choice on Create to
+  `PUT /v1/me/preferences/design-default`, per user, stored on the server;
+  a saved None also beats the org kit. Recents stay in localStorage and are
+  options, never the default. Covered by
+  `tests/server/routes/test_design_kits.py` and
+  `web/src/lib/designSystem.test.ts`.
+- `design-org-kit`: with `design_kit: true` in server config, the kit in
+  `{config_dir}/design-kit/` is checked at startup, named in `GET /v1/info`
+  as `design_kit`, and served to signed-in users from
+  `GET /v1/design-kit/<path>`. New design offers "<name> (organization)"
+  when the folder has no kit of its own; Create copies `kit.json` and the
+  files it uses into `.omnigent/design-kit/` (kit.json last), so the deck
+  renders as a normal folder kit for every viewer.
 - `design-system-import`: "Import" next to the chosen system in New design,
   and "Import design system" in the studio header for the owner of a design
   whose pointer is an absolute folder, copy the system into
@@ -187,6 +203,17 @@ need the flag set.
   `.omnigent/design-system/` holds the copy, the pointer has `imported_from`,
   and the first message names `.omnigent/design-system`. Share the session
   with another user and check they see the branding.
+- Org kit and user default, by hand: put the sample kit in the config dir
+  (`cp -R examples/design-kits/sample <config_dir>/design-kit`), add
+  `design_kit: true` to the server config, restart, and check `GET /v1/info`
+  shows `"design_kit": {"name": "Sample Kit"}`. In New design pick a folder
+  without a kit: the field defaults to "Sample Kit (organization)"; create
+  and check the folder's `.omnigent/design-kit/` holds `kit.json`,
+  `layouts.css`, and `logo.svg`, and the deck shows the kit. Then choose a
+  design system, tick "Make this my default", create, and reopen New
+  design: that system is now the default on that host, and the org kit on
+  others. Tests: `uv run pytest tests/server/routes/test_design_kits.py tests/server/test_server_config.py -k design`
+  and `cd web && pnpm exec vitest run src/pages/design/NewDesignDialog.test.tsx src/lib/designDeckApi.test.ts`.
 - Offline session, by hand: stop the runner of a session that has decks,
   choose Refresh, and check its group shows the Unavailable row and link.
 
@@ -215,6 +242,12 @@ need the flag set.
   folder by an earlier design still applies.
 - An external folder that only has a `kit.json` is not a design system; kits
   stay in the design's own `.omnigent/design-kit/`.
+- The org kit is read once at startup, so editing it needs a restart, and a
+  design created earlier keeps its copy. Any symlink, a file over 2 MB, more
+  than 20 MB in total, or a `kit.json` without a `name` turns the whole kit
+  off with a server warning; files of other types (a `README.md`) are skipped.
+  The org kit is not offered while the folder's kit listing is loading or
+  fails.
 - Import follows symlinks in the source as their targets; the allowlist,
   type filter, and caps still apply. A re-import overwrites files but does
   not remove ones the source no longer has. Text files over 2,000 lines are

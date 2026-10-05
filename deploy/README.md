@@ -591,6 +591,26 @@ Desktop builds that read it always show the host next to it, and an MDM-provided
 name (`omnigentServerName`) takes precedence. When unset, the desktop shows the
 host; it does not fall back to `app_name`.
 
+## Organization design kit
+
+With the `design` feature on, a slide-deck design kit can be offered to every
+user from the server config. Put the kit (a `kit.json` plus its assets, as in
+`examples/design-kits/sample/`) in a `design-kit/` directory beside the config
+file and set:
+
+```yaml
+design_kit: true                 # serves {config_dir}/design-kit/
+```
+
+The kit is checked once at startup: no symlinks anywhere in it, each file at
+most 2 MB, 20 MB in total, and a `kit.json` with a `name`; any failure turns
+the kit off with a warning. Only `.json`, `.css`, font, and image files are
+served; others are skipped. `GET /v1/info` names it as `design_kit`, and
+signed-in users read it from `GET /v1/design-kit/<path>`. New design offers
+it for folders without their own kit and copies it into the design's
+`.omnigent/design-kit/`. The config ships with each replica, so this works on
+multi-replica and Databricks-hosted servers.
+
 ## Adding a new deploy target
 
 Drop a new subdirectory under `deploy/<target>/` with a `README.md`
