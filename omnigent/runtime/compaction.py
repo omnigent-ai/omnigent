@@ -24,7 +24,10 @@ import tiktoken
 from omnigent.entities import (
     CompactionData,
     ConversationItem,
+    FunctionCallData,
+    FunctionCallOutputData,
     MessageData,
+    NativeToolData,
 )
 from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.llms.summarize import (
@@ -509,17 +512,15 @@ def compaction_to_history_items(
     if data.compacted_messages:
         items: list[ConversationItem] = []
         for i, msg in enumerate(data.compacted_messages):
+            item_type, item_data = _compacted_snapshot_data(msg, model=data.model)
             items.append(
                 ConversationItem(
                     id=f"{compaction_item.id}_compacted_{i}",
-                    type=msg.get("type", "message"),
+                    type=item_type,
                     status="completed",
                     response_id=compaction_item.response_id,
                     created_at=compaction_item.created_at,
-                    data=MessageData(
-                        role=msg.get("role", "user"),
-                        content=msg.get("content", []),
-                    ),
+                    data=item_data,
                 )
             )
         return items
@@ -550,10 +551,117 @@ def compaction_to_history_items(
         data=MessageData(
             role="assistant",
             content=[{"type": "output_text", "text": data.summary}],
-            agent=data.model,
+            agent=data.model or "unknown",
         ),
     )
     return [user_item, assistant_item]
+
+
+def _compacted_snapshot_data(
+    snapshot: dict[str, Any],
+    *,
+    model: str | None,
+) -> tuple[str, MessageData | FunctionCallData | FunctionCallOutputData | NativeToolData]:
+    """Parse one provider snapshot into a typed history item payload."""
+    raw_type = snapshot.get("type")
+    item_type = raw_type if isinstance(raw_type, str) else None
+    agent = _snapshot_agent(snapshot, model)
+
+    if item_type == "message" or (item_type is None and "role" in snapshot):
+        role = snapshot.get("role", "user")
+        if role in ("user", "assistant"):
+            content = _snapshot_message_content(snapshot.get("content"), role)
+            if content is not None:
+                return "message", MessageData(
+                    role=role,
+                    content=content,
+                    agent=agent if role == "assistant" else None,
+                    is_meta=snapshot.get("is_meta") is True,
+                    user_authored=snapshot.get("user_authored") is True,
+                    subagent_return_id=(
+                        snapshot.get("subagent_return_id")
+                        if isinstance(snapshot.get("subagent_return_id"), str)
+                        else None
+                    ),
+                    interrupted=snapshot.get("interrupted") is True,
+                    stream_message_id=(
+                        snapshot.get("stream_message_id")
+                        if isinstance(snapshot.get("stream_message_id"), str)
+                        else None
+                    ),
+                )
+
+    if item_type == "function_call":
+        call_id = snapshot.get("call_id")
+        name = snapshot.get("name")
+        if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
+            return "function_call", FunctionCallData(
+                agent=agent,
+                name=name,
+                arguments=_snapshot_string(snapshot.get("arguments")),
+                call_id=call_id,
+            )
+
+    if item_type == "function_call_output":
+        call_id = snapshot.get("call_id")
+        if isinstance(call_id, str) and call_id:
+            return "function_call_output", FunctionCallOutputData(
+                call_id=call_id,
+                output=_snapshot_string(snapshot.get("output")),
+                subagent_return_id=(
+                    snapshot.get("subagent_return_id")
+                    if isinstance(snapshot.get("subagent_return_id"), str)
+                    else None
+                ),
+            )
+
+    if item_type == "native_tool":
+        raw_item = snapshot.get("item")
+        return "native_tool", NativeToolData(
+            item=raw_item if isinstance(raw_item, dict) else snapshot
+        )
+
+    # Provider-native, reasoning, and future vendor records are replayed as
+    # opaque input items rather than coerced into a lossy message shape.
+    return "native_tool", NativeToolData(item=snapshot)
+
+
+def _snapshot_agent(snapshot: dict[str, Any], model: str | None) -> str:
+    """Return assistant/tool attribution from a snapshot or compaction row."""
+    for key in ("agent", "model"):
+        value = snapshot.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return model if isinstance(model, str) and model else "unknown"
+
+
+def _snapshot_string(value: object) -> str:
+    """Render a snapshot scalar as the string shape required by item data."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _snapshot_message_content(value: object, role: str) -> list[dict[str, Any]] | None:
+    """Normalize supported content or return ``None`` to preserve it opaque."""
+    block_type = "input_text" if role == "user" else "output_text"
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [{"type": block_type, "text": value}]
+    if isinstance(value, list):
+        blocks: list[dict[str, Any]] = []
+        for block in value:
+            if isinstance(block, dict):
+                blocks.append(block)
+            elif isinstance(block, str):
+                blocks.append({"type": block_type, "text": block})
+            else:
+                return None
+        return blocks
+    return None
 
 
 async def compact(
