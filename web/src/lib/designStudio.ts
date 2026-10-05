@@ -1,7 +1,7 @@
-// Pure helpers for the Design studio: deck slugs, the first message, the
+// Pure helpers for the Design studio: design slugs, the first message, the
 // studio URL, remembered dialog defaults, and the preview's waiting states.
 
-import { DECK_SUFFIX } from "./designDecks";
+import { DESIGN_SUFFIXES, designKind, type DesignKind } from "./designDecks";
 import { designSystemInstruction, type DesignSystemRef } from "./designSystem";
 
 export const DESIGN_SESSION_PARAM = "session";
@@ -58,15 +58,35 @@ export function deckSlug(prompt: string, taken: Iterable<string>): string {
   return slug;
 }
 
-export function designDeckPath(slug: string): string {
-  return `decks/${slug}${DECK_SUFFIX}`;
+/** The workspace folder New design writes each kind to. */
+export const DESIGN_FOLDERS: Record<DesignKind, string> = {
+  deck: "decks",
+  wireframe: "wireframes",
+};
+
+export function designPath(slug: string, kind: DesignKind): string {
+  return `${DESIGN_FOLDERS[kind]}/${slug}${DESIGN_SUFFIXES[kind]}`;
 }
 
+export function designDeckPath(slug: string): string {
+  return designPath(slug, "deck");
+}
+
+const FIRST_MESSAGE: Record<DesignKind, (path: string) => string> = {
+  deck: (path) =>
+    `Use the slide-decks skill. Write the deck to \`${path}\`. ` +
+    "Write a complete document with only the title slide first, then add one complete " +
+    "slide per edit.",
+  wireframe: (path) =>
+    `Use the wireframes skill. Write the wireframe to \`${path}\`. ` +
+    "Write a complete document with only the first screen first, then add one complete " +
+    "screen per edit.",
+};
+
+/** The prompt plus the skill and write instructions for the kind `path` ends with. */
 export function firstDesignMessage(prompt: string, path: string, system?: DesignSystemRef): string {
   return (
-    `${prompt.trim()}\n\nUse the slide-decks skill. Write the deck to \`${path}\`. ` +
-    "Write a complete document with only the title slide first, then add one complete " +
-    "slide per edit." +
+    `${prompt.trim()}\n\n${FIRST_MESSAGE[designKind(path) ?? "deck"](path)}` +
     (system ? `\n\n${designSystemInstruction(system)}` : "")
   );
 }

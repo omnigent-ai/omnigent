@@ -1,5 +1,5 @@
-// "New design" dialog: a prompt, the New session agent picker, and an online
-// host plus folder. Create sends the same session create the New session
+// "New design" dialog: Slides or Wireframe, a prompt, the New session agent
+// picker, and an online host plus folder. Create sends the same session create the New session
 // dialog sends, then the first message, and stays on `/design`.
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -30,7 +30,7 @@ import { useHosts } from "@/hooks/useHosts";
 import { deleteFileContent, writeFileContent } from "@/hooks/useWriteFileContent";
 import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
 import { planDesignSystemImportFrom, runDesignSystemImport } from "@/lib/designDeckApi";
-import { DECK_SUFFIX, designName, type DesignKind } from "@/lib/designDecks";
+import { DESIGN_SUFFIXES, designName, type DesignKind } from "@/lib/designDecks";
 import type { ImportError, ImportPlan } from "@/lib/designSystemImport";
 import {
   DESIGN_SYSTEM_POINTER,
@@ -46,8 +46,9 @@ import {
   type DesignSystemRef,
 } from "@/lib/designSystem";
 import {
+  DESIGN_FOLDERS,
   deckSlug,
-  designDeckPath,
+  designPath,
   firstDesignMessage,
   readDesignDefaults,
   rememberDesignDefaults,
@@ -55,6 +56,7 @@ import {
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { isNativeCodingAgent, nativeWrapperLabelsForAgent } from "@/lib/nativeCodingAgents";
 import { createSession, postEvent } from "@/lib/sessionsApi";
+import { cn } from "@/lib/utils";
 import { DESIGN_KIT_DIR } from "@/shell/codeViewerHelpers";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
@@ -69,6 +71,15 @@ const SYSTEM_KIT = "kit";
 const SYSTEM_CHOOSE = "choose";
 const systemValue = (ref: DesignSystemRef) => `ds:${ref.path}`;
 const errorText = (e: unknown) => (e instanceof Error && e.message ? e.message : String(e));
+
+const KIND_COPY: Record<DesignKind, { label: string; noun: string; placeholder: string }> = {
+  deck: { label: "Slides", noun: "a slide deck", placeholder: "What should the deck cover?" },
+  wireframe: {
+    label: "Wireframe",
+    noun: "a clickable wireframe",
+    placeholder: "What should the wireframe show?",
+  },
+};
 
 /** An import of the chosen system, keyed by its folder. */
 type ImportChoice =
@@ -111,6 +122,7 @@ export function NewDesignDialog({
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: hosts } = useHosts({ enabled: open });
   const [prompt, setPrompt] = useState("");
+  const [kind, setKind] = useState<DesignKind>("deck");
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [pickedHostId, setPickedHostId] = useState<string | null>(null);
   // null: use the remembered folder for the selected host.
@@ -134,6 +146,7 @@ export function NewDesignDialog({
   useEffect(() => {
     if (open && !wasOpen.current) {
       setPrompt(initialPrompt ?? "");
+      setKind("deck");
       setPickedAgentId(null);
       setPickedHostId(null);
       setPickedFolder(null);
@@ -166,7 +179,10 @@ export function NewDesignDialog({
   const folder = pickedFolder ?? (hostId ? (defaults.folders?.[hostId] ?? "") : "");
 
   const kitListing = useHostFilesystem(hostId, folder ? joinPath(folder, DESIGN_KIT_DIR) : null);
-  const decksListing = useHostFilesystem(hostId, folder ? joinPath(folder, "decks") : null);
+  const designsListing = useHostFilesystem(
+    hostId,
+    folder ? joinPath(folder, DESIGN_FOLDERS[kind]) : null,
+  );
   const kitHint = kitListing.data?.entries.some((e) => e.name === "kit.json")
     ? "Kit found"
     : kitListing.data || (kitListing.error as { status?: number } | null)?.status === 404
@@ -234,8 +250,8 @@ export function NewDesignDialog({
     !submitting &&
     importing?.status !== "planning" &&
     importing?.status !== "confirm" &&
-    !decksListing.isLoading &&
-    !decksListing.isPlaceholderData;
+    !designsListing.isLoading &&
+    !designsListing.isPlaceholderData;
 
   // Nested pickers portal outside the dialog; keep their clicks from closing it.
   const selectOpenCount = useRef(0);
@@ -262,10 +278,11 @@ export function NewDesignDialog({
     setError(null);
     setSubmitting(true);
     try {
-      const inFolder = (decksListing.data?.entries ?? [])
-        .filter((e) => e.name.endsWith(DECK_SUFFIX))
+      const inFolder = (designsListing.data?.entries ?? [])
+        .filter((e) => e.name.endsWith(DESIGN_SUFFIXES[kind]))
         .map((e) => designName(e.name));
-      const path = designDeckPath(deckSlug(prompt, [...takenNames(folder, "deck"), ...inFolder]));
+      const taken = [...takenNames(folder, kind), ...inFolder];
+      const path = designPath(deckSlug(prompt, taken), kind);
       const key = `${agent.id}\0${hostId}\0${folder}`;
       let sessionId = created.current?.key === key ? created.current.id : null;
       if (sessionId === null) {
@@ -334,11 +351,34 @@ export function NewDesignDialog({
         <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
           <DialogTitle>New design</DialogTitle>
           <DialogDescription>
-            Starts an agent session that builds a slide deck you can watch and refine here.
+            {`Starts an agent session that builds ${KIND_COPY[kind].noun} you can watch and refine here.`}
           </DialogDescription>
         </DialogHeader>
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4">
+          <div
+            role="group"
+            aria-label="Design type"
+            className="flex w-fit gap-1 rounded-lg border border-border p-0.5"
+          >
+            {(["deck", "wireframe"] as const).map((k) => (
+              <button
+                key={k}
+                type="button"
+                aria-pressed={kind === k}
+                onClick={() => setKind(k)}
+                className={cn(
+                  "rounded-md px-3 py-1 text-ui font-medium transition-colors",
+                  kind === k
+                    ? "bg-muted text-foreground"
+                    : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                )}
+              >
+                {KIND_COPY[k].label}
+              </button>
+            ))}
+          </div>
+
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="design-prompt">Prompt</Label>
             <Textarea
@@ -346,7 +386,7 @@ export function NewDesignDialog({
               value={prompt}
               rows={4}
               required
-              placeholder="What should the deck cover?"
+              placeholder={KIND_COPY[kind].placeholder}
               componentId="design.new.prompt"
               className="resize-none text-ui"
               onChange={(e) => setPrompt(e.target.value)}

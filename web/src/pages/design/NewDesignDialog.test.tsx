@@ -275,6 +275,57 @@ describe("NewDesignDialog create", () => {
     );
   });
 
+  it("writes a wireframe under wireframes/ and names the wireframes skill", async () => {
+    const { onCreated } = renderDialog({ initialPrompt: "Sign-up flow" });
+    expect(screen.getByRole("button", { name: "Slides" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Wireframe" }));
+    expect(screen.getByRole("button", { name: "Wireframe" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByLabelText("Prompt")).toHaveAttribute(
+      "placeholder",
+      "What should the wireframe show?",
+    );
+    create();
+    await waitFor(() =>
+      expect(onCreated).toHaveBeenCalledWith("conv_new", "wireframes/sign-up-flow.wireframe.html"),
+    );
+    const text = (postMock.mock.calls[0][1].data as { content: { text: string }[] }).content[0]
+      .text;
+    expect(text).toMatch(
+      /^Sign-up flow\n\nUse the wireframes skill\. Write the wireframe to `wireframes\/sign-up-flow\.wireframe\.html`\./,
+    );
+  });
+
+  it("skips wireframe names taken in wireframes/ and on the landing, not deck names", async () => {
+    listings["/work/site/decks"] = ["flow-4.slides.html"];
+    listings["/work/site/wireframes"] = ["flow.wireframe.html", "flow-2.wireframe.html"];
+    const { onCreated } = renderDialog({
+      initialPrompt: "Flow",
+      takenNames: (folder, kind) =>
+        folder === "/work/site" ? (kind === "wireframe" ? ["flow-3"] : ["flow-5"]) : [],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Wireframe" }));
+    create();
+    await waitFor(() =>
+      expect(onCreated).toHaveBeenCalledWith("conv_new", "wireframes/flow-4.wireframe.html"),
+    );
+  });
+
+  it("waits for the wireframes/ listing before Create", () => {
+    filesystemMock.mockImplementation(
+      (_host, path) =>
+        (path === "/work/site/wireframes"
+          ? { data: undefined, error: null, isLoading: true }
+          : listing(path)) as unknown as ReturnType<typeof useHostFilesystem>,
+    );
+    renderDialog({ initialPrompt: "Flow" });
+    expect(screen.getByRole("button", { name: "Create" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Wireframe" }));
+    expect(screen.getByRole("button", { name: "Create" })).toBeDisabled();
+  });
+
   it("keeps the dialog, the error, and the prompt when create fails", async () => {
     createMock.mockRejectedValueOnce(new Error("Workspace not found"));
     const { onCreated } = renderDialog({ initialPrompt: "Pitch deck" });

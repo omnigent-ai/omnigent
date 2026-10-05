@@ -4,6 +4,7 @@ import {
   deckPreviewState,
   deckSlug,
   designDeckPath,
+  designPath,
   firstDesignMessage,
   readDesignDefaults,
   readStudioParams,
@@ -45,8 +46,18 @@ describe("deckSlug", () => {
 });
 
 describe("first message", () => {
-  it("puts the deck under decks/", () => {
+  it("puts the deck under decks/ and the wireframe under wireframes/", () => {
     expect(designDeckPath("pitch")).toBe("decks/pitch.slides.html");
+    expect(designPath("pitch", "deck")).toBe("decks/pitch.slides.html");
+    expect(designPath("sign-up", "wireframe")).toBe("wireframes/sign-up.wireframe.html");
+  });
+
+  it("names the wireframes skill for a wireframe", () => {
+    expect(firstDesignMessage("Sign-up flow", "wireframes/sign-up-flow.wireframe.html")).toBe(
+      "Sign-up flow\n\nUse the wireframes skill. Write the wireframe to " +
+        "`wireframes/sign-up-flow.wireframe.html`. Write a complete document with only the " +
+        "first screen first, then add one complete screen per edit.",
+    );
   });
 
   it("appends the studio instructions to the prompt", () => {
