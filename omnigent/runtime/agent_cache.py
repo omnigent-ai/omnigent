@@ -195,7 +195,7 @@ class AgentCache:
                 with contextlib.suppress(FileNotFoundError):
                     shutil.rmtree(workdir)
                 loaded = self._extract_and_cache(
-                    agent_id, bundle_location, bundle_bytes, expand_env=expand_env
+                    agent_id, bundle_location, bundle_bytes, expand_env=expand_env, repairing=True
                 )
             except Exception as exc:
                 _logger.warning(
@@ -325,6 +325,7 @@ class AgentCache:
         bundle_bytes: bytes,
         *,
         expand_env: bool = False,
+        repairing: bool = False,
     ) -> LoadedAgent:
         """
         Extract bundle bytes to disk and populate both cache tiers.
@@ -336,6 +337,8 @@ class AgentCache:
             against the server process environment. Forwarded from
             :meth:`load`; defaults to ``False`` (fail-safe). See
             :meth:`load` for the rationale.
+        :param repairing: Called from :meth:`_recover_disk_entry`, which
+            already holds the repair lock.
         :returns: A LoadedAgent with the parsed spec and workdir.
         """
         with self._staging_dir() as staging_dir:
@@ -356,8 +359,13 @@ class AgentCache:
                 if not workdir.is_dir():
                     raise
                 if _published_location(workdir) != bundle_location:
-                    # Another loader published a different bundle; serve ours uncached.
-                    return LoadedAgent(spec=spec, workdir=workdir)
+                    if repairing:
+                        raise
+                    # Another loader published a different bundle. Rebuild ours under the
+                    # repair lock: the spec parsed here points into this staging directory.
+                    return self._recover_disk_entry(
+                        agent_id, bundle_location, expand_env=expand_env
+                    )
                 # Another cold loader published first; use its complete bundle.
                 spec = load_spec(
                     workdir,

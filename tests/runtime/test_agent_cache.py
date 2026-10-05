@@ -745,8 +745,35 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
 
     assert (first_loaded.spec.name, second_loaded.spec.name) == ("test-agent", "winner")
     assert first_loaded.workdir == second_loaded.workdir == cache_dir / "agent-shared"
-    assert yaml.safe_load((first_loaded.workdir / "config.yaml").read_text())["name"] == "winner"
-    assert not any((cache_dir / ".staging").iterdir())
+    # The loser rebuilt its own entry rather than pair its spec with the winner's files.
+    assert (
+        yaml.safe_load((first_loaded.workdir / "config.yaml").read_text())["name"] == "test-agent"
+    )
+    assert [p.name for p in (cache_dir / ".staging").iterdir()] in ([], ["repair.lock"])
+
+
+def test_a_cold_load_that_loses_to_another_revision_serves_its_own_files(
+    artifact_store: LocalArtifactStore, cache_dir: Path
+) -> None:
+    """A cold loader that finds another revision published rebuilds its own entry, so the
+    spec it returns and the directory it names hold the same revision."""
+    skill = "---\nname: triage\ndescription: d\n---\n{}\n"
+    for location, body in (("agent-x/one", "ONE"), ("agent-x/two", "TWO")):
+        _store_bundle(
+            artifact_store,
+            location,
+            {"config.yaml": _MINIMAL_CONFIG, "skills/triage/SKILL.md": skill.format(body)},
+        )
+    cache = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache.load("agent-x", "agent-x/one")  # another loader published revision one
+    cache._specs.clear()  # a second worker has no in-memory entry
+
+    loaded = cache._extract_and_cache("agent-x", "agent-x/two", artifact_store.get("agent-x/two"))
+
+    [triage] = loaded.spec.skills
+    assert triage.content.strip() == "TWO"
+    assert (loaded.workdir / "skills/triage/SKILL.md").read_text().strip().endswith("TWO")
+    assert (loaded.workdir / ".omnigent-bundle-location").read_text() == "agent-x/two"
 
 
 def test_load_failure_cleans_unpublished_extraction(
