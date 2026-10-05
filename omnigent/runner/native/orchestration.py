@@ -5505,6 +5505,7 @@ async def _auto_create_codex_terminal(
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
                 client=retained_resume_client,
+                app_server=app_server,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -5791,6 +5792,7 @@ async def _codex_discover_thread_and_forward(
         CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
         CodexNativeBridgeState,
         clear_bridge_startup_error,
+        record_app_server_stopped,
         write_bridge_startup_error,
         write_bridge_state,
     )
@@ -5830,6 +5832,7 @@ async def _codex_discover_thread_and_forward(
 
     discovery_started_at = time.monotonic()
     startup_pending_recorded = False
+    cancelled = False
     try:
         while True:
             try:
@@ -6095,6 +6098,9 @@ async def _codex_discover_thread_and_forward(
             client=event_client,
             auth=_RunnerDatabricksAuth(auth_factory),
         )
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
         # Tear down the listener and the per-session app-server whenever
         # forwarding ends — discovery failed, the app-server connection dropped
@@ -6115,6 +6121,9 @@ async def _codex_discover_thread_and_forward(
         leftover_app_server = app_server
         if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
             leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            if not cancelled:
+                # The pane outlives its app-server; mark it so the next ensure replaces it.
+                record_app_server_stopped(bridge_dir)
         with contextlib.suppress(Exception):
             await event_client.close()
         if leftover_app_server is not None:
@@ -6131,6 +6140,7 @@ async def _codex_forward_known_thread(
     codex_ws_url: str,
     thread_id: str,
     client: CodexAppServerClient | None = None,
+    app_server: CodexNativeAppServer | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -6144,6 +6154,10 @@ async def _codex_forward_known_thread(
     :param thread_id: Existing Codex app-server thread id, e.g.
         ``"thread_abc123"``.
     :param client: Retained preload subscription, owned and closed by this forwarder.
+    :param app_server: This launch's process. Only a registry entry that is still
+        this process is dropped on exit, so a late teardown cannot pop the entry a
+        re-created terminal has since installed. ``None`` drops whatever the
+        session has registered.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -6152,12 +6166,14 @@ async def _codex_forward_known_thread(
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
+    from omnigent.harnesses.codex_native.bridge import record_app_server_stopped
     from omnigent.harnesses.codex_native.forwarder import supervise_forwarder
     from omnigent.runner._entry import (
         _make_auth_token_factory,
         _RunnerDatabricksAuth,
     )
 
+    cancelled = False
     try:
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = _make_auth_token_factory()
@@ -6173,6 +6189,9 @@ async def _codex_forward_known_thread(
             client=client,
             auth=_RunnerDatabricksAuth(auth_factory),
         )
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
@@ -6186,7 +6205,12 @@ async def _codex_forward_known_thread(
                 stage="native_input",
             ),
         )
-        leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        leftover_app_server = app_server
+        if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
+            leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            if not cancelled:
+                # The pane outlives its app-server; mark it so the next ensure replaces it.
+                record_app_server_stopped(bridge_dir)
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
                 await leftover_app_server.close()

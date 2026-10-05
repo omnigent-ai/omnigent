@@ -11,6 +11,7 @@ import pytest
 
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.codex_native.bridge import (
+    CODEX_APP_SERVER_STOPPED,
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
@@ -31,6 +32,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_home_config_model,
     read_mcp_startup,
     read_policy_hook_config,
+    record_app_server_stopped,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -603,6 +605,39 @@ def test_bridge_startup_failure_round_trips_structured_fields(bridge_dir: Path) 
     assert plain is not None
     assert plain.message == "thread never started (TimeoutError)"
     assert (plain.code, plain.title, plain.remediation) == (None, None, None)
+
+
+def test_record_app_server_stopped_leaves_a_coded_record_until_the_next_launch(
+    bridge_dir: Path,
+) -> None:
+    """The stop is recorded with its code and cleared, like any launch failure, on relaunch."""
+    record_app_server_stopped(bridge_dir)
+
+    assert read_bridge_startup_failure(bridge_dir) == CODEX_APP_SERVER_STOPPED
+    assert CODEX_APP_SERVER_STOPPED.code == "codex_app_server_stopped"
+
+    clear_bridge_state(bridge_dir)
+    assert read_bridge_startup_failure(bridge_dir) is None
+
+
+def test_record_app_server_stopped_keeps_a_more_specific_cause(bridge_dir: Path) -> None:
+    """A launch failure already on record explains more than a bare "stopped"."""
+    write_bridge_startup_error(bridge_dir, "Codex stopped before it could start.", code="other")
+
+    record_app_server_stopped(bridge_dir)
+
+    failure = read_bridge_startup_failure(bridge_dir)
+    assert failure is not None
+    assert (failure.message, failure.code) == ("Codex stopped before it could start.", "other")
+
+
+def test_record_app_server_stopped_does_not_recreate_a_removed_bridge(tmp_path: Path) -> None:
+    """A session whose bridge was already deleted does not get a directory back."""
+    gone = tmp_path / "deleted-bridge"
+
+    record_app_server_stopped(gone)
+
+    assert not gone.exists()
 
 
 def test_bridge_startup_timeout_round_trips_and_is_cleared(bridge_dir: Path) -> None:
