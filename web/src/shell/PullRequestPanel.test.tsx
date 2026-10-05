@@ -2,7 +2,9 @@
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { parsePatchFiles } from "@pierre/diffs";
+import type * as DiffsModule from "@pierre/diffs";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -77,7 +79,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
 // stubbed to yield the files configured on `state` (name + optional rename
 // metadata), matching the whole-PR patch.
 vi.mock("@pierre/diffs", () => ({
-  parsePatchFiles: () => [{ files: state.parsedFiles }],
+  parsePatchFiles: vi.fn(() => [{ files: state.parsedFiles }]),
 }));
 vi.mock("@pierre/diffs/react", () => ({
   FileDiff: ({ fileDiff }: { fileDiff: { name: string } }) => (
@@ -115,8 +117,8 @@ const FORGE_DISPLAY = {
 function file(
   path: string,
   status: PullRequestChangedFile["status"],
-  adds = 1,
-  dels = 0,
+  adds: number | null = 1,
+  dels: number | null = 0,
 ): PullRequestChangedFile {
   return {
     path,
@@ -1223,6 +1225,39 @@ describe("PullRequestPanel", () => {
     expect(await screen.findByText("The changed-file list is incomplete.")).toBeInTheDocument();
     expect(screen.getAllByTestId("diff")).toHaveLength(2);
   });
+
+  it.each([false, true])(
+    "keeps missing text patches local to their files (all missing: %s)",
+    async (allMissing) => {
+      const parser = await vi.importActual<typeof DiffsModule>("@pierre/diffs");
+      if (!allMissing) vi.mocked(parsePatchFiles).mockImplementationOnce(parser.parsePatchFiles);
+      state.changes!.data!.data = [
+        file("__init__.py", "created", null, null),
+        ...(!allMissing ? [file("widget.py", "modified", 1, 1)] : []),
+        file("image.png", "modified", null, null),
+      ];
+      state.diff = {
+        object: "session.github.pr_diff",
+        patch: allMissing
+          ? ""
+          : "diff --git a/widget.py b/widget.py\n--- a/widget.py\n+++ b/widget.py\n@@ -1 +1 @@\n-old\n+new\n",
+      };
+      const { container } = renderChanges();
+
+      expect(await screen.findAllByText("No text diff available for this file.")).toHaveLength(2);
+      for (const path of ["__init__.py", "image.png"]) {
+        const section = container.querySelector<HTMLElement>(`[data-github-file="${path}"]`)!;
+        expect(within(section).getByText("No text diff available for this file.")).toBeVisible();
+        expect(within(section).queryByTestId("diff")).toBeNull();
+        expect(within(section).queryByText("+0")).toBeNull();
+      }
+      expect(screen.queryAllByTestId("diff").map((diff) => diff.dataset.path)).toEqual(
+        allMissing ? [] : ["widget.py"],
+      );
+      expect(screen.queryByText("No changes vs base.")).toBeNull();
+      expect(screen.queryByText("The changed-file list is incomplete.")).toBeNull();
+    },
+  );
 
   it("reports an unavailable file list without claiming the request has no changes", async () => {
     state.changes!.data = {

@@ -58,8 +58,10 @@ overrides remain supported when explicit instance configuration is useful.
 Open the Pull Requests tab in the session's Workspace sidepanel, or click the
 MR number beside its composer. The current branch's merge request is inferred from its upstream
 remote, then `origin`, then other GitLab remotes and the fork's parent project.
-The source project comes from the configured push remote or `origin`; discovery
-requires both its project ID and the current branch to match. Paste an MR URL into the panel
+The source project comes from `branch.<name>.pushRemote`, then `remote.pushDefault`,
+then the branch's tracking remote, `origin`, or another GitLab remote. An explicit
+`git push <remote>` does not change that configuration. Discovery requires both
+the source project ID and the current branch to match. Paste an MR URL into the panel
 to attach another accessible merge request. Removing it prevents automatic
 tracking from adding it again; attaching it manually restores it.
 
@@ -82,9 +84,11 @@ or manual linking. Tracking does not make API calls.
 ## Limits and verification
 
 Each panel request has an eight-second CLI budget. Lists are limited to 500
-items. The panel marks incomplete comments, checks, and file lists; omitted,
-large, binary, or metadata-only patches direct you to GitLab. A failed content
-read is an error rather than an apparent file deletion.
+items. The panel marks incomplete comments, checks, and file lists. Files without
+a text patch (including empty, binary, metadata-only, or omitted large files)
+show a per-file notice while readable diffs remain visible. Truncated file lists
+still direct you to GitLab for the full diff. A failed content read is an error
+rather than an apparent file deletion.
 
 Account selection remains in `glab`; the panel has no GitLab account or base
 remote switcher. Repository picking, webhook events, and managed sandbox

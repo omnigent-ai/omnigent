@@ -433,8 +433,63 @@ def test_changed_files_and_whole_patch(root: str, api: Mock) -> None:
     assert "--- a/src/old.py\n+++ b/src/new.py\n@@ -1 +1 @@\n-old\n+new\n" in patch
 
 
-def test_partial_changes_never_masquerade_as_complete_diff(root: str, api: Mock, mr: dict) -> None:
-    mr["changes_count"] = "1000+"
+@pytest.mark.parametrize(
+    "omitted",
+    [
+        {"diff": "", "new_file": True},
+        {"diff": None},
+        {"diff": "Binary files a/omitted and b/omitted differ\n"},
+        {"diff": "old mode 100644\nnew mode 100755\n"},
+        {"too_large": True},
+        {"collapsed": True},
+    ],
+    ids=["empty-new-file", "missing", "binary", "metadata", "too-large", "collapsed"],
+)
+def test_unavailable_file_does_not_hide_readable_diffs(
+    root: str, api: Mock, mr: dict, change: dict, omitted: dict
+) -> None:
+    mr["changes_count"] = "3"
+    api.pages.side_effect = None
+    api.pages.return_value = (
+        [
+            change,
+            {
+                **change,
+                "old_path": "src/__init__.py",
+                "new_path": "src/__init__.py",
+                "renamed_file": False,
+                **omitted,
+            },
+            {**change, "old_path": "last.py", "new_path": "last.py", "renamed_file": False},
+        ],
+        False,
+    )
+    result = module.PULL_REQUESTS.pr_diff(root, ref())
+    assert result == {
+        "object": "session.github.pr_diff",
+        "patch": (
+            "diff --git a/src/old.py b/src/new.py\n--- a/src/old.py\n+++ b/src/new.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+            "diff --git a/last.py b/last.py\n--- a/last.py\n+++ b/last.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        ),
+    }
+    files = module.PULL_REQUESTS.changed_files(root, ref())
+    assert not files["has_more"] and files["warning"] is None
+    assert [f["path"] for f in files["data"]] == ["src/new.py", "src/__init__.py", "last.py"]
+    assert [f["lines_added"] for f in files["data"]] == [1, None, 1]
+    assert [f["lines_removed"] for f in files["data"]] == [1, None, 1]
+    assert files["data"][0]["previous_path"] == "src/old.py"
+    assert files["data"][1]["status"] == ("created" if omitted.get("new_file") else "modified")
+
+
+@pytest.mark.parametrize("count,paginated", [("1000+", False), ("2", False), ("1", True)])
+def test_partial_changes_never_masquerade_as_complete_diff(
+    root: str, api: Mock, mr: dict, change: dict, count: str, paginated: bool
+) -> None:
+    mr["changes_count"] = count
+    api.pages.side_effect = None
+    api.pages.return_value = ([change], paginated)
     files = module.PULL_REQUESTS.changed_files(root, ref())
     assert files["has_more"] and files["warning"]
     result = module.PULL_REQUESTS.pr_diff(root, ref())
@@ -442,13 +497,16 @@ def test_partial_changes_never_masquerade_as_complete_diff(root: str, api: Mock,
     assert "incomplete diff" in result["message"]
 
 
-def test_gitlab_omitted_patch_is_visible(root: str, api: Mock, change: dict) -> None:
+def test_gitlab_omitted_patch_keeps_file_without_line_counts(
+    root: str, api: Mock, change: dict
+) -> None:
     change["too_large"] = True
     files = module.PULL_REQUESTS.changed_files(root, ref())
-    assert files["warning"] and files["data"][0]["lines_added"] is None
+    assert not files["has_more"] and files["warning"] is None
+    assert files["data"][0]["path"] == "src/new.py"
+    assert files["data"][0]["lines_added"] is None
     result = module.PULL_REQUESTS.pr_diff(root, ref())
-    assert not result["patch"] and result["unavailable_reason"] == "patch_unavailable"
-    assert "omitted" in result["message"]
+    assert result == {"object": "session.github.pr_diff", "patch": ""}
 
 
 def file_diff(root: str, **overrides) -> dict:
@@ -565,16 +623,17 @@ def test_upstream_remote_precedence_preserves_other_gitlab_remotes(root: str) ->
         "old mode 100644\nnew mode 100755\n",
     ],
 )
-def test_binary_or_metadata_only_patch_is_not_shown_as_complete(
+def test_binary_or_metadata_only_file_is_listed_without_text_patch(
     root: str, api: Mock, change: dict, patch: object
 ) -> None:
     change["diff"] = patch
     files = module.PULL_REQUESTS.changed_files(root, ref())
-    assert files["warning"]
+    assert not files["has_more"] and files["warning"] is None
+    assert files["data"][0]["path"] == "src/new.py"
     assert files["data"][0]["lines_added"] is None
     assert files["data"][0]["lines_removed"] is None
     result = module.PULL_REQUESTS.pr_diff(root, ref())
-    assert result["patch"] == "" and result["unavailable_reason"] == "patch_unavailable"
+    assert result == {"object": "session.github.pr_diff", "patch": ""}
 
 
 def test_generic_panel_inference_attach_selection_files_and_removal(

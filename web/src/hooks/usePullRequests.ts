@@ -539,7 +539,8 @@ export async function fetchPullRequestFileContents(
 
 export interface PullRequestDiffResponse {
   object: "session.github.pr_diff";
-  /** The whole PR as one unified diff patch (every changed file). */
+  /** Available text diffs as one unified patch; listed files without a patch
+   *  get a per-file fallback in the panel. */
   patch: string;
   /** Why the host can't diff this PR, e.g. `pr_outside_workspace`. */
   unavailable_reason?: string;

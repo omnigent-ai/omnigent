@@ -32,8 +32,9 @@ responses; they exercise the actual shared UI without contacting GitLab.
 
 - `desktop-rail`, `desktop-composer`, and `mobile-composer`:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_panel_summary_and_diff`
-  shows `!7`, comments and checks, then opens the file diff and expands unchanged
-  context with the pinned MR revisions. Record every variant.
+  shows `!7`, comments and checks, then opens a readable diff beside an empty
+  file's no-text-diff notice and expands unchanged context with the pinned MR
+  revisions. Record every variant.
 - Associations:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_link_select_unlink`
   attaches a second project, changes selection, and removes it.

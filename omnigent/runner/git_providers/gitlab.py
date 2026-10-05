@@ -415,11 +415,10 @@ class GitLabPullRequests:
         if resolved is None:
             return {"object": "list", "data": [], "has_more": False}
         changes, partial = _changes(*resolved)
-        data, limited = [], False
+        data = []
         for change in changes:
             patch = _text_patch(change)
             unavailable = patch is None
-            limited |= unavailable
             lines = patch.splitlines() if patch is not None else []
             data.append(
                 {
@@ -440,9 +439,7 @@ class GitLabPullRequests:
             "object": "list",
             "data": data,
             "has_more": partial,
-            "warning": "GitLab returned incomplete file changes or omitted large/binary patches."
-            if partial or limited
-            else None,
+            "warning": "GitLab returned incomplete file changes." if partial else None,
         }
 
     def pr_diff(self, root: str, reference: PullRequestRef | None) -> dict[str, Any]:
@@ -462,13 +459,7 @@ class GitLabPullRequests:
         for change in changes:
             patch = _text_patch(change)
             if patch is None:
-                return {
-                    "object": PR_DIFF_OBJECT,
-                    "patch": "",
-                    "unavailable_reason": "patch_unavailable",
-                    "message": "GitLab omitted a large, binary or metadata-only patch. "
-                    "View the full diff on GitLab.",
-                }
+                continue
             old, new = _patch_path("a/", change["old_path"]), _patch_path("b/", change["new_path"])
             before, after = (
                 ("/dev/null" if change.get("new_file") else old),

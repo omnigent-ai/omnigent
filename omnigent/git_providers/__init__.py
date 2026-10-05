@@ -350,8 +350,13 @@ def _candidates(url: str, instances: Instances) -> Iterator[GitProvider]:
     remaining = list(providers())
     try:
         parsed = urlsplit(url)
+        hostname = parsed.hostname or ""
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
         authority = (
-            parsed.netloc.lower() if parsed.scheme in {"http", "https"} and parsed.port else None
+            f"{hostname}:{parsed.port}"
+            if parsed.scheme in {"http", "https"} and parsed.port
+            else None
         )
     except ValueError:
         authority = None

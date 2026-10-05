@@ -146,13 +146,16 @@ def test_glab_explicit_host_is_trusted_without_oauth(monkeypatch: pytest.MonkeyP
     assert not GitLabProvider().matches_host("private.test", EnvInstances())
 
 
-def test_exact_https_authority_precedes_a_bare_host_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("userinfo", ["", "alice@"])
+def test_exact_https_authority_precedes_a_bare_host_claim(
+    monkeypatch: pytest.MonkeyPatch, userinfo: str
+) -> None:
     from omnigent.git_providers import reset_for_tests, resolve_remote
 
     monkeypatch.setenv("GH_HOST", "git.example.test")
     reset_for_tests()
     try:
-        parsed = resolve_remote("https://git.example.test:8443/team/project.git")
+        parsed = resolve_remote(f"https://{userinfo}git.example.test:8443/team/project.git")
         assert parsed is not None and parsed.provider == "gitlab"
         assert parsed.host == "git.example.test:8443"
         fallback = resolve_remote("https://git.example.test/team/project.git")

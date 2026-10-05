@@ -8,6 +8,7 @@ import os
 import shlex
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,13 @@ from omnigent.runner.session_prs import SessionPrRegistry
 from omnigent.workspace_fs import WorkspaceReader
 
 URL = "https://gitlab.com/team/sub/project/-/merge_requests/7"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_registry() -> Iterator[None]:
+    reset_for_tests()
+    yield
+    reset_for_tests()
 
 
 @pytest.mark.parametrize("harness", ["claude_native", "codex_native"])
@@ -55,7 +63,6 @@ async def test_native_hook_tracks_gitlab_mr_without_observer_io(
     )
     glab.chmod(0o755)
     monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
-    reset_for_tests()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     bridge_dir = bridge.prepare_bridge_dir("gitlab-tracking", workspace=workspace)
@@ -115,4 +122,3 @@ async def test_native_hook_tracks_gitlab_mr_without_observer_io(
     assert info["pr"]["title"] == "Native GitLab MR"
     assert info["provider_display"]["number_prefix"] == "!"
     assert info["prs"][0]["provider"] == "gitlab"
-    reset_for_tests()

@@ -143,7 +143,15 @@ def stub(page: Page, *, partial: bool = False) -> list[tuple[str, str | None]]:
                             "status": "modified",
                             "lines_added": 1,
                             "lines_removed": 1,
-                        }
+                        },
+                        {
+                            "object": "session.github.changed_file",
+                            "path": "__init__.py",
+                            "name": "__init__.py",
+                            "status": "created",
+                            "lines_added": None,
+                            "lines_removed": None,
+                        },
                     ],
                     "has_more": partial,
                     "warning": "GitLab returned incomplete file changes." if partial else None,
@@ -218,6 +226,12 @@ def test_gitlab_panel_summary_and_diff(
     panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
     expect(panel.get_by_text("widget.py", exact=True).first).to_be_visible()
     expect(panel.get_by_text("new_widget", exact=True)).to_be_visible()
+    expect(
+        panel.locator('[data-github-file="__init__.py"]').get_by_text(
+            "No text diff available for this file.", exact=True
+        )
+    ).to_be_visible()
+    expect(panel.get_by_text("The changed-file list is incomplete.", exact=True)).to_have_count(0)
     assert ("changes", URL) in requested and ("diff", URL) in requested
     panel.locator("[data-expand-button]").first.click()
     expect(panel.get_by_text("unchanged_header", exact=True)).to_be_visible()
