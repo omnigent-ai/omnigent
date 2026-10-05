@@ -63,6 +63,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     report_capture_start_failure,
 )
 from omnigent.inner import _proc
+from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
@@ -121,6 +122,9 @@ _MODEL_DISCOVERY_STDERR_LINE_CHARS = 500
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
+_APP_SERVER_TERMINATE_TIMEOUT_SECONDS = 5.0
+_APP_SERVER_KILL_TIMEOUT_SECONDS = 1.0
+_APP_SERVER_STDERR_CLOSE_TIMEOUT_SECONDS = 1.0
 # hooks.json filename written into the private CODEX_HOME registering the
 # Omnigent policy hook. Codex discovers it as a ``user``-layer hook
 # source on every config load (see codex hooks ``discover_handlers``).
@@ -1829,8 +1833,32 @@ class CodexNativeAppServer:
     session_id: str | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
+    _cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _cleaned: bool = field(default=True, init=False, repr=False)
 
     async def start(self) -> None:
+        """Start the app-server, resetting ownership if setup owns nothing."""
+        cleanup_task = self._cleanup_task
+        if cleanup_task is not None:
+            await asyncio.shield(cleanup_task)
+            cleanup_task.result()
+        if not self._cleaned:
+            raise RuntimeError("Codex app-server is already started or still owned by cleanup")
+        self._cleaned = False
+        try:
+            await self._start_impl()
+        except BaseException:
+            if (
+                self.proc is None
+                and self.stderr_task is None
+                and self._stderr_diagnostics is None
+                and self.process_owner_lock is None
+            ):
+                self.process_registry_tag = None
+                self._cleaned = True
+            raise
+
+    async def _start_impl(self) -> None:
         """
         Start the Codex app-server and wait for the socket.
 
@@ -2203,42 +2231,131 @@ class CodexNativeAppServer:
 
     async def close(self) -> None:
         """
-        Stop the app-server subprocess.
+        Stop the app-server subprocess and release session-owned resources.
 
         :returns: None.
         """
-        if self.proc is not None and self.proc.returncode is None:
-            _terminate_process_tree(self.proc)
+        task = self._cleanup_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._close_same_loop(), name="codex-app-server-close")
+            self._cleanup_task = task
+        cancelled = False
+        while True:
             try:
-                await asyncio.wait_for(self.proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                _kill_process_tree(self.proc)
-                await self.proc.wait()
-        if self.process_registry_tag is not None:
-            unregister_codex_native_process(self.process_registry_tag)
-        if self.process_owner_lock is not None:
-            self.process_owner_lock.close()
-        try:
-            if self.stderr_task is not None and self._stderr_diagnostics is not None:
-                # The process has exited; allow buffered output to reach EOF.
-                # A descendant can still hold the pipe open, so bound the wait.
-                await asyncio.wait({self.stderr_task}, timeout=1.0)
-        finally:
+                await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if task.done():
+                    break
+        if task.done():
+            task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close_same_loop(self) -> None:
+        """Run bounded teardown while retaining ownership of unfinished state."""
+        self._cleaned = False
+        proc = self.proc
+        worker_reaped = proc is None or proc.returncode is not None
+        cleanup_complete = True
+
+        if proc is not None and proc.returncode is None:
             try:
-                if self.stderr_task is not None:
-                    self.stderr_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await self.stderr_task
-            finally:
-                diagnostics, self._stderr_diagnostics = self._stderr_diagnostics, None
-                self.proc = None
+                _terminate_process_tree(proc)
+            except Exception:  # noqa: BLE001 - continue to the force-kill path
+                _logger.warning("Could not terminate Codex app-server", exc_info=True)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_APP_SERVER_TERMINATE_TIMEOUT_SECONDS)
+            except Exception:  # noqa: BLE001 - force kill is the bounded backstop
+                try:
+                    _kill_process_tree(proc)
+                except Exception:  # noqa: BLE001 - retain ownership for retry
+                    _logger.warning("Could not kill Codex app-server", exc_info=True)
+                if proc.returncode is None:
+                    try:
+                        await asyncio.wait_for(
+                            proc.wait(), timeout=_APP_SERVER_KILL_TIMEOUT_SECONDS
+                        )
+                    except Exception:  # noqa: BLE001 - report incomplete cleanup below
+                        cleanup_complete = False
+            worker_reaped = proc.returncode is not None
+            if not worker_reaped:
+                cleanup_complete = False
+
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                close_subprocess_transport(proc)
+
+        stderr_task = self.stderr_task
+        if stderr_task is not None:
+            if not stderr_task.done():
+                _done, pending = await asyncio.wait(
+                    {stderr_task}, timeout=_APP_SERVER_STDERR_CLOSE_TIMEOUT_SECONDS
+                )
+                if pending:
+                    stderr_task.cancel()
+                    _done, pending = await asyncio.wait(
+                        {stderr_task}, timeout=_APP_SERVER_STDERR_CLOSE_TIMEOUT_SECONDS
+                    )
+                if pending:
+                    cleanup_complete = False
+            if stderr_task.done():
+                try:
+                    stderr_task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001 - stderr failure must not block teardown
+                    _logger.warning("Codex app-server stderr task failed", exc_info=True)
                 self.stderr_task = None
-                self.process_registry_tag = None
-                self.process_owner_lock = None
-                if diagnostics is not None:
-                    diagnostics.finish()
-                    with contextlib.suppress(Exception):
-                        await asyncio.to_thread(diagnostics.close)
+
+        diagnostics = self._stderr_diagnostics
+        if diagnostics is not None:
+            diagnostics.finish()
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(diagnostics.close),
+                    timeout=_APP_SERVER_STDERR_CLOSE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                cleanup_complete = False
+            except Exception:  # noqa: BLE001 - retain diagnostics for retry
+                _logger.warning("Could not close Codex stderr diagnostics", exc_info=True)
+                cleanup_complete = False
+            else:
+                self._stderr_diagnostics = None
+
+        if worker_reaped:
+            if self.process_registry_tag is not None:
+                try:
+                    unregister_codex_native_process(self.process_registry_tag)
+                except Exception:  # noqa: BLE001 - preserve tag for retry
+                    _logger.warning("Could not unregister Codex app-server", exc_info=True)
+                    cleanup_complete = False
+                else:
+                    self.process_registry_tag = None
+            if self.process_owner_lock is not None:
+                try:
+                    self.process_owner_lock.close()
+                except Exception:  # noqa: BLE001 - preserve lock for retry
+                    _logger.warning("Could not release Codex app-server owner lock", exc_info=True)
+                    cleanup_complete = False
+                else:
+                    self.process_owner_lock = None
+            self.proc = None
+        else:
+            cleanup_complete = False
+
+        self._cleaned = cleanup_complete and all(
+            value is None
+            for value in (
+                self.proc,
+                self.stderr_task,
+                self._stderr_diagnostics,
+                self.process_registry_tag,
+                self.process_owner_lock,
+            )
+        )
 
     async def _wait_until_ready(self) -> CodexAppServerClient:
         """
