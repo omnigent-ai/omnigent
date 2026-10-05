@@ -2757,6 +2757,7 @@ def create_runner_app(
                         bundle_dir=bundle_dir,
                         skills_filter=skills_filter,
                         agent_spec=spec_entry,
+                        session_init=init_context.envelope,
                     )
 
                 _launch_pre = _codex_pre_launch
