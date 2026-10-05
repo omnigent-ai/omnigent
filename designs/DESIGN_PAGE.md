@@ -359,7 +359,9 @@ runners.
   not recorded. When the page's existing per-workspace scan succeeds, it
   sends the full path set for that session to
   `PUT /v1/sessions/{id}/design-artifacts`, which replaces that session's
-  rows. Opening a deck that returns 404 marks its row deleted.
+  rows. An optional `kind` in the body limits the replace to that kind, so
+  the deck-only scan sends `kind: "deck"` and leaves wireframe rows alone.
+  Opening a deck that returns 404 marks its row deleted.
 - **List endpoint:** `GET /v1/design/artifacts?kind=deck|wireframe` returns
   session id, path, kind, updated time, session title, and workspace for
   sessions the caller can see, using the session list's visibility rules.
