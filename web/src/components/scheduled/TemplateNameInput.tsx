@@ -70,7 +70,7 @@ export function TemplateNameInput({
       <div
         ref={backdropRef}
         aria-hidden="true"
-        className="pointer-events-none absolute inset-0 flex items-center overflow-hidden whitespace-pre rounded-lg border border-transparent px-2.5 py-1 text-ui text-foreground"
+        className="pointer-events-none absolute inset-0 flex items-center overflow-hidden whitespace-pre rounded-lg border border-transparent bg-transparent px-2.5 py-1 text-ui text-foreground dark:bg-input/30"
         data-testid="task-name-template-overlay"
       >
         <span className="w-max shrink-0 whitespace-pre">
