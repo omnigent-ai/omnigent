@@ -819,6 +819,8 @@ class _RelayStatusSnapshot:
     runner_id: str
     host_id: str | None
     updated_at: int
+    # Mirrors an in-process sub-agent whose native parent owns its turn.
+    parent_owned: bool = False
 
 
 @dataclass
