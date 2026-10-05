@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { fetchFileContent } from "@/hooks/useFileContent";
+import { fetchWorkspaceDirectory } from "@/hooks/useWorkspaceChangedFiles";
 import { DESIGN_SYSTEM_POINTER } from "@/lib/designSystem";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { getSessionSlim } from "@/lib/sessionsApi";
@@ -29,6 +30,16 @@ async function readKitFile(conversationId: string, path: string): Promise<KitFil
     return await fetchFileContent(conversationId, path);
   } catch (e) {
     if (e instanceof Error && e.message.startsWith("404")) return null;
+    throw e;
+  }
+}
+
+/** A folder's entries through the session listing; a 404 means "no such folder". */
+async function listKitDir(conversationId: string, path: string) {
+  try {
+    return await fetchWorkspaceDirectory(conversationId, path);
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("404")) return [];
     throw e;
   }
 }
@@ -85,6 +96,7 @@ export function useDesignBranding(
       {
         read,
         isOwner: () => isSessionOwner(conversationId),
+        list: (path) => listKitDir(conversationId, path),
         onDesignSystem: () => {
           clearTimeout(timer);
           timer = setTimeout(() => finish(SYSTEM_TIMED_OUT), DESIGN_SYSTEM_TIMEOUT_MS);

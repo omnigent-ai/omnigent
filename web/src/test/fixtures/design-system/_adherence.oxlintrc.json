@@ -1,0 +1,17 @@
+{
+  "rules": {
+    "no-restricted-syntax": [
+      "warn",
+      { "selector": "Literal[value=/#[0-9a-fA-F]{3,8}\\b/]", "message": "Use a color token" },
+      { "selector": "Literal[value=/^\\d+(\\.\\d+)?px$/]", "message": "Use a size token" },
+      {
+        "selector": "Property[key.name='fontFamily'] > Literal[value=/^(?!Fixture)/]",
+        "message": "Use a listed font"
+      }
+    ]
+  },
+  "x-omelette": {
+    "tokens": ["--fx-primary", "--fx-font"],
+    "fontFamilies": ["Fixture Sans"]
+  }
+}

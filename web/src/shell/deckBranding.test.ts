@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer } from "@/lib/designSystem";
-import { readFixtureFile } from "@/test/designSystemFixture";
+import { listFixtureDir, readFixtureFile } from "@/test/designSystemFixture";
 import { DESIGN_KIT_DIR, type KitFile } from "./codeViewerHelpers";
 import {
   DS_OWNER_ONLY,
@@ -20,7 +20,11 @@ const pointer = (kind: "full" | "skill", path = FOLDER) =>
 function deps(
   files: Record<string, KitFile>,
   opts: { owner?: boolean; root?: string; fail?: string } = {},
-): BrandingDeps & { read: ReturnType<typeof vi.fn>; isOwner: ReturnType<typeof vi.fn> } {
+): BrandingDeps & {
+  read: ReturnType<typeof vi.fn>;
+  isOwner: ReturnType<typeof vi.fn>;
+  list?: ReturnType<typeof vi.fn>;
+} {
   const root = `${opts.root ?? FOLDER}/`;
   return {
     read: vi.fn(async (path: string) => {
@@ -32,6 +36,9 @@ function deps(
     }),
     isOwner: vi.fn(async () => opts.owner ?? true),
     onDesignSystem: vi.fn(),
+    list: vi.fn(async (dir: string) =>
+      dir.startsWith(root) ? listFixtureDir(dir.slice(root.length)) : [],
+    ),
   };
 }
 
@@ -59,9 +66,77 @@ describe("loadDeckBranding", () => {
 
   it("injects a full system the same way for wireframes", async () => {
     const d = deps({ [DESIGN_SYSTEM_POINTER]: pointer("full") });
-    expect(await loadDeckBranding(DECK, d, { sections: false })).toEqual(
-      await loadDeckBranding(DECK, d),
-    );
+    expect(await loadDeckBranding(DECK, d, { sections: false })).toEqual({
+      ...(await loadDeckBranding(DECK, d)),
+      brandWarnings: null,
+    });
+  });
+
+  describe("brand warnings", () => {
+    const BRAND_DECK = `<style>.title h1{color:#0B5FFF;font-size:64px}h2{color:#ff0000}</style>
+<section class="title"><h1 style="font-family:Comic Sans">Hi #123456</h1></section>`;
+    const full = () => deps({ [DESIGN_SYSTEM_POINTER]: pointer("full") });
+
+    it("flags raw values a full system's templates do not use", async () => {
+      const d = full();
+      expect((await loadDeckBranding(BRAND_DECK, d)).brandWarnings).toEqual([
+        { value: "#ff0000", property: "color", where: "<style> h2" },
+        { value: "Comic Sans", property: "font-family", where: "slide 1 <h1>" },
+      ]);
+      expect(d.read).toHaveBeenCalledWith(`${FOLDER}/_adherence.oxlintrc.json`);
+      expect(d.list).toHaveBeenCalledWith(`${FOLDER}/templates`);
+      expect(d.read).toHaveBeenCalledWith(`${FOLDER}/templates/title.html`);
+    });
+
+    it("reads an imported system's rules and templates through the workspace", async () => {
+      const root = ".omnigent/design-system";
+      const d = deps({ [DESIGN_SYSTEM_POINTER]: pointer("full", root) }, { root });
+      expect((await loadDeckBranding(BRAND_DECK, d)).brandWarnings).toHaveLength(2);
+      expect(d.read).toHaveBeenCalledWith(`${root}/templates/title.html`);
+    });
+
+    it("is empty, not null, for a clean deck", async () => {
+      expect((await loadDeckBranding(DECK, full())).brandWarnings).toEqual([]);
+    });
+
+    it("skips wireframes without reading the rules", async () => {
+      const d = full();
+      expect((await loadDeckBranding(BRAND_DECK, d, { sections: false })).brandWarnings).toBeNull();
+      expect(d.read).not.toHaveBeenCalledWith(`${FOLDER}/_adherence.oxlintrc.json`);
+      expect(d.list).not.toHaveBeenCalled();
+    });
+
+    it("has no warnings for kits and skill-only systems", async () => {
+      const kit = deps({ [`${DESIGN_KIT_DIR}/kit.json`]: text('{"name":"Acme"}') });
+      const skill = deps({ [DESIGN_SYSTEM_POINTER]: pointer("skill") });
+      expect((await loadDeckBranding(BRAND_DECK, kit)).brandWarnings).toBeNull();
+      expect((await loadDeckBranding(BRAND_DECK, skill)).brandWarnings).toBeNull();
+    });
+
+    it.each([
+      ["no listing", (d: ReturnType<typeof full>) => delete d.list],
+      [
+        "a failed listing",
+        (d: ReturnType<typeof full>) => d.list!.mockRejectedValue(new Error("500")),
+      ],
+      [
+        "an oversized rules file",
+        (d: ReturnType<typeof full>) => {
+          const read = d.read.getMockImplementation() as BrandingDeps["read"];
+          const big: KitFile = { encoding: "utf-8", content: "{}", bytes: 3 * 1024 * 1024 };
+          d.read.mockImplementation(async (p: string) =>
+            p.endsWith("_adherence.oxlintrc.json") ? big : read(p),
+          );
+        },
+      ],
+    ])("shows no warnings, and still brands, with %s", async (_label, breakIt) => {
+      const d = full();
+      breakIt(d);
+      const branding = await loadDeckBranding(BRAND_DECK, d);
+      expect(branding.brandWarnings).toBeNull();
+      expect(branding.notice).toBeNull();
+      expect(branding.systemStyle).toContain("--fx-primary");
+    });
   });
 
   it("names a kit failure as before", async () => {

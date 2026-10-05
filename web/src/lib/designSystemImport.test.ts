@@ -148,6 +148,7 @@ describe("planDesignSystemImport", () => {
         file("SKILL.md"),
         file("README.md"),
         file("_ds_manifest.json"),
+        file("_adherence.oxlintrc.json"),
         file("colors_and_type.css"),
         file("notes.txt"),
         file("fonts/brand.woff2"),
@@ -162,6 +163,7 @@ describe("planDesignSystemImport", () => {
     expect(plan.files.map((f) => f.path)).toEqual([
       "README.md",
       "SKILL.md",
+      "_adherence.oxlintrc.json",
       "_ds_manifest.json",
       "assets/logo.svg",
       "colors_and_type.css",
@@ -177,7 +179,7 @@ describe("planDesignSystemImport", () => {
       { path: "ui_kits/", reason: "never imported" },
       { path: "uploads/", reason: "never imported" },
     ]);
-    expect(plan.totalBytes).toBe(80);
+    expect(plan.totalBytes).toBe(90);
   });
 
   it("skips files over 2 MB and stops at the 20 MB total", () => {

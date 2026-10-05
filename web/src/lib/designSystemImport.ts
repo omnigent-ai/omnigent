@@ -12,9 +12,10 @@ import {
   serializeDesignSystemPointer,
   type DesignSystemRef,
 } from "./designSystem";
+import { ADHERENCE_FILE } from "./brandRules";
 import { DS_ASSET_MAX_BYTES, DS_DECK_MAX_BYTES, DS_STYLESHEET } from "./designSystemInjection";
 
-export const IMPORT_FILES = [DS_SKILL, "README.md", DS_MANIFEST, DS_STYLESHEET];
+export const IMPORT_FILES = [DS_SKILL, "README.md", DS_MANIFEST, ADHERENCE_FILE, DS_STYLESHEET];
 export const IMPORT_FOLDERS = ["fonts", "assets", "templates", "slides"];
 export const NEVER_IMPORTED = ["uploads", "ui_kits", "preview"];
 export const IMPORT_CONCURRENCY = 4;

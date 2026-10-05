@@ -1,7 +1,7 @@
 // Serves the synthetic design system in `fixtures/design-system/` the way the
 // workspace file API does: text as utf-8, binaries as base64, null when missing.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { KitFile } from "@/shell/codeViewerHelpers";
@@ -22,3 +22,13 @@ export function readFixtureFile(rel: string): KitFile | null {
 }
 
 export const readFixture = async (rel: string) => readFixtureFile(rel);
+
+/** A fixture folder's entries the way the directory listing names them; empty when missing. */
+export function listFixtureDir(rel: string): { name: string; type: "file" | "directory" }[] {
+  const dir = path.join(DS_FIXTURE_DIR, rel);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true }).map((e) => ({
+    name: e.name,
+    type: e.isDirectory() ? "directory" : "file",
+  }));
+}

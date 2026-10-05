@@ -7,6 +7,13 @@ import {
   isAbsoluteDesignSystemPath,
   parseDesignSystemPointer,
 } from "@/lib/designSystem";
+import {
+  ADHERENCE_FILE,
+  parseAdherence,
+  scanBrandWarnings,
+  templateBaseline,
+  type BrandWarning,
+} from "@/lib/brandRules";
 import { injectDesignSystem } from "@/lib/designSystemInjection";
 import {
   kitText,
@@ -30,6 +37,8 @@ export interface DeckBranding {
   content: string | null;
   badge: { kind: "kit" | "system"; name: string } | null;
   notice: string | null;
+  /** Raw values outside a full system's rules, for decks only; `null` shows no badge. */
+  brandWarnings: BrandWarning[] | null;
 }
 
 export const NO_BRANDING: DeckBranding = {
@@ -38,7 +47,10 @@ export const NO_BRANDING: DeckBranding = {
   content: null,
   badge: null,
   notice: null,
+  brandWarnings: null,
 };
+
+export const DS_MAX_TEMPLATES = 20;
 
 export interface BrandingDeps {
   /** Workspace-relative or absolute read; resolves `null` when the file does not exist. */
@@ -47,6 +59,8 @@ export interface BrandingDeps {
   isOwner: () => Promise<boolean>;
   /** Called once a full design system is found, before its files load. */
   onDesignSystem?: () => void;
+  /** A folder's entries, read like `read`; without it there are no brand warnings. */
+  list?: (dir: string) => Promise<{ name: string; type: "file" | "directory" }[]>;
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -56,6 +70,28 @@ export function brandingFromKit(kit: DesignKitState): DeckBranding {
   if (kit.status === "error") return withNotice(kitNotApplied(kit.reason));
   if (kit.status === "none") return NO_BRANDING;
   return { ...NO_BRANDING, kitStyle: kit.style, badge: { kind: "kit", name: kit.name } };
+}
+
+/** Never throws: a missing or unreadable rules file or template just means no badge. */
+async function loadBrandWarnings(content: string, root: string, deps: BrandingDeps) {
+  try {
+    const file = deps.list && (await deps.read(`${root}/${ADHERENCE_FILE}`));
+    const rules = file ? parseAdherence(kitText(file, ADHERENCE_FILE)) : null;
+    if (!rules || !deps.list) return null;
+    const paths = (await deps.list(`${root}/templates`))
+      .filter((e) => e.type === "file" && /^[\w.-]+\.(?:css|html)$/i.test(e.name))
+      .slice(0, DS_MAX_TEMPLATES)
+      .map((e) => `templates/${e.name}`);
+    const files = await Promise.all(
+      paths.map(async (path) => {
+        const f = await deps.read(`${root}/${path}`);
+        return { path, text: f ? kitText(f, path) : "" };
+      }),
+    );
+    return scanBrandWarnings(content, rules, templateBaseline(files, rules));
+  } catch {
+    return null;
+  }
 }
 
 /** `kit` shapes only the kit style; design-system injection is the same for every kind. */
@@ -82,7 +118,16 @@ export async function loadDeckBranding(
     deps.onDesignSystem?.();
     try {
       const injected = await injectDesignSystem(content, (p) => deps.read(`${ref.path}/${p}`));
-      return { ...NO_BRANDING, systemStyle: injected.style, content: injected.content, badge };
+      // Wireframes start grayscale, so brand warnings are for decks only.
+      const brandWarnings =
+        kit.sections === false ? null : await loadBrandWarnings(content, ref.path, deps);
+      return {
+        ...NO_BRANDING,
+        systemStyle: injected.style,
+        content: injected.content,
+        badge,
+        brandWarnings,
+      };
     } catch (e) {
       if (absolute && message(e).startsWith("403")) return withNotice(DS_UNREADABLE);
       throw e;

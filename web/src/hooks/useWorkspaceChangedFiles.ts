@@ -637,7 +637,7 @@ export function useWorkspaceFileSearch(
 
 // ── Directory contents (lazy, on-demand) ──────────────────────────────────────
 
-async function fetchWorkspaceDirectory(
+export async function fetchWorkspaceDirectory(
   conversationId: string,
   dirPath: string,
   location = "",
