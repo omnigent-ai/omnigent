@@ -90,7 +90,6 @@ _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _DURABLE_ITEM_POST_TIMEOUT_SECONDS = 5.0
 # Rotation retries are limited to idempotent reads and same-value target
 # metadata writes. Session creation and terminal transfer remain one-shot.
-_ROTATION_REQUEST_TIMEOUT_SECONDS = 30.0
 _ROTATION_REQUEST_MAX_ATTEMPTS = 3
 _ROTATION_RETRY_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 _ROTATION_RETRY_DELAY_SECONDS = 0.25
@@ -2526,7 +2525,6 @@ async def _create_thread_replacement_session(
             lambda: client.patch(
                 f"/v1/sessions/{url_component(new_session_id)}",
                 json={"runner_id": runner_id},
-                timeout=_ROTATION_REQUEST_TIMEOUT_SECONDS,
             ),
         )
         bind_resp.raise_for_status()
@@ -2536,7 +2534,6 @@ async def _create_thread_replacement_session(
         lambda: client.patch(
             f"/v1/sessions/{url_component(new_session_id)}",
             json={"external_session_id": new_thread_id},
-            timeout=_ROTATION_REQUEST_TIMEOUT_SECONDS,
         ),
     )
     external_resp.raise_for_status()
@@ -2596,10 +2593,7 @@ async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) ->
     """
     resp = await _codex_rotation_request(
         "old-session snapshot",
-        lambda: client.get(
-            f"/v1/sessions/{url_component(session_id)}",
-            timeout=_ROTATION_REQUEST_TIMEOUT_SECONDS,
-        ),
+        lambda: client.get(f"/v1/sessions/{url_component(session_id)}"),
     )
     resp.raise_for_status()
     payload = resp.json()
