@@ -39,7 +39,6 @@ import {
   renderTriggerPrompt,
   splitTriggerPrompt,
 } from "./triggerTemplates";
-import { SCHEDULED_TASK_SUGGESTIONS } from "./suggestions";
 
 const gitWorkspace = vi.hoisted(() => ({
   available: true as boolean | undefined,
@@ -834,35 +833,17 @@ describe("CreateScheduledTaskDialog validation", () => {
 });
 
 describe("CreateScheduledTaskDialog prefill (seed-on-open + reset)", () => {
-  it("shows the session name template placeholder and help", () => {
-    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
-    expect(screen.getByTestId("task-name-input")).toHaveAttribute(
-      "placeholder",
-      "Open PR Rebase - {{YYYY-MM-DD}}",
-    );
-    expect(
-      screen.getByText(
-        "Add {{YYYY-MM-DD}} or {{MMM DD}} to put each run's date in its session name.",
-      ),
-    ).toBeVisible();
-  });
+  it("highlights template spans while keeping the Name input value unchanged", () => {
+    const name = "Test Automation {{MMM DD}}";
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName={name} />);
 
-  it.each([
-    ["follow-up-monitor", "Follow-up monitor - {{ddd, MMM DD}}"],
-    ["pr-sweep", "PR sweep - {{YYYY-MM-DD}}"],
-    ["news-digest", "News digest - {{MMM DD}}"],
-  ])("prefills the %s suggestion's templated name", (id, expectedName) => {
-    const suggestion = SCHEDULED_TASK_SUGGESTIONS.find((entry) => entry.id === id)!;
-    render(
-      <CreateScheduledTaskDialog
-        open
-        onOpenChange={vi.fn()}
-        initialName={suggestion.prefill.name}
-        initialPrompt={suggestion.prefill.prompt}
-      />,
-    );
-    expect(screen.getByTestId("task-name-input")).toHaveValue(expectedName);
-    expect(screen.getByTestId("task-prompt-input")).toHaveValue(suggestion.prefill.prompt);
+    const input = screen.getByTestId("task-name-input");
+    const overlay = screen.getByTestId("task-name-template-overlay");
+    const highlight = overlay.querySelector("mark[data-template-placeholder]");
+    expect(input).toHaveValue(name);
+    expect(highlight).toHaveTextContent("{{MMM DD}}");
+    expect(highlight?.previousSibling?.textContent).toBe("Test Automation ");
+    expect(overlay).toHaveTextContent(name);
   });
 
   it("seeds Name + Prompt from initialName/initialPrompt when opened", () => {
