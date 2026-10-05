@@ -802,6 +802,8 @@ async def _stop_host_runner_intentionally(
             if _intentional_stop_sessions.get(related_id) != runner_id:
                 marked.add(related_id)
                 _intentional_stop_sessions[related_id] = runner_id
+                if handle is not None:
+                    handle.intentional_stop_turn_ended = False
 
         acknowledged = False
         attempt = _HostRunnerStopAttempt()
@@ -7879,6 +7881,25 @@ async def _relay_runner_stream_once(
                             ready.set()
                         continue
 
+                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES or (
+                        evt_type == "session.status" and event.get("status") == "running"
+                    ):
+                        relay = _runner_relay_tasks.get(session_id)
+                        if relay is not None and relay.task is asyncio.current_task():
+                            if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                                relay.intentional_stop_turn_ended = (
+                                    _intentional_stop_sessions.get(session_id) == runner_id
+                                )
+                            else:
+                                # Running can resume the same turn, including after PTY idle.
+                                # Only completed stopped work makes its marker stale.
+                                if (
+                                    relay.intentional_stop_turn_ended
+                                    and _intentional_stop_sessions.get(session_id) == runner_id
+                                ):
+                                    _intentional_stop_sessions.pop(session_id, None)
+                                relay.intentional_stop_turn_ended = False
+
                     if evt_type == "session.created":
                         child_id = event.get("child_session_id")
                         if isinstance(child_id, str) and child_id:
@@ -7946,14 +7967,6 @@ async def _relay_runner_stream_once(
                                     None,
                                     conversation_store,
                                 )
-                                # A new turn proves the runner is live again, so
-                                # a prior Stop that never dropped the tunnel must
-                                # not leave the intentional-stop marker to swallow
-                                # this turn's genuine disconnect. Fence-independent
-                                # (the fence may already be cleared by a terminal
-                                # stop event), so it fires on every running edge.
-                                if _intentional_stop_sessions.get(session_id) == runner_id:
-                                    _intentional_stop_sessions.pop(session_id, None)
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
                             # via external_session_status (the codex-shared path)

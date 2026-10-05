@@ -849,12 +849,15 @@ class _RelayHandle:
         no-replay subscription is registered.
     :param status_snapshot: Saved status read when adopting this binding,
         used only when live status and a fresh row are unavailable.
+    :param intentional_stop_turn_ended: A terminal response arrived while the
+        current stop marker was pending; reset when installing a new marker.
     """
 
     runner_id: str
     task: asyncio.Task[None]
     ready: asyncio.Event
     status_snapshot: _RelayStatusSnapshot | None = None
+    intentional_stop_turn_ended: bool = False
 
 
 _runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()
