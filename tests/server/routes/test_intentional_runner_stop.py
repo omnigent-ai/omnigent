@@ -311,6 +311,39 @@ async def test_unconsumed_stop_expires_before_a_later_disconnect(
 
 
 @pytest.mark.parametrize("stopped_runner", [_RUNNER, "runner-replacement"])
+async def test_stop_arriving_during_status_lookup_matches_the_departed_runner(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    stopped_runner: str,
+) -> None:
+    store, ids = family
+    child_id = ids["cold"]
+    snapshot = store.get_conversation(child_id)
+    read = store.get_conversation
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_read(session_id: str):
+        entered.set()
+        assert release.wait(timeout=10), "test did not release the status lookup"
+        return read(session_id)
+
+    monkeypatch.setattr(store, "get_conversation", blocked_read)
+    task = asyncio.create_task(
+        orchestration._runner_disconnect_requires_failure(
+            child_id, store, origin="runner_offline_sweep", snapshot=snapshot
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        sessions._intentional_stop_sessions[child_id] = stopped_runner
+        release.set()
+        assert await asyncio.wait_for(task, timeout=10) is (stopped_runner != _RUNNER)
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=10)
+
+
+@pytest.mark.parametrize("stopped_runner", [_RUNNER, "runner-replacement"])
 @pytest.mark.parametrize("with_relay", [False, True])
 async def test_old_runner_sweep_preserves_rebound_session(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],

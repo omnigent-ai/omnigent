@@ -14,7 +14,8 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { ComposerAgentIcon } from "@/shell/NewChatDialog";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHarnessStartup, useHosts, type Host } from "@/hooks/useHosts";
+import { ApiError } from "@/lib/sessionsApi";
 import { INVENTORY_HARNESS_IDS } from "@/hooks/useHarnessInventory";
 import { BRAND_HARNESSES } from "@/components/onboarding/harnessBrand";
 import {
@@ -421,7 +422,19 @@ function HarnessDetail({
   // The host inventory only covers these families' MCP servers, skills, and plugins.
   const family = BRAND_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
   if (status.ready && host && family) {
-    return <HarnessCatalog header={header} settings={credential} host={host} family={family} />;
+    return (
+      <HarnessCatalog
+        header={header}
+        settings={
+          <div className="flex flex-col gap-6">
+            {credential}
+            <StartupSettings host={host} harness={entry.harness} />
+          </div>
+        }
+        host={host}
+        family={family}
+      />
+    );
   }
   return (
     <>
@@ -443,6 +456,58 @@ function HarnessDetail({
         )}
       </div>
     </>
+  );
+}
+
+function StartupSettings({ host, harness }: { host: Host; harness: string }) {
+  const { data, error, isPending } = useHarnessStartup(host.host_id, harness);
+  if (error instanceof ApiError && error.status === 404) return null;
+  if (isPending) return <p className="text-ui text-muted-foreground">Loading launch settings…</p>;
+  if (error || !data) {
+    return (
+      <p className="text-ui text-muted-foreground">
+        {error instanceof ApiError && error.status === 501
+          ? `Update ${host.name} to see launch settings.`
+          : `Couldn't load launch settings from ${host.name}.`}
+      </p>
+    );
+  }
+  const source = {
+    env: `From OMNIGENT_${harness.replace(/-native$/, "").toUpperCase()}_PATH on ${host.name}.`,
+    config: `From harness.${harness}.command in ~/.omnigent/config.yaml.`,
+    default: `Default command on ${host.name}.`,
+  }[data.command_source];
+  return (
+    <div className="flex flex-col gap-6">
+      <section className="flex flex-col gap-2">
+        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+          Path to binary
+        </h2>
+        <code className="rounded-xl border border-border p-3 text-ui break-all">
+          {data.resolved_path ?? data.command}
+        </code>
+        <p className="text-xs text-muted-foreground">
+          {source}
+          {!data.resolved_path && " Executable not found."}
+        </p>
+      </section>
+      <section className="flex flex-col gap-2">
+        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+          Startup arguments
+        </h2>
+        <p className="rounded-xl border border-border p-3 text-ui">
+          {data.arg_count === 0
+            ? "None configured"
+            : `${data.arg_count} configured argument${data.arg_count === 1 ? "" : "s"} (values hidden)`}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          From harness.{harness}.args in ~/.omnigent/config.yaml.
+        </p>
+      </section>
+      <p className="text-xs text-muted-foreground">
+        Host defaults, read-only. A workspace's .omnigent/config.yaml can override these.
+      </p>
+    </div>
   );
 }
 

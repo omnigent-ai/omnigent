@@ -8123,6 +8123,11 @@ async def _cleanup_drained_subagent_work(
     a lost receipt costs one duplicate delivery after a restart, whereas a
     lost result would never reach the parent.
 
+    A drained ``failed`` that is only the launch reaper's guess is not final:
+    the dispatch stays registered and un-receipted so the child's own terminal
+    edge can still replace it and reach the parent. Draining that genuine
+    result (or session teardown) performs the cleanup instead.
+
     :param payload: Drained inbox payload.
     :param server_client: HTTP client pointed at the Omnigent server, or
         ``None`` when the drain runs without server access.
@@ -8140,6 +8145,9 @@ async def _cleanup_drained_subagent_work(
         return
     from omnigent.runner import subagent_work as _subagent_work
 
+    entry = _subagent_work.get_subagent_work(child_id)
+    if entry is not None and entry.work_id == work_id and entry.launch_timed_out:
+        return
     _subagent_work.unregister_subagent_work(
         child_id,
         work_id=work_id,

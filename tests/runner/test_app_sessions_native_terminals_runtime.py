@@ -39,6 +39,10 @@ from omnigent.runner.resource_registry import (
     CODEX_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
+from omnigent.runner.session_init_protocol import (
+    RunnerSessionInitEnvelope,
+    RunnerSessionInitSnapshot,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -414,6 +418,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     ],
 )
 @pytest.mark.parametrize("cancel_launch", [False, True])
+@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -421,6 +426,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     permission_args: list[str],
     retain_subscription: bool,
     cancel_launch: bool,
+    use_envelope: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -457,6 +463,26 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
     caplog.set_level(logging.INFO, logger="omnigent.runner.native.orchestration")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+    launch_snapshot = RunnerSessionInitSnapshot(
+        created_at=10,
+        updated_at=11,
+        terminal_launch_args=["--config", "approval_policy=on-request"],
+        model_override="gpt-5.4-mini",
+        external_session_id=thread_id,
+    ).model_dump(mode="json")
+    session_init = (
+        RunnerSessionInitEnvelope.model_validate(
+            {
+                "protocol_version": 2,
+                "server_version": "test",
+                "session_id": session_id,
+                "agent_id": "agent_codex",
+                "snapshot": launch_snapshot,
+            }
+        )
+        if use_envelope
+        else None
+    )
     codex_native_bridge.write_bridge_state(
         bridge_dir,
         codex_native_bridge.CodexNativeBridgeState(
@@ -498,16 +524,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                     request=httpx.Request("GET", url),
                 )
             assert url == f"/v1/sessions/{session_id}", kwargs
+            assert not use_envelope, "Codex init must use the supplied launch metadata"
             return httpx.Response(
                 200,
-                json={
-                    "terminal_launch_args": [
-                        "--config",
-                        "approval_policy=on-request",
-                    ],
-                    "model_override": "gpt-5.4-mini",
-                    "external_session_id": thread_id,
-                },
+                json=launch_snapshot,
                 request=httpx.Request("GET", url),
             )
 
@@ -716,6 +736,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                     lambda _sid, event: published_events.append(event),
                     agent_spec=agent_spec,
                     server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+                    session_init=session_init,
                 )
             assert retained_client.closed is retain_subscription
             assert app_server.closed
@@ -728,6 +749,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             lambda _sid, event: published_events.append(event),
             agent_spec=agent_spec,
             server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+            session_init=session_init,
         )
         await asyncio.sleep(0)
     finally:

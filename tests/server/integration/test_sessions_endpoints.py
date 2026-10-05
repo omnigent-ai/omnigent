@@ -5122,6 +5122,8 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         _runner_id: str,
         _runner_client: _RecoveringRunnerClient,
         _conversation_store: Any,
+        *,
+        conversation: Any = None,
     ) -> None:
         """
         Skip relay startup; this test targets the PATCH init branch.
@@ -5130,6 +5132,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         :param _runner_id: Runner id, e.g. ``"runner_recovered"``.
         :param _runner_client: Runner client stub.
         :param _conversation_store: Conversation store from the route.
+        :param conversation: Saved session row from the route.
         :returns: None.
         """
         relay_bindings.append((_session_id, _runner_id))
