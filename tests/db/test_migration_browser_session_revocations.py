@@ -13,18 +13,36 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.interfaces import ReflectedColumn
 from sqlalchemy.exc import DBAPIError
 
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
     get_or_create_engine,
+    is_cockroachdb,
 )
 
 _TABLE = "browser_session_revocations"
 _PREVIOUS_HEAD = "mm1a2b3c4d5e"
 # Past the 32-bit signed limit (2038-01-19), e.g. a login plus a long lifetime.
 _BEYOND_INT32 = 2**31 + 3600
+
+
+def _is_64_bit(engine: Engine, column: ReflectedColumn) -> bool:
+    if not is_cockroachdb(engine.dialect.name):
+        return isinstance(column["type"], sa.BigInteger)
+    # The CockroachDB dialect reflects every integer width as INT.
+    with engine.connect() as conn:
+        data_type = conn.execute(
+            sa.text(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = :table "
+                "AND column_name = :column"
+            ),
+            {"table": _TABLE, "column": column["name"]},
+        ).scalar_one()
+    return data_type == "bigint"
 
 
 @pytest.fixture
@@ -69,7 +87,7 @@ def test_epoch_columns_hold_times_past_2038(db_engine: Engine) -> None:
     """``revoked_at`` and ``expires_at`` are 64-bit and round-trip a post-2038 time."""
     columns = {c["name"]: c for c in sa.inspect(db_engine).get_columns(_TABLE)}
     for name in ("revoked_at", "expires_at"):
-        assert isinstance(columns[name]["type"], sa.BigInteger), name
+        assert _is_64_bit(db_engine, columns[name]), name
 
     with db_engine.begin() as conn:
         conn.execute(
