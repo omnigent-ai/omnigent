@@ -831,14 +831,20 @@ function WorkspacePanelImpl({
     // screen now.
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
-    // Started this session → live (not a dead restored Codex fork).
-    sideChatsStartedThisSession.add(childId);
-    const awaiting = awaitingPendingIdsRef.current.shift();
-    if (awaiting !== undefined) {
-      sideChats.rekey(awaiting, childId);
-    } else {
-      // Generic already rekeyed its own tab; this just re-selects it (idempotent).
+    if (childId.startsWith("pending:")) {
+      // "Ask in side chat": a not-yet-forked tab, so it must not take a slot in
+      // the Codex awaiting queue. Its first send creates the fork.
       sideChats.open(childId);
+    } else {
+      // Started this session → live (not a dead restored Codex fork).
+      sideChatsStartedThisSession.add(childId);
+      const awaiting = awaitingPendingIdsRef.current.shift();
+      if (awaiting !== undefined) {
+        sideChats.rekey(awaiting, childId);
+      } else {
+        // Generic already rekeyed its own tab; this just re-selects it (idempotent).
+        sideChats.open(childId);
+      }
     }
     onRightRailTabChange("sidechat");
     clearSideChatToOpen();

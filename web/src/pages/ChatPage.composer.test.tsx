@@ -4151,6 +4151,8 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
       failedSendDraft: null,
       queuedMessages: [],
       sessionHarness: "codex-native",
+      sideChatToOpen: null,
+      sideChatDrafts: {},
     });
   });
 
@@ -4160,58 +4162,18 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
     vi.restoreAllMocks();
   });
 
-  it("adds the selection as a quote card and flags it a side chat", () => {
+  it("opens a pending side-chat tab quoting the selection, leaving the main composer empty", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     render(<Composer {...composerProps()} ref={ref} />);
 
     act(() => ref.current?.startSideChat("restore the row on failure"));
 
-    // Renders exactly like a reply quote (card + empty tail input), plus the
-    // side-chat hint so the user knows this will fork.
+    const { sideChatToOpen, sideChatDrafts } = useChatStore.getState();
+    expect(sideChatToOpen?.parentId).toBe("conv_test");
+    expect(sideChatToOpen?.childId).toMatch(/^pending:/);
+    expect(sideChatDrafts[sideChatToOpen!.childId]).toBe("restore the row on failure");
     expect(textarea()).toHaveValue("");
-    expect(
-      screen.getByTestId("composer-reply-quote").querySelector("blockquote"),
-    ).toHaveTextContent("restore the row on failure");
-    expect(screen.getByTestId("composer-side-chat-hint")).toBeInTheDocument();
-  });
-
-  it("sends as a /side command carrying the quoted selection and the question", () => {
-    const props = composerProps();
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    render(<Composer {...props} ref={ref} />);
-
-    act(() => ref.current?.startSideChat("restore the row on failure"));
-    fireEvent.change(textarea(), { target: { value: "why is this safe?" } });
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-
-    // Prefixed with /side so the existing pipeline forks it; no reply-draft
-    // snapshot (a side chat keeps no main-chat bubble).
-    expect(props.onSend).toHaveBeenCalledWith(
-      "/side > restore the row on failure\n\nwhy is this safe?",
-      undefined,
-    );
-    expect(textarea()).toHaveValue("");
-  });
-
-  it("falls back to a normal reply when the session has no side-chat harness", () => {
-    // Side chat is generic now (every harness supports it), so the only
-    // no-side-chat case is a session with no bound harness — then a quoted
-    // "Ask in side chat" degrades to an ordinary reply.
-    useChatStore.setState({ sessionHarness: "" });
-    const props = composerProps();
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    render(<Composer {...props} ref={ref} />);
-
-    act(() => ref.current?.startSideChat("some selection"));
-    fireEvent.change(textarea(), { target: { value: "a question" } });
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-
-    // No /side prefix, no fork; sends as an ordinary quoted reply with its snapshot.
-    expect(props.onSend).toHaveBeenCalledWith("> some selection\n\na question", undefined, {
-      version: 1,
-      quotes: [{ before: "", text: "some selection" }],
-      text: "a question",
-    });
+    expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
   });
 
   it.each([
@@ -4223,8 +4185,7 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     render(<Composer {...composerProps(overrides)} ref={ref} />);
     act(() => ref.current?.startSideChat("selected text"));
-    expect(textarea()).toHaveValue("");
-    expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
+    expect(useChatStore.getState().sideChatToOpen).toBeNull();
   });
 });
 

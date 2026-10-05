@@ -26,12 +26,14 @@ import { ChatComposer, ComposerSendButton } from "@/components/composer/ChatComp
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
+import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
 import { useChatStore, ensureConversationStreamed } from "@/store/chatStore";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useSession } from "@/hooks/useSession";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
+import { serializeReplyDraft } from "@/lib/replyDraft";
 import { interrupt, stopSession } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
@@ -241,6 +243,8 @@ export function SideChatPane({
     setStarting(true);
     try {
       await onStart(text);
+      // The quoted selection now travels with the fork's first message.
+      useChatStore.getState().clearSideChatDraft(childId);
     } catch {
       // Re-enable the composer while preserving the draft for retry.
       setStarting(false);
@@ -349,6 +353,11 @@ function SideChatComposer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceSnapshotRef = useRef("");
   const dictation = useDictationInsert(text, setText, textareaRef);
+  // A pending tab opened by "Ask in side chat" carries the selection to quote.
+  const quote = useChatStore((s) => (pending ? s.sideChatDrafts[childId] : undefined));
+  useEffect(() => {
+    if (quote !== undefined) textareaRef.current?.focus();
+  }, [quote]);
 
   // A `/side <question>` that opened this side chat seeds a draft to SEND (not
   // just populate). Consumed once on mount; the send waits until the child's
@@ -391,7 +400,11 @@ function SideChatComposer({
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
       // Keep the text so a failed fork can be retried without re-typing.
-      void onStart(trimmed);
+      void onStart(
+        quote === undefined
+          ? trimmed
+          : serializeReplyDraft({ quotes: [{ before: "", text: quote }], text: trimmed }),
+      );
       return;
     }
     if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
@@ -437,6 +450,17 @@ function SideChatComposer({
           },
         }}
         slots={{
+          inputPrefix:
+            quote === undefined ? undefined : (
+              <ReplyDraftBlocks
+                quotes={[{ id: childId, before: "", text: quote }]}
+                activeTextId={null}
+                keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+                disabled={!ready}
+                inputFor={() => ({})}
+                onRemove={() => clearSideChatDraft(childId)}
+              />
+            ),
           attachments:
             !pending && files.length > 0 ? (
               <ComposerAttachments
