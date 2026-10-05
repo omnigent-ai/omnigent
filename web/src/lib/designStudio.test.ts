@@ -56,6 +56,18 @@ describe("first message", () => {
         "slide per edit.",
     );
   });
+
+  it("adds the design-system instruction when one is chosen", () => {
+    const message = firstDesignMessage("Pitch", "decks/pitch.slides.html", {
+      path: "/brand",
+      kind: "skill",
+      name: "Brand",
+    });
+    expect(message).toMatch(
+      /slide per edit\.\n\nFollow the design system at `\/brand` \(`skill`\)/,
+    );
+    expect(message.endsWith("Read its SKILL.md first.")).toBe(true);
+  });
 });
 
 describe("studio URL", () => {

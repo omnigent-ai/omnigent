@@ -2,6 +2,7 @@
 // studio URL, remembered dialog defaults, and the preview's waiting states.
 
 import { DECK_SUFFIX } from "./designDecks";
+import { designSystemInstruction, type DesignSystemRef } from "./designSystem";
 
 export const DESIGN_SESSION_PARAM = "session";
 export const DESIGN_FILE_PARAM = "file";
@@ -61,11 +62,12 @@ export function designDeckPath(slug: string): string {
   return `decks/${slug}${DECK_SUFFIX}`;
 }
 
-export function firstDesignMessage(prompt: string, path: string): string {
+export function firstDesignMessage(prompt: string, path: string, system?: DesignSystemRef): string {
   return (
     `${prompt.trim()}\n\nUse the slide-decks skill. Write the deck to \`${path}\`. ` +
     "Write a complete document with only the title slide first, then add one complete " +
-    "slide per edit."
+    "slide per edit." +
+    (system ? `\n\n${designSystemInstruction(system)}` : "")
   );
 }
 
