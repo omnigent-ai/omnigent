@@ -95,14 +95,21 @@ async function replaceAsync(
  * `ds:` urls (including `@font-face` sources) inlined, remote urls dropped.
  */
 export async function processDesignSystemCss(css: string, asset: AssetUri): Promise<string> {
-  if (/<\/style/i.test(css)) throw new Error(`${DS_STYLESHEET} must not contain "</style"`);
+  assertSafeCss(css);
   const stripped = css.replace(/@import\b[^;]*;?/gi, "");
-  return replaceAsync(stripped, CSS_URL_RE, async ([whole, quote, raw]) => {
+  const out = await replaceAsync(stripped, CSS_URL_RE, async ([whole, quote, raw]) => {
     const value = raw.trim();
     if (/^data:/i.test(value)) return whole;
     if (!/^ds:/i.test(value) && /^(?:[a-z][\w+.-]*:|\/)/i.test(value)) return "none";
     return `url(${quote}${await asset(resolveDsPath(value.replace(/^\.\//, "")))}${quote})`;
   });
+  assertSafeCss(out);
+  return out;
+}
+
+/** Fail closed on anything that could end the `<style>` early. */
+function assertSafeCss(css: string): void {
+  if (/<\/style/i.test(css)) throw new Error(`${DS_STYLESHEET} must not contain "</style"`);
 }
 
 /** Rewrite `ds:` in `src` and `href` attributes and CSS `url()` to data: URIs. */

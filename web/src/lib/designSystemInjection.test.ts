@@ -73,6 +73,12 @@ describe("processDesignSystemCss", () => {
     );
   });
 
+  it("rejects </style that only forms once @import is stripped", async () => {
+    await expect(
+      processDesignSystemCss("a{} </@import;style><script>alert(1)</script>", asset),
+    ).rejects.toThrow('colors_and_type.css must not contain "</style"');
+  });
+
   it("rejects a url that escapes the folder", async () => {
     await expect(processDesignSystemCss(".a{background:url(../x.png)}", asset)).rejects.toThrow(
       "../x.png must be a relative path inside the design system",
