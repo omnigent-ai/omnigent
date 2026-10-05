@@ -659,6 +659,30 @@ describe("loadDesignKit", () => {
     expect([...at].sort((a, b) => a - b)).toEqual(at);
   });
 
+  it("keeps only fonts and tokens without section rules, and skips the logo and kit CSS", async () => {
+    const read = vi.fn(kitReader(KIT_FILES));
+    const kit = await loadDesignKit(read, { sections: false });
+    expect(kit.status).toBe("ok");
+    if (kit.status !== "ok") return;
+    expect(kit.style).toContain('@font-face{font-family:"Acme Sans"');
+    expect(kit.style).toContain(":root{--kit-primary:#ff0066");
+    expect(kit.style).toContain('--kit-font-body:"Georgia", serif');
+    for (const rule of ["body>section", "html,body{", "body{", "!important", ".layout-title"]) {
+      expect(kit.style).not.toContain(rule);
+    }
+    const paths = read.mock.calls.map(([p]) => p);
+    expect(paths).not.toContain(`${DESIGN_KIT_DIR}/logo.svg`);
+    expect(paths).not.toContain(`${DESIGN_KIT_DIR}/layouts.css`);
+  });
+
+  it("still validates kit.json and font assets without section rules", async () => {
+    const bad = { ...KIT_FILES, "fonts/acme.woff2": { ...bin("AAAA"), bytes: MB2 + 1 } };
+    const kit = await loadDesignKit(kitReader(bad), { sections: false });
+    expect(kit.status === "error" && kit.reason).toMatch(/acme\.woff2 is larger than 2 MB/);
+    const invalid = { ...KIT_FILES, "kit.json": text(kitJson({ logo: { src: "../x.svg" } })) };
+    expect((await loadDesignKit(kitReader(invalid), { sections: false })).status).toBe("error");
+  });
+
   it("places the logo by position", () => {
     const style = buildDesignKitStyle(
       parseDesignKit(kitJson({ logo: { src: "logo.png", position: "top-left" } })),

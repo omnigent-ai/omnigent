@@ -45,6 +45,25 @@ describe("loadDeckBranding", () => {
     expect(d.isOwner).not.toHaveBeenCalled();
   });
 
+  it("passes sections: false to the kit for wireframes", async () => {
+    const kit = text(
+      '{"name":"Acme","colors":{"background":"#fff"},"fonts":{"body":{"family":"Inter"}}}',
+    );
+    const d = deps({ [`${DESIGN_KIT_DIR}/kit.json`]: kit });
+    const branding = await loadDeckBranding(DECK, d, { sections: false });
+    expect(branding.kitStyle).toContain("--kit-background:#fff");
+    expect(branding.kitStyle).not.toContain("body>section");
+    expect(branding.kitStyle).not.toContain("!important");
+    expect((await loadDeckBranding(DECK, d)).kitStyle).toContain("body>section");
+  });
+
+  it("injects a full system the same way for wireframes", async () => {
+    const d = deps({ [DESIGN_SYSTEM_POINTER]: pointer("full") });
+    expect(await loadDeckBranding(DECK, d, { sections: false })).toEqual(
+      await loadDeckBranding(DECK, d),
+    );
+  });
+
   it("names a kit failure as before", async () => {
     const branding = await loadDeckBranding(
       DECK,

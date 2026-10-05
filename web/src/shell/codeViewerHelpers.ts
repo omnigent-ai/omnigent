@@ -948,6 +948,11 @@ const LOGO_INSET: Record<KitLogoPosition, string> = {
   "bottom-right": "bottom:24px;right:24px;background-position:right bottom",
 };
 
+export interface KitStyleOptions {
+  /** `false` keeps only @font-face and tokens (wireframes): no kit CSS, base rules, or logo. */
+  sections?: boolean;
+}
+
 /**
  * The injected kit <style>: @font-face and `--kit-*` tokens, then the kit
  * stylesheet, then `!important` base rules so the brand beats the deck's own
@@ -957,6 +962,7 @@ export function buildDesignKitStyle(
   kit: DesignKit,
   assets: Record<string, string>,
   css = "",
+  { sections = true }: KitStyleOptions = {},
 ): string {
   const { heading, body } = kit.fonts;
   const faces = [heading, body]
@@ -971,6 +977,10 @@ export function buildDesignKitStyle(
     ...(heading ? [`--kit-font-heading:${heading.family}`] : []),
     ...(body ? [`--kit-font-body:${body.family}`] : []),
   ];
+  const tokens = [...faces, vars.length ? `:root{${vars.join(";")}}` : ""];
+  if (!sections) {
+    return `<style data-omnigent-kit>\n${tokens.filter(Boolean).join("\n")}\n</style>`;
+  }
   const { background, text } = kit.colors;
   const section = [
     background && "background:var(--kit-background)!important",
@@ -980,8 +990,7 @@ export function buildDesignKitStyle(
     "-webkit-print-color-adjust:exact;print-color-adjust:exact",
   ].filter(Boolean);
   const rules = [
-    ...faces,
-    vars.length ? `:root{${vars.join(";")}}` : "",
+    ...tokens,
     css,
     background ? "html,body{background:var(--kit-background)!important}" : "",
     body ? "body{font-family:var(--kit-font-body)!important}" : "",
@@ -1006,7 +1015,9 @@ export function buildDesignKitStyle(
  */
 export async function loadDesignKit(
   read: (path: string) => Promise<KitFile | null>,
+  options: KitStyleOptions = {},
 ): Promise<DesignKitState> {
+  const sections = options.sections ?? true;
   try {
     const kitFile = await read(`${DESIGN_KIT_DIR}/kit.json`);
     if (!kitFile) return { status: "none" };
@@ -1020,7 +1031,7 @@ export async function loadDesignKit(
       ...[kit.fonts.heading?.src, kit.fonts.body?.src].map(
         (src) => src && { src, mimes: FONT_MIME },
       ),
-      kit.logo && { src: kit.logo.src, mimes: IMAGE_MIME },
+      sections && kit.logo && { src: kit.logo.src, mimes: IMAGE_MIME },
     ].filter((a): a is { src: string; mimes: Record<string, string> } => !!a);
     const assets: Record<string, string> = {};
     await Promise.all(
@@ -1028,9 +1039,13 @@ export async function loadDesignKit(
         assets[src] = kitDataUri(await need(src), src, mimes[extension(src)]);
       }),
     );
-    const css = kit.css ? kitText(await need(kit.css), kit.css) : "";
+    const css = sections && kit.css ? kitText(await need(kit.css), kit.css) : "";
     if (/<\/style/i.test(css)) throw new Error(`${kit.css} must not contain "</style"`);
-    return { status: "ok", name: kit.name, style: buildDesignKitStyle(kit, assets, css) };
+    return {
+      status: "ok",
+      name: kit.name,
+      style: buildDesignKitStyle(kit, assets, css, { sections }),
+    };
   } catch (e) {
     return { status: "error", reason: e instanceof Error ? e.message : String(e) };
   }

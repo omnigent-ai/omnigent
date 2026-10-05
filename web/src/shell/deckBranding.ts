@@ -8,7 +8,13 @@ import {
   parseDesignSystemPointer,
 } from "@/lib/designSystem";
 import { injectDesignSystem } from "@/lib/designSystemInjection";
-import { kitText, loadDesignKit, type DesignKitState, type KitFile } from "./codeViewerHelpers";
+import {
+  kitText,
+  loadDesignKit,
+  type DesignKitState,
+  type KitFile,
+  type KitStyleOptions,
+} from "./codeViewerHelpers";
 
 export const DS_OWNER_ONLY = "Design system is only available to the session owner";
 export const DS_UNREADABLE = "Design system folder is not readable from this session; import it";
@@ -52,7 +58,12 @@ export function brandingFromKit(kit: DesignKitState): DeckBranding {
   return { ...NO_BRANDING, kitStyle: kit.style, badge: { kind: "kit", name: kit.name } };
 }
 
-export async function loadDeckBranding(content: string, deps: BrandingDeps): Promise<DeckBranding> {
+/** `kit` shapes only the kit style; design-system injection is the same for every kind. */
+export async function loadDeckBranding(
+  content: string,
+  deps: BrandingDeps,
+  kit: KitStyleOptions = {},
+): Promise<DeckBranding> {
   let pointerFile: KitFile | null;
   try {
     pointerFile = await deps.read(DESIGN_SYSTEM_POINTER);
@@ -60,7 +71,7 @@ export async function loadDeckBranding(content: string, deps: BrandingDeps): Pro
     // Same failure the kit read will name; the kit path reports it.
     pointerFile = null;
   }
-  if (!pointerFile) return brandingFromKit(await loadDesignKit(deps.read));
+  if (!pointerFile) return brandingFromKit(await loadDesignKit(deps.read, kit));
 
   try {
     const ref = parseDesignSystemPointer(kitText(pointerFile, "design-system.json"));
