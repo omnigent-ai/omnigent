@@ -19,6 +19,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useSkillContent } from "@/hooks/useSkillContent";
 import { ApiError } from "@/lib/sessionsApi";
+import { Spinner } from "../../components/ui/spinner";
 
 type CatalogKind = "mcps" | "skills" | "plugins";
 
@@ -575,7 +576,10 @@ function McpRow({
       </AccordionPrimitive.Header>
       <AccordionPrimitive.Content className="pr-4 pb-2.5 pl-10">
         {query.isPending ? (
-          <Notice>Loading tools…</Notice>
+          <div className="flex items-center gap-2 mt-1">
+            <Spinner />
+            <Notice> Loading tools...</Notice>
+          </div>
         ) : query.error ? (
           <Notice>
             {query.error instanceof ApiError && query.error.status === 501
@@ -585,30 +589,30 @@ function McpRow({
                 : `Couldn't reach ${server.name}.`}
           </Notice>
         ) : data ? (
-          <>
-            <p className="mb-2 text-xs text-muted-foreground">
-              Tools reported when probed from this host. Workspace overrides and harness sign-in
-              credentials are not used.
-            </p>
-            {data.connection !== "connected" ? (
-              <Notice>{CONNECTION_LABELS[data.connection]}</Notice>
-            ) : (
-              <>
-                {data.tools.length === 0 && <Notice>No tools reported.</Notice>}
-                {data.truncated && <Notice>Showing the first 500 tools.</Notice>}
-                <ul className="flex flex-col gap-1 text-xs text-muted-foreground">
-                  {data.tools.map((tool, index) => (
-                    // Capped names can collide; these display-only rows have no state.
-                    // eslint-disable-next-line react/no-array-index-key
-                    <li key={index}>
+          data.connection !== "connected" ? (
+            <Notice>{CONNECTION_LABELS[data.connection]}</Notice>
+          ) : (
+            <>
+              {data.tools.length === 0 && <Notice>No tools reported.</Notice>}
+              {data.truncated && <Notice>Showing the first 500 tools.</Notice>}
+              <ul className="flex flex-col gap-1 text-xs text-muted-foreground">
+                {data.tools.map((tool, index) => (
+                  // Capped names can collide; these display-only rows have no state.
+                  // eslint-disable-next-line react/no-array-index-key
+                  <li key={index}>
+                    <div>
                       <span className="font-mono">{tool.name}</span>
-                      {tool.description && <span className="ml-2">{tool.description}</span>}
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
-          </>
+                    </div>
+                    {tool.description && <div className="mb-1">{tool.description}</div>}
+                  </li>
+                ))}
+              </ul>
+              <p className="mb-2 text-xs">
+                Tools reported when probed from this host. Workspace overrides and harness sign-in
+                credentials are not used.
+              </p>
+            </>
+          )
         ) : null}
       </AccordionPrimitive.Content>
     </AccordionPrimitive.Item>
