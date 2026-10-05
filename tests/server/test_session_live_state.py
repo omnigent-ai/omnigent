@@ -435,3 +435,43 @@ async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
         (False, 0),
         (True, 3),
     ]
+
+
+class _DesignRecordingStore(_RecordingStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.design_writes: list[tuple[str, str, str, bool]] = []
+
+    def record_design_artifact(
+        self, session_id: str, path: str, kind: str, *, deleted: bool = False
+    ) -> None:
+        self.design_writes.append((session_id, path, kind, deleted))
+
+
+def test_persist_design_artifact_records_decks_and_wireframes_when_enabled() -> None:
+    store = _DesignRecordingStore()
+    session_live_state.configure(store, design_index=True)  # type: ignore[arg-type]
+    try:
+        session_live_state.persist_design_artifact("s1", "notes.html", deleted=False)
+        session_live_state.persist_design_artifact("s1", 42, deleted=False)
+        session_live_state.persist_design_artifact("s1", "a.slides.html", deleted=False)
+        session_live_state.persist_design_artifact("s1", "b.wireframe.html", deleted=True)
+        _wait_until(lambda: len(store.design_writes) == 2)
+        assert store.design_writes == [
+            ("s1", "a.slides.html", "deck", False),
+            ("s1", "b.wireframe.html", "wireframe", True),
+        ]
+    finally:
+        session_live_state.configure(None)
+
+
+def test_persist_design_artifact_is_off_without_the_design_flag() -> None:
+    store = _DesignRecordingStore()
+    session_live_state.configure(store)  # type: ignore[arg-type]
+    try:
+        session_live_state.persist_design_artifact("s1", "a.slides.html", deleted=False)
+        session_live_state.persist_live_status("s1", "running")
+        _wait_until(lambda: store.status_writes)
+        assert store.design_writes == []
+    finally:
+        session_live_state.configure(None)

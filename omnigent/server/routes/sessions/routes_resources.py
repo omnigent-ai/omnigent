@@ -38,6 +38,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_live_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -2753,9 +2754,8 @@ def register_resources_routes(
         )
         # The session is already validated above at the browse level, which is
         # stricter than main's plain LEVEL_READ for an absolute path.
-        return _skip_gzip_for_binary(
-            request,
-            await _fs_get_with_host_fallback(
+        try:
+            result = await _fs_get_with_host_fallback(
                 session_id,
                 conv,
                 op="list_or_read",
@@ -2768,8 +2768,13 @@ def register_resources_routes(
                 },
                 runner_path=path,
                 host_workspace_resolver=resolver,
-            ),
-        )
+            )
+        except OmnigentError as exc:
+            # A deck that is gone drops out of the Design page index.
+            if exc.code == ErrorCode.NOT_FOUND and not absolute:
+                session_live_state.persist_design_artifact(session_id, relative_path, deleted=True)
+            raise
+        return _skip_gzip_for_binary(request, result)
 
     @router.put(
         "/sessions/{session_id}/resources/environments"

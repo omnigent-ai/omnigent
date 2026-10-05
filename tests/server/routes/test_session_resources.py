@@ -8635,3 +8635,35 @@ async def test_native_send_rechecks_runtime_after_upload(
     assert "Update Omnigent" in response.text
     assert runner.post_json_calls == []
     assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+@pytest.mark.asyncio
+async def test_read_of_missing_deck_marks_its_index_row_deleted(
+    client: httpx.AsyncClient,
+) -> None:
+    """A deck read the runner answers 404 marks the deck deleted in the index."""
+    from omnigent.server import session_live_state
+
+    writes: list[tuple[str, str, str, bool]] = []
+    done = threading.Event()
+
+    class _Store:
+        def record_design_artifact(
+            self, session_id: str, path: str, kind: str, *, deleted: bool = False
+        ) -> None:
+            writes.append((session_id, path, kind, deleted))
+            done.set()
+
+    not_found = {"error": {"code": "not_found", "message": "File not found"}}
+    set_runner_router(
+        _FakeRunnerRouter(_FakeRunnerClient(status_code=404, payload=not_found))  # type: ignore[arg-type]
+    )
+    session_live_state.configure(_Store(), design_index=True)  # type: ignore[arg-type]
+    try:
+        base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        assert (await client.get(f"{base}/filesystem/notes.html")).status_code == 404
+        assert (await client.get(f"{base}/filesystem/decks/q3.slides.html")).status_code == 404
+        assert done.wait(10)
+    finally:
+        session_live_state.configure(None)
+    assert writes == [("79b22ebd2309e48fdeb450c65611d51b", "decks/q3.slides.html", "deck", True)]

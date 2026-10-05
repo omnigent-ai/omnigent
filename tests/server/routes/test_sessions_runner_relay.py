@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import TracebackType
@@ -3255,3 +3256,38 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
         f"({_MAX_RECONNECT_DELAY_S} * (1 + {_RECONNECT_JITTER_FRACTION}) = "
         f"{worst_case_reconnect_s}s)"
     )
+
+
+@pytest.mark.asyncio
+async def test_relay_indexes_design_artifact_changes(db_uri: str) -> None:
+    """A runner ``session.design_artifact.changed`` event upserts the index row."""
+    from omnigent.server import session_live_state
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    release = asyncio.Event()
+    release.set()
+    events = [
+        {
+            "type": "session.design_artifact.changed",
+            "session_id": conv.id,
+            "path": "decks/q3.slides.html",
+            "deleted": False,
+        }
+    ]
+    session_live_state.configure(store, design_index=True)
+    try:
+        await _relay_runner_stream_once(
+            conv.id,
+            _ScriptedRunnerClient(release, events),
+            store,  # type: ignore[arg-type]
+        )
+        deadline = time.monotonic() + 10
+        while not store.list_design_artifacts() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert [(a.session_id, a.path, a.kind) for a in store.list_design_artifacts()] == [
+            (conv.id, "decks/q3.slides.html", "deck")
+        ]
+    finally:
+        session_live_state.configure(None)

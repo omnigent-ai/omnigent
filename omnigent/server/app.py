@@ -1997,7 +1997,11 @@ def create_app(
     # scheduled-task store additionally enables the event-driven
     # run-completion hook (persist_scheduled_run_completion) fired from
     # _publish_status when a fired conversation's turn reaches terminal.
-    session_live_state.configure(conversation_store, scheduled_task_store)
+    session_live_state.configure(
+        conversation_store,
+        scheduled_task_store,
+        design_index=resolved_feature_flags.enabled(Feature.DESIGN),
+    )
     # Extend a managed sandbox while its runner tunnel is live (the managed-path
     # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
     managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)

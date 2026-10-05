@@ -8163,6 +8163,13 @@ async def _relay_runner_stream_once(
                     # path. Re-publish via _publish_terminal_pending so the
                     # event carries conversation_id and the cache write
                     # (read by the snapshot) stays coherent with the stream.
+                    # Indexed for the Design page only; clients never see it.
+                    if evt_type == "session.design_artifact.changed":
+                        session_live_state.persist_design_artifact(
+                            session_id, event.get("path"), deleted=event.get("deleted") is True
+                        )
+                        continue
+
                     if evt_type == "session.terminal_pending":
                         # Use ``is True`` (not bool()) so a malformed frame
                         # with a string like ``"false"`` can't strand the

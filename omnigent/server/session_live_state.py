@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.entities.design_artifact import DESIGN_ARTIFACT_PATH_MAX, design_artifact_kind
 
 if TYPE_CHECKING:
     from omnigent.stores import ConversationStore
@@ -64,6 +65,8 @@ _store: ConversationStore | None = None
 # alongside ``_store`` by :func:`configure`; ``None`` disables the hook (the
 # runner process and unit tests that never configure it are unaffected).
 _scheduled_task_store: ScheduledTaskStore | None = None
+# Design page artifact index writes, on only while the ``design`` flag is.
+_design_index = False
 # Single worker => writes apply in submission order (see module docstring).
 _executor: ThreadPoolExecutor | None = None
 # Last status seen per session, for dedupe — the value whose write was
@@ -82,6 +85,8 @@ _last_liveness_stamp: dict[str, int] = {}
 def configure(
     store: ConversationStore | None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    *,
+    design_index: bool = False,
 ) -> None:
     """
     Wire (or clear) the stores live-state writes go to.
@@ -91,10 +96,13 @@ def configure(
     :param scheduled_task_store: The server's scheduled-task store, enabling
         the event-driven run-completion hook
         (:func:`persist_scheduled_run_completion`); ``None`` disables it.
+    :param design_index: Enables :func:`persist_design_artifact` (the
+        ``design`` feature flag).
     """
-    global _store, _scheduled_task_store
+    global _store, _scheduled_task_store, _design_index
     _store = store
     _scheduled_task_store = scheduled_task_store
+    _design_index = design_index
     _last_status.clear()
     _last_pending.clear()
     _last_liveness_stamp.clear()
@@ -285,6 +293,30 @@ def persist_pending_count(conversation_id: str, count: int) -> None:
         conversation_id,
         count,
         on_failure=_evict,
+    )
+
+
+def persist_design_artifact(session_id: str, path: object, *, deleted: bool) -> None:
+    """
+    Index a Design page deck or wireframe change for the session.
+
+    Called from the runner relay for ``session.design_artifact.changed`` and
+    from the file read route when a deck read finds the file missing.
+
+    :param session_id: Session the file belongs to.
+    :param path: Workspace-relative path; anything but a deck or wireframe
+        path is ignored.
+    :param deleted: Mark the existing row deleted instead of upserting it.
+    """
+    store = _store
+    if store is None or not _design_index or not isinstance(path, str):
+        return
+    kind = design_artifact_kind(path)
+    if kind is None or len(path) > DESIGN_ARTIFACT_PATH_MAX:
+        return
+    submit(
+        "design_artifact",
+        lambda: store.record_design_artifact(session_id, path, kind, deleted=deleted),
     )
 
 
