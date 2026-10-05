@@ -99,10 +99,9 @@ async def test_list_environment_root_with_broken_symlink(
     """GET /filesystem succeeds even when the workspace contains a broken symlink.
 
     Broken symlinks are common in large repos (e.g. Bazel convenience symlinks
-    like bazel-out/bazel-bin pointing to a cleaned or absent cache).  The old
-    os.stat()-based implementation would raise FileNotFoundError and fail the
-    entire listing; the new implementation uses os.lstat() so broken symlinks
-    are listed as file-type entries rather than crashing the whole request.
+    like bazel-out/bazel-bin pointing to a cleaned or absent cache). Following
+    one raises, so the listing reads each entry with os.lstat() and reports the
+    dangling link as a symlink with its own size instead of failing the request.
     """
     ws = tmp_path / "workspace"
     ws.mkdir()
@@ -133,14 +132,10 @@ async def test_list_environment_root_with_broken_symlink(
     names = {e["name"] for e in body["data"]}
     # The real file is visible.
     assert "real.txt" in names
-    # Broken symlinks are listed as file-type entries via the lstat fallback
-    # rather than being silently skipped or crashing. Size is None because
-    # os.stat() (which follows symlinks) fails and lstat() on the symlink
-    # itself doesn't reflect the target's size.
     assert "broken_link" in names
     broken_entry = next(e for e in body["data"] if e["name"] == "broken_link")
-    assert broken_entry["type"] == "file"
-    assert broken_entry["bytes"] is None
+    assert broken_entry["type"] == "symlink"
+    assert broken_entry["bytes"] == (ws / "broken_link").lstat().st_size
 
 
 @pytest.mark.asyncio
@@ -2440,3 +2435,157 @@ async def test_scoped_search_reaches_snapshot_files_past_the_budget(
 
     assert [e["path"] for e in body["data"]] == ["zzz/new.txt"], body
     assert body["truncated"] is True
+
+
+# A symlink is described by its own lstat size and mtime, never its target's.
+# A link to a directory stays a navigable ``directory`` row (the Files panel
+# expands it); a link to a file or to a missing target is a ``symlink``.
+
+
+def _seed_symlink_workspace(ws: Path) -> dict[str, os.stat_result]:
+    """Seed a file, dir and the three symlinks (targets dated 2001 so a link
+    reported with its target's mtime is unmistakable); return each link's lstat."""
+    target = ws / "target.txt"
+    target.write_bytes(b"z" * 4000)
+    os.utime(target, (1_000_000_000, 1_000_000_000))
+    docs = ws / "docs"
+    docs.mkdir()
+    (docs / "readme.txt").write_text("docs\n")
+    os.utime(docs, (1_000_000_000, 1_000_000_000))
+    os.symlink("target.txt", ws / "link-to-file.txt")
+    os.symlink("docs", ws / "link-to-dir")
+    os.symlink("missing-target", ws / "broken-link")
+    return {
+        name: os.lstat(ws / name) for name in ("link-to-file.txt", "link-to-dir", "broken-link")
+    }
+
+
+def _fs_for(workspace: Path) -> CallerProcessFilesystem:
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    assert os_env is not None
+    return CallerProcessFilesystem(os_env)
+
+
+@pytest.mark.asyncio
+async def test_list_dir_reports_symlink_metadata_not_target(tmp_path: Path) -> None:
+    """``list_dir`` must report a symlink's own lstat size/mtime and type."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    links = _seed_symlink_workspace(ws)
+
+    page = await _fs_for(ws).list_dir("", limit=50, order="asc")
+    by_name = {e.name: e for e in page.data}
+
+    file_link = by_name["link-to-file.txt"]
+    assert file_link.type == "symlink", (
+        f"a file symlink should be type 'symlink', got {file_link.type!r}"
+    )
+    assert file_link.bytes == links["link-to-file.txt"].st_size, (
+        f"size should be the link's own ({links['link-to-file.txt'].st_size}), "
+        f"not the target's; got {file_link.bytes}"
+    )
+    assert file_link.modified_at == int(links["link-to-file.txt"].st_mtime), (
+        "mtime should be the link's own, not the target's 2001 mtime"
+    )
+
+    dir_link = by_name["link-to-dir"]
+    assert dir_link.type == "directory", f"a dir symlink stays a folder row, got {dir_link.type!r}"
+    assert dir_link.bytes is None
+    assert dir_link.modified_at == int(links["link-to-dir"].st_mtime), (
+        "mtime should be the link's own, not the target dir's 2001 mtime"
+    )
+
+    broken = by_name["broken-link"]
+    assert broken.type == "symlink", (
+        f"a broken symlink should be type 'symlink', got {broken.type!r}"
+    )
+    assert broken.bytes == links["broken-link"].st_size
+    assert broken.modified_at == int(links["broken-link"].st_mtime)
+
+
+@pytest.mark.asyncio
+async def test_search_reports_symlink_metadata_not_target(tmp_path: Path) -> None:
+    """``search_files`` must report a symlink's own lstat size/mtime and type."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    links = _seed_symlink_workspace(ws)
+
+    entries, _ = await _fs_for(ws).search_files("link", path="")
+    by_name = {e.name: e for e in entries}
+
+    file_link = by_name["link-to-file.txt"]
+    assert file_link.type == "symlink", (
+        f"a file symlink should be type 'symlink', got {file_link.type!r}"
+    )
+    assert file_link.bytes == links["link-to-file.txt"].st_size, (
+        f"size should be the link's own, got {file_link.bytes}"
+    )
+    assert file_link.modified_at == int(links["link-to-file.txt"].st_mtime), (
+        "mtime should be the link's own, not the target's 2001 mtime"
+    )
+
+    dir_link = by_name["link-to-dir"]
+    assert dir_link.type == "directory", f"a dir symlink stays a folder row, got {dir_link.type!r}"
+    assert dir_link.bytes is None
+    assert dir_link.modified_at == int(links["link-to-dir"].st_mtime)
+
+    broken = by_name["broken-link"]
+    assert broken.type == "symlink", (
+        f"a broken symlink should be type 'symlink', got {broken.type!r}"
+    )
+    assert broken.bytes == links["broken-link"].st_size
+
+
+@pytest.mark.asyncio
+async def test_stat_reports_symlink_metadata_not_target(tmp_path: Path) -> None:
+    """``stat`` must describe a symlink by its own lstat metadata and type;
+    a dangling link still exists even though following it fails."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    links = _seed_symlink_workspace(ws)
+    fs = _fs_for(ws)
+
+    file_link = await fs.stat("link-to-file.txt")
+    assert file_link.type == "symlink", (
+        f"a file symlink should be type 'symlink', got {file_link.type!r}"
+    )
+    assert file_link.bytes == links["link-to-file.txt"].st_size, (
+        f"size should be the link's own, got {file_link.bytes}"
+    )
+    assert file_link.modified_at == int(links["link-to-file.txt"].st_mtime), (
+        "mtime should be the link's own, not the target's 2001 mtime"
+    )
+
+    dir_link = await fs.stat("link-to-dir")
+    assert dir_link.type == "directory", f"a dir symlink stays a folder row, got {dir_link.type!r}"
+    assert dir_link.bytes is None
+    assert dir_link.modified_at == int(links["link-to-dir"].st_mtime)
+
+    broken = await fs.stat("broken-link")
+    assert broken.type == "symlink", (
+        f"a broken symlink should be type 'symlink', got {broken.type!r}"
+    )
+    assert broken.bytes == links["broken-link"].st_size
+    assert broken.modified_at == int(links["broken-link"].st_mtime)
+
+
+@pytest.mark.asyncio
+async def test_open_download_serves_the_target_of_a_file_symlink(tmp_path: Path) -> None:
+    """Describing a link by its own metadata must not break downloading through
+    it: the helper still resolves the link to the regular file this process
+    opened and reports that file's identity."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed_symlink_workspace(ws)
+
+    handle, resolved, size = await _fs_for(ws).open_download("link-to-file.txt")
+    try:
+        assert resolved == (ws / "target.txt").resolve()
+        assert size == 4000
+        assert handle.read(4) == b"zzzz"
+    finally:
+        handle.close()

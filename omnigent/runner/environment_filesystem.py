@@ -542,6 +542,15 @@ def resolve_browse_target(
     )
 
 
+def classify_entry(*, is_dir: bool, is_link: bool) -> Literal["file", "directory", "symlink"]:
+    """Type a listed path the way the Files panel navigates it: anything that
+    is or resolves to a directory is an expandable ``directory``; any other
+    symlink is a ``symlink`` described by its own size and mtime."""
+    if is_dir:
+        return "directory"
+    return "symlink" if is_link else "file"
+
+
 def _entry_from_stat(
     _root: Path,
     full_path: Path,
@@ -755,11 +764,12 @@ class CallerProcessFilesystem:
 
         Uses ``os_env.shell()`` to run a Python script inside the sandbox so
         access control is enforced.  The script uses ``os.lstat()`` (does not
-        follow symlinks) for size/mtime and ``os.path.isdir()`` (follows
-        symlinks but returns ``False`` for broken ones) for type classification.
-        Per-entry ``OSError`` is silently skipped so a single inaccessible
-        entry (e.g. a broken Bazel symlink in a large monorepo) does not cause
-        the entire listing to fail.
+        follow symlinks) for size/mtime, so a symlink reports its own metadata
+        rather than its target's, and ``os.path.isdir()`` (follows symlinks but
+        returns ``False`` for broken ones) to keep a link to a directory a
+        navigable folder; see :func:`classify_entry`. Per-entry ``OSError`` is
+        silently skipped so a single inaccessible entry does not cause the
+        entire listing to fail.
 
         :param path: Relative directory path. Empty string or
             ``"."`` for the root.
@@ -778,25 +788,20 @@ class CallerProcessFilesystem:
         target, prefix = self._target(path)
 
         # Shell-quote the generated script; target is embedded via json.dumps.
-        # Per-entry try/except handles broken symlinks.
         _script = "\n".join(
             [
-                "import os, json",
+                "import os, json, stat as S",
                 f"d = {_json.dumps(target)}",
                 "es = []",
                 "for e in sorted(os.listdir(d)):",
                 "    p = os.path.join(d, e)",
                 "    try:",
-                "        st = os.stat(p)",
-                "        t = 'd' if os.path.isdir(p) else 'f'",
-                "        es.append({'n': e, 's': st.st_size if t == 'f' else None,",
-                "            'm': int(st.st_mtime), 't': t})",
+                "        st = os.lstat(p)",
                 "    except OSError:",
-                "        try:",
-                "            ls = os.lstat(p)",
-                "            es.append({'n': e, 's': None, 'm': int(ls.st_mtime), 't': 'f'})",
-                "        except OSError:",
-                "            pass",
+                "        continue",
+                "    isd = os.path.isdir(p)",
+                "    es.append({'n': e, 's': None if isd else st.st_size,",
+                "        'm': int(st.st_mtime), 'd': isd, 'l': S.S_ISLNK(st.st_mode)})",
                 "print(json.dumps(es))",
             ]
         )
@@ -815,14 +820,14 @@ class CallerProcessFilesystem:
         for item in raw:
             name = item["n"]
             rel = os.path.join(prefix, name) if prefix else name
-            entry_type: Literal["file", "directory"] = "directory" if item["t"] == "d" else "file"
+            entry_type = classify_entry(is_dir=bool(item["d"]), is_link=bool(item["l"]))
             entries.append(
                 FilesystemEntry(
                     id=rel,
                     name=name,
                     path=rel,
                     type=entry_type,
-                    bytes=item["s"] if entry_type == "file" else None,
+                    bytes=None if entry_type == "directory" else item["s"],
                     modified_at=item["m"],
                 )
             )
@@ -903,7 +908,7 @@ class CallerProcessFilesystem:
         # cannot inject code; the whole script is shell-quoted below.
         _header = "\n".join(
             [
-                "import os, json, re",
+                "import os, json, re, stat as S",
                 "from collections import deque",
                 f"q = {_json.dumps(q)}",
                 f"limit = {limit}",
@@ -944,8 +949,9 @@ def rel(dirpath, name):
 
 
 def match(dirpath, name, is_dir):
-    # A directory carries no byte size; a file stats for size + mtime. Every
-    # dir reaching here already passed the exc filter in scan()'s kept loop;
+    # A directory carries no byte size; a file lstats for size + mtime, so a
+    # symlink reports its own metadata rather than its target's. Every dir
+    # reaching here already passed the exc filter in scan()'s kept loop;
     # re-checking keeps the two entry kinds symmetric so a future refactor of
     # that pre-filter can't silently leak excluded dirs.
     p = rel(dirpath, name)
@@ -956,9 +962,9 @@ def match(dirpath, name, is_dir):
     if q not in p.lower():
         return
     try:
-        st = os.stat(os.path.join(dirpath, name))
+        st = os.lstat(os.path.join(dirpath, name))
         results.append({'n': name, 'p': p, 's': None if is_dir else st.st_size,
-                        'm': int(st.st_mtime), 'd': is_dir})
+                        'm': int(st.st_mtime), 'd': is_dir, 'l': S.S_ISLNK(st.st_mode)})
     except OSError:
         results.append({'n': name, 'p': p, 's': None, 'm': None, 'd': is_dir})
 
@@ -1046,7 +1052,7 @@ print(json.dumps({'r': results, 't': truncated}))
                     id=item["p"],
                     name=item["n"],
                     path=item["p"],
-                    type="directory" if item.get("d") else "file",
+                    type=classify_entry(is_dir=bool(item.get("d")), is_link=bool(item.get("l"))),
                     bytes=item["s"],
                     modified_at=item["m"],
                 )
@@ -1218,7 +1224,9 @@ print(json.dumps({'r': results, 't': truncated}))
         :param probe_read: Also open and read one byte of a regular file.
         :returns: ``{"s": size, "m": mtime, "d": is_dir, "l": is_symlink,
             "r": readable_regular_file, "dev": st_dev, "ino": st_ino}``, or
-            ``None`` when the helper cannot stat the path.
+            ``None`` when the helper cannot stat the path. ``s``, ``m`` and
+            ``l`` describe the path itself (a symlink's own size and mtime);
+            ``d``, ``r`` and the identity describe what it resolves to.
         """
         import json as _json
 
@@ -1231,19 +1239,23 @@ print(json.dumps({'r': results, 't': truncated}))
             [
                 "import os, json, stat as S",
                 f"p = {_json.dumps(target)}",
-                "s = os.stat(p)",
-                "r = S.S_ISREG(s.st_mode)",
+                "s = os.lstat(p)",
+                "try:",
+                "    t = os.stat(p)",
+                "except OSError:",
+                "    t = s",
+                "r = S.S_ISREG(t.st_mode)",
                 f"if r and {probe_read!r}:",
                 "    try:",
                 "        with open(p, 'rb') as f:",
-                "            s = os.fstat(f.fileno())",
-                "            r = S.S_ISREG(s.st_mode)",
+                "            t = os.fstat(f.fileno())",
+                "            r = S.S_ISREG(t.st_mode)",
                 "            f.read(1)",
                 "    except OSError:",
                 "        r = False",
                 "print(json.dumps({'s': s.st_size, 'm': int(s.st_mtime),",
-                "    'd': S.S_ISDIR(s.st_mode), 'l': S.S_ISLNK(s.st_mode),",
-                "    'r': r, 'dev': s.st_dev, 'ino': s.st_ino}))",
+                "    'd': S.S_ISDIR(t.st_mode), 'l': S.S_ISLNK(s.st_mode),",
+                "    'r': r, 'dev': t.st_dev, 'ino': t.st_ino}))",
             ]
         )
         result = await _run_os_env_async(
@@ -1260,6 +1272,10 @@ print(json.dumps({'r': results, 't': truncated}))
     async def stat(self, path: str) -> FilesystemEntry:
         """Return metadata for a single path via the sandboxed helper.
 
+        A symlink is described by its own size and mtime and typed per
+        :func:`classify_entry`, so a dangling link is still reported rather
+        than treated as missing.
+
         :param path: Relative path within the environment.
         :returns: The filesystem entry.
         :raises FilesystemPathNotFound: If the path does not exist.
@@ -1269,17 +1285,13 @@ print(json.dumps({'r': results, 't': truncated}))
         if info is None:
             raise FilesystemPathNotFound(f"Path {path!r} not found")
         name = os.path.basename(validated) if validated else ""
-        entry_type: Literal["file", "directory", "symlink"] = "file"
-        if info.get("d"):
-            entry_type = "directory"
-        elif info.get("l"):
-            entry_type = "symlink"
+        entry_type = classify_entry(is_dir=bool(info.get("d")), is_link=bool(info.get("l")))
         return FilesystemEntry(
             id=validated or ".",
             name=name or ".",
             path=validated,
             type=entry_type,
-            bytes=info["s"] if entry_type == "file" else None,
+            bytes=None if entry_type == "directory" else info["s"],
             modified_at=info["m"],
         )
 

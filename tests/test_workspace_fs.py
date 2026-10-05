@@ -183,13 +183,10 @@ def test_oversize_binary_still_serves_base64(tmp_path: Path, monkeypatch) -> Non
     assert result["truncated"] is True
 
 
-def test_list_dir_includes_broken_symlink_as_file(tmp_path: Path) -> None:
-    """A broken symlink is listed as ``type="file"`` with no size, like the runner.
-
-    ``stat`` (follows the link) raises for a dangling target; the reader falls
-    back to ``lstat`` and still lists the entry rather than silently dropping
-    it — matching the runner's ``list_dir``.
-    """
+def test_list_dir_includes_broken_symlink_as_symlink(tmp_path: Path) -> None:
+    """A broken symlink is listed as ``type="symlink"`` with its own size, like
+    the runner: following it raises, so the reader lstats the entry and still
+    lists it rather than dropping it."""
     (tmp_path / "dangling").symlink_to(tmp_path / "does_not_exist")
     reader = WorkspaceReader(tmp_path)
 
@@ -197,8 +194,36 @@ def test_list_dir_includes_broken_symlink_as_file(tmp_path: Path) -> None:
 
     by_path = {e["path"]: e for e in result["data"]}
     assert "dangling" in by_path, "broken symlink must still appear in the listing"
-    assert by_path["dangling"]["type"] == "file"
-    assert by_path["dangling"]["bytes"] is None
+    assert by_path["dangling"]["type"] == "symlink"
+    assert by_path["dangling"]["bytes"] == (tmp_path / "dangling").lstat().st_size
+
+
+def test_list_and_search_describe_a_symlink_by_its_own_metadata(tmp_path: Path) -> None:
+    """A symlink row carries the link's own size and mtime, never its target's;
+    a link to a file is a ``symlink`` and a link to a directory stays a folder
+    row — like the runner."""
+    target = tmp_path / "target.txt"
+    target.write_bytes(b"z" * 4000)
+    os.utime(target, (1_000_000_000, 1_000_000_000))
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "readme.txt").write_text("docs\n")
+    os.symlink("target.txt", tmp_path / "link-to-file.txt")
+    os.symlink("docs", tmp_path / "link-to-dir")
+    file_link = os.lstat(tmp_path / "link-to-file.txt")
+    dir_link = os.lstat(tmp_path / "link-to-dir")
+    reader = WorkspaceReader(tmp_path)
+
+    listed = {e["path"]: e for e in reader.list_or_read("", limit=100, order="asc")["data"]}
+    found = {e["path"]: e for e in reader.search("link")["data"]}
+
+    for rows in (listed, found):
+        assert (rows["link-to-file.txt"]["type"], rows["link-to-file.txt"]["bytes"]) == (
+            "symlink",
+            file_link.st_size,
+        )
+        assert rows["link-to-file.txt"]["modified_at"] == int(file_link.st_mtime)
+        assert (rows["link-to-dir"]["type"], rows["link-to-dir"]["bytes"]) == ("directory", None)
+        assert rows["link-to-dir"]["modified_at"] == int(dir_link.st_mtime)
 
 
 # ── Path confinement (read-only, workspace-root only) ─────────────────

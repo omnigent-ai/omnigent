@@ -296,7 +296,8 @@ export function useWorkspaceChangedFiles(
 export interface WorkspaceFile {
   path: string;
   name: string;
-  type: "file" | "directory";
+  /** A symlink to a directory is reported as a directory so it stays navigable. */
+  type: "file" | "directory" | "symlink" | "other";
   bytes: number | null;
   modified_at: number | null;
 }

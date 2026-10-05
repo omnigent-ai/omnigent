@@ -36,6 +36,7 @@ import base64
 import mimetypes
 import os
 import re
+import stat
 from collections import deque
 from pathlib import Path
 from typing import TypeAlias, cast
@@ -48,6 +49,7 @@ from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
     _glob_to_regex,
     _validate_path,
+    classify_entry,
     entry_payload,
     index_search,
     merge_entries,
@@ -160,9 +162,10 @@ class WorkspaceReader:
     ) -> _WorkspacePayload:
         """Build the directory-listing payload for a resolved directory.
 
-        Classifies entries by target type (follows symlinks) and skips
-        per-entry ``OSError`` (e.g. a broken symlink) so one bad entry
-        does not fail the listing — matching the runner's ``list_dir``.
+        Reports a symlink's own size and mtime, keeps a link to a directory a
+        navigable folder (see :func:`classify_entry`) and skips per-entry
+        ``OSError`` so one bad entry does not fail the listing — matching the
+        runner's ``list_dir``.
         """
         validated = _validate_path(rel) if rel else ""
         entries: list[_WorkspacePayload] = []
@@ -176,22 +179,14 @@ class WorkspaceReader:
             full = resolved / name
             child_rel = os.path.join(validated, name) if validated else name
             try:
-                st = full.stat()  # follows symlinks, like the runner
-                is_dir = full.is_dir()
-                entry_type = "directory" if is_dir else "file"
-                size = st.st_size if entry_type == "file" else None
-                mtime = int(st.st_mtime)
+                st = full.lstat()
             except OSError:
-                # Broken symlink (target gone): fall back to lstat and list it
-                # as a file with no size, matching the runner's list_dir rather
-                # than dropping the entry.
-                try:
-                    ls = full.lstat()
-                except OSError:
-                    continue
-                entry_type = "file"
-                size = None
-                mtime = int(ls.st_mtime)
+                continue
+            entry_type = classify_entry(
+                is_dir=os.path.isdir(full), is_link=stat.S_ISLNK(st.st_mode)
+            )
+            size = None if entry_type == "directory" else st.st_size
+            mtime = int(st.st_mtime)
             entries.append(
                 {
                     "id": child_rel,
@@ -362,7 +357,8 @@ class WorkspaceReader:
             return f"{rel_dir}/{name}" if rel_dir else name
 
         def match(dirpath: str, name: str, *, is_dir: bool) -> None:
-            # A directory carries no byte size; a file stats for size + mtime.
+            # A directory carries no byte size; a file lstats for size + mtime,
+            # so a symlink reports its own metadata rather than its target's.
             p = rel(dirpath, name)
             if exc and any(r.match(p) for r in exc):
                 return
@@ -370,8 +366,10 @@ class WorkspaceReader:
                 return
             if q not in name.lower() and q not in p.lower():
                 return
+            is_link = False
             try:
-                st = (Path(dirpath) / name).stat()
+                st = (Path(dirpath) / name).lstat()
+                is_link = stat.S_ISLNK(st.st_mode)
                 size: int | None = None if is_dir else st.st_size
                 mtime: int | None = int(st.st_mtime)
             except OSError:
@@ -382,7 +380,7 @@ class WorkspaceReader:
                     id=p,
                     name=name,
                     path=p,
-                    type="directory" if is_dir else "file",
+                    type=classify_entry(is_dir=is_dir, is_link=is_link),
                     bytes=size,
                     modified_at=mtime,
                 )
