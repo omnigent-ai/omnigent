@@ -51,6 +51,21 @@ server deck index (`GET /v1/design/artifacts`) lists decks across sessions.
   workspace file write, and adds "Follow the design system at `<path>`
   (`<kind>`). Read its SKILL.md first." to the first message. The deck viewer
   behavior is `deck-design-system` in `feature-map/slide-decks.md`.
+- `design-system-import`: "Import" next to the chosen system in New design,
+  and "Import design system" in the studio header for the owner of a design
+  whose pointer is an absolute folder, copy the system into
+  `.omnigent/design-system/`. A confirm step lists the file count, total
+  size, and skipped files. Only `SKILL.md`, `README.md`, `_ds_manifest.json`,
+  `colors_and_type.css`, and `fonts/`, `assets/`, `templates/`, `slides/` with
+  image, font, css, html, md, or json files are copied, each at most 2 MB and
+  20 MB in total; `uploads/`, `ui_kits/`, and `preview/` are never walked
+  and show as skipped.
+  Files are read through the session's owner-only absolute read, written with
+  the workspace file write (base64 for binaries), four at a time with
+  progress and per-file errors. Only when every file copied is the pointer
+  written, as `{"path": ".omnigent/design-system", "imported_from": "<folder>"}`,
+  so collaborators with workspace file access see the branding. Decks inside
+  the copy are left out of the landing and the server index.
 - `design-new`: the New design dialog takes a prompt, an agent (the last one
   used for a design, else the default), an online host, and a folder (the last
   one used on that host). It shows "Kit found" or "No kit" for the folder,
@@ -149,6 +164,17 @@ need the flag set.
   folder, the first message names the folder, the header reads "My Brand"
   with "Full", and the deck uses the tokens and the `ds:` logo. Pick a folder
   without either marker to see the rejection.
+- Design-system import plan, copy, and pointer order:
+  `cd web && pnpm exec vitest run src/lib/designSystemImport.test.ts`; the
+  dialog and studio flows: `pnpm exec vitest run src/pages/design/NewDesignDialog.test.tsx src/pages/design/DesignStudio.test.tsx`;
+  binary writes: `uv run pytest tests/runner/test_environment_filesystem.py -k write_file`.
+- Design-system import, by hand: with the folder from the previous step plus a
+  `fonts/` file and an `uploads/` folder, choose it in New design, choose
+  Import, check the summary (and that `uploads/` is listed as never
+  imported), choose "Import a copy", create, and check
+  `.omnigent/design-system/` holds the copy, the pointer has `imported_from`,
+  and the first message names `.omnigent/design-system`. Share the session
+  with another user and check they see the branding.
 - Offline session, by hand: stop the runner of a session that has decks,
   choose Refresh, and check its group shows the Unavailable row and link.
 
@@ -177,3 +203,7 @@ need the flag set.
   folder by an earlier design still applies.
 - An external folder that only has a `kit.json` is not a design system; kits
   stay in the design's own `.omnigent/design-kit/`.
+- Import follows symlinks in the source as their targets; the allowlist,
+  type filter, and caps still apply. A re-import overwrites files but does
+  not remove ones the source no longer has. Text files over 2,000 lines are
+  reported as errors because the session read truncates them.

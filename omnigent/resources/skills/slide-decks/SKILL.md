@@ -85,6 +85,10 @@ guidance from the user's chosen source.
 - The viewer reads the design system when a deck opens, so reopen the deck to
   see edits made only to design-system files.
 - Ignore `uploads/`, `ui_kits/`, and `preview/`.
+- An imported system has `"path": ".omnigent/design-system"` (relative to the
+  workspace) and `imported_from` naming the original folder. Read the
+  workspace copy, not the original, and never write decks inside
+  `.omnigent/design-system/`.
 - A skill-only system (kind `skill`) has no viewer support beyond its name:
   follow its `SKILL.md` and inline everything as usual.
 - A "Design system not applied: reason" notice, or a notice that the folder

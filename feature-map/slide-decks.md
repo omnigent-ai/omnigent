@@ -37,7 +37,10 @@ slide to PDF, and a Source toggle back to the code view.
   not applied: reason", a viewer who does not own the session sees "Design
   system is only available to the session owner", and a session whose
   sandbox cannot read the folder shows "Design system folder is not readable
-  from this session; import it". The deck then renders unbranded.
+  from this session; import it". The deck then renders unbranded. An
+  imported system (`path: ".omnigent/design-system"`) reads through the
+  normal workspace file read, so collaborators see it and there is no
+  owner-only notice.
 
 ## How to get to it (user POV)
 
