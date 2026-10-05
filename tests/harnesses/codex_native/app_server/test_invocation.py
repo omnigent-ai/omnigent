@@ -10,8 +10,10 @@ import pytest
 from omnigent.harnesses.codex_native.app_server import (
     NativeCodexLaunch,
     _build_native_codex_app_server_argv,
+    _codex_startup_timeout_seconds,
     _isaac_model_catalog_identity,
     _model_discovery_cache_key,
+    _resolve_native_codex_invocation,
     codex_catalog_fingerprint,
 )
 from omnigent.harnesses.codex_native.invocation import (
@@ -88,6 +90,53 @@ def test_resolve_invocation_command_precedence(
     invocation = resolve_codex_invocation(explicit=explicit, cfg=cfg)
     assert invocation.executable == expected_command
     assert invocation.argv_prefix == expected_prefix
+
+
+def test_args_only_config_is_terminal_only() -> None:
+    """Args without a command configure the TUI, not app-server startup."""
+    invocation = resolve_codex_invocation(
+        cfg={"harness": {"codex-native": {"args": ["--remote-config"]}}}
+    )
+    assert invocation.argv_prefix == ()
+    assert invocation.terminal_prefix == ("--remote-config",)
+    assert invocation.argv("app-server") == ("codex", "app-server")
+
+
+def test_args_only_config_survives_bare_executable_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Making bare Codex absolute must retain its terminal-only arguments."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.resolve_codex_invocation",
+        lambda: CodexInvocation(
+            "codex",
+            terminal_prefix=("--terminal-only",),
+            configured=True,
+            app_server_configured=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._find_codex_cli",
+        lambda: "/opt/codex/bin/codex",
+    )
+
+    invocation = _resolve_native_codex_invocation()
+
+    assert invocation.executable == "/opt/codex/bin/codex"
+    assert invocation.argv_prefix == ()
+    assert invocation.terminal_prefix == ("--terminal-only",)
+    assert invocation.app_server_configured is False
+
+
+def test_configured_app_server_timeout_is_distinct_from_args_only() -> None:
+    """Only a command-wrapped app-server gets the configured bootstrap budget."""
+    configured = CodexInvocation("wrapper", configured=True, app_server_configured=True)
+    args_only = CodexInvocation(
+        "codex", configured=True, terminal_prefix=("--remote-config",), app_server_configured=False
+    )
+    assert _codex_startup_timeout_seconds(configured, 60.0) == 120.0
+    assert _codex_startup_timeout_seconds(args_only, 60.0) == 60.0
+    assert _codex_startup_timeout_seconds(CodexInvocation("codex"), 60.0) == 60.0
 
 
 def test_app_server_argv_keeps_default_bare_and_prepends_configured_prefix() -> None:

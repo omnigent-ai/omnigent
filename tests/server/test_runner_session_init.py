@@ -17,6 +17,7 @@ from omnigent.runner.session_init_protocol import (
     parse_runner_session_init_envelope,
 )
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+from omnigent.server.routes._sessions.common import runner_session_init_timeout
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import (
@@ -61,6 +62,13 @@ def _conversation() -> Conversation:
         workspace="/tmp/workspace",
         labels={"example": "value"},
     )
+
+
+def test_runner_session_init_timeout_is_harness_aware() -> None:
+    """Codex-native bootstrap gets its bounded wrapper allowance only."""
+    assert runner_session_init_timeout("codex-native") == 125.0
+    assert runner_session_init_timeout("claude-native") == 10.0
+    assert runner_session_init_timeout(None) == 10.0
 
 
 @pytest.mark.asyncio

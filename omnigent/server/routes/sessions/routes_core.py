@@ -114,6 +114,7 @@ from omnigent.server.routes._sessions.common import (
     _logger,
     _managed_launch_tasks,
     get_server_runner_router,
+    runner_session_init_timeout,
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
@@ -133,6 +134,7 @@ from omnigent.server.routes._sessions.helpers import (
     _grant_default_public,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
+    _native_coding_agent_for_session,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
     _permission_level_from_grants,
@@ -2545,6 +2547,10 @@ def register_core_routes(
                 )
                 parent_initialized = False
                 if _runner_client is not None and conv is not None and conv.agent_id is not None:
+                    native_agent = _native_coding_agent_for_session(conv)
+                    runner_init_timeout = runner_session_init_timeout(
+                        native_agent.harness if native_agent is not None else None
+                    )
                     # The versioned payload's snapshot carries harness_override,
                     # so a rebind after a cross-harness create initializes the
                     # override harness — a bare body left the runner resolving
@@ -2558,7 +2564,7 @@ def register_core_routes(
                                 conv,
                                 server_version=VERSION,
                             ),
-                            timeout=10.0,
+                            timeout=runner_init_timeout,
                         )
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST

@@ -8,11 +8,26 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CodexInvocation:
-    """One executable plus the immutable arguments prepended to Codex args."""
+    """One executable plus app-server and terminal argument prefixes.
+
+    ``terminal_prefix`` defaults to ``argv_prefix`` for compatibility with
+    manually constructed invocations. Configured args-only launches override
+    it so only the TUI receives those pass-through arguments.
+    """
 
     executable: str
     argv_prefix: tuple[str, ...] = ()
     configured: bool = False
+    terminal_prefix: tuple[str, ...] | None = None
+    app_server_configured: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.terminal_prefix is None:
+            object.__setattr__(self, "terminal_prefix", self.argv_prefix)
+        if self.app_server_configured is None:
+            object.__setattr__(
+                self, "app_server_configured", self.configured or bool(self.argv_prefix)
+            )
 
     def argv(self, *args: str) -> tuple[str, ...]:
         """Return the complete argv for one Codex subcommand."""
@@ -49,10 +64,8 @@ def resolve_codex_invocation(
     explicit_command = explicit.strip() if isinstance(explicit, str) and explicit.strip() else None
     if explicit_command is not None:
         command = explicit_command
-        prefix = configured_prefix if configured_command in {None, explicit_command} else ()
     elif configured_command is not None:
         command = configured_command
-        prefix = configured_prefix
     else:
         command = resolve_harness_command(
             "codex-native",
@@ -60,13 +73,25 @@ def resolve_codex_invocation(
             explicit=None,
             cfg=cfg,
         )
-        prefix = configured_prefix
+    same_configured_command = configured_command is not None and command == configured_command
+    app_prefix = configured_prefix if same_configured_command else ()
+    if configured_command is None or same_configured_command:
+        terminal_prefix = configured_prefix
+    else:
+        terminal_prefix = ()
     configured = bool(
-        prefix
-        or (configured_command is not None and command == configured_command)
+        app_prefix
+        or terminal_prefix
+        or (configured_command is not None and same_configured_command)
         or (explicit_command is None and command != "codex")
     )
-    return CodexInvocation(command, prefix, configured)
+    return CodexInvocation(
+        command,
+        app_prefix,
+        configured,
+        terminal_prefix,
+        app_server_configured=same_configured_command,
+    )
 
 
 __all__ = ["CodexInvocation", "resolve_codex_invocation"]

@@ -4551,8 +4551,10 @@ async def _launch_codex_native_tui(
     _codex_harness_cfg = load_effective_config()
     if configured_invocation is not None:
         codex_command = configured_invocation.executable
-        configured_codex_command = codex_command if configured_invocation.configured else None
-        configured_prefix = list(configured_invocation.argv_prefix)
+        configured_codex_command = (
+            codex_command if configured_invocation.app_server_configured else None
+        )
+        configured_prefix = list(configured_invocation.terminal_prefix or ())
         configured_args_resolved = True
     else:
         _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)

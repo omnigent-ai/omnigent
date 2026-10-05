@@ -16,7 +16,7 @@ import sys
 import tempfile
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
 
@@ -35,7 +35,10 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
+from omnigent.harnesses.codex_native.bridge import (
+    CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS,
+    write_policy_hook_config,
+)
 from omnigent.harnesses.codex_native.invocation import (
     CodexInvocation,
     resolve_codex_invocation,
@@ -169,6 +172,13 @@ _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 _ISAAC_CODEX_MODEL_CATALOG_PATH_ENV = "ISAAC_CODEX_MODEL_CATALOG_PATH"
 
 
+def _codex_startup_timeout_seconds(invocation: CodexInvocation, fallback: float) -> float:
+    """Use the configured-wrapper allowance only when app-server is wrapped."""
+    if invocation.app_server_configured:
+        return CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+    return fallback
+
+
 def _resolve_native_codex_invocation(
     *,
     codex_path: str | None = None,
@@ -181,7 +191,10 @@ def _resolve_native_codex_invocation(
         return CodexInvocation(codex_path)
     invocation = resolve_codex_invocation()
     if invocation.executable == "codex" and not invocation.argv_prefix:
-        return CodexInvocation(_find_codex_cli() or invocation.executable)
+        return replace(
+            invocation,
+            executable=_find_codex_cli() or invocation.executable,
+        )
     return invocation
 
 
@@ -1305,7 +1318,14 @@ async def discover_codex_model_options(
         discovery = await _start_codex_model_discovery_process(**discovery_kwargs)  # type: ignore[arg-type]
         client: CodexAppServerClient | None = None
         try:
-            await _wait_for_discovery_listener(discovery, port)
+            if invocation.app_server_configured:
+                await _wait_for_discovery_listener(
+                    discovery,
+                    port,
+                    timeout=_codex_startup_timeout_seconds(invocation, _CONNECT_TIMEOUT_SECONDS),
+                )
+            else:
+                await _wait_for_discovery_listener(discovery, port)
             client = CodexAppServerClient(
                 ws_url=listen_url,
                 client_name="omnigent-codex-model-discovery",
@@ -1402,10 +1422,12 @@ def _allocate_loopback_port() -> int:
 async def _wait_for_discovery_listener(
     discovery: _CodexModelDiscoveryProcess,
     port: int,
+    *,
+    timeout: float = _CONNECT_TIMEOUT_SECONDS,
 ) -> None:
     """Wait until a discovery app-server accepts loopback connections."""
     process = discovery.process
-    deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
+    deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         if process.returncode is not None:
             message = f"Codex model discovery exited early ({process.returncode})"
@@ -1422,7 +1444,9 @@ async def _wait_for_discovery_listener(
         await writer.wait_closed()
         del reader
         return
-    raise TimeoutError("Timed out waiting for Codex model discovery app-server")
+    raise TimeoutError(
+        f"Timed out after {timeout:g}s waiting for Codex model discovery app-server"
+    )
 
 
 def _codex_config_identity(source_home: Path) -> tuple[object, ...]:
@@ -1652,7 +1676,14 @@ async def probe_codex_model_options(
     discovery = await _start_codex_model_discovery_process(**discovery_kwargs)  # type: ignore[arg-type]
     client: CodexAppServerClient | None = None
     try:
-        await _wait_for_discovery_listener(discovery, port)
+        if invocation.app_server_configured:
+            await _wait_for_discovery_listener(
+                discovery,
+                port,
+                timeout=_codex_startup_timeout_seconds(invocation, _CONNECT_TIMEOUT_SECONDS),
+            )
+        else:
+            await _wait_for_discovery_listener(discovery, port)
         client = CodexAppServerClient(
             ws_url=listen_url,
             client_name="omnigent-codex-model-probe",
@@ -1777,10 +1808,14 @@ async def _codex_launch_catalog(
     except Exception:  # noqa: BLE001 — a broken provider config means no catalog
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
         return None
+    effective_invocation = _resolve_native_codex_invocation(
+        codex_path=codex_path,
+        codex_invocation=codex_invocation,
+    )
     fingerprint = codex_catalog_fingerprint(
         launch,
         codex_path=codex_path,
-        codex_invocation=codex_invocation,
+        codex_invocation=effective_invocation,
     )
 
     async def _probe(*, allow_empty: bool) -> list[_JsonObject] | None:
@@ -1789,12 +1824,13 @@ async def _codex_launch_catalog(
                 "codex_path": codex_path,
                 "launch": launch,
             }
-            if codex_invocation is not None:
-                probe_kwargs["codex_invocation"] = codex_invocation
+            probe_kwargs["codex_invocation"] = effective_invocation
             try:
                 rows = await asyncio.wait_for(
                     probe_codex_model_options(**probe_kwargs),  # type: ignore[arg-type]
-                    timeout=_MODEL_CATALOG_PROBE_TIMEOUT_SECONDS,
+                    timeout=_codex_startup_timeout_seconds(
+                        effective_invocation, _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS
+                    ),
                 )
             except TypeError as exc:
                 if "codex_invocation" not in str(exc):
@@ -1802,7 +1838,9 @@ async def _codex_launch_catalog(
                 probe_kwargs.pop("codex_invocation", None)
                 rows = await asyncio.wait_for(
                     probe_codex_model_options(**probe_kwargs),  # type: ignore[arg-type]
-                    timeout=_MODEL_CATALOG_PROBE_TIMEOUT_SECONDS,
+                    timeout=_codex_startup_timeout_seconds(
+                        effective_invocation, _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS
+                    ),
                 )
         except Exception:  # noqa: BLE001 — probe failure means "no catalog", never a crash
             # Best-effort probe re-run on every catalog fetch; log once so a
@@ -2475,7 +2513,11 @@ class CodexNativeAppServer:
         :raises RuntimeError: If the app-server exits or never
             becomes ready within ``_APP_SERVER_READY_TIMEOUT_SECONDS``.
         """
-        deadline = asyncio.get_running_loop().time() + _APP_SERVER_READY_TIMEOUT_SECONDS
+        timeout = _codex_startup_timeout_seconds(
+            self.codex_invocation or CodexInvocation(self.codex_path),
+            _APP_SERVER_READY_TIMEOUT_SECONDS,
+        )
+        deadline = asyncio.get_running_loop().time() + timeout
         last_error: Exception | None = None
         while asyncio.get_running_loop().time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:
@@ -2509,7 +2551,7 @@ class CodexNativeAppServer:
         detail = " | ".join((self.recent_stderr or [])[-5:])
         target = self.listen_url or f"unix://{self.socket_path}"
         raise RuntimeError(
-            f"Timed out after {_APP_SERVER_READY_TIMEOUT_SECONDS:g}s waiting for the "
+            f"Timed out after {timeout:g}s waiting for the "
             f"Codex app-server at {target}: {last_error}; stderr={detail}"
         )
 
