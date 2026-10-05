@@ -68,8 +68,9 @@ vi.mock("@/hooks/useFileContent", async (importOriginal) => {
   return { ...actual, triggerBrowserDownload: mocks.triggerDownload };
 });
 
+// `toast` is callable too: archiving shows the Undo pill via `toast(...)`.
 vi.mock("sonner", () => ({
-  toast: { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() },
+  toast: Object.assign(vi.fn(), { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() }),
 }));
 
 const CONVERSATION: Conversation = {
