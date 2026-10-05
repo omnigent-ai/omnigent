@@ -123,14 +123,18 @@ async def test_reconcile_replaces_the_session_rows(stores, client) -> None:  # t
     permissions.grant("alice", conv.id, LEVEL_OWNER)
     permissions.grant("bob", conv.id, LEVEL_READ)
     store.record_design_artifact(conv.id, "old.slides.html", "deck", now=1)
+    store.record_design_artifact(conv.id, "flow.wireframe.html", "wireframe", now=1)
 
     resp = await client.put(
         f"/v1/sessions/{conv.id}/design-artifacts",
-        json={"paths": ["new.slides.html", "notes.md"]},
+        json={"paths": ["new.slides.html", "notes.md"], "kind": "deck"},
         headers=_as("alice"),
     )
     assert resp.status_code == 204
-    assert [a.path for a in store.list_design_artifacts()] == ["new.slides.html"]
+    assert sorted(a.path for a in store.list_design_artifacts()) == [
+        "flow.wireframe.html",
+        "new.slides.html",
+    ]
 
     # A read-only collaborator cannot rewrite the index; a stranger gets 404.
     reader = await client.put(
@@ -140,7 +144,7 @@ async def test_reconcile_replaces_the_session_rows(stores, client) -> None:  # t
         f"/v1/sessions/{conv.id}/design-artifacts", json={"paths": []}, headers=_as("carol")
     )
     assert (reader.status_code, stranger.status_code) == (403, 404)
-    assert [a.path for a in store.list_design_artifacts()] == ["new.slides.html"]
+    assert len(store.list_design_artifacts()) == 2
 
 
 async def test_both_routes_are_dark_without_the_design_flag(stores) -> None:  # type: ignore[no-untyped-def]

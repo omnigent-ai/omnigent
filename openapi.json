@@ -4733,6 +4733,22 @@
       "ReplaceDesignArtifactsRequest": {
         "description": "Every artifact path a workspace scan found for one session.",
         "properties": {
+          "kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "deck",
+                  "wireframe"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Replace only rows of this kind, e.g. `\"deck\"` for a deck scan; omitted replaces every kind.",
+            "title": "Kind"
+          },
           "paths": {
             "description": "Workspace-relative paths; non-artifact paths are ignored.",
             "items": {

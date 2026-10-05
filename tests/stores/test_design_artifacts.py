@@ -84,6 +84,23 @@ def test_replace_sets_exactly_the_given_paths(
     assert rows[(conv.id, "new.wireframe.html")].kind == "wireframe"
 
 
+def test_replace_of_one_kind_leaves_the_other(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    conversation_store.record_design_artifact(conv.id, "a.slides.html", "deck", now=1)
+    conversation_store.record_design_artifact(conv.id, "w.wireframe.html", "wireframe", now=1)
+
+    conversation_store.replace_design_artifacts(
+        conv.id, ["b.slides.html", "x.wireframe.html"], kind="deck", now=2
+    )
+
+    assert sorted(_live(conversation_store)) == [
+        (conv.id, "b.slides.html"),
+        (conv.id, "w.wireframe.html"),
+    ]
+
+
 def test_rows_are_workspace_scoped(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     conversation_store.record_design_artifact(conv.id, "a.slides.html", "deck", now=1)

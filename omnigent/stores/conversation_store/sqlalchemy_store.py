@@ -3860,24 +3860,31 @@ class SqlAlchemyConversationStore(ConversationStore):
             ]
 
     def replace_design_artifacts(
-        self, session_id: str, paths: list[str], *, now: int | None = None
+        self,
+        session_id: str,
+        paths: list[str],
+        *,
+        kind: str | None = None,
+        now: int | None = None,
     ) -> None:
         """Replace a session's artifact rows with *paths*. See the abstract method."""
         stamp = now if now is not None else now_epoch()
         wanted = {
-            path: kind
+            path: path_kind
             for path in paths
             if len(path) <= DESIGN_ARTIFACT_PATH_MAX
-            and (kind := design_artifact_kind(path)) is not None
+            and (path_kind := design_artifact_kind(path)) is not None
+            and kind in (None, path_kind)
         }
 
         def write(session: Session) -> None:
-            rows = session.execute(
-                select(SqlDesignArtifact).where(
-                    SqlDesignArtifact.workspace_id == current_workspace_id(),
-                    SqlDesignArtifact.session_id == session_id,
-                )
-            ).scalars()
+            stmt = select(SqlDesignArtifact).where(
+                SqlDesignArtifact.workspace_id == current_workspace_id(),
+                SqlDesignArtifact.session_id == session_id,
+            )
+            if kind is not None:
+                stmt = stmt.where(SqlDesignArtifact.kind == kind)
+            rows = session.execute(stmt).scalars()
             existing = {row.path: row for row in rows}
             for path, row in existing.items():
                 if path not in wanted:
@@ -3885,11 +3892,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 elif row.deleted:
                     row.deleted = False
                     row.updated_at = stamp
-            for path, kind in wanted.items():
+            for path, path_kind in wanted.items():
                 if path not in existing:
                     session.add(
                         SqlDesignArtifact(
-                            session_id=session_id, path=path, kind=kind, updated_at=stamp
+                            session_id=session_id, path=path, kind=path_kind, updated_at=stamp
                         )
                     )
 

@@ -1528,7 +1528,12 @@ class ConversationStore(ABC):
 
     @abstractmethod
     def replace_design_artifacts(
-        self, session_id: str, paths: list[str], *, now: int | None = None
+        self,
+        session_id: str,
+        paths: list[str],
+        *,
+        kind: str | None = None,
+        now: int | None = None,
     ) -> None:
         """
         Replace a session's artifact rows with exactly *paths*.
@@ -1538,6 +1543,8 @@ class ConversationStore(ABC):
 
         :param session_id: Session whose workspace was scanned.
         :param paths: Every artifact path the scan found.
+        :param kind: Replace only rows of this kind (a deck-only scan leaves
+            wireframes alone); ``None`` replaces every kind.
         :param now: Epoch seconds to stamp; defaults to the current time.
         """
         ...

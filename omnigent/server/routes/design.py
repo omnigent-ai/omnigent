@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -97,7 +98,9 @@ def create_design_router(
         user_id = require_user(request, auth_provider)
         await require_access(user_id, session_id, LEVEL_EDIT, permission_store, conversation_store)
         await asyncio.to_thread(
-            conversation_store.replace_design_artifacts, session_id, body.paths
+            functools.partial(
+                conversation_store.replace_design_artifacts, session_id, body.paths, kind=body.kind
+            )
         )
         return Response(status_code=204)
 

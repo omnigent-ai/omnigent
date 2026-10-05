@@ -2965,9 +2965,12 @@ class ReplaceDesignArtifactsRequest(BaseModel):
     Every artifact path a workspace scan found for one session.
 
     :param paths: Workspace-relative paths; non-artifact paths are ignored.
+    :param kind: Replace only rows of this kind, e.g. ``"deck"`` for a deck
+        scan; omitted replaces every kind.
     """
 
     paths: list[str] = Field(max_length=10_000)
+    kind: Literal["deck", "wireframe"] | None = None
 
 
 class GrantPermissionRequest(BaseModel):
