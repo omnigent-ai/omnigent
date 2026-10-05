@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 
-import { splitNameTemplate } from "./TemplateNameInput";
+import { splitNameTemplate, TemplateNameInput } from "./TemplateNameInput";
 
 describe("splitNameTemplate", () => {
   it.each([
@@ -34,4 +35,18 @@ describe("splitNameTemplate", () => {
   ])("splits %s", (value, expected) => {
     expect(splitNameTemplate(value)).toEqual(expected);
   });
+});
+
+describe("TemplateNameInput", () => {
+  it.each(["First\nSecond {{YYYY}}", "First\rSecond {{YYYY}}", "First {{YYYY\nMM}} Second"])(
+    "keeps the backdrop aligned with the native single-line value (%s)",
+    (name) => {
+      render(<TemplateNameInput aria-label="Name" value={name} onChange={vi.fn()} />);
+
+      const input = screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement;
+      const overlay = screen.getByTestId("task-name-template-overlay");
+
+      expect(overlay.textContent).toBe(input.value);
+    },
+  );
 });
