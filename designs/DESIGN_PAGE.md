@@ -437,6 +437,10 @@ self-contained file that opens in any browser.
   assets.
 - **Saved** with the existing browser download helper as `<deck>.html`. The
   app never navigates to the generated document.
+- **Deck's own references:** `@import` rules and `<script src>` the deck itself
+  contains are kept as written, so the file matches the preview; such decks
+  still need the network. Links keep the preview's `<base target="_blank">`,
+  and slides fill the window rather than a scaled 16:9 stage.
 - **Tests:** no frame script in the output, style injected, the stacked
   fallback without the script, navigation keys, and the disabled states.
 
