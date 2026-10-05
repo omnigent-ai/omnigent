@@ -61,13 +61,11 @@ export function FileInfoDialog({
           onCloseAutoFocus={(event) => {
             event.preventDefault();
             const fallback = panelFocusRef?.current ?? null;
-            queueMicrotask(() => {
-              if (canReceiveFocus(returnFocus)) {
-                returnFocus.focus();
-              } else if (canReceiveFocus(fallback)) {
-                fallback.focus();
-              }
-            });
+            if (canReceiveFocus(returnFocus)) {
+              returnFocus.focus();
+            } else if (canReceiveFocus(fallback)) {
+              fallback.focus();
+            }
           }}
         >
           <DialogHeader>
@@ -106,7 +104,7 @@ export function FileInfoDialog({
                 </dd>
               </>
             )}
-            {info.kind === "file" && !info.lastKnown && (
+            {!info.lastKnown && (
               <>
                 <dt className="text-muted-foreground">Modified</dt>
                 <dd>{formatModifiedAt(info.modifiedAt)}</dd>
