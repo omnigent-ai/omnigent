@@ -3563,13 +3563,13 @@ def create_app(
                 or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
             )
 
-        # Refresh dependent bindings after attaching roots, which may have moved.
+        # Attach independent roots first; their recovery restores dependent sessions.
         convs.sort(key=lambda conv: not is_independent(conv))
         _logger.info("_on_runner_connect: runner=%s, %d bound session(s)", runner_id, len(convs))
         roots: list[tuple[Conversation, httpx.AsyncClient]] = []
         store_slots = asyncio.Semaphore(RECOVERY_STORE_CONCURRENCY)
         for _, candidates in groupby(convs, key=is_independent):
-            # Batch reads let attachment yield between groups, even for native mirrors.
+            # Awaited reads let attachment yield between batches, even for native mirrors.
             for batch in batched(candidates, _RECONNECT_BINDING_BATCH_SIZE):
                 try:
                     async with store_slots:
