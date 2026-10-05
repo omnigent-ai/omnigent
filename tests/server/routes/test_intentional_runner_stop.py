@@ -255,7 +255,7 @@ async def test_stop_burst_does_not_evict_other_pending_stops(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pending stop intent must survive a burst beyond the former cache capacity."""
+    """Pending stop intent must survive large concurrent bursts."""
     store, ids = family
     pending = {f"pending-stop-{i}": "runner-previous-stop" for i in range(16384)}
     sessions._intentional_stop_sessions.update(pending)
