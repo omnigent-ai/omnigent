@@ -109,6 +109,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import {
   isSideChatCommand,
+  newPendingSideChatId,
   SIDE_CHAT_COMMAND_PREFIX,
   supportsSideChat,
   usesNativeSideChatFork,
@@ -2369,8 +2370,6 @@ function ComposerImpl(
     editText,
     replaceText,
     appendQuote,
-    beginSideChatQuote,
-    sideChat,
     removeQuote,
   } = useReplyDraft();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
@@ -3248,20 +3247,13 @@ function ComposerImpl(
       recallingRef.current = false;
     },
     startSideChat(selectedText) {
-      // Add the selection as a quote card (exactly like Reply) and mark the
-      // draft as opening a side chat. The user types their question below it;
-      // submit prefixes /side so it forks instead of replying inline.
-      if (disabled || isReadOnly || unreachable || composerLockedByBtw || !selectedText.trim()) {
+      // Open an empty side-chat rail tab right away with the selection quoted in
+      // its composer; the fork is created when the user sends from that tab.
+      const sourceId = useChatStore.getState().conversationId;
+      if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
         return;
       }
-      beginSideChatQuote(selectedText);
-      textareaRef.current = tailTextareaRef.current;
-      dirtyRef.current = true;
-      replyQuoteInsertedRef.current = true;
-      setCommandError(null);
-      dismissMention();
-      resetCursor();
-      recallingRef.current = false;
+      useChatStore.getState().openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
     },
   }));
 
@@ -3443,18 +3435,7 @@ function ComposerImpl(
           index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
         ),
       };
-      const serialized = serializeReplyDraft(outgoing);
-      if (sideChat && usesNativeSideChatFork(sessionHarness)) {
-        // Codex: the /side pipeline keys off the leading command and forks
-        // in-process. No main-chat bubble is kept, so no reply-draft snapshot.
-        onSend(SIDE_CHAT_COMMAND_PREFIX + serialized, sendFiles);
-      } else if (sideChat && supportsSideChat(sessionHarness)) {
-        // Generic: fork onto a managed side chat, seeding its composer with the
-        // quoted selection + question (no main-chat bubble either).
-        openGenericSideChat(serialized);
-      } else {
-        onSend(serialized, sendFiles, snapshotReplyDraft(outgoing));
-      }
+      onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
       onSend(mentionPreamble + trimmed, sendFiles);
     }
@@ -3769,40 +3750,29 @@ function ComposerImpl(
         slots={{
           inputPrefix:
             draft.quotes.length > 0 ? (
-              <>
-                {sideChat ? (
-                  <div
-                    data-testid="composer-side-chat-hint"
-                    className="mb-1 flex items-center gap-1 text-xs font-medium text-brand-accent"
-                  >
-                    <MessagesSquareIcon className="size-3" />
-                    Ask in a side chat forked from this main conversation
-                  </div>
-                ) : null}
-                <ReplyDraftBlocks
-                  quotes={draft.quotes}
-                  activeTextId={activeTextId}
-                  keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-                  disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
-                  onGrowth={onViewportShrinkPinScroll}
-                  onRemove={(id) => {
-                    removeQuote(id);
-                    resetCursor();
-                    recallingRef.current = false;
-                    textareaRef.current = tailTextareaRef.current;
-                    dirtyRef.current = true;
-                    dismissMention();
-                  }}
-                  inputFor={(quote) => ({
-                    onChange: (e) => handleTextChange(quote.id, e),
-                    onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
-                    onBlur: dismissMention,
-                    onKeyDown: handleKeyDown,
-                    onPaste,
-                    "data-has-draft": hasDraft ? "true" : undefined,
-                  })}
-                />
-              </>
+              <ReplyDraftBlocks
+                quotes={draft.quotes}
+                activeTextId={activeTextId}
+                keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
+                disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
+                onGrowth={onViewportShrinkPinScroll}
+                onRemove={(id) => {
+                  removeQuote(id);
+                  resetCursor();
+                  recallingRef.current = false;
+                  textareaRef.current = tailTextareaRef.current;
+                  dirtyRef.current = true;
+                  dismissMention();
+                }}
+                inputFor={(quote) => ({
+                  onChange: (e) => handleTextChange(quote.id, e),
+                  onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
+                  onBlur: dismissMention,
+                  onKeyDown: handleKeyDown,
+                  onPaste,
+                  "data-has-draft": hasDraft ? "true" : undefined,
+                })}
+              />
             ) : undefined,
           beforeInput: (
             <>

@@ -259,6 +259,54 @@ def test_runner_bound_side_chat_closes_without_stopping_parent(
     assert question not in parent_items
 
 
+def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """The selection's side-chat action opens a tab at once, quoting the selection there."""
+    base_url, session_id = seeded_session
+    parent_reply = "Retry the upload with exponential backoff."
+    side_reply = "Backoff spreads the retries out so the server can recover."
+    question = f"quote-side-{session_id}: why backoff?"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": parent_reply}],
+        key=f"quote-main-{session_id}",
+        match=f"quote-main-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": side_reply}],
+        key=f"quote-side-{session_id}",
+        match=f"quote-side-{session_id}",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _send_parent(page, f"quote-main-{session_id}: how should I retry?", parent_reply)
+    page.locator(_ASSISTANT).get_by_text(parent_reply).select_text()
+    page.get_by_role("button", name="Ask in side chat", exact=True).click()
+
+    # The tab opens before any fork exists, with the quote in its own composer.
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_role("tab", name="Side chat 1", exact=True)).to_be_visible()
+    pane = page.locator(".side-chat-backdrop")
+    expect(pane.get_by_test_id("composer-reply-quote")).to_contain_text(parent_reply)
+    expect(page.get_by_test_id("composer-reply-quote")).to_have_count(1)
+    expect(page.get_by_test_id("side-chat-input")).to_be_focused()
+    assert side_chat_forks == []
+
+    page.get_by_test_id("side-chat-input").fill(question)
+    page.get_by_test_id("side-chat-send").click()
+    expect(pane.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
+    assert len(side_chat_forks) == 1
+    child_text = str(_items(base_url, side_chat_forks[0]))
+    assert f"> {parent_reply}" in child_text
+    assert question in child_text
+    assert question not in str(_items(base_url, session_id))
+
+
 def test_running_empty_side_chat_shows_working(
     page: Page,
     seeded_session: tuple[str, str],

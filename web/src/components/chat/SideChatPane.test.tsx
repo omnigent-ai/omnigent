@@ -136,6 +136,35 @@ describe("side-chat working indicator", () => {
   });
 });
 
+describe("side chat opened from a text selection", () => {
+  it("quotes the selection in the pending tab and sends it with the question", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ sideChatDrafts: { "pending:quoted": "restore the row" } });
+    renderPane(<SideChatPane childId="pending:quoted" onStart={onStart} />);
+
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("restore the row");
+    expect(screen.getByTestId("side-chat-input")).toHaveFocus();
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "why?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("> restore the row\n\nwhy?");
+    await waitFor(() => expect(useChatStore.getState().sideChatDrafts).toEqual({}));
+  });
+
+  it("drops the quote when its card is removed", () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ sideChatDrafts: { "pending:quoted": "restore the row" } });
+    renderPane(<SideChatPane childId="pending:quoted" onStart={onStart} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "why?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+
+    expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("why?");
+  });
+});
+
 describe("side-chat interrupt", () => {
   beforeEach(() => {
     conversationRegistry.acquire(childId).setState({
