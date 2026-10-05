@@ -8447,6 +8447,24 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     }
   });
 
+  it("lists your own agent on a native harness under Other..., not among the harnesses", async () => {
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("ag_orion", "orion", {
+        display_name: "Orion",
+        harness: "claude-native",
+        builtin: false,
+        mine: true,
+      }),
+    ]);
+    renderLanding({ agent_install: true });
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-agent-ag_orion")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    expect(await screen.findByTestId("new-chat-landing-agent-ag_orion")).toBeVisible();
+  });
+
   it("cancels a custom agent without replacing the selected agent", async () => {
     renderLanding();
     const agentPicker = screen.getByTestId("new-chat-landing-agent-select");

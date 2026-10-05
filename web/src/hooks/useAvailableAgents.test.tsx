@@ -1319,6 +1319,43 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     });
   });
 
+  it("names your agents by their own name, whatever their harness", async () => {
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      [MINE_URL]: sessionResponse({ object: "list", data: [], has_more: false }),
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "grok", label: "Grok Build", capabilities: { integration_mode: "acp-subprocess" } },
+        ],
+      }),
+      [USER_AGENTS_URL]: mockResponse({
+        data: [
+          {
+            id: "ag_orion",
+            name: "orion",
+            harness: "claude-native",
+            builtin: false,
+            created_at: 2,
+          },
+          { id: "ag_scout", name: "scout", harness: "grok", builtin: false, created_at: 1 },
+        ],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() =>
+      expect(result.current.data?.find((a) => a.id === "ag_scout")?.acpHarness).toBe(true),
+    );
+    const mine = (result.current.data ?? []).filter((a) => a.mine);
+    expect(mine.map((a) => [a.id, a.display_name])).toEqual([
+      ["ag_orion", "Orion"],
+      ["ag_scout", "Scout"],
+    ]);
+  });
+
   it("follows the cursor past a page of one name's repeats to older agents", async () => {
     // An older server kept a row per `omnigent run --harness codex`.
     const codexRuns = Array.from({ length: 50 }, (_, i) => ({

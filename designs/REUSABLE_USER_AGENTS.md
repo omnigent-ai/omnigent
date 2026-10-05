@@ -371,7 +371,9 @@ agents stay read-only. Tests lock this in.
   A user agent the session scan also finds is ranked only by these agent timestamps, so starting or
   forking a session never changes which same-named agent is shown.
 - Sorting and grouping (`sortAgentsForDisplay`, `partitionAgentsByKind`) unchanged; user agents land
-  under Agents, "Other..." as custom agents do today.
+  under Agents, "Other..." as custom agents do today, whatever their harness: one on a native CLI
+  harness is still the user's agent, so it never joins the Harnesses rows (nor stands in for the
+  Claude Code wrapper that Smart Routing binds).
 - The earlier draft's merge changes (an "installed" flag beating session copies, native-dedupe
   exemption) are reverted.
 
@@ -385,7 +387,7 @@ omnigent agent remove <name | id> [--yes] [--server URL]
 
 - Every command first checks `/v1/info`; a server without `agent_install` gets
   "<server> does not support installing agents; upgrade the server to use `omnigent agent`."
-- `list` pages `scope=user` to completion and prints name, version, harness, and id.
+- `list` pages `scope=user` to completion and prints a table of name, version, harness, and id.
 - `remove` resolves an id or a name in `scope=user`; a name several agents share is refused with
   their ids, so the user removes one by id. It sends `DELETE`; on 409 shows the session count and
   asks "Remove anyway?"; `--yes` sends `force=true` directly.
@@ -554,7 +556,9 @@ long as the deploy.
   in a recent session; `omnigent agent list` shows all. Ordering the listing by last change would
   lift that.
 - Uploads whose files differ on every run (a generated timestamp, say) still get a row each, as do
-  sub-agent uploads. Rows older servers created per run stay until removed.
+  sub-agent uploads. Rows older servers created per run stay until removed. If users pile up many,
+  a dedupe command could merge identical ones: move their sessions and scheduled tasks onto the row
+  new runs bind (runners re-read a session's agent each turn), then delete the rows nothing uses.
 - MCP edits apply to every session using the agent; per-session MCP overrides are not supported.
 
 ## 13. Open items

@@ -106,9 +106,11 @@ def test_add_uploads_the_whole_directory(tmp_path: Path, server: _FakeServer) ->
 def test_list_pages_through_your_agents(server: _FakeServer) -> None:
     result = CliRunner().invoke(cli_mod.cli, ["agent", "list"])
     assert result.exit_code == 0, result.output
-    assert result.output.splitlines() == [
-        "orion\tversion 2\tcodex\tag_orion",
-        "vega\tversion 1\t-\tag_vega",
+    rows = [line.split() for line in result.output.splitlines()]
+    header = rows.index(["Name", "Version", "Harness", "ID"])
+    assert [row for row in rows[header + 1 :] if len(row) == 4] == [
+        ["orion", "2", "codex", "ag_orion"],
+        ["vega", "1", "-", "ag_vega"],
     ]
     assert [q for m, _, q in server.calls() if m == "GET" and "scope" in q] == [
         "scope=user&limit=50",

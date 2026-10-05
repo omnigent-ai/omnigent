@@ -50,6 +50,10 @@ export interface AvailableAgent {
   // Last change of one of the caller's own agents (scope=user rows only): an
   // install or import makes that agent the one shown for its name.
   updated_at?: number | null;
+  // One of the caller's own agents (scope=user rows only). The picker lists
+  // these under Agents whatever their harness: an installed agent on a native
+  // CLI is still the user's agent, not a harness row.
+  mine?: true;
   // Session id used to fetch the full agent spec on hover. Only set on
   // session-discovered agents (custom uploads); absent on catalog agents
   // whose full data is already present from GET /v1/agents.
@@ -183,7 +187,13 @@ export async function fetchUserAgents(): Promise<AvailableAgent[]> {
     after = body.last_id;
   }
   /* oxlint-enable no-await-in-loop */
-  return rows.map((a) => ({ ...agentFromWire(a), updated_at: a.updated_at ?? null }));
+  return rows.map((a) => ({
+    ...agentFromWire(a),
+    // By its own name: "orion" on claude-native is Orion, not "Claude Code".
+    display_name: displayNameForAgent(a.name),
+    updated_at: a.updated_at ?? null,
+    mine: true as const,
+  }));
 }
 
 interface DiscoveredSessionAgent {
@@ -452,7 +462,10 @@ function applyAcpHarnessCatalog(
     return {
       ...agent,
       acpHarness: true,
-      display_name: harnessLabels[harness] ?? agent.display_name,
+      // The user's own agent keeps its own name rather than the vendor's.
+      display_name: agent.mine
+        ? agent.display_name
+        : (harnessLabels[harness] ?? agent.display_name),
     };
   });
 }

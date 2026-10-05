@@ -11564,9 +11564,17 @@ def agent_list(server: str | None) -> None:
     if not rows:
         click.echo("No agents yet. Install one with: omnigent agent add <path>")
         return
+    table = _host_table("Your agents")
+    table.add_column("Name", style="bold", overflow="fold")
+    table.add_column("Version", justify="right", no_wrap=True)
+    table.add_column("Harness", no_wrap=True)
+    # The id is what `omnigent agent remove` takes when two agents share a name.
+    table.add_column("ID", no_wrap=True, min_width=32)
     for agent in rows:
-        harness = agent.get("harness") or "-"
-        click.echo(f"{agent['name']}\tversion {agent['version']}\t{harness}\t{agent['id']}")
+        table.add_row(
+            agent["name"], str(agent["version"]), agent.get("harness") or "-", agent["id"]
+        )
+    _host_console().print(table)
 
 
 @agent_grp.command("remove")
