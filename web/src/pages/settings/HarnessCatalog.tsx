@@ -355,6 +355,7 @@ function PluginPage({
         </TabsList>
         <TabsContent value="skills">
           <ul className="flex flex-col gap-2">
+            {plugin.skills.length === 0 && <Notice>No skills found.</Notice>}
             {plugin.skills.map((name) => (
               <CatalogRow
                 key={name}
@@ -367,6 +368,7 @@ function PluginPage({
         </TabsContent>
         <TabsContent value="mcps">
           <ul className="flex flex-col gap-2">
+            {mcps.length === 0 && <Notice>No MCPs found.</Notice>}
             {mcps.map((server) => (
               <CatalogRow
                 key={server.id}
