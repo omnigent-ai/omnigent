@@ -48,6 +48,53 @@
         "title": "AddCommentRequest",
         "type": "object"
       },
+      "AgentList": {
+        "description": "Paginated list of agents; `data` is a page of `AgentObject`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/AgentObject"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "AgentList",
+        "type": "object"
+      },
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
@@ -3933,55 +3980,6 @@
         "title": "OutputTextDeltaEvent",
         "type": "object"
       },
-      "PaginatedList": {
-        "description": "A paginated list response following cursor-based pagination.",
-        "properties": {
-          "data": {
-            "description": "Page of results. Items are heterogeneous (`ResponseObject`, `ConversationObject`, `FileObject`, or dicts) and list is invariant, so no single concrete type satisfies all callers.",
-            "items": {},
-            "title": "Data",
-            "type": "array"
-          },
-          "first_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "ID of the first item in the page, or `None` if the page is empty, e.g. `\"resp_abc123\"`.",
-            "title": "First Id"
-          },
-          "has_more": {
-            "default": false,
-            "description": "Whether more items exist beyond this page.",
-            "title": "Has More",
-            "type": "boolean"
-          },
-          "last_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "ID of the last item in the page, or `None` if the page is empty, e.g. `\"resp_xyz789\"`.",
-            "title": "Last Id"
-          },
-          "object": {
-            "default": "list",
-            "description": "Fixed resource type, always `\"list\"`.",
-            "title": "Object",
-            "type": "string"
-          }
-        },
-        "title": "PaginatedList",
-        "type": "object"
-      },
       "PermissionObject": {
         "description": "API representation of a session permission grant.",
         "properties": {
@@ -5750,6 +5748,143 @@
         "title": "SessionCollaborationModeEvent",
         "type": "object"
       },
+      "SessionCompactionItem": {
+        "description": "`compaction` item: common fields plus `CompactionData`.",
+        "properties": {
+          "compacted_messages": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compacted Messages"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_item_id": {
+            "title": "Last Item Id",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "token_count": {
+            "format": "int64",
+            "title": "Token Count",
+            "type": "integer"
+          },
+          "type": {
+            "const": "compaction",
+            "title": "Type",
+            "type": "string"
+          },
+          "window_id": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window Id"
+          }
+        },
+        "required": [
+          "summary",
+          "last_item_id",
+          "token_count",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionCompactionItem",
+        "type": "object"
+      },
+      "SessionContentBlock": {
+        "additionalProperties": true,
+        "description": "One `content` or `summary` block of a message or reasoning item.\n\nBlocks are heterogeneous (`input_text`, `output_text`,\n`input_image`, `summary_text`, ...), so kinds other than text\ncarry extra keys.",
+        "properties": {
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Text body of a text block; absent for other kinds.",
+            "title": "Text"
+          },
+          "type": {
+            "description": "Block kind, e.g. `\"input_text\"` or `\"output_text\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionContentBlock",
+        "type": "object"
+      },
       "SessionCreatedEvent": {
         "description": "A child (sub-agent) session was spawned from this session.\n\nEmitted by `omnigent/tools/builtins/spawn.py:_spawn_one`\nonto the **parent** session's conversation stream after the\nchild conversation row is created and the child task has been\nstarted. Per the session-rearchitecture spec \u00a73 (\"Event types\nand direction\") and \u00a77 (\"Flow: client interacts with\nsub-agent\"), this lets clients watching the parent session's\nSSE subscribe directly to the child's stream without polling\nhistory for the tunneled `function_call` item.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.created\", \"conversation_id\": <parent>, \"child_session_id\": <child>, \"agent_id\": <agent or None>, \"parent_session_id\": <parent>, \"sequence_number\": null}`.\n\nThe existing tunneled `function_call` ConversationItem\n(carried inside `OutputItemDoneEvent`) is retained\nfor compatibility \u2014 clients that don't yet implement the\n\"subscribe to child stream\" pattern can keep rendering sub-\nagent calls from the parent's persistent history.",
         "properties": {
@@ -5815,6 +5950,127 @@
           "child_session_id"
         ],
         "title": "SessionCreatedEvent",
+        "type": "object"
+      },
+      "SessionErrorItem": {
+        "description": "`error` item: common fields plus `ErrorData`.",
+        "properties": {
+          "cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cause"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "level": {
+            "anyOf": [
+              {
+                "enum": [
+                  "error",
+                  "info"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "remediation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remediation"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "llm",
+              "execution",
+              "tool",
+              "harness"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "type": {
+            "const": "error",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "code",
+          "message",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionErrorItem",
         "type": "object"
       },
       "SessionForkRequest": {
@@ -5944,6 +6200,151 @@
           }
         },
         "title": "SessionForkRequest",
+        "type": "object"
+      },
+      "SessionFunctionCallItem": {
+        "description": "`function_call` item: common fields plus `FunctionCallData`.",
+        "properties": {
+          "arguments": {
+            "title": "Arguments",
+            "type": "string"
+          },
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "const": "function_call",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "name",
+          "arguments",
+          "call_id",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionFunctionCallItem",
+        "type": "object"
+      },
+      "SessionFunctionCallOutputItem": {
+        "description": "`function_call_output` item: common fields plus `FunctionCallOutputData`.",
+        "properties": {
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "output": {
+            "title": "Output",
+            "type": "string"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "subagent_return_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subagent Return Id"
+          },
+          "type": {
+            "const": "function_call_output",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "call_id",
+          "output",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionFunctionCallOutputItem",
         "type": "object"
       },
       "SessionGitOptions": {
@@ -6176,6 +6577,108 @@
           "requested_at"
         ],
         "title": "SessionInterruptedPayload",
+        "type": "object"
+      },
+      "SessionItem": {
+        "description": "One record of `GET /v1/sessions/{id}/items`; `type` selects the variant.",
+        "discriminator": {
+          "mapping": {
+            "compaction": "#/components/schemas/SessionCompactionItem",
+            "error": "#/components/schemas/SessionErrorItem",
+            "function_call": "#/components/schemas/SessionFunctionCallItem",
+            "function_call_output": "#/components/schemas/SessionFunctionCallOutputItem",
+            "message": "#/components/schemas/SessionMessageItem",
+            "native_tool": "#/components/schemas/SessionNativeToolItem",
+            "reasoning": "#/components/schemas/SessionReasoningItem",
+            "resource_event": "#/components/schemas/SessionResourceEventItem",
+            "routing_decision": "#/components/schemas/SessionRoutingDecisionItem",
+            "slash_command": "#/components/schemas/SessionSlashCommandItem",
+            "terminal_command": "#/components/schemas/SessionTerminalCommandItem"
+          },
+          "propertyName": "type"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/SessionMessageItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionFunctionCallItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionFunctionCallOutputItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionErrorItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionReasoningItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCompactionItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionNativeToolItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionResourceEventItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionRoutingDecisionItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionSlashCommandItem"
+          },
+          {
+            "$ref": "#/components/schemas/SessionTerminalCommandItem"
+          }
+        ],
+        "title": "SessionItem"
+      },
+      "SessionItemList": {
+        "description": "Paginated list of session items; `data` is a page of `SessionItem`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SessionItem"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SessionItemList",
         "type": "object"
       },
       "SessionLabelsResponse": {
@@ -6578,6 +7081,132 @@
         "title": "SessionMcpStartupEvent",
         "type": "object"
       },
+      "SessionMessageItem": {
+        "description": "`message` item as returned by `GET /v1/sessions/{id}/items`.\n\nMirrors `MessageData` field for field. The entity keeps the blocks\nas free-form dicts, so this variant spells out the typed block shape\ninstead of inheriting it.",
+        "properties": {
+          "content": {
+            "description": "Content blocks in order.",
+            "items": {
+              "$ref": "#/components/schemas/SessionContentBlock"
+            },
+            "title": "Content",
+            "type": "array"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "interrupted": {
+            "default": false,
+            "description": "`True` for a partial assistant response from an interrupted turn; omitted when `False`.",
+            "title": "Interrupted",
+            "type": "boolean"
+          },
+          "is_meta": {
+            "default": false,
+            "description": "`True` for durable context hidden from user-facing transcripts; omitted when `False`.",
+            "title": "Is Meta",
+            "type": "boolean"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Agent name; present on assistant messages, absent on user messages.",
+            "title": "Model"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "role": {
+            "description": "`\"user\"` or `\"assistant\"`.",
+            "enum": [
+              "user",
+              "assistant"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "stream_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native live-preview stream finalized by this assistant message.",
+            "title": "Stream Message Id"
+          },
+          "subagent_return_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native task id of an explicitly completed child; omitted when unset.",
+            "title": "Subagent Return Id"
+          },
+          "type": {
+            "const": "message",
+            "description": "Always `\"message\"`.",
+            "title": "Type",
+            "type": "string"
+          },
+          "user_authored": {
+            "default": false,
+            "description": "`True` for confirmed or conservatively preserved user input; omitted when `False`.",
+            "title": "User Authored",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type",
+          "role",
+          "content"
+        ],
+        "title": "SessionMessageItem",
+        "type": "object"
+      },
       "SessionModelEvent": {
         "description": "Active-model report from a harness integration.\n\nEmitted after an `external_model_change` POST from a native\nforwarder or when an SDK relay reports its concrete model in terminal\nresponse usage. Every surface re-renders its model display from this.",
         "properties": {
@@ -6652,6 +7281,64 @@
           "conversation_id"
         ],
         "title": "SessionModelOptionsEvent",
+        "type": "object"
+      },
+      "SessionNativeToolItem": {
+        "description": "`native_tool` item: common fields plus `NativeToolData`.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "item": {
+            "additionalProperties": true,
+            "title": "Item",
+            "type": "object"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "const": "native_tool",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionNativeToolItem",
         "type": "object"
       },
       "SessionPermissionModeEvent": {
@@ -6826,6 +7513,101 @@
         "title": "SessionReasoningEffortEvent",
         "type": "object"
       },
+      "SessionReasoningItem": {
+        "description": "`reasoning` item as returned by `GET /v1/sessions/{id}/items`.\n\nMirrors `ReasoningData` field for field, with its text blocks typed\nas `SessionContentBlock` like message content.",
+        "properties": {
+          "content": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SessionContentBlock"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Raw reasoning text blocks; absent when redacted.",
+            "title": "Content"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "encrypted_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Encrypted reasoning content; absent when none.",
+            "title": "Encrypted Content"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "description": "Agent name.",
+            "title": "Model",
+            "type": "string"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "description": "Summary text blocks, e.g. `[{\"type\": \"summary_text\", \"text\": \"...\"}]`.",
+            "items": {
+              "$ref": "#/components/schemas/SessionContentBlock"
+            },
+            "title": "Summary",
+            "type": "array"
+          },
+          "type": {
+            "const": "reasoning",
+            "description": "Always `\"reasoning\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type",
+          "model",
+          "summary"
+        ],
+        "title": "SessionReasoningItem",
+        "type": "object"
+      },
       "SessionResourceCreatedEvent": {
         "description": "A session resource was created.\n\nEmitted when a terminal is launched, a file is uploaded, or\nany other resource is materialized under a session. Wire shape\nis FLAT: `{\"type\": \"session.resource.created\", \"resource\": <SessionResourceObject-like dict>}`.",
         "properties": {
@@ -6907,6 +7689,85 @@
           "session_id"
         ],
         "title": "SessionResourceDeletedEvent",
+        "type": "object"
+      },
+      "SessionResourceEventItem": {
+        "description": "`resource_event` item: common fields plus `ResourceEventData`.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "resource": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resource"
+          },
+          "resource_id": {
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "resource_type": {
+            "title": "Resource Type",
+            "type": "string"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "const": "resource_event",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_type",
+          "resource_id",
+          "resource_type",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionResourceEventItem",
         "type": "object"
       },
       "SessionResourceObject": {
@@ -7564,6 +8425,161 @@
         "title": "SessionResponse",
         "type": "object"
       },
+      "SessionRoutingDecisionItem": {
+        "description": "`routing_decision` item: common fields plus `RoutingDecisionData`.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent"
+          },
+          "applied": {
+            "title": "Applied",
+            "type": "boolean"
+          },
+          "attempted_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempted Override"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "decision_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Id"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "rationale": {
+            "title": "Rationale",
+            "type": "string"
+          },
+          "raw_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Model"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "router_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Router Source"
+          },
+          "scope": {
+            "default": "turn",
+            "enum": [
+              "session",
+              "turn",
+              "child_session",
+              "native_subagent"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "task_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Description"
+          },
+          "type": {
+            "const": "routing_decision",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "applied",
+          "rationale",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionRoutingDecisionItem",
+        "type": "object"
+      },
       "SessionSandboxStatusEvent": {
         "description": "Managed-sandbox launch progress for a `host_type=\"managed\"` session.\n\nA managed create returns before its sandbox exists; the Omnigent\nserver emits this event as the background launch pipeline advances\nso the Web UI can show live provisioning progress on the session\npage instead of a silent dead chat: sandbox provision \u2192 repository\nclone \u2192 host startup \u2192 runner connect \u2192 ready, or a terminal\nfailure with the reason.",
         "properties": {
@@ -7624,6 +8640,93 @@
           "stage"
         ],
         "title": "SessionSandboxStatusEvent",
+        "type": "object"
+      },
+      "SessionSlashCommandItem": {
+        "description": "`slash_command` item: common fields plus `SlashCommandData`.",
+        "properties": {
+          "arguments": {
+            "title": "Arguments",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "default": "skill",
+            "enum": [
+              "skill",
+              "command"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "const": "slash_command",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "name",
+          "arguments",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionSlashCommandItem",
         "type": "object"
       },
       "SessionStatusEvent": {
@@ -7829,6 +8932,100 @@
           "terminal_id"
         ],
         "title": "SessionTerminalActivityEvent",
+        "type": "object"
+      },
+      "SessionTerminalCommandItem": {
+        "description": "`terminal_command` item: common fields plus `TerminalCommandData`.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Identity of the human author; omitted for agent, tool, and system items.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "input": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input"
+          },
+          "kind": {
+            "enum": [
+              "input",
+              "output"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "response_id": {
+            "description": "ID of the task/response that produced this item.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "status": {
+            "description": "Item status, e.g. `\"completed\"`.",
+            "title": "Status",
+            "type": "string"
+          },
+          "stderr": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stderr"
+          },
+          "stdout": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stdout"
+          },
+          "type": {
+            "const": "terminal_command",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "id",
+          "response_id",
+          "status",
+          "created_at",
+          "type"
+        ],
+        "title": "SessionTerminalCommandItem",
         "type": "object"
       },
       "SessionTerminalPendingEvent": {
@@ -9498,7 +10695,7 @@
     },
     "/v1/agents": {
       "get": {
-        "description": "List built-in agents with cursor-based pagination.\n\nReturns only built-in agents \u2014 `agent_store.list()` filters\n`session_id IS NULL` \u2014 so session-scoped agents never appear.\n\n**Returns:** A `PaginatedList` of built-in agents.",
+        "description": "List built-in agents with cursor-based pagination.\n\nReturns only built-in agents \u2014 `agent_store.list()` filters\n`session_id IS NULL` \u2014 so session-scoped agents never appear.\n\n**Returns:** An `AgentList` of built-in agents.",
         "operationId": "list_builtin_agents_v1_agents_get",
         "parameters": [
           {
@@ -9566,7 +10763,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PaginatedList"
+                  "$ref": "#/components/schemas/AgentList"
                 }
               }
             },
@@ -13279,7 +14476,7 @@
     },
     "/v1/sessions/{session_id}/items": {
       "get": {
-        "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n`GET /v1/conversations/{id}/items`.\n\n**Returns:** A `PaginatedList` of conversation items.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
+        "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n`GET /v1/conversations/{id}/items`.\n\n**Returns:** A page of flattened conversation items, documented as `SessionItemList`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
         "operationId": "list_session_items_v1_sessions__session_id__items_get",
         "parameters": [
           {
@@ -13357,7 +14554,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PaginatedList"
+                  "$ref": "#/components/schemas/SessionItemList"
                 }
               }
             },
