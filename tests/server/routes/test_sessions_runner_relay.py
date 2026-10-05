@@ -1579,27 +1579,38 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("adopted_status", "later_lookup", "live_status", "expect_failed", "status_source"),
+    ("kind", "adopted_status", "later_lookup", "live_status", "decision", "status_source"),
     [
-        ("idle", "missing", None, False, "relay_snapshot"),
-        ("idle", "error", None, False, "relay_snapshot"),
-        ("running", "error", None, True, "relay_snapshot"),
-        ("waiting", "missing", None, True, "relay_snapshot"),
-        (None, "missing", None, True, "unknown"),
-        ("idle", "running", None, True, "persisted"),
-        ("idle", "waiting", None, True, "persisted"),
-        ("running", "idle", None, False, "persisted"),
-        ("idle", "idle", "running", True, "cache"),
-        ("running", "running", "idle", False, "cache"),
+        ("sub_agent", "idle", "missing", None, "idle_no_failure", "relay_snapshot"),
+        ("sub_agent", "idle", "error", None, "idle_no_failure", "relay_snapshot"),
+        ("sub_agent", "running", "error", None, "failed_mid_turn", "relay_snapshot"),
+        ("sub_agent", "waiting", "missing", None, "failed_mid_turn", "relay_snapshot"),
+        ("sub_agent", None, "missing", None, "failed_mid_turn", "unknown"),
+        ("sub_agent", "idle", "running", None, "failed_mid_turn", "persisted"),
+        ("sub_agent", "idle", "waiting", None, "failed_mid_turn", "persisted"),
+        ("sub_agent", "running", "idle", None, "idle_no_failure", "persisted"),
+        ("sub_agent", "idle", "idle", "running", "failed_mid_turn", "cache"),
+        ("sub_agent", "running", "running", "idle", "idle_no_failure", "cache"),
+        # A native mirror's saved status can read mid-turn after its last idle
+        # edge, and its parent's runtime owns the turn: only the cache fails it.
+        ("mirror", "running", "error", None, "subagent_unobserved", "relay_snapshot"),
+        ("mirror", "waiting", "missing", None, "subagent_unobserved", "relay_snapshot"),
+        ("mirror", None, "missing", None, "failed_mid_turn", "unknown"),
+        ("mirror", "idle", "running", None, "subagent_unobserved", "persisted"),
+        ("mirror", "idle", "idle", "running", "failed_mid_turn", "cache"),
+        # A top-level session's saved mid-turn status still reports the drop.
+        ("default", "running", "error", None, "failed_mid_turn", "relay_snapshot"),
+        ("default", "idle", "running", None, "failed_mid_turn", "persisted"),
     ],
 )
 async def test_relay_disconnect_status_after_adoption(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    kind: str,
     adopted_status: str | None,
     later_lookup: str,
     live_status: str | None,
-    expect_failed: bool,
+    decision: str,
     status_source: str,
 ) -> None:
     """Saved adoption state is a fallback; newer state still decides interruptions."""
@@ -1611,9 +1622,14 @@ async def test_relay_disconnect_status_after_adoption(
     )
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation()
+    # ``default`` binds an unrelated top-level session the same way.
     child = store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id, runner_id="runner_adopted"
+        kind="default" if kind == "default" else "sub_agent",
+        parent_conversation_id=None if kind == "default" else parent.id,
+        runner_id="runner_adopted",
     )
+    if kind == "mirror":
+        store.set_labels(child.id, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
     if adopted_status is not None:
         store.set_session_live_status(child.id, adopted_status)
     snapshot = store.get_conversation(child.id)
@@ -1661,23 +1677,24 @@ async def test_relay_disconnect_status_after_adoption(
         refreshed = get_conversation(child.id)
         assert refreshed is not None
         error = sessions_module._last_task_error_from_labels(refreshed.labels)
-        if expect_failed:
+        if decision == "failed_mid_turn":
             assert sessions_module._session_status_cache[child.id] == "failed"
             assert error is not None and error["code"] == "runner_disconnected"
-            items = store.list_items(parent.id).data
-            assert len(items) == 1 and items[0].data.resource["status"] == "failed"
+            if kind != "default":
+                items = store.list_items(parent.id).data
+                assert len(items) == 1 and items[0].data.resource["status"] == "failed"
         else:
             assert sessions_module._session_status_cache.get(child.id) != "failed"
             assert error is None
             assert store.list_items(parent.id).data == []
             assert not any(row["event_name"] == "session_turn_failed" for row in rows)
-        decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
-        assert decision["attributes"]["status_source"] == status_source
-        assert decision["attributes"]["decision"] == (
-            "failed_mid_turn" if expect_failed else "idle_no_failure"
-        )
+            if decision == "subagent_unobserved":
+                assert refreshed.live_status in {"running", "waiting"}
+        logged = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert logged["attributes"]["status_source"] == status_source
+        assert logged["attributes"]["decision"] == decision
         if adopted_status is not None:
-            assert decision["attributes"]["snapshot_session_status"] == adopted_status
+            assert logged["attributes"]["snapshot_session_status"] == adopted_status
     finally:
         gate.set()
         if handle is not None and not handle.task.done():
@@ -2156,6 +2173,74 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
         sessions_module._intentional_stop_sessions.discard(session_id)
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("labels", "fail_idle_top_level", "decision"),
+    [
+        ({"omnigent.wrapper": "claude-code-native-ui-subagent"}, False, "subagent_unobserved"),
+        ({"omnigent.wrapper": "claude-code-native-ui-subagent"}, True, "subagent_unobserved"),
+        ({"omnigent.wrapper": "codex-native-ui-subagent"}, False, "subagent_unobserved"),
+        ({"omnigent.acp.subagent_id": "acp_sub_1"}, False, "subagent_unobserved"),
+        # A sys_session_create child's failure label drives the runner's
+        # restart recovery, so its saved status still decides.
+        ({}, False, "failed_mid_turn"),
+    ],
+)
+async def test_offline_sweep_saved_subagent_turn_without_a_cached_edge(
+    db_uri: str,
+    labels: dict[str, str],
+    fail_idle_top_level: bool,
+    decision: str,
+) -> None:
+    """
+    A saved running status alone does not fail a native parent's sub-agent mirror.
+
+    A mirror can still read ``running`` after its last idle edge, so failing
+    on it painted finished children red. The parent's runtime owns the turn
+    and its result; reconnect re-attaches the mirror, which still counts as
+    interrupted.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.child_session_recovery import _interrupted
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    if labels:
+        store.set_labels(child.id, labels)
+    store.set_session_live_status(child.id, "running")
+    snapshot = store.get_conversation(child.id)
+    assert snapshot is not None
+    error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [snapshot], error, store, fail_idle_top_level=fail_idle_top_level
+            )
+
+        refreshed = store.get_conversation(child.id)
+        assert refreshed is not None
+        persisted = sessions_module._last_task_error_from_labels(refreshed.labels)
+        if decision == "subagent_unobserved":
+            assert refreshed.live_status == "running"
+            assert persisted is None
+            assert store.list_items(parent.id).data == []
+            assert _interrupted(refreshed)
+        else:
+            assert persisted is not None and persisted["code"] == "runner_disconnected"
+        logged = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert logged["attributes"]["origin"] == "runner_offline_sweep"
+        assert logged["attributes"]["decision"] == decision
+        assert logged["attributes"]["status_source"] == "persisted"
+        assert logged["attributes"]["session_kind"] == "sub_agent"
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(child.id)
 
 
 @pytest.mark.asyncio

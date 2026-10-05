@@ -7293,6 +7293,15 @@ def _runner_live_on_another_replica_from_conversations(
     )
 
 
+def _owned_by_parent_runtime(conv: Conversation | _RelayStatusSnapshot | None) -> bool:
+    """Return whether ``conv`` mirrors an in-process sub-agent of a native parent."""
+    from omnigent.server.child_session_recovery import is_parent_owned_subagent
+
+    if isinstance(conv, _RelayStatusSnapshot):
+        return conv.parent_owned
+    return conv is not None and is_parent_owned_subagent(conv)
+
+
 async def _runner_disconnect_requires_failure(
     session_id: str,
     conversation_store: ConversationStore,
@@ -7311,6 +7320,11 @@ async def _runner_disconnect_requires_failure(
     If the read is unavailable, use the sweep or relay's adoption snapshot.
     Without any known state, report the drop so an interruption is not lost.
     Only top-level sessions can fail before startup with ``fail_idle_top_level``.
+
+    A sub-agent mirrored from a native parent fails only on a turn in the
+    cache: its saved status can still read mid-turn after its last idle edge.
+    The parent's native runtime drives that turn and reports its outcome, so
+    the saved status alone is no evidence of an interruption.
     """
     cached = _session_status_cache.get(session_id)
     persisted: Conversation | None = None
@@ -7347,6 +7361,8 @@ async def _runner_disconnect_requires_failure(
     if snapshot is not None and session_id in _intentional_stop_sessions:
         # A Stop can arrive while the sweep refreshes its row.
         decision = "intentional_stop"
+    elif live in _MID_TURN_STATUSES and source != "cache" and _owned_by_parent_runtime(conv):
+        decision = "subagent_unobserved"
     elif live in _MID_TURN_STATUSES or source == "unknown":
         decision = "failed_mid_turn"
     elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
@@ -8472,6 +8488,8 @@ def _ensure_runner_relay(
             runner_id,
             extra={"session_id": session_id},
         )
+    from omnigent.server.child_session_recovery import is_parent_owned_subagent
+
     ready = asyncio.Event()
     # Runtime callers always supply a store. ``None`` is retained for
     # heartbeat-only relay readiness tests that never emit persistable frames.
@@ -8496,6 +8514,7 @@ def _ensure_runner_relay(
             runner_id=runner_id,
             host_id=conversation.host_id,
             updated_at=conversation.updated_at,
+            parent_owned=is_parent_owned_subagent(conversation),
         )
         if conversation is not None
         and conversation.id == session_id

@@ -62,9 +62,15 @@ both ends.
 - `runner_disconnect_decision`: a warning explaining the status check in the
   relay (`origin = runner_disconnected_mid_turn`) or offline sweep
   (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
-  `failed_mid_turn`, `failed_before_start`, or `intentional_stop`.
+  `failed_mid_turn`, `failed_before_start`, `intentional_stop`, or
+  `subagent_unobserved`.
   Idle subsessions keep their status and emit no `session_turn_failed` event
-  or error labels. Running and waiting sessions still fail on disconnect;
+  or error labels. Running and waiting sessions still fail on disconnect, but
+  a subsession mirrored from a native parent (such as a Claude subsession)
+  needs that status in this server's cache: a saved or adopted running/waiting
+  status alone gives `subagent_unobserved`. A mirror's row can still read
+  mid-turn after its last idle edge, and the parent's native runtime, not the
+  server, drives the mirror's turn and reports its outcome.
   `fail_idle_top_level` applies only to top-level startup failures.
 
   `status_source` is `cache`, `persisted`, `snapshot`, `relay_snapshot`, or
@@ -154,12 +160,16 @@ For idle-child handling, let a Claude subsession become idle, then stop its
 host without using the session's Stop action. After the disconnect grace,
 the child should remain idle with a warning whose decision is
 `idle_no_failure`, no disconnect error in its transcript, and no Failed
-activity in its parent's transcript. Repeat with a running child to confirm
-that interrupted work still produces `runner_disconnected`.
+activity in its parent's transcript. Repeat with a running child whose turn
+this server relayed to confirm that interrupted work still produces
+`runner_disconnected`.
 
 For handoff handling, reconnect an idle child's runner to a fresh server,
 then drop the runner after its heartbeat-only relay is ready. In a test
 environment, make the disconnect-time conversation lookup fail or return no
 row. The warning should report `status_source = relay_snapshot` and
 `decision = idle_no_failure`. Repeat after persisting a new running status:
-the fresh row must win and the interruption must still fail.
+the fresh row must win (`status_source = persisted`), giving
+`subagent_unobserved` for the Claude subsession; a top-level session or a
+`sys_session_create` child in that state must
+still fail.

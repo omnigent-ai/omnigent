@@ -470,6 +470,192 @@ async def test_close_entry_kills_process_when_aclose_raises(
         await manager.shutdown()
 
 
+async def test_release_reaps_term_resistant_process_when_graceful_wait_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled graceful wait still force-kills and reaps a real child."""
+    from omnigent.runtime.harnesses import process_manager as process_manager_module
+
+    class _Client:
+        async def aclose(self) -> None:
+            return None
+
+    class _Endpoint:
+        def __init__(self) -> None:
+            self.cleaned = False
+
+        def cleanup(self) -> None:
+            self.cleaned = True
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        (
+            "import signal, sys, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); "
+            "time.sleep(60)"
+        ),
+        stdout=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert process.stdout is not None
+        assert await asyncio.wait_for(process.stdout.readline(), timeout=10.0) == b"ready\n"
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+        raise
+    endpoint = _Endpoint()
+    transport_closes: list[object] = []
+    terminate_started = asyncio.Event()
+    real_terminate_tree = process_manager_module._proc.terminate_tree
+    real_close_transport = process_manager_module.close_subprocess_transport
+
+    def terminate_tree(target: object) -> None:
+        real_terminate_tree(target)  # type: ignore[arg-type]
+        terminate_started.set()
+
+    def close_transport(target: object) -> None:
+        transport_closes.append(target)
+        real_close_transport(target)
+
+    monkeypatch.setattr(process_manager_module._proc, "terminate_tree", terminate_tree)
+    monkeypatch.setattr(process_manager_module, "close_subprocess_transport", close_transport)
+    manager = object.__new__(HarnessProcessManager)
+    manager._entries = {}
+    manager._spawn_locks = {"conv_real": asyncio.Lock()}
+    manager._registry_lock = asyncio.Lock()
+    manager._release_generations = {}
+    manager._in_flight_response_ids = {}
+    entry = process_manager_module._SubprocessEntry(
+        process,
+        _Client(),
+        endpoint,
+        "test",
+    )
+    manager._entries["conv_real"] = entry
+    closing = asyncio.create_task(manager.release("conv_real"))
+    try:
+        await asyncio.wait_for(terminate_started.wait(), timeout=10.0)
+        assert process.returncode is None, "fixture child unexpectedly honored SIGTERM"
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(closing, timeout=10.0)
+
+        assert process.returncode is not None
+        assert await asyncio.wait_for(process.wait(), timeout=1.0) == process.returncode
+        assert "conv_real" not in manager._entries
+        assert transport_closes == [process]
+        assert endpoint.cleaned
+    finally:
+        if not closing.done():
+            closing.cancel()
+            await asyncio.gather(closing, return_exceptions=True)
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
+@pytest.mark.parametrize("cancel_stage", ["force_wait", "client_close"])
+async def test_release_reaps_process_when_teardown_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_stage: str,
+) -> None:
+    """Cancellation during force wait or client close still cleans up."""
+    from omnigent.runtime.harnesses import process_manager as process_manager_module
+
+    class _BlockingProcess:
+        pid = 424242
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.wait_started = asyncio.Event()
+            self.force_wait_started = asyncio.Event()
+            self.wait_calls = 0
+            self.dead = False
+
+        async def wait(self) -> None:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                self.wait_started.set()
+                if self.returncode is None:
+                    await asyncio.Event().wait()
+            elif cancel_stage == "force_wait":
+                self.force_wait_started.set()
+                await asyncio.Event().wait()
+            return self.returncode
+
+    class _Client:
+        def __init__(self) -> None:
+            self.aclose_started = asyncio.Event()
+
+        async def aclose(self) -> None:
+            if cancel_stage == "client_close":
+                self.aclose_started.set()
+                await asyncio.Event().wait()
+
+    class _Endpoint:
+        def __init__(self) -> None:
+            self.cleaned = False
+
+        def cleanup(self) -> None:
+            self.cleaned = True
+
+    process = _BlockingProcess()
+    endpoint = _Endpoint()
+    client = _Client()
+    transport_closes: list[object] = []
+
+    def terminate_tree(_process: object) -> None:
+        if cancel_stage == "client_close":
+            process.returncode = -15
+
+    def kill_tree(_process: object) -> None:
+        process.dead = True
+        process.returncode = -9
+
+    monkeypatch.setattr(process_manager_module._proc, "terminate_tree", terminate_tree)
+    monkeypatch.setattr(process_manager_module._proc, "kill_tree", kill_tree)
+    monkeypatch.setattr(
+        process_manager_module,
+        "close_subprocess_transport",
+        lambda process: transport_closes.append(process),
+    )
+    manager = object.__new__(HarnessProcessManager)
+    manager._entries = {}
+    manager._spawn_locks = {"conv_a": asyncio.Lock()}
+    manager._registry_lock = asyncio.Lock()
+    manager._release_generations = {}
+    manager._in_flight_response_ids = {}
+    entry = process_manager_module._SubprocessEntry(
+        process,
+        client,
+        endpoint,
+        "test",
+    )
+    manager._entries["conv_a"] = entry
+
+    closing = asyncio.create_task(manager.release("conv_a"))
+    if cancel_stage == "client_close":
+        await asyncio.wait_for(client.aclose_started.wait(), timeout=1.0)
+    else:
+        await asyncio.wait_for(process.wait_started.wait(), timeout=1.0)
+        closing.cancel()
+        await asyncio.wait_for(process.force_wait_started.wait(), timeout=1.0)
+    closing.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert "conv_a" not in manager._entries
+    assert process.returncode is not None
+    if cancel_stage == "force_wait":
+        assert process.dead
+    assert process.wait_calls == (2 if cancel_stage == "force_wait" else 1)
+    assert transport_closes == [process]
+    assert endpoint.cleaned
+
+
 @pytest.mark.parametrize("response_id", [None, "resp_crashed"])
 async def test_get_client_respawns_after_crash(
     manager: HarnessProcessManager,
