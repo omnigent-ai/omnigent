@@ -2429,6 +2429,7 @@ function AccountSection() {
   const [pwBusy, setPwBusy] = useState(false);
   const [pwError, setPwError] = useState<string | null>(null);
   const [pwDone, setPwDone] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
 
   useEffect(() => {
     void (async () => {
@@ -2440,8 +2441,15 @@ function AccountSection() {
   const onSignOut = useCallback(async () => {
     if (accountsEnabled) {
       // Accounts: clear the cookie via the JSON logout endpoint, then land on
-      // the SPA login form.
-      await logout();
+      // the SPA login form. A failed sign-out leaves the session live, so stay
+      // here and say so instead of pretending the user is signed out.
+      setSignOutError(null);
+      try {
+        await logout();
+      } catch (err) {
+        setSignOutError(err instanceof Error ? err.message : "Sign-out failed. Try again.");
+        return;
+      }
       // Hard navigation so the chat store / react-query cache reset.
       window.location.href = withBasePath("/login");
       return;
@@ -2531,6 +2539,14 @@ function AccountSection() {
           >
             <LogOutIcon className="size-4" /> Sign out
           </Button>
+          {signOutError !== null && (
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+            >
+              {signOutError}
+            </div>
+          )}
         </div>
       </div>
 
