@@ -1,7 +1,9 @@
 import { useContext } from "react";
 import { canReceiveFocus, FilesPanelFocusContext, type FileRowInfo } from "./FileRowActions";
 import { CopyPathButton } from "./CopyPathButton";
-import { gitStatusLabel, formatBytes } from "./fileStatusUtils";
+import { formatBytes } from "./fileStatusUtils";
+import { isAbsoluteComposerPath } from "@/lib/composerContext";
+import { fileTypeLabel } from "./fileTypeLabel";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
@@ -10,14 +12,31 @@ function formatModifiedAt(modifiedAt: number | null | undefined): string {
   const date = new Date(modifiedAt * 1000);
   return Number.isNaN(date.getTime())
     ? "Not available"
-    : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+    : new Intl.DateTimeFormat(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        timeZoneName: "short",
+      }).format(date);
 }
 
 function changeStatus(info: FileRowInfo): string {
+  if (info.kind === "folder") return info.status ? "Contains changes" : "Not available";
   if (!info.status) return "Not available";
-  const label = gitStatusLabel(info.status);
-  return info.lastKnown ? `${label} (last known)` : label;
+
+  const counts: string[] = [];
+  if (info.linesAdded != null) counts.push(`+${info.linesAdded}`);
+  if (info.linesRemoved != null) counts.push(`−${info.linesRemoved}`);
+  const label =
+    info.status === "created" ? "New file" : info.status === "modified" ? "Modified" : "Deleted";
+  if (counts.length === 0) return label;
+  return `${label} · ${counts.join(" ")} lines`;
 }
+
+const CHANGES_CAPTION =
+  "With Git, changes compare the workspace with the last commit. Without Git, only file edits recorded this session are listed; shell edits aren't.";
 
 export function FileInfoDialog({
   info,
@@ -42,54 +61,62 @@ export function FileInfoDialog({
           onCloseAutoFocus={(event) => {
             event.preventDefault();
             const fallback = panelFocusRef?.current ?? null;
-            if (canReceiveFocus(returnFocus)) {
-              returnFocus.focus();
-            } else if (canReceiveFocus(fallback)) {
-              fallback.focus();
-            }
+            queueMicrotask(() => {
+              if (canReceiveFocus(returnFocus)) {
+                returnFocus.focus();
+              } else if (canReceiveFocus(fallback)) {
+                fallback.focus();
+              }
+            });
           }}
         >
           <DialogHeader>
             <DialogTitle>{title}</DialogTitle>
+            <h2 className="break-words text-base font-medium">{info.name}</h2>
           </DialogHeader>
           <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-ui">
-            <dt className="text-muted-foreground">Name</dt>
-            <dd className="min-w-0 break-words">{info.name}</dd>
-            <dt className="text-muted-foreground">Path</dt>
+            <dt className="text-muted-foreground">
+              {isAbsoluteComposerPath(info.path)
+                ? "Host path"
+                : info.path.includes("/")
+                  ? "Path"
+                  : "Location"}
+            </dt>
             <dd className="flex min-w-0 items-start gap-2">
-              <code className="min-w-0 flex-1 break-all select-text">{info.path}</code>
+              <code className="min-w-0 flex-1 break-all select-text">
+                {isAbsoluteComposerPath(info.path)
+                  ? info.path
+                  : info.path.includes("/")
+                    ? info.path
+                    : "Workspace root"}
+              </code>
               <TooltipProvider>
-                <CopyPathButton path={info.path} />
+                <CopyPathButton path={info.path} tooltipSide="left" />
               </TooltipProvider>
             </dd>
-            <dt className="text-muted-foreground">Kind</dt>
-            <dd>{info.kind}</dd>
-            {info.kind === "file" && (
+            <dt className="text-muted-foreground">Type</dt>
+            <dd>{fileTypeLabel(info.name, info.kind)}</dd>
+            {info.kind === "file" && !info.lastKnown && (
               <>
                 <dt className="text-muted-foreground">Size</dt>
                 <dd>
-                  {info.bytes == null || !Number.isFinite(info.bytes)
+                  {info.bytes == null || !Number.isFinite(info.bytes) || info.bytes < 0
                     ? "Not available"
-                    : formatBytes(info.bytes)}
+                    : `${formatBytes(info.bytes)} (${new Intl.NumberFormat().format(info.bytes)} bytes)`}
                 </dd>
               </>
             )}
-            <dt className="text-muted-foreground">Modified</dt>
-            <dd>{formatModifiedAt(info.modifiedAt)}</dd>
+            {info.kind === "file" && !info.lastKnown && (
+              <>
+                <dt className="text-muted-foreground">Modified</dt>
+                <dd>{formatModifiedAt(info.modifiedAt)}</dd>
+              </>
+            )}
             <dt className="text-muted-foreground">Changes</dt>
-            <dd>{changeStatus(info)}</dd>
-            {info.linesAdded != null && (
-              <>
-                <dt className="text-muted-foreground">Lines added</dt>
-                <dd>{info.linesAdded}</dd>
-              </>
-            )}
-            {info.linesRemoved != null && (
-              <>
-                <dt className="text-muted-foreground">Lines removed</dt>
-                <dd>{info.linesRemoved}</dd>
-              </>
-            )}
+            <dd>
+              {changeStatus(info)}
+              <p className="mt-1 text-muted-foreground text-xs">{CHANGES_CAPTION}</p>
+            </dd>
           </dl>
         </DialogContent>
       )}
