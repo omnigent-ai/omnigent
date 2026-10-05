@@ -37,6 +37,8 @@ from omnigent.host.frames import (
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
+    HostCreateWorktreeFrame,
+    HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
@@ -76,6 +78,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.host.git_worktree import _GIT_TIMEOUT_S, CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
@@ -3468,6 +3471,66 @@ def test_host_subprocess_op_guard_is_reentrant_and_balanced(tmp_path: Path) -> N
             assert host._owned_subprocess_ops == 1
             raise RuntimeError("worktree op blew up")
     assert host._owned_subprocess_ops == 0, "guard leaked a ref on exception — reaper wedged"
+
+
+async def test_handle_create_worktree_passes_server_supplied_checkout_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new host bounds its git commands by the server-supplied timeout.
+
+    The server advertises how long it will wait; the host threads that into
+    create_worktree so a large repo's slow checkout outlasts the metadata
+    bound without the server abandoning a still-running create.
+    """
+    host = _make_host_process()
+    captured: dict[str, object] = {}
+
+    def _fake_create_worktree(**kwargs: object) -> CreatedWorktree:
+        captured.update(kwargs)
+        return CreatedWorktree(worktree_path="/wt", branch="feature/login", workspace="/wt")
+
+    monkeypatch.setattr("omnigent.host.connect.create_worktree", _fake_create_worktree)
+
+    result = await host._handle_create_worktree(
+        HostCreateWorktreeFrame(
+            request_id="r1",
+            repo_path="/repo",
+            branch_name="feature/login",
+            checkout_timeout_s=1234.0,
+        )
+    )
+
+    assert isinstance(result, HostCreateWorktreeResultFrame)
+    assert result.status == "ok"
+    assert captured["checkout_timeout_s"] == 1234.0
+
+
+async def test_handle_create_worktree_without_server_timeout_keeps_legacy_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy server omits the timeout; the new host keeps the metadata bound.
+
+    Protocol regression for mixed-version deploys: a new host paired with an
+    old server (no ``checkout_timeout_s``) must not let a slow checkout outlive
+    that server's shorter create deadline, so it falls back to the legacy git
+    bound instead of the generous one.
+    """
+    host = _make_host_process()
+    captured: dict[str, object] = {}
+
+    def _fake_create_worktree(**kwargs: object) -> CreatedWorktree:
+        captured.update(kwargs)
+        return CreatedWorktree(worktree_path="/wt", branch="wip", workspace="/wt")
+
+    monkeypatch.setattr("omnigent.host.connect.create_worktree", _fake_create_worktree)
+
+    result = await host._handle_create_worktree(
+        HostCreateWorktreeFrame(request_id="r2", repo_path="/repo", branch_name="wip")
+    )
+
+    assert isinstance(result, HostCreateWorktreeResultFrame)
+    assert result.status == "ok"
+    assert captured["checkout_timeout_s"] == _GIT_TIMEOUT_S
 
 
 def test_reap_orphans_is_noop_without_wnohang(

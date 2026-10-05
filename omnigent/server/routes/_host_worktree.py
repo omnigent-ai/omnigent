@@ -22,6 +22,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeFrame,
     encode_host_frame,
 )
+from omnigent.host.git_worktree import GIT_CHECKOUT_TIMEOUT_S
 from omnigent.server.host_registry import HostConnection, HostRegistry
 
 _logger = logging.getLogger(__name__)
@@ -29,6 +30,11 @@ _logger = logging.getLogger(__name__)
 # Above the host's own git timeout (120 s) so the host's specific error
 # surfaces instead of a generic server-side timeout.
 _WORKTREE_TIMEOUT_S: float = 150.0
+
+# A failing create runs three host git commands in sequence — fallback fetch,
+# checkout, rollback remove — each bounded by GIT_CHECKOUT_TIMEOUT_S, so the
+# server must outwait all three (plus margin) rather than abandon one midway.
+_WORKTREE_CREATE_TIMEOUT_S: float = 3 * GIT_CHECKOUT_TIMEOUT_S + 30.0
 
 
 WORKTREE_ROOT_LABEL_KEY = "omnigent.git.worktree_root_sha256"
@@ -130,6 +136,7 @@ async def _await_host_worktree_result(
     request_id: str,
     frame: str,
     op: str,
+    timeout: float,
 ) -> dict[str, object]:
     """
     Send a worktree frame and await its matching result over the tunnel.
@@ -146,26 +153,28 @@ async def _await_host_worktree_result(
     :param frame: Encoded host frame to send.
     :param op: Short label for error messages, e.g.
         ``"worktree creation"``.
+    :param timeout: Seconds to wait for the host's reply.
     :returns: The host's result dict (``status`` plus op-specific
         fields).
     :raises WorktreeHostUnavailableError: On connection loss or no
-        reply within :data:`_WORKTREE_TIMEOUT_S`.
+        reply within ``timeout``.
     """
     future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
     pending[request_id] = future
     try:
         try:
             host_registry.send_text(host_conn, frame)
+            # The registry fails the future when the tunnel drops, so a dead
+            # host surfaces at once instead of waiting out the bound.
+            return await asyncio.wait_for(future, timeout=timeout)
         except ConnectionError as exc:
             raise WorktreeHostUnavailableError(
                 f"host '{host_conn.host_id}' connection lost during {op}"
             ) from exc
-        try:
-            return await asyncio.wait_for(future, timeout=_WORKTREE_TIMEOUT_S)
         except asyncio.TimeoutError as exc:
             raise WorktreeHostUnavailableError(
                 f"host '{host_conn.host_id}' did not respond to {op} within "
-                f"{_WORKTREE_TIMEOUT_S:.0f}s (it may be running an older version "
+                f"{timeout:.0f}s (it may be running an older version "
                 "that does not support worktrees)"
             ) from exc
     finally:
@@ -198,7 +207,7 @@ async def create_worktree_on_host(
         deleted-worktree recreate path) instead of creating a branch.
     :returns: The created worktree's path and branch.
     :raises WorktreeHostUnavailableError: If the host connection drops
-        or doesn't respond within :data:`_WORKTREE_TIMEOUT_S`.
+        or doesn't respond within :data:`_WORKTREE_CREATE_TIMEOUT_S`.
     :raises WorktreeProxyError: If the host reports a worktree failure.
     """
     request_id = secrets.token_hex(8)
@@ -209,6 +218,9 @@ async def create_worktree_on_host(
             branch_name=branch_name,
             base_branch=base_branch,
             existing_branch=existing_branch,
+            # Tell a new host the per-command bound this deadline is sized for;
+            # older hosts ignore the field and keep their own metadata bound.
+            checkout_timeout_s=GIT_CHECKOUT_TIMEOUT_S,
         )
     )
     result = await _await_host_worktree_result(
@@ -218,6 +230,7 @@ async def create_worktree_on_host(
         request_id=request_id,
         frame=frame,
         op="worktree creation",
+        timeout=_WORKTREE_CREATE_TIMEOUT_S,
     )
     if result.get("status") != "ok":
         raise WorktreeProxyError(
@@ -276,6 +289,7 @@ async def remove_worktree_on_host(
         request_id=request_id,
         frame=frame,
         op="worktree removal",
+        timeout=_WORKTREE_TIMEOUT_S,
     )
     if result.get("status") != "ok":
         raise WorktreeProxyError(
@@ -322,6 +336,7 @@ async def list_worktrees_on_host(
         request_id=request_id,
         frame=frame,
         op="worktree listing",
+        timeout=_WORKTREE_TIMEOUT_S,
     )
     if result.get("status") != "ok":
         raise WorktreeProxyError(

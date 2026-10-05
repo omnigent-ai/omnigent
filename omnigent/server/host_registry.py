@@ -143,6 +143,19 @@ def _fail_pending_mcp_tools(conn: HostConnection) -> None:
             future.set_exception(ConnectionError("host disconnected"))
 
 
+def _fail_pending_worktrees(conn: HostConnection) -> None:
+    """Fail in-flight worktree requests as soon as their tunnel disconnects or is replaced."""
+    for pending in (
+        conn.pending_create_worktrees,
+        conn.pending_remove_worktrees,
+        conn.pending_list_worktrees,
+    ):
+        while pending:
+            _request_id, future = pending.popitem()
+            if not future.done():
+                future.set_exception(ConnectionError(f"host '{conn.host_id}' disconnected"))
+
+
 # How long a runner exit report stays answerable, and how many are kept.
 # Reports only matter while a client is still waiting for the runner to
 # come online (a 60s window today); 10 minutes covers slow retries with
@@ -527,6 +540,7 @@ class HostRegistry:
                 _fail_pending_plugins(old)
                 _fail_pending_skill_content(old)
                 _fail_pending_mcp_tools(old)
+                _fail_pending_worktrees(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -573,6 +587,7 @@ class HostRegistry:
         _fail_pending_plugins(removed)
         _fail_pending_skill_content(removed)
         _fail_pending_mcp_tools(removed)
+        _fail_pending_worktrees(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -472,10 +473,10 @@ def test_list_worktrees_fetches_all_timestamps_with_one_git_command(
     original_run_git = git_worktree_module._run_git
     show_calls: list[list[str]] = []
 
-    def run_git(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+    def run_git(args: list[str], *, cwd: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         if args[:3] == ["show", "-s", "--format=%H%x00%ct"]:
             show_calls.append(args)
-        return original_run_git(args, cwd=cwd)
+        return original_run_git(args, cwd=cwd, **kwargs)
 
     monkeypatch.setattr(git_worktree_module, "_run_git", run_git)
 
@@ -658,9 +659,11 @@ def test_directory_validation_survives_revision_moving(
     real_run = git_worktree_module._run_git
     moved = False
 
-    def move_after_validation(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+    def move_after_validation(
+        args: list[str], *, cwd: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
         nonlocal moved
-        result = real_run(args, cwd=cwd)
+        result = real_run(args, cwd=cwd, **kwargs)
         if args[:2] == ["cat-file", "-t"] and not moved:
             ref = "main" if mode == "head" else "moving"
             _git(git_repo, "update-ref", f"refs/heads/{ref}", before)
@@ -719,15 +722,117 @@ def test_failed_pinned_checkout_rolls_back_without_hiding_original_error(
     _git(git_repo, "commit", "-m", "web")
     real_run = git_worktree_module._run_git
 
-    def fail_checkout(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+    def fail_checkout(
+        args: list[str], *, cwd: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
         if args[:2] == ["checkout", "--force"]:
             return subprocess.CompletedProcess(args, 1, "", "checkout failed")
         if rollback_fails and args[:2] == ["worktree", "remove"]:
             return subprocess.CompletedProcess(args, 1, "", "rollback failed")
-        return real_run(args, cwd=cwd)
+        return real_run(args, cwd=cwd, **kwargs)
 
     monkeypatch.setattr(git_worktree_module, "_run_git", fail_checkout)
     with pytest.raises(WorktreeError, match="could not check out validated"):
         create_worktree(repo_path=str(source), branch_name="new")
     assert _branch_exists(git_repo, "new") is rollback_fails
     assert len(list_worktrees(repo_path=str(git_repo))) == (2 if rollback_fails else 1)
+
+
+def _commit_slow_smudge_file(repo: Path, delay_s: int) -> None:
+    """Commit ``slow.bin`` behind a smudge filter that sleeps on every checkout.
+
+    :param repo: Repository to commit into.
+    :param delay_s: Seconds each checkout of the file takes.
+    """
+    (repo / ".gitattributes").write_text("slow.bin filter=slow\n")
+    (repo / "slow.bin").write_text("payload\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "slow file")
+    _git(repo, "config", "filter.slow.smudge", f"sh -c 'exec 2>/dev/null; sleep {delay_s}; cat'")
+    _git(repo, "config", "filter.slow.clean", "cat")
+    _git(repo, "config", "filter.slow.required", "true")
+
+
+def test_create_worktree_checkout_outlasting_command_timeout_completes(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkout slower than the per-command git bound still populates the worktree."""
+    _commit_slow_smudge_file(git_repo, delay_s=5)
+    monkeypatch.setattr(git_worktree_module, "_GIT_TIMEOUT_S", 2.0)
+
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/slow")
+
+    assert (Path(created.worktree_path) / "slow.bin").read_text() == "payload\n"
+
+
+def test_create_worktree_checkout_outlasting_checkout_bound_times_out(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The checkout bound is still enforced, and the error names that bound."""
+    _commit_slow_smudge_file(git_repo, delay_s=3)
+    monkeypatch.setattr(git_worktree_module, "GIT_CHECKOUT_TIMEOUT_S", 1.0)
+
+    with pytest.raises(WorktreeError, match="git command timed out after 1s"):
+        create_worktree(repo_path=str(git_repo), branch_name="feature/slow")
+
+
+@pytest.fixture
+def git_bounds(monkeypatch: pytest.MonkeyPatch) -> list[tuple[list[str], float | None]]:
+    """Record the ``timeout`` each real git command runs with.
+
+    :returns: ``(argv after git, timeout)`` per command, in call order.
+    """
+    real_run = git_worktree_module._run_git
+    calls: list[tuple[list[str], float | None]] = []
+
+    def recording_run(
+        argv: list[str], *, cwd: str, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, timeout))
+        return real_run(argv, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", recording_run)
+    return calls
+
+
+def test_create_worktree_bounds_only_checkout_commands_generously(
+    git_repo: Path, git_bounds: list[tuple[list[str], float | None]]
+) -> None:
+    """``worktree add`` and the pinned ``checkout`` get the generous bound.
+
+    Metadata commands keep the short per-command bound.
+    """
+    (git_repo / "web").mkdir()
+    (git_repo / "web" / "index.html").write_text("<html></html>")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "add web")
+
+    create_worktree(repo_path=str(git_repo / "web"), branch_name="feature/bounds")
+
+    # Key on the full subcommand so a metadata ``worktree prune``/``list`` is
+    # never conflated with the size-scaling ``worktree add``.
+    def _subcommand(argv: list[str]) -> str:
+        return f"worktree {argv[1]}" if argv[0] == "worktree" and len(argv) > 1 else argv[0]
+
+    generous = {"worktree add", "checkout"}
+    by_bound: dict[float | None, set[str]] = {}
+    for argv, timeout in git_bounds:
+        by_bound.setdefault(timeout, set()).add(_subcommand(argv))
+
+    assert by_bound[git_worktree_module.GIT_CHECKOUT_TIMEOUT_S] == generous
+    assert all(
+        timeout is None for argv, timeout in git_bounds if _subcommand(argv) not in generous
+    )
+
+
+def test_create_worktree_fetches_missing_base_with_checkout_bound(
+    git_repo: Path, git_bounds: list[tuple[list[str], float | None]]
+) -> None:
+    """The ``git fetch`` for an unresolvable base ref gets the checkout bound too."""
+    with pytest.raises(WorktreeError, match="base branch does not exist"):
+        create_worktree(
+            repo_path=str(git_repo), branch_name="feature/x", base_branch="origin/nope"
+        )
+
+    fetch_bounds = [timeout for argv, timeout in git_bounds if argv[0] == "fetch"]
+    assert fetch_bounds == [git_worktree_module.GIT_CHECKOUT_TIMEOUT_S]

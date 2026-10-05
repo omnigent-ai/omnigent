@@ -569,3 +569,38 @@ def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
     # Deregistering by any spelling removes the entry.
     registry.deregister(prefixed)
     assert registry.get(bare) is None
+
+
+async def test_deregister_fails_pending_worktree_requests() -> None:
+    """Deregistering fails in-flight worktree requests instead of leaving them to
+    wait out a bound sized for an hour-long checkout on a tunnel that can never answer."""
+    registry = HostRegistry()
+    conn = registry.register("host_wt", FakeWebSocket(), _make_hello(), owner="bob")
+    loop = asyncio.get_running_loop()
+    create, remove, listing = loop.create_future(), loop.create_future(), loop.create_future()
+    conn.pending_create_worktrees["req_c"] = create
+    conn.pending_remove_worktrees["req_r"] = remove
+    conn.pending_list_worktrees["req_l"] = listing
+
+    assert registry.deregister("host_wt") is True
+
+    for future in (create, remove, listing):
+        with pytest.raises(ConnectionError, match="host 'host_wt' disconnected"):
+            future.result()
+    assert not conn.pending_create_worktrees
+    assert not conn.pending_remove_worktrees
+    assert not conn.pending_list_worktrees
+
+
+async def test_register_replacement_fails_stale_pending_worktree_requests() -> None:
+    """A reconnect fails the replaced connection's worktree requests: their
+    replies would land on a tunnel the server no longer reads."""
+    registry = HostRegistry()
+    old = registry.register("host_wt2", FakeWebSocket(), _make_hello(), owner="bob")
+    future = asyncio.get_running_loop().create_future()
+    old.pending_create_worktrees["req_c"] = future
+
+    registry.register("host_wt2", FakeWebSocket(), _make_hello(), owner="bob")
+
+    with pytest.raises(ConnectionError, match="disconnected"):
+        future.result()

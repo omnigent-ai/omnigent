@@ -1639,6 +1639,50 @@ def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
     assert decoded.existing_branch is False
 
 
+def test_create_worktree_frame_checkout_timeout_round_trip() -> None:
+    """The server-supplied checkout bound survives encode → decode."""
+    original = HostCreateWorktreeFrame(
+        request_id="req_wt_5",
+        repo_path="/repo",
+        branch_name="feature/login",
+        checkout_timeout_s=3600.0,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.checkout_timeout_s == 3600.0
+    assert decoded == original
+
+
+def test_create_worktree_frame_checkout_timeout_absent_defaults_none() -> None:
+    """A frame from an older server (no checkout_timeout_s) decodes as None.
+
+    The host relies on this to keep its legacy bound against an old server.
+    """
+    import json
+
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_6", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    msg.pop("checkout_timeout_s", None)
+    decoded = decode_host_frame(json.dumps(msg))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.checkout_timeout_s is None
+
+
+def test_create_worktree_frame_checkout_timeout_rejects_non_positive() -> None:
+    """A non-positive checkout bound is a malformed frame, not silently kept."""
+    import json
+
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_7", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    msg["checkout_timeout_s"] = 0
+    with pytest.raises(ValueError, match="checkout_timeout_s"):
+        decode_host_frame(json.dumps(msg))
+
+
 def test_create_worktree_result_frame_round_trip() -> None:
     """Verify HostCreateWorktreeResultFrame survives encode → decode.
 
