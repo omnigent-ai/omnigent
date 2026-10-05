@@ -5765,6 +5765,7 @@ export function NewChatLandingScreen() {
     <ComposerWorkspaceTrigger
       kind="directory"
       label={noExecutionTargetSelected ? "No host selected" : visibleWorktreeHeader.repositoryLabel}
+      iconOnly={noExecutionTargetSelected}
       icon={
         workspaceIsGit ? (
           <FolderGit2Icon
@@ -6127,6 +6128,7 @@ export function NewChatLandingScreen() {
                             ? "No host selected"
                             : visibleWorktreeHeader.branchLabel
                         }
+                        iconOnly={noExecutionTargetSelected}
                         aria-label={
                           noExecutionTargetSelected
                             ? "No host selected"
@@ -6657,6 +6659,7 @@ export function NewChatLandingScreen() {
                         value="No host selected"
                         harness={selectedNativeHarness}
                         disabled
+                        iconOnly
                         options={directModeOptions}
                         onSelect={selectDirectMode}
                         testIdPrefix="new-chat-landing"
