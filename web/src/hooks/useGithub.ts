@@ -57,6 +57,20 @@ export interface GithubComment {
   url: string | null;
 }
 
+/** One PR review (from `gh pr view --json reviews`). */
+export interface GithubReview {
+  /** Reviewer's GitHub login, or null when unknown. */
+  author: string | null;
+  /** Submitted review state: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED. */
+  state: string | null;
+  /** Review summary body (GitHub-flavored markdown); empty string when none. */
+  body: string;
+  /** ISO-8601 submission time, or null for pending reviews. */
+  submitted_at: string | null;
+  /** Link to the review on GitHub, or null. */
+  url: string | null;
+}
+
 export interface GithubPr {
   number: number;
   title: string;
@@ -75,6 +89,11 @@ export interface GithubPr {
   body?: string | null;
   /** Top-level PR comments GitHub shows by default; absent from an older host. */
   comments?: GithubComment[];
+  /** Overall review decision: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED"
+   *  | null. Absent from an older host; treat undefined as null. */
+  review_decision?: string | null;
+  /** PR reviews; absent from an older host, treat undefined as empty. */
+  reviews?: GithubReview[];
 }
 
 export interface GithubRepo {

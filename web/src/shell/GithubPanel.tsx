@@ -83,6 +83,7 @@ import {
   type GithubComment,
   type GithubInfo,
   type GithubPrAssociation,
+  type GithubReview,
 } from "@/hooks/useGithub";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
@@ -554,15 +555,110 @@ function GithubCommentCard({ comment }: { comment: GithubComment }) {
   );
 }
 
+/** Compact badge showing the PR's overall review decision. */
+function ReviewDecisionBadge({ decision }: { decision: string | null | undefined }) {
+  if (!decision) return null;
+  const normalized = decision.toUpperCase();
+  const visual =
+    normalized === "APPROVED"
+      ? {
+          label: "Approved",
+          className: "border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400",
+        }
+      : normalized === "CHANGES_REQUESTED"
+        ? {
+            label: "Changes requested",
+            className: "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400",
+          }
+        : normalized === "REVIEW_REQUIRED"
+          ? {
+              label: "Review required",
+              className: "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+            }
+          : null;
+  if (!visual) return null;
+  return (
+    <Badge
+      aria-label={`Review decision: ${visual.label}`}
+      className={cn("h-5 rounded-full border px-2 py-px text-xs leading-none", visual.className)}
+    >
+      {visual.label}
+    </Badge>
+  );
+}
+
+/** One review card: reviewer + state chip + relative time, then the body. */
+function GithubReviewCard({ review }: { review: GithubReview }) {
+  const ts = review.submitted_at ? Date.parse(review.submitted_at) : NaN;
+  const rel = relativeTime(ts);
+  const initial = review.author?.[0]?.toUpperCase() ?? "?";
+  const stateNorm = review.state?.toUpperCase() ?? "";
+  const stateVisual =
+    stateNorm === "APPROVED"
+      ? { label: "Approved", className: "text-green-700 dark:text-green-400" }
+      : stateNorm === "CHANGES_REQUESTED"
+        ? { label: "Changes requested", className: "text-red-700 dark:text-red-400" }
+        : stateNorm === "DISMISSED"
+          ? { label: "Dismissed", className: "text-muted-foreground" }
+          : stateNorm === "COMMENTED"
+            ? { label: "Commented", className: "text-foreground" }
+            : null;
+  return (
+    <li className="rounded-lg border border-border bg-muted/20 p-3">
+      <div className="mb-1.5 flex items-center gap-2 text-xs">
+        <span
+          aria-hidden
+          className="inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] font-semibold text-muted-foreground"
+        >
+          {initial}
+        </span>
+        <span className="min-w-0 truncate font-medium text-foreground">
+          {review.author ?? "unknown"}
+        </span>
+        {stateVisual && (
+          <span className={cn("shrink-0 font-medium", stateVisual.className)}>
+            {stateVisual.label}
+          </span>
+        )}
+        {rel && (
+          <span className="shrink-0 text-muted-foreground/70" title={absoluteTime(ts)}>
+            {rel}
+          </span>
+        )}
+        {review.url && (
+          <a
+            href={review.url}
+            target="_blank"
+            rel="noreferrer"
+            aria-label="Open review on GitHub"
+            className="ml-auto shrink-0 text-muted-foreground hover:text-foreground"
+          >
+            <ExternalLinkIcon className="size-3" />
+          </a>
+        )}
+      </div>
+      {review.body && (
+        <div className="text-ui break-words">
+          <MessageResponse>{review.body}</MessageResponse>
+        </div>
+      )}
+    </li>
+  );
+}
+
 /** The Summary tab body: CI checks, the PR description, then its comments. */
 function GithubSummaryTab({
   checks,
   body,
   comments,
+  reviewDecision,
+  reviews,
 }: {
   checks: GithubChecks;
   body: string | null | undefined;
   comments: GithubComment[];
+  reviewDecision: string | null | undefined;
+  reviews: GithubReview[];
 }) {
   return (
     // Extra bottom padding so the last comment can scroll clear of the very
@@ -610,6 +706,23 @@ function GithubSummaryTab({
           </div>
         ) : (
           <p className="text-ui text-muted-foreground italic">No description provided.</p>
+        )}
+      </section>
+      <section className="space-y-2">
+        <div className="flex items-center gap-2">
+          <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+            {reviews.length > 0 ? `Reviews (${reviews.length})` : "Reviews"}
+          </h3>
+          <ReviewDecisionBadge decision={reviewDecision} />
+        </div>
+        {reviews.length === 0 ? (
+          <p className="text-ui text-muted-foreground">No reviews yet.</p>
+        ) : (
+          <ul className="space-y-2">
+            {reviews.map((r, i) => (
+              <GithubReviewCard key={r.url ?? `${r.author}-${i}`} review={r} />
+            ))}
+          </ul>
         )}
       </section>
       <section className="space-y-2">
@@ -1313,6 +1426,7 @@ function GithubPanelDetails({
   const pr = data.pr!;
   const checks = pr.checks;
   const comments = pr.comments ?? [];
+  const reviews = pr.reviews ?? [];
 
   return (
     <TooltipProvider delayDuration={0}>
@@ -1368,7 +1482,13 @@ function GithubPanelDetails({
 
         {/* Summary: CI checks + the PR description + its conversation comments. */}
         <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
-          <GithubSummaryTab checks={checks} body={pr.body} comments={comments} />
+          <GithubSummaryTab
+            checks={checks}
+            body={pr.body}
+            comments={comments}
+            reviewDecision={pr.review_decision}
+            reviews={reviews}
+          />
         </TabsContent>
 
         {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll

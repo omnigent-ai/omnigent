@@ -255,6 +255,53 @@ describe("GithubPanel", () => {
     expect(screen.queryByTestId("diff")).toBeNull();
   });
 
+  it("shows an Approved review decision badge and reviews list", async () => {
+    state.info!.data!.pr!.review_decision = "APPROVED";
+    state.info!.data!.pr!.reviews = [
+      {
+        author: "bob",
+        state: "APPROVED",
+        body: "Looks great!",
+        submitted_at: "2026-09-10T10:00:00Z",
+        url: "https://example.com/pr/6000#review-1",
+      },
+    ];
+    renderPanel();
+    const badge = screen.getByLabelText("Review decision: Approved");
+    expect(badge).toHaveTextContent("Approved");
+    expect(badge).toHaveClass("text-green-700");
+    expect(screen.getByText("Reviews (1)")).toBeInTheDocument();
+    expect(screen.getByText("bob")).toBeInTheDocument();
+    expect(await screen.findByText("Looks great!")).toBeInTheDocument();
+    // "Approved" appears as both the decision badge and the review state chip.
+    expect(screen.getAllByText("Approved").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("shows a Changes requested badge", () => {
+    state.info!.data!.pr!.review_decision = "CHANGES_REQUESTED";
+    state.info!.data!.pr!.reviews = [];
+    renderPanel();
+    const badge = screen.getByLabelText("Review decision: Changes requested");
+    expect(badge).toHaveTextContent("Changes requested");
+    expect(badge).toHaveClass("text-red-700");
+  });
+
+  it("shows a Review required badge", () => {
+    state.info!.data!.pr!.review_decision = "REVIEW_REQUIRED";
+    state.info!.data!.pr!.reviews = [];
+    renderPanel();
+    const badge = screen.getByLabelText("Review decision: Review required");
+    expect(badge).toHaveTextContent("Review required");
+    expect(badge).toHaveClass("text-amber-700");
+  });
+
+  it("shows empty reviews state when there are no reviews", () => {
+    // Default fixture has no reviews or review_decision.
+    renderPanel();
+    expect(screen.getByText("No reviews yet.")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Review decision/)).toBeNull();
+  });
+
   it("reveals the stacked diff after switching to the Changes tab", async () => {
     renderPanel();
     expect(screen.queryByTestId("diff")).toBeNull();
