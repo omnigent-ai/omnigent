@@ -14,6 +14,8 @@ the header menu), and each place is a separate entry point.
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged.
+- `stop`: Stop session ends a host-launched parent and the sub-agents on its
+  runner without reporting their expected disconnect as a task failure.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
@@ -68,6 +70,10 @@ and send a follow-up after its parent runner is replaced.
 
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
+
+**Stop session:** open the native parent's sidebar menu and choose Stop session
+while a sub-agent is working. This ends the runner; the current-turn interrupt
+control is a separate action that leaves the session connected.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -144,6 +150,14 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
+- **`stop`, `archive`, active sub-agents (own environment):**
+  `tests/e2e/test_parent_stop_subagents_e2e.py::test_native_parent_teardown_preserves_child_outcome`
+  drives real Claude and Codex parents, native children, a host daemon, and its
+  dedicated runner through the public Stop/Archive APIs. Only model replies are
+  scripted. It waits through the production disconnect grace and includes a
+  real runner crash that must still report a failure. Requires both native
+  CLIs and tmux; Claude's machine-managed credentials require an isolated
+  container for the local model endpoint.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`

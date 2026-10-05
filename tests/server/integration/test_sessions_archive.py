@@ -297,7 +297,7 @@ async def test_archive_tears_down_host_spawned_runner(
         )
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
-        _sessions_common._intentional_stop_sessions.discard(session_id)
+        _sessions_common._intentional_stop_sessions.pop(session_id, None)
 
 
 async def test_failed_archive_leaves_session_running(

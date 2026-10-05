@@ -272,7 +272,8 @@ def sse_tool_call_response(
     Build a complete SSE stream for a function call response.
 
     :param tool_calls: List of tool call dicts, each with
-        ``"call_id"``, ``"name"``, and ``"arguments"`` keys.
+        ``"call_id"``, ``"name"``, and ``"arguments"`` keys, plus an optional
+        ``"namespace"`` for native Codex MCP calls.
     :param model: Model name to include in the response.
     :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string.
@@ -289,6 +290,7 @@ def sse_tool_call_response(
                 "name": tc["name"],
                 "arguments": tc.get("arguments", "{}"),
                 "status": "completed",
+                **({"namespace": tc["namespace"]} if "namespace" in tc else {}),
             }
         )
     response_obj = {
@@ -809,9 +811,10 @@ class QueuedResponse:
     # this text before the ``text`` block — scripts a turn where the model
     # visibly thinks before answering.
     thinking: str | None = None
-    # Seconds to sleep between SSE events on ``/v1/messages``. ``0`` keeps the
-    # historical single-chunk body; a small value paces the stream so live
-    # surfaces (a native TUI) visibly render intermediate deltas.
+    # Seconds to sleep between SSE events on ``/v1/messages`` and
+    # ``/v1/responses``. ``0`` keeps the historical single-chunk body; a small
+    # value paces the stream so live surfaces (a native TUI) visibly render
+    # intermediate deltas.
     chunk_delay: float = 0.0
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
@@ -1137,8 +1140,17 @@ async def create_response(
     if qr.truncate_after is not None:
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
+    chunk_delay = qr.chunk_delay
+
     async def _generate() -> AsyncIterator[str]:
-        yield sse_body
+        if chunk_delay > 0:
+            # Paced like ``/v1/messages``: one SSE event at a time.
+            for event in sse_body.split("\n\n"):
+                if event:
+                    yield event + "\n\n"
+                    await asyncio.sleep(chunk_delay)
+        else:
+            yield sse_body
 
     return StreamingResponse(
         _generate(),
