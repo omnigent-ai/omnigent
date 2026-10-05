@@ -135,8 +135,8 @@ class _Stream:
     def __exit__(self, exc_type, *_args):
         self.done.set()
         self.thread.join(timeout=35)
-        assert not self.thread.is_alive(), "SSE reader did not exit within its read timeout"
         if exc_type is None:
+            assert not self.thread.is_alive(), "SSE reader did not exit within its read timeout"
             self.check_error()
 
 
