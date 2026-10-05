@@ -467,6 +467,7 @@ def test_codex_catalog_fingerprint_changes_when_the_cli_is_upgraded(
     codex = tmp_path / "codex"
     codex.write_text("old build")
     codex.chmod(0o755)
+    monkeypatch.setattr("omnigent.config.load_effective_config", dict)
     # Resolve through the same override ladder the probe launches with.
     monkeypatch.setenv("OMNIGENT_CODEX_PATH", str(codex))
     launch = _default_codex_launch()

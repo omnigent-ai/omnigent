@@ -41,6 +41,7 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.errors import HarnessTransportClosedError
+from omnigent.harnesses.codex_native.invocation import CodexInvocation
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
@@ -550,12 +551,19 @@ def _find_codex_cli() -> str | None:
     return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
-async def _codex_cli_version_text(codex_path: str) -> str | None:
+def _as_codex_invocation(codex_path: str | CodexInvocation) -> CodexInvocation:
+    """Normalize legacy executable call sites to a bare invocation."""
+    if isinstance(codex_path, CodexInvocation):
+        return codex_path
+    return CodexInvocation(codex_path)
+
+
+async def _codex_cli_version_text(codex_path: str | CodexInvocation) -> str | None:
     """Return the exact version token reported by ``codex --version``."""
+    invocation = _as_codex_invocation(codex_path)
     try:
         proc = await _create_subprocess_exec(
-            codex_path,
-            "--version",
+            *invocation.argv("--version"),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -579,7 +587,9 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
     return match.group(1) if match is not None else None
 
 
-async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
+async def _codex_cli_version(
+    codex_path: str | CodexInvocation,
+) -> tuple[int, int, int] | None:
     """
     Return the codex CLI version as a ``(major, minor, patch)`` tuple.
 
@@ -1070,6 +1080,7 @@ def _populate_codex_home_config(
     supported_efforts: frozenset[str] = CODEX_EFFORTS,
     include_credentials: bool = True,
     required_brokered_probe: tuple[str, Path, OSEnvSpec] | None = None,
+    codex_invocation: CodexInvocation | None = None,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -1227,7 +1238,12 @@ def _populate_codex_home_config(
                 # Routed turns and spawns can land on an arm codex's bundled
                 # catalog has no entry for, which it then refuses client-side.
                 catalog_path = write_codex_model_catalog(
-                    target_dir, codex_path=_find_codex_cli(), source_home=source_dir
+                    target_dir,
+                    codex_path=(
+                        codex_invocation.executable if codex_invocation else _find_codex_cli()
+                    ),
+                    source_home=source_dir,
+                    codex_invocation=codex_invocation,
                 )
                 if catalog_path is not None:
                     set_codex_model_catalog_path(dest_path, catalog_path)
@@ -1729,7 +1745,7 @@ def extended_model_catalog(
 # Cached ``codex debug models`` result, keyed by (binary, CODEX_HOME). The
 # catalog is a property of the installed CLI, not of a session, so a successful
 # probe is paid once per host process rather than once per session.
-_MODEL_CATALOG_CACHE: dict[tuple[str, str, int, int], dict[str, Any]] = {}
+_MODEL_CATALOG_CACHE: dict[tuple[object, ...], dict[str, Any]] = {}
 
 # Failures are cached only briefly, keyed the same way and holding the
 # monotonic time the negative expires. Caching them forever turned one
@@ -1738,7 +1754,7 @@ _MODEL_CATALOG_CACHE: dict[tuple[str, str, int, int], dict[str, Any]] = {}
 # from every later session's ``spawn_agent``. Caching them not at all would pay
 # the full timeout per session on a genuinely broken CLI.
 _MODEL_CATALOG_FAILURE_TTL_S = 60.0
-_MODEL_CATALOG_FAILURES: dict[tuple[str, str, int, int], float] = {}
+_MODEL_CATALOG_FAILURES: dict[tuple[object, ...], float] = {}
 
 # Both caches are host-process globals reached from worker threads (every
 # caller populates a codex home through ``asyncio.to_thread``), and the probe
@@ -1748,7 +1764,33 @@ _MODEL_CATALOG_FAILURES: dict[tuple[str, str, int, int], float] = {}
 _MODEL_CATALOG_LOCK = threading.Lock()
 
 
-def _model_catalog_cache_key(codex_path: str, source_home: Path) -> tuple[str, str, int, int]:
+def _codex_invocation_identity(invocation: CodexInvocation) -> tuple[object, ...]:
+    """Capture executable metadata for a configured wrapper invocation."""
+    resolved_executable = (
+        invocation.executable
+        if os.path.isabs(invocation.executable)
+        else shutil.which(invocation.executable)
+    )
+    parts: list[object] = [
+        (
+            invocation.executable,
+            _codex_binary_identity(resolved_executable or invocation.executable),
+        )
+    ]
+    for arg in invocation.argv_prefix:
+        if "=" in arg or arg.startswith("-"):
+            continue
+        resolved = arg if os.path.isabs(arg) else shutil.which(arg)
+        parts.append((arg, _codex_binary_identity(resolved or arg)))
+    return tuple(parts)
+
+
+def _model_catalog_cache_key(
+    codex_path: str,
+    source_home: Path,
+    *,
+    codex_invocation: CodexInvocation | None = None,
+) -> tuple[object, ...]:
     """
     Key the catalog cache so an in-place codex upgrade re-probes.
 
@@ -1765,8 +1807,12 @@ def _model_catalog_cache_key(codex_path: str, source_home: Path) -> tuple[str, s
     try:
         stat = os.stat(codex_path)
     except OSError:
-        return (codex_path, str(source_home), -1, -1)
-    return (codex_path, str(source_home), stat.st_mtime_ns, stat.st_size)
+        key: tuple[object, ...] = (codex_path, str(source_home), -1, -1)
+    else:
+        key = (codex_path, str(source_home), stat.st_mtime_ns, stat.st_size)
+    if codex_invocation is not None and codex_invocation.argv_prefix:
+        return (*key, codex_invocation.argv_prefix, _codex_invocation_identity(codex_invocation))
+    return key
 
 
 def _valid_model_catalog(catalog: object) -> bool:
@@ -1810,6 +1856,7 @@ def read_codex_model_catalog(
     source_home: Path,
     *,
     timeout: float = 10.0,
+    codex_invocation: CodexInvocation | None = None,
 ) -> dict[str, Any] | None:
     """
     Ask the codex CLI for its own model catalog, once per host process.
@@ -1826,7 +1873,9 @@ def read_codex_model_catalog(
     :param timeout: Seconds to wait; a slow probe must not delay session boot.
     :returns: ``{"models": [...]}``, or ``None`` on any failure.
     """
-    cache_key = _model_catalog_cache_key(codex_path, source_home)
+    cache_key = _model_catalog_cache_key(
+        codex_path, source_home, codex_invocation=codex_invocation
+    )
     with _MODEL_CATALOG_LOCK:
         cached = _MODEL_CATALOG_CACHE.get(cache_key)
         if cached is not None:
@@ -1836,7 +1885,15 @@ def read_codex_model_catalog(
             if time.monotonic() < failed_until:
                 return None
             del _MODEL_CATALOG_FAILURES[cache_key]
-        catalog = _probe_codex_model_catalog(codex_path, source_home, timeout=timeout)
+        if codex_invocation is None or not codex_invocation.argv_prefix:
+            catalog = _probe_codex_model_catalog(codex_path, source_home, timeout=timeout)
+        else:
+            catalog = _probe_codex_model_catalog(
+                codex_path,
+                source_home,
+                timeout=timeout,
+                codex_invocation=codex_invocation,
+            )
         if catalog is None:
             _MODEL_CATALOG_FAILURES[cache_key] = time.monotonic() + _MODEL_CATALOG_FAILURE_TTL_S
             return None
@@ -1849,11 +1906,13 @@ def _probe_codex_model_catalog(
     source_home: Path,
     *,
     timeout: float,
+    codex_invocation: CodexInvocation | None = None,
 ) -> dict[str, Any] | None:
     """Run ``codex debug models``, returning ``None`` on any failure."""
     try:
+        invocation = codex_invocation or CodexInvocation(codex_path)
         completed = subprocess.run(
-            [codex_path, "debug", "models"],
+            list(invocation.argv("debug", "models")),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -1886,6 +1945,7 @@ def write_codex_model_catalog(
     *,
     codex_path: str | None,
     source_home: Path,
+    codex_invocation: CodexInvocation | None = None,
 ) -> Path | None:
     """
     Give the session a model catalog its ``spawn_agent`` can route across.
@@ -1906,7 +1966,11 @@ def write_codex_model_catalog(
     """
     if codex_path is None:
         return None
-    catalog = read_codex_model_catalog(codex_path, source_home)
+    catalog = read_codex_model_catalog(
+        codex_path,
+        source_home,
+        codex_invocation=codex_invocation,
+    )
     if catalog is None:
         return None
     extended = extended_model_catalog(catalog)
@@ -1964,6 +2028,7 @@ def write_required_brokered_model_catalog(
     *,
     codex_path: str,
     timeout: float = 10.0,
+    codex_invocation: CodexInvocation | None = None,
 ) -> Path:
     """Write the bundled Codex catalog required by a brokered session."""
     env = {
@@ -1975,8 +2040,9 @@ def write_required_brokered_model_catalog(
     env["HOME"] = str(target_dir)
     env["CODEX_HOME"] = str(target_dir)
     try:
+        invocation = codex_invocation or CodexInvocation(codex_path)
         completed = subprocess.run(
-            [codex_path, "debug", "models", "--bundled"],
+            list(invocation.argv("debug", "models", "--bundled")),
             capture_output=True,
             timeout=timeout,
             env=env,

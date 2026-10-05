@@ -22,6 +22,12 @@ from tests.harnesses.codex_native.app_server._support import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_startup_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep launch-shape tests independent of the developer's config.yaml."""
+    monkeypatch.setattr("omnigent.config.load_effective_config", dict)
+
+
 def test_build_codex_native_server_profile_error_names_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -4505,6 +4505,11 @@ async def _launch_codex_native_tui(
     login_required: bool = False,
 ) -> _CodexNativeTuiLaunch:
     """Attach a terminal to an app-server without owning its lifecycle."""
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import (
+        resolve_harness_args,
+        resolve_harness_config,
+    )
     from omnigent.harnesses.codex_native.app_server import (
         _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
         _format_codex_version,
@@ -4540,24 +4545,26 @@ async def _launch_codex_native_tui(
             or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
         ),
     )
-    # Apply configured wrappers to both cold start and recovery.
-    from omnigent.config import load_effective_config
-    from omnigent.harness_startup_config import (
-        resolve_harness_args,
-        resolve_harness_config,
-    )
-
+    # Reuse the invocation that started the app-server so a configured wrapper
+    # is applied once to the TUI and once to the server, never doubled.
+    configured_invocation = getattr(app_server, "codex_invocation", None)
     _codex_harness_cfg = load_effective_config()
-    # Honor configured wrappers while keeping the host-provisioned binary
-    # immune to ambient OMNIGENT_CODEX_PATH overrides.
-    _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
-    _codex_cmd_override = (_codex_overrides.get("codex-native") or {}).get("command")
-    configured_codex_command = (
-        _codex_cmd_override.strip()
-        if isinstance(_codex_cmd_override, str) and _codex_cmd_override.strip()
-        else None
-    )
-    codex_command = configured_codex_command or app_server.codex_path
+    if configured_invocation is not None:
+        codex_command = configured_invocation.executable
+        configured_codex_command = codex_command if configured_invocation.configured else None
+        configured_prefix = list(configured_invocation.argv_prefix)
+        configured_args_resolved = True
+    else:
+        _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
+        _codex_cmd_override = (_codex_overrides.get("codex-native") or {}).get("command")
+        configured_codex_command = (
+            _codex_cmd_override.strip()
+            if isinstance(_codex_cmd_override, str) and _codex_cmd_override.strip()
+            else None
+        )
+        codex_command = configured_codex_command or app_server.codex_path
+        configured_prefix = []
+        configured_args_resolved = False
     thread_start_timeout_seconds = (
         CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
         if configured_codex_command is not None and not login_required
@@ -4587,9 +4594,12 @@ async def _launch_codex_native_tui(
                 thread_start_timeout_seconds,
                 session_id,
             )
-    codex_launch_args = resolve_harness_args(
-        "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
-    )
+    if configured_args_resolved:
+        codex_launch_args = [*configured_prefix, *codex_remote_args]
+    else:
+        codex_launch_args = resolve_harness_args(
+            "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
+        )
     loggable_launch_args = shlex.join(redact_codex_launch_args(codex_launch_args))
     _logger.info(
         "Codex terminal launch: session=%s command=%s codex_cli_version=%s resume=%s args=%s",
@@ -4760,6 +4770,7 @@ async def _auto_create_codex_terminal(
         write_bridge_startup_timeout,
         write_bridge_state,
     )
+    from omnigent.harnesses.codex_native.invocation import resolve_codex_invocation
     from omnigent.inner.codex_executor import codex_extended_catalog_env
 
     launch_config = await _codex_native_launch_config(
@@ -4822,9 +4833,8 @@ async def _auto_create_codex_terminal(
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
     codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
-    from omnigent.inner.codex_executor import _find_codex_cli
-
-    _codex_cli_path = _find_codex_cli()
+    _codex_invocation = resolve_codex_invocation()
+    _codex_cli_path = _codex_invocation.executable
     _catalog_launch = None
     _fresh_codex_catalog: list[_JsonObject] | None = None
     try:
@@ -4837,6 +4847,7 @@ async def _auto_create_codex_terminal(
         _fresh_codex_catalog = fresh_codex_launch_catalog(
             codex_path=_codex_cli_path,
             launch=_catalog_launch,
+            codex_invocation=_codex_invocation,
         )
     except Exception:  # noqa: BLE001 — startup falls back to codex's migration probe
         _logger.debug(
@@ -4877,10 +4888,14 @@ async def _auto_create_codex_terminal(
             # Read staleness before the fetch can start a background probe.
             # The fingerprint and probe must use this session's provider.
             _codex_catalog_was_stale = await codex_launch_catalog_is_stale(
-                codex_path=_codex_cli_path, launch=_catalog_launch
+                codex_path=_codex_cli_path,
+                launch=_catalog_launch,
+                codex_invocation=_codex_invocation,
             )
             _codex_catalog = await codex_launch_catalog(
-                codex_path=_codex_cli_path, launch=_catalog_launch
+                codex_path=_codex_cli_path,
+                launch=_catalog_launch,
+                codex_invocation=_codex_invocation,
             )
         except Exception:  # noqa: BLE001 — discovery must not prevent a launch
             _logger.warning(
@@ -4895,7 +4910,9 @@ async def _auto_create_codex_terminal(
             fresh_rows = _codex_catalog
             if reachable is None and _codex_catalog_was_stale:
                 fresh_rows = await codex_reprobed_launch_catalog(
-                    codex_path=_codex_cli_path, launch=_catalog_launch
+                    codex_path=_codex_cli_path,
+                    launch=_catalog_launch,
+                    codex_invocation=_codex_invocation,
                 )
                 if fresh_rows:
                     _codex_catalog = fresh_rows
@@ -5237,6 +5254,7 @@ async def _auto_create_codex_terminal(
         cwd=Path(workspace),
         model=_codex_launch.model,
         profile=_codex_launch.profile,
+        codex_invocation=_codex_invocation,
         extra_config_overrides=[*_codex_launch.config_overrides, *mcp_overrides],
         bridge_dir=bridge_dir,
         ap_server_url=launch_config.policy_server_url,

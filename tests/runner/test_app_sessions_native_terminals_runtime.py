@@ -440,6 +440,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     """
     import omnigent.harness_startup_config as startup_config_mod
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.harnesses.codex_native.invocation import CodexInvocation
     from omnigent.runner import app as runner_app_mod
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
@@ -516,6 +517,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version = version
+        codex_invocation = CodexInvocation("codex-wrapper", ("codex", "--"), configured=True)
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -683,6 +685,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         "build_codex_native_server",
         _fake_build_codex_native_server,
     )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.invocation.resolve_codex_invocation",
+        lambda: _FakeCodexAppServer.codex_invocation,
+    )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
@@ -740,6 +746,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     )
     assert app_server.codex_home == expected_codex_home
     assert build_calls[0]["model"] == "gpt-5.4-mini"
+    assert build_calls[0]["codex_invocation"] == _FakeCodexAppServer.codex_invocation
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
     assert build_calls[0]["trust_project"] is True
     assert build_calls[0]["reconcile_process_registry"] is False
@@ -752,6 +759,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "codex-wrapper"
+    assert launched.args[:2] == ["codex", "--"]
+    assert launched.args.count("codex") == 1
     # Older TUIs still need permission flags; Codex 0.154+ rejects them.
     assert launched.args == [
         "codex",
