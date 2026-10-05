@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from omnigent_slack.models import ThreadKey
-from omnigent_slack.omnigent import ClientAuth, OmnigentClient, OmnigentError
+from omnigent_slack.omnigent import (
+    ClientAuth,
+    OmnigentClient,
+    OmnigentError,
+    ServerUnreachableError,
+)
 from omnigent_slack.resume import parse_resume, recap
 from omnigent_slack.service import SlackOmnigentService
 from omnigent_slack.store import SQLiteStore
@@ -93,7 +98,7 @@ async def test_binding_conflict_force_idempotency(store):
 async def test_binding_inflight_and_other_owner(store):
     await bind(store)
     await store.set_turn_inflight(KEY, True)
-    assert (await bind(store, OTHER, force=True))[0] == "conflict"
+    assert (await bind(store, OTHER, force=True))[0] == "busy"
     assert (
         await store.bind_session(
             OTHER,
@@ -227,7 +232,7 @@ async def test_inaccessible(environment, store, status):
 
 @pytest.mark.parametrize(
     "field,value,expected",
-    [("permission_level", 1, "edit access"), ("archived", True, "Unarchive")],
+    [("permission_level", 1, "Session unavailable"), ("archived", True, "Unarchive")],
 )
 async def test_rejected_snapshot(environment, store, field, value, expected):
     environment[2]["snapshot"][field] = value
@@ -388,3 +393,219 @@ async def test_recovery_refreshes_assigned_host(environment, store):
         "/new_repo",
         "managed",
     )
+
+
+async def test_null_permissions_allow_authenticated_resume(environment, store):
+    environment[2]["snapshot"]["permission_level"] = None
+    assert "Ready" in await resume(environment)
+    assert (await store.get_session(KEY)).session_id == "conv_a"
+
+
+async def test_read_only_not_found_and_forbidden_share_exact_message(environment):
+    service, slack, state, _ = environment
+    replies = []
+    for status, level in [(200, 1), (403, 3), (404, 3)]:
+        slack.reset_mock()
+        state["status"] = status
+        state["snapshot"]["permission_level"] = level
+        await resume(environment)
+        replies.append(slack.chat_postMessage.call_args.kwargs["text"])
+        assert not service._active_threads
+    assert len(set(replies)) == 1
+
+
+async def test_idempotent_repeat_has_no_recap_recovery_or_input(environment, store):
+    await resume(environment)
+    service, slack, state, omni = environment
+    before = await store.get_session(KEY)
+    state["requests"].clear()
+    slack.reset_mock()
+    omni.recover_session = AsyncMock()
+    text = await resume(environment)
+    assert "already connected" in text
+    assert slack.chat_postMessage.await_count == 1
+    assert await store.get_session(KEY) == before
+    assert all(r.method == "GET" and not r.url.path.endswith("/items") for r in state["requests"])
+    omni.recover_session.assert_not_awaited()
+    assert not service._active_threads
+
+
+@pytest.mark.parametrize("stage", ["snapshot", "recovery"])
+async def test_resume_reserves_destination_through_read_and_recovery(environment, store, stage):
+    from unittest.mock import Mock
+
+    service, slack, state, omni = environment
+    entered, release = asyncio.Event(), asyncio.Event()
+    snapshot = {**state["snapshot"], "runner_online": True}
+
+    async def pause(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return snapshot
+
+    if stage == "snapshot":
+        omni.resume_snapshot = pause
+    else:
+        state["snapshot"]["runner_online"] = False
+        omni.recover_session = pause
+    service._spawn_turn = Mock()
+    task = asyncio.create_task(resume(environment))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert KEY in service._active_threads
+        await service._route_turn(
+            key=KEY, event={"user": "U1"}, text="continue", client=slack, in_channel=False
+        )
+        service._spawn_turn.assert_not_called()
+        assert not any(r.method == "POST" for r in state["requests"])
+        if stage == "snapshot":
+            assert await store.get_session(KEY) is None
+        release.set()
+        assert "Ready" in await asyncio.wait_for(task, 2)
+        assert (await store.get_session(KEY)).session_id == "conv_a"
+    finally:
+        release.set()
+        await task
+    assert not service._active_threads
+
+
+async def test_force_refuses_turn_reserved_after_resume_snapshot(environment, store, monkeypatch):
+    from unittest.mock import Mock
+
+    await resume(environment)
+    service, slack, _, _ = environment
+    original_bind = store.bind_session
+    service._spawn_turn = Mock()
+
+    async def racing_bind(*args, **kwargs):
+        await service._route_turn(
+            key=KEY, event={"user": "U1"}, text="continue", client=slack, in_channel=False
+        )
+        assert KEY in service._active_threads
+        assert not (await store.get_session(KEY)).turn_inflight
+        return await original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(store, "bind_session", racing_bind)
+    assert "existing Slack thread is busy" in await resume(
+        environment, OTHER, "resume conv_a --force"
+    )
+    assert (await store.get_session(KEY)).session_id == "conv_a"
+    assert await store.get_session(OTHER) is None
+    assert OTHER not in service._active_threads
+    service._spawn_turn.assert_called_once()
+    service._active_threads.discard(KEY)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_force_reserves_old_thread_during_transaction(
+    environment, store, monkeypatch, cancel
+):
+    from unittest.mock import Mock
+
+    import aiosqlite
+
+    await resume(environment)
+    service, slack, _, _ = environment
+    entered, release = asyncio.Event(), asyncio.Event()
+    execute = aiosqlite.Connection.execute
+
+    async def pause_delete(connection, sql, *args, **kwargs):
+        if sql.startswith("DELETE FROM thread_sessions WHERE omnigent_session_id"):
+            entered.set()
+            await release.wait()
+        return await execute(connection, sql, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", pause_delete)
+    service._spawn_turn = Mock()
+    task = asyncio.create_task(resume(environment, OTHER, "resume conv_a --force"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert {KEY, OTHER} <= service._active_threads
+        await service._route_turn(
+            key=KEY, event={"user": "U1"}, text="continue", client=slack, in_channel=False
+        )
+        service._spawn_turn.assert_not_called()
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            release.set()
+            assert "Ready" in await asyncio.wait_for(task, 2)
+    finally:
+        release.set()
+        if not task.cancelled():
+            await task
+    assert not service._active_threads
+    if cancel:
+        assert (await store.get_session(KEY)).session_id == "conv_a"
+        assert await store.get_session(OTHER) is None
+    else:
+        assert await store.get_session(KEY) is None
+        assert (await store.get_session(OTHER)).session_id == "conv_a"
+
+
+async def test_cancelled_resume_releases_destination(environment, store):
+    service, _, _, omni = environment
+    entered = asyncio.Event()
+
+    async def pause(_session):
+        entered.set()
+        await asyncio.Event().wait()
+
+    omni.resume_snapshot = pause
+    task = asyncio.create_task(resume(environment))
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not service._active_threads
+    assert await store.get_session(KEY) is None
+
+
+@pytest.mark.parametrize("error_type", [OmnigentError, ServerUnreachableError])
+async def test_resume_scrubs_transport_details(environment, error_type):
+    environment[3].resume_snapshot = AsyncMock(
+        side_effect=error_type("https://private-server.example:1234/internal timeout detail")
+    )
+    text = await resume(environment)
+    assert text == "Could not resume the session. Check Omnigent and try again."
+    assert "private-server" not in text and "timeout detail" not in text
+    assert not environment[0]._active_threads
+
+
+@pytest.mark.parametrize(
+    "outcome", ["same", "occupied", "unavailable", "conflict", "busy", "reserved"]
+)
+async def test_bind_early_returns_rollback(store, monkeypatch, outcome):
+    import aiosqlite
+
+    await bind(store)
+    if outcome == "busy":
+        await store.set_turn_inflight(KEY, True)
+    rollback = aiosqlite.Connection.rollback
+    rolled_back = []
+
+    async def record_rollback(connection):
+        rolled_back.append(connection)
+        await rollback(connection)
+
+    monkeypatch.setattr(aiosqlite.Connection, "rollback", record_rollback)
+    kwargs = {
+        "owner_user_id": "U2" if outcome == "unavailable" else "U1",
+        "host_id": None,
+        "workspace": None,
+        "host_type": "external",
+        "force": outcome in ("busy", "reserved"),
+    }
+    if outcome == "reserved":
+        kwargs["reserve_previous"] = lambda _key: False
+    result = await store.bind_session(
+        KEY if outcome in ("same", "occupied") else OTHER,
+        "conv_b" if outcome == "occupied" else "conv_a",
+        "title",
+        **kwargs,
+    )
+    assert result[0] == ("busy" if outcome == "reserved" else outcome)
+    assert len(rolled_back) == 1
+    assert (await store.get_session(KEY)).session_id == "conv_a"

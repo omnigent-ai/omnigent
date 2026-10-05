@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -192,7 +193,7 @@ class SQLiteStore:
     ) -> None:
         now = int(time.time())
         async with aiosqlite.connect(self._path) as db:
-            await db.execute(
+            cursor = await db.execute(
                 """
                 INSERT INTO thread_sessions (
                     team_id, channel_id, thread_ts, omnigent_session_id,
@@ -208,6 +209,7 @@ class SQLiteStore:
                     workspace = excluded.workspace,
                     host_type = excluded.host_type,
                     updated_at = excluded.updated_at
+                WHERE thread_sessions.omnigent_session_id = excluded.omnigent_session_id
                 """,
                 (
                     key.team_id,
@@ -223,6 +225,9 @@ class SQLiteStore:
                     now,
                 ),
             )
+            if cursor.rowcount == 0:
+                await db.rollback()
+                raise aiosqlite.IntegrityError("Thread is already bound to another session")
             await db.commit()
 
     async def session_binding(self, session_id: str) -> ThreadKey | None:
@@ -246,6 +251,7 @@ class SQLiteStore:
         workspace: str | None,
         host_type: HostType,
         force: bool = False,
+        reserve_previous: Callable[[ThreadKey], bool] | None = None,
     ) -> tuple[str, ThreadKey | None]:
         """Atomically bind, refusing occupied destinations and conflicting owners."""
         async with aiosqlite.connect(self._path) as db:
@@ -257,6 +263,7 @@ class SQLiteStore:
             )
             destination = await cursor.fetchone()
             if destination:
+                await db.rollback()
                 return (
                     "same"
                     if destination[0] == session_id and destination[1] == owner_user_id
@@ -270,9 +277,17 @@ class SQLiteStore:
             row = await cursor.fetchone()
             previous = ThreadKey(*row[:3]) if row else None
             if row and (row[3] != owner_user_id or row[0] != key.team_id):
+                await db.rollback()
                 return "unavailable", None
-            if row and (not force or row[4]):
+            if row and not force:
+                await db.rollback()
                 return "conflict", previous
+            if row and (
+                row[4]
+                or (reserve_previous is not None and not reserve_previous(ThreadKey(*row[:3])))
+            ):
+                await db.rollback()
+                return "busy", previous
             await db.execute(
                 "DELETE FROM thread_sessions WHERE omnigent_session_id = ?",
                 (session_id,),

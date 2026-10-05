@@ -41,6 +41,7 @@ from omnigent_slack.events import (
     iter_sse_events,
     session_status,
 )
+from omnigent_slack.resume import SESSION_UNAVAILABLE_TEXT, ResumeError
 
 __all__ = [
     "AuthRequiredError",
@@ -1099,16 +1100,16 @@ class OmnigentClient:
             params={"include_items": "false", "include_usage": "false"},
         )
         if response.status_code in (403, 404):
-            raise OmnigentError(
-                "Session unavailable. Check the ID and server, and sign in as a user "
-                "with access; the session may have been deleted."
-            )
+            raise ResumeError(SESSION_UNAVAILABLE_TEXT)
         await _raise_for_status(response)
         snapshot = response.json()
-        if not isinstance(snapshot, dict) or (snapshot.get("permission_level") or 0) < 2:
-            raise OmnigentError("Session unavailable. Ask its owner for edit access.")
+        if not isinstance(snapshot, dict):
+            raise ResumeError(SESSION_UNAVAILABLE_TEXT)
+        level = snapshot.get("permission_level")
+        if isinstance(level, (int, float)) and level < 2:
+            raise ResumeError(SESSION_UNAVAILABLE_TEXT)
         if snapshot.get("archived"):
-            raise OmnigentError("Unarchive this session in Omnigent before resuming it.")
+            raise ResumeError("Unarchive this session in Omnigent before resuming it.")
         return snapshot
 
     async def recent_messages(self, session_id: str) -> list[dict[str, Any]]:

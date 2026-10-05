@@ -40,7 +40,7 @@ from omnigent_slack.omnigent import (
     extract_policy_denied,
     extract_todos,
 )
-from omnigent_slack.resume import parse_resume, recap
+from omnigent_slack.resume import ResumeError, parse_resume, recap
 from omnigent_slack.setup import SetupFlow, host_unavailable_text
 from omnigent_slack.store import SQLiteStore
 from omnigent_slack.streaming import (
@@ -614,6 +614,27 @@ class SlackOmnigentService:
         requester: str,
         client: Any,
     ) -> None:
+        if key in self._active_threads:
+            await client.chat_postMessage(
+                channel=key.channel_id,
+                thread_ts=key.thread_ts,
+                text="This thread is busy. Wait for its current turn before resuming.",
+            )
+            return
+        self._active_threads.add(key)
+        try:
+            await self._resume_reserved(key=key, text=text, requester=requester, client=client)
+        finally:
+            self._active_threads.discard(key)
+
+    async def _resume_reserved(
+        self,
+        *,
+        key: ThreadKey,
+        text: str,
+        requester: str,
+        client: Any,
+    ) -> None:
         async def post(message: str) -> None:
             await client.chat_postMessage(
                 channel=key.channel_id,
@@ -623,6 +644,15 @@ class SlackOmnigentService:
                 unfurl_links=False,
                 unfurl_media=False,
             )
+
+        rebind_reservations: set[ThreadKey] = set()
+
+        def reserve_previous(previous: ThreadKey) -> bool:
+            if previous in self._active_threads:
+                return False
+            self._active_threads.add(previous)
+            rebind_reservations.add(previous)
+            return True
 
         try:
             session_id, force = parse_resume(text, self._notifier._session_web_link("ID"))
@@ -635,17 +665,10 @@ class SlackOmnigentService:
             if destination and destination.owner_user_id != requester:
                 await self._notifier.notify_non_owner(client, key, requester)
                 return
-            if key in self._active_threads:
-                await post("This thread is busy. Wait for its current turn before resuming.")
-                return
             host_id = snapshot.get("host_id")
             host_type: HostType = (
                 "managed" if snapshot.get("host_type") == "managed" else "external"
             )
-            previous_key = await self._store.session_binding(session_id)
-            if force and previous_key in self._active_threads:
-                await post("The existing Slack thread is busy. Wait before moving its session.")
-                return
             outcome, previous = await self._store.bind_session(
                 key,
                 session_id,
@@ -655,7 +678,11 @@ class SlackOmnigentService:
                 workspace=snapshot.get("workspace"),
                 host_type=host_type,
                 force=force,
+                reserve_previous=reserve_previous,
             )
+            if outcome == "busy":
+                await post("The existing Slack thread is busy. Wait before moving its session.")
+                return
             if outcome == "same":
                 await self._store.refresh_session_metadata(
                     key,
@@ -759,8 +786,14 @@ class SlackOmnigentService:
                 "Sign in with `/omnigent` using the Omnigent account that has "
                 "edit access, then retry resume."
             )
-        except OmnigentError as exc:
+        except ResumeError as exc:
             await post(str(exc))
+        except OmnigentError:
+            self._logger.exception("Resume failed thread=%s", key.display())
+            await post("Could not resume the session. Check Omnigent and try again.")
+        finally:
+            for previous in rebind_reservations:
+                self._active_threads.discard(previous)
 
     def _spawn_turn(self, turn: SlackTurn) -> None:
         """Run a reserved turn as a background task, tracked for shutdown.

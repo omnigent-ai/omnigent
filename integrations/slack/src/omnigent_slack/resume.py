@@ -5,11 +5,20 @@ from urllib.parse import urlsplit
 
 from omnigent_slack.events import OmnigentError
 
+SESSION_UNAVAILABLE_TEXT = (
+    "Session unavailable. Check the ID and server, and sign in as a user "
+    "with access; the session may have been deleted."
+)
+
+
+class ResumeError(OmnigentError):
+    """Curated resume guidance that is safe to display in Slack."""
+
 
 def parse_resume(text: str, web_link: str) -> tuple[str, bool]:
     parts = text.split()
     if len(parts) not in (2, 3) or (len(parts) == 3 and parts[2] != "--force"):
-        raise OmnigentError("Use resume <session_id or Omnigent web URL> [--force].")
+        raise ResumeError("Use resume <session_id or Omnigent web URL> [--force].")
     target = parts[1]
     if target.startswith("<") and target.endswith(">"):
         target = target[1:-1].split("|", 1)[0]
@@ -20,16 +29,16 @@ def parse_resume(text: str, web_link: str) -> tuple[str, bool]:
             expected.scheme,
             expected.netloc,
         ) or not supplied.path.startswith(prefix):
-            raise OmnigentError(
+            raise ResumeError(
                 "That URL belongs to another server. Use this bot's configured Omnigent server."
             )
         if supplied.query != expected.query:
-            raise OmnigentError(
+            raise ResumeError(
                 "That URL belongs to another workspace. Use this bot's configured workspace."
             )
         target = supplied.path[len(prefix) :]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", target):
-        raise OmnigentError("Invalid session ID. Copy the ID or conversation URL from Omnigent.")
+        raise ResumeError("Invalid session ID. Copy the ID or conversation URL from Omnigent.")
     return target, len(parts) == 3
 
 
