@@ -527,6 +527,7 @@ async def test_release_reaps_term_resistant_process_when_graceful_wait_is_cancel
     manager._spawn_locks = {"conv_real": asyncio.Lock()}
     manager._registry_lock = asyncio.Lock()
     manager._release_generations = {}
+    manager._in_flight_response_ids = {}
     entry = process_manager_module._SubprocessEntry(
         process,
         _Client(),
@@ -626,6 +627,7 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
     manager._spawn_locks = {"conv_a": asyncio.Lock()}
     manager._registry_lock = asyncio.Lock()
     manager._release_generations = {}
+    manager._in_flight_response_ids = {}
     entry = process_manager_module._SubprocessEntry(
         process,
         client,
