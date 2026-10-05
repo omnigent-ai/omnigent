@@ -15,16 +15,27 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { fetchFileContent } from "@/hooks/useFileContent";
+import { DESIGN_SYSTEM_POINTER } from "@/lib/designSystem";
+import { isOwnerLevel } from "@/lib/permissionsApi";
+import { getSessionSlim } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
 import {
+  DESIGN_KIT_DIR,
   HTML_PREVIEW_SANDBOX,
   SLIDES_EDITABLE_SELECTOR,
   SLIDES_MSG_SOURCE,
   countSlideSections,
-  loadDesignKit,
   prepareSlidesDoc,
-  type DesignKitState,
+  type KitFile,
 } from "./codeViewerHelpers";
+import {
+  NO_BRANDING,
+  dsNotApplied,
+  kitNotApplied,
+  loadDeckBranding,
+  withNotice,
+  type DeckBranding,
+} from "./deckBranding";
 import { TruncatedBanner } from "./TruncatedBanner";
 
 // Fixed 16:9 stage; the iframe renders at this size and is scaled to fit.
@@ -48,19 +59,25 @@ export function isIgnoredNavKey(e: {
   return e.target instanceof Element && !!e.target.closest(SLIDES_EDITABLE_SELECTOR);
 }
 
-// A stalled kit read must not leave the deck blank.
+// A stalled kit or design-system read must not leave the deck blank. A full
+// design system loads more files, so it gets longer once it is found.
 export const DESIGN_KIT_TIMEOUT_MS = 2000;
-const NO_KIT: DesignKitState = { status: "none" };
-const KIT_TIMED_OUT: DesignKitState = { status: "error", reason: "design kit timed out" };
+export const DESIGN_SYSTEM_TIMEOUT_MS = 10_000;
+const KIT_TIMED_OUT = withNotice(kitNotApplied("design kit timed out"));
+const SYSTEM_TIMED_OUT = withNotice(dsNotApplied("design system timed out"));
 
-/** Workspace file read for the kit loader; a 404 means "no such file". */
-async function readKitFile(conversationId: string, path: string) {
+/** Workspace or absolute file read for the branding loader; a 404 means "no such file". */
+async function readKitFile(conversationId: string, path: string): Promise<KitFile | null> {
   try {
     return await fetchFileContent(conversationId, path);
   } catch (e) {
     if (e instanceof Error && e.message.startsWith("404")) return null;
     throw e;
   }
+}
+
+async function isSessionOwner(conversationId: string): Promise<boolean> {
+  return isOwnerLevel((await getSessionSlim(conversationId)).permissionLevel);
 }
 
 export interface SlidesViewerProps {
@@ -82,30 +99,61 @@ export function SlidesViewer({
   const stageRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const sourceTotal = useMemo(() => countSlideSections(content), [content]);
-  // Hold the deck blank until this session's kit resolves so it never flashes
-  // unbranded; a kit loaded for another session counts as not loaded.
-  const [loaded, setLoaded] = useState<{ id: string; kit: DesignKitState } | null>(null);
-  const kit = !conversationId ? NO_KIT : loaded?.id === conversationId ? loaded.kit : null;
+  // Hold the deck blank until this session's branding resolves so it never
+  // flashes unbranded; branding loaded for another session counts as not loaded.
+  const [loaded, setLoaded] = useState<{ id: string; branding: DeckBranding } | null>(null);
+  const branding = !conversationId
+    ? NO_BRANDING
+    : loaded?.id === conversationId
+      ? loaded.branding
+      : null;
+  // Design-system files are read once per session, not on every deck write.
+  const systemReads = useRef<{ id: string; files: Map<string, Promise<KitFile | null>> }>(null);
   useEffect(() => {
     if (!conversationId) return;
+    if (systemReads.current?.id !== conversationId) {
+      systemReads.current = { id: conversationId, files: new Map() };
+    }
+    const cache = systemReads.current.files;
+    const read = (path: string) => {
+      if (path === DESIGN_SYSTEM_POINTER || path.startsWith(`${DESIGN_KIT_DIR}/`)) {
+        return readKitFile(conversationId, path);
+      }
+      let file = cache.get(path);
+      if (!file) {
+        file = readKitFile(conversationId, path);
+        file.catch(() => cache.delete(path));
+        cache.set(path, file);
+      }
+      return file;
+    };
     let cancelled = false;
-    const finish = (k: DesignKitState) => {
+    const finish = (b: DeckBranding) => {
       if (cancelled) return;
       cancelled = true;
-      setLoaded({ id: conversationId, kit: k });
+      setLoaded({ id: conversationId, branding: b });
     };
-    const timer = setTimeout(() => finish(KIT_TIMED_OUT), DESIGN_KIT_TIMEOUT_MS);
-    void loadDesignKit((p) => readKitFile(conversationId, p)).then(finish);
+    let timer = setTimeout(() => finish(KIT_TIMED_OUT), DESIGN_KIT_TIMEOUT_MS);
+    void loadDeckBranding(content, {
+      read,
+      isOwner: () => isSessionOwner(conversationId),
+      onDesignSystem: () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => finish(SYSTEM_TIMED_OUT), DESIGN_SYSTEM_TIMEOUT_MS);
+      },
+    }).then(finish);
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
   }, [conversationId, content]);
-  const kitReady = kit !== null;
-  const kitStyle = kit?.status === "ok" ? kit.style : "";
+  const brandingReady = branding !== null;
+  const deckContent = branding?.content ?? content;
+  const kitStyle = branding?.kitStyle ?? "";
+  const systemStyle = branding?.systemStyle ?? "";
   const srcDoc = useMemo(
-    () => (kitReady ? prepareSlidesDoc(content, kitStyle) : ""),
-    [content, kitReady, kitStyle],
+    () => (brandingReady ? prepareSlidesDoc(deckContent, kitStyle, systemStyle) : ""),
+    [deckContent, brandingReady, kitStyle, systemStyle],
   );
   // The iframe's runtime count wins once it reports for the current document.
   const [runtime, setRuntime] = useState<{ srcDoc: string; total: number } | null>(null);
@@ -210,13 +258,13 @@ export function SlidesViewer({
       className="flex h-full flex-col bg-background outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
     >
       {truncated && <TruncatedBanner />}
-      {kit?.status === "error" && (
+      {branding?.notice && (
         <div
           role="status"
           className="shrink-0 truncate border-b border-border bg-muted px-3 py-1 text-ui text-muted-foreground"
-          title={kit.reason}
+          title={branding.notice}
         >
-          Design kit not applied: {kit.reason}
+          {branding.notice}
         </div>
       )}
       {empty && (
@@ -279,13 +327,13 @@ export function SlidesViewer({
             </Button>
           </div>
           <div className="flex min-w-0 items-center gap-1">
-            {kit?.status === "ok" && (
+            {branding?.badge && (
               <span
                 className="flex min-w-0 items-center gap-1 px-1"
-                title={`Design kit: ${kit.name}`}
+                title={`${branding.badge.kind === "kit" ? "Design kit" : "Design system"}: ${branding.badge.name}`}
               >
                 <PaletteIcon className="size-3.5 shrink-0" aria-hidden />
-                <span className="max-w-32 truncate max-sm:sr-only">{kit.name}</span>
+                <span className="max-w-32 truncate max-sm:sr-only">{branding.badge.name}</span>
               </span>
             )}
             <Button

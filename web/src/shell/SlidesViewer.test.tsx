@@ -3,7 +3,7 @@
 // state, Source toggle, print, and fullscreen visibility.
 
 import { act, cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchFileContent, type FileContentResponse } from "@/hooks/useFileContent";
 import {
   HTML_PREVIEW_HEAD,
@@ -18,14 +18,19 @@ import {
   prepareSlidesDoc,
   type KitFile,
 } from "./codeViewerHelpers";
+import { DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer } from "@/lib/designSystem";
+import { getSessionSlim } from "@/lib/sessionsApi";
+import { readFixtureFile } from "@/test/designSystemFixture";
 import {
   DESIGN_KIT_TIMEOUT_MS,
+  DESIGN_SYSTEM_TIMEOUT_MS,
   MAX_SLIDE_COUNT,
   SlidesViewer,
   isIgnoredNavKey,
 } from "./SlidesViewer";
 
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({ getSessionSlim: vi.fn() }));
 
 const DECK = `<!DOCTYPE html>
 <html><head><title>Deck</title></head><body>
@@ -670,5 +675,112 @@ describe("SlidesViewer design kit", () => {
     rerender(<SlidesViewer content={updated} conversationId="conv_1" />);
     await vi.waitFor(() => expect(srcdoc()).toContain("<h1>Four</h1>"));
     expect(deckFrame()).not.toBe(first);
+  });
+});
+
+describe("SlidesViewer design system", () => {
+  const FOLDER = "/Users/me/brand/fixture";
+  const DS_DECK = `<html><head><style>h1{color:red}</style></head><body>
+<section><h1>One</h1><img src="ds:assets/logo.svg"></section>
+</body></html>`;
+  const pointerFile = (kind: "full" | "skill") =>
+    text(serializeDesignSystemPointer({ path: FOLDER, kind, name: "Fixture Brand" }));
+  const serveSystem = (
+    kind: "full" | "skill",
+    opts: { owner?: boolean; fail?: string; hang?: boolean } = {},
+  ) => {
+    vi.mocked(getSessionSlim).mockResolvedValue({
+      permissionLevel: opts.owner === false ? 1 : null,
+    } as Awaited<ReturnType<typeof getSessionSlim>>);
+    vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
+      if (path === DESIGN_SYSTEM_POINTER) return { ...pointerFile(kind), path } as never;
+      if (path.startsWith(`${FOLDER}/`)) {
+        if (opts.hang) await new Promise(() => {});
+        if (opts.fail) throw new Error(opts.fail);
+        const f = readFixtureFile(path.slice(FOLDER.length + 1));
+        if (f) return { ...f, path } as never;
+      }
+      throw new Error("404 Not Found");
+    });
+  };
+  const srcdoc = () => deckFrame().getAttribute("srcdoc") ?? "";
+  beforeEach(() => vi.clearAllMocks());
+
+  it("shows a skill-only system's name and leaves the deck unbranded", async () => {
+    serveSystem("skill");
+    render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+    expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
+    expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(getSessionSlim).not.toHaveBeenCalled();
+  });
+
+  it("injects a full system's tokens before the deck styles and inlines ds: assets", async () => {
+    serveSystem("full");
+    render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+    expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
+    const doc = srcdoc();
+    expect(doc.indexOf("data-omnigent-design-system")).toBeGreaterThan(0);
+    expect(doc.indexOf("data-omnigent-design-system")).toBeLessThan(doc.indexOf("h1{color:red}"));
+    expect(doc).toContain("--fx-primary: #0b5fff");
+    expect(doc).toMatch(/<img src="data:image\/svg\+xml;base64,[^"]+">/);
+    expect(doc).not.toContain("ds:assets");
+    expect(doc).not.toContain("data-omnigent-kit");
+    expect(fetchFileContent).toHaveBeenCalledWith("conv_1", `${FOLDER}/colors_and_type.css`);
+  });
+
+  it("renders the deck without the system and names the reason on failure", async () => {
+    serveSystem("full", { fail: "500 Server Error" });
+    render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Design system not applied: 500 Server Error",
+    );
+    expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
+  });
+
+  it("tells a viewer who is not the owner", async () => {
+    serveSystem("full", { owner: false });
+    render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Design system is only available to the session owner",
+    );
+    expect(fetchFileContent).toHaveBeenCalledTimes(1);
+    expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
+  });
+
+  it("asks to import when the session cannot read the folder", async () => {
+    serveSystem("full", { fail: "403 Forbidden" });
+    render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Design system folder is not readable from this session; import it",
+    );
+  });
+
+  it("gives a full system its own timeout, then renders unbranded", async () => {
+    vi.useFakeTimers();
+    try {
+      serveSystem("full", { hang: true });
+      render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+      await act(() => vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS + 1));
+      expect(srcdoc()).toBe("");
+      await act(() => vi.advanceTimersByTimeAsync(DESIGN_SYSTEM_TIMEOUT_MS));
+      expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Design system not applied: design system timed out",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads each design-system file once across content refreshes", async () => {
+    serveSystem("full");
+    const { rerender } = render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+    expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
+    rerender(<SlidesViewer content={DS_DECK.replace("One", "Uno")} conversationId="conv_1" />);
+    await vi.waitFor(() => expect(srcdoc()).toContain("<h1>Uno</h1>"));
+    const reads = vi.mocked(fetchFileContent).mock.calls.map(([, p]) => p);
+    expect(reads.filter((p) => p === `${FOLDER}/colors_and_type.css`)).toHaveLength(1);
+    expect(reads.filter((p) => p === DESIGN_SYSTEM_POINTER)).toHaveLength(2);
   });
 });
