@@ -92,21 +92,20 @@ async function walk(roots: Dir[], list: ListHostDir) {
   const files: SourceFile[] = [];
   const skipped: Skipped[] = [];
   let listed = 0;
+  const overCap = (dir: Dir) =>
+    skipped.push({
+      path: `${dir.rel}/`,
+      reason: `over the ${MAX_LISTED_ENTRIES}-entry listing limit`,
+    });
   let level = roots;
   for (let depth = 1; level.length; depth++) {
     const found: { files: SourceFile[]; dirs: Dir[] }[] = [];
     // oxlint-disable-next-line no-await-in-loop
     await eachLimited(level, async (dir, i) => {
-      if (listed > MAX_LISTED_ENTRIES) return;
+      if (listed > MAX_LISTED_ENTRIES) return void overCap(dir);
       const entries = await listAll(dir.path, list);
       listed += entries.length;
-      if (listed > MAX_LISTED_ENTRIES) {
-        skipped.push({
-          path: `${dir.rel}/`,
-          reason: `over the ${MAX_LISTED_ENTRIES}-entry listing limit`,
-        });
-        return;
-      }
+      if (listed > MAX_LISTED_ENTRIES) return void overCap(dir);
       found[i] = {
         files: entries
           .filter((e) => e.type === "file")
@@ -129,6 +128,7 @@ async function walk(roots: Dir[], list: ListHostDir) {
           })),
         );
     }
+    if (listed > MAX_LISTED_ENTRIES) next.forEach(overCap);
     level = listed > MAX_LISTED_ENTRIES ? [] : next;
   }
   return { files, skipped };

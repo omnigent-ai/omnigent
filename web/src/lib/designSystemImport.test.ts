@@ -116,30 +116,28 @@ describe("listDesignSystemSource", () => {
     expect(list.mock.calls.length).toBeLessThanOrEqual(2 ** MAX_WALK_DEPTH);
   });
 
-  it("stops walking once the listed entries pass the cap", async () => {
+  it("reports every folder the entry cap left unlisted, once each", async () => {
     const many = (n: number) =>
       Array.from({ length: n }, (_, i): [string, "file"] => [`${i}.svg`, "file"]);
     const list = hostTree({
       [SOURCE]: [["assets", "directory"]],
-      [`${SOURCE}/assets`]: [
-        ["a", "directory"],
-        ["b", "directory"],
-        ["c", "directory"],
-      ],
-      [`${SOURCE}/assets/a`]: many(900),
-      [`${SOURCE}/assets/b`]: many(900),
+      [`${SOURCE}/assets`]: ["a", "b", "c", "d", "e"].map((n): [string, "directory"] => [
+        n,
+        "directory",
+      ]),
+      [`${SOURCE}/assets/a`]: [...many(900), ["x", "directory"]],
+      [`${SOURCE}/assets/b`]: [...many(900), ["y", "directory"]],
       [`${SOURCE}/assets/c`]: many(900),
+      [`${SOURCE}/assets/d`]: many(900),
+      [`${SOURCE}/assets/e`]: many(900),
     });
     const source = await listDesignSystemSource(SOURCE, list);
     expect(source.files.length).toBeLessThanOrEqual(MAX_LISTED_ENTRIES);
-    expect(source.skipped).toContainEqual({
-      path: "assets/c/",
-      reason: `over the ${MAX_LISTED_ENTRIES}-entry listing limit`,
-    });
-    expect(planDesignSystemImport(source).skipped).toContainEqual({
-      path: "assets/c/",
-      reason: `over the ${MAX_LISTED_ENTRIES}-entry listing limit`,
-    });
+    const capped = planDesignSystemImport(source)
+      .skipped.filter((s) => s.reason === `over the ${MAX_LISTED_ENTRIES}-entry listing limit`)
+      .map((s) => s.path)
+      .sort();
+    expect(capped).toEqual(["assets/a/x/", "assets/b/y/", "assets/c/", "assets/d/", "assets/e/"]);
   });
 });
 
