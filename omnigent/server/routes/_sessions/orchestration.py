@@ -791,7 +791,7 @@ async def _stop_host_runner_intentionally(
                 statuses.setdefault(related_id, None)
         statuses.setdefault(session_id, None)
         marked: set[str] = set()
-        completed_stop_relays: dict[str, _RelayHandle] = {}
+        completed_stop_relays: dict[str, tuple[_RelayHandle, int]] = {}
         for related_id, persisted_status in statuses.items():
             handle = _runner_relay_tasks.get(related_id)
             if handle is not None and handle.runner_id != runner_id:
@@ -805,7 +805,7 @@ async def _stop_host_runner_intentionally(
                 _intentional_stop_sessions[related_id] = runner_id
             if handle is not None:
                 if handle.intentional_stop_turn_ended:
-                    completed_stop_relays[related_id] = handle
+                    completed_stop_relays[related_id] = (handle, handle.running_event_count)
                 handle.intentional_stop_turn_ended = False
 
         acknowledged = False
@@ -820,12 +820,15 @@ async def _stop_host_runner_intentionally(
                     if _intentional_stop_sessions.get(related_id) == runner_id:
                         _intentional_stop_sessions.pop(related_id, None)
                 # Rejection must not revive stale intent from an earlier completed turn.
-                for related_id, handle in completed_stop_relays.items():
+                for related_id, (handle, running_event_count) in completed_stop_relays.items():
                     if (
                         _intentional_stop_sessions.get(related_id) == runner_id
                         and _runner_relay_tasks.get(related_id) is handle
                     ):
-                        handle.intentional_stop_turn_ended = True
+                        if handle.running_event_count == running_event_count:
+                            handle.intentional_stop_turn_ended = True
+                        else:
+                            _intentional_stop_sessions.pop(related_id, None)
         return acknowledged
 
 
@@ -7917,6 +7920,7 @@ async def _relay_runner_stream_once(
                                     _intentional_stop_sessions.get(session_id) == runner_id
                                 )
                             else:
+                                relay.running_event_count += 1
                                 # Running can resume the same turn, including after PTY idle.
                                 # Only completed stopped work makes its marker stale.
                                 if (

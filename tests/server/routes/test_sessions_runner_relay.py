@@ -1303,6 +1303,7 @@ async def test_relay_same_turn_running_preserves_intentional_stop(
         ("retained", "acknowledged"),
         ("retained", "timeout"),
         ("retained", "rejected"),
+        ("retained", "rejected_while_running"),
     ],
 )
 async def test_relay_terminal_observation_tracks_stop_attempt(
@@ -1317,9 +1318,15 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
     from omnigent.server.routes._sessions import orchestration
     from omnigent.server.routes._sessions.helpers import _HostRunnerStopAttempt
 
+    dispatched = asyncio.Event()
+    acknowledgement = asyncio.Event()
+
     async def stop_host(*_args: object, attempt: _HostRunnerStopAttempt) -> bool:
         attempt.dispatched = True
-        attempt.rejected = outcome == "rejected"
+        dispatched.set()
+        if outcome == "rejected_while_running":
+            await acknowledgement.wait()
+        attempt.rejected = outcome.startswith("rejected")
         return outcome == "acknowledged"
 
     monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
@@ -1338,19 +1345,30 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
     gate = asyncio.Event()
     runner = _ScriptedThenDropRunnerClient([], gate)
     response = _ScriptedThenDropStreamResponse([], gate)
+    stop_task: asyncio.Task[bool] | None = None
 
     async def stream_events() -> AsyncIterator[str]:
+        nonlocal stop_task
+
         yield 'data: {"type": "session.heartbeat"}\n\n'
         await gate.wait()
         yield 'data: {"type": "response.cancelled"}\n\n'
         if earlier_stop == "rolled_back":
             sessions_module._intentional_stop_sessions.pop(session_id, None)
-        acknowledged = await orchestration._stop_host_runner_intentionally(
-            parent.id, "host", runner_id, None, store
+        stop_task = asyncio.create_task(
+            orchestration._stop_host_runner_intentionally(
+                parent.id, "host", runner_id, None, store
+            )
         )
+        if outcome == "rejected_while_running":
+            await asyncio.wait_for(dispatched.wait(), timeout=_TASK_TIMEOUT_S)
+            yield 'data: {"type": "session.status", "status": "running"}\n\n'
+            acknowledgement.set()
+        acknowledged = await asyncio.wait_for(stop_task, timeout=_TASK_TIMEOUT_S)
         assert acknowledged is (outcome == "acknowledged")
-        assert sessions_module._intentional_stop_sessions.get(session_id) == runner_id
-        yield 'data: {"type": "session.status", "status": "running"}\n\n'
+        if outcome != "rejected_while_running":
+            assert sessions_module._intentional_stop_sessions.get(session_id) == runner_id
+            yield 'data: {"type": "session.status", "status": "running"}\n\n'
         raise ConnectionError("intentional runner teardown")
 
     monkeypatch.setattr(response, "aiter_text", stream_events)
@@ -1375,7 +1393,7 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
         assert persisted is not None
         error = sessions_module._last_task_error_from_labels(persisted.labels)
         failed = [event for event in statuses if event.get("status") == "failed"]
-        if outcome == "rejected":
+        if outcome.startswith("rejected"):
             assert failed and failed[-1]["error"]["code"] == "runner_disconnected", statuses
             assert sessions_module._session_status_cache[session_id] == "failed"
             assert error is not None and error["code"] == "runner_disconnected"
@@ -1386,11 +1404,15 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
             assert error is None
     finally:
         gate.set()
+        acknowledgement.set()
         if collector is not None:
             await collector.stop()
         if handle is not None:
             handle.task.cancel()
             await asyncio.gather(handle.task, return_exceptions=True)
+        if stop_task is not None:
+            stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
         sessions_module._runner_relay_tasks.pop(session_id, None)
         for row in (parent, child):
             sessions_module._intentional_stop_sessions.pop(row.id, None)

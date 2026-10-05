@@ -852,7 +852,9 @@ class _RelayHandle:
     :param status_snapshot: Saved status read when adopting this binding,
         used only when live status and a fresh row are unavailable.
     :param intentional_stop_turn_ended: A terminal response arrived while the
-        current stop marker was pending; reset when installing a new marker.
+        current stop marker was pending; reset by each Stop request.
+    :param running_event_count: Running notifications observed by this relay,
+        used to preserve intervening activity when a Stop is rejected.
     """
 
     runner_id: str
@@ -860,6 +862,7 @@ class _RelayHandle:
     ready: asyncio.Event
     status_snapshot: _RelayStatusSnapshot | None = None
     intentional_stop_turn_ended: bool = False
+    running_event_count: int = 0
 
 
 _runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()
