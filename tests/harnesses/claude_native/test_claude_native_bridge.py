@@ -9125,6 +9125,62 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     assert "JSON Parse error: Unrecognized token '<'" in message
 
 
+_LOGIN_PANE = (
+    "example-cli: Logging in via SSO...\n"
+    "Select login method\n"
+    "1. Claude account\n"
+    "2. Console account\n"
+    "Enter a number and press Enter:\n"
+)
+
+
+def test_stalled_pane_state_names_an_interactive_prompt() -> None:
+    """Generic login text identifies an interactive readiness gate."""
+    assert (
+        claude_native_bridge._stalled_pane_state(_LOGIN_PANE, polls=100, empty_polls=0)
+        == "awaiting-user-input"
+    )
+
+
+def test_stalled_pane_state_separates_empty_and_missing_prompt_diagnostics() -> None:
+    """Empty captures and missing composer frames retain distinct labels."""
+    assert (
+        claude_native_bridge._stalled_pane_state(_BOOTING_PANE, polls=100, empty_polls=90)
+        == "captures-mostly-empty"
+    )
+    assert (
+        claude_native_bridge._stalled_pane_state(_BOOTING_PANE, polls=100, empty_polls=0)
+        == "prompt-absent-from-pane"
+    )
+    assert (
+        claude_native_bridge._stalled_pane_state("", polls=100, empty_polls=100)
+        == "pane-never-rendered"
+    )
+
+
+def test_wait_for_claude_prompt_ready_blames_generic_interactive_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timeout points the user to finish a generic login prompt in Terminal."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: _LOGIN_PANE,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(False),
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock", "claude:0.0", timeout_s=0.0
+        )
+    message = str(excinfo.value)
+    assert "waiting on an interactive prompt" in message
+    assert "state=awaiting-user-input" in message
+    assert "Finish it in the terminal" in message
+    assert excinfo.value.pane_state == claude_native_bridge.PANE_STATE_AWAITING_USER_INPUT
+
+
 def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

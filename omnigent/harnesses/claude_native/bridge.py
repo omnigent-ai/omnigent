@@ -60,7 +60,7 @@ from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, TypeVar, cast
 from urllib import request
 
 from filelock import FileLock
@@ -548,6 +548,11 @@ def validate_claude_hook_interpreter_compatibility(
 
 class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
+
+    def __init__(self, message: str, *, pane_state: str = "") -> None:
+        """Preserve the pane diagnosis for delivery cleanup decisions."""
+        super().__init__(message)
+        self.pane_state = pane_state
 
 
 class ClaudeTerminalExited(ClaudePromptTimeout):
@@ -5888,6 +5893,34 @@ def _format_terminal_failure_tail(pane: str) -> str:
     return f" Last terminal output:\n{tail}"
 
 
+# Generic auth and consent prompts can prevent the composer from rendering.
+# These markers describe visible state, not terminal health.
+PANE_STATE_AWAITING_USER_INPUT: Final = "awaiting-user-input"
+_PANE_AWAITING_USER_MARKERS: Final[tuple[str, ...]] = (
+    "Logging in via SSO",
+    "If the browser does not open automatically",
+    "open the following URL",
+    "Select login method",
+    "Press Enter to continue",
+    "(y/n)",
+    "[Y/n]",
+    "[y/N]",
+    "Enter your password",
+    "Passcode or option",
+)
+
+
+def _stalled_pane_state(pane: str, *, polls: int, empty_polls: int) -> str:
+    """Classify a readiness timeout without claiming the terminal is healthy."""
+    if any(marker in pane for marker in _PANE_AWAITING_USER_MARKERS):
+        return PANE_STATE_AWAITING_USER_INPUT
+    if not pane.strip():
+        return "pane-never-rendered"
+    if polls and empty_polls >= polls / 2:
+        return "captures-mostly-empty"
+    return "prompt-absent-from-pane"
+
+
 def _terminal_dialog_headline(pane: str) -> str | None:
     """
     Name the dialog holding Claude Code's terminal, or ``None``.
@@ -6069,11 +6102,21 @@ def _wait_for_claude_prompt_ready(
             "this conversation." + _format_terminal_failure_tail(last_nonempty),
             exit_status=exited_status,
         )
+    state = _stalled_pane_state(last_nonempty, polls=polls, empty_polls=empty_polls)
+    if state == PANE_STATE_AWAITING_USER_INPUT:
+        raise ClaudePromptTimeout(
+            f"The terminal is waiting on an interactive prompt, so Claude Code has "
+            f"not started yet (state={state}, waited {waited_s:.1f}s). Finish it in "
+            f"the terminal, then send the message again."
+            + _format_terminal_failure_tail(last_nonempty),
+            pane_state=state,
+        )
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
-        f"(input prompt never rendered in {polls} polls, "
+        f"(state={state}, input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
-        + _format_terminal_failure_tail(last_nonempty)
+        + _format_terminal_failure_tail(last_nonempty),
+        pane_state=state,
     )
 
 
