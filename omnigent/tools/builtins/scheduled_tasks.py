@@ -23,6 +23,7 @@ _NAME_DESC = (
     "Date placeholders are filled in per run in the task timezone: "
     "'Nightly triage - {{YYYY-MM-DD}}' -> 'Nightly triage - 2026-10-02'. "
     "Tokens: YYYY MMMM MMM (alias Mon) MM DD dddd ddd HH mm. "
+    "mm is minutes and needs HH; use {{HH:mm}}. "
     r"Write \{{ for a literal {{."
 )
 

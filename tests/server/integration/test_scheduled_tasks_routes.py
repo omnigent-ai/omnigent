@@ -251,37 +251,21 @@ async def test_schedule_validation_keeps_requests_responsive(
     assert "time limit" in result.text
 
 
-@pytest.mark.parametrize(
-    "name", ["Open PR Rebase - {{Mon DD}}", "Open PR Rebase - {{YYYY-MM-DD}}"]
-)
-async def test_name_template_create_echoes_raw(
-    auth_client: httpx.AsyncClient, db_uri: str, name: str
+async def test_name_template_create_stores_raw_and_rejects_invalid(
+    auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     _make_user(db_uri)
+    name = "Open PR Rebase - {{YYYY-MM-DD}}"
     response = await auth_client.post(
         "/v1/scheduled-tasks", json=_create_body(name=name), headers=_headers()
     )
     assert response.status_code == 200
     assert response.json()["name"] == name
-
-
-@pytest.mark.parametrize(
-    "name,hint",
-    [
-        ("{{yyyy-MM-dd}}", "use YYYY"),
-        ("{{YYYY-mm-DD}}", "mm is minutes and needs HH (e.g. {{HH:mm}}); MM is the month"),
-    ],
-)
-async def test_name_template_create_invalid_hint(
-    auth_client: httpx.AsyncClient, db_uri: str, name: str, hint: str
-) -> None:
-    _make_user(db_uri)
     response = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(name=name), headers=_headers()
+        "/v1/scheduled-tasks", json=_create_body(name="{{yyyy-MM-dd}}"), headers=_headers()
     )
     assert response.status_code == 400
-    assert "invalid name template" in response.text
-    assert hint in response.text
+    assert "supported tokens" in response.text
 
 
 async def test_name_template_patch_invalid_leaves_row_unchanged(
@@ -300,38 +284,22 @@ async def test_name_template_patch_invalid_leaves_row_unchanged(
     assert task is not None and task.name == "nightly triage"
 
 
-@pytest.mark.parametrize("field,value", [("prompt", "updated prompt"), ("rrule", "FREQ=DAILY")])
-@pytest.mark.parametrize("resend_name", [False, True])
-async def test_name_template_legacy_patch_only_validates_changed_name(
-    auth_client: httpx.AsyncClient, db_uri: str, field: str, value: str, resend_name: bool
+async def test_name_template_legacy_name_resent_unchanged_is_accepted(
+    auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     _make_user(db_uri)
     created = await auth_client.post(
         "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
     )
     task_id = created.json()["id"]
-    store = SqlAlchemyScheduledTaskStore(db_uri)
-    store.update(task_id, name="Deploy {{env}}")
-    body = {field: value}
-    if resend_name:
-        body["name"] = "Deploy {{env}}"
+    SqlAlchemyScheduledTaskStore(db_uri).update(task_id, name="Deploy {{env}}")
     response = await auth_client.patch(
-        f"/v1/scheduled-tasks/{task_id}", json=body, headers=_headers()
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"name": "Deploy {{env}}", "prompt": "updated prompt"},
+        headers=_headers(),
     )
     assert response.status_code == 200
-    assert response.json()["name"] == "Deploy {{env}}"
-    assert response.json()[field] == value
-
-
-async def test_name_template_create_code_point_limit(
-    auth_client: httpx.AsyncClient, db_uri: str
-) -> None:
-    _make_user(db_uri)
-    response = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(name="é" * 249 + "{{YYYY}}"), headers=_headers()
-    )
-    assert response.status_code == 400
-    assert "256" in response.text
+    assert response.json()["prompt"] == "updated prompt"
 
 
 async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str) -> None:

@@ -92,71 +92,20 @@ New automations default to the **Omnigent Automation** project, which is created
 
 ## Session names
 
-The automation's stored name stays visible in the Automations list. Each run's
-session name expands `{{FORMAT}}` date placeholders using the **worker start
-time** (also recorded as the run's `scheduled_at`), in the task's timezone.
-Month and weekday names are always English, independent of locale. The prompt
-is never expanded.
+The stored name keeps its template in Automations; each session title expands
+placeholders at worker start in the automation's timezone. Month and weekday
+names are English, and the prompt is never templated.
 
-For example, at 2026-10-02 09:05 in `America/New_York`:
+Tokens are case-sensitive: YYYY (year), MMMM / MMM (month name), MM (month
+number), DD (day), dddd / ddd (weekday), HH (hour), and mm (minute). Mon is an
+alias for MMM. Minutes need HH in the same placeholder; use {{HH:mm}} (MM means
+month). Separate whole tokens with spaces or - / . : , _; compact runs like
+{{YYYYMMDD}} are invalid, so use adjacent placeholders: {{YYYY}}{{MM}}{{DD}}.
+Write \{{ for a literal {{.
 
-| Stored name | Session name |
-| --- | --- |
-| `Open PR Rebase - {{YYYY-MM-DD}}` | `Open PR Rebase - 2026-10-02` |
-| `Open PR Rebase - {{Mon DD}}` | `Open PR Rebase - Oct 02` |
-| `Open PR Rebase - {{MMM DD}}` | `Open PR Rebase - Oct 02` |
-| `Hourly check - {{YYYY-MM-DD HH:mm}}` | `Hourly check - 2026-10-02 09:05` |
-| `Weekly review - {{dddd}}, {{MMM DD}}` | `Weekly review - Friday, Oct 02` |
-| `{{YYYY}}{{MM}}{{DD}}` | `20261002` |
-
-Tokens are case-sensitive and must be whole letter runs. Separate tokens with
-spaces, `-`, `/`, `.`, `:`, `,`, or `_`, or put them in adjacent placeholders.
-Patterns must start and end with a token. Spaces and tabs at the edges of a
-placeholder are trimmed: `{{ MMM DD }}` works. Placeholders must close on the
-same line and cannot contain nested braces.
-
-| Token | Meaning | Example |
-| --- | --- | --- |
-| `YYYY` | Calendar year | `2026` |
-| `MMMM` | Full month name | `October` |
-| `MMM` / `Mon` | Short month name (`Mon` is a permanent alias) | `Oct` |
-| `MM` | Month, 01–12 | `10` |
-| `DD` | Day of month, 01–31 | `02` |
-| `dddd` | Full weekday name | `Friday` |
-| `ddd` | Short weekday name | `Fri` |
-| `HH` | Hour, 00–23 | `09` |
-| `mm` | Minute, 00–59; requires `HH` in the same placeholder | `05` |
-
-Write `\{{` for a literal `{{`: `Deploy \{{env}} - {{YYYY}}` becomes
-`Deploy {{env}} - 2026`. The escaped output is not parsed again. Lone braces,
-`}}`, and other backslashes remain literal. Names without `{{` are unchanged.
-
-Invalid templates return HTTP 400 on create or rename with these hints:
-
-| Input | Hint |
-| --- | --- |
-| `mon`, `MON` | Use `MMM` (or `Mon`) |
-| `Month` | Use `MMMM` |
-| `Day`, `Dy`, `EEE`, `EEEE` | Use `ddd` / `dddd` |
-| `yyyy`, `yy`, `YY` | Use `YYYY` |
-| `dd`, `d`, `D` | Use `DD` or `ddd` |
-| `DDD`, `DDDD` | Day of year is not supported |
-| `M` | Use `MM` |
-| `H`, `h`, `hh`, `A`, `a` | Use `HH:mm` (24-hour) |
-| `ss` | Seconds are not supported |
-| `date` | Use `{{YYYY-MM-DD}}` |
-| `time` | Use `{{HH:mm}}` |
-| Body containing `%` | strftime codes are not supported |
-| `YYYYMMDD`, `MonDD` | Separate tokens or use adjacent placeholders, e.g. `{{YYYY}}{{MM}}{{DD}}` |
-| `mm` without `HH`, or `HH:MM` | `mm` is minutes and needs `HH` (e.g. `{{HH:mm}}`); `MM` is the month |
-| Anything else | Lists the supported tokens |
-
-Reserved words such as `date`, `time`, `run`, `agent`, and `run.number` have no
-special meaning today and are rejected inside placeholders. Templated names
-(including escaped placeholders) are limited to 256 Unicode code points;
-rendered names are limited to 768. If a legacy stored name cannot render, the
-entire literal name is used and a warning is logged, without preventing the
-run. Unrelated edits that resend the same legacy name remain supported.
+Names without {{ stay unchanged. Invalid templates return HTTP 400 on create or
+rename with the supported-token list. If a stored name cannot render, the whole
+literal name is used and the run continues.
 
 ## Schedules are RRULEs, not cron
 
