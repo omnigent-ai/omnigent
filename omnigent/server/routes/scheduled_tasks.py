@@ -56,7 +56,7 @@ class CreateScheduledTaskRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str
+    name: str = Field(min_length=1, max_length=256)
     prompt: str
     rrule: str
     agent_id: str
@@ -96,7 +96,7 @@ class UpdateScheduledTaskRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=256)
     prompt: str | None = None
     rrule: str | None = None
     # Rebinding the agent switches the harness the task fires with. The
