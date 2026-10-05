@@ -54,6 +54,8 @@ slide to PDF, and a Source toggle back to the code view.
   each value once with its property and where it first appears. Values the
   system's `templates/*` use are allowed. It never blocks the deck or changes
   the export. Kits, skill-only systems, and wireframes show no badge.
+  Edits to the system's adherence file or templates show after you reopen
+  the deck, like other design-system edits.
 
 ## How to get to it (user POV)
 
