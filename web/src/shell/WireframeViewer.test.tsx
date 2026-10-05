@@ -1,7 +1,14 @@
 // Tests for wireframes: file detection, screen listing, the srcdoc and its
 // frame script (screen switches and links), and the WireframeViewer.
 
-import { describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fetchFileContent } from "@/hooks/useFileContent";
+import { DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer } from "@/lib/designSystem";
+import { getSessionSlim } from "@/lib/sessionsApi";
+import { readFixtureFile } from "@/test/designSystemFixture";
+import { DESIGN_KIT_DIR, HTML_PREVIEW_SANDBOX, type KitFile } from "./codeViewerHelpers";
+import { WireframeViewer, fitScale } from "./WireframeViewer";
 import {
   WIREFRAME_DEVICES,
   WIREFRAME_MSG_SOURCE,
@@ -9,6 +16,14 @@ import {
   listWireframeScreens,
   prepareWireframeDoc,
 } from "./wireframeDoc";
+
+vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({ getSessionSlim: vi.fn() }));
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 const body = (inner: string) =>
   `<html><head><style>h1{color:red}</style></head><body>${inner}</body></html>`;
@@ -154,5 +169,171 @@ describe("wireframe frame script", () => {
     expect(f.active()).toEqual(["home"]);
     f.message({ source: WIREFRAME_MSG_SOURCE, type: "goto", id: "sign-in" });
     expect(f.active()).toEqual(["sign-in"]);
+  });
+});
+
+describe("fitScale", () => {
+  const desktop = WIREFRAME_DEVICES[0];
+  const phone = WIREFRAME_DEVICES[2];
+  it("scales the device down to fit the container, letterboxed", () => {
+    expect(fitScale(720, 900, desktop)).toBe(0.5);
+    expect(fitScale(1440, 450, desktop)).toBe(0.5);
+  });
+  it("never scales above the device size", () => {
+    expect(fitScale(2000, 2000, phone)).toBe(1);
+  });
+  it("is 0 before the container is measured", () => {
+    expect(fitScale(0, 0, phone)).toBe(0);
+  });
+});
+
+describe("WireframeViewer", () => {
+  const frame = () => screen.getByTitle("Wireframe") as HTMLIFrameElement;
+  const srcdoc = () => frame().getAttribute("srcdoc") ?? "";
+  const fromFrame = (
+    data: Record<string, unknown>,
+    source: Window | null = frame().contentWindow,
+  ) =>
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", { data: { source: WIREFRAME_MSG_SOURCE, ...data }, source }),
+      );
+    });
+  const spyOnFrame = () => {
+    const spy = vi.fn();
+    frame().contentWindow!.postMessage = spy;
+    return spy;
+  };
+
+  it("renders in the HTML preview sandbox at the desktop size by default", () => {
+    render(<WireframeViewer content={body(SCREENS)} />);
+    expect(frame().getAttribute("sandbox")).toBe(HTML_PREVIEW_SANDBOX);
+    expect(frame().style.width).toBe("1440px");
+    expect(frame().style.height).toBe("900px");
+    expect(srcdoc()).toContain(WIREFRAME_MSG_SOURCE);
+    expect(screen.getByRole("button", { name: "Desktop" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("switches devices and rescales to fit", () => {
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(720);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(600);
+    render(<WireframeViewer content={body(SCREENS)} />);
+    expect(frame().style.transform).toBe("scale(0.5)");
+    fireEvent.click(screen.getByRole("button", { name: "Phone" }));
+    expect(screen.getByRole("button", { name: "Phone" })).toHaveAttribute("aria-pressed", "true");
+    expect(frame().style.width).toBe("390px");
+    expect(frame().style.height).toBe("844px");
+    expect(frame().style.transform).toBe(`scale(${600 / 844})`);
+    fireEvent.click(screen.getByRole("button", { name: "Tablet" }));
+    expect(frame().style.width).toBe("834px");
+    expect(frame().style.height).toBe("1194px");
+  });
+
+  it("picks screens and posts goto to its iframe", () => {
+    render(<WireframeViewer content={body(SCREENS)} />);
+    const picker = screen.getByRole("combobox", { name: "Screen" }) as HTMLSelectElement;
+    expect(Array.from(picker.options, (o) => o.text)).toEqual(["Home", "Sign in"]);
+    const post = spyOnFrame();
+    fireEvent.change(picker, { target: { value: "sign-in" } });
+    expect(post).toHaveBeenLastCalledWith(
+      { source: WIREFRAME_MSG_SOURCE, type: "goto", id: "sign-in" },
+      "*",
+    );
+  });
+
+  it("follows link switches reported by its own iframe only", () => {
+    render(<WireframeViewer content={body(SCREENS)} />);
+    const picker = screen.getByRole("combobox", { name: "Screen" }) as HTMLSelectElement;
+    fromFrame({ type: "screen", id: "sign-in" }, window);
+    fromFrame({ type: "screen", id: "missing" });
+    expect(picker.value).toBe("home");
+    fromFrame({ type: "screen", id: "sign-in" });
+    expect(picker.value).toBe("sign-in");
+  });
+
+  it("has no screen picker for a file without screens", () => {
+    render(<WireframeViewer content={body("<main>One page</main>")} />);
+    expect(screen.queryByRole("combobox", { name: "Screen" })).not.toBeInTheDocument();
+    expect(srcdoc()).toContain("<main>One page</main>");
+  });
+
+  it("hands back to the source view", () => {
+    const onSource = vi.fn();
+    render(<WireframeViewer content={body(SCREENS)} onRequestSourceMode={onSource} />);
+    fireEvent.click(screen.getByRole("button", { name: "View wireframe source" }));
+    expect(onSource).toHaveBeenCalled();
+  });
+
+  it("shows the fullscreen toggle when the Fullscreen API is supported", () => {
+    Object.defineProperty(document, "fullscreenEnabled", { value: true, configurable: true });
+    render(<WireframeViewer content={body(SCREENS)} />);
+    expect(screen.getByRole("button", { name: "Enter fullscreen" })).toBeInTheDocument();
+    delete (document as { fullscreenEnabled?: boolean }).fullscreenEnabled;
+  });
+
+  describe("branding", () => {
+    const text = (content: string): KitFile => ({
+      encoding: "utf-8",
+      content,
+      bytes: content.length,
+    });
+    const KIT = {
+      name: "Acme",
+      colors: { background: "#fafafa", primary: "#ff0066" },
+      fonts: { body: { family: "Georgia, serif" } },
+      logo: { src: "logo.svg" },
+      css: "layouts.css",
+    };
+    const serve = (files: Record<string, KitFile>) =>
+      vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
+        const f = files[path];
+        if (!f) throw new Error("404 Not Found");
+        return { ...f, path } as never;
+      });
+    beforeEach(() => vi.clearAllMocks());
+
+    it("applies kit fonts and tokens without deck section rules or the logo", async () => {
+      serve({ [`${DESIGN_KIT_DIR}/kit.json`]: text(JSON.stringify(KIT)) });
+      render(<WireframeViewer content={body(SCREENS)} conversationId="conv_1" />);
+      expect(await screen.findByTitle("Design kit: Acme")).toBeInTheDocument();
+      const doc = srcdoc();
+      expect(doc).toContain("--kit-primary:#ff0066");
+      expect(doc).toContain('--kit-font-body:"Georgia", serif');
+      expect(doc).not.toContain("body>section{");
+      expect(doc).not.toContain("::after");
+      expect(doc).not.toContain("background:var(--kit-background)!important");
+      expect(fetchFileContent).not.toHaveBeenCalledWith("conv_1", `${DESIGN_KIT_DIR}/logo.svg`);
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    });
+
+    it("injects a full design system and inlines ds: assets", async () => {
+      const folder = "/Users/me/brand/fixture";
+      vi.mocked(getSessionSlim).mockResolvedValue({ permissionLevel: null } as never);
+      vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
+        if (path === DESIGN_SYSTEM_POINTER) {
+          const ref = { path: folder, kind: "full" as const, name: "Fixture Brand" };
+          return { ...text(serializeDesignSystemPointer(ref)), path } as never;
+        }
+        const f = path.startsWith(`${folder}/`) && readFixtureFile(path.slice(folder.length + 1));
+        if (f) return { ...f, path } as never;
+        throw new Error("404 Not Found");
+      });
+      const content = body('<section data-screen="a"><img src="ds:assets/logo.svg"></section>');
+      render(<WireframeViewer content={content} conversationId="conv_1" />);
+      expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
+      const doc = srcdoc();
+      expect(doc.indexOf("data-omnigent-design-system")).toBeLessThan(doc.indexOf("h1{color:red}"));
+      expect(doc).toMatch(/<img src="data:image\/svg\+xml;base64,[^"]+">/);
+      expect(doc).not.toContain("data-omnigent-kit");
+    });
+
+    it("names the reason when the kit does not apply", async () => {
+      serve({ [`${DESIGN_KIT_DIR}/kit.json`]: text("{") });
+      render(<WireframeViewer content={body(SCREENS)} conversationId="conv_1" />);
+      expect(await screen.findByRole("status")).toHaveTextContent(
+        "Design kit not applied: kit.json is not valid JSON",
+      );
+      expect(srcdoc()).toContain('<section data-screen="home"');
+    });
   });
 });

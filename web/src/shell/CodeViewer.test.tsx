@@ -798,6 +798,23 @@ describe("CodeViewer slide deck", () => {
   });
 });
 
+describe("CodeViewer wireframe", () => {
+  it("opens *.wireframe.html in the wireframe viewer, not the deck or HTML preview", async () => {
+    renderViewer(
+      '<section data-screen="home">Home</section>',
+      true,
+      "wireframes/app.wireframe.html",
+      { viewMode: "preview" },
+    );
+    expect(await screen.findByRole("group", { name: "Device" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTitle("Wireframe").getAttribute("srcdoc")).toContain('data-screen="home"'),
+    );
+    expect(screen.queryByTitle("Slide deck")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("HTML preview")).not.toBeInTheDocument();
+  });
+});
+
 describe("CodeViewer image rendering", () => {
   // jsdom implements neither URL.createObjectURL nor revokeObjectURL; ImageViewer
   // calls both, so stub them and capture the blob it encodes.

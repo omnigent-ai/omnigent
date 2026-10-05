@@ -71,6 +71,7 @@ import {
   isSlidesFile,
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
+import { isWireframeFile } from "./wireframeDoc";
 import { NotebookPreview } from "./NotebookPreview";
 import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
@@ -101,6 +102,9 @@ const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m
 // Slide decks load their viewer on demand, like the other preview surfaces.
 const SlidesViewer = lazy(() =>
   import("./SlidesViewer").then((m) => ({ default: m.SlidesViewer })),
+);
+const WireframeViewer = lazy(() =>
+  import("./WireframeViewer").then((m) => ({ default: m.WireframeViewer })),
 );
 
 // ---------------------------------------------------------------------------
@@ -862,9 +866,27 @@ export function CodeViewer({
 
   // HTML preview gets its own comment-enabled viewer (selection capture +
   // highlights relayed over a bridge into the still-sandboxed iframe), so it
-  // owns the truncated banner internally. Slide decks (*.slides.html) render
-  // in their own SlidesViewer.
+  // owns the truncated banner internally. Slide decks (*.slides.html) and
+  // wireframes (*.wireframe.html) render in their own viewers.
   if (isHtmlPreview) {
+    if (isWireframeFile(path)) {
+      return (
+        <Suspense
+          fallback={
+            <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+              Loading wireframe...
+            </div>
+          }
+        >
+          <WireframeViewer
+            content={content}
+            truncated={truncated}
+            conversationId={conversationId}
+            onRequestSourceMode={onRequestSourceMode}
+          />
+        </Suspense>
+      );
+    }
     if (isSlidesFile(path)) {
       return (
         <Suspense
