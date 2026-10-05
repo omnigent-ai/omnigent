@@ -39,6 +39,35 @@ def _direct_upgrade(engine: sa.Engine, migration: Any) -> None:
         connection.commit()
 
 
+def _direct_downgrade(engine: sa.Engine, migration: Any) -> None:
+    """Re-enter the downgrade directly for partial-DDL retry coverage."""
+    with engine.connect() as connection:
+        if engine.dialect.name == "cockroachdb":
+            _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        context = MigrationContext.configure(connection, opts={"transactional_ddl": True})
+        with Operations.context(context), context.begin_transaction():
+            migration.downgrade()
+        connection.commit()
+
+
+def _alter_watermark_column(engine: sa.Engine, name: str, *, add: bool) -> None:
+    """Apply one schema operation to simulate a partially completed DDL run."""
+    with engine.connect() as connection:
+        if engine.dialect.name == "cockroachdb":
+            _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        context = MigrationContext.configure(connection, opts={"transactional_ddl": True})
+        operations = Operations(context)
+        with Operations.context(context), context.begin_transaction():
+            if add:
+                operations.add_column(
+                    "conversations", sa.Column(name, sa.Integer(), nullable=True)
+                )
+            else:
+                with operations.batch_alter_table("conversations") as batch:
+                    batch.drop_column(name)
+        connection.commit()
+
+
 def _insert_conversations(engine: sa.Engine, rows: list[tuple[int, bytes, int]]) -> None:
     """Insert minimal rows through reflection, without current ORM models."""
     table = sa.Table("conversations", sa.MetaData(), autoload_with=engine)
@@ -147,4 +176,50 @@ def test_last_message_at_columns_preserve_rows_and_reenter(db_uri: str) -> None:
         }
         assert _base_rows(engine) == before
     finally:
+        _migrate(engine, db_uri, "head")
+
+
+def test_last_message_at_partial_ddl_retry_preserves_markers_and_data(db_uri: str) -> None:
+    """Partial upgrades/downgrades preserve markers and old-style inserts."""
+    engine = get_or_create_engine(db_uri)
+    migration = import_module(_MIGRATION)
+    rows = [(0, b"\x11" * 16, 500), (17, b"\x11" * 16, 600)]
+    try:
+        _migrate(engine, db_uri, _PREVIOUS_REVISION, downgrade=True)
+        _insert_conversations(engine, rows)
+        before = _base_rows(engine)
+
+        # Simulate a process that added only the first column before it died.
+        _alter_watermark_column(engine, "last_message_at", add=True)
+        with engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    "UPDATE conversations SET last_message_at = :value "
+                    "WHERE workspace_id = :workspace_id AND id = :id"
+                ),
+                {"value": 888, "workspace_id": 0, "id": b"\x11" * 16},
+            )
+
+        _migrate(engine, db_uri, "head")
+        assert _watermarks(engine)[(0, b"\x11" * 16)] == (888, None)
+        assert _base_rows(engine) == before
+
+        # A writer from before the schema release omits both new columns.
+        old_style_row = (23, b"\x12" * 16, 700)
+        _insert_conversations(engine, [old_style_row])
+        assert _watermarks(engine)[(23, b"\x12" * 16)] == (None, None)
+
+        # Simulate a partial downgrade, then retry it and retry it again.
+        _alter_watermark_column(engine, "last_message_observed_position", add=False)
+        _direct_downgrade(engine, migration)
+        assert not {"last_message_at", "last_message_observed_position"} & {
+            column["name"] for column in sa.inspect(engine).get_columns("conversations")
+        }
+        assert _base_rows(engine) == {**before, (23, b"\x12" * 16): (699, 700, b"\x12" * 16)}
+        _direct_downgrade(engine, migration)
+        assert not {"last_message_at", "last_message_observed_position"} & {
+            column["name"] for column in sa.inspect(engine).get_columns("conversations")
+        }
+    finally:
+        _direct_upgrade(engine, migration)
         _migrate(engine, db_uri, "head")

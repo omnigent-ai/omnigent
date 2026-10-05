@@ -33,6 +33,11 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Remove watermark storage after all schema-aware binaries are stopped."""
-    with op.batch_alter_table("conversations") as batch:
-        batch.drop_column("last_message_observed_position")
-        batch.drop_column("last_message_at")
+    existing = {
+        column["name"] for column in sa.inspect(op.get_bind()).get_columns("conversations")
+    }
+    for name in ("last_message_observed_position", "last_message_at"):
+        if name not in existing:
+            continue
+        with op.batch_alter_table("conversations") as batch:
+            batch.drop_column(name)
