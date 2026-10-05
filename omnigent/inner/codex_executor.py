@@ -727,8 +727,9 @@ def codex_skill_sources(
     ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
     provider — so the linked set and the menu cannot drift on which roots
     are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
-    the host-installed skills dir (a bundled skill shadows a host skill of
-    the same name). Only existing directories are returned.
+    the host-installed Codex skills dir, then ``~/.agents/skills`` (a bundled
+    skill shadows a host skill of the same name). Only existing directories
+    are returned.
 
     :param bundle_dir: Materialized agent-bundle root, or ``None``.
     :param home: The user home directory (``Path.home()``); injected so
@@ -747,6 +748,9 @@ def codex_skill_sources(
     host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
         sources.append(host)
+    shared = home / ".agents" / "skills"
+    if shared.is_dir():
+        sources.append(shared)
     return sources
 
 
