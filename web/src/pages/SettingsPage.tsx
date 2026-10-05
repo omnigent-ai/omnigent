@@ -759,6 +759,21 @@ function ColorThemeControl() {
               </output>
             </div>
           </div>
+          <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
+            <div>
+              <div className="text-ui font-medium">Flat background</div>
+              <div className="text-sm text-muted-foreground">
+                Use the custom background color instead of the preset background.
+              </div>
+            </div>
+            <Switch
+              aria-label="Flat background"
+              checked={editableTheme.flatBackground}
+              onCheckedChange={(flatBackground) => updateCustomTheme({ flatBackground })}
+              data-testid="custom-theme-flat-background"
+              componentId="settings.appearance.flat_background"
+            />
+          </div>
           <div className="flex items-center justify-between gap-4 py-4">
             <div>
               <div className="text-ui font-medium">Translucent sidebars</div>

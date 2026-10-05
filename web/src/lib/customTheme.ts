@@ -20,6 +20,7 @@ export interface CustomTheme {
   darkTint: string;
   contrast: number;
   translucentSidebar: boolean;
+  flatBackground: boolean;
 }
 
 export const DEFAULT_CUSTOM_THEME: CustomTheme = {
@@ -30,6 +31,7 @@ export const DEFAULT_CUSTOM_THEME: CustomTheme = {
   darkTint: "#0e1013",
   contrast: 50,
   translucentSidebar: false,
+  flatBackground: false,
 };
 
 interface Rgb {
@@ -80,6 +82,7 @@ function normalizeTheme(value: unknown): CustomTheme | null {
         DEFAULT_CUSTOM_THEME.darkTint),
     contrast: Math.round(clamp(candidate.contrast, 0, 100)),
     translucentSidebar: candidate.translucentSidebar,
+    flatBackground: candidate.flatBackground === true,
   };
 }
 
@@ -114,6 +117,7 @@ export function createCustomThemeFromPalette(palette: PaletteMeta): CustomTheme 
     darkTint: palette.tokens.dark.background.toLowerCase(),
     contrast: 50,
     translucentSidebar: false,
+    flatBackground: false,
   };
 }
 
@@ -358,8 +362,10 @@ function rebaseVariant(
   current: GeneratedThemeVariant,
   primary: string,
   translucentSidebar: boolean,
+  flatBackground: boolean,
 ): DerivedThemeVariant {
   const primaryChanged = primary !== base.primary.toLowerCase();
+  const background = rebaseColor(base.background, reference.background, current.background);
   const foreground = rebaseColor(base.foreground, reference.foreground, current.foreground);
   const card = rebaseColor(base.card, reference.card, current.card);
   const cardSolid = rebaseColor(base.cardSolid, reference.cardSolid, current.cardSolid);
@@ -373,7 +379,7 @@ function rebaseVariant(
   const sidebar = rebaseColor(base.sidebar, reference.sidebar, current.sidebar);
 
   return {
-    background: rebaseColor(base.background, reference.background, current.background),
+    background,
     foreground,
     card,
     cardSolid,
@@ -439,8 +445,8 @@ function rebaseVariant(
     sidebarActiveForeground: primaryChanged
       ? rebaseColor(base.sidebarForeground, reference.foreground, current.foreground)
       : base.sidebarActiveForeground,
-    sidebarBackground: base.sidebarBackground,
-    shellBackground: base.shellBackground,
+    sidebarBackground: flatBackground ? "var(--sidebar)" : base.sidebarBackground,
+    shellBackground: flatBackground ? background : base.shellBackground,
   };
 }
 
@@ -459,6 +465,7 @@ export function deriveCustomTheme(theme: CustomTheme): DerivedCustomTheme {
       current.light,
       normalized.accent,
       normalized.translucentSidebar,
+      normalized.flatBackground,
     ),
     dark: rebaseVariant(
       palette.tokens.dark,
@@ -466,6 +473,7 @@ export function deriveCustomTheme(theme: CustomTheme): DerivedCustomTheme {
       current.dark,
       normalized.darkAccent,
       normalized.translucentSidebar,
+      normalized.flatBackground,
     ),
   };
 }
