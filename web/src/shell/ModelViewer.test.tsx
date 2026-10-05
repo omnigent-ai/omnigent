@@ -687,7 +687,9 @@ describe("ModelViewer loading state", () => {
 
   it("shows a preparing status from mount and clears it once the model renders", async () => {
     render(<ModelViewer data={makeData()} path="part.stl" conversationId="conv_1" />);
-    expect(screen.getByText("Preparing model…")).toBeDefined();
+    expect(screen.getByText("Preparing model…").parentElement?.querySelectorAll("p")).toHaveLength(
+      1,
+    );
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Preparing model…"));
 
     await waitFor(() => expect(lastRenderer).not.toBeNull());
@@ -710,6 +712,9 @@ describe("ModelViewer loading state", () => {
         }),
     );
     expect(screen.getByRole("status").textContent).toBe("Preparing model…");
+    expect(
+      screen.getByText("Preparing model…", { selector: '[aria-hidden="true"]' }),
+    ).toBeDefined();
   });
 
   it("shows determinate download progress when the total size is known", async () => {
@@ -726,12 +731,29 @@ describe("ModelViewer loading state", () => {
     expect(screen.getByText("50% · 512 KB of 1.0 MB")).toBeDefined();
   });
 
+  it("shows the progress bar from 0% through 100% of the declared size", async () => {
+    const downloads = holdDownloads();
+    render(
+      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+    );
+    await waitFor(() => expect(downloads).toHaveLength(1));
+
+    act(() => downloads[0].onProgress?.({ receivedBytes: 0, totalBytes: 1024 * 1024 }));
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("0");
+
+    act(() => downloads[0].onProgress?.({ receivedBytes: 1024 * 1024, totalBytes: 1024 * 1024 }));
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("100");
+    expect(screen.getByText("100% · 1.0 MB of 1.0 MB")).toBeDefined();
+  });
+
   it("shows indeterminate download progress when the total size is unknown", async () => {
     const downloads = holdDownloads();
     render(
       <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
     );
     await waitFor(() => expect(downloads).toHaveLength(1));
+    act(() => downloads[0].onProgress?.({ receivedBytes: 0, totalBytes: null }));
+    expect(screen.queryByText(/received/)).toBeNull();
 
     act(() => downloads[0].onProgress?.({ receivedBytes: 2 * 1024 * 1024, totalBytes: null }));
 
@@ -839,6 +861,30 @@ describe("ModelViewer loading state", () => {
 
     expect(commits - before).toBe(2);
     expect(screen.getByText("75% · 768 KB of 1.0 MB")).toBeDefined();
+  });
+
+  it("re-renders only when the received byte count shown changes for an unknown size", async () => {
+    const downloads = holdDownloads();
+    let commits = 0;
+    render(
+      <Profiler id="viewer" onRender={() => (commits += 1)}>
+        <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />
+      </Profiler>,
+    );
+    await waitFor(() => expect(downloads).toHaveLength(1));
+    const before = commits;
+
+    // 100 chunks (20 MiB to 20 MiB + 9.9 KB) that all read "20 MB received".
+    for (let i = 0; i < 100; i += 1) {
+      act(() =>
+        downloads[0].onProgress?.({ receivedBytes: 20 * 1024 * 1024 + i * 100, totalBytes: null }),
+      );
+    }
+    expect(commits - before).toBe(1);
+
+    act(() => downloads[0].onProgress?.({ receivedBytes: 21 * 1024 * 1024, totalBytes: null }));
+    expect(commits - before).toBe(2);
+    expect(screen.getByText("21 MB received")).toBeDefined();
   });
 
   it("replaces the loading state with the error overlay on failure", async () => {
