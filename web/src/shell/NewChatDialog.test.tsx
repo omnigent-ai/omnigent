@@ -6997,15 +6997,17 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("blocks submit when remembered repos exceed a single-repo provider's cap", async () => {
-    // Two repos remembered from a prior multi-repo session seed the picker; on a
-    // single-repo provider they're over cap, so submit is blocked (with a
-    // warning) rather than 422'd after the session row is created.
+    // Two repos remembered from a prior multi-repo session of the default agent
+    // seed the picker; on a single-repo provider they're over cap, so submit is
+    // blocked (with a warning) rather than 422'd after the session row is created.
     localStorage.setItem(
       "omnigent:last-sandbox-repos",
-      JSON.stringify([
-        { url: "https://github.com/org/api", branch: "" },
-        { url: "https://github.com/org/web", branch: "" },
-      ]),
+      JSON.stringify({
+        a1: [
+          { url: "https://github.com/org/api", branch: "" },
+          { url: "https://github.com/org/web", branch: "" },
+        ],
+      }),
     );
     renderLanding({
       managed_sandboxes_enabled: true,
@@ -7059,6 +7061,114 @@ describe("NewChatLandingScreen", () => {
     // No selections carried over → an empty workspaces list (empty server-created
     // workspace), not Alpha's repo.
     expect(body.workspaces).toEqual([]);
+  });
+
+  it("does not seed another agent's launch with the repository remembered for this one", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    // Claude Code (the default pick) launches with org/api, which is remembered
+    // for it.
+    renderLanding({ managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/api" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    await screen.findByTestId("new-chat-landing-repo-row");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "audit the repo" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    cleanup();
+    resetLandingDraft();
+
+    // A fresh visit re-seeds Claude Code's repo, but picking Codex, whose
+    // sandbox may not even be able to clone it, must start with none.
+    renderLanding({ managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("api"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveAttribute(
+        "aria-label",
+        "Sandbox repositories: None selected",
+      ),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "say hello" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
+    const [, init] = authenticatedFetchMock.mock.calls[1];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.agent_id).toBe("a2");
+    expect(body.host_type).toBe("managed");
+    expect(body.workspaces).toEqual([]);
+
+    // Returning to Claude Code brings its own remembered repo back.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("api"),
+    );
+  });
+
+  it("remembers launched repositories under the agent they were picked for", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({ managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/web" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    await screen.findByTestId("new-chat-landing-repo-row");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "audit the repo" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(localStorage.getItem("omnigent:last-sandbox-repos") ?? "{}")).toEqual({
+      a2: [{ url: "https://github.com/org/web", branch: "" }],
+    });
+  });
+
+  it("keeps a hand-picked repository list when the agent changes", async () => {
+    localStorage.setItem(
+      "omnigent:last-sandbox-repos",
+      JSON.stringify({ a2: [{ url: "https://github.com/org/codex-repo", branch: "" }] }),
+    );
+    renderLanding({ managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/mine" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    await screen.findByTestId("new-chat-landing-repo-row");
+
+    // The user's own pick is not location state of the agent: switching to
+    // Codex keeps it rather than swapping in Codex's remembered repo.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/^Codex/);
+    expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("mine");
   });
 
   it("carries the picked provider in the managed create when several are offered", async () => {

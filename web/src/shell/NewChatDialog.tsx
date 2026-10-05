@@ -913,6 +913,15 @@ export function sanitizeInitialPrompt(prompt: string): string {
 export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
 
 /**
+ * A managed session's ``<url>[#<branch>]`` repos from its space-joined label, or ``[]``.
+ */
+export function sandboxReposFromLabels(
+  labels: Record<string, string> | null | undefined,
+): string[] {
+  return (labels?.[SANDBOX_REPO_LABEL_KEY] ?? "").split(/\s+/).filter((w) => w !== "");
+}
+
+/**
  * Return true when ``url`` is acceptable as a sandbox repository URL.
  *
  * Mirrors the server's accepted forms (``parse_repo_workspace``):
@@ -2048,6 +2057,9 @@ interface LandingDraft {
   sandboxSelected: boolean;
   sandboxProvider: string | null;
   sandboxRepoSelections: LastSandboxRepo[];
+  // Whether the repo list is still the untouched seed remembered for the
+  // agent (an agent switch may then swap in that agent's repos).
+  sandboxReposSeeded: boolean;
   workspace: string;
   branchName: string;
   autoSeededBranch: string;
@@ -2248,6 +2260,7 @@ export function NewChatLandingScreen() {
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
           sandboxRepoSelections: [],
+          sandboxReposSeeded: true,
           workspace: "",
           branchName: "",
           // The branch may be the worktree-default's auto-seed, generated for
@@ -2401,13 +2414,17 @@ export function NewChatLandingScreen() {
   // Sandbox repository inputs — composed into the managed create's
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
-  // Seed from the in-session draft, else the last repos the user launched with
-  // (remembered across visits) so returning users don't re-pick them. The repo
-  // combobox derives its selection from each URL, so a remembered repo the
-  // account can no longer access just shows unselected.
+  // Seed from the in-session draft, else the repos last launched with this agent
+  // (remembered per agent) so returning users don't re-pick them; a remembered
+  // repo the account can no longer access simply shows unselected in the combobox.
   const [sandboxRepoSelections, setSandboxRepoSelections] = useState<LastSandboxRepo[]>(
-    () => restoredDraft?.sandboxRepoSelections ?? readLastSandboxRepos(),
+    () => restoredDraft?.sandboxRepoSelections ?? readLastSandboxRepos(pickedAgentId),
   );
+  // True while the list is still that untouched remembered seed; any edit makes
+  // it the user's own, which an agent switch then leaves alone.
+  const sandboxReposSeededRef = useRef<boolean>(restoredDraft?.sandboxReposSeeded ?? true);
+  // Agent whose remembered repos the current seed came from.
+  const sandboxReposSeededForRef = useRef<string | null>(pickedAgentId);
   // Whether the launch provider clones several repos (server-declared per
   // provider via /v1/info). A single-repo provider caps the picker at one, so
   // it reads as a plain single-repo picker and never offers a multi-repo menu.
@@ -2427,6 +2444,7 @@ export function NewChatLandingScreen() {
     (url: string, branch = ""): void => {
       const u = url.trim();
       if (u === "") return;
+      sandboxReposSeededRef.current = false;
       setSandboxRepoSelections((prev) =>
         // Cap at the provider's limit so a selection can't only fail with a 422
         // at create; a duplicate URL is a no-op.
@@ -2438,9 +2456,11 @@ export function NewChatLandingScreen() {
     [maxSandboxRepos],
   );
   const removeSandboxRepo = useCallback((url: string): void => {
+    sandboxReposSeededRef.current = false;
     setSandboxRepoSelections((prev) => prev.filter((r) => r.url !== url));
   }, []);
   const setSandboxRepoBranch = useCallback((url: string, branch: string): void => {
+    sandboxReposSeededRef.current = false;
     setSandboxRepoSelections((prev) => prev.map((r) => (r.url === url ? { ...r, branch } : r)));
   }, []);
   // Free-text URL being typed into the "paste a URL" adder (not yet added).
@@ -2611,6 +2631,7 @@ export function NewChatLandingScreen() {
     sandboxSelected,
     sandboxProvider,
     sandboxRepoSelections,
+    sandboxReposSeeded: sandboxReposSeededRef.current,
     workspace,
     branchName,
     autoSeededBranch,
@@ -2746,8 +2767,11 @@ export function NewChatLandingScreen() {
     setBranchName("");
     setAutoSeededBranch("");
     // Drafted sandbox repo fields are location state too — left in place they
-    // would clone the previous project's repo into this project's sandbox.
+    // would clone the previous project's repo into this project's sandbox. The
+    // agent's remembered repos may seed again once this visit's agent resolves.
     setSandboxRepoSelections([]);
+    sandboxReposSeededRef.current = true;
+    sandboxReposSeededForRef.current = null;
     setPendingRepoUrl("");
     agentFromConfigRef.current = false;
     workspaceFromConfigRef.current = false;
@@ -3035,6 +3059,15 @@ export function NewChatLandingScreen() {
             ? cachedPickerOptions!.agent.id
             : (agentList[0]?.id ?? null);
   const effectiveAgentId = automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId;
+  // Re-seed the list from the agent the launch will use, so a repo remembered
+  // for one agent never rides into another agent's launch. Left alone once the
+  // user has edited the list this visit, or while no agent has resolved yet.
+  useEffect(() => {
+    if (!sandboxReposSeededRef.current || effectiveAgentId === null) return;
+    if (sandboxReposSeededForRef.current === effectiveAgentId) return;
+    sandboxReposSeededForRef.current = effectiveAgentId;
+    setSandboxRepoSelections(readLastSandboxRepos(effectiveAgentId));
+  }, [effectiveAgentId]);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -5168,11 +5201,11 @@ export function NewChatLandingScreen() {
     // after the user has navigated elsewhere while this component is still
     // mounted in the outgoing transition tree.
     const createLocation = window.location.href;
-    // Remember the repos/branches for next time (seeds the picker on the next
-    // visit). Only when a repo is actually set — a no-repo session leaves the
-    // remembered repos untouched rather than clearing them.
-    if (sandboxRepoSelections.length > 0) {
-      writeLastSandboxRepos(sandboxRepoSelections);
+    // Remember the repos/branches for this agent's next launch. Only when a repo
+    // is set — a no-repo session leaves the remembered repos untouched — and only
+    // for an existing agent: one still being created has no id to key them by.
+    if (sandboxRepoSelections.length > 0 && effectiveAgentId !== PENDING_AGENT_ID) {
+      writeLastSandboxRepos(effectiveAgentId, sandboxRepoSelections);
     }
     setCreating(true);
     setCreateError(null);
