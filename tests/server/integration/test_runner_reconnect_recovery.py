@@ -64,7 +64,7 @@ async def _recover(
         finished.set()
 
     monkeypatch.setattr(runner_tunnel, "_run_connect_hook", record_completion)
-    monkeypatch.setattr(sessions, "_ensure_runner_relay", lambda sid, *_: relays.append(sid))
+    monkeypatch.setattr(sessions, "_ensure_runner_relay", lambda sid, *_, **__: relays.append(sid))
     monkeypatch.setattr(sessions, "RUNNER_DISCONNECT_GRACE_S", 0)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(respond), base_url="http://runner"
@@ -364,8 +364,8 @@ async def test_reconnect_skips_root_rebound_before_initialization(
         async with _recover(app, monkeypatch, respond) as (relays, finished):
             original_relay = sessions._ensure_runner_relay
 
-            def attach_then_rebind(sid: str, rid: str, *args: Any) -> None:
-                original_relay(sid, rid, *args)
+            def attach_then_rebind(sid: str, rid: str, *args: Any, **kwargs: Any) -> None:
+                original_relay(sid, rid, *args, **kwargs)
                 relay_bindings[sid] = rid
                 if phase == "attachment" and sid == moved.id:
                     rebind_subtree()

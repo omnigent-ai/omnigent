@@ -78,6 +78,7 @@ from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -4809,6 +4810,7 @@ def _publish_status(
     persist_live_status: bool = True,
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
+    failure_context: object = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4841,6 +4843,8 @@ def _publish_status(
         server-side failure logs one ERROR from here, so without it the
         dozen unrelated causes that reach this function are one
         undifferentiated signature. Ignored for non-failed edges.
+    :param failure_context: Untrusted optional native evidence, normalized at
+        the failure-log boundary. Malformed values cannot reject the status edge.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -4915,6 +4919,7 @@ def _publish_status(
                 code=failure_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
+                **failure_log_attributes(failure_context),
             ),
         )
         session_live_state.persist_scheduled_run_completion(
@@ -7991,6 +7996,18 @@ async def _relay_persist_error_once(
             session_id,
             [item],
         )
+        _logger.info(
+            "Relay: error item persisted for session=%s code=%s",
+            session_id,
+            item.data.code,
+            extra=debug_event(
+                "error_item_persisted",
+                session_id=session_id,
+                code=item.data.code,
+                level=item.data.level,
+                source=item.data.source,
+            ),
+        )
         return "persisted"
     except Exception:  # noqa: BLE001
         _logger.exception(
@@ -9452,7 +9469,7 @@ async def _remove_session_worktree_best_effort(
     worktree_path: str,
     branch: str,
     delete_branch: bool,
-    request: Request,
+    host_registry: Any,
     reason: str,
     conversation_store: ConversationStore | None = None,
     exclude_conversation_id: str | None = None,
@@ -9463,7 +9480,7 @@ async def _remove_session_worktree_best_effort(
     Best-effort removal of a session's git worktree.
 
     Used for create-rollback (orphan cleanup) and opt-in session-delete
-    cleanup. Host-reported git failures are logged so the caller's
+    and session-archive cleanup. Host-reported git failures are logged so the caller's
     primary operation still completes. When ``fail_if_unavailable`` is
     set, an unreachable host raises ``CONFLICT`` instead of skipping —
     the session is left in place so the caller can retry without
@@ -9477,9 +9494,10 @@ async def _remove_session_worktree_best_effort(
         ``"feature/login"``.
     :param delete_branch: When ``True``, also run ``git branch -D``
         after removing the worktree directory.
-    :param request: FastAPI request carrying the host registry.
+    :param host_registry: The ``HostRegistry`` tracking live host
+        tunnels, or ``None`` when host support is not wired.
     :param reason: Short label for log lines, e.g.
-        ``"create-rollback"`` or ``"session-delete"``.
+        ``"create-rollback"``, ``"session-delete"`` or ``"session-archive"``.
     :param conversation_store: Store used to check whether another live
         session shares this directory. ``None`` skips the check — correct
         for create-rollback, whose worktree was made moments ago in the
@@ -9531,7 +9549,6 @@ async def _remove_session_worktree_best_effort(
             )
             return
 
-    host_registry = getattr(request.app.state, "host_registry", None)
     if host_registry is None:
         if fail_if_unavailable:
             raise OmnigentError(

@@ -36,6 +36,7 @@ from omnigent.version import VERSION
 if TYPE_CHECKING:
     from types import TracebackType
 
+    from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
     from omnigent.runner.native import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
     from omnigent.spec.types import AgentSpec
@@ -655,8 +656,6 @@ def _make_auth_token_factory(
         )
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
 
-    from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
-
     # Prefer the host-launched runner's owner-bound capability so user
     # credentials stay out of the runner and credential discovery is skipped.
     delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
@@ -668,9 +667,7 @@ def _make_auth_token_factory(
         if delegated_factory is not None:
             return delegated_factory
 
-    # Reuse the SDK token cache, but re-resolve auth if a mint fails after a
-    # CLI upgrade or other credential change.
-    sdk_token_source = _ReusedDatabricksTokenSource(resolved_server_url)
+    sdk_token_source: _ReusedDatabricksTokenSource | None = None
 
     def _factory() -> str | None:
         """Return a fresh auth token.
@@ -681,6 +678,7 @@ def _make_auth_token_factory(
         :returns: Bearer token string, or ``None`` if no credentials
             are configured.
         """
+        nonlocal sdk_token_source
         # Check stored OIDC token first.
         if resolved_server_url:
             from omnigent.cli_auth import (
@@ -711,6 +709,12 @@ def _make_auth_token_factory(
             still_valid = load_token(resolved_server_url)
             if still_valid:
                 return still_valid
+        if sdk_token_source is None:
+            # Optional SDK imports must not prevent delegated/OIDC recovery or
+            # bypass the managed-mint fallback when the executor cannot load.
+            from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
+
+            sdk_token_source = _ReusedDatabricksTokenSource(resolved_server_url)
         return sdk_token_source.current_token()
 
     # Probe once to check if a user credential is available.

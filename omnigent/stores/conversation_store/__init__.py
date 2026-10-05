@@ -539,6 +539,19 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+        """Return the bound runner ID and heartbeat from the metadata database.
+
+        Reads neither conversation data nor labels, so an unrelated
+        conversation backend outage cannot hide a healthy runner.
+
+        :param conversation_id: Session/conversation ID to look up.
+        :returns: ``(runner_id, runner_last_seen)``, or ``None`` if the
+            metadata row is missing. Either field may be ``None``.
+        """
+        ...
+
+    @abstractmethod
     def get_session_connectivity(
         self, conversation_ids: list[str]
     ) -> dict[str, SessionConnectivity]:

@@ -295,7 +295,7 @@ async def restore_active_children(
                     )
                     response.raise_for_status()
                 initializer.require_generation(runner_id, client, generation)
-                _ensure_runner_relay(child.id, parent.runner_id, client, store)
+                _ensure_runner_relay(child.id, parent.runner_id, client, store, conversation=child)
                 # Only execution status can clear the interruption. Initialization
                 # may return before a native continuation emits its first running edge.
                 return True

@@ -206,6 +206,10 @@ import {
 } from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
+  readDeleteWorktreesOnArchive,
+  writeDeleteWorktreesOnArchive,
+} from "@/lib/archiveWorktreePreferences";
+import {
   archivedAtSeconds,
   readRetentionDays,
   writeRetentionDays,
@@ -1079,6 +1083,8 @@ function AppearanceSection() {
 
 /** Git behavior settings. */
 function GitSection() {
+  const info = useServerInfo();
+  const archiveWorktreeCleanup = info !== "loading" && info.archive_worktree_cleanup === true;
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
       <div className="flex flex-col gap-3">
@@ -1088,6 +1094,11 @@ function GitSection() {
           <div className="mt-4 border-t border-border pt-4">
             <DefaultBaseBranchControl />
           </div>
+          {archiveWorktreeCleanup && (
+            <div className="mt-4 border-t border-border pt-4">
+              <DeleteWorktreesOnArchiveControl />
+            </div>
+          )}
         </div>
       </div>
     </Section>
@@ -1292,6 +1303,40 @@ function AlwaysUseWorktreeControl() {
         data-testid="settings-always-use-worktree-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.git.always_use_worktree"
+      />
+    </div>
+  );
+}
+
+/**
+ * Remove a session's git worktree when it's archived. Off until chosen; while
+ * unset, the first archive of a worktree session asks instead.
+ */
+function DeleteWorktreesOnArchiveControl() {
+  const [value, setValue] = useState(() => readDeleteWorktreesOnArchive() === true);
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeDeleteWorktreesOnArchive(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Delete worktrees for archived sessions
+        </span>
+        <span className="text-ui text-muted-foreground">
+          Remove a session's git worktree directory, including uncommitted changes, when you archive
+          it. The branch is kept.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="settings-delete-worktrees-on-archive-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.git.delete_worktrees_on_archive"
       />
     </div>
   );

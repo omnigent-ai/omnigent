@@ -1273,6 +1273,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             ).all()
         return {row.id: row.runner_id for row in rows}
 
+    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+        """Read one session's bound runner and heartbeat from the metadata DB only."""
+        with self._session("get_runner_liveness") as session:
+            row = session.execute(
+                select(
+                    SqlConversationMetadata.runner_id,
+                    SqlConversationMetadata.runner_last_seen,
+                ).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+            ).one_or_none()
+        return (row.runner_id, row.runner_last_seen) if row is not None else None
+
     def get_session_connectivity(
         self, conversation_ids: list[str]
     ) -> dict[str, SessionConnectivity]:

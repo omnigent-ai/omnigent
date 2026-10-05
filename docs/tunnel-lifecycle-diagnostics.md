@@ -54,11 +54,40 @@ both ends.
   loss is then held for `grace_s`; an intentional stop goes straight to the
   give-up row.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
-  (`intentional_stop`, `server_shutdown`, `idle_no_failure` or
+  (`intentional_stop`, `server_shutdown`, `live_elsewhere`, `idle_no_failure` or
   `failed_mid_turn`), `grace_s`, `outage_s`, `retries`. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected
   stretch and is not cumulative disconnected time.
+- `runner_disconnect_decision`: a warning explaining the status check in the
+  relay (`origin = runner_disconnected_mid_turn`) or offline sweep
+  (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
+  `failed_mid_turn`, `failed_before_start`, or `intentional_stop`.
+  Idle subsessions keep their status and emit no `session_turn_failed` event
+  or error labels. Running and waiting sessions still fail on disconnect;
+  `fail_idle_top_level` applies only to top-level startup failures.
+
+  `status_source` is `cache`, `persisted`, `snapshot`, `relay_snapshot`, or
+  `unknown`, alongside `cached_session_status`, `persisted_session_status`,
+  `snapshot_session_status`, and `status_lookup` (`not_needed`, `found`,
+  `missing`, or `error`). Both paths read a fresh row on a cache miss and
+  recheck the cache after the read. A missing or failed read falls back to the
+  sweep's snapshot (`snapshot`) or the known status retained when the relay
+  adopted its runner binding (`relay_snapshot`). Without any known state,
+  the disconnect still reports a failure.
+
+  Adoption snapshots stay outside the live cache: an old saved status must
+  not override a newer row written by another server. They belong to one
+  relay binding and are discarded when it ends or is replaced. A quiet
+  Claude subsession can emit only heartbeats after handoff, so retaining its
+  saved idle state avoids a false failure if the later status lookup fails.
+  A readable running/waiting row still takes precedence, including when
+  that persisted state is stale; this fallback does not repair stale writes.
+
+  The row includes the active `turn_id` and, when available, `session_kind`,
+  `parent_session_id`, `runner_id`, `host_id`, and `conversation_updated_at`.
+  The latter measures content activity, not the time of a status transition.
+  A relay cache hit does not load conversation metadata solely for logging.
 - `runner_session_init_started`: `resume_interrupted_turn`,
   `suppress_recovery_turn`, `recovery_id`. Neither flag set is the tunnel
   reconnect hook; resume set is a sub-agent restore; suppress set is a
@@ -66,11 +95,29 @@ both ends.
 
 ## Correlation
 
+The disconnect grace task rechecks the local tunnel after loading bound
+sessions. A reconnect during that read logs `reconnected during offline
+lookup; skipping offline-marking`; an older database snapshot must not turn
+the live runner's sessions into disconnect failures.
+
 Join the runner's and server's rows for one socket on
 `attributes['connection_id']`. A `runner_connected` row with `reconnect =
 False` after earlier rows for the same `runner_id` is a new process; `pid`
 confirms it. A repeating `connection_age_s` across drops points at an
 intermediary timeout rather than either endpoint.
+
+## Credential recovery
+
+`auth token refresh failed; falling back to previous token` describes a
+failed renewal attempt, not the cause of the preceding socket close. Check
+the exception type and subsequent handshake result: a rejected old bearer
+can keep the runner disconnected even after network connectivity returns.
+
+Delegated runner credentials and stored or refreshed OIDC logins do not
+require the Databricks executor to import. The SDK path loads only when
+those providers do not supply a token; an import failure there still permits
+the existing managed-mint fallback. This does not repair an inconsistent
+installation or provide a credential when every configured provider fails.
 
 ## Build identity
 
@@ -90,6 +137,8 @@ uv run --no-sync pytest -q tests/runner/transports/ws_tunnel/test_serve.py \
   tests/runner/transports/ws_tunnel/test_frames.py \
   tests/server/integration/test_runner_tunnel_route.py \
   tests/server/routes/test_sessions_runner_relay.py \
+  tests/server/integration/test_sessions_tunnel_three_layer.py \
+  tests/server/routes/test_subagent_status.py \
   tests/server/test_runner_session_init.py \
   tests/runner/test_suppress_recovery_turn.py \
   tests/deploy/test_databricks_deploy_version.py
@@ -100,3 +149,17 @@ runner's socket, hold a reconnect past `RUNNER_DISCONNECT_GRACE_S`, kill the
 runner process, and crash a harness mid-turn. One query on the session over
 the events above, ordered by `client_time`, must tell the four apart and show
 whether the original turn survived.
+
+For idle-child handling, let a Claude subsession become idle, then stop its
+host without using the session's Stop action. After the disconnect grace,
+the child should remain idle with a warning whose decision is
+`idle_no_failure`, no disconnect error in its transcript, and no Failed
+activity in its parent's transcript. Repeat with a running child to confirm
+that interrupted work still produces `runner_disconnected`.
+
+For handoff handling, reconnect an idle child's runner to a fresh server,
+then drop the runner after its heartbeat-only relay is ready. In a test
+environment, make the disconnect-time conversation lookup fail or return no
+row. The warning should report `status_source = relay_snapshot` and
+`decision = idle_no_failure`. Repeat after persisting a new running status:
+the fresh row must win and the interruption must still fail.

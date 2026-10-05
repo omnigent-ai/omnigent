@@ -166,6 +166,7 @@ from omnigent.runner.subagent_work import (
     _WAKE_POST_MAX_ATTEMPTS,
     _child_session_parents,
     _ChildParentMeta,
+    _deliver_subagent_completion,
     _deliver_subagent_wake_post,
     _format_subagent_wake_notice,
     _session_inboxes_ref,
@@ -1786,21 +1787,29 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        exit_log = debug_event("required_terminal_exited", session_id=event.session_id)
+        exit_log["attributes"] = {
+            **{
+                key: value
+                for key, value in event.lifecycle_context.items()
+                if key not in {"event_name", "session_id", "turn_id", "user_id"}
+            },
+            "terminal_id": event.terminal_id,
+            "terminal_instance_id": event.terminal_instance_id,
+            "terminal_name": event.terminal_name,
+            "terminal_exit_status": event.exit_status,
+            "runner_shutting_down": _shutting_down.is_set(),
+            "error_code": error["code"],
+            # An unrecognized exit is the harness CLI dying under the runner.
+            "error_category": (diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
+            "error_impact": ErrorImpact.BLOCKING.value,
+        }
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
             event.session_id,
             error.get("message"),
-            extra=debug_event(
-                "required_terminal_exited",
-                session_id=event.session_id,
-                terminal_name=event.terminal_name,
-                terminal_exit_status=event.exit_status,
-                error_code=error["code"],
-                # An unrecognized exit is the harness CLI dying under the runner.
-                error_category=(diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
-                error_impact=ErrorImpact.BLOCKING.value,
-            ),
+            extra=exit_log,
         )
         _publish_event(
             event.session_id,
@@ -2749,6 +2758,7 @@ def create_runner_app(
                         bundle_dir=bundle_dir,
                         skills_filter=skills_filter,
                         agent_spec=spec_entry,
+                        session_init=init_context.envelope,
                     )
 
                 _launch_pre = _codex_pre_launch
@@ -3206,6 +3216,7 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
         _session_message_buffers.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
@@ -3785,6 +3796,10 @@ def create_runner_app(
                 status="completed",
                 output=_extract_last_assistant_text(conv_id),
             )
+        elif _is_native_harness(conv_id):
+            # A clean native turn end acknowledges prompt submission, so the
+            # dispatch leaves ``launching`` even when no running edge is relayed.
+            mark_subagent_work_started(conv_id)
         try:
             loop = asyncio.get_running_loop()
             _cont = loop.create_task(
@@ -6350,6 +6365,7 @@ def create_runner_app(
         if body_type == "interrupt":
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
+            resource_registry.note_terminal_control_request(conversation_id, "interrupt")
             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
             if _interrupt_resp is not None:
                 return _interrupt_resp
@@ -6443,12 +6459,13 @@ def create_runner_app(
                 if entry is None or entry.status not in _SUBAGENT_TERMINAL_STATUSES:
                     return Response(status_code=204)
                 # An already-settled outcome may still await parent delivery
-                # (the forwarder's 503-retry contract); re-attempt it.
-                delivery_ack = _mark_subagent_terminal_and_wake(
-                    conversation_id,
-                    status=entry.status,
-                    output=entry.output,
-                )
+                # (the forwarder's 503-retry contract): retry the recorded
+                # result as-is. Re-reporting it as a fresh terminal edge would
+                # let a provisional launch-timeout ``failed`` pass for the
+                # child's own report and spend its flag.
+                delivery_ack = _deliver_subagent_completion(entry)
+                if delivery_ack.delivered_now:
+                    _schedule_subagent_wake(entry)
             else:
                 if status in ("idle", "failed"):
                     recovered_entry = await _ensure_subagent_work_entry(conversation_id)
@@ -6499,6 +6516,7 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "stop_session":
+            resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)

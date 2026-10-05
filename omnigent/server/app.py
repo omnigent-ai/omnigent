@@ -185,6 +185,8 @@ class ServerInfoResponse(BaseModel):
     harness_install_enabled: bool
     installable_harnesses: list[str]
     dictation_available: bool
+    # The archive PATCH accepts ``delete_worktree``; older servers reject it.
+    archive_worktree_cleanup: bool = True
     branding: BrandingInfo
 
 
@@ -2978,6 +2980,7 @@ def create_app(
                 "harness_install_enabled": harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
+                "archive_worktree_cleanup": True,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3367,6 +3370,13 @@ def create_app(
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        # The runner may reconnect while the store returns an older snapshot.
+        if tunnel_registry.get(runner_id) is not None:
+            _logger.info(
+                "Runner %s reconnected during offline lookup; skipping offline-marking",
+                runner_id,
+            )
+            return
         if _runner_live_on_another_replica_from_conversations(
             affected, runner_id, reference_stamp
         ):
@@ -3594,7 +3604,13 @@ def create_app(
                             continue
                         if routed.runner_id != runner_id:
                             continue
-                        _ensure_runner_relay(conv.id, runner_id, routed.client, conversation_store)
+                        _ensure_runner_relay(
+                            conv.id,
+                            runner_id,
+                            routed.client,
+                            conversation_store,
+                            conversation=conv,
+                        )
                         if is_independent(conv):
                             roots.append((conv, routed.client))
                         else:
@@ -3717,9 +3733,13 @@ def create_app(
     # except (a hidden failure). No host_store = host support is simply
     # not enabled (host connects get 404), rather than silently broken.
     if host_store is not None:
+        from omnigent.server.routes.harness_startup import create_harness_startup_router
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
         from omnigent.server.routes.mcp_servers import create_mcp_servers_router
+        from omnigent.server.routes.mcp_tools import create_mcp_tools_router
+        from omnigent.server.routes.plugins import create_plugins_router
+        from omnigent.server.routes.skill_content import create_skill_content_router
         from omnigent.server.routes.skills import create_skills_router
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
@@ -3765,6 +3785,26 @@ def create_app(
             ),
             prefix="/v1",
             tags=["skills"],
+        )
+        app.include_router(
+            create_harness_startup_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_plugins_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_skill_content_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_mcp_tools_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
         )
         app.include_router(
             create_mcp_servers_router(host_registry, host_store, auth_provider=auth_provider),

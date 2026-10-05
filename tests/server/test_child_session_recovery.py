@@ -367,7 +367,7 @@ async def test_message_handshake_does_not_wait_for_child_initialization(
     row = child()
     entered, release, restored = asyncio.Event(), asyncio.Event(), asyncio.Event()
     requests = []
-    relay.side_effect = lambda *_args: restored.set()
+    relay.side_effect = lambda *_args, **_kwargs: restored.set()
 
     async def respond(request: httpx.Request) -> httpx.Response:
         session_id = json.loads(request.content)["session_id"]
@@ -480,7 +480,9 @@ async def test_parent_recovery_published_before_descendant_store_failure(
 
     def fail_lookup(*_args: Any) -> None:
         recovered.assert_awaited_once_with(parent.id, store)
-        ready.assert_awaited_once_with(parent.id, parent.runner_id, client, store)
+        ready.assert_awaited_once_with(
+            parent.id, parent.runner_id, client, store, conversation=parent
+        )
         raise failure
 
     monkeypatch.setattr(store, "list_child_conversation_ids_by_parent", fail_lookup)
@@ -507,7 +509,9 @@ async def test_hung_child_does_not_block_sibling_or_its_descendants(recovery_tre
     restored = asyncio.Event()
     stopped: set[str] = set()
     requested = []
-    relay.side_effect = lambda sid, *_: restored.set() if sid == healthy_descendant.id else None
+    relay.side_effect = lambda sid, *_, **__: (
+        restored.set() if sid == healthy_descendant.id else None
+    )
 
     async def respond(request: httpx.Request) -> httpx.Response:
         sid = json.loads(request.content)["session_id"]
@@ -600,7 +604,7 @@ async def test_mirror_changed_while_recovery_waits_is_not_attached(
     entered, release = asyncio.Event(), asyncio.Event()
     requested: list[str] = []
     bindings = {mirror.id: "new"}
-    relay.side_effect = lambda sid, rid, *_: bindings.update({sid: rid})
+    relay.side_effect = lambda sid, rid, *_, **__: bindings.update({sid: rid})
 
     def change_mirror() -> None:
         if change == "rebound":
@@ -766,7 +770,7 @@ async def test_store_fanout_is_bounded_without_blocking_on_hung_initializations(
         "asyncio",
         SimpleNamespace(**(vars(asyncio) | {"to_thread": scheduled_store_call})),
     )
-    relay.side_effect = lambda sid, *_: restored.set() if sid == healthy.id else None
+    relay.side_effect = lambda sid, *_, **__: restored.set() if sid == healthy.id else None
 
     async def respond(request: httpx.Request) -> httpx.Response:
         sid = json.loads(request.content)["session_id"]
@@ -882,7 +886,7 @@ async def test_rebinding_joins_old_initialization_without_blocking_siblings(
     initialized_after_retirement: list[bool] = []
     destination_entered, destination_release = asyncio.Event(), asyncio.Event()
     destination: asyncio.Task[httpx.Response] | None = None
-    relay.side_effect = lambda sid, *_: sibling_restored.set() if sid == sibling.id else None
+    relay.side_effect = lambda sid, *_, **__: sibling_restored.set() if sid == sibling.id else None
 
     async def start_destination_after_rebind(call: Any, *args: Any, **kwargs: Any) -> Any:
         nonlocal destination

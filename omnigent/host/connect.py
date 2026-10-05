@@ -73,6 +73,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostFsWriteFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
@@ -89,13 +91,19 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
+    HostMcpToolsFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPluginsFrame,
+    HostPluginsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillContentFrame,
+    HostSkillContentResultFrame,
     HostSkillsFrame,
     HostSkillsResultFrame,
     HostStatFrame,
@@ -1121,6 +1129,9 @@ class HostProcess:
         from omnigent.host.mcp_inventory import HostMcpInventory
 
         self._mcp_inventory = HostMcpInventory()
+        from omnigent.host.mcp_tools import HostMcpTools
+
+        self._mcp_tools = HostMcpTools()
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -3180,6 +3191,20 @@ class HostProcess:
                 error="skill discovery failed; see the host log",
             )
 
+    def _handle_harness_startup(
+        self, frame: HostHarnessStartupFrame
+    ) -> HostHarnessStartupResultFrame:
+        """Read launch metadata locally, keeping config values off the tunnel."""
+        from omnigent.host.harness_startup import describe_harness_startup
+
+        try:
+            return HostHarnessStartupResultFrame(
+                frame.request_id, describe_harness_startup(frame.harness)
+            )
+        except Exception:
+            _logger.exception("Harness launch settings failed")
+            return HostHarnessStartupResultFrame(frame.request_id)
+
     def _handle_mcp_servers(self, frame: HostMcpServersFrame) -> HostMcpServersResultFrame:
         """List user-level MCP servers in a worker thread."""
         try:
@@ -3194,6 +3219,44 @@ class HostProcess:
         return HostMcpServersResultFrame(
             request_id=frame.request_id, status="ok", mcp_servers=servers
         )
+
+    def _handle_plugins(self, frame: HostPluginsFrame) -> HostPluginsResultFrame:
+        """Read installed plugin metadata off the event loop."""
+        from omnigent.host.plugins import discover_plugins
+
+        try:
+            plugins = discover_plugins()
+        except Exception:  # noqa: BLE001 — do not log host file contents
+            return HostPluginsResultFrame(
+                request_id=frame.request_id, status="failed", error="plugin inventory failed"
+            )
+        return HostPluginsResultFrame(request_id=frame.request_id, status="ok", plugins=plugins)
+
+    def _handle_skill_content(self, frame: HostSkillContentFrame) -> HostSkillContentResultFrame:
+        from omnigent.host.skill_content import read_skill_content
+
+        try:
+            skill = read_skill_content(frame.harness, frame.name, source_id=frame.source_id)
+        except Exception:  # noqa: BLE001 — file contents must never enter exception logs
+            return HostSkillContentResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="skill content lookup failed",
+            )
+        return HostSkillContentResultFrame(request_id=frame.request_id, status="ok", skill=skill)
+
+    async def _handle_mcp_tools(self, frame: HostMcpToolsFrame) -> HostMcpToolsResultFrame:
+        try:
+            result = await self._mcp_tools.probe(
+                frame.harness, frame.server, frame.plugin, frame.source_id
+            )
+        except BlockingIOError:
+            return HostMcpToolsResultFrame(request_id=frame.request_id, status="busy")
+        except Exception:  # noqa: BLE001 — transport failures must not expose private config
+            return HostMcpToolsResultFrame(
+                request_id=frame.request_id, status="failed", error="MCP tools lookup failed"
+            )
+        return HostMcpToolsResultFrame(request_id=frame.request_id, status="ok", **result)
 
     def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
         """Read the bound session bundle using this host's existing credentials."""
@@ -4728,6 +4791,18 @@ class HostProcess:
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
             await ws.send(encode_host_frame(skills_result))
+        elif isinstance(frame, HostPluginsFrame):
+            plugins_result = await asyncio.to_thread(self._handle_plugins, frame)
+            await ws.send(encode_host_frame(plugins_result))
+        elif isinstance(frame, HostSkillContentFrame):
+            content_result = await asyncio.to_thread(self._handle_skill_content, frame)
+            await ws.send(encode_host_frame(content_result))
+        elif isinstance(frame, HostMcpToolsFrame):
+            tools_result = await self._handle_mcp_tools(frame)
+            await ws.send(encode_host_frame(tools_result))
+        elif isinstance(frame, HostHarnessStartupFrame):
+            startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
+            await ws.send(encode_host_frame(startup_result))
         elif isinstance(frame, HostMcpServersFrame):
             mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
             await ws.send(encode_host_frame(mcp_result))

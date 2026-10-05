@@ -29,6 +29,19 @@ implements them separately, so a fix for one harness does not reach the others.
   connection ends; reconnect can receive fresh events. Distinguish a native
   CLI disconnect, a runner going offline, and a browser stream reconnect.
 
+- `launch-settings`: Settings → Harnesses → a configured Claude or Codex →
+  Settings (or its card's gear). Shows the selected host's binary, source, and
+  configured argument count, read-only. Argument and environment values stay
+  on the host. Workspace config can override these host defaults. Behind
+  `harness_settings_ui`; other harnesses keep their credential card only.
+- `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
+  with loading, truncation, unavailable-host, and older-server states.
+
+- `mcp-tools`: expand a configured or plugin MCP server to probe its tools,
+  with connected/auth/timeout/unreachable/unsupported and mixed-version states.
+
+- `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
+
 ## How to get to it (user POV)
 
 **Web:** start a new session, choose the harness in the harness picker, open its
@@ -37,6 +50,14 @@ view appear in the session.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Skill contents:** Settings → Harnesses → configured harness card (or gear),
+then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
+list or plugin. Requires `harness_settings_ui`.
+
+**MCP tools:** Settings → Harnesses → configured harness card (or gear),
+then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
+Probes run only on expansion; requires `harness_settings_ui`.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -75,6 +96,16 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   --output="$VERIFY_EVIDENCE/native-harnesses"
 ```
 
+**Launch settings (own environment):** enable `harness_settings_ui`, connect a
+host with Claude/Codex configured, and put a command and two args under
+`harness.claude-native` / `harness.codex-native` in its `~/.omnigent/config.yaml`.
+Open each harness through both its gear and card → Settings. Check the binary,
+source, count of two (no values), and credential. Select a second host on the
+grid and repeat. An older host shows an update message; an older server hides
+the extra fields. Resolver and raw-tunnel checks:
+`tests/host/test_harness_startup.py`,
+`tests/server/integration/test_host_tunnel_route.py::test_startup_http_through_real_tunnel`.
+
 Cross-harness journeys:
 
 - **`needs-auth`:**
@@ -90,6 +121,37 @@ Cross-harness journeys:
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
 - **`chat-render`, `steer`, per harness:** use the matrix.
+- **`skill-contents`:** run `tests/host/test_skill_content.py`,
+  `tests/server/routes/test_skill_content.py`, and the real-host test
+  `tests/e2e/test_host_skill_content_e2e.py::test_host_skill_content` with plain
+  pytest. Web coverage is in `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  Open installed plugin skills while the plugin is disabled and when the skill
+  is not user-invocable. With matching names in two marketplaces or a plain skill,
+  verify each plugin page shows its own instructions.
+  For both card and gear entry points, open a plain skill and a plugin skill;
+  verify markdown, Back, and the truncation note for a body over 256 KiB.
+  Remote markdown images must not load. A 501 shows an update hint; inject a
+  404 from the contents route and verify the list remains with nonclickable
+  skill rows. A 502/504 shows a generic failure. Bodies must be absent from
+  the skills listing and host/server logs, with no other files or paths returned.
+
+- **`mcp-tools`:** run `tests/host/test_mcp_tools.py`,
+  `tests/server/routes/test_mcp_tools.py`, and the real-host test
+  `tests/e2e/test_host_mcp_tools_e2e.py::test_host_mcp_tools` with plain pytest.
+  Web coverage is in `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  Disabled plugin MCP rows stay visible without expansion or probes. Check
+  same-name plugins from different marketplaces return their respective tools.
+  HTTP probes honor the host's proxy and certificate environment settings.
+  From both card and gear entry points, expand a standalone and a plugin server;
+  verify the left chevron, immediate expansion, names, count and status dot.
+  Collapsed rows must not send probes or start processes. Reopen within five
+  minutes to reuse results. Test an HTTP 401, a hanging stdio process and a
+  missing executable; expect auth, timeout and unreachable states.
+  If both probe slots are occupied, an expired queued request reports that the
+  host is busy; collapse and reopen after capacity frees to retry immediately.
+  A 501 shows an update hint; inject a 404 from the tools route to retain plain
+  rows without expansion. Confirm no raw config, schemas or synthetic secrets
+  appear in responses/logs and no probe processes survive cancellation/timeout.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
@@ -113,6 +175,21 @@ Cross-harness journeys:
   checks output recovery across a real server restart and injected stream-open
   failures. It supplies native-style events; it does not run a vendor CLI.
   Run with plain `uv run pytest` and the browser prerequisites in the skill.
+
+- **`plugin-inventory` (component and host tests):**
+  `tests/e2e/test_host_plugins_e2e.py::test_host_plugin_inventory` starts a real
+  host against the test server and checks metadata and secret exclusion.
+  `tests/host/test_plugins.py`, `tests/server/routes/test_plugins.py`, and
+  `tests/server/integration/test_host_tunnel_route.py::test_host_tunnel_routes_plugins_result_to_future`.
+  Run `pnpm --dir web test src/hooks/useHarnessInventory.test.tsx src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  With `harness_settings_ui` enabled, open Settings → Harnesses, select the test
+  host and Claude Code, then Plugins. Verify name, version, marketplace, enabled
+  state, and hook/command labels from the host. Open a plugin, inspect its
+  description and Skills/MCPs tabs, then return with Plugins. Repeat via the
+  harness card's Settings gear and switch to Plugins. Installed disabled plugins
+  remain visible. For an older host (501) or server (404), verify that the
+  derived skill/MCP plugin listing still works; a 502 shows an inventory error.
+  Codex and Cursor keep their existing derived listings.
 
 ## Gotchas
 

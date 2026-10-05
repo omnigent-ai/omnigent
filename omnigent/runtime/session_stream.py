@@ -193,14 +193,18 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
             attrs["item_id"] = item["id"]
         if isinstance(item.get("type"), str):
             attrs["item_type"] = item["type"]
-        # For error items, capture level and code so dashboards can exclude
-        # info-level notices from error-rate metrics.
+        # For error items capture code, level and source (all flat on the item
+        # from to_api_dict()) so dashboards can exclude info-level notices from
+        # error-rate metrics and group errors by cause and source.
         if item.get("type") == "error":
             if isinstance(item.get("level"), str):
                 attrs["item_level"] = item["level"]
             code = item.get("code")
             if isinstance(code, str) and len(code) <= 64:
                 attrs["item_code"] = code
+            source = item.get("source")
+            if isinstance(source, str) and len(source) <= 32:
+                attrs["item_source"] = source
     error = event.get("error")
     if not isinstance(error, dict) and isinstance(response, dict):
         error = response.get("error")

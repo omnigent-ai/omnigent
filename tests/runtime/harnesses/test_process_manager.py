@@ -489,6 +489,8 @@ async def test_get_client_respawns_after_crash(
         original_pid = (await client.get("/pid")).json()["pid"]
         if response_id is not None:
             manager.mark_in_flight("conv_a", response_id)
+            assert await manager.get_client("conv_a", _TEST_HARNESS_NAME) is client
+            assert manager.has_active_turn("conv_a")
         os.kill(original_pid, signal.SIGKILL)
         # Wait for the OS to mark the process dead so the next
         # get_client's ``returncode`` check sees it.
@@ -503,6 +505,11 @@ async def test_get_client_respawns_after_crash(
         # crash detection is broken.
         assert new_pid != original_pid
         assert _pid_alive(new_pid)
+        assert not manager.has_active_turn("conv_a")
+        assert await manager.forward_cancel("conv_a") is False
+        manager._entries["conv_a"].last_used_at = time.monotonic() - 120.0
+        await manager.release("conv_a", only_if_idle_cutoff=time.monotonic() - 60.0)
+        assert "conv_a" not in manager._entries
         exits = [
             r for r in caplog.records if getattr(r, "event_name", None) == "harness_exit_detected"
         ]
@@ -514,6 +521,25 @@ async def test_get_client_respawns_after_crash(
             "returncode": -signal.SIGKILL,
             "tracked_response_id": response_id,
         }
+    finally:
+        await manager.shutdown()
+
+
+async def test_release_clears_marker_before_same_session_replacement(
+    manager: HarnessProcessManager,
+) -> None:
+    """An explicit retirement does not make a replacement look in-flight."""
+    await manager.start()
+    try:
+        await manager.get_client("conv_release", _TEST_HARNESS_NAME)
+        manager.mark_in_flight("conv_release", "resp_old")
+        await manager.release("conv_release")
+        assert not manager.has_active_turn("conv_release")
+
+        replacement = await manager.get_client("conv_release", _TEST_HARNESS_NAME)
+        assert replacement is not None
+        assert not manager.has_active_turn("conv_release")
+        assert await manager.forward_cancel("conv_release") is False
     finally:
         await manager.shutdown()
 
@@ -536,6 +562,7 @@ async def test_get_client_respawns_on_harness_change(
     try:
         client_first = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         pid_first = (await client_first.get("/pid")).json()["pid"]
+        manager.mark_in_flight("conv_a", "resp_switch")
 
         # Same conversation, DIFFERENT harness → must respawn.
         client_second = await manager.get_client("conv_a", "test2")
@@ -545,6 +572,7 @@ async def test_get_client_respawns_on_harness_change(
         # subprocess and spawned a new one. Same PID would mean the switch
         # kept serving the old harness (the bug this branch fixes).
         assert pid_second != pid_first
+        assert not manager.has_active_turn("conv_a")
         assert _pid_alive(pid_second)
         # The original subprocess was terminated by the respawn's close.
         for _ in range(40):

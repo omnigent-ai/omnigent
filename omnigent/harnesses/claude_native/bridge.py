@@ -68,12 +68,14 @@ from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native import delivery_diagnostics
+from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
 from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.failure_telemetry import FailureContext
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -809,6 +811,8 @@ class ClaudeTranscriptItem:
         handback; transported separately from model-visible message content.
     :param agent_message_candidate: Unproven team-shaped user text; the server
         must correlate it by text without draining unrelated pending input.
+    :param failure_context: Explicit API-error evidence for diagnostic logging;
+        kept outside model-visible conversation content.
     """
 
     source_id: str
@@ -819,6 +823,7 @@ class ClaudeTranscriptItem:
     is_compact_noop: bool = False
     subagent_return_id: str | None = None
     agent_message_candidate: bool = False
+    failure_context: FailureContext | None = None
 
 
 @dataclass(frozen=True)
@@ -949,6 +954,7 @@ class ClaudeHookRecord:
     :param failure_message: ``StopFailure`` error text Claude Code rendered
         for the turn (the payload's ``last_assistant_message``), e.g.
         ``"API Error: 500 Internal server error"``. ``None`` when absent.
+    :param failure_context: Structured evidence supplied by this hook record.
     """
 
     event_cursor: int
@@ -972,6 +978,7 @@ class ClaudeHookRecord:
     background_tasks: list[_JsonObject] | None = None
     failure_category: str | None = None
     failure_message: str | None = None
+    failure_context: FailureContext | None = None
 
 
 @dataclass(frozen=True)
@@ -1655,6 +1662,9 @@ def prepare_bridge_dir(
     """
     Create or refresh the bridge directory for a native Claude session.
 
+    Per-launch lifecycle files remain available to delayed exit observers until
+    session deletion or the dead-owner sweep removes the bridge directory.
+
     :param conversation_id: Omnigent conversation id, e.g.
         ``"conv_abc123"``.
     :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
@@ -2254,6 +2264,7 @@ def build_hook_settings(
     }
     hooks: dict[str, list[_JsonObject]] = {
         "SessionStart": [{"hooks": [session_start_hook]}],
+        "SessionEnd": [{"hooks": [hook]}],
         "Stop": [{"hooks": [hook]}],
         "StopFailure": [{"hooks": [hook]}],
         # ``UserPromptSubmit`` is the symmetric counterpart to
@@ -3783,12 +3794,18 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             background_tasks = details or None
     failure_category: str | None = None
     failure_message: str | None = None
+    failure_context: FailureContext | None = None
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
         # The CLI renders this text for its own error, so it reads like the
         # mirrored API-error message.
         raw_message = _bounded_hook_text(
             payload.get("last_assistant_message"), _FAILURE_MESSAGE_MAX_CHARS
+        )
+        original_message = payload.get("last_assistant_message")
+        failure_context = claude_failure_context(
+            payload,
+            error_text=original_message if isinstance(original_message, str) else None,
         )
         failure_message = (
             _display_text(raw_message, is_api_error=True) if raw_message is not None else None
@@ -3839,6 +3856,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         background_tasks=background_tasks,
         failure_category=failure_category,
         failure_message=failure_message,
+        failure_context=failure_context,
     )
 
 
@@ -8746,6 +8764,9 @@ def _assistant_transcript_items_from_entry(
                     response_id=response_id,
                     text=content,
                     is_api_error=is_api_error,
+                    failure_context=(
+                        claude_failure_context(entry, error_text=content) if is_api_error else None
+                    ),
                 )
             )
         if waking:
@@ -8774,6 +8795,11 @@ def _assistant_transcript_items_from_entry(
                         response_id=response_id,
                         text=text,
                         is_api_error=is_api_error,
+                        failure_context=(
+                            claude_failure_context(entry, error_text=text)
+                            if is_api_error
+                            else None
+                        ),
                     )
                 )
             continue
@@ -8947,6 +8973,7 @@ def _assistant_message_item(
     response_id: str,
     text: str,
     is_api_error: bool = False,
+    failure_context: FailureContext | None = None,
 ) -> ClaudeTranscriptItem:
     """
     Build an assistant message item from one Claude text block.
@@ -8960,6 +8987,7 @@ def _assistant_message_item(
         own API error (see :func:`_is_api_error_entry`). Gates the
         ``/login`` guidance append, which is safe only on CLI-authored
         text.
+    :param failure_context: Original error fields before display-text rewriting.
     :returns: Parsed transcript item.
     """
     return ClaudeTranscriptItem(
@@ -8973,6 +9001,7 @@ def _assistant_message_item(
             ],
         },
         response_id=response_id,
+        failure_context=failure_context,
     )
 
 

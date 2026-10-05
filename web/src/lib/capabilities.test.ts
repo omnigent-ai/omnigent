@@ -152,6 +152,16 @@ describe("resolveServerInfo release features", () => {
   });
 });
 
+describe("resolveServerInfo archive_worktree_cleanup", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ archive_worktree_cleanup: true })).archive_worktree_cleanup).toBe(true);
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).archive_worktree_cleanup).toBe(false);
+  });
+});
+
 describe("resolveServerInfo smart_routing_sources", () => {
   it("reads an explicit field verbatim", async () => {
     const parsed = await probe({

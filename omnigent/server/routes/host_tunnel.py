@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalDoneFrame,
@@ -48,10 +49,13 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostMcpServersResultFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
+    HostPluginsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSkillContentResultFrame,
     HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
@@ -857,10 +861,30 @@ async def _receive_loop(
             if skills_future is not None and not skills_future.done():
                 skills_future.set_result(frame)
             continue
+        if isinstance(frame, HostHarnessStartupResultFrame):
+            startup_future = conn.pending_harness_startup.pop(frame.request_id, None)
+            if startup_future is not None and not startup_future.done():
+                startup_future.set_result(frame.startup)
+            continue
         if isinstance(frame, HostMcpServersResultFrame):
             mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
             if mcp_future is not None and not mcp_future.done():
                 mcp_future.set_result(frame)
+            continue
+        if isinstance(frame, HostPluginsResultFrame):
+            plugins_future = conn.pending_plugins.pop(frame.request_id, None)
+            if plugins_future is not None and not plugins_future.done():
+                plugins_future.set_result(frame)
+            continue
+        if isinstance(frame, HostSkillContentResultFrame):
+            content_future = conn.pending_skill_content.pop(frame.request_id, None)
+            if content_future is not None and not content_future.done():
+                content_future.set_result(frame)
+            continue
+        if isinstance(frame, HostMcpToolsResultFrame):
+            tools_future = conn.pending_mcp_tools.pop(frame.request_id, None)
+            if tools_future is not None and not tools_future.done():
+                tools_future.set_result(frame)
             continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)

@@ -68,6 +68,7 @@ from omnigent.host.frames import (
 )
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -203,6 +204,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _recent_mirrored_tool_calls,
     _RelayHandle,
+    _RelayStatusSnapshot,
     _runner_relay_tasks,
     _runner_status_probe_backoff,
     _runner_status_probe_inflight,
@@ -744,6 +746,8 @@ async def _archive_stop(
     conversation_store: ConversationStore,
     runner_router: Any,
     host_registry: Any,
+    *,
+    delete_worktree: bool = False,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -772,6 +776,8 @@ async def _archive_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
+    :param delete_worktree: After the stop, also remove the session's
+        server-created worktree directory (the branch is kept).
     """
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
@@ -809,16 +815,58 @@ async def _archive_stop(
     _pending_archive_stops.pop(session_id, None)
 
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
-    if not conv.host_id or not conv.runner_id:
-        return
+    if conv.host_id and conv.runner_id:
+        await _archive_stop_host_runner(session_id, conv.host_id, conv.runner_id, host_registry)
+    # Runs after the runner teardown so the agent isn't left in a deleted cwd.
+    if delete_worktree and conv.git_branch and conv.workspace and conv.host_id:
+        from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+        try:
+            await _facade._remove_session_worktree_best_effort(
+                host_id=conv.host_id,
+                worktree_path=conv.workspace,
+                branch=conv.git_branch,
+                delete_branch=False,
+                host_registry=host_registry,
+                reason="session-archive",
+                expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
+                conversation_store=conversation_store,
+                exclude_conversation_id=session_id,
+            )
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Archive worktree cleanup failed for %s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+
+
+async def _archive_stop_host_runner(
+    session_id: str,
+    host_id: str,
+    runner_id: str,
+    host_registry: Any,
+) -> None:
+    """
+    Tear down an archived session's host-launched runner, best-effort.
+
+    :param session_id: Session/conversation identifier.
+    :param host_id: Host that launched the runner.
+    :param runner_id: Runner bound to the session.
+    :param host_registry: The ``HostRegistry`` tracking live host
+        tunnels, or ``None`` when host support is not wired.
+    """
+    from omnigent.server.routes import sessions as _facade
+
     # Mark the tunnel drop intentional BEFORE tearing it down so the relay
     # renders a quiet stopped state rather than "runner_disconnected".
     _intentional_stop_sessions.add(session_id)
     try:
         delivered = await _facade._stop_session_host_runner(
             session_id,
-            conv.host_id,
-            conv.runner_id,
+            host_id,
+            runner_id,
             host_registry,
         )
     except Exception:  # noqa: BLE001
@@ -840,6 +888,8 @@ def _spawn_archive_stop(
     conversation_store: ConversationStore,
     runner_router: Any,
     host_registry: Any = None,
+    *,
+    delete_worktree: bool = False,
 ) -> None:
     """
     Defer :func:`_archive_stop` past the undo grace, as a retained task.
@@ -867,6 +917,7 @@ def _spawn_archive_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
+    :param delete_worktree: Forwarded to :func:`_archive_stop`.
     """
     # Replace any pending stop from an earlier archive of this session.
     _cancel_pending_archive_stop(session_id)
@@ -880,7 +931,13 @@ def _spawn_archive_stop(
             await asyncio.sleep(_facade._ARCHIVE_STOP_UNDO_GRACE_S)
         except asyncio.CancelledError:
             return
-        await _archive_stop(session_id, conversation_store, runner_router, host_registry)
+        await _archive_stop(
+            session_id,
+            conversation_store,
+            runner_router,
+            host_registry,
+            delete_worktree=delete_worktree,
+        )
 
     task = asyncio.create_task(_stop_after_grace())
     _pending_archive_stops[session_id] = task
@@ -1607,7 +1664,8 @@ def _persist_native_cumulative_usage(
       in* ``cumulative_input_tokens`` (e.g. codex-native's
       ``tokenUsage.total.cachedInputTokens``). Split out of the input total
       so :func:`compute_llm_cost` prices it at the cache-read rate rather
-      than the full input rate. Absent for harnesses that don't report it.
+      than the full input rate. Absent for harnesses that don't report it;
+      a token report that omits it keeps the persisted cached count.
     - ``model`` — LLM model id to price with (e.g. ``"databricks-gpt-5-5"``);
       falls back to the agent spec's model when absent.
 
@@ -1667,7 +1725,23 @@ def _persist_native_cumulative_usage(
         # ``input_tokens`` keeps only the non-cached remainder (its contract).
         # Clamp cached to the total so a malformed report never makes
         # ``input_tokens`` negative.
-        cached = min(int(ccache), int(cin)) if ccache is not None else 0
+        if ccache is None:
+            # Cumulative cache counts never shrink: a report that omits the
+            # field keeps the persisted split instead of re-billing earlier
+            # cache reads at the full input rate.
+            ccache = int(current.get("cache_read_input_tokens", 0) or 0)
+        cached = min(int(ccache), int(cin))
+        if int(ccache) > int(cin):
+            # Reported or carried cache reads exceed the input total; surface it
+            # so operators can spot a malformed or shrunken cumulative report
+            # instead of silently clamping.
+            _logger.warning(
+                "Cumulative cache reads (%d) exceed the reported input total (%d) "
+                "for session %r; clamping cache reads to the input total.",
+                int(ccache),
+                int(cin),
+                session_id,
+            )
         current["cache_read_input_tokens"] = cached
         current["input_tokens"] = int(cin) - cached
     if cout is not None:
@@ -3181,13 +3255,21 @@ async def _enrich_terminal_status_with_subagent_output(
     """
     if status not in ("idle", "failed"):
         return data
+    context: FailureContext = {}
+    if status == "failed":
+        context = normalize_failure_context(data.get("failure_context"))
+        context.setdefault("failure_source", "external_status")
+        data = {**data, "failure_context": context}
     current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
     existing = data.get("output")
     if current_turn_only and isinstance(existing, str) and existing.strip():
+        if status == "failed":
+            context.setdefault("detail_source", "external_status_output")
         return data
     # The store's latest assistant text can be prose that preceded the error.
     failure_detail = data.get("failure_detail") if status == "failed" else None
     if isinstance(failure_detail, str) and failure_detail.strip():
+        context.setdefault("detail_source", "external_status_failure_detail")
         return {**data, "output": failure_detail.strip()}
     raw_response_id = data.get("response_id") if current_turn_only else None
     response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
@@ -3199,7 +3281,11 @@ async def _enrich_terminal_status_with_subagent_output(
         stop_at_user_message=current_turn_only,
     )
     if output is None:
+        if status == "failed":
+            context["detail_source"] = "missing"
         return data
+    if status == "failed":
+        context["detail_source"] = "assistant_output_fallback"
     return {**data, "output": output}
 
 
@@ -3519,13 +3605,14 @@ async def _mark_runner_sessions_offline_impl(
         # consumes the marker — so peek without discarding here.
         if conv.id in _intentional_stop_sessions:
             continue
-        # Cache first (this replica holds the runner's tunnel, so it saw the
-        # turn edges), falling back to the row for a session whose live state
-        # was published before a restart.
-        live = _session_status_cache.get(conv.id, conv.live_status)
-        interrupted = live in _MID_TURN_STATUSES
-        dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
-        if not interrupted and not dead_on_arrival:
+        if not await _runner_disconnect_requires_failure(
+            conv.id,
+            conversation_store,
+            origin="runner_offline_sweep",
+            snapshot=conv,
+            fail_idle_top_level=fail_idle_top_level,
+            error_code=error.code,
+        ):
             continue
         turn_id = _session_active_response_cache.get(conv.id)
         _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
@@ -3533,6 +3620,46 @@ async def _mark_runner_sessions_offline_impl(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
+
+
+async def _wait_for_host_reconnect(
+    host_id: str,
+    host_registry: HostRegistry,
+    tunnel_registry: TunnelRegistry | None,
+    *,
+    runner_id: str | None,
+    timeout_s: float,
+) -> HostConnection | None:
+    """Wait for an absent host or its surviving runner to reconnect.
+
+    Only reads the local registries; no database or network polling. A runner
+    reconnect ends the host grace too, so a surviving runner can serve the
+    input even while its host daemon remains offline. Callers re-resolve the
+    runner before launching a replacement. Remote reconnects and changed
+    runner bindings are resolved after this grace and can take the full timeout.
+
+    :param host_id: Host whose tunnel must return before a launch is possible.
+    :param host_registry: Workspace-scoped registry of host connections.
+    :param tunnel_registry: Registry of locally connected runners, if configured.
+    :param runner_id: Existing runner binding, or ``None`` before the first launch.
+    :param timeout_s: Maximum host grace, separate from runner startup time.
+    :returns: The reconnected host, or ``None`` on runner recovery or timeout.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        host_conn = host_registry.get(host_id)
+        if host_conn is not None:
+            return host_conn
+        if (
+            runner_id is not None
+            and tunnel_registry is not None
+            and tunnel_registry.get(runner_id) is not None
+        ):
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(0.1, remaining))
 
 
 async def _wait_for_host_bound_runner_client(
@@ -3884,8 +4011,8 @@ async def _maybe_relaunch_managed_sandbox(
     Relaunch a dead managed sandbox for a session, if it has one.
 
     Called from the message-dispatch relaunch path when the session's
-    host tunnel is gone. For an external (laptop) host that is the end
-    of the line, but a managed host's sandbox is RELAUNCHABLE: the
+    host tunnel is gone. External hosts must reconnect themselves,
+    but a managed host's sandbox is relaunchable: the
     host row is durable, so a new sandbox generation can be provisioned
     under the same host identity — "send a message to wake the
     sandbox", mirroring how a message relaunches a dead runner on a
@@ -3907,7 +4034,7 @@ async def _maybe_relaunch_managed_sandbox(
         successfully (the session row is re-bound; re-resolve the
         runner client). ``False`` when the host is not a managed
         sandbox or managed hosts are not configured — the caller
-        falls through to the normal unavailable handling.
+        can wait for the existing host to reconnect.
     :raises OmnigentError: 503 when the relaunch failed or timed out.
     """
     host_store = getattr(app_state, "host_store", None)
@@ -4847,7 +4974,7 @@ async def _ensure_runner_session_initialized(
             schedule_child_restoration(conv, runner_client, conversation_store, initializer)
         else:
             await _ensure_runner_relay_ready(
-                session_id, conv.runner_id, runner_client, conversation_store
+                session_id, conv.runner_id, runner_client, conversation_store, conversation=conv
             )
             await restore_active_children(conv, runner_client, conversation_store, initializer)
     try:
@@ -7120,11 +7247,14 @@ class _RelayTransportLost(Exception):
     :param intentional: Whether the session carried the intentional-stop
         marker when the transport dropped, snapshotted before the relay
         teardown consumes it.
+    :param stream_ready: Whether this attempt received the runner's ready
+        heartbeat before losing its transport.
     """
 
-    def __init__(self, *, intentional: bool) -> None:
+    def __init__(self, *, intentional: bool, stream_ready: bool = False) -> None:
         super().__init__("runner stream transport lost")
         self.intentional = intentional
+        self.stream_ready = stream_ready
 
 
 def _relinquish_session_live_state(session_id: str) -> None:
@@ -7163,47 +7293,94 @@ def _runner_live_on_another_replica_from_conversations(
     )
 
 
-async def _runner_drop_interrupted_turn(
+async def _runner_disconnect_requires_failure(
     session_id: str,
     conversation_store: ConversationStore,
+    *,
+    origin: str,
+    snapshot: Conversation | None = None,
+    fail_idle_top_level: bool = False,
+    error_code: str = "runner_disconnected",
 ) -> bool:
-    """
-    Report whether a departing runner caught this session mid-turn.
+    """Decide whether runner loss interrupted work, recording the state used.
 
-    Prefers the relay-fed cache — the replica holding the runner's tunnel
-    saw the turn edges — and falls back to the row for a session whose live
-    state was published before a restart, so a deploy mid-turn does not
-    downgrade a real interruption to a benign one.
+    Local turn edges are newer than asynchronous persistence. A cold cache
+    needs a fresh row: an offline sweep's snapshot may predate a child's idle
+    observation. Recheck the cache after the read, even when the read fails.
 
-    An unreadable or missing row leaves the question open, and this runs
-    inside the disconnect handler: answering "not mid-turn" there would
-    both swallow the failure and let the error escape the handler, killing
-    the relay without publishing anything — the silent truncation the
-    failed status exists to prevent. So an indeterminate answer reports the
-    drop, as the ungated relay always did.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param conversation_store: Store used to read the durable live status.
-    :returns: ``True`` when a turn was in flight
-        (:data:`_MID_TURN_STATUSES`) or the state is indeterminate.
+    If the read is unavailable, use the sweep or relay's adoption snapshot.
+    Without any known state, report the drop so an interruption is not lost.
+    Only top-level sessions can fail before startup with ``fail_idle_top_level``.
     """
     cached = _session_status_cache.get(session_id)
+    persisted: Conversation | None = None
+    lookup = "not_needed"
+    if cached is None:
+        try:
+            persisted = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            lookup = "found" if persisted is not None else "missing"
+        except Exception:  # noqa: BLE001 — a failed read must not swallow a disconnect
+            lookup = "error"
+            _logger.warning(
+                "Runner disconnect: live-status read failed for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        cached = _session_status_cache.get(session_id)
+
+    handle = _runner_relay_tasks.get(session_id)
+    relay_snapshot = handle.status_snapshot if handle is not None else None
+    fallback = snapshot if snapshot is not None else relay_snapshot
+
     if cached is not None:
-        return cached in _MID_TURN_STATUSES
-    try:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    except Exception:  # noqa: BLE001 — an unreadable row must not kill the relay
-        _logger.warning(
-            "Relay: live-status read failed for session=%s; reporting the drop",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-        return True
-    if conv is None:
-        return True
-    return conv.live_status in _MID_TURN_STATUSES
+        live, source = cached, "cache"
+    elif persisted is not None:
+        live, source = persisted.live_status, "persisted"
+    elif fallback is not None:
+        live = fallback.live_status
+        source = "snapshot" if snapshot is not None else "relay_snapshot"
+    else:
+        live, source = None, "unknown"
+
+    conv = persisted if persisted is not None else fallback
+    if snapshot is not None and session_id in _intentional_stop_sessions:
+        # A Stop can arrive while the sweep refreshes its row.
+        decision = "intentional_stop"
+    elif live in _MID_TURN_STATUSES or source == "unknown":
+        decision = "failed_mid_turn"
+    elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
+        decision = "failed_before_start"
+    else:
+        decision = "idle_no_failure"
+
+    _logger.warning(
+        "Runner disconnect for session=%s: %s (status=%s source=%s)",
+        session_id,
+        decision,
+        live,
+        source,
+        extra=debug_event(
+            "runner_disconnect_decision",
+            session_id=session_id,
+            turn_id=_session_active_response_cache.get(session_id),
+            origin=origin,
+            decision=decision,
+            error_code=error_code,
+            status_source=source,
+            cached_session_status=cached,
+            persisted_session_status=persisted.live_status if persisted is not None else None,
+            snapshot_session_status=fallback.live_status if fallback is not None else None,
+            status_lookup=lookup,
+            session_kind=conv.kind if conv is not None else None,
+            parent_session_id=conv.parent_conversation_id if conv is not None else None,
+            runner_id=handle.runner_id if handle is not None else conv.runner_id if conv else None,
+            host_id=conv.host_id if conv is not None else None,
+            conversation_updated_at=conv.updated_at if conv is not None else None,
+            fail_idle_top_level=fail_idle_top_level,
+        ),
+    )
+    return decision in ("failed_mid_turn", "failed_before_start")
 
 
 async def _relay_runner_live_elsewhere(
@@ -7211,38 +7388,40 @@ async def _relay_runner_live_elsewhere(
     conversation_store: ConversationStore,
 ) -> bool:
     """
-    Resolve this relay's bound runner and check it against another replica.
+    Check this relay's bound runner using shared runner metadata.
 
-    The active relay's runner id is normally known from its own
-    ``_runner_relay_tasks`` registration; a caller that drives
-    :func:`_relay_runner_stream` directly (tests, or a code path
-    bypassing :func:`_ensure_runner_relay`) has no such entry, so fall
-    back to the session row's binding. One row read serves both the
-    binding and the liveness stamp, keeping this path bounded.
+    A full-conversation read can depend on unrelated backends; their outage
+    must not hide a fresh heartbeat from another replica. Prefer the active
+    relay's runner binding, falling back to the metadata binding when called
+    without a registered relay.
 
     :param session_id: Session/conversation identifier.
-    :param conversation_store: Store used to read the session row.
+    :param conversation_store: Store used to read runner metadata.
     :returns: ``True`` when the bound runner is confirmed live on
         another replica; ``False`` when unbound, unreadable, or not.
     """
     try:
-        row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, session_id)
     except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
         _logger.warning(
-            "Relay: session-row lookup failed for session=%s",
+            "Relay: runner liveness lookup failed for session=%s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
         return False
-    if row is None:
+    if liveness is None:
         return False
+    bound_runner_id, runner_last_seen = liveness
     handle = _runner_relay_tasks.get(session_id)
-    runner_id = handle.runner_id if handle is not None else row.runner_id
+    runner_id = handle.runner_id if handle is not None else bound_runner_id
     if runner_id is None:
         return False
     reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return _runner_live_on_another_replica_from_conversations([row], runner_id, reference_stamp)
+    return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
+        stamp=runner_last_seen,
+        reference_stamp=reference_stamp,
+    )
 
 
 async def _relay_runner_stream(
@@ -7263,7 +7442,7 @@ async def _relay_runner_stream(
     one shutting down (:func:`omnigent.server.shutdown_state.server_shutting_down`):
     it closed the tunnel itself, so the loss says nothing about the runner
     and no session is failed. Otherwise only a session it caught mid-turn
-    (:func:`_runner_drop_interrupted_turn`) gets the
+    (:func:`_runner_disconnect_requires_failure`) gets the
     ``failed`` status and durable ``runner_disconnected`` labels — the same
     rule :func:`_mark_runner_sessions_offline_impl` applies to the runner's
     other sessions. An idle session had no work to interrupt, so it stays
@@ -7293,9 +7472,9 @@ async def _relay_runner_stream(
             return
         except _RelayTransportLost as lost:
             now = loop.time()
-            # An attempt that streamed longer than the grace was a live
-            # tunnel dropping anew — give the new outage a fresh window.
-            if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
+            # A ready heartbeat confirms recovery, even on a brief connection.
+            # Its next disconnect starts a new outage with a full grace window.
+            if deadline is None or lost.stream_ready or now - started > RUNNER_DISCONNECT_GRACE_S:
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
                 outage_started = now
                 retries = 0
@@ -7338,7 +7517,9 @@ async def _relay_runner_stream(
                 decision = "server_shutdown"
             elif await _relay_runner_live_elsewhere(session_id, conversation_store):
                 decision = "live_elsewhere"
-            elif await _runner_drop_interrupted_turn(session_id, conversation_store):
+            elif await _runner_disconnect_requires_failure(
+                session_id, conversation_store, origin="runner_disconnected_mid_turn"
+            ):
                 decision = "failed_mid_turn"
             else:
                 decision = "idle_no_failure"
@@ -7455,7 +7636,8 @@ async def _relay_runner_stream_once(
     One connection attempt: transport loss raises
     :class:`_RelayTransportLost` for the :func:`_relay_runner_stream`
     supervisor, which retries inside the disconnect grace and owns the
-    terminal failure / quiet-stop handling.
+    terminal failure / quiet-stop handling. A natural HTTP EOF without the
+    runner's ``[DONE]`` sentinel is transport loss too.
 
     Long-lived background task that opens
     ``GET /v1/sessions/{id}/stream`` on the runner and publishes
@@ -7506,6 +7688,7 @@ async def _relay_runner_stream_once(
     # past the grace, fails the session). ``connect`` stays at httpx's
     # default (5s); ``write``/``pool`` are not rate-limiting here.
     _relay_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
+    heartbeat_seen = False
     try:
         async with runner_client.stream(
             "GET",
@@ -7519,7 +7702,6 @@ async def _relay_runner_stream_once(
                 extra=debug_event("runner_stream_connected", session_id=session_id),
             )
             buffer = ""
-            heartbeat_seen = False
             async for chunk in resp.aiter_text():
                 buffer += chunk
                 while "\n\n" in buffer:
@@ -8170,6 +8352,13 @@ async def _relay_runner_stream_once(
                         continue
                     session_stream.publish(session_id, event)
 
+            # Treat a bare EOF without ``[DONE]`` as a tunnel drop.
+            # Route it through the existing bounded recovery path.
+            raise _RelayTransportLost(
+                intentional=session_id in _intentional_stop_sessions,
+                stream_ready=heartbeat_seen,
+            )
+
     except (httpx.HTTPError, ConnectionError) as exc:
         if isinstance(exc, httpx.HTTPStatusError):
             _logger.warning(
@@ -8186,7 +8375,10 @@ async def _relay_runner_stream_once(
         # treat the same as HTTPError. The finally below consumes the
         # intentional-stop marker, so snapshot it now for the supervisor's
         # retry-vs-quiet-exit decision.
-        raise _RelayTransportLost(intentional=session_id in _intentional_stop_sessions) from exc
+        raise _RelayTransportLost(
+            intentional=session_id in _intentional_stop_sessions,
+            stream_ready=heartbeat_seen,
+        ) from exc
     except asyncio.CancelledError:
         raise
     finally:
@@ -8220,6 +8412,8 @@ def _ensure_runner_relay(
     runner_id: str | None,
     runner_client: httpx.AsyncClient | None,
     conversation_store: ConversationStore | None = None,
+    *,
+    conversation: Conversation | None = None,
 ) -> _RelayHandle | None:
     """
     Start (or replace) the SSE relay for ``session_id``.
@@ -8238,6 +8432,8 @@ def _ensure_runner_relay(
         ``None`` skips relay.
     :param conversation_store: Store for persisting items from
         the runner's SSE stream. ``None`` disables persistence.
+    :param conversation: Row already read by the caller. Its known status
+        is retained as a fallback for this runner binding, outside the live cache.
     :returns: The active relay handle, or ``None`` when no runner is
         bound.
     """
@@ -8290,7 +8486,27 @@ def _ensure_runner_relay(
             ),
             name=f"runner-relay-{session_id}",
         )
-    handle = _RelayHandle(runner_id=runner_id, task=task, ready=ready)
+    # A heartbeat-only stream may never repeat the pre-handoff idle edge.
+    # Retain only immutable status metadata for this relay's lifetime.
+    status_snapshot = (
+        _RelayStatusSnapshot(
+            live_status=conversation.live_status,
+            kind=conversation.kind,
+            parent_conversation_id=conversation.parent_conversation_id,
+            runner_id=runner_id,
+            host_id=conversation.host_id,
+            updated_at=conversation.updated_at,
+        )
+        if conversation is not None
+        and conversation.id == session_id
+        and conversation.runner_id == runner_id
+        and conversation.live_status is not None
+        and conversation.live_status in {"idle", "running", "waiting", "failed"}
+        else None
+    )
+    handle = _RelayHandle(
+        runner_id=runner_id, task=task, ready=ready, status_snapshot=status_snapshot
+    )
     _runner_relay_tasks[session_id] = handle
 
     def _on_done(t: asyncio.Task[None]) -> None:
@@ -8321,6 +8537,8 @@ async def _ensure_runner_relay_ready_impl(
     runner_id: str | None,
     runner_client: httpx.AsyncClient | None,
     conversation_store: ConversationStore | None = None,
+    *,
+    conversation: Conversation | None = None,
 ) -> _RelayHandle | None:
     """
     Start the runner SSE relay and wait for its subscription ack.
@@ -8337,6 +8555,8 @@ async def _ensure_runner_relay_ready_impl(
     :param runner_client: HTTP client pointed at ``runner_id``.
         ``None`` skips relay setup.
     :param conversation_store: Store for persisting relayed items.
+    :param conversation: Row already read by the caller, retained as a
+        disconnect-status fallback by the relay.
     :returns: The active relay handle, or ``None`` when no runner is
         bound.
     :raises OmnigentError: If the relay cannot observe the
@@ -8347,6 +8567,7 @@ async def _ensure_runner_relay_ready_impl(
         runner_id,
         runner_client,
         conversation_store,
+        conversation=conversation,
     )
     if handle is None or handle.ready.is_set():
         return handle
@@ -8764,6 +8985,7 @@ async def _wake_parent_for_blocked_child(
         parent_conv.runner_id,
         runner_client,
         conversation_store,
+        conversation=parent_conv,
     )
     body = SessionEventInput(
         type="message",
@@ -10246,7 +10468,7 @@ async def _create_session_from_existing_agent(
                 # remove the directory but keep the user's branch (and its
                 # unpushed commits).
                 delete_branch=body.git is None or not body.git.existing_branch,
-                request=request,
+                host_registry=getattr(request.app.state, "host_registry", None),
                 reason="create-rollback",
             )
         raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
@@ -10270,7 +10492,7 @@ async def _create_session_from_existing_agent(
                 # Same branch-preservation rule as the NameAlreadyExists
                 # rollback above: never -D a pre-existing branch.
                 delete_branch=body.git is None or not body.git.existing_branch,
-                request=request,
+                host_registry=getattr(request.app.state, "host_registry", None),
                 reason="create-rollback",
             )
         raise
@@ -10431,6 +10653,7 @@ async def _create_session_from_existing_agent(
                 conv.runner_id,
                 runner_client,
                 conversation_store,
+                conversation=conv,
             )
             # Dispatch (not a plain forward) so native-terminal sessions take the
             # single-writer bypass — otherwise the forwarder's echo duplicates the kickoff.
@@ -11916,6 +12139,7 @@ __all__ = [
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
     "_wait_for_host_bound_runner_client",
+    "_wait_for_host_reconnect",
     "_wake_parent_for_blocked_child",
     "configure_subagent_block_notifier",
     "ensure_runner_connected",
