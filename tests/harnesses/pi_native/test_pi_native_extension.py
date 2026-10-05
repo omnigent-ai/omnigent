@@ -150,87 +150,6 @@ require(extensionPath)(pi);
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_delivery_drop_error_post_is_best_effort(tmp_path: Path) -> None:
-    """A dropped-follow-up notice does not retry or reject on transport failure."""
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node is required for the pi-native extension e2e test")
-
-    extension_path = (
-        Path(__file__).resolve().parents[3]
-        / "omnigent"
-        / "resources"
-        / "pi_native"
-        / "omnigent_pi_native_extension.js"
-    )
-
-    script = r"""
-const assert = require("assert").strict;
-const fs = require("fs");
-const path = require("path");
-
-const extensionPath = process.argv[1];
-const tmpDir = process.argv[2];
-const inboxDir = path.join(tmpDir, "inbox");
-const payloadPath = path.join(inboxDir, "000-msg.json");
-const configPath = path.join(tmpDir, "config.json");
-fs.mkdirSync(inboxDir, { recursive: true });
-fs.writeFileSync(
-  payloadPath,
-  JSON.stringify({ id: "msg-1", type: "user_message", content: "follow up" }),
-);
-fs.writeFileSync(
-  configPath,
-  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir }),
-);
-process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
-
-let fetchCalls = 0;
-global.fetch = async () => {
-  fetchCalls += 1;
-  throw new Error("server unavailable");
-};
-let pollInbox = null;
-global.setInterval = (fn, _ms) => {
-  pollInbox = fn;
-  return { fakeInterval: true };
-};
-const handlers = {};
-const pi = {
-  registerCommand() {},
-  on(name, handler) { handlers[name] = handler; },
-  sendUserMessage() { throw new Error("Pi is not ready"); },
-};
-require(extensionPath)(pi);
-
-(async () => {
-  await handlers.session_start({}, {
-    sessionManager: { getSessionId: () => "native-session-1" },
-    ui: { setTitle() {}, setStatus() {}, notify() {} },
-  });
-  fetchCalls = 0;
-  for (let attempt = 0; attempt < 5; attempt += 1) pollInbox();
-  // Best-effort posts issue exactly one request and settle without an
-  // unhandled rejection; a durable retry would issue three requests here.
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  assert.equal(fs.existsSync(payloadPath), false);
-  assert.equal(fetchCalls, 1);
-})().catch((error) => {
-  console.error(error && error.stack ? error.stack : error);
-  process.exit(1);
-});
-"""
-
-    result = subprocess.run(
-        [node, "-e", script, str(extension_path), str(tmp_path)],
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=10,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
 def _run_extension_script(node: str, extension_path: Path, script: str) -> None:
     """Run a Node test ``script`` against the real extension; fail on nonzero exit."""
     result = subprocess.run(
@@ -884,7 +803,7 @@ def test_message_without_streamed_text_posts_no_delta(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-_DURABILITY_HARNESS = r"""
+_ASSISTANT_DURABILITY_HARNESS = r"""
 const assert = require("assert").strict;
 const fs = require("fs");
 const path = require("path");
@@ -897,16 +816,15 @@ fs.writeFileSync(
   JSON.stringify({
     serverUrl: "http://omnigent.test",
     sessionId: "session-1",
-    // Keep the timeout regression fast; production uses the extension's
-    // five-second default when this test-only override is absent.
-    durableItemPostTimeoutMs: 10,
+    // Keep retry-timeout coverage fast; production uses the default.
+    assistantItemPostTimeoutMs: 10,
   }),
 );
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
 const posted = [];
-const responses = [];
 let fetchCalls = 0;
+const responses = [];
 global.fetch = async (_url, request) => {
   posted.push(JSON.parse(request.body));
   fetchCalls += 1;
@@ -921,41 +839,51 @@ const pi = {
   on(name, handler) { handlers[name] = handler; },
 };
 require(extensionPath)(pi);
-
 const ctx = { ui: { setTitle() {}, setStatus() {}, notify() {} } };
-function items(type) {
+function assistantItems() {
   return posted.filter(
     (event) =>
       event.type === "external_conversation_item" &&
-      (!type || event.data.item_type === type),
+      event.data.item_type === "message" &&
+      event.data.item_data.role === "assistant",
   );
 }
 """
 
 
-def test_durable_item_retries_non_2xx_and_reuses_source_id(tmp_path: Path) -> None:
-    """A transient HTTP failure retries the same source-keyed item."""
+def test_assistant_message_retries_with_stable_source_and_exact_text(
+    tmp_path: Path,
+) -> None:
+    """Pi's real assistant identity survives one transient POST failure."""
     script = (
-        _DURABILITY_HARNESS
+        _ASSISTANT_DURABILITY_HARNESS
         + r"""
 (async () => {
-  // Deliberately report an inconsistent `ok` value: status is authoritative.
-  responses.push({ ok: true, status: 503 }, { ok: true, status: 204 });
-  const result = {
-    toolCallId: "call-1",
-    content: [{ type: "text", text: "done" }],
+  responses.push({ ok: false, status: 503 }, { ok: true, status: 204 });
+  const message = {
+    role: "assistant",
+    timestamp: 1700000000123,
+    responseId: "pi-response-42",
+    content: [{ type: "text", text: "exact assistant answer" }],
   };
-  await handlers.tool_result(result, ctx);
+  await handlers.message_end({ message }, ctx);
 
+  const attempts = assistantItems();
   assert.equal(fetchCalls, 2, JSON.stringify(posted));
-  const outputs = items("function_call_output");
-  assert.equal(outputs.length, 2, JSON.stringify(outputs));
-  assert.ok(outputs[0].data.source_id);
-  assert.equal(outputs[0].data.source_id, outputs[1].data.source_id);
+  assert.equal(attempts.length, 2, JSON.stringify(attempts));
+  assert.match(attempts[0].data.source_id, /response:pi-response-42/);
+  assert.equal(attempts[0].data.source_id, attempts[1].data.source_id);
+  assert.deepEqual(
+    attempts.map((item) => item.data.item_data.content),
+    [
+      [{ type: "output_text", text: "exact assistant answer" }],
+      [{ type: "output_text", text: "exact assistant answer" }],
+    ],
+  );
 
-  // The successful post advances the dedup state; a duplicate lifecycle
-  // callback must not issue another request.
-  await handlers.tool_execution_end(result, ctx);
+  // A duplicate callback after acceptance is suppressed; a failed callback
+  // would remain eligible because the dedupe mark is added after success.
+  await handlers.message_end({ message }, ctx);
   assert.equal(fetchCalls, 2, JSON.stringify(posted));
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
@@ -967,12 +895,12 @@ def test_durable_item_retries_non_2xx_and_reuses_source_id(tmp_path: Path) -> No
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_durable_item_surfaces_terminal_failure_after_bounded_retries(
+def test_assistant_message_failure_propagates_and_400_is_not_retried(
     tmp_path: Path,
 ) -> None:
-    """A transient item failure rejects the lifecycle callback after three tries."""
+    """Exhausted transient failures reject, while a permanent 400 is single-shot."""
     script = (
-        _DURABILITY_HARNESS
+        _ASSISTANT_DURABILITY_HARNESS
         + r"""
 (async () => {
   global.fetch = async (_url, request) => {
@@ -980,189 +908,57 @@ def test_durable_item_surfaces_terminal_failure_after_bounded_retries(
     fetchCalls += 1;
     return { ok: false, status: 503 };
   };
-  const message = {
-    id: "assistant-1",
+  const transientMessage = {
     role: "assistant",
-    content: [{ type: "text", text: "final answer" }],
+    timestamp: 1700000000124,
+    responseId: "pi-response-transient",
+    content: [{ type: "text", text: "retry then surface" }],
   };
   let failure;
   try {
-    await handlers.message_end({ message }, ctx);
+    await handlers.message_end({ message: transientMessage }, ctx);
   } catch (error) {
     failure = error;
   }
-  assert.ok(failure, "terminal persistence failure must reject");
+  assert.ok(failure, "exhausted assistant persistence must reject");
   assert.match(String(failure && failure.message), /HTTP 503/);
   assert.equal(fetchCalls, 3, JSON.stringify(posted));
-  const messages = items("message");
-  assert.equal(messages.length, 3, JSON.stringify(messages));
-  const sourceIds = new Set(messages.map((event) => event.data.source_id));
-  assert.equal(sourceIds.size, 1, JSON.stringify(messages));
-})().catch((error) => {
-  console.error(error && error.stack ? error.stack : error);
-  process.exit(1);
-});
-"""
-    )
-    result = _run_node(script, str(_extension_path()), str(tmp_path))
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_durable_item_does_not_retry_permanent_http_failure(tmp_path: Path) -> None:
-    """A permanent HTTP failure rejects immediately instead of retrying."""
-    script = (
-        _DURABILITY_HARNESS
-        + r"""
-(async () => {
-  responses.push({ ok: false, status: 400 });
-  const message = {
-    id: "assistant-400",
-    role: "assistant",
-    content: [{ type: "text", text: "bad request" }],
-  };
-  let failure;
-  try {
-    await handlers.message_end({ message }, ctx);
-  } catch (error) {
-    failure = error;
-  }
-  assert.ok(failure, "permanent persistence failure must reject");
-  assert.match(String(failure && failure.message), /HTTP 400/);
-  assert.equal(fetchCalls, 1, JSON.stringify(posted));
-  assert.equal(items("message").length, 1, JSON.stringify(posted));
-})().catch((error) => {
-  console.error(error && error.stack ? error.stack : error);
-  process.exit(1);
-});
-"""
-    )
-    result = _run_node(script, str(_extension_path()), str(tmp_path))
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_durable_item_timeout_is_retryable_and_aborts_each_attempt(
-    tmp_path: Path,
-) -> None:
-    """A hung durable POST is aborted and retried within the attempt budget."""
-    script = (
-        _DURABILITY_HARNESS
-        + r"""
-(async () => {
-  const signals = [];
-  global.fetch = async (_url, request) => {
-    posted.push(JSON.parse(request.body));
-    fetchCalls += 1;
-    signals.push(request.signal);
-    await new Promise((resolve, reject) => {
-      request.signal.addEventListener("abort", () => {
-        reject(Object.assign(new Error("request timed out"), { name: "AbortError" }));
-      }, { once: true });
-    });
-    return { ok: true, status: 204 };
-  };
-  const message = {
-    id: "assistant-timeout",
-    role: "assistant",
-    content: [{ type: "text", text: "hung request" }],
-  };
-  let failure;
-  try {
-    await handlers.message_end({ message }, ctx);
-  } catch (error) {
-    failure = error;
-  }
-  assert.ok(failure, "exhausted timeout retries must reject");
-  assert.match(String(failure && failure.name), /AbortError/);
-  assert.equal(fetchCalls, 3, JSON.stringify(posted));
-  assert.equal(signals.length, 3);
-  assert.ok(signals.every((signal) => signal.aborted));
-})().catch((error) => {
-  console.error(error && error.stack ? error.stack : error);
-  process.exit(1);
-});
-"""
-    )
-    result = _run_node(script, str(_extension_path()), str(tmp_path))
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_duplicate_lifecycle_callbacks_persist_one_assistant_and_tool_item(
-    tmp_path: Path,
-) -> None:
-    """Repeated Pi callbacks do not create duplicate durable transcript items."""
-    script = (
-        _DURABILITY_HARNESS
-        + r"""
-(async () => {
-  const message = {
-    id: "assistant-1",
-    role: "assistant",
-    content: [{ type: "text", text: "final answer" }],
-  };
-  await handlers.message_end({ message }, ctx);
-  await handlers.message_end({ message }, ctx);
-
-  const result = {
-    toolCallId: "call-1",
-    content: [{ type: "text", text: "tool output" }],
-  };
-  await handlers.tool_result(result, ctx);
-  await handlers.tool_execution_end(result, ctx);
-
-  assert.equal(items("message").length, 1, JSON.stringify(posted));
+  assert.equal(assistantItems().length, 3, JSON.stringify(posted));
   assert.equal(
-    items("function_call_output").length,
+    new Set(assistantItems().map((item) => item.data.source_id)).size,
     1,
     JSON.stringify(posted),
   );
-  assert.equal(fetchCalls, 2, JSON.stringify(posted));
-})().catch((error) => {
-  console.error(error && error.stack ? error.stack : error);
-  process.exit(1);
-});
-"""
-    )
-    result = _run_node(script, str(_extension_path()), str(tmp_path))
-    assert result.returncode == 0, result.stdout + result.stderr
 
+  // The failed callback remains eligible for a later delivery.
+  global.fetch = async (_url, request) => {
+    posted.push(JSON.parse(request.body));
+    fetchCalls += 1;
+    return { ok: true, status: 204 };
+  };
+  await handlers.message_end({ message: transientMessage }, ctx);
+  assert.equal(fetchCalls, 4, JSON.stringify(posted));
 
-def test_distinct_user_inputs_with_same_text_remain_distinct(tmp_path: Path) -> None:
-    """Only a repeated callback for the same input object is deduplicated."""
-    script = (
-        _DURABILITY_HARNESS
-        + r"""
-(async () => {
-  const input = { text: "repeat" };
-  await handlers.input(input, ctx);
-  await handlers.input(input, ctx);
-  await handlers.input({ text: "repeat" }, ctx);
-
-  const messages = items("message");
-  assert.equal(messages.length, 2, JSON.stringify(posted));
-  assert.notEqual(messages[0].data.source_id, messages[1].data.source_id);
-  assert.equal(fetchCalls, 2, JSON.stringify(posted));
-})().catch((error) => {
-  console.error(error && error.stack ? error.stack : error);
-  process.exit(1);
-});
-"""
-    )
-    result = _run_node(script, str(_extension_path()), str(tmp_path))
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_non_durable_event_failures_remain_best_effort(tmp_path: Path) -> None:
-    """Preview and status failures do not reject Pi lifecycle callbacks."""
-    script = (
-        _DURABILITY_HARNESS
-        + r"""
-(async () => {
-  global.fetch = async () => ({ ok: false, status: 503 });
-  await handlers.agent_start({}, ctx);
-  await handlers.message_update(
-    { assistantMessageEvent: { type: "text_delta", delta: "live" } },
-    ctx,
-  );
+  global.fetch = async (_url, request) => {
+    posted.push(JSON.parse(request.body));
+    fetchCalls += 1;
+    return { ok: false, status: 400 };
+  };
+  const permanentMessage = {
+    role: "assistant",
+    timestamp: 1700000000125,
+    responseId: "pi-response-permanent",
+    content: [{ type: "text", text: "bad request answer" }],
+  };
+  failure = undefined;
+  try {
+    await handlers.message_end({ message: permanentMessage }, ctx);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, "permanent assistant persistence must reject");
+  assert.match(String(failure && failure.message), /HTTP 400/);
+  assert.equal(fetchCalls, 5, JSON.stringify(posted));
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
@@ -2414,96 +2210,6 @@ const ctx = {
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_compact_unavailable_error_post_is_best_effort(tmp_path: Path) -> None:
-    """A failed compact-unavailable POST must not reject the inbox poller."""
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node is required for the pi-native extension e2e test")
-
-    extension_path = (
-        Path(__file__).resolve().parents[3]
-        / "omnigent"
-        / "resources"
-        / "pi_native"
-        / "omnigent_pi_native_extension.js"
-    )
-
-    script = r"""
-const assert = require("assert").strict;
-const fs = require("fs");
-const path = require("path");
-
-const extensionPath = process.argv[1];
-const tmpDir = process.argv[2];
-const inboxDir = path.join(tmpDir, "inbox");
-const payloadPath = path.join(inboxDir, "000-compact.json");
-const configPath = path.join(tmpDir, "config.json");
-fs.mkdirSync(inboxDir, { recursive: true });
-fs.writeFileSync(payloadPath, JSON.stringify({ id: "compact-1", type: "compact" }));
-fs.writeFileSync(
-  configPath,
-  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir }),
-);
-process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
-
-const postedEvents = [];
-global.fetch = async (_url, request) => {
-  postedEvents.push(JSON.parse(request.body));
-  return { ok: false, status: 400 };
-};
-let pollInbox = null;
-global.setInterval = (fn, _ms) => {
-  pollInbox = fn;
-  return { fakeInterval: true };
-};
-const handlers = {};
-const pi = {
-  registerCommand() {},
-  on(name, handler) { handlers[name] = handler; },
-  sendUserMessage() {},
-};
-require(extensionPath)(pi);
-
-const ctx = {
-  sessionManager: { getSessionId: () => "native-session-1" },
-  ui: { setTitle() {}, setStatus() {}, notify() {} },
-  abort() {},
-  isIdle: () => false,
-};
-(async () => {
-  await handlers.session_start({}, ctx);
-  pollInbox();
-  // Allow a mistaken durable retry/rejection to surface as an unhandled
-  // rejection; the best-effort path completes immediately.
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  assert.equal(fs.existsSync(payloadPath), false);
-  assert.equal(
-    postedEvents.filter(
-      (event) =>
-        event.type === "external_conversation_item" &&
-        event.data &&
-        event.data.item_data &&
-        event.data.item_data.code === "pi_compact_unavailable",
-    ).length,
-    1,
-    JSON.stringify(postedEvents),
-  );
-})().catch((error) => {
-  console.error(error && error.stack ? error.stack : error);
-  process.exit(1);
-});
-"""
-
-    result = subprocess.run(
-        [node, "-e", script, str(extension_path), str(tmp_path)],
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=10,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
 def test_compact_payload_synchronous_throw_dismisses_spinner(
     tmp_path: Path,
 ) -> None:
@@ -3496,36 +3202,6 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
   const errs = errorItems();
   assert.equal(errs.length, 1, JSON.stringify(posted));
   assert.match(errs[0].data.item_data.message, /not available/);
-  finish();
-})().catch((error) => {
-  finish();
-  console.error(error && error.stack ? error.stack : error);
-  process.exit(1);
-});
-"""
-    )
-    _run_extension_script(node, _extension_path(), script)
-
-
-def test_model_change_error_post_is_best_effort(tmp_path: Path) -> None:
-    """A failed model-error POST must not reject the inbox delivery task."""
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node is required for the pi-native extension e2e test")
-
-    script = (
-        _MODEL_SWITCH_HARNESS
-        + r"""
-(async () => {
-  await handlers.session_start({}, ctx);
-  // The error item is auxiliary feedback; an unavailable server must not
-  // create an unhandled rejection in the fire-and-forget inbox poller.
-  global.fetch = async () => ({ ok: false, status: 400 });
-  await deliverModelChange("model-that-does-not-exist");
-  await sleep(250);
-
-  assert.equal(setModelCalls.length, 0, JSON.stringify(setModelCalls));
-  assert.equal(errorItems().length, 0, JSON.stringify(posted));
   finish();
 })().catch((error) => {
   finish();

@@ -35,15 +35,6 @@ const _PARK_TOTAL_BUDGET_MS = 86_400_000;
 const _TRANSIENT_RETRY_BUDGET_MS = 30_000;
 const _TRANSIENT_RETRY_INITIAL_BACKOFF_MS = 1_000;
 const _TRANSIENT_RETRY_MAX_BACKOFF_MS = 10_000;
-// Durable items carry source-id idempotency keys, so retries remain safe when
-// the server commits before the response is lost. Keep this budget short so a
-// terminal failure still reaches Pi's lifecycle callback.
-const _DURABLE_ITEM_MAX_ATTEMPTS = 3;
-const _DURABLE_ITEM_INITIAL_BACKOFF_MS = 50;
-const _DURABLE_ITEM_MAX_BACKOFF_MS = 250;
-// Keep a lost connection from wedging Pi's lifecycle callback indefinitely;
-// source_id makes retrying an acknowledged-but-unseen POST idempotent.
-const _DURABLE_ITEM_POST_TIMEOUT_MS = 5_000;
 // A genuine connect error (refused / reset) throws fast — well under the
 // per-attempt park timeout. A legitimate long-poll abort only throws once
 // our own _PARK_ATTEMPT_TIMEOUT_MS timer fires (the server held the
@@ -788,9 +779,14 @@ function headers(config) {
   };
 }
 
+const _ASSISTANT_ITEM_MAX_ATTEMPTS = 3;
+const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 50;
+const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 250;
+const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
+
 function boundedSourceId(sourceId) {
   const value = typeof sourceId === "string" ? sourceId.trim() : "";
-  if (!value) throw new Error("durable conversation item requires source_id");
+  if (!value) throw new Error("assistant conversation item requires source_id");
   if (value.length <= 256) return value;
   return `pi:${crypto.createHash("sha256").update(value).digest("hex")}`;
 }
@@ -805,7 +801,7 @@ function eventPostError(response) {
   return new Error("Omnigent event POST returned an invalid response");
 }
 
-async function postEvent(config, body, options = {}) {
+async function postEventChecked(config, body, signal) {
   if (
     !config ||
     !config.serverUrl ||
@@ -819,7 +815,7 @@ async function postEvent(config, body, options = {}) {
     headers: headers(config),
     body: JSON.stringify(body),
   };
-  if (options && options.signal) request.signal = options.signal;
+  if (signal) request.signal = signal;
   const response = await fetch(url, request);
   const status = response && response.status;
   if (
@@ -833,90 +829,73 @@ async function postEvent(config, body, options = {}) {
   return response;
 }
 
-// Authoritative user, assistant, tool, and reasoning transcript items use
-// postDurableConversationItem below, which retries transient failures and
-// propagates exhaustion. Auxiliary error/status, preview, and metadata events
-// use postEventBestEffort and intentionally fail open.
-async function postEventBestEffort(config, body) {
+async function postEvent(config, body) {
   try {
-    return await postEvent(config, body);
+    await postEventChecked(config, body);
   } catch (_err) {
-    return undefined;
+    // Keep Pi responsive even if Omnigent is temporarily unavailable.
   }
 }
 
-// Coalesce duplicate lifecycle callbacks while one durable POST is in flight.
-// The server-side source_id remains the correctness boundary, so this is only
-// an optimization that avoids needless duplicate requests in the common case.
-const pendingDurableItems = new Map();
-
-function durableItemPostTimeoutMs(config) {
-  const configured = config && config.durableItemPostTimeoutMs;
-  return typeof configured === "number" &&
-    Number.isFinite(configured) &&
-    configured > 0
-    ? configured
-    : _DURABLE_ITEM_POST_TIMEOUT_MS;
-}
-
-function isRetryableDurableError(error) {
+function isRetryableAssistantError(error) {
   const status = error && error.status;
   if (typeof status !== "number") return true;
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
 }
 
-async function postDurableAttempt(config, body) {
-  // Abort each fetch independently so one hung request cannot consume the
-  // whole lifecycle callback's retry budget.
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    durableItemPostTimeoutMs(config),
-  );
-  try {
-    return await postEvent(config, body, { signal: controller.signal });
-  } finally {
-    clearTimeout(timeout);
-  }
+function assistantItemPostTimeoutMs(config) {
+  const configured = config && config.assistantItemPostTimeoutMs;
+  return typeof configured === "number" &&
+    Number.isFinite(configured) &&
+    configured > 0
+    ? configured
+    : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
 }
 
-async function postDurableConversationItem(config, data, sourceId) {
-  const normalizedSourceId = boundedSourceId(sourceId);
+// Only the authoritative assistant message_end uses this checked, bounded
+// path; every other bridge event retains postEvent's best-effort behavior.
+async function postAssistantMessage(config, data, sourceId) {
   const body = {
     type: "external_conversation_item",
-    data: { ...data, source_id: normalizedSourceId },
+    data: { ...data, source_id: boundedSourceId(sourceId) },
   };
-  if (!config || !config.sessionId) return postEvent(config, body);
-  const pendingKey = `${config.sessionId}:${normalizedSourceId}`;
-  const existing = pendingDurableItems.get(pendingKey);
-  if (existing) return existing;
-  const task = (async () => {
-    let backoff = _DURABLE_ITEM_INITIAL_BACKOFF_MS;
-    let lastError;
-    for (let attempt = 1; attempt <= _DURABLE_ITEM_MAX_ATTEMPTS; attempt += 1) {
-      try {
-        return await postDurableAttempt(config, body);
-      } catch (err) {
-        lastError = err;
-        if (
-          attempt === _DURABLE_ITEM_MAX_ATTEMPTS ||
-          !isRetryableDurableError(err)
-        )
-          break;
-        await sleep(backoff);
-        backoff = Math.min(backoff * 2, _DURABLE_ITEM_MAX_BACKOFF_MS);
-      }
+  let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
+  let lastError;
+  for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      assistantItemPostTimeoutMs(config),
+    );
+    try {
+      return await postEventChecked(config, body, controller.signal);
+    } catch (err) {
+      lastError = err;
+    } finally {
+      clearTimeout(timeout);
     }
-    throw lastError || new Error("durable conversation item POST failed");
-  })();
-  pendingDurableItems.set(pendingKey, task);
-  try {
-    return await task;
-  } finally {
-    if (pendingDurableItems.get(pendingKey) === task) {
-      pendingDurableItems.delete(pendingKey);
-    }
+    if (
+      attempt === _ASSISTANT_ITEM_MAX_ATTEMPTS ||
+      !isRetryableAssistantError(lastError)
+    )
+      break;
+    await sleep(backoff);
+    backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
   }
+  throw lastError || new Error("assistant conversation item POST failed");
+}
+
+function assistantMessageSourceId(message, responseId, text) {
+  const response =
+    message && typeof message.responseId === "string" && message.responseId
+      ? `response:${message.responseId}`
+      : "";
+  const timestamp =
+    message && typeof message.timestamp === "number"
+      ? `timestamp:${message.timestamp}`
+      : "";
+  const identity = response || timestamp || `turn:${responseId}:${fingerprint(text)}`;
+  return boundedSourceId(`pi:assistant:${identity}`);
 }
 
 async function patchExternalSessionId(config, nativeSessionId) {
@@ -963,11 +942,10 @@ function interruptActiveContext(ctx) {
 /** Run Pi compaction through its callback API, publishing ordered progress events. */
 async function triggerCompaction(config, ctx, customInstructions) {
   if (!ctx || typeof ctx.compact !== "function") {
-    const responseId = `pi-compact-unavailable-${Date.now()}`;
-    await postEventBestEffort(config, {
+    await postEvent(config, {
       type: "external_conversation_item",
       data: {
-        response_id: responseId,
+        response_id: `pi-compact-unavailable-${Date.now()}`,
         item_type: "error",
         item_data: {
           source: "execution",
@@ -982,7 +960,7 @@ async function triggerCompaction(config, ctx, customInstructions) {
     return false;
   }
   try {
-    await postEventBestEffort(config, {
+    await postEvent(config, {
       type: "external_compaction_status",
       data: { status: "in_progress" },
     });
@@ -995,13 +973,13 @@ async function triggerCompaction(config, ctx, customInstructions) {
           : {}),
       });
     });
-    await postEventBestEffort(config, {
+    await postEvent(config, {
       type: "external_compaction_status",
       data: { status: "completed" },
     });
     return true;
   } catch (_err) {
-    await postEventBestEffort(config, {
+    await postEvent(config, {
       type: "external_compaction_status",
       data: { status: "failed" },
     });
@@ -1131,11 +1109,10 @@ async function applyModelChange(pi, config, ctx, modelId) {
 }
 
 async function postModelChangeError(config, message) {
-  const responseId = `pi-model-change-error-${Date.now()}`;
-  await postEventBestEffort(config, {
+  await postEvent(config, {
     type: "external_conversation_item",
     data: {
-      response_id: responseId,
+      response_id: `pi-model-change-error-${Date.now()}`,
       item_type: "error",
       item_data: {
         source: "execution",
@@ -1201,7 +1178,7 @@ async function postModelOptions(config, ctx) {
     options.push({ id, model: id, displayName: name });
   }
   if (options.length === 0) return;
-  await postEventBestEffort(config, {
+  await postEvent(config, {
     type: "external_model_options",
     data: { models: options },
   });
@@ -1321,11 +1298,10 @@ function startInboxPoller(
                 ? `${payload.content.slice(0, 80)}…`
                 : payload.content
               : "";
-          const responseId = `pi-deliver-dropped-${Date.now()}`;
-          void postEventBestEffort(config, {
+          postEvent(config, {
             type: "external_conversation_item",
             data: {
-              response_id: responseId,
+              response_id: `pi-deliver-dropped-${Date.now()}`,
               item_type: "error",
               item_data: {
                 source: "execution",
@@ -1421,11 +1397,7 @@ module.exports = function (pi) {
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
   const postedReasoning = new Set();
-  const postedUserInputs = new Set();
-  const postedAssistantItems = new Set();
-  const assistantSourceIdsByObject = new WeakMap();
-  const assistantSourceIdsByFallback = new Map();
-  const userSourceIdsByObject = new WeakMap();
+  const postedAssistantMessages = new Set();
   const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
   const pendingInterruptMs = 30_000;
@@ -1447,7 +1419,7 @@ module.exports = function (pi) {
   // message share its id with a single monotonic chunk index, so the
   // preview reads as one growing message — matching claude-native.
   //
-  // Deltas are best-effort live preview: postEventBestEffort fails open, and the
+  // Deltas are best-effort live preview: postEvent fails open, and the
   // authoritative text still arrives via message_end regardless.
   //
   // streamingMessageOrdinal: bumped at each assistant message_end so the
@@ -1532,7 +1504,7 @@ module.exports = function (pi) {
       "in-progress": "in_progress",
       completed: "completed",
     };
-    await postEventBestEffort(config, {
+    await postEvent(config, {
       type: "external_session_todos",
       data: {
         todos: taskList.map((task) => ({
@@ -1718,8 +1690,7 @@ module.exports = function (pi) {
   // POST the cumulative session usage so the server prices it and publishes a
   // ``session.usage`` event. Cumulative (SET) semantics — the server overwrites
   // its stored totals each flush. Deduped so a flush with no advance is a
-  // no-op. Fail-open via ``postEventBestEffort`` so a failed POST never wedges
-  // Pi.
+  // no-op. Fail-open via ``postEvent`` so a failed POST never wedges Pi.
   async function postSessionUsage() {
     if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
     const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
@@ -1731,7 +1702,7 @@ module.exports = function (pi) {
       cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
     };
     if (usageModel) data.model = usageModel;
-    await postEventBestEffort(config, { type: "external_session_usage", data });
+    await postEvent(config, { type: "external_session_usage", data });
   }
 
   function rememberContext(ctx) {
@@ -1745,41 +1716,6 @@ module.exports = function (pi) {
   function currentResponseId() {
     if (!activeResponseId) activeResponseId = newResponseId("turn");
     return activeResponseId;
-  }
-
-  function itemSourceId(kind, ...parts) {
-    return boundedSourceId(`pi:${kind}:${parts.join(":")}`);
-  }
-
-  function assistantItemSourceId(message, responseId) {
-    if (message && typeof message === "object") {
-      const known = assistantSourceIdsByObject.get(message);
-      if (known) return known;
-    }
-    let identity = "";
-    if (message && typeof message === "object") {
-      if (typeof message.id === "string" && message.id) {
-        identity = `id:${message.id}`;
-      } else if (typeof message.responseId === "string" && message.responseId) {
-        identity = `response:${message.responseId}`;
-      } else if (typeof message.timestamp === "number") {
-        identity = `timestamp:${message.timestamp}`;
-      }
-    }
-    if (!identity) {
-      const fallbackKey = `${responseId}:${fingerprint(textFromMessage(message))}`;
-      const known = assistantSourceIdsByFallback.get(fallbackKey);
-      if (known) return known;
-      identity = `text:${fingerprint(textFromMessage(message))}`;
-    }
-    const sourceId = itemSourceId("assistant", responseId, identity);
-    if (message && typeof message === "object") {
-      assistantSourceIdsByObject.set(message, sourceId);
-    }
-    if (identity.startsWith("text:")) {
-      assistantSourceIdsByFallback.set(`${responseId}:${identity}`, sourceId);
-    }
-    return sourceId;
   }
 
   function hasPendingInterrupt() {
@@ -1836,10 +1772,12 @@ module.exports = function (pi) {
     const name = String(toolCall.name || toolCall.toolName || "");
     if (!callId || !name) return;
     const key = `${responseId}:${callId}`;
+    toolCallsById.set(callId, { key, responseId, name });
     if (postedToolCalls.has(key)) return;
-    await postDurableConversationItem(
-      config,
-      {
+    postedToolCalls.add(key);
+    await postEvent(config, {
+      type: "external_conversation_item",
+      data: {
         response_id: responseId,
         item_type: "function_call",
         item_data: {
@@ -1851,10 +1789,7 @@ module.exports = function (pi) {
           call_id: callId,
         },
       },
-      itemSourceId("function-call", responseId, callId),
-    );
-    postedToolCalls.add(key);
-    toolCallsById.set(callId, { key, responseId, name });
+    });
   }
 
   async function postToolResult(event, responseId) {
@@ -1864,21 +1799,18 @@ module.exports = function (pi) {
     const known = toolCallsById.get(callId);
     const key = known && known.key ? known.key : `${responseId}:${callId}`;
     if (postedToolResults.has(key)) return;
-    const resultResponseId =
-      known && known.responseId ? known.responseId : responseId;
-    await postDurableConversationItem(
-      config,
-      {
-        response_id: resultResponseId,
+    postedToolResults.add(key);
+    await postEvent(config, {
+      type: "external_conversation_item",
+      data: {
+        response_id: known && known.responseId ? known.responseId : responseId,
         item_type: "function_call_output",
         item_data: {
           call_id: callId,
           output: textFromToolResult(event),
         },
       },
-      itemSourceId("function-call-output", resultResponseId, callId),
-    );
-    postedToolResults.add(key);
+    });
   }
 
   async function postCompletedReasoning(text, responseId, keyHint, streamed) {
@@ -1886,15 +1818,17 @@ module.exports = function (pi) {
     const textKey = `${responseId}:text:${fingerprint(text)}`;
     const key = `${responseId}:${keyHint || fingerprint(text)}`;
     if (postedReasoning.has(key) || postedReasoning.has(textKey)) return;
+    postedReasoning.add(key);
+    postedReasoning.add(textKey);
     if (!streamed) {
-      await postEventBestEffort(config, {
+      await postEvent(config, {
         type: "external_output_reasoning_delta",
         data: { delta: text, started: true },
       });
     }
-    await postDurableConversationItem(
-      config,
-      {
+    await postEvent(config, {
+      type: "external_conversation_item",
+      data: {
         response_id: responseId,
         item_type: "reasoning",
         item_data: {
@@ -1903,10 +1837,7 @@ module.exports = function (pi) {
           content: [{ type: "reasoning_text", text }],
         },
       },
-      itemSourceId("reasoning", responseId, keyHint || fingerprint(text)),
-    );
-    postedReasoning.add(key);
-    postedReasoning.add(textKey);
+    });
   }
 
   function reasoningBlockKey(responseId, contentIndex) {
@@ -1918,7 +1849,7 @@ module.exports = function (pi) {
     const blockKey = reasoningBlockKey(responseId, update.contentIndex);
     const started = !streamedReasoningBlocks.has(blockKey);
     streamedReasoningBlocks.add(blockKey);
-    await postEventBestEffort(config, {
+    await postEvent(config, {
       type: "external_output_reasoning_delta",
       data: { delta: update.delta, started },
     });
@@ -1946,7 +1877,7 @@ module.exports = function (pi) {
     if (!delta && !final) return;
     const index = streamedTextIndex.get(messageId) || 0;
     streamedTextIndex.set(messageId, index + 1);
-    await postEventBestEffort(config, {
+    await postEvent(config, {
       type: "external_output_text_delta",
       data: {
         delta,
@@ -2025,14 +1956,14 @@ module.exports = function (pi) {
         const responseId = turnStatusResponseId ?? newResponseId("compact");
         compacting = true;
         try {
-          await postEventBestEffort(config, {
+          await postEvent(config, {
             type: "external_session_status",
             data: { status: "running", response_id: responseId },
           });
           await triggerCompaction(config, latestContext, customInstructions);
         } finally {
           if (!agentRunning) {
-            await postEventBestEffort(config, {
+            await postEvent(config, {
               type: "external_session_status",
               data: { status: "idle", response_id: responseId },
             });
@@ -2067,7 +1998,7 @@ module.exports = function (pi) {
     // ``model_select`` handler, but for the startup value ``ctx.model``.
     const startupModel = modelReference(ctx ? ctx.model : undefined);
     if (startupModel) {
-      await postEventBestEffort(config, {
+      await postEvent(config, {
         type: "external_model_change",
         data: { model: startupModel },
       });
@@ -2096,7 +2027,7 @@ module.exports = function (pi) {
     const model = event && event.model ? event.model : undefined;
     const selectedModel = modelReference(model);
     if (!selectedModel) return;
-    await postEventBestEffort(config, {
+    await postEvent(config, {
       type: "external_model_change",
       data: { model: selectedModel },
     });
@@ -2117,9 +2048,7 @@ module.exports = function (pi) {
     postedToolCalls.clear();
     postedToolResults.clear();
     postedReasoning.clear();
-    postedUserInputs.clear();
-    postedAssistantItems.clear();
-    assistantSourceIdsByFallback.clear();
+    postedAssistantMessages.clear();
     streamedReasoningBlocks.clear();
     toolCallsById.clear();
     streamedTextIndex.clear();
@@ -2127,7 +2056,7 @@ module.exports = function (pi) {
     streamingMessageOrdinal = 0;
     // Pin the status response_id for this agent loop through agent_end.
     turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
-    await postEventBestEffort(config, {
+    await postEvent(config, {
       type: "external_session_status",
       data: {
         status: "running",
@@ -2161,7 +2090,7 @@ module.exports = function (pi) {
     turnStatusResponseId = null;
     // Manual compact aborts the turn first; its own completion publishes idle.
     if (compacting) return;
-    await postEventBestEffort(config, {
+    await postEvent(config, {
       type: "external_session_status",
       data: { status: "idle", response_id: endResponseId },
     });
@@ -2272,37 +2201,17 @@ module.exports = function (pi) {
     setOmnigentStatus(config, ctx, "running");
     const text = event && typeof event.text === "string" ? event.text : "";
     if (!text) return;
-    const responseId = `pi-user-${Date.now()}-${++sequence}`;
-    let inputSourceId;
-    if (event && typeof event === "object") {
-      inputSourceId = userSourceIdsByObject.get(event);
-      if (!inputSourceId) {
-        const inputIdentity =
-          typeof event.id === "string" && event.id
-            ? `id:${event.id}`
-            : typeof event.timestamp === "number"
-              ? `timestamp:${event.timestamp}`
-              : responseId;
-        inputSourceId = itemSourceId("user", inputIdentity);
-        userSourceIdsByObject.set(event, inputSourceId);
-      }
-    } else {
-      inputSourceId = itemSourceId("user", responseId);
-    }
-    if (postedUserInputs.has(inputSourceId)) return;
-    await postDurableConversationItem(
-      config,
-      {
-        response_id: responseId,
+    await postEvent(config, {
+      type: "external_conversation_item",
+      data: {
+        response_id: `pi-user-${Date.now()}-${++sequence}`,
         item_type: "message",
         item_data: {
           role: "user",
           content: [{ type: "input_text", text }],
         },
       },
-      inputSourceId,
-    );
-    postedUserInputs.add(inputSourceId);
+    });
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -2338,9 +2247,9 @@ module.exports = function (pi) {
         ? message.errorMessage
         : "";
     if (stopReason === "error" && errorMessage) {
-      await postDurableConversationItem(
-        config,
-        {
+      await postEvent(config, {
+        type: "external_conversation_item",
+        data: {
           response_id: responseId,
           item_type: "error",
           item_data: {
@@ -2349,18 +2258,17 @@ module.exports = function (pi) {
             message: `Pi model error: ${errorMessage}`,
           },
         },
-        itemSourceId("assistant-error", responseId, fingerprint(errorMessage)),
-      );
+      });
       return;
     }
     const text = textFromMessage(message);
     if (!text) return;
-    const sourceId = assistantItemSourceId(message, responseId);
-    if (postedAssistantItems.has(sourceId)) return;
+    const sourceId = assistantMessageSourceId(message, responseId, text);
+    if (postedAssistantMessages.has(sourceId)) return;
     // The authoritative assistant item. The web UI retires + replaces the
     // oldest in-flight live preview in place with this (FIFO; one preview
     // per message), so the streamed partials never duplicate the final.
-    await postDurableConversationItem(
+    await postAssistantMessage(
       config,
       {
         response_id: responseId,
@@ -2373,7 +2281,9 @@ module.exports = function (pi) {
       },
       sourceId,
     );
-    postedAssistantItems.add(sourceId);
+    // Retry a failed callback on its next delivery; only suppress duplicates
+    // after the authoritative POST has been accepted.
+    postedAssistantMessages.add(sourceId);
   });
 
   pi.on("turn_end", async (event, ctx) => {
