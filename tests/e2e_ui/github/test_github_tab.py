@@ -60,12 +60,16 @@ _INFO = {
             "passing": 3,
             "failing": 1,
             "pending": 0,
-            "total": 4,
+            "cancelled": 1,
+            "skipped": 1,
+            "total": 6,
             "runs": [
                 {"name": "unit", "bucket": "passing", "url": None},
                 {"name": "lint", "bucket": "passing", "url": None},
                 {"name": "types", "bucket": "passing", "url": None},
                 {"name": "e2e", "bucket": "failing", "url": None},
+                {"name": "superseded build", "bucket": "cancelled", "url": None},
+                {"name": "optional deploy", "bucket": "skipped", "url": None},
             ],
         },
         # The Summary tab renders the description (markdown) and comments.
@@ -185,6 +189,16 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_text("Checks")).to_be_visible()
     expect(rail.get_by_text(re.compile(r"3\s*passed"))).to_be_visible()
     expect(rail.get_by_text(re.compile(r"1\s*failed"))).to_be_visible()
+    for label, job in [("cancelled", "superseded build"), ("skipped", "optional deploy")]:
+        pill = rail.get_by_role("button", name=f"1 {label}", exact=True)
+        expect(pill).to_be_visible()
+        expect(pill).to_have_class(re.compile(r"\bbg-muted\b"))
+        expect(pill).to_have_class(re.compile(r"\btext-muted-foreground\b"))
+        pill.hover()
+        expect(page.get_by_text(job, exact=True)).to_be_visible()
+        expect(page.get_by_text("e2e", exact=True)).not_to_be_visible()
+        rail.get_by_text("Checks", exact=True).hover()
+        expect(page.get_by_text(job, exact=True)).not_to_be_visible()
 
     # Summary is the default tab: the PR description + a comment render there.
     expect(rail.get_by_text(re.compile(r"Adds the GitHub tab"))).to_be_visible()
