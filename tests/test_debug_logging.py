@@ -1610,3 +1610,106 @@ def test_post_timeout_is_cut_to_the_deadline(
 
     assert sink._post([{"message": "m"}], deadline=time.monotonic() + 0.5) == "delivered"
     assert len(timeouts) == 1 and 0 < timeouts[0] <= 0.5
+
+
+class _CountingZerobus:
+    """Fake httpx client for a live ZerobusLogHandler: counts mints and inserts."""
+
+    def __init__(self, *, expires_in: float = 3600, mint_status: int = 200) -> None:
+        self.mints = 0
+        self.inserted: list[str] = []
+        self._expires_in = expires_in
+        self._mint_status = mint_status
+        self.minted = threading.Event()
+
+    def post(self, url: str, **kwargs: object) -> httpx.Response:
+        if url.endswith("/oidc/v1/token"):
+            self.mints += 1
+            self.minted.set()
+            if self._mint_status != 200:
+                return httpx.Response(self._mint_status, text="nope")
+            return httpx.Response(
+                200, json={"access_token": f"t{self.mints}", "expires_in": self._expires_in}
+            )
+        self.inserted.extend(r["message"] for r in json.loads(str(kwargs["content"])))
+        return httpx.Response(200)
+
+    def close(self) -> None:
+        pass
+
+
+def _live_zerobus_sink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, client: _CountingZerobus
+) -> dl.ZerobusLogHandler:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl.httpx, "Client", lambda **_: client)
+    config = dl.config_from_env()
+    assert config is not None
+    return dl.ZerobusLogHandler(
+        config, "host", spool=DebugLogSpool(tmp_path / "spool", config.insert_url)
+    )
+
+
+def test_token_is_minted_at_worker_start_not_at_shutdown(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = _CountingZerobus()
+    sink = _live_zerobus_sink(monkeypatch, tmp_path, client)
+    try:
+        # Minted before any row was logged.
+        assert client.minted.wait(timeout=2)
+        assert client.mints == 1
+        for i in range(5):
+            sink.emit(_record(f"row {i}"))
+    finally:
+        sink.close()
+    # Shutdown delivered on the warm token: no mint on the close path.
+    assert client.mints == 1
+    assert client.inserted == [f"row {i}" for i in range(5)]
+
+
+def test_token_is_refreshed_before_it_expires(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Fresh for only 0.3s past the 300s refresh margin.
+    client = _CountingZerobus(expires_in=dl._TOKEN_REFRESH_SKEW_S + 0.3)
+    sink = _live_zerobus_sink(monkeypatch, tmp_path, client)
+    try:
+        deadline = time.monotonic() + 3
+        while client.mints < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert client.mints >= 2, "the idle worker should refresh the token on its own"
+    finally:
+        sink.close()
+
+
+def test_revived_worker_keeps_the_token(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After dictConfig's close() (or a fork) the revived worker doesn't re-mint."""
+    client = _CountingZerobus()
+    sink = _live_zerobus_sink(monkeypatch, tmp_path, client)
+    try:
+        assert client.minted.wait(timeout=2)
+        sink.close()
+        sink.emit(_record("after revive"))
+        deadline = time.monotonic() + 2
+        while not client.inserted and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert client.inserted == ["after revive"]
+        assert client.mints == 1
+    finally:
+        sink.close()
+
+
+def test_failing_mint_backs_off_instead_of_hammering(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = _CountingZerobus(mint_status=500)
+    sink = _live_zerobus_sink(monkeypatch, tmp_path, client)
+    try:
+        assert client.minted.wait(timeout=2)
+        time.sleep(1.0)
+        assert client.mints == 1  # backing off (5s) after the failed warm-up
+    finally:
+        sink.close()

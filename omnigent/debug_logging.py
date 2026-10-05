@@ -641,13 +641,31 @@ class _TokenSource:
     do the OIDC exchange by hand rather than through the SDK.
     """
 
-    def __init__(self, config: DebugLogConfig, client: httpx.Client) -> None:
+    def __init__(
+        self,
+        config: DebugLogConfig,
+        client: httpx.Client,
+        *,
+        carry_over: _TokenSource | None = None,
+    ) -> None:
         self._config = config
         self._client = client
         self._lock = threading.Lock()
         self._token: str | None = None
         self._expires_at = 0.0
         self._client_secret = config.client_secret
+        if carry_over is not None:
+            # A revived worker (after fork or dictConfig) keeps the token and the
+            # resolved secret: plain values, so reading them without the old,
+            # possibly fork-poisoned lock is safe.
+            self._token = carry_over._token
+            self._expires_at = carry_over._expires_at
+            self._client_secret = carry_over._client_secret or self._client_secret
+
+    def is_fresh(self) -> bool:
+        """Whether a cached token is valid beyond the refresh margin."""
+        with self._lock:
+            return bool(self._token) and time.time() < self._expires_at - _TOKEN_REFRESH_SKEW_S
 
     def token(self, *, deadline: float | None = None) -> str | None:
         """Return a cached token or mint one.
@@ -955,6 +973,15 @@ class DebugLogHandler(logging.Handler):
             finally:
                 state.in_network.clear()
 
+        def prepare() -> bool:
+            # E.g. a token mint: network (and maybe subprocess) work done here,
+            # off the shutdown path, so close() rarely has to mint.
+            state.in_network.set()
+            try:
+                return self._prepare_delivery()
+            finally:
+                state.in_network.clear()
+
         backoff = 0.0
         failing_until = 0.0
         next_replay = 0.0  # replay a previous process's leftovers soon after start
@@ -968,6 +995,8 @@ class DebugLogHandler(logging.Handler):
         pending: list[DebugLogRow] = []
         while not stop.is_set():
             try:
+                if time.monotonic() >= failing_until and not prepare():
+                    _note_failure()
                 batch = self._collect_batch(work_queue, self._FLUSH_WAIT)
                 if stop.is_set():
                     pending = batch  # not sent yet; the close drain handles it
@@ -1057,6 +1086,10 @@ class DebugLogHandler(logging.Handler):
             if item is not _CLOSE_WAKEUP:
                 more.append(item)
         return more
+
+    def _prepare_delivery(self) -> bool:
+        """Get ready to deliver ahead of need (e.g. credentials); ``False`` on failure."""
+        return True
 
     def _deliver(
         self,
@@ -1181,7 +1214,9 @@ class ZerobusLogHandler(DebugLogHandler):
         # Recreate the transport on every worker start. After a fork, inherited
         # httpx/token locks may be indeterminate and must not be reused.
         self._client = httpx.Client(timeout=_HTTP_TIMEOUT_S)
-        self._tokens = _TokenSource(self._config, self._client)
+        self._tokens = _TokenSource(
+            self._config, self._client, carry_over=getattr(self, "_tokens", None)
+        )
         super()._start_worker()
 
     def _run(self, work_queue: queue.Queue[DebugLogRow], stop: threading.Event) -> None:
@@ -1193,6 +1228,10 @@ class ZerobusLogHandler(DebugLogHandler):
         finally:
             with contextlib.suppress(Exception):
                 client.close()
+
+    def _prepare_delivery(self) -> bool:
+        """Mint at worker start and refresh before expiry, not at shutdown."""
+        return self._tokens.is_fresh() or self._tokens.token() is not None
 
     def _deliver(self, batch: list[DebugLogRow], deadline: float | None = None) -> DeliveryResult:
         return self._post(batch, deadline=deadline)
