@@ -1185,9 +1185,9 @@ async def test_relay_ignores_stop_intent_for_a_different_runner(
         gate.set()
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         assert sessions_module._session_status_cache[session_id] == "failed"
-        assert sessions_module._last_task_error_from_labels(store.labels[session_id])["code"] == (
-            "runner_disconnected"
-        )
+        error = sessions_module._last_task_error_from_labels(store.labels[session_id])
+        assert error is not None
+        assert error["code"] == "runner_disconnected"
     finally:
         gate.set()
         handle.task.cancel()

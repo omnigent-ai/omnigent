@@ -802,7 +802,8 @@ async def _stop_host_runner_intentionally(
                 continue
             if _intentional_stop_sessions.get(related_id) != runner_id:
                 marked.add(related_id)
-                _intentional_stop_sessions[related_id] = runner_id
+            # Each Stop needs a fresh disconnect window, including repeated requests.
+            _intentional_stop_sessions[related_id] = runner_id
             if handle is not None:
                 if handle.intentional_stop_turn_ended:
                     completed_stop_relays[related_id] = (handle, handle.running_event_count)
@@ -3680,8 +3681,10 @@ async def _mark_runner_sessions_offline_impl(
         if not pending:
             return
     _logger.warning(
-        "Runner offline reconciliation exhausted metadata retries for %d session(s)",
+        "Runner offline reconciliation exhausted metadata retries for %d session(s); "
+        "sample session IDs: %s",
         len(pending),
+        [conv.id for conv in pending[:10]],
     )
 
 
@@ -7917,7 +7920,8 @@ async def _relay_runner_stream_once(
                         if relay is not None and relay.task is asyncio.current_task():
                             if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
                                 relay.intentional_stop_turn_ended = (
-                                    _intentional_stop_sessions.get(session_id) == runner_id
+                                    runner_id is not None
+                                    and _intentional_stop_sessions.get(session_id) == runner_id
                                 )
                             else:
                                 relay.running_event_count += 1

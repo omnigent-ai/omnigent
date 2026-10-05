@@ -3166,7 +3166,7 @@ def test_replace_runner_id_allows_internal_non_session_conversation(
     assert fetched.runner_id == "runner-uuid-1"
 
 
-@pytest.mark.parametrize("limit", [1, 3])
+@pytest.mark.parametrize("limit", [1, 4])
 def test_list_runner_session_statuses_pages(
     conversation_store: SqlAlchemyConversationStore, limit: int
 ) -> None:

@@ -390,6 +390,76 @@ async def test_unconsumed_stop_expires_before_a_later_disconnect(
     )
 
 
+@pytest.mark.parametrize("outcome", ["stopped", "timeout"])
+async def test_repeated_stop_renews_retained_intent(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    store, ids = family
+    now = time.monotonic()
+    monkeypatch.setattr(common, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(helpers, "_STOP_RUNNER_RESULT_TIMEOUT_S", 0.1)
+    registry = HostRegistry()
+    conn = registry.register(
+        "host",
+        AsyncMock(spec=WebSocketLike),
+        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="host"),
+        owner=None,
+    )
+    first = asyncio.create_task(
+        orchestration._stop_host_runner_intentionally(
+            ids["parent"], "host", _RUNNER, registry, store
+        )
+    )
+    second: asyncio.Task[bool] | None = None
+    try:
+        encoded = await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)
+        assert encoded is not None
+        frame = decode_host_frame(encoded)
+        assert isinstance(frame, HostStopRunnerFrame)
+        assert frame.runner_id == _RUNNER
+        assert not await asyncio.wait_for(first, timeout=10)
+        assert not conn.pending_stops
+
+        now += 2 * RUNNER_LIVENESS_TTL_S - 1
+        if outcome == "stopped":
+            monkeypatch.setattr(helpers, "_STOP_RUNNER_RESULT_TIMEOUT_S", 10.0)
+        second = asyncio.create_task(
+            orchestration._stop_host_runner_intentionally(
+                ids["parent"], "host", _RUNNER, registry, store
+            )
+        )
+        encoded = await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)
+        assert encoded is not None
+        frame = decode_host_frame(encoded)
+        assert isinstance(frame, HostStopRunnerFrame)
+        assert frame.runner_id == _RUNNER
+        now += 2
+        if outcome == "stopped":
+            conn.pending_stops.pop(frame.request_id).set_result({"status": "stopped"})
+        assert await asyncio.wait_for(second, timeout=10) is (outcome == "stopped")
+        assert not conn.pending_stops
+
+        error = ErrorDetail(code="runner_disconnected", message="Runner disappeared.")
+        await sessions._mark_runner_sessions_offline(
+            store.list_conversations_by_runner_id(_RUNNER), error, store
+        )
+        for name in ("active", "cold", "grandchild"):
+            child_id = ids[name]
+            assert sessions._session_status_cache[child_id] == "idle"
+            assert (
+                sessions._last_task_error_from_labels(store.get_conversation(child_id).labels)
+                is None
+            )
+    finally:
+        pending = [first] if second is None else [first, second]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        registry.deregister("host")
+
+
 @pytest.mark.parametrize("stopped_runner", [_RUNNER, "runner-replacement"])
 async def test_stop_arriving_during_status_lookup_matches_the_departed_runner(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],
