@@ -76,7 +76,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   runner_error: "Something went wrong setting up the turn on the host.",
   runner_disconnected: "The connection to the host dropped unexpectedly.",
   runner_unavailable: "The session's runner isn't connected to the server.",
-  connection_error: "The connection to the agent dropped mid-turn.",
+  connection_error:
+    "The connection to the agent dropped mid-turn; retrying usually continues the turn.",
   context_length_exceeded: "The conversation grew past the model's context window.",
   executor_error: "The agent runtime hit an error while running the turn.",
   workspace_missing: "The session workspace no longer exists on the host.",
@@ -104,14 +105,17 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_unavailable",
   "rate_limit_exceeded",
   "transient_upstream_error",
+  "connection_error",
 ]);
 
-// Failed turns the runner itself survived: the session is healthy, only the
-// upstream model call failed, so retry continues the turn in place instead of
-// resuming the runner.
+// Failed turns the runner itself survived: the session is healthy, so retry
+// continues the turn in place (posts a continuation) instead of resuming the
+// runner. Includes a dropped harness stream — the runner marks the session
+// desynced, and the continuation message triggers the rebind.
 export const CONTINUE_TURN_ERROR_CODES = new Set([
   "rate_limit_exceeded",
   "transient_upstream_error",
+  "connection_error",
 ]);
 
 interface ParsedErrorMessage {

@@ -149,6 +149,9 @@ _TURN_OUTCOME_IMPACT = {
 # correlates a call to its result without naming the tool), alongside the
 # content fields dropped in _sse_safe_attributes.
 _SSE_SAFE_KEYS = (
+    "parent_session_id",
+    "child_session_id",
+    "agent_id",
     "status",
     "call_id",
     "message_id",

@@ -813,9 +813,8 @@ class HarnessProcessManager:
             if entry is not None and harness != "any" and entry.harness != harness:
                 # The harness is fixed at spawn time (it selects which runner
                 # module the subprocess loads), but the socket is keyed by
-                # conversation only — so after an in-place agent switch
-                # (``POST /v1/sessions/{id}/switch-agent``) a later turn
-                # resolves a DIFFERENT harness and must respawn, otherwise the
+                # conversation only, so if the session's agent binding changes,
+                # a later turn resolves a DIFFERENT harness and must respawn, otherwise the
                 # cached subprocess keeps serving the old harness. Mirrors the
                 # model-change respawn below.
                 #

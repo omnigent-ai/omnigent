@@ -379,7 +379,9 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",
-        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch([], model, "test-profile"),
+        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
+            [], model, "test-profile"
+        ),
     )
 
     task = asyncio.create_task(
@@ -540,6 +542,14 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     app_server = _FakeCodexAppServer()
     build_calls: list[dict[str, Any]] = []
+    resolve_calls: list[dict[str, Any]] = []
+    real_resolve_launch = codex_app_mod.resolve_native_codex_launch
+
+    def _recording_resolve_launch(**kwargs: Any) -> codex_app_mod.NativeCodexLaunch:
+        resolve_calls.append(kwargs)
+        return real_resolve_launch(**kwargs)
+
+    monkeypatch.setattr(codex_app_mod, "resolve_native_codex_launch", _recording_resolve_launch)
 
     def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
         """
@@ -734,6 +744,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["trust_project"] is True
     assert build_calls[0]["reconcile_process_registry"] is False
     assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
+    # Persisted pass-through args must reach launch resolution (--profile layering).
+    assert resolve_calls and all(
+        call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
+        for call in resolve_calls
+    )
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "codex-wrapper"
@@ -4073,7 +4088,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",
-        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch(
+        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
             config_overrides=[], model=model, profile=None
         ),
     )
@@ -4322,7 +4337,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",
-        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch(
+        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
             config_overrides=[], model=model, profile=None
         ),
     )
@@ -4572,9 +4587,11 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
     try:
         if launch_fails:
             with pytest.raises(RuntimeError, match="TUI launch failed"):
-                await _auto_create_codex_terminal(session_id, cast(Any, None), lambda *_: None)
+                await native._auto_create_codex_terminal(
+                    session_id, cast(Any, None), lambda *_: None
+                )
         else:
-            result = await _auto_create_codex_terminal(
+            result = await native._auto_create_codex_terminal(
                 session_id, cast(Any, None), lambda *_: None
             )
             assert result is fake_view

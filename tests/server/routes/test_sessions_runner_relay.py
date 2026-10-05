@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any
 
@@ -720,48 +721,37 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
 
 
 class _RecordingLabelStore:
-    """Minimal conversation store that records ``set_labels`` calls.
+    """Minimal store for disconnect labels, live status, and runner liveness.
 
-    The disconnect path persists the failure cause as durable labels so
-    snapshots and child summaries can tell a benign runner disconnect
-    from a real task failure (Option B). ``set_labels`` is exercised by
-    the tunnel-close path; ``get_conversation`` is read by
-    ``_publish_runner_recovered_status`` to gate the clear on the
-    persisted disconnect code, so both are implemented here.
-
-    :param connectivity: Canned ``SessionConnectivity`` rows whose
-        ``runner_id`` / ``runner_last_seen`` surface on ``get_conversation``,
-        e.g. to simulate a runner already live on another replica.
+    :param runner_liveness: Canned runner bindings and heartbeats used to
+        simulate a runner live on another replica.
     """
 
     def __init__(
         self,
         *,
         live_status: str = "idle",
-        connectivity: dict[str, Any] | None = None,
+        runner_liveness: dict[str, tuple[str | None, int | None]] | None = None,
     ) -> None:
         self.labels: dict[str, dict[str, str]] = {}
         self.live_status = live_status
-        self._connectivity = connectivity or {}
+        self._runner_liveness = runner_liveness or {}
 
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
+
+    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+        return self._runner_liveness.get(conversation_id)
 
     def get_conversation(self, conversation_id: str) -> Any:
         """Return a conversation-shaped object exposing the read fields.
 
         ``.labels`` is read by the recovery guard, ``.live_status`` by the
-        mid-turn check when the in-memory status cache is cold, and
-        ``.runner_id`` / ``.runner_last_seen`` by the cross-replica liveness
-        check (from the canned connectivity row, else ``None``: no other
-        replica has stamped this session).
+        mid-turn check when the in-memory status cache is cold.
         """
-        row = self._connectivity.get(conversation_id)
         return SimpleNamespace(
             labels=dict(self.labels.get(conversation_id, {})),
             live_status=self.live_status,
-            runner_id=row.runner_id if row is not None else None,
-            runner_last_seen=row.runner_last_seen if row is not None else None,
         )
 
 
@@ -1901,8 +1891,49 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_relay_reads_handoff_evidence_with_conversation_database_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A conversation-engine outage must not hide a healthy metadata heartbeat."""
+    import time
+
+    from sqlalchemy import event
+
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_live_elsewhere
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'conversations.db'}",
+    )
+    runner_id = "runner_handed_off"
+    conversation = store.create_conversation(runner_id=runner_id)
+    now = int(time.time())
+    store.touch_runner_liveness([runner_id], now)
+    monkeypatch.setattr(
+        "omnigent.server.session_live_state.last_liveness_stamp",
+        lambda _runner_id: now - 1,
+    )
+
+    def unavailable(*_args: Any) -> None:
+        raise ConnectionError("conversation database unavailable")
+
+    event.listen(store._conv_engine, "before_cursor_execute", unavailable)
+    try:
+        with pytest.raises(ConnectionError, match="conversation database unavailable"):
+            store.get_session_connectivity([conversation.id])
+        assert await asyncio.wait_for(
+            _relay_runner_live_elsewhere(conversation.id, store), timeout=_TASK_TIMEOUT_S
+        )
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", unavailable)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conversation_backend_unavailable", [False, True])
 async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
     monkeypatch: pytest.MonkeyPatch,
+    conversation_backend_unavailable: bool,
 ) -> None:
     """
     A runner already re-tunnelled to another replica is not failed here.
@@ -1917,7 +1948,6 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
 
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.stores.conversation_store import SessionConnectivity
 
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
@@ -1935,16 +1965,13 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
         "omnigent.server.session_live_state.last_liveness_stamp",
         lambda _runner_id: now - 60,
     )
-    store = _RecordingLabelStore(
-        connectivity={
-            session_id: SessionConnectivity(
-                runner_id=runner_id,
-                host_id=None,
-                needs_workspace=False,
-                runner_last_seen=now,
-            )
-        }
-    )
+    store = _RecordingLabelStore(runner_liveness={session_id: (runner_id, now)})
+    if conversation_backend_unavailable:
+
+        def unavailable(conversation_id: str) -> Any:
+            raise ConnectionError("conversation backend unavailable")
+
+        monkeypatch.setattr(store, "get_conversation", unavailable)
     # A turn is in flight, so a plain disconnect (without the cross-replica
     # check) would otherwise fail it.
     sessions_module._session_status_cache[session_id] = "running"
@@ -1985,36 +2012,50 @@ def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
     from omnigent.server.routes.sessions import (
         _runner_live_on_another_replica_from_conversations,
     )
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 
     now = int(time.time())
+    expired_stamp = now - RUNNER_LIVENESS_TTL_S - 1
     conversations = [SimpleNamespace(runner_id="runner_a", runner_last_seen=now)]
 
     assert _runner_live_on_another_replica_from_conversations(conversations, "runner_a", now - 1)
     assert not _runner_live_on_another_replica_from_conversations(conversations, "runner_a", now)
     assert not _runner_live_on_another_replica_from_conversations(
-        [SimpleNamespace(runner_id="runner_a", runner_last_seen=now - 91)],
+        [SimpleNamespace(runner_id="runner_a", runner_last_seen=expired_stamp)],
         "runner_a",
-        now - 100,
+        expired_stamp - 1,
     )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stale_runner_last_seen", [None, 1])
-async def test_relay_still_fails_mid_turn_session_when_stamp_is_not_newer(
+@pytest.mark.parametrize(
+    "liveness_state",
+    [
+        "cleared",
+        "expired",
+        "same-stamp",
+        "older-stamp",
+        "different-runner",
+        "missing",
+        "unavailable",
+    ],
+)
+async def test_relay_still_fails_mid_turn_session_without_handoff_evidence(
     monkeypatch: pytest.MonkeyPatch,
-    stale_runner_last_seen: int | None,
+    liveness_state: str,
 ) -> None:
     """
-    A cleared or stale connectivity stamp does not suppress the failure.
+    Only positive evidence for this runner suppresses a mid-turn failure.
 
     Only a fresh stamp strictly newer than this replica's own reference
-    proves another replica took over; a cleared (``None``) or stale
-    (past the liveness TTL) one means the runner is really gone, so the
-    mid-turn session must still fail with cause.
+    proves another replica took over. Missing, unreadable, or mismatched
+    runner metadata must still report a possible interruption.
     """
+    import time
+
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.stores.conversation_store import SessionConnectivity
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
@@ -2025,16 +2066,36 @@ async def test_relay_still_fails_mid_turn_session_when_stamp_is_not_newer(
     fake_runner = _TunnelCloseRunnerClient(gate)
     runner_id = "runner_stale_or_cleared_stamp"
     session_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    now = int(time.time())
+    expired_stamp = now - RUNNER_LIVENESS_TTL_S - 1
+    # The expired stamp is newer than the reference, isolating the TTL check.
+    reference_stamp = expired_stamp - 1 if liveness_state == "expired" else now - 1
+    monkeypatch.setattr(
+        "omnigent.server.session_live_state.last_liveness_stamp",
+        lambda _runner_id: reference_stamp,
+    )
+    stamp = {
+        "cleared": None,
+        "expired": expired_stamp,
+        "same-stamp": reference_stamp,
+        "older-stamp": reference_stamp - 1,
+    }.get(liveness_state, now)
     store = _RecordingLabelStore(
-        connectivity={
-            session_id: SessionConnectivity(
-                runner_id=runner_id,
-                host_id=None,
-                needs_workspace=False,
-                runner_last_seen=stale_runner_last_seen,
+        runner_liveness={}
+        if liveness_state == "missing"
+        else {
+            session_id: (
+                "other-runner" if liveness_state == "different-runner" else runner_id,
+                stamp,
             )
         }
     )
+    if liveness_state == "unavailable":
+
+        def unavailable(conversation_id: str) -> Any:
+            raise ConnectionError("metadata backend unavailable")
+
+        monkeypatch.setattr(store, "get_runner_liveness", unavailable)
     sessions_module._session_status_cache[session_id] = "running"
 
     try:

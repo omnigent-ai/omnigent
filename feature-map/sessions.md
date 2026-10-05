@@ -20,11 +20,20 @@ the header menu), and each place is a separate entry point.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
+- `fork-custom-agent`: switch to a custom agent discovered from an existing
+  session, as well as to a built-in agent; the fork uses the chosen agent.
+- `fork-access`: require read access to the source and, for a custom target,
+  its owning session. The caller owns the fork; source grants are not copied.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app can reconnect a local host
   itself. States: reconnecting (spinner), reconnect failed (retry), host offline.
+- `message-recovery`: a message racing initial runner binding or replacement
+  reaches the available runner without a false failed turn. Native sessions
+  initialize before delivery; SDK sub-agents reuse their loaded session state.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
+- `recent-switcher`: the desktop app opens the five most recent sessions with
+  Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab.
@@ -41,7 +50,10 @@ actions (archive, unarchive, delete).
 pin, fork, rename, archive or unarchive, and delete. Clicking the title also
 renames. Sub-agent sessions hide owner-only actions.
 
-**Message actions:** fork from a specific assistant message.
+**Message actions:** fork through a specific assistant message, excluding later
+turns. The header's Fork action copies the whole session instead. In either
+dialog, keep the agent or choose another built-in or custom agent. To make a
+custom agent available, first run a session using its spec file.
 
 **Archived view:** switch the sidebar to archived sessions and filter by project.
 
@@ -50,12 +62,20 @@ in the chat; the dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
 when a local session is stranded). In the desktop app, reconnect acts directly.
 
+**Message recovery:** send the first prompt while a runner is starting, or send
+another message after its runner restarts. Also open a sub-agent's conversation
+and send a follow-up after its parent runner is replaced.
+
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
-**Desktop browser:** choose **+ → Browser** in the Workspace panel. Agent
-browser requests and chat links with in-app opening enabled create or select a
-closable Browser soft tab automatically.
+**Desktop browser:** choose **+ → Browser** in the Workspace panel or press
+⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
+create or select a closable Browser soft tab automatically.
+
+**Desktop recent sessions:** hold Control and press Tab to open the five most
+recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control
+to switch, or press Escape to cancel.
 
 ## Driving it with the repro environment
 
@@ -91,11 +111,32 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
-- **`fork`:**
+- **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
-  `tests/e2e_ui/fork_session/test_fork_preserves_image_attachment.py::test_fork_carries_image_reference_and_its_resource`,
-  `tests/e2e_ui/fork_session/test_fork_retains_worked_for.py::test_fork_retains_worked_for_duration`,
+  plus agent switching:
   `tests/e2e_ui/fork_session/test_fork_switch_agent.py::test_fork_switch_agent_carries_history`
+- **`fork`, whole session and resources:**
+  `tests/e2e_ui/fork_session/test_fork_preserves_image_attachment.py::test_fork_carries_image_reference_and_its_resource`.
+  This uses the header menu and checks that the fork's image URL loads.
+  Duration coverage:
+  `tests/e2e_ui/fork_session/test_fork_retains_worked_for.py::test_fork_retains_worked_for_duration`,
+  and transcript-copy integration coverage (plain `uv run pytest`):
+  `tests/server/integration/test_sessions_fork.py::test_fork_copies_transcript_content_with_fresh_ids`
+- **`fork-custom-agent`, message action:**
+  `tests/e2e_ui/fork_session/test_fork_session_scoped_custom_agent.py::test_fork_switches_onto_session_scoped_custom_agent`
+  creates a custom-agent session, selects it as the target, and checks the
+  copied transcript and bound agent. The header/custom-agent combination needs
+  a manual drive: choose that target from the header's Fork dialog and check
+  that the full transcript and chosen agent survive in the new session. Record
+  the selection, navigation to a different session, transcript readback, and
+  the target agent returned by the session API. Repeat from a message with a
+  later turn present to distinguish message cutoff from the whole-session fork.
+- **`fork-access` (server integration, plain `uv run pytest`):**
+  `tests/server/integration/test_sessions_permissions.py::test_fork_session_requires_read_access`,
+  `tests/server/integration/test_sessions_permissions.py::test_fork_switch_binds_session_scoped_target_with_access`,
+  `tests/server/integration/test_sessions_permissions.py::test_fork_switch_denies_session_scoped_target_without_access`.
+  These exercise authenticated routes and stores; the single-user browser
+  recipe cannot prove cross-user access rules.
 - **`clone`:**
   `tests/e2e_ui/sessions/test_clone_session.py::test_clone_session_copies_transcript_and_navigates`,
   `tests/e2e_ui/fork_session/test_typed_workspace_enables_clone.py::test_typed_tilde_workspace_enables_clone`
@@ -106,8 +147,34 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`
+- **`message-recovery`, native binding races (own environment):**
+  `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
+  drives real servers, runners, and Claude/Codex CLIs with a mock model. It
+  covers first binding on a sibling replica and local runner replacement,
+  including explicit retry on the owner and exactly-once prompt/reply checks.
+- **`message-recovery`, native host crash (own environment, live model):**
+  `tests/e2e/test_native_host_reconnect_e2e.py::test_native_message_survives_host_restart`
+  uses a real server, host daemon, host-launched runners, and Codex CLI. After
+  a successful tool-using turn it kills the daemon, sends one follow-up, and
+  restarts the same host beyond the ten-second runner grace. The original
+  input must complete its file write exactly once on a new runner, without
+  resending or persisting a failed turn. Requires `codex`, `tmux`,
+  `OMNIGENT_E2E_CODEX_NATIVE=1`, and live `--llm-api-key` credentials (optionally
+  `--profile`). Logs and timing evidence remain in pytest's temporary directory.
+- **`message-recovery`, host relaunch (server integration, plain `uv run pytest`):**
+  `tests/server/integration/test_session_host_launch.py::test_message_relaunch_classifies_replacement_runner_liveness`
+  distinguishes a replacement live on another replica from a failed launch
+  with an old heartbeat or a local heartbeat. This controls liveness evidence;
+  it does not drive an actual cross-replica host migration.
+- **`message-recovery`, SDK sub-agent (server integration, plain `uv run pytest`):**
+  `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
+  covers recovery during ancestor healing and during the final binding refresh,
+  without initializing the SDK child's already-loaded session again.
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`
+- **`recent-switcher` (manual Electron):** open at least six sessions, hold
+  Control and press Tab to show the five most recent, cycle with Tab and
+  Shift+Tab, release Control to switch, then reopen and press Escape to cancel.
 - **`browser-storage` (real Electron, own environment):**
   `web/electron/e2e/desktop_cookie_isolation.e2e.js`. Sign into a site in one
   tab, open it in another tab and the agent browser, and confirm both are signed
@@ -126,6 +193,11 @@ plain `uv run pytest`, which starts a private server for the test.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
+- A custom agent belongs to its original session; appearing in the picker does
+  not prove the fork API accepts it. Check the bound agent after navigation.
+- A copied web transcript does not prove the native CLI received that history.
+  Native variants of the agent-switch test skip without `LLM_API_KEY`; record
+  those skips and use a configured test harness before claiming native coverage.
 - The reconnect command depends on why the session stopped (host offline vs. a
   stranded local session vs. a sandbox). Reproduce the reporter's reason, not
   just any stopped session.

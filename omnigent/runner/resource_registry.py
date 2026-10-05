@@ -21,7 +21,7 @@ import threading
 import time
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -41,6 +41,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
 
@@ -171,7 +172,7 @@ class TerminalExitEvent:
         specs may contain credentials or other launch-only secrets.
     :param cwd: Working directory used to launch the terminal, if known.
     :param last_output: Last visible pane text captured before exit, if any.
-    :param exit_status: The inner process's exit code, when tmux captured one
+    :param exit_status: The launched command's exit code, when tmux captured one
         from ``#{pane_dead_status}`` (terminals with ``keep_alive_after_exit``).
         ``None`` when unknown — e.g. the tmux server vanished before the status
         could be read, or the terminal doesn't keep the pane alive after exit.
@@ -179,6 +180,8 @@ class TerminalExitEvent:
         ``idle`` at exit. ``True`` marks a clean shutdown after the turn
         finished; ``False`` (the default — last seen ``running``, or never
         observed) keeps a mid-turn crash or boot failure a failure.
+    :param terminal_instance_id: Identity of the observed terminal instance.
+    :param lifecycle_context: Content-free evidence captured before exit cleanup.
     """
 
     session_id: str
@@ -192,6 +195,68 @@ class TerminalExitEvent:
     last_output: str | None = None
     exit_status: int | None = None
     session_was_idle: bool = False
+    terminal_instance_id: str | None = None
+    lifecycle_context: dict[str, str] = field(default_factory=dict)
+
+
+def _terminal_lifecycle_context(
+    instance: TerminalInstance | None, resource_role: str | None
+) -> dict[str, str]:
+    """Freeze launch evidence before cleanup without changing exit handling.
+
+    The size-bounded read assumes runner-local temporary storage for bridge files.
+    """
+    if instance is None:
+        return {}
+    context: dict[str, object] = {}
+    if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
+        context.update(
+            claude_session_end_reason="unknown",
+            claude_session_end_evidence="not_observed",
+        )
+    try:
+        context.update(instance.lifecycle_trace.snapshot())
+        context["terminal_exit_signal"] = instance.last_exit_signal()
+        if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
+            from omnigent.harnesses.claude_native.bridge import bridge_dir_from_launch_args
+            from omnigent.harnesses.claude_native.lifecycle import read_lifecycle_snapshot
+
+            evidence = read_lifecycle_snapshot(
+                bridge_dir_from_launch_args(instance.args),
+                instance.diagnostic_id,
+                instance.lifecycle_trace.launch_id,
+            )
+            context.update(
+                claude_lifecycle=evidence,
+                claude_lifecycle_read_status=evidence.get("read_status"),
+                claude_session_id=evidence.get("claude_session_id"),
+                claude_session_end_reason=evidence["session_end_reason"],
+                claude_session_end_evidence=evidence["session_end_evidence"],
+                claude_session_end_identity=evidence.get("session_end_identity"),
+                claude_hook_turn_in_progress=evidence.get("hook_turn_in_progress"),
+            )
+            session_end = evidence.get("session_end")
+            if isinstance(session_end, dict):
+                context.update(
+                    claude_session_end_at=session_end.get("recorded_at"),
+                    claude_session_end_last_observed_at=session_end.get("last_recorded_at"),
+                    claude_session_end_event_id=session_end.get("event_id"),
+                    claude_session_end_bridge_session_id=session_end.get("bridge_session_id"),
+                    claude_session_end_reason_status=session_end.get("reason_status"),
+                    claude_session_end_signal=session_end.get("signal"),
+                    claude_session_end_observation_count=session_end.get("observation_count"),
+                    claude_session_end_timestamp_source="hook_received",
+                )
+    except Exception as exc:  # noqa: BLE001 - diagnostics cannot replace the terminal outcome.
+        context["lifecycle_capture_failed"] = True
+        context["lifecycle_capture_error_type"] = type(exc).__name__
+    try:
+        return lifecycle_log_attributes(context)
+    except Exception as exc:  # noqa: BLE001 - even serialization must not prevent exit cleanup.
+        return {
+            "lifecycle_capture_failed": "true",
+            "lifecycle_capture_error_type": type(exc).__name__,
+        }
 
 
 def trim_terminal_output(text: str | None) -> str | None:
@@ -201,7 +266,9 @@ def trim_terminal_output(text: str | None) -> str | None:
     stripped = text.strip()
     if not stripped:
         return None
-    lines = stripped.splitlines()
+    # A tmux capture pads the screen with blank rows; left in, they fill the
+    # line budget and push the real output out ahead of "pane is dead".
+    lines = [line for line in stripped.splitlines() if line.strip()]
     full = "\n".join(lines)
     body = "\n".join(lines[-_TERMINAL_EXIT_OUTPUT_MAX_LINES:])
     # Keep the tail by characters: dropping whole lines would discard one long
@@ -629,6 +696,7 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         """
         self._set_session_status_memo(session_id, "running")
+        self._note_terminal_status(session_id, "running", "runner_turn_start")
 
     def note_external_session_status(self, session_id: str, status: str) -> None:
         """Record a terminal-observed external status for exit classification.
@@ -653,6 +721,52 @@ class SessionResourceRegistry:
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
         self._sync_status_edge(session_id, status)
+        self._note_terminal_status(session_id, status, "forwarded_status")
+
+    def _note_terminal_status(self, session_id: str, status: str, source: str) -> None:
+        """Attach external status edges to the owning Claude terminal's history."""
+        if self._terminal_registry is None:
+            return
+        for entry in self._terminal_registry.list_for_conversation(session_id):
+            try:
+                terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+                if (
+                    self.terminal_resource_role(session_id, terminal_id)
+                    == CLAUDE_NATIVE_TERMINAL_ROLE
+                ):
+                    entry.instance.lifecycle_trace.note_status(status, source)
+            except Exception as exc:  # noqa: BLE001 - diagnostics cannot affect status handling.
+                _logger.debug("Terminal status telemetry failed (%s)", type(exc).__name__)
+
+    def note_terminal_control_request(self, session_id: str, action: str) -> None:
+        """Record explicit runner requests separately from process exit and cleanup."""
+        if self._terminal_registry is None:
+            return
+        for entry in self._terminal_registry.list_for_conversation(session_id):
+            try:
+                terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+                if (
+                    self.terminal_resource_role(session_id, terminal_id)
+                    != CLAUDE_NATIVE_TERMINAL_ROLE
+                ):
+                    continue
+                entry.instance.lifecycle_trace.note_request(action, "runner_request")
+                if not _logger.isEnabledFor(logging.INFO):
+                    continue
+                _logger.info(
+                    "Native terminal control requested: %s",
+                    action,
+                    extra=debug_event(
+                        "native_terminal_control_requested",
+                        session_id=session_id,
+                        terminal_id=terminal_id,
+                        terminal_instance_id=entry.instance.diagnostic_id,
+                        action=action,
+                        **_terminal_lifecycle_context(entry.instance, CLAUDE_NATIVE_TERMINAL_ROLE),
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent control requests.
+                _logger.debug("Native terminal control telemetry failed (%s)", type(exc).__name__)
 
     @property
     def terminal_registry(self) -> TerminalRegistry | None:
@@ -1359,6 +1473,10 @@ class SessionResourceRegistry:
                 self._set_session_status_memo(session_id, status)
             if not self._claim_status_edge(session_id, status, blocked_on):
                 return
+            with contextlib.suppress(Exception):
+                instance.lifecycle_trace.note_status(
+                    status, "claude_status_file" if record_activity else "pane_activity"
+                )
             # Pane repaints can be startup output, not a new agent turn.
             if not explicit_activity:
                 self._set_session_status_memo(session_id, status, record_activity=False)
@@ -1444,6 +1562,8 @@ class SessionResourceRegistry:
                         )
 
         def _on_activity() -> None:
+            with contextlib.suppress(Exception):
+                instance.lifecycle_trace.note_activity()
             # Runs on the watcher daemon thread; hop to the loop so the
             # loop-only publishers (queue.put_nowait) are touched safely.
             #
@@ -1470,6 +1590,8 @@ class SessionResourceRegistry:
                 _publish_status("running")
 
         def _on_exit() -> None:
+            with contextlib.suppress(Exception):
+                instance.lifecycle_trace.note_exit()
             # The pane's process is gone, which the status file cannot report —
             # a killed Claude never unlinks it, so the record survives holding
             # its last value. Retire the poller before classifying the exit so
@@ -1657,6 +1779,18 @@ class SessionResourceRegistry:
     ) -> None:
         """Preserve exit evidence even when a pane dies before observation starts."""
         terminal_id = terminal_resource_id(terminal_name, session_key)
+        if instance is not None:
+            with contextlib.suppress(Exception):
+                instance.lifecycle_trace.note_exit()
+        lifecycle_context = _terminal_lifecycle_context(instance, resource_role)
+        lifecycle_context.update(
+            terminal_exit_status_source="tmux_pane_dead_status",
+            terminal_exit_status_process="launched_command",
+        )
+        lifecycle_context["session_turn_active_before_exit"] = str(
+            self.session_turn_is_active(session_id)
+        ).lower()
+        lifecycle_context["session_activity_epoch"] = str(self.session_activity_epoch(session_id))
         command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
 
         superseded_by: TerminalInstance | None = None
@@ -1684,6 +1818,10 @@ class SessionResourceRegistry:
             else None
         )
         session_was_idle = session_status_before_exit == "idle"
+        lifecycle_context["session_status_before_exit"] = session_status_before_exit or "unknown"
+        if superseded_by is not None:
+            lifecycle_context.pop("session_turn_active_before_exit", None)
+            lifecycle_context.pop("session_activity_epoch", None)
 
         # Codex keeps its existing final-screen event. New pre-observation
         # diagnostics may include recent history only under explicit opt-in.
@@ -1724,11 +1862,11 @@ class SessionResourceRegistry:
                 terminal_name=terminal_name,
                 terminal_key=session_key,
                 terminal_lifecycle=lifecycle.value,
-                session_status_before_exit=session_status_before_exit or "unknown",
                 terminal_exit_status=exit_status,
                 terminal_last_output=redacted_last_output,
                 before_observation=before_observation,
                 superseded=superseded_by is not None,
+                **lifecycle_context,
             ),
         )
         if superseded_by is not None:
@@ -1752,6 +1890,8 @@ class SessionResourceRegistry:
                     last_output=last_output,
                     exit_status=exit_status,
                     session_was_idle=session_was_idle,
+                    terminal_instance_id=instance.diagnostic_id if instance is not None else None,
+                    lifecycle_context=lifecycle_context,
                 )
             )
 
@@ -1773,6 +1913,10 @@ class SessionResourceRegistry:
             session_id,
         ):
             if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
+                with contextlib.suppress(Exception):
+                    entry.instance.lifecycle_trace.note_request(
+                        "close_terminal", "resource_request"
+                    )
                 _logger.info(
                     "Terminal close requested: session=%s terminal=%s",
                     session_id,
@@ -1783,6 +1927,9 @@ class SessionResourceRegistry:
                         terminal_id=terminal_id,
                         terminal_instance_id=entry.instance.diagnostic_id,
                         terminal_name=entry.terminal_name,
+                        **_terminal_lifecycle_context(
+                            entry.instance, self.terminal_resource_role(session_id, terminal_id)
+                        ),
                     ),
                 )
                 closed = await self._terminal_registry.close(

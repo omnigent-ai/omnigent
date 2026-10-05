@@ -139,9 +139,17 @@ If the workspace rejects the session, login requests are blocked while the shell
 tries silent renewal. Missing credentials, failed renewal, unavailable OAuth,
 and cancellation lead to the shell's connect/retry screen—not embedded workspace
 SSO. Failed connections stay blocked through the selector handoff so a late login
-redirect cannot replace it. Choose Connect to explicitly sign in through the system browser again.
-Saved-server launches, additional windows, server switches, and deep links use
-stored credentials without opening a browser automatically.
+redirect cannot replace it. Connect reuses stored credentials and opens the
+system browser only when they can't sign in; **Sign in with a different account**
+under Connect always opens it. Saved-server launches, additional windows, server
+switches, and deep links use stored credentials without opening a browser
+automatically.
+
+When the workspace is briefly unreachable (a VPN reconnecting after wake, an IP
+access list refusing this network, or HTTP 5xx/429), the window keeps its page
+under a **Reconnecting to Databricks…** overlay and retries every 5s for a minute,
+then every 10s for another. Cancel, or running out of retries, returns to the
+setup page with the reason.
 
 For the packaged macOS app, explicitly roll back to embedded Databricks sign-in:
 

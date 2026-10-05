@@ -524,8 +524,8 @@ async def bridge_tmux_control_to_websocket(
     :param websocket: An accepted FastAPI :class:`WebSocket`.
     :param socket_path: Filesystem path to the tmux server socket.
     :param tmux_target: The ``-t`` target string identifying the session.
-    :param read_only: When ``True``, attach with ``-r`` *and* drop inbound
-        binary input frames at the application layer (defense in depth).
+    :param read_only: When ``True``, drop inbound binary input frames and
+        attach with ``ignore-size`` so the viewer can't resize the pane.
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints.
@@ -559,7 +559,11 @@ async def bridge_tmux_control_to_websocket(
 
     argv = [tmux, "-S", socket_path, "-f", "/dev/null", "-C", "attach"]
     if read_only:
-        argv.append("-r")
+        # Not ``-r``: tmux >= 3.7 rejects ``send-keys`` whose implicit target
+        # client is read-only, so a viewer would block the harness from typing
+        # into the pane. Input is already dropped below; keep only the
+        # ignore-size half of ``-r`` so a viewer can't resize the owner's pane.
+        argv += ["-f", "ignore-size"]
     argv += ["-t", tmux_target]
 
     try:

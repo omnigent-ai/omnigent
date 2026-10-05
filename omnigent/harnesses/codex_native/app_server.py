@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import logging
@@ -36,12 +37,14 @@ if TYPE_CHECKING:
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
 from omnigent.harnesses.codex_native.launch_args import (
+    _merge_tables,
     _write_private_config,
     absolute_codex_path,
     canonical_codex_launch_args,
     codex_config_profile,
     materialize_codex_config_profile,
     read_codex_mcp_servers,
+    reject_reserved_codex_transport_args,
     validate_codex_config_profile_state,
     without_codex_config_profile,
 )
@@ -3542,6 +3545,35 @@ def _codex_login_usable() -> bool:
     return codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json")
 
 
+def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
+    """Built-in provider the bridged config selects without any Codex login, if any.
+
+    Layers the selected profile over ``config.toml`` the way
+    :func:`materialize_codex_config_profile` does at start.
+    """
+    from omnigent.onboarding.codex_auth_readiness import (
+        effective_self_sufficient_builtin_provider,
+        load_codex_config,
+    )
+
+    source_home = _codex_home_config_source_from_env()
+    config_path = source_home / "config.toml"
+    config = load_codex_config(config_path) if config_path.exists() else {}
+    if config is None:
+        return None
+    if config_profile is not None:
+        overlay = load_codex_config(source_home / f"{config_profile}.config.toml")
+        if overlay is None:
+            # Codex < 0.134 keeps file profiles inline; newer codex fails at start on a
+            # missing file anyway, so the fallback only matters where it is correct.
+            profiles = config.get("profiles")
+            overlay = profiles.get(config_profile) if isinstance(profiles, dict) else None
+        if not isinstance(overlay, dict):
+            return None
+        _merge_tables(config, copy.deepcopy(overlay))
+    return effective_self_sufficient_builtin_provider(config)
+
+
 def _resolve_subscription_launch(
     entry: ProviderEntry, model: str | None, explicit: dict[str, object]
 ) -> NativeCodexLaunch:
@@ -3603,7 +3635,10 @@ def _resolve_subscription_launch(
 
 
 def resolve_native_codex_launch(
-    *, model: str | None, spec: AgentSpec | None = None
+    *,
+    model: str | None,
+    spec: AgentSpec | None = None,
+    terminal_launch_args: Sequence[str] = (),
 ) -> NativeCodexLaunch:
     """Resolve the native Codex launch config across all offerings.
 
@@ -3633,7 +3668,10 @@ def resolve_native_codex_launch(
     2. else a global ``auth:`` block → ucode for Databricks, or provider
        overrides for an inline API key;
     3. else an ambient-detected provider (first run without configure);
-    4. else the codex CLI's own login.
+    4. else a self-sufficient built-in provider the bridged ``config.toml``
+       selects, read through the ``--profile`` in *terminal_launch_args*
+       (e.g. ``amazon-bedrock`` — Codex authenticates it itself);
+    5. else the codex CLI's own login.
 
     Without a *spec* (or when the spec carries no spec-level credential),
     credentials are controlled by ``omnigent setup`` provider config (or the
@@ -3645,6 +3683,9 @@ def resolve_native_codex_launch(
     :param spec: The custom agent spec launching this session, when there is
         one, so its ``executor.auth`` / legacy profile win over machine-level
         config (issue #2744 — parity with the in-process codex harness).
+    :param terminal_launch_args: Codex CLI pass-through args; their
+        ``--profile`` selects the config-file layer the bridged config is read
+        through, as :func:`build_codex_native_server` applies it at start.
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     from omnigent.inference_config import (
@@ -3827,6 +3868,28 @@ def resolve_native_codex_launch(
             )
 
     if entry is None:
+        try:
+            ambient_profile = codex_config_profile(terminal_launch_args)
+        except ValueError:
+            # Malformed selectors are reported where launch args are validated, at start.
+            ambient_profile = None
+        ambient_builtin = _ambient_builtin_codex_provider(ambient_profile)
+        if ambient_builtin is not None:
+            log_info_once(
+                _logger,
+                "native-codex routing: config.toml built-in provider %r (Codex-native "
+                "ambient config; Codex authenticates it itself)",
+                ambient_builtin,
+            )
+            return NativeCodexLaunch(
+                config_overrides=[f"model_provider={json.dumps(ambient_builtin)}"],
+                model=model,
+                profile=None,
+                summary=(
+                    f"Codex config.toml built-in provider {ambient_builtin!r} "
+                    "(Codex-native ambient config; Codex authenticates it itself)"
+                ),
+            )
         log_info_once(
             _logger,
             "native-codex routing: Codex CLI login (no provider configured for the Codex "
@@ -4456,6 +4519,10 @@ def build_codex_remote_args(
         can accept hooks normally.
     :returns: Codex argv tail after the executable.
     """
+    # The runner owns the app-server and the TUI ``--remote`` attach it appends
+    # below; reject caller pass-through args that would re-select or re-attach
+    # that transport (e.g. ``codex app-server … --remote``, which clap rejects).
+    reject_reserved_codex_transport_args(codex_args)
     override_args: list[str] = []
     for override in config_overrides:
         if override.lstrip().startswith("model_providers."):

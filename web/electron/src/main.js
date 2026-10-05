@@ -62,6 +62,7 @@ const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
 const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner");
 const { createReturnBanner } = require("./return_banner");
+const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
@@ -86,6 +87,9 @@ const {
   usesDatabricksBrowserAuth,
   isDatabricksLoginUrl,
   createDatabricksAuth,
+  isTransientRenewalError,
+  SESSION_REJECTED,
+  IP_ACL_BLOCKED,
 } = require("./databricks-auth");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const {
@@ -194,6 +198,7 @@ function onboardingMockSearch() {
  * the failing load settle first makes the fallback land every time.
  */
 function loadSetupPage(win, search = "") {
+  cancelReconnect(win);
   abortConnectionAttempt(win);
   // Fold in the dev-only onboarding mock (env-driven); caller params win on
   // conflict. No-op in packaged builds / when the mock is off.
@@ -460,6 +465,9 @@ let quitInstallFallbackMs = 3000;
 // Away-banner delay, `let` for the same reason: wiring tests shrink it via
 // testApi.setAwayBannerDelayMs instead of waiting out the real delay.
 let awayBannerDelayMs = AWAY_BANNER_DELAY_MS;
+// Silent Databricks reconnects: every 5s for a minute, then every 10s for another.
+// `let` so wiring tests can shrink it via testApi.setReconnectDelaysMs.
+let reconnectDelaysMs = [...Array(12).fill(5_000), ...Array(6).fill(10_000)];
 
 /**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
@@ -744,6 +752,9 @@ const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
 let databricksAuthMode;
 let databricksAuth;
 const connectionAttempts = new WeakMap();
+// Workspaces whose stored credentials minted a session Databricks then rejected;
+// the next Connect signs in through the browser instead of retrying them.
+const databricksBrowserSignInRequired = new Set();
 
 function abortConnectionAttempt(win, message = "Connection superseded") {
   const attempt = connectionAttempts.get(win);
@@ -777,28 +788,152 @@ function usesBrowserAuth(url) {
   return usesDatabricksBrowserAuth(url, databricksAuthMode);
 }
 
-function showDatabricksAuthRequired(win, serverUrl, error) {
+// Chromium net errors that mean the host could not be reached at all.
+const UNREACHABLE_NET_ERRORS = new Set([
+  -7, // TIMED_OUT
+  -21, // NETWORK_CHANGED
+  -100, // CONNECTION_CLOSED
+  -101, // CONNECTION_RESET
+  -102, // CONNECTION_REFUSED
+  -104, // CONNECTION_FAILED
+  -105, // NAME_NOT_RESOLVED
+  -106, // INTERNET_DISCONNECTED
+  -109, // ADDRESS_UNREACHABLE
+  -118, // CONNECTION_TIMED_OUT
+  -137, // NAME_RESOLUTION_FAILED
+]);
+
+// Pending silent reconnects behind the overlay:
+// win → { serverUrl, returnUrl, attempt, timer, finalMessage }.
+const reconnects = new WeakMap();
+
+function cancelReconnect(win) {
+  clearTimeout(reconnects.get(win)?.timer);
+  reconnects.delete(win);
+  reconnectOverlay.hide(win);
+}
+
+/** Setup page for a connection that failed; `url` pre-fills the form. */
+function showConnectFailure(win, url, message) {
+  const params = new URLSearchParams({ error: message, url });
+  if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
+  pinWindow(win, null); // back on the setup page → no trusted origin
+  void loadSetupPage(win, params.toString());
+}
+
+/** Cancel on the overlay: stop reconnecting and show the final message. */
+function stopReconnect(win) {
+  const state = reconnects.get(win);
+  if (!state) return cancelReconnect(win);
+  console.log("[omnigent] databricks auth: reconnect cancelled", {
+    origin: originOf(state.serverUrl),
+    attempt: state.attempt,
+  });
+  // An in-flight attempt may have re-pinned the window; hold it for setup again.
+  databricksAuth?.rejectConnection(win);
+  showConnectFailure(win, state.serverUrl, state.finalMessage);
+}
+
+/**
+ * Arm the next silent reconnect for a transient failure and show the overlay;
+ * false once the schedule runs out. `finalMessage` is what Cancel shows.
+ */
+function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage }) {
+  const previous = reconnects.get(win);
+  const same = previous?.serverUrl === serverUrl;
+  clearTimeout(previous?.timer);
+  const attempt = same ? previous.attempt : 0;
+  const delayMs = reconnectDelaysMs[attempt];
+  if (delayMs === undefined) return false;
+  const state = {
+    serverUrl,
+    // Never logged: it can name a conversation.
+    returnUrl: returnUrl ?? (same ? previous.returnUrl : undefined) ?? serverUrl,
+    attempt: attempt + 1,
+    timer: null,
+    finalMessage,
+  };
+  const origin = originOf(serverUrl);
+  console.log("[omnigent] databricks auth: reconnect scheduled", {
+    origin,
+    attempt: state.attempt,
+    delayMs,
+  });
+  state.timer = setTimeout(() => {
+    // Cancel, Change Server, a new connection, or closing the window cleared it.
+    if (win.isDestroyed() || reconnects.get(win) !== state) return;
+    // Another load (e.g. a deep link) is already reconnecting this window.
+    if (connectionAttempts.get(win)?.pending) return;
+    console.log("[omnigent] databricks auth: reconnecting", { origin, attempt: state.attempt });
+    // Another transient failure re-enters scheduleReconnect with this state still set.
+    loadServerUrl(win, serverUrl, undefined, { loadUrl: state.returnUrl }).catch((error) => {
+      if (error.name === "AbortError" && reconnects.get(win) === state) cancelReconnect(win);
+    });
+  }, delayMs);
+  reconnects.set(win, state);
+  reconnectOverlay.show(win, hint);
+  return true;
+}
+
+/** Network advice for an unreachable workspace, or one whose IP access list blocked us. */
+function networkHint(serverUrl, blocked) {
+  if (databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)) {
+    return "Check that you're connected to the VPN";
+  }
+  return blocked ? "Connect from a network the workspace allows" : "Check your network connection";
+}
+
+/** Overlay hint while reconnecting. */
+function reconnectingHint(serverUrl, blocked = false) {
+  const hint = `${networkHint(serverUrl, blocked)}.`;
+  return blocked ? `Databricks blocked this network. ${hint}` : hint;
+}
+
+/** Setup-page message once reconnecting stops. */
+function unreachableMessage(serverUrl, blocked = false) {
+  const problem = blocked ? "Databricks blocked this network." : "Couldn't reach Databricks.";
+  return `${problem} ${networkHint(serverUrl, blocked)}, then click Connect.`;
+}
+
+const UNAVAILABLE_HINT = "Databricks isn't responding.";
+
+function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedReturnUrl } = {}) {
   if (win.isDestroyed()) return;
   console.warn("[omnigent] databricks auth: connection requires sign-in", {
-    origin: originOf(serverUrl),
+    origin: originOf(failedUrl),
     phase: error.phase ?? "authentication",
     status: error.status,
     errorCode: error.errorCode,
     requestId: error.requestId,
   });
+  if (error.errorCode === SESSION_REJECTED) {
+    databricksBrowserSignInRequired.add(originOf(failedUrl));
+  }
   const expired = error.errorCode === "NO_REFRESH_TOKEN" || error.errorCode === "invalid_grant";
-  const params = new URLSearchParams({
-    error: expired
-      ? "Session expired. Connect to sign in again."
-      : "Couldn't sign in to Databricks. Please try again.",
-    url: serverUrl,
-  });
-  if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
+  const transient = isTransientRenewalError(error);
+  const resumable = transient && error.resumable !== false;
+  // Offline, Connect can't discover a bare workspace root's UI mount: retry the mount itself.
+  const mounted = (resumable && databricksWorkspaceUiUrl(failedUrl)) || null;
+  const serverUrl = mounted ?? failedUrl;
+  const returnUrl =
+    mounted && (!failedReturnUrl || failedReturnUrl === failedUrl) ? mounted : failedReturnUrl;
+  const blocked = error.errorCode === IP_ACL_BLOCKED;
+  const unreachable = transient && (error.status == null || blocked);
+  let message = "Couldn't sign in to Databricks. Please try again.";
+  if (expired) message = "Session expired. Connect to sign in again.";
+  else if (unreachable) message = unreachableMessage(serverUrl, blocked);
+  // The page stays under the overlay, but no longer trusted or allowed to navigate.
   databricksAuth?.rejectConnection(win);
   pinWindow(win, null);
   setWindowServerUrl(win, null);
   win.webContents.stop();
-  void loadSetupPage(win, params.toString());
+  const retrying =
+    resumable &&
+    scheduleReconnect(win, serverUrl, returnUrl, {
+      hint: unreachable ? reconnectingHint(serverUrl, blocked) : UNAVAILABLE_HINT,
+      finalMessage: message,
+    });
+  if (!retrying) showConnectFailure(win, serverUrl, message);
 }
 
 function getDatabricksAuth() {
@@ -1214,6 +1349,16 @@ const returnBanner = createReturnBanner({
   onGoBack: (win) => awayWatches.get(win)?.reset(),
 });
 
+// Shell-owned "Reconnecting to Databricks…" overlay over the window's page while
+// silent reconnects run; Cancel ends them on the setup page.
+const reconnectOverlay = createReconnectOverlay({
+  WebContentsView,
+  ipcMain,
+  overlayPage: path.join(__dirname, "..", "reconnect-overlay", "index.html"),
+  preloadPath: path.join(__dirname, "reconnect_overlay_preload.js"),
+  onCancel: (win) => stopReconnect(win),
+});
+
 const browserPermissionStore = createBrowserPermissionStore({ loadSettings, saveSettings });
 const browserPermissionPrompt = createBrowserPermissionPrompt({
   BrowserWindow,
@@ -1615,14 +1760,20 @@ function resolveServerPath(serverUrl, routePath) {
  * @param {BrowserWindow} win
  * @param {string} requestedServerUrl Clean server URL (origin or origin+mount).
  * @param {string} [routePath] Optional basename-less in-app path (e.g. ``/c/<id>``).
- * @param {{ interactive?: boolean, loadUrl?: string, attempt?: ReturnType<typeof beginConnectionAttempt> }} [options]
+ * @param {{ interactive?: boolean, browserSignIn?: boolean, loadUrl?: string, attempt?: ReturnType<typeof beginConnectionAttempt> }} [options]
+ *   ``browserSignIn`` skips stored credentials on an interactive connect (another account).
  * @returns {Promise<string>} Resolved server URL after authentication and loading.
  */
 async function loadServerUrl(
   win,
   requestedServerUrl,
   routePath,
-  { interactive = false, loadUrl, attempt = beginConnectionAttempt(win) } = {},
+  {
+    interactive = false,
+    browserSignIn: forceBrowserSignIn = false,
+    loadUrl,
+    attempt = beginConnectionAttempt(win),
+  } = {},
 ) {
   const signal = attempt.controller.signal;
   const current = () =>
@@ -1651,22 +1802,29 @@ async function loadServerUrl(
       reportConnectionProgress(win, attempt, "authenticating");
       const auth = getDatabricksAuth();
       win.webContents.stop();
-      if (!isSetupPageUrl(win.webContents.getURL())) {
+      // The reconnect overlay already says what's happening.
+      if (!isSetupPageUrl(win.webContents.getURL()) && !reconnectOverlay.isShown(win)) {
         connectionLoading.show(win, attempt, "Signing in…");
       }
       try {
         const entered = new URL(serverUrl);
+        // Kept until a browser sign-in succeeds, so a cancelled one doesn't reuse rejected credentials.
+        const browserSignIn =
+          interactive &&
+          (forceBrowserSignIn || databricksBrowserSignInRequired.has(entered.origin));
         const resolvedOrigin = await ensureDatabricksSession(
           session.defaultSession,
           entered.origin,
           {
             interactive,
+            useStoredCredentials: !browserSignIn,
             signal,
             workspaceId: entered.searchParams.get("o") || undefined,
             pickWorkspace: (workspaces) =>
               current() ? pickWorkspaceForBridge(win, workspaces, { signal }) : null,
           },
         );
+        if (browserSignIn) databricksBrowserSignInRequired.delete(entered.origin);
         assertCurrent();
         if (resolvedOrigin !== entered.origin) {
           serverUrl = databricksWorkspaceUiUrl(resolvedOrigin);
@@ -1685,7 +1843,7 @@ async function loadServerUrl(
           if (error.name === "AbortError") {
             pinWindow(win, null);
             setWindowServerUrl(win, null);
-          } else showDatabricksAuthRequired(win, serverUrl, error);
+          } else showDatabricksAuthRequired(win, serverUrl, error, { returnUrl: target });
         }
         throw error;
       }
@@ -1696,9 +1854,11 @@ async function loadServerUrl(
     void fetchServerManifest(serverUrl).then((manifest) => {
       if (current()) setWindowServerManifest(win, manifest);
     });
-    connectionLoading.show(win, attempt, "Opening Omnigent…");
+    if (!reconnectOverlay.isShown(win)) connectionLoading.show(win, attempt, "Opening Omnigent…");
     await win.loadURL(target);
     assertCurrent();
+    // Loaded: any reconnect this window was waiting on is over.
+    cancelReconnect(win);
     const arcaServerUrl = windowArcaServerUrl(win);
     void refreshArcaBinary().then(() => arcaAutoConnect.ensure(arcaServerUrl));
     return serverUrl;
@@ -1753,16 +1913,32 @@ function registerNavigationFallbacks(win) {
       // not yank the window off its new destination.
       const failedOrigin = originOf(validatedURL ?? "");
       if (failedOrigin !== windows.get(win)?.origin) return;
-      const params = new URLSearchParams({
-        error: `${errorDescription || "load failed"} (${errorCode})`,
-        // The failure often happens on a deep SPA route (e.g. /chat/…);
-        // prefill the setup form with just the server origin — that's what
-        // the user connects to — not the full path that happened to fail.
-        url: failedOrigin ? failedOrigin + "/" : (validatedURL ?? ""),
-      });
-      if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
-      pinWindow(win, null); // back on the setup page → no trusted origin
-      void loadSetupPage(win, params.toString());
+      let error = `${errorDescription || "load failed"} (${errorCode})`;
+      const serverUrl = windows.get(win)?.serverUrl;
+      const reconnectable =
+        Boolean(serverUrl) &&
+        UNREACHABLE_NET_ERRORS.has(errorCode) &&
+        usesBrowserAuth(pinnedOrigin(win));
+      // The failure often happens on a deep SPA route (e.g. /chat/…);
+      // prefill the setup form with just the server origin — that's what
+      // the user connects to — not the full path that happened to fail.
+      // Workspace reconnects keep the mounted server URL.
+      let url = failedOrigin ? failedOrigin + "/" : (validatedURL ?? "");
+      if (reconnectable) {
+        console.warn("[omnigent] databricks auth: page load failed", {
+          origin: failedOrigin,
+          errorCode,
+        });
+        error = unreachableMessage(validatedURL);
+        url = serverUrl;
+        // The error page underneath is no longer trusted or allowed to navigate.
+        databricksAuth?.rejectConnection(win);
+        pinWindow(win, null);
+        // DNS/VPN may still be reconnecting right after wake: retry behind the overlay.
+        const hint = reconnectingHint(validatedURL);
+        if (scheduleReconnect(win, serverUrl, validatedURL, { hint, finalMessage: error })) return;
+      }
+      showConnectFailure(win, url, error);
     },
   );
 
@@ -1778,13 +1954,20 @@ function registerNavigationFallbacks(win) {
     const status = httpStatusText
       ? `${httpResponseCode} ${httpStatusText}`
       : `HTTP ${httpResponseCode}`;
-    const params = new URLSearchParams({
-      error: status,
-      url: state.serverUrl ?? url ?? "",
-    });
-    if (state.ephemeral) params.set("ephemeral", "1");
-    pinWindow(win, null);
-    void loadSetupPage(win, params.toString());
+    const overloaded =
+      httpResponseCode === 429 || (httpResponseCode >= 500 && httpResponseCode <= 599);
+    if (overloaded && state.serverUrl && usesBrowserAuth(pinnedOrigin(win))) {
+      // The workspace may be restarting or shedding load: retry behind the overlay.
+      console.warn("[omnigent] databricks auth: page load failed", {
+        origin: failedOrigin,
+        status: httpResponseCode,
+      });
+      databricksAuth?.rejectConnection(win);
+      pinWindow(win, null);
+      const options = { hint: UNAVAILABLE_HINT, finalMessage: status };
+      if (scheduleReconnect(win, state.serverUrl, url, options)) return;
+    }
+    showConnectFailure(win, state.serverUrl ?? url ?? "", status);
   });
 }
 
@@ -2005,6 +2188,7 @@ function createWindow(targetUrl, opts = {}) {
 
   win.on("closed", () => {
     abortConnectionAttempt(win);
+    cancelReconnect(win);
     databricksAuth?.reset(win);
     // Destroy this window's embedded-browser views, else they leak webContents.
     try {
@@ -2969,7 +3153,10 @@ function createBrowserRegistryForWindow(win) {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
     createBoundsController: createBrowserViewBoundsController,
-    attachToHost: (view) => win.contentView.addChildView(view),
+    attachToHost: (view) => {
+      win.contentView.addChildView(view);
+      reconnectOverlay.raise(win);
+    },
     detachFromHost: (view) => win.contentView.removeChildView(view),
     sendToRenderer: (channel, payload) => {
       if (channel === "browser-host-active-changed") browserPermissionPrompt.dismiss(win);
@@ -2979,6 +3166,7 @@ function createBrowserRegistryForWindow(win) {
         /* window torn down */
       }
     },
+    isHostFocused: () => !win.isDestroyed() && win.isFocused(),
     // Renderer measures in CSS px; convert to window DIPs using the host
     // webContents zoom factor (Cmd+/Cmd- changes this out from under us).
     getHostZoomFactor: () => {
@@ -2993,6 +3181,9 @@ function createBrowserRegistryForWindow(win) {
     showContextMenu: (items) => {
       Menu.buildFromTemplate(items).popup({ window: win });
     },
+  });
+  win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) registry.setRecentSessionSwitchSupported(false);
   });
   return registry;
 }
@@ -3121,6 +3312,10 @@ function registerIpc() {
     ) {
       throw new Error("Invalid connection request ID");
     }
+    // "Sign in with a different account": skip stored credentials for this Connect.
+    const browserSignIn = opts?.browserSignIn ?? false;
+    if (typeof browserSignIn !== "boolean") throw new Error("Invalid browserSignIn option");
+    cancelReconnect(win);
     const attempt = beginConnectionAttempt(win, requestId);
     const signal = attempt.controller.signal;
     reportConnectionProgress(win, attempt, "connecting");
@@ -3143,6 +3338,7 @@ function registerIpc() {
       }
       const resolvedServerUrl = await loadServerUrl(win, target, undefined, {
         interactive: true,
+        browserSignIn,
         attempt,
       });
       // Only a server that actually responded earns a recents slot. Sign-in that
@@ -3164,6 +3360,8 @@ function registerIpc() {
       return {};
     } catch (error) {
       if (error.name === "AbortError") return { cancelled: true };
+      // The overlay now covers this page and reconnects on its own.
+      if (reconnectOverlay.isShown(win)) return { reconnecting: true };
       throw error;
     } finally {
       attempt.pending = false;
@@ -3770,6 +3968,7 @@ function registerIpc() {
   browserPermissionPrompt.registerIpc();
   updateOverlay.registerIpc();
   returnBanner.registerIpc();
+  reconnectOverlay.registerIpc();
 
   // Mirror the web app's in-app theme onto the native side so the update
   // overlay, native dialogs, and menus track the theme switcher (not just the

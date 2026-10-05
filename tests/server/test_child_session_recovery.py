@@ -105,7 +105,9 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exclusion", ["closed", "archived", "stopped", "hosted", "live_runner"])
+@pytest.mark.parametrize(
+    "exclusion", ["closed", "archived", "stopped", "hosted", "side_chat", "live_runner"]
+)
 async def test_do_not_restore_excluded_children(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, exclusion: str
 ) -> None:
@@ -121,6 +123,8 @@ async def test_do_not_restore_excluded_children(
         _intentional_stop_sessions.add(row.id)
     elif exclusion == "hosted":
         store.set_host_id(row.id, "a" * 32, workspace="/tmp")
+    elif exclusion == "side_chat":
+        store.set_labels(row.id, {"omnigent.codex_native.agent_nickname": "Side chat"})
     else:
         monkeypatch.setattr(
             "omnigent.runtime.get_runner_router", lambda: Mock(runner_is_online=lambda _: True)

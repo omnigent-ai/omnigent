@@ -16,6 +16,7 @@ from omnigent.entities import (
     NewConversationItem,
     ResourceEventData,
 )
+from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.runtime import session_stream
 from omnigent.server.schemas import OutputItemDoneEvent
 from omnigent.stores import ConversationStore
@@ -145,7 +146,12 @@ async def record_subagent_activity(
     """Persist and publish a child lifecycle edge once, including across retries."""
     try:
         child = await asyncio.to_thread(store.get_conversation, child_id)
-        if child is None or child.parent_conversation_id is None:
+        if (
+            child is None
+            or child.parent_conversation_id is None
+            or is_side_chat_child(child.labels)
+        ):
+            # A side chat lives in its own rail tab; it is not delegated work.
             return
         if parent_id is not None and child.parent_conversation_id != parent_id:
             return

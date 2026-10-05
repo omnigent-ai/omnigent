@@ -540,9 +540,8 @@ def build_policy_engine(
         that rebuild an engine specifically to observe concurrent writes
         (the native ASK gate's post-lock re-evaluation) pass ``None``.
     :param expected_agent_id: The ``agent_id`` the caller resolved *spec*
-        from. ``agent_id`` is mutable (switch-agent) but selects the spec,
-        so it must be read before the engine exists and cannot be
-        re-derived here. Passing it lets the builder confirm it against
+        from. ``agent_id`` selects the spec, so it must be read before the
+        engine exists and cannot be re-derived here. Passing it lets the builder confirm it against
         the fresh row and fail closed on a mismatch, instead of
         authorizing an evaluation under the previous agent's guardrails.
         ``None`` skips the check (callers with no spec/agent coupling).
@@ -662,12 +661,9 @@ def build_policy_engine(
                 code=ErrorCode.CONFLICT,
             )
         conv = fresh_self
-    # Agent/spec confirmation — deliberately AFTER the refresh above, and
-    # nowhere else. Comparing against the earlier row (as a previous revision
-    # did) validated the very snapshot whose staleness is the hazard, so a
-    # switch-agent in the window was accepted. Exact equality: a fresh row
-    # whose binding is ``None``, or no fresh row at all, is a mismatch too —
-    # not a reason to skip the check.
+    # Must run AFTER the refresh: comparing the earlier (stale) row would accept
+    # a rebind in the window. Exact equality: a fresh row bound to ``None``, or no
+    # fresh row at all, is a mismatch too.
     if expected_agent_id is not None:
         fresh_agent_id = conv.agent_id if conv is not None else None
         if fresh_agent_id != expected_agent_id:

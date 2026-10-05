@@ -97,6 +97,9 @@ class RunnerSession:
     :param in_flight: Per-req_id reassembly state. Each entry holds
         a head Future + body queue + end Event so the transport can
         await heads, iterate body chunks, and detect end.
+    :param close_code: First server-requested close code, recorded under
+        the registry lock before helpers can observe retirement.
+    :param close_reason: Reason accompanying ``close_code``.
     """
 
     runner_id: str
@@ -112,6 +115,8 @@ class RunnerSession:
     # 8-char hex channel ids; values hold the inbound queue consumed
     # by whichever side terminated the attach.
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
+    close_code: int | None = None
+    close_reason: str | None = None
 
 
 @dataclass
@@ -283,6 +288,7 @@ class TunnelRegistry:
         with self._lock:
             old = self._sessions.pop(runner_id, None)
             if old is not None:
+                self.record_close(old, code=4000, reason="tunnel replaced")
                 self._abort_session_inflight(
                     old,
                     ConnectionError(
@@ -326,6 +332,7 @@ class TunnelRegistry:
             if current is None or (session is not None and current is not session):
                 return None
             removed = self._sessions.pop(runner_id)
+            self.record_close(removed, code=1001, reason="tunnel retired by server; reconnect")
             in_flight_count = len(removed.in_flight)
             if in_flight_count:
                 _logger.warning(
@@ -351,6 +358,22 @@ class TunnelRegistry:
         # "this server is shutting down".
         _retire_session_writer(removed, code=1001, reason="tunnel retired by server; reconnect")
         return removed
+
+    def record_close(self, session: RunnerSession, *, code: int, reason: str) -> None:
+        """Retain the first server-requested close for one connection.
+
+        Retirement callers hold the registry lock across removal and this
+        update so stale-session helpers cannot finish before it is visible.
+
+        :param session: Connection being closed, including a retired generation.
+        :param code: Requested WebSocket close code.
+        :param reason: Requested WebSocket close reason.
+        :returns: None.
+        """
+        with self._lock:
+            if session.close_code is None:
+                session.close_code = code
+                session.close_reason = reason
 
     @staticmethod
     def _abort_session_inflight(session: RunnerSession, error: BaseException) -> None:

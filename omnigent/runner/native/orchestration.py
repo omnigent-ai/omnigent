@@ -4815,7 +4815,10 @@ async def _auto_create_codex_terminal(
     # Thread the spec so its executor.auth / legacy profile win over
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
+    _codex_terminal_args = launch_config.terminal_launch_args or ()
+    _codex_launch = resolve_native_codex_launch(
+        model=default_model, spec=_launch_spec, terminal_launch_args=_codex_terminal_args
+    )
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
     codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
@@ -4826,7 +4829,10 @@ async def _auto_create_codex_terminal(
     _fresh_codex_catalog: list[_JsonObject] | None = None
     try:
         _catalog_launch = await asyncio.to_thread(
-            resolve_native_codex_launch, model=None, spec=_launch_spec
+            resolve_native_codex_launch,
+            model=None,
+            spec=_launch_spec,
+            terminal_launch_args=_codex_terminal_args,
         )
         _fresh_codex_catalog = fresh_codex_launch_catalog(
             codex_path=_codex_cli_path,
@@ -4863,7 +4869,10 @@ async def _auto_create_codex_terminal(
         try:
             if _catalog_launch is None:
                 _catalog_launch = await asyncio.to_thread(
-                    resolve_native_codex_launch, model=None, spec=_launch_spec
+                    resolve_native_codex_launch,
+                    model=None,
+                    spec=_launch_spec,
+                    terminal_launch_args=_codex_terminal_args,
                 )
             # Read staleness before the fetch can start a background probe.
             # The fingerprint and probe must use this session's provider.
@@ -4896,7 +4905,9 @@ async def _auto_create_codex_terminal(
                 # Re-resolve so provider overrides cannot retain the old model.
                 # A failed probe permits fallback, but cannot retire the pick.
                 _codex_launch = resolve_native_codex_launch(
-                    model=unpinned_model, spec=_launch_spec
+                    model=unpinned_model,
+                    spec=_launch_spec,
+                    terminal_launch_args=_codex_terminal_args,
                 )
                 pick_to_reset = pick if fresh_rows else None
                 outcome = (

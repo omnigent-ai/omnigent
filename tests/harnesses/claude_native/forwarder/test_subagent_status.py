@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +31,7 @@ from tests.harnesses.claude_native.forwarder._support import (
 @pytest.mark.asyncio
 async def test_forwarder_ignores_subagent_stop_failure_hook(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A subagent's ``StopFailure`` must not flip the parent session failed.
@@ -44,6 +46,7 @@ async def test_forwarder_ignores_subagent_stop_failure_hook(
     ``failed`` is the only mapped status left, so this is the surviving
     subagent-skip case.)
     """
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -66,6 +69,7 @@ async def test_forwarder_ignores_subagent_stop_failure_hook(
             "hook_event_name": "StopFailure",
             "session_id": "subagent-session",
             "transcript_path": str(subagent_transcript),
+            "error": "server_error",
         },
     )
     # Parent turn fails — this SHOULD surface as the one failed edge.
@@ -105,10 +109,22 @@ async def test_forwarder_ignores_subagent_stop_failure_hook(
         server.server_close()
         thread.join(timeout=5.0)
 
+    context = first["body"]["data"].pop("failure_context")
+    assert context["native_session_id"] == "parent-session"
     assert first["body"] == {
         "type": "external_session_status",
         "data": {"status": "failed"},
     }
+    observations = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "native_failure_observed"
+    ]
+    assert len(observations) == 1
+    attrs = observations[0].attributes
+    assert attrs["native_session_id"] == "subagent-session"
+    assert attrs["native_parent_session_id"] == "parent-session"
+    assert attrs["native_error_category"] == "server_error"
+    assert attrs["failure_decision"] == "suppressed"
+    assert attrs["suppression_reason"] == "foreign_native_session_id"
 
 
 @pytest.mark.asyncio
@@ -262,6 +278,8 @@ async def test_forwarder_parent_stop_failure_not_affected_by_background_session_
         server.server_close()
         thread.join(timeout=5.0)
 
+    context = first["body"]["data"].pop("failure_context")
+    assert context["native_agent_role"] == "session_agent"
     assert first["body"] == {
         "type": "external_session_status",
         "data": {"status": "failed"},

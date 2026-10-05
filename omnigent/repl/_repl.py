@@ -3444,8 +3444,8 @@ async def run_repl(
         """
         Fire a background re-sync of session metadata from a snapshot.
 
-        Shared by the two triggers that can observe an in-place agent
-        switch: the ``session.agent_changed`` stream event (live, while
+        Shared by the two triggers that can observe an agent change: the
+        ``session.agent_changed`` stream event (live, while
         attached) and the turn-start catch-up in the ``running`` status
         branch. Both funnel into :func:`_refresh_session_metadata` so
         adapter state is always derived from a snapshot — never applied
@@ -5967,9 +5967,8 @@ async def _refresh_session_metadata(
     Fired in the background from two triggers. The session's bound
     agent — and with it ``llm_model`` / ``harness`` /
     ``context_window`` / ``model_override`` — can change between turns
-    when another client switches the agent in place
-    (``POST /v1/sessions/{id}/switch-agent``). The server publishes a
-    ``session.agent_changed`` stream event for the switch (the live
+    when another client edits it. The server publishes a
+    ``session.agent_changed`` stream event (the live
     trigger), but the event is transient SSE-only with no replay — one
     landing in a stream-pump reconnect gap or before this REPL attached
     is lost — so each turn start re-fires the refresh as the catch-up

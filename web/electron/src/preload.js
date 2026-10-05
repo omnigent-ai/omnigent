@@ -275,6 +275,23 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("browser-host-active-changed", listener);
   },
   /**
+   * Forward Ctrl+Tab, Control release, and Escape from the focused embedded
+   * Browser WebContents so the shell's recent-session switcher can own them.
+   * @param {(payload: Record<string, unknown>) => void} callback
+   * @returns {() => void}
+   */
+  onBrowserRecentSessionInput: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-recent-session-input", listener);
+    return () => ipcRenderer.removeListener("browser-recent-session-input", listener);
+  },
+  /** Enable native Ctrl+Tab forwarding only while this renderer supports it. */
+  browserSetRecentSessionSwitchSupported: (supported) =>
+    ipcRenderer.invoke("omnigent:browser-set-recent-session-switch-supported", { supported }),
+  /** Clear the native Ctrl+Tab latch when the renderer has no sessions to show. */
+  browserCancelRecentSessionSwitch: () =>
+    ipcRenderer.invoke("omnigent:browser-cancel-recent-session-switch"),
+  /**
    * Subscribe to browser-view creation (`{conversationId}`), fired the first
    * time a view is created — including detached (fresh conversation), which is
    * how the SPA learns to mount+attach it. Returns an unsubscribe.

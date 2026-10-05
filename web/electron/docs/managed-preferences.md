@@ -165,6 +165,27 @@ defaults delete ai.omnigent.desktop databricksInternalFeaturesEnabled
 
 For development, substitute `ai.omnigent.desktop-dev` in the commands above.
 A profile for `ai.omnigent.desktop` doesn't apply to local builds, so they can
-be tested on a machine that already has one.
+be tested on a machine that already has one. `just electron-mdm` manages the
+development values:
+
+```bash
+just electron-mdm set "https://omnigent.corp.example.com/?omnigentServerName=Engineering" --internal
+just electron-mdm import   # copy this Mac's managed values for the release app
+just electron-mdm show
+just electron-mdm clear
+```
+
+To test the onboarding flows with a local build:
+
+| Scenario                     | Commands                                                                        |
+| ---------------------------- | ------------------------------------------------------------------------------- |
+| New user, no managed servers | `just electron-mdm clear`, then `just electron-run --v2-flow --reset-state`     |
+| New user, managed servers    | `just electron-mdm set <url>`, then `just electron-run --v2-flow --reset-state` |
+| This Mac's managed setup     | `just electron-mdm import`, then `just electron-run --v2-flow --reset-state`    |
+| Returning user               | `just electron-run --v2-flow` after any of the above                            |
+
+`--reset-state` uninstalls the CLI and removes the local build's app data, so
+the next launch starts as a new user.
+
 Production deployment should use an MDM-forced preference rather than a local
 user default.

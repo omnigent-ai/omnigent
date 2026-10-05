@@ -25,6 +25,17 @@ implements them separately, so a fix for one harness does not reach the others.
 - `chat-render`: the harness's output renders in chat like other harnesses.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
+- `disconnect`: startup waits and active operations settle when their native
+  connection ends; reconnect can receive fresh events. Distinguish a native
+  CLI disconnect, a runner going offline, and a browser stream reconnect.
+
+- `launch-settings`: Settings → Harnesses → a configured Claude or Codex →
+  Settings (or its card's gear). Shows the selected host's binary, source, and
+  configured argument count, read-only. Argument and environment values stay
+  on the host. Workspace config can override these host defaults. Behind
+  `harness_settings_ui`; other harnesses keep their credential card only.
+
+- `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
 
 ## How to get to it (user POV)
 
@@ -34,6 +45,11 @@ view appear in the session.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Interrupted session:** observe startup before the first message, a running
+turn, and Stop separately. For an offline host use the reconnect paths in
+[sessions](./sessions.md); a detached terminal has its own paths in
+[terminals](./terminals.md).
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -67,6 +83,16 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   --output="$VERIFY_EVIDENCE/native-harnesses"
 ```
 
+**Launch settings (own environment):** enable `harness_settings_ui`, connect a
+host with Claude/Codex configured, and put a command and two args under
+`harness.claude-native` / `harness.codex-native` in its `~/.omnigent/config.yaml`.
+Open each harness through both its gear and card → Settings. Check the binary,
+source, count of two (no values), and credential. Select a second host on the
+grid and repeat. An older host shows an update message; an older server hides
+the extra fields. Resolver and raw-tunnel checks:
+`tests/host/test_harness_startup.py`,
+`tests/server/integration/test_host_tunnel_route.py::test_startup_http_through_real_tunnel`.
+
 Cross-harness journeys:
 
 - **`needs-auth`:**
@@ -85,6 +111,41 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
+  `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
+  consumers, buffered events, explicit close, and startup discovery without a
+  deadline. `tests/e2e/test_codex_native_app_server_disconnect_e2e.py` covers
+  pending requests, cancellation, and a reply arriving before disconnect.
+  Both use real loopback WebSockets with a controlled peer.
+  `tests/harnesses/codex_native/test_codex_native_app_server_event_stream.py` adds multiple waiting
+  consumers and reconnecting the same client to receive fresh events.
+- **`disconnect`, Codex startup consumers (component tests):**
+  `tests/harnesses/codex_native/session/test_subscription.py::test_wait_for_thread_started_fails_when_stream_ends`
+  checks the CLI error with a fake client;
+  `tests/runner/test_codex_startup_telemetry.py::test_startup_failure_is_visible_at_error_and_belongs_to_child`
+  checks host-started failure reporting with stubbed discovery. Run these with
+  plain `uv run pytest`. The ongoing chat forwarder also consumes native events;
+  these startup tests do not prove it stops or recovers after a live disconnect.
+- **`disconnect`, browser stream (own environment):**
+  `tests/e2e_ui/chat/test_stream_disconnect_stage_matrix.py::test_numbered_output_recovers_across_stream_stages`
+  checks output recovery across a real server restart and injected stream-open
+  failures. It supplies native-style events; it does not run a vendor CLI.
+  Run with plain `uv run pytest` and the browser prerequisites in the skill.
+
+- **`plugin-inventory` (component and host tests):**
+  `tests/e2e/test_host_plugins_e2e.py::test_host_plugin_inventory` starts a real
+  host against the test server and checks metadata and secret exclusion.
+  `tests/host/test_plugins.py`, `tests/server/routes/test_plugins.py`, and
+  `tests/server/integration/test_host_tunnel_route.py::test_host_tunnel_routes_plugins_result_to_future`.
+  Run `pnpm --dir web test src/hooks/useHarnessInventory.test.tsx src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  With `harness_settings_ui` enabled, open Settings → Harnesses, select the test
+  host and Claude Code, then Plugins. Verify name, version, marketplace, enabled
+  state, and hook/command labels from the host. Open a plugin, inspect its
+  description and Skills/MCPs tabs, then return with Plugins. Repeat via the
+  harness card's Settings gear and switch to Plugins. Installed disabled plugins
+  remain visible. For an older host (501) or server (404), verify that the
+  derived skill/MCP plugin listing still works; a 502 shows an inventory error.
+  Codex and Cursor keep their existing derived listings.
 
 ## Gotchas
 
@@ -100,5 +161,10 @@ Cross-harness journeys:
   Omnigent's managed setup; the managed and unmanaged paths behave differently.
 - The mock instance proves Omnigent's integration with Claude and Codex, not a
   live vendor model. A passing mock run is not evidence for another harness.
+- A transport check is not a full reconnect journey. To verify that claim,
+  use an isolated configured harness, interrupt only its test connection, then
+  resume and send another turn; check both terminal and chat for missing or
+  duplicate output. Record an unavailable live check explicitly. Codex checks
+  above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.

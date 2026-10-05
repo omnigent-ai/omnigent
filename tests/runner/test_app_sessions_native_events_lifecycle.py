@@ -6,7 +6,7 @@ import asyncio
 import logging
 import sys
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -23,7 +23,7 @@ from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.kiro_native import main as kiro_native
-from omnigent.runner import create_runner_app, subagent_work
+from omnigent.runner import create_runner_app, model_option_routes, subagent_work
 from omnigent.runner.resource_registry import (
     KIRO_NATIVE_TERMINAL_ROLE,
 )
@@ -962,8 +962,12 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
         return spec
 
     def resolve_launch(
-        *, model: str | None, spec: AgentSpec | None = None
+        *,
+        model: str | None,
+        spec: AgentSpec | None = None,
+        terminal_launch_args: Sequence[str] = (),
     ) -> codex.NativeCodexLaunch:
+        del terminal_launch_args
         if case == "invalid-config":
             raise RuntimeError("provider configuration unavailable")
         selected = spec.executor.auth.profile if spec is not None else "default"
@@ -1317,7 +1321,6 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     expiring — the second read joins it instead of restarting it.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
-    from omnigent.runner import app as runner_app_module
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
     monkeypatch.setattr(
@@ -1356,7 +1359,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.probe_claude_model_options", _slow_probe
     )
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 0.01)
+    monkeypatch.setattr(model_option_routes, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 0.01)
 
     async def _fake_auto_create(
         session_id: str,
@@ -1396,7 +1399,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         # The 0.01s wait above exists only to make the first read time out.
         # Keep it that tight here and a loaded machine answers 503 again
         # before the woken probe is even scheduled.
-        monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 5.0)
+        monkeypatch.setattr(model_option_routes, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 5.0)
         resolved = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
         cached = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
 
@@ -1504,7 +1507,9 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
-    monkeypatch.setattr("omnigent.runner.app._CLAUDE_MODEL_OPTIONS_CACHE_TTL_S", 0.0)
+    monkeypatch.setattr(
+        "omnigent.runner.model_option_routes._CLAUDE_MODEL_OPTIONS_CACHE_TTL_S", 0.0
+    )
     conv_id = "8c1f2e3d4a5b46c7d8e9f0a1b2c3d4e5"
     claude_spec = _harness_spec("claude-native")
 

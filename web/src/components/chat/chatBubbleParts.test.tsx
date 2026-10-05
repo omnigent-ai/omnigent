@@ -248,6 +248,21 @@ describe("AssistantBubble error retry", () => {
     });
   });
 
+  it("continues a dropped harness stream in place instead of resuming the runner", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
+    render(<BubbleView bubble={errorBubble("connection_error")} isLastAssistant />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_retry/events");
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+    });
+  });
+
   it("coalesces retry clicks from separate rate-limit cards in the same turn", async () => {
     let finishRetry: ((response: Response) => void) | undefined;
     fetchMock.mockImplementationOnce(
