@@ -27,6 +27,17 @@ slide to PDF, and a Source toggle back to the code view.
   whose author ignored it. The toolbar shows the kit name; an invalid kit shows
   a "Design kit not applied: reason" notice and the deck renders unbranded.
   Format and a copyable sample: `examples/design-kits/sample/README.md`.
+- `deck-design-system`: a pointer at `.omnigent/design-system.json` in the
+  workspace (`path`, `kind`, `name`, written by New design on the Design page)
+  replaces the kit. A skill-only system (`kind: "skill"`) only shows its name
+  in the toolbar. A full system (`kind: "full"`) injects the folder's
+  `colors_and_type.css` (tokens and fonts, `@import` stripped, no
+  `!important`) before the deck's own styles and rewrites `ds:<path>` in
+  `src`, `href`, and CSS `url()` to data URIs. Failures show "Design system
+  not applied: reason", a viewer who does not own the session sees "Design
+  system is only available to the session owner", and a session whose
+  sandbox cannot read the folder shows "Design system folder is not readable
+  from this session; import it". The deck then renders unbranded.
 
 ## How to get to it (user POV)
 
@@ -39,6 +50,10 @@ opens in the full-screen file viewer.
 **Design kit (any surface):** copy `examples/design-kits/sample` to
 `.omnigent/design-kit` at the workspace root (or have the agent write a kit
 there), then open or reopen a deck.
+
+**Design system (any surface):** choose one in the Design page's New design
+dialog, or write `.omnigent/design-system.json` by hand, then open or reopen a
+deck that references `ds:` assets.
 
 ## Driving it with the repro environment
 
@@ -64,6 +79,15 @@ doctor`) and the built web UI.
   background, fonts, and logo in the bottom-right corner of every slide, in
   fullscreen, and in the print preview. Change a color in `kit.json` to
   `"red;}"` and reopen the deck to see the notice.
+- Design system rules (pointer, `ds:` confinement and extensions, 2 MB per
+  asset and 20 MB per deck, CSS processing, owner and sandbox notices,
+  timeout), against the synthetic fixture in
+  `web/src/test/fixtures/design-system/`:
+  `cd web && pnpm exec vitest run src/lib/designSystem.test.ts src/lib/designSystemInjection.test.ts src/shell/deckBranding.test.ts src/shell/SlidesViewer.test.tsx`.
+- Design system by hand: write a pointer to a full design system folder on
+  the session's host, ask for a deck that uses `ds:assets/...` images, and
+  check the fonts, tokens, and images load. Open the same deck as a viewer
+  the session is shared with to see the owner-only notice.
 
 ## Gotchas
 
@@ -88,3 +112,9 @@ doctor`) and the built web UI.
   digits, `_`, `-`, `.`, `/`; no `..`, spaces, or URLs), each file at most 2 MB.
   Fonts without `src` must be installed on the viewer's machine.
 - The deck iframe has an opaque origin, so assets are inlined as data URIs.
+- Design-system files are read once per session while the viewer is open;
+  edits to the design system need the deck reopened. An absolute pointer reads
+  through the owner-only absolute file API, so only the owner sees full
+  branding, and a sandboxed session needs a read grant for the folder.
+- `ds:` paths use the same character rules as kit paths; remote `url()`
+  values in `colors_and_type.css` are dropped.

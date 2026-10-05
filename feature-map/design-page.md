@@ -25,6 +25,21 @@ and uses only the existing session, host filesystem, and file APIs.
 - `design-kit-indicator`: a group header shows the kit name when
   `.omnigent/design-kit/kit.json` parses, "No kit" (a link to the sample kit
   instructions) when there is none, or "Kit invalid" when it does not parse.
+  When the workspace has `.omnigent/design-system.json`, the header shows that
+  design system's name and kind ("Full" or "Skill-only") instead, or "Design
+  system invalid" when the pointer does not parse.
+- `design-system-field`: the New design dialog's Design system field offers
+  None, "Folder kit" (when the folder has a kit), recent design systems for
+  the host (kept in localStorage), and "Choose folder" (the host folder
+  picker). A folder with `_ds_manifest.json` is a full system, one with only
+  `SKILL.md` is skill-only, and anything else shows "Not a design system: no
+  SKILL.md or _ds_manifest.json". The default is the folder kit, else the
+  host's most recent system, else None. On create the dialog reads the name
+  (manifest `namespace`, else `SKILL.md` `name`, else the folder name) through
+  the new session, writes `.omnigent/design-system.json` through the existing
+  workspace file write, and adds "Follow the design system at `<path>`
+  (`<kind>`). Read its SKILL.md first." to the first message. The deck viewer
+  behavior is `deck-design-system` in `feature-map/slide-decks.md`.
 - `design-new`: the New design dialog takes a prompt, an agent (the last one
   used for a design, else the default), an online host, and a folder (the last
   one used on that host). It shows "Kit found" or "No kit" for the folder,
@@ -107,6 +122,16 @@ need the flag set.
 - Kit applied, by hand: copy `examples/design-kits/sample` to
   `.omnigent/design-kit` in a deck's workspace, choose Refresh, and check the
   header shows the kit name and the deck uses the kit's colors and logo.
+- Design system field and pointer write:
+  `cd web && pnpm exec vitest run src/pages/design/NewDesignDialog.test.tsx`;
+  header badges: `pnpm exec vitest run src/pages/DesignPage.test.tsx src/lib/designDeckApi.test.ts`.
+- Design system, by hand: make a folder on the host with a `SKILL.md`, a
+  `_ds_manifest.json` (`{"namespace": "My Brand"}`), a `colors_and_type.css`,
+  and an `assets/logo.svg`. In New design choose "Choose folder", pick it,
+  create, and check `.omnigent/design-system.json` appears in the design
+  folder, the first message names the folder, the header reads "My Brand"
+  with "Full", and the deck uses the tokens and the `ds:` logo. Pick a folder
+  without either marker to see the rejection.
 - Offline session, by hand: stop the runner of a session that has decks,
   choose Refresh, and check its group shows the Unavailable row and link.
 
@@ -128,3 +153,9 @@ need the flag set.
 - The changed-files event only arrives while the session's stream is bound;
   the studio keeps it bound even in Full mode and on the phone preview.
 - The flag is read at page boot; reload after changing `OMNIGENT_FEATURES`.
+- The host folder listing only names files, so a newly chosen design system
+  shows its folder name in the dialog until create resolves the real name.
+- Choosing None or "Folder kit" writes nothing, so a pointer left in that
+  folder by an earlier design still applies.
+- An external folder that only has a `kit.json` is not a design system; kits
+  stay in the design's own `.omnigent/design-kit/`.
