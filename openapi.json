@@ -7178,6 +7178,16 @@
             "title": "Host Resumable",
             "type": "boolean"
           },
+          "host_type": {
+            "default": "external",
+            "description": "Whether the bound host is external or a server-managed sandbox, including when the viewer cannot list that host.",
+            "enum": [
+              "external",
+              "managed"
+            ],
+            "title": "Host Type",
+            "type": "string"
+          },
           "id": {
             "description": "Unique session identifier (also the underlying conversation ID), e.g. `\"conv_abc123\"`.",
             "title": "Id",

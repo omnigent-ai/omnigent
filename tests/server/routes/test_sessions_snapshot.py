@@ -3023,3 +3023,28 @@ async def test_side_chat_fork_lost_trusts_only_a_host_verdict(
     assert (
         await orchestration._codex_side_chat_fork_lost(ordinary, store, router, registry) is False
     )  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("provider,expected", [(None, "external"), ("modal", "managed")])
+async def test_snapshot_exposes_host_type_without_sandbox_config(provider, expected):
+    from unittest.mock import Mock
+
+    session_id = "resume_host_type"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="agent",
+        host_id="host",
+    )
+    conv_store = _ConversationStore([], conversations={session_id: conv})
+    host_store = Mock()
+    host_store.get_host.return_value = SimpleNamespace(sandbox_provider=provider)
+    snapshot = await _get_session_snapshot(
+        conv_store,
+        session_id,
+        host_store=host_store,  # type: ignore[arg-type]
+    )
+    assert snapshot.host_type == expected
+    host_store.get_host.assert_called_once_with("host")

@@ -359,3 +359,40 @@ from the repo-root env:
 uv sync --extra slack --group dev
 uv run --no-sync omni integration slack
 ```
+
+### Continue an existing session
+
+Sign in with `/omnigent` as an Omnigent user with **edit access** to the
+conversation, then send `resume <session_id>` or `resume <Omnigent web URL>`
+in a DM, mention the bot with that command in a channel, or use
+`/omnigent resume <session_id>`. Reply in the resulting thread to continue;
+channel replies must mention the bot. Resume never sends the command as input.
+The bot posts up to four recent user/assistant messages (500 characters each)
+and an **Open in Omnigent** link. In channels, that recap is visible to channel
+members; use a DM for private conversations.
+
+The URL must match the bot's configured server and workspace. Missing,
+deleted, and inaccessible conversations receive the same unavailable message;
+archived conversations must first be unarchived in Omnigent. Anonymous and
+read-only access cannot resume sessions. No new agent/host configuration is
+needed after signing in.
+
+A session has one Slack binding. A conflicting command links the existing
+thread; `resume <id> --force` explicitly moves it to a new thread. It cannot
+replace another session or another Slack user's binding, or move an in-flight
+Slack turn. Repeating resume in its bound thread is harmless. Legacy duplicate
+bindings retain the newest row; displaced rows are preserved in SQLite's
+`thread_sessions_binding_backup` table for operator recovery.
+
+Busy sessions bind without submitting input or replaying their live output;
+finish the turn or answer pending questions in Omnigent before continuing.
+Stopped runners use the server's input-free `retry_session` recovery, bounded
+by a 60-second readiness timeout. If recovery fails, reconnect the original
+host (or inspect managed-host provisioning) in Omnigent and repeat resume in
+this thread. Host and workspace stay with the existing session.
+
+Claude, Codex, and Cursor native harness sessions can bind using the same path.
+Slack shows committed text, not terminal screen state; terminal-only controls
+and unsupported interactive prompts still require Omnigent. Local sessions
+without a recoverable host require their original runner to reconnect. A web
+**Continue in Slack** button is a follow-up and is not included here.

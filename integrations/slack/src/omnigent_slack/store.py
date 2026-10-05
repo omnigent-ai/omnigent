@@ -40,6 +40,7 @@ class SQLiteStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self._path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS thread_sessions (
@@ -85,7 +86,57 @@ class SQLiteStore:
                 """
             )
             await self._add_missing_columns(db)
+            await self._ensure_unique_bindings(db)
             await db.commit()
+
+    @staticmethod
+    async def _ensure_unique_bindings(db: aiosqlite.Connection) -> None:
+        cursor = await db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'thread_sessions_session_id'",
+        )
+        if await cursor.fetchone():
+            return
+        # Preserve displaced legacy bindings before enforcing one thread per session.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS thread_sessions_binding_backup (
+                backup_id INTEGER PRIMARY KEY,
+                team_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                thread_ts TEXT NOT NULL,
+                omnigent_session_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                owner_user_id TEXT,
+                host_id TEXT,
+                workspace TEXT,
+                host_type TEXT NOT NULL,
+                turn_inflight INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        columns = (
+            "team_id, channel_id, thread_ts, omnigent_session_id, title, "
+            "owner_user_id, host_id, workspace, host_type, turn_inflight, "
+            "created_at, updated_at"
+        )
+        duplicates = """rowid IN (
+            SELECT binding_rowid FROM (
+                SELECT rowid AS binding_rowid, ROW_NUMBER() OVER (
+                    PARTITION BY omnigent_session_id
+                    ORDER BY updated_at DESC, rowid DESC
+                ) AS binding_rank FROM thread_sessions
+            ) WHERE binding_rank > 1
+        )"""
+        await db.execute(
+            f"INSERT INTO thread_sessions_binding_backup ({columns}) "
+            f"SELECT {columns} FROM thread_sessions WHERE {duplicates}"
+        )
+        await db.execute(f"DELETE FROM thread_sessions WHERE {duplicates}")
+        await db.execute("""
+            CREATE UNIQUE INDEX thread_sessions_session_id
+            ON thread_sessions (omnigent_session_id)
+        """)
 
     @staticmethod
     async def _add_missing_columns(db: aiosqlite.Connection) -> None:
@@ -170,6 +221,107 @@ class SQLiteStore:
                     host_type,
                     now,
                     now,
+                ),
+            )
+            await db.commit()
+
+    async def session_binding(self, session_id: str) -> ThreadKey | None:
+        async with aiosqlite.connect(self._path) as db:
+            cursor = await db.execute(
+                "SELECT team_id, channel_id, thread_ts FROM thread_sessions "
+                "WHERE omnigent_session_id = ?",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+        return ThreadKey(*row) if row else None
+
+    async def bind_session(
+        self,
+        key: ThreadKey,
+        session_id: str,
+        title: str,
+        *,
+        owner_user_id: str,
+        host_id: str | None,
+        workspace: str | None,
+        host_type: HostType,
+        force: bool = False,
+    ) -> tuple[str, ThreadKey | None]:
+        """Atomically bind, refusing occupied destinations and conflicting owners."""
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT omnigent_session_id, owner_user_id FROM thread_sessions "
+                "WHERE team_id = ? AND channel_id = ? AND thread_ts = ?",
+                (key.team_id, key.channel_id, key.thread_ts),
+            )
+            destination = await cursor.fetchone()
+            if destination:
+                return (
+                    "same"
+                    if destination[0] == session_id and destination[1] == owner_user_id
+                    else "occupied"
+                ), None
+            cursor = await db.execute(
+                "SELECT team_id, channel_id, thread_ts, owner_user_id, turn_inflight "
+                "FROM thread_sessions WHERE omnigent_session_id = ?",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+            previous = ThreadKey(*row[:3]) if row else None
+            if row and (row[3] != owner_user_id or row[0] != key.team_id):
+                return "unavailable", None
+            if row and (not force or row[4]):
+                return "conflict", previous
+            await db.execute(
+                "DELETE FROM thread_sessions WHERE omnigent_session_id = ?",
+                (session_id,),
+            )
+            now = int(time.time())
+            await db.execute(
+                "INSERT INTO thread_sessions (team_id, channel_id, thread_ts, "
+                "omnigent_session_id, title, owner_user_id, host_id, workspace, "
+                "host_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    key.team_id,
+                    key.channel_id,
+                    key.thread_ts,
+                    session_id,
+                    title,
+                    owner_user_id,
+                    host_id,
+                    workspace,
+                    host_type,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+            return "bound", previous
+
+    async def refresh_session_metadata(
+        self,
+        key: ThreadKey,
+        session_id: str,
+        *,
+        host_id: str | None,
+        workspace: str | None,
+        host_type: HostType,
+    ) -> None:
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                "UPDATE thread_sessions SET host_id = ?, workspace = ?, host_type = ?, "
+                "updated_at = ? WHERE team_id = ? AND channel_id = ? AND thread_ts = ? "
+                "AND omnigent_session_id = ?",
+                (
+                    host_id,
+                    workspace,
+                    host_type,
+                    int(time.time()),
+                    key.team_id,
+                    key.channel_id,
+                    key.thread_ts,
+                    session_id,
                 ),
             )
             await db.commit()

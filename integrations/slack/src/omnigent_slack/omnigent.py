@@ -1089,6 +1089,54 @@ class OmnigentClient:
             return None
         return payload if isinstance(payload, dict) else None
 
+    async def resume_snapshot(self, session_id: str) -> dict[str, Any]:
+        """Read using the Slack user's delegated identity; never anonymous."""
+        if self._auth is None or not self._auth.access_token:
+            raise AuthRequiredError("Sign in with /omnigent before resuming a session.")
+        response = await self._request(
+            "GET",
+            f"/v1/sessions/{session_id}",
+            params={"include_items": "false", "include_usage": "false"},
+        )
+        if response.status_code in (403, 404):
+            raise OmnigentError(
+                "Session unavailable. Check the ID and server, and sign in as a user "
+                "with access; the session may have been deleted."
+            )
+        await _raise_for_status(response)
+        snapshot = response.json()
+        if not isinstance(snapshot, dict) or (snapshot.get("permission_level") or 0) < 2:
+            raise OmnigentError("Session unavailable. Ask its owner for edit access.")
+        if snapshot.get("archived"):
+            raise OmnigentError("Unarchive this session in Omnigent before resuming it.")
+        return snapshot
+
+    async def recent_messages(self, session_id: str) -> list[dict[str, Any]]:
+        payload = await self._get_json(
+            f"/v1/sessions/{session_id}/items",
+            params={"limit": 20, "order": "desc"},
+        )
+        data = payload.get("data") if payload else None
+        return (
+            [item for item in reversed(data) if isinstance(item, dict)]
+            if isinstance(data, list)
+            else []
+        )
+
+    async def recover_session(self, session_id: str) -> dict[str, Any]:
+        async with asyncio.timeout(self._runner_launch_timeout_seconds):
+            response = await self._request(
+                "POST",
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "retry_session"},
+            )
+            await _raise_for_status(response)
+            while True:
+                snapshot = await self.resume_snapshot(session_id)
+                if snapshot.get("runner_online") is True:
+                    return snapshot
+                await asyncio.sleep(1)
+
     async def get_session_activity(self, session_id: str) -> SessionActivity:
         """Snapshot of whether the SERVER considers this session busy.
 
