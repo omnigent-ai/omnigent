@@ -719,7 +719,7 @@ function lastBodyCloseIndex(doc: string): number {
  * them, so the deck's own rules still apply.
  */
 export function prepareSlidesDoc(html: string, kitStyle = "", systemStyle = ""): string {
-  return injectSlides(html, systemStyle, SLIDES_STYLE + kitStyle + SLIDES_SCRIPT);
+  return injectDesignDoc(html, systemStyle, SLIDES_STYLE + kitStyle + SLIDES_SCRIPT);
 }
 
 /**
@@ -727,10 +727,11 @@ export function prepareSlidesDoc(html: string, kitStyle = "", systemStyle = ""):
  * with its own navigation script instead of the frame script.
  */
 export function prepareSlidesExport(html: string, kitStyle = "", systemStyle = ""): string {
-  return injectSlides(html, systemStyle, SLIDES_EXPORT_STYLE + kitStyle + SLIDES_EXPORT_SCRIPT);
+  return injectDesignDoc(html, systemStyle, SLIDES_EXPORT_STYLE + kitStyle + SLIDES_EXPORT_SCRIPT);
 }
 
-function injectSlides(html: string, systemStyle: string, injection: string): string {
+/** The preview doc with `systemStyle` right after its `<base>` and `injection` before `</body>`. */
+export function injectDesignDoc(html: string, systemStyle: string, injection: string): string {
   let doc = prepareHtmlPreviewDoc(html);
   if (systemStyle) {
     const at = Math.max(startTagEnd(doc, "head"), 0) + HTML_PREVIEW_HEAD.length;
