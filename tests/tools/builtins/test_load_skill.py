@@ -365,6 +365,24 @@ def test_slide_decks_workflow_writes_one_slide_per_edit(tool_ctx: ToolContext) -
     assert "never leave unclosed tags between edits" in workflow
 
 
+def test_slide_decks_explains_using_a_design_system(tool_ctx: ToolContext) -> None:
+    """A design system section says what to read, what to copy, and how to reference assets."""
+    content = LoadSkillTool([], skills_filter="none").invoke(
+        json.dumps({"name": "slide-decks"}), tool_ctx
+    )
+    section = content.split("## Using a design system", 1)[1].split("\n## ", 1)[0]
+    flat = " ".join(section.split())
+
+    for name in ("SKILL.md", "README.md", "_ds_manifest.json", "templates/"):
+        assert name in flat
+    assert "drop `<deck-stage>`" in flat
+    assert "directly in `<body>`" in flat
+    assert "`ds:<path relative to the design system>`" in flat
+    assert "Never embed base64 copies" in flat
+    assert "`uploads/`, `ui_kits/`, and `preview/`" in flat
+    assert ".omnigent/design-system.json" in flat
+
+
 def test_bundled_skill_wins_over_framework_skill(tool_ctx: ToolContext) -> None:
     """A bundled skill of the same name replaces the framework copy, no duplicate."""
     own = SkillSpec(name="slide-decks", description="Mine.", content="Mine.")
