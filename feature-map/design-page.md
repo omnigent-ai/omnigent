@@ -5,8 +5,9 @@ shows every `*.slides.html` deck found in the workspaces of the 50 most recent
 top-level sessions as cards grouped by workspace, lets the user ask for a new
 deck without leaving the page, and opens any deck in a studio: the session's
 compact chat beside a live preview that updates as the agent writes. It is
-behind the default-off `design` release feature (`OMNIGENT_FEATURES=design`)
-and uses only the existing session, host filesystem, and file APIs.
+behind the default-off `design` release feature (`OMNIGENT_FEATURES=design`).
+Deck reads use the existing session, host filesystem, and file APIs; the
+server deck index (`GET /v1/design/artifacts`) lists decks across sessions.
 
 ## Sub-features
 
@@ -17,6 +18,16 @@ and uses only the existing session, host filesystem, and file APIs.
   workspace labelled with the session's project name or the folder name. A card
   shows the deck name, its path, and the session title. Decks under
   `.worktrees/` or `node_modules/` are left out.
+- `design-index`: the server records every `*.slides.html` and
+  `*.wireframe.html` written through `sys_os_write`, `sys_os_edit`, the file
+  PUT/PATCH/DELETE routes, or a native harness file tool. The landing lists
+  decks from it, scans only sessions whose runner or host is live, and sends
+  each successful scan to `PUT /v1/sessions/{id}/design-artifacts`. Decks of
+  offline sessions show under an "Unavailable" row; a deck read that returns
+  404 drops it from the index. An older server (404) falls back to the scan.
+  Covered by `tests/server/routes/test_design_artifacts.py`,
+  `tests/stores/test_design_artifacts.py`, and
+  `tests/server/routes/test_sessions_runner_relay.py::test_relay_indexes_design_artifact_changes`.
 - `design-search`: the search box filters cards by deck name, workspace label,
   or session title; nothing matching shows "No designs match".
 - `design-suggestions`: "Pitch deck from my notes", "Weekly status update", and
@@ -144,7 +155,8 @@ need the flag set.
 ## Gotchas
 
 - Only the 50 most recent top-level, non-archived sessions are scanned; decks
-  only in older sessions do not appear.
+  only in older sessions appear only once the index has them. Shell writes and
+  edits made outside the agent reach the index only through a later scan.
 - Sessions without a workspace path are skipped. Several sessions in one
   workspace make one group, read through the most recent of them, so a card
   opens that session's studio.
