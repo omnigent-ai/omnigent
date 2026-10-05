@@ -39,10 +39,10 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
+import { TemplateNameInput } from "@/components/scheduled/TemplateNameInput";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import {
   acceptsApprovalSkippingModes,
@@ -1562,18 +1562,15 @@ export function CreateScheduledTaskDialog({
                 ? "Edit automation"
                 : "New automation"}
           </DialogTitle>
-          <Input
+          <TemplateNameInput
             id="task-name"
             value={name}
-            placeholder="Open PR Rebase - {{YYYY-MM-DD}}"
+            placeholder="Name your automation"
             aria-label="Automation title"
             data-testid="task-name-input"
             className="h-8 border-0 px-0 py-0 pr-10 font-heading text-[1.25em] leading-[32px] font-[600] focus-visible:border-transparent focus-visible:ring-0 md:text-[1.25em]"
             onChange={(event) => setName(event.target.value)}
           />
-          <p className="text-sm text-muted-foreground">
-            {"Add {{YYYY-MM-DD}} or {{MMM DD}} to put each run's date in its session name."}
-          </p>
           <DialogDescription className="sr-only">
             {triggerMode
               ? "Starts an agent session for each matching item."
