@@ -12,8 +12,11 @@ from __future__ import annotations
 import logging
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
+from contextlib import suppress
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 from filelock import Timeout as FileLockTimeout
@@ -46,6 +49,10 @@ _PR_TITLE_LOOKUP_SECONDS = 2.0
 _PR_TITLE_REQUEST_SECONDS = 8.0
 # A git config key that pins a workspace to one provider id.
 _PROVIDER_CONFIG_KEY = "omnigent.gitprovider"
+
+_DISCOVERY_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-discovery")
+_DISCOVERY_LOCK = Lock()
+_DISCOVERY_JOBS: dict[tuple[str, str, str | None], Future[dict[str, Any]]] = {}
 
 
 @dataclass(frozen=True)
@@ -335,6 +342,62 @@ def _session_prs_with_titles(
     ]
 
 
+def _associate_discovered_pr(
+    root: str, registry: SessionPrRegistry, candidate: dict[str, Any], timestamp: float
+) -> None:
+    pr = candidate.get("pr")
+    if isinstance(pr, dict) and isinstance(pr.get("url"), str):
+        try:
+            inferred = PullRequestRef.from_url(pr["url"])
+            if inferred.provider != candidate.get("provider"):
+                raise ValueError("Discovery returned a different provider's pull request")
+            registry.record(
+                [inferred], relationship="inferred", source="branch", timestamp=timestamp
+            )
+            if any(entry.url == inferred.url for entry in registry.list()):
+                candidate["selected_pr_url"] = inferred.url
+                try:
+                    facet = _facet(inferred.provider)
+                    if facet is not None:
+                        facet.on_inferred_pr(root, inferred)
+                    title = _pr_title(pr)
+                    if title is not None:
+                        registry.update_titles({inferred.url: title})
+                except Exception:  # noqa: BLE001 — metadata cannot undo a valid association
+                    _logger.warning("Could not cache discovered PR metadata", exc_info=True)
+            else:
+                candidate["pr"] = None
+        except Exception:  # noqa: BLE001 — failed optional inference preserves selected PRs
+            _logger.warning("Could not associate discovered pull request", exc_info=True)
+            candidate["pr"] = None
+            candidate.setdefault("warnings", []).append("Could not associate this pull request.")
+
+
+def _background_discovery(
+    root: str, session_id: str, resolution: ProviderResolution
+) -> Future[dict[str, Any]]:
+    """Share in-flight discovery across polls; persist results for the next poll."""
+    key = (root, session_id, resolution.provider)
+
+    def discover() -> dict[str, Any]:
+        candidate = _discovery_info(root, resolution)
+        _associate_discovered_pr(root, SessionPrRegistry(session_id), candidate, time.time())
+        return candidate
+
+    def finished(_future: Future[dict[str, Any]]) -> None:
+        with _DISCOVERY_LOCK:
+            _DISCOVERY_JOBS.pop(key, None)
+
+    with _DISCOVERY_LOCK:
+        existing = _DISCOVERY_JOBS.get(key)
+        if existing is not None:
+            return existing
+        future = _DISCOVERY_POOL.submit(discover)
+        _DISCOVERY_JOBS[key] = future
+    future.add_done_callback(finished)
+    return future
+
+
 def pr_info(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
@@ -371,51 +434,32 @@ def pr_info(
     if not resolutions:
         assert reference is not None
         info = _reference_info(root, reference)
-    elif len(resolutions) == 1 and reference is None:
+    elif reference is not None:
+        pending = [_background_discovery(root, session_id, value) for value in resolutions]
+        info = _reference_info(root, reference)
+        # Collect quick results; slow forges will appear on a subsequent poll.
+        deadline = time.monotonic() + 0.1
+        for future in pending:
+            with suppress(FutureTimeout):
+                discovered.append(future.result(timeout=max(0, deadline - time.monotonic())))
+    elif len(resolutions) == 1:
         discovered = [_discovery_info(root, resolutions[0])]
         info = discovered[0]
     else:
         # Each provider enforces its request budget; unrelated forges run concurrently.
-        with ThreadPoolExecutor(max_workers=min(4, len(resolutions) + bool(reference))) as pool:
-            selected = pool.submit(_reference_info, root, reference) if reference else None
+        with ThreadPoolExecutor(max_workers=min(4, len(resolutions))) as pool:
             discovered = list(pool.map(lambda value: _discovery_info(root, value), resolutions))
-            info = selected.result() if selected else discovered[0]
-    discovered_at = time.time()
-    for candidate in discovered:
-        pr = candidate.get("pr")
-        if isinstance(pr, dict) and isinstance(pr.get("url"), str):
-            try:
-                inferred = PullRequestRef.from_url(pr["url"])
-                if inferred.provider != candidate.get("provider"):
-                    raise ValueError("Discovery returned a different provider's pull request")
-                registry.record(
-                    [inferred], relationship="inferred", source="branch", timestamp=discovered_at
-                )
-                if any(entry.url == inferred.url for entry in registry.list()):
-                    candidate["selected_pr_url"] = inferred.url
-                    try:
-                        facet = _facet(inferred.provider)
-                        if facet is not None:
-                            facet.on_inferred_pr(root, inferred)
-                        title = _pr_title(pr)
-                        if title is not None:
-                            registry.update_titles({inferred.url: title})
-                    except Exception:  # noqa: BLE001 — metadata cannot undo a valid association
-                        _logger.warning("Could not cache discovered PR metadata", exc_info=True)
-                else:
-                    candidate["pr"] = None
-            except Exception:  # noqa: BLE001 — failed optional inference preserves selected PRs
-                _logger.warning("Could not associate discovered pull request", exc_info=True)
-                candidate["pr"] = None
-                candidate.setdefault("warnings", []).append(
-                    "Could not associate this pull request."
-                )
+            info = discovered[0]
+    if reference is None:
+        discovered_at = time.time()
+        for candidate in discovered:
+            _associate_discovered_pr(root, registry, candidate, discovered_at)
     entries = registry.list()
     if reference is None:
         info = next((candidate for candidate in discovered if candidate.get("pr")), info)
     for candidate in discovered:
         if candidate is not info:
-            info.setdefault("warnings", []).extend(candidate.get("warnings", []))
+            info.setdefault("discovery_warnings", []).extend(candidate.get("warnings", []))
     info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
     info["tracking_available"] = True
     provider_id = info.get("provider")

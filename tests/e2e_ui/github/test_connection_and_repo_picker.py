@@ -142,13 +142,13 @@ def test_github_alternate_entry_points(
     page.goto(f"{base_url}/c/{session_id}")
     if mobile:
         page.get_by_role("button", name=re.compile(r"^(Conversation|Session) actions$")).click()
-        page.get_by_role("menuitem", name=re.compile(r"(?:GitHub|Pull Requests)$")).click()
+        page.get_by_role("menuitem", name=re.compile(r"Pull Requests$")).click()
         panel = page.get_by_test_id("github-panel-drawer")
         expect(panel).to_have_attribute("data-state", "open")
     else:
         open_right_rail(page)
         panel = page.get_by_role("complementary", name="Workspace")
-        tab = panel.get_by_role("tab", name=re.compile(r"^(GitHub|Pull Requests)$"))
+        tab = panel.get_by_role("tab", name="Pull Requests", exact=True)
         shortcut = tab.get_attribute("aria-keyshortcuts")
         assert shortcut
         panel.get_by_role("tab", name="Files", exact=True).focus()

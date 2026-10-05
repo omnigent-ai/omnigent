@@ -191,7 +191,10 @@ function GithubAccountSelector({
         onValueChange={(login) => setPref.mutate({ account: login, pr_url: info.selected_pr_url })}
         disabled={setPref.isPending}
       >
-        <SelectTrigger aria-label="GitHub account" className="h-8 w-full text-ui">
+        <SelectTrigger
+          aria-label={`${gitProviderCopy(info.provider, info.auth.hint, info.provider_display).label} account`}
+          className="h-8 w-full text-ui"
+        >
           <SelectValue placeholder="Account" />
         </SelectTrigger>
         <SelectContent>
@@ -1109,12 +1112,12 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
       {showTrackingControls && (linking || update.isError) && (
         <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
       )}
-      {info.data?.warnings?.length ? (
+      {info.data?.warnings?.length || info.data?.discovery_warnings?.length ? (
         <p
           role="status"
           className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
         >
-          {info.data.warnings.join(" ")}
+          {[...(info.data?.warnings ?? []), ...(info.data?.discovery_warnings ?? [])].join(" ")}
         </p>
       ) : null}
       <div className="min-h-0 flex-1">

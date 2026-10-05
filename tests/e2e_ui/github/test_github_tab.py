@@ -423,3 +423,30 @@ def test_github_tab_prompts_to_update_outdated_host(
     )
     # The hint names the version floor so the user knows what to update to.
     expect(rail.get_by_text(re.compile(r"0\.13\.0 or later"))).to_be_visible()
+
+
+def test_no_pr_keeps_linking_when_another_provider_discovery_fails(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A secondary remote's warning leaves the GitHub empty state actionable."""
+    base_url, session_id = seeded_session
+    page.route(
+        re.compile(r"/resources/github(?:\?|$)"),
+        lambda route: route.fulfill(
+            json={
+                **_INFO,
+                "pr": None,
+                "prs": [],
+                "tracking_available": True,
+                "discovery_warnings": ["GitLab discovery failed. Refresh to retry."],
+            }
+        ),
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name="Pull Requests").click()
+    expect(rail.get_by_text("No open PR for", exact=False)).to_be_visible(timeout=30_000)
+    expect(rail.get_by_role("status")).to_have_text("GitLab discovery failed. Refresh to retry.")
+    rail.get_by_role("button", name="Link a PR", exact=True).click()
+    expect(rail.get_by_role("textbox", name="Pull request URL")).to_be_visible()

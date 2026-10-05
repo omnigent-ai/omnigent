@@ -371,6 +371,18 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText(/No open PR for/)).not.toBeInTheDocument();
   });
 
+  it("keeps the no-PR state and linking available when another provider fails", () => {
+    state.info!.data!.pr = null;
+    state.info!.data!.tracking_available = true;
+    state.info!.data!.discovery_warnings = ["GitLab discovery failed. Refresh to retry."];
+    renderPanel();
+
+    expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("GitLab discovery failed.");
+    expect(screen.queryByText("Pull requests aren’t available.")).not.toBeInTheDocument();
+  });
+
   it("reveals the stacked diff after switching to the Changes tab", async () => {
     renderPanel();
     expect(screen.queryByTestId("diff")).toBeNull();
@@ -583,6 +595,38 @@ describe("PullRequestPanel", () => {
     } else {
       expect(account).toBeNull();
     }
+  });
+
+  it("names an extensible provider's account selector", () => {
+    const info = state.info!.data!;
+    info.repo = null;
+    info.provider = "forge";
+    info.provider_display = {
+      id: "forge",
+      display_name: "Example Forge",
+      request_name: "pull request",
+      number_prefix: "#",
+    };
+    info.auth = {
+      authenticated: true,
+      cli: { name: "forge", available: true },
+      hint: null,
+      accounts: ["personal", "work"].map((login) => ({
+        login,
+        active: login === "personal",
+        state: "success",
+        host: "forge.example.test",
+      })),
+      selected_account: "personal",
+    };
+    info.capabilities = {
+      account_switching: true,
+      base_remote_selection: false,
+      line_counts: true,
+      linked_pr_diff: true,
+    };
+    renderPanel();
+    expect(screen.getByRole("combobox", { name: "Example Forge account" })).toBeInTheDocument();
   });
 
   it("hides the account selector when the provider can't switch accounts", () => {

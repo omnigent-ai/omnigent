@@ -133,7 +133,7 @@ export interface PullRequestCapabilities {
  *  - `host_outdated` — the host predates the `/resources/github` route and
  *    404s "Resource 'github' not found"; synthesized in {@link fetchPullRequestInfo}. */
 export type PullRequestUnavailableReason =
-  "not_a_git_repo" | "no_os_env" | "unsupported_remote" | "host_outdated";
+  "not_a_git_repo" | "no_os_env" | "unsupported_remote" | "provider_unavailable" | "host_outdated";
 
 export interface PullRequestAssociation {
   url: string;
@@ -167,6 +167,8 @@ export interface PullRequestInfo {
   provider?: string | null;
   provider_display?: GitProviderDisplay | null;
   warnings?: string[];
+  /** Failures on other remotes do not change the selected provider’s state. */
+  discovery_warnings?: string[];
   auth?: PullRequestAuth;
   capabilities?: PullRequestCapabilities;
   /** Whether the `gh` CLI is present on the host.
@@ -441,13 +443,8 @@ async function postPullRequestPreference(
 }
 
 /**
- * Apply the panel's account / base-repo selection for a session.
- *
- * The runner persists the choice (`gh repo set-default` for the base repo; a
- * per-repo account preference in the user config) and returns the refreshed
- * info, which we seed straight into the `github-info` cache. Because a different
- * account/base can resolve a different PR, the PR-derived queries (changed files,
- * whole-PR diff) are invalidated so they refetch. Requires the runner online.
+ * Save the account / base-repo selection through the runner or host fallback,
+ * update the info cache, and invalidate the selected PR's files and diff.
  */
 export function useSetPullRequestPreference(conversationId: string | undefined) {
   const queryClient = useQueryClient();

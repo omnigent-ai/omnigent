@@ -342,6 +342,22 @@ def test_a_remote_whose_provider_has_no_facet_is_skipped(repo: Path) -> None:
     assert pr_resource.resolve_provider(str(repo)) == ProviderResolution("github", FORGE_HOST)
 
 
+def test_attaching_without_a_facet_preserves_the_registry(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    register_provider(_ForgeWithoutFacet())
+    url = f"https://{FORGE_HOST}/o/r/pull/7"
+    monkeypatch.setattr(
+        _ForgeWithoutFacet,
+        "parse_pr_url",
+        lambda *_: ParsedPullRequest("forge", FORGE_HOST, "o/r", 7, url),
+    )
+    registry = SessionPrRegistry("no-facet")
+    with pytest.raises(ValueError, match="Forge pull requests are not supported"):
+        pr_resource.update_session_pr(str(repo), "no-facet", url, "attach")
+    assert registry.list() == []
+
+
 def test_git_config_provider_wins_over_remote_matching(repo: Path) -> None:
     _git(repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
     _git(repo, "config", "omnigent.gitprovider", "Example_Forge")

@@ -13,8 +13,9 @@ import subprocess
 import sys
 import types
 from collections.abc import Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -223,6 +224,10 @@ def facet(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[FakeGitLa
     reset_for_tests()
     register_provider(FakeGitLab())
     yield fake
+    with pr_resource._DISCOVERY_LOCK:
+        pending = list(pr_resource._DISCOVERY_JOBS.values())
+    for future in pending:
+        future.result(timeout=budget(5))
     reset_for_tests()
 
 
@@ -590,8 +595,6 @@ def test_tracked_provider_does_not_stop_discovery_or_lose_selection_on_failure(
     assert {pr["url"] for pr in info["prs"]} == ({selected} if failure else {selected, MR})
     assert SessionPrRegistry("mixed-discovery").list()[0].relationship == relationship
     assert pr_resource.pr_info(repo, session_id="mixed-discovery")["selected_pr_url"] == selected
-    if failure:
-        assert any("discovery failed" in warning for warning in info["warnings"])
 
 
 def test_failing_tracked_provider_keeps_newly_discovered_provider_selectable(
@@ -634,3 +637,84 @@ def test_optional_inferred_metadata_failure_preserves_pr(
     assert info["pr"]["url"] == MR
     assert info["selected_pr_url"] == MR
     assert [pr["url"] for pr in info["prs"]] == [MR]
+
+
+def test_other_provider_warnings_do_not_override_a_successful_empty_lookup(
+    facet: FakeGitLabFacet, repo: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subprocess.run(
+        ["git", "remote", "add", "mirror", "https://github.com/example/project.git"],
+        cwd=repo,
+        check=True,
+    )
+    github = provider_registry.load_facet("github", "pull_requests")
+
+    def unavailable(_root):
+        raise RuntimeError("Forge offline")
+
+    monkeypatch.setattr(github, "workspace_info", unavailable)
+    info = pr_resource.pr_info(repo, session_id="empty-with-failed-mirror")
+    assert info["available"] and info["pr"] is None
+    assert not info.get("warnings")
+    assert any("discovery failed" in warning for warning in info["discovery_warnings"])
+
+
+@pytest.mark.parametrize("remove_during_discovery", [False, True])
+def test_tracked_pr_does_not_wait_for_discovery_and_later_includes_its_result(
+    facet: FakeGitLabFacet,
+    repo: str,
+    monkeypatch: pytest.MonkeyPatch,
+    remove_during_discovery: bool,
+) -> None:
+    selected = "https://github.com/example/project/pull/42"
+    registry = SessionPrRegistry("slow-discovery")
+    registry.record([PullRequestRef.from_url(selected)], relationship="attached", source="user")
+    github = provider_registry.load_facet("github", "pull_requests")
+    monkeypatch.setattr(
+        github,
+        "reference_info",
+        lambda _root, ref: {
+            "provider": "github",
+            "selected_pr_url": ref.url,
+            "pr": {"url": ref.url, "title": "Selected GitHub PR"},
+        },
+    )
+    monkeypatch.setattr(github, "titles_available", lambda _: False)
+    started, release = Event(), Event()
+    calls = []
+    original = facet.workspace_info
+
+    def slow_info(root):
+        calls.append(root)
+        started.set()
+        assert release.wait(budget(5))
+        return original(root)
+
+    facet.branch_pr = MR
+    monkeypatch.setattr(facet, "workspace_info", slow_info)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(pr_resource.pr_info, repo, session_id="slow-discovery")
+        try:
+            assert started.wait(budget(1))
+            with pr_resource._DISCOVERY_LOCK:
+                discovery_jobs = list(pr_resource._DISCOVERY_JOBS.values())
+            info = pending.result(timeout=budget(1))
+            assert info["selected_pr_url"] == selected
+            assert [pr["url"] for pr in info["prs"]] == [selected]
+            assert (
+                pr_resource.pr_info(repo, session_id="slow-discovery")["selected_pr_url"]
+                == selected
+            )
+            assert calls == [repo]
+            if remove_during_discovery:
+                registry.remove(MR)
+        finally:
+            release.set()
+            pending.result(timeout=budget(5))
+    for future in discovery_jobs:
+        future.result(timeout=budget(2))
+    info = pr_resource.pr_info(repo, session_id="slow-discovery")
+    assert info["selected_pr_url"] == selected
+    assert {pr["url"] for pr in info["prs"]} == (
+        {selected} if remove_during_discovery else {selected, MR}
+    )
