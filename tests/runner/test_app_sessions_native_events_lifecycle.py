@@ -929,6 +929,130 @@ async def test_codex_native_model_options_query_model_list(
 
 
 @pytest.mark.asyncio
+async def test_codex_native_model_options_stalled_model_list_fails_retryably(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Page one served, page two never answered: the route still ends in a
+    retryable 503 within its budget and schedules no write-back of partial rows.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import native_controls as native_controls_module
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        native_controls_module, "_CODEX_NATIVE_MODEL_OPTIONS_TIMEOUT_S", 0.5
+    )
+    conv_id = "5b1e6d0c9f3a4e7b8c2d1f0a9e8b7c6d"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    async def _fake_auto_create_codex(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_codex_main",
+            type="terminal",
+            session_id=session_id,
+            name="codex:main",
+            metadata={"terminal_name": "codex", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _fake_auto_create_codex,
+    )
+    codex_native_bridge.write_bridge_state(
+        codex_native_bridge.bridge_dir_for_bridge_id(conv_id),
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+            active_turn_id=None,
+        ),
+    )
+
+    class _StallingAfterFirstPage(_RecordingCodexAppServerClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            self.requests.append((method, params))
+            if params.get("cursor") is None:
+                return {
+                    "result": {
+                        "data": [{"id": "gpt-5.5", "isDefault": True}],
+                        "nextCursor": "next-page",
+                    }
+                }
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    fake_client = _StallingAfterFirstPage(
+        transport="ws://127.0.0.1:43210",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        assert (transport, client_name) == (fake_client.transport, fake_client.client_name)
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _fake_client_for_transport,
+    )
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return codex_native_spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        try:
+            resp = await asyncio.wait_for(
+                client.get(f"/v1/sessions/{conv_id}/codex-model-options"), timeout=10
+            )
+        except TimeoutError:
+            pytest.fail("codex-model-options stayed pending while model/list stalled")
+        write_backs = [
+            task
+            for task in asyncio.all_tasks()
+            if getattr(task.get_coro(), "__name__", "") == "_write_back_codex_catalog"
+        ]
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "codex_native_model_options_failed"
+    assert [method for method, _params in fake_client.requests] == ["model/list", "model/list"]
+    assert fake_client.closed
+    assert write_backs == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["default", "other", "missing-spec", "invalid-config"])
 async def test_codex_model_catalog_writeback_uses_session_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str

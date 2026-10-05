@@ -93,6 +93,12 @@ _CODEX_POPUP_RENDER_S = 0.7
 _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 
 
+# Bound the live, account-aware catalog refresh for an already-running Codex
+# app-server. A timeout keeps the picker retryable and prevents partial rows
+# from being written back to the shared catalog.
+_CODEX_NATIVE_MODEL_OPTIONS_TIMEOUT_S = 5.0
+
+
 # Budget for the /permissions popup to render its option rows before we read
 # them to find the target preset's menu digit. The popup can be slow to draw
 # mid-session (a busy TUI, MCP still starting), so give it room; if it still
@@ -528,7 +534,10 @@ def build_native_controls(
         )
         try:
             await codex_client.connect()
-            rows = await list_codex_model_options(codex_client)
+            rows = await list_codex_model_options(
+                codex_client,
+                timeout_s=_CODEX_NATIVE_MODEL_OPTIONS_TIMEOUT_S,
+            )
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()

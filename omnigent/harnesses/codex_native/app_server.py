@@ -1115,46 +1115,55 @@ def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -
     )
 
 
-async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonObject]:
+async def list_codex_model_options(
+    client: CodexAppServerClient,
+    *,
+    timeout_s: float | None = None,
+) -> list[_JsonObject]:
     """Read every visible model from an initialized Codex app-server client.
 
     :param client: Connected Codex app-server client.
+    :param timeout_s: Optional end-to-end budget for all paginated
+        ``model/list`` requests. A timeout discards partial rows so callers
+        never mistake an incomplete account-aware catalog for the full list.
     :returns: Raw ``model/list`` rows in Codex preference order.
+    :raises TimeoutError: When ``timeout_s`` expires before pagination completes.
     :raises ValueError: When Codex returns a malformed response.
     """
     options: list[_JsonObject] = []
     cursor: str | None = None
     include_hidden_supported = True
-    while True:
-        params: CodexParams = {"includeHidden": False} if include_hidden_supported else {}
-        if cursor is not None:
-            params["cursor"] = cursor
-        try:
-            response = await client.request("model/list", params)
-        except CodexAppServerResponseError as exc:
-            if not include_hidden_supported or not _codex_rejects_request_field(
-                exc, "includeHidden"
-            ):
-                raise
-            # Older servers list visible models by default but reject this field.
-            include_hidden_supported = False
-            continue
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise ValueError("Codex model/list result must be an object")
-        data = result.get("data")
-        if not isinstance(data, list):
-            raise ValueError("Codex model/list data must be a list")
-        for raw_model in data:
-            if not isinstance(raw_model, dict):
-                raise ValueError("Codex model/list item must be an object")
-            options.append(raw_model)
-        next_cursor = result.get("nextCursor")
-        if next_cursor is None:
-            return options
-        if not isinstance(next_cursor, str) or not next_cursor:
-            raise ValueError("Codex model/list nextCursor must be a string or null")
-        cursor = next_cursor
+    async with asyncio.timeout(timeout_s):
+        while True:
+            params: CodexParams = {"includeHidden": False} if include_hidden_supported else {}
+            if cursor is not None:
+                params["cursor"] = cursor
+            try:
+                response = await client.request("model/list", params)
+            except CodexAppServerResponseError as exc:
+                if not include_hidden_supported or not _codex_rejects_request_field(
+                    exc, "includeHidden"
+                ):
+                    raise
+                # Older servers list visible models by default but reject this field.
+                include_hidden_supported = False
+                continue
+            result = response.get("result")
+            if not isinstance(result, dict):
+                raise ValueError("Codex model/list result must be an object")
+            data = result.get("data")
+            if not isinstance(data, list):
+                raise ValueError("Codex model/list data must be a list")
+            for raw_model in data:
+                if not isinstance(raw_model, dict):
+                    raise ValueError("Codex model/list item must be an object")
+                options.append(raw_model)
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None:
+                return options
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise ValueError("Codex model/list nextCursor must be a string or null")
+            cursor = next_cursor
 
 
 _model_discovery_cache: TTLCache[str, tuple[_JsonObject, ...]] = TTLCache(
