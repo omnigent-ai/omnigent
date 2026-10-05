@@ -11,6 +11,7 @@ import {
   ArchiveIcon,
   ArrowLeftIcon,
   BlocksIcon,
+  BotIcon,
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
@@ -26,7 +27,7 @@ import {
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode } from "@/lib/capabilities";
+import { customAgentsSettingsEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -35,6 +36,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 export type SettingsSectionId =
   | "appearance"
   | "harnesses"
+  | "custom-agents"
   | "general"
   | "git"
   | "integrations"
@@ -51,6 +53,7 @@ export type SettingsSectionId =
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "harnesses",
+  "custom-agents",
   "general",
   "git",
   "integrations",
@@ -93,6 +96,7 @@ export function settingsNavGroups(
   isAdmin = false,
   isSingleUser = false,
   integrationsEnabled = false,
+  customAgentsEnabled = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
@@ -102,6 +106,13 @@ export function settingsNavGroups(
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
+  if (customAgentsEnabled) {
+    general.splice(3, 0, {
+      id: "custom-agents",
+      label: "Custom agents",
+      icon: BotIcon,
+    });
+  }
   // Sandbox Integrations appears once any connection provider is wired
   // (enabled_connections non-empty). Slots right after Git.
   if (integrationsEnabled) {
@@ -164,6 +175,7 @@ export function useSettingsRoute(): {
   inSettings: boolean;
   section: SettingsSectionId;
   harness?: string;
+  agentId?: string;
 } {
   const info = useServerInfo();
   const defaultSection: SettingsSectionId = "general";
@@ -180,9 +192,13 @@ export function useSettingsRoute(): {
   const singleUser = isSingleUserMode(info);
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
-    !(singleUser && (next === "members" || next === "sharing"));
+    !(singleUser && (next === "members" || next === "sharing")) &&
+    !(next === "custom-agents" && !customAgentsSettingsEnabled(info));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
+  if (section === "custom-agents" && segments[idx + 2]) {
+    return { inSettings: true, section, agentId: segments[idx + 2] };
+  }
   return harness ? { inSettings: true, section, harness } : { inSettings: true, section };
 }
 
@@ -231,6 +247,7 @@ export function SettingsSidebarBody({
     isAdmin,
     isSingleUserMode(info),
     integrationsEnabled,
+    customAgentsSettingsEnabled(info),
   );
 
   return (

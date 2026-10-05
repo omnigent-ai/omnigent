@@ -57,7 +57,12 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "arca_shutdown_warnings";
+export type FeatureKey =
+  | "usage_page"
+  | "harness_install"
+  | "canvas"
+  | "arca_shutdown_warnings"
+  | "custom_agents_settings_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -302,6 +307,14 @@ function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureVal
 /** Return whether a known release feature is enabled; missing/loading is off. */
 export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
   return info !== "loading" && info.features?.[feature] === true;
+}
+
+export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
+  return (
+    isFeatureEnabled(info, "custom_agents_settings_ui") &&
+    info !== "loading" &&
+    info.agent_install === true
+  );
 }
 
 let cachedServerInfo: ServerInfo | null = null;
