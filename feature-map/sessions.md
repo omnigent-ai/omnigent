@@ -18,6 +18,9 @@ the header menu), and each place is a separate entry point.
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
+- `project-preview`: an expanded project shows its five newest sessions,
+  keeping the active session and bulk-selected rows visible. Show more and
+  Show less reveal or hide older rows.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
 - `fork-custom-agent`: switch to a custom agent discovered from an existing
@@ -45,6 +48,10 @@ offer pin, rename, archive or unarchive, and delete.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (archive, unarchive, delete).
+
+**Project preview:** expand a project folder in the desktop sidebar or mobile
+sidebar drawer. Choose Show more to reveal older sessions and enable pagination;
+choose Show less to return to the preview.
 
 **Session header menu:** open a session and use the menu next to its title for
 pin, fork, rename, archive or unarchive, and delete. Clicking the title also
@@ -92,6 +99,10 @@ Tests that stop a runner, restart the server, or read the database cannot run
 through `verify-env run`. They are marked "own environment" below; run them with
 plain `uv run pytest`, which starts a private server for the test.
 
+- **`project-preview`, desktop sidebar and mobile drawer:**
+  `tests/e2e_ui/sessions/test_project_session_preview.py::test_project_session_preview`
+  runs both layouts, expands and contracts a project with eight sessions, and
+  confirms that hiding rows preserves their server-side project membership.
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
 - **`rename`:**

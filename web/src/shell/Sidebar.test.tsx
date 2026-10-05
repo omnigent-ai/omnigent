@@ -44,6 +44,7 @@ const {
   conversationsRef,
   pinnedIdsRef,
   projectSessionsMock,
+  projectPaginationMock,
   useHostsMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
@@ -71,6 +72,9 @@ const {
   // serves exactly those rows instead of deriving from the global list — used to
   // prove a folder fetches its members independently of the global window.
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
+  projectPaginationMock: {
+    current: {} as Record<string, { hasNextPage: boolean; fetchNextPage: () => Promise<void> }>,
+  },
   useHostsMock: vi.fn(),
 }));
 
@@ -128,8 +132,8 @@ vi.mock("@/hooks/useConversations", async () => {
         isLoading: false,
         isError: false,
         error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
+        fetchNextPage: projectPaginationMock.current[project]?.fetchNextPage ?? vi.fn(),
+        hasNextPage: projectPaginationMock.current[project]?.hasNextPage ?? false,
         isFetchingNextPage: false,
       };
     },
@@ -282,6 +286,7 @@ beforeEach(() => {
   fetchProjectSessionIdsMock.mockReset();
   fetchProjectSessionIdsMock.mockResolvedValue([]);
   projectSessionsMock.current = {};
+  projectPaginationMock.current = {};
   pinnedIdsRef.current = [];
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
@@ -2123,6 +2128,80 @@ describe("Sidebar visibility filter (server-side mine/shared split)", () => {
 // "Sessions" list into a folder under the "Projects" group (rendered between
 // Pinned and Sessions). The project list comes from useProjects() (mocked here).
 describe("Sidebar project sections", () => {
+  it("previews five sessions per project and expands each project independently", () => {
+    projectsMock.push("Alpha", "Beta");
+    mockConversations(
+      ["Alpha", "Beta"].flatMap((project) =>
+        Array.from({ length: 8 }, (_, index) =>
+          conv(`${project}-${index}`, "Claude Code", {
+            labels: { omni_project: project },
+            updated_at: 100 - index,
+          }),
+        ),
+      ),
+    );
+    renderSidebar();
+    for (const project of projectsMock) {
+      fireEvent.click(screen.getByRole("button", { name: project }));
+      expect(screen.getByText(`${project}-4`)).toBeInTheDocument();
+      expect(screen.queryByText(`${project}-5`)).not.toBeInTheDocument();
+    }
+
+    const alpha = within(screen.getByText("Alpha").closest("section")!);
+    fireEvent.click(alpha.getByRole("button", { name: "Show more" }));
+    expect(alpha.getByText("Alpha-7")).toBeInTheDocument();
+    expect(screen.queryByText("Beta-5")).not.toBeInTheDocument();
+
+    fireEvent.click(alpha.getByRole("button", { name: "Show less" }));
+    expect(alpha.queryByText("Alpha-5")).not.toBeInTheDocument();
+    expect(alpha.getByText("Alpha-4")).toBeInTheDocument();
+  });
+
+  it("offers older server pages only after the project preview is expanded", () => {
+    projectsMock.push("Alpha");
+    mockConversations(
+      Array.from({ length: 5 }, (_, index) =>
+        conv(`Alpha-${index}`, "Claude Code", { labels: { omni_project: "Alpha" } }),
+      ),
+    );
+    const fetchNextPage = vi.fn().mockResolvedValue(undefined);
+    projectPaginationMock.current.Alpha = { hasNextPage: true, fetchNextPage };
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
+
+    const alpha = within(screen.getByText("Alpha").closest("section")!);
+    expect(alpha.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    fireEvent.click(alpha.getByRole("button", { name: "Show more" }));
+    fireEvent.click(alpha.getByRole("button", { name: "Load more" }));
+    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps selected out-of-window sessions actionable when showing less", () => {
+    projectsMock.push("Alpha");
+    mockConversations([
+      conv("Alpha-0", "Claude Code", { labels: { omni_project: "Alpha" }, updated_at: 100 }),
+    ]);
+    projectSessionsMock.current.Alpha = Array.from({ length: 8 }, (_, index) =>
+      conv(`Alpha-${index}`, "Claude Code", {
+        labels: { omni_project: "Alpha" },
+        updated_at: 100 - index,
+      }),
+    );
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
+    const alpha = within(screen.getByText("Alpha").closest("section")!);
+    fireEvent.click(alpha.getByRole("button", { name: "Show more" }));
+    openProjectsMenu();
+    fireEvent.click(screen.getByTestId("projects-select-sessions"));
+    fireEvent.click(alpha.getByRole("link", { name: "Alpha-7" }));
+    fireEvent.click(alpha.getByRole("button", { name: "Show less" }));
+
+    expect(alpha.getByRole("link", { name: "Alpha-7" })).toBeInTheDocument();
+    expect(alpha.queryByText("Alpha-6")).not.toBeInTheDocument();
+    expect(screen.getByTestId("bulk-archive")).toBeEnabled();
+  });
+
   it("groups sessions by their project label, separate from Sessions", () => {
     projectsMock.push("Customer X");
     mockConversations([
@@ -2232,7 +2311,16 @@ describe("Sidebar project sections", () => {
   it("auto-expands the project folder holding the selected session", () => {
     projectsMock.push("Customer X");
     mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+      ...Array.from({ length: 8 }, (_, index) =>
+        conv(`conv_recent_${index}`, "Claude Code", {
+          labels: { omni_project: "Customer X" },
+          updated_at: 100 - index,
+        }),
+      ),
+      conv("conv_filed", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        updated_at: 1,
+      }),
     ]);
     // Render with the filed session active (a matched /c/:conversationId route
     // so useParams resolves), instead of the default renderSidebar() which
@@ -2258,6 +2346,7 @@ describe("Sidebar project sections", () => {
     expect(header).toHaveAttribute("aria-expanded", "true");
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_filed")).toBeInTheDocument();
+    expect(within(projectSection).queryByText("conv_recent_6")).not.toBeInTheDocument();
   });
 
   it("moves a pinned project session out into the global Pinned section", () => {
