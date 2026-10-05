@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import stat
 import traceback
 from pathlib import Path
@@ -377,6 +378,47 @@ async def test_cold_start_minimal_config_preserves_explicit_profile_mcps(
     assert set(servers) == expected
     if profile:
         assert servers["explicit"] == {"command": "new"}
+
+
+async def test_cold_start_minimal_config_preserves_probe_picker_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runtime and probe homes retain the same Isaac model catalog source."""
+    source = tmp_path / "source"
+    source.mkdir()
+    catalog = source / "isaac-models.json"
+    catalog.write_text(
+        json.dumps({"models": [{"slug": "system.ai.gpt-6-1-sol", "visibility": "list"}]}),
+        encoding="utf-8",
+    )
+    (source / "config.toml").write_text(
+        'model = "system.ai.gpt-6-1-sol"\n'
+        'profile = "default"\n'
+        'model_catalog_json = "isaac-models.json"\n'
+        'model_provider = "Databricks"\n'
+        '[model_providers.Databricks]\nbase_url = "https://example/codex/v1"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    monkeypatch.setenv("HARNESS_CODEX_MINIMAL_CONFIG", "1")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=(0, 154, 0)))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    private = tmp_path / "private"
+    server = _test_app_server(tmp_path, private, tmp_path / "bridge", tmp_path)
+    await server.start()
+    await server.close()
+
+    runtime_config = tomllib.loads((private / "config.toml").read_text())
+    probe_home = app_server._probe_codex_home([])
+    probe_config = tomllib.loads((probe_home / "config.toml").read_text())
+    expected_catalog = str(catalog.resolve())
+    for key in ("model", "profile", "model_catalog_json"):
+        assert runtime_config[key] == probe_config[key]
+    assert runtime_config["model_catalog_json"] == expected_catalog
+    visible_rows = json.loads(catalog.read_text(encoding="utf-8"))["models"]
+    assert visible_rows == [{"slug": "system.ai.gpt-6-1-sol", "visibility": "list"}]
 
 
 def test_mcp_refresh_atomically_replaces_private_symlink(tmp_path: Path) -> None:

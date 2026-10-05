@@ -4751,6 +4751,7 @@ async def _auto_create_codex_terminal(
     from omnigent.harnesses.codex_native.app_server import (
         CodexAppServerClient,
         CodexAppServerResponseError,
+        _resolve_native_codex_invocation,
         apply_codex_thread_effort,
         build_codex_native_server,
         codex_remote_resume_omits_permission_args,
@@ -4770,7 +4771,6 @@ async def _auto_create_codex_terminal(
         write_bridge_startup_timeout,
         write_bridge_state,
     )
-    from omnigent.harnesses.codex_native.invocation import resolve_codex_invocation
     from omnigent.inner.codex_executor import codex_extended_catalog_env
 
     launch_config = await _codex_native_launch_config(
@@ -4833,7 +4833,7 @@ async def _auto_create_codex_terminal(
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
     codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
-    _codex_invocation = resolve_codex_invocation()
+    _codex_invocation = _resolve_native_codex_invocation()
     _codex_cli_path = _codex_invocation.executable
     _catalog_launch = None
     _fresh_codex_catalog: list[_JsonObject] | None = None

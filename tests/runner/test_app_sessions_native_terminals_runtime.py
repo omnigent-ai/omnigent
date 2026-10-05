@@ -686,7 +686,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         _fake_build_codex_native_server,
     )
     monkeypatch.setattr(
-        "omnigent.harnesses.codex_native.invocation.resolve_codex_invocation",
+        codex_app_mod,
+        "_resolve_native_codex_invocation",
         lambda: _FakeCodexAppServer.codex_invocation,
     )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)

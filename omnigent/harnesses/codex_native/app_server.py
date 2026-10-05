@@ -164,6 +164,10 @@ _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
+# Isaac may select a model catalog outside Codex's config.toml. Keep that
+# external file in the same cache identity as the wrapped Codex executable.
+_ISAAC_CODEX_MODEL_CATALOG_PATH_ENV = "ISAAC_CODEX_MODEL_CATALOG_PATH"
+
 
 def _resolve_native_codex_invocation(
     *,
@@ -1183,6 +1187,69 @@ _model_discovery_cache: TTLCache[str, tuple[_JsonObject, ...]] = TTLCache(
 )
 
 
+def _isaac_model_catalog_identity(
+    invocation: CodexInvocation | None = None,
+) -> tuple[str, str | None, int | None, int | None] | None:
+    """Return identity for Isaac's externally selected model catalog.
+
+    Relative paths resolve against this process's cwd; the child Codex cwd is
+    deliberately not inferred here. The raw value remains in the identity.
+    """
+    selected: str | None = None
+    if invocation is not None:
+        for arg in invocation.argv_prefix:
+            key, separator, value = arg.partition("=")
+            if key == _ISAAC_CODEX_MODEL_CATALOG_PATH_ENV and separator:
+                selected = value
+    if selected is None:
+        selected = os.environ.get(_ISAAC_CODEX_MODEL_CATALOG_PATH_ENV)
+    if not selected:
+        return None
+    raw_path = selected
+    path = Path(selected).expanduser()
+    try:
+        resolved_path = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return (raw_path, None, None, None)
+    try:
+        stat = resolved_path.stat()
+    except OSError:
+        return (raw_path, str(resolved_path), None, None)
+    return (raw_path, str(resolved_path), stat.st_size, stat.st_mtime_ns)
+
+
+def _codex_invocation_identity(invocation: CodexInvocation) -> tuple[object, ...]:
+    """Capture executable metadata for one Codex invocation."""
+    from omnigent.models.model_catalog_store import binary_identity
+
+    prefix_identities = tuple(
+        (part, binary_identity(part))
+        for part in invocation.argv_prefix
+        if "=" not in part and not part.startswith("-")
+    )
+    return (
+        invocation.executable,
+        binary_identity(invocation.executable),
+        invocation.argv_prefix,
+        prefix_identities,
+    )
+
+
+def _model_discovery_cache_key(
+    invocation: CodexInvocation,
+) -> str:
+    """Key short-lived discovery by the selected invocation and catalog."""
+    parts: list[object] = [
+        invocation.executable,
+        invocation.argv_prefix,
+        ("codex_invocation", _codex_invocation_identity(invocation)),
+    ]
+    identity = _isaac_model_catalog_identity(invocation)
+    if identity is not None:
+        parts.append(("isaac_model_catalog", identity))
+    return repr(tuple(parts))
+
+
 async def discover_codex_model_options(
     *,
     codex_path: str | None = None,
@@ -1208,7 +1275,7 @@ async def discover_codex_model_options(
     resolved_codex = invocation.executable
     if not resolved_codex:
         raise ImportError("Native Codex model discovery requires the 'codex' CLI on PATH.")
-    cache_key = repr((resolved_codex, invocation.argv_prefix))
+    cache_key = _model_discovery_cache_key(invocation)
     cached = _model_discovery_cache.get(cache_key)
     if cached is not None:
         return [dict(option) for option in cached]
@@ -1395,6 +1462,22 @@ def _codex_picker_config(source_home: Path) -> dict[str, str]:
     return picker
 
 
+def _restore_codex_picker_config(target_home: Path, source_home: Path) -> None:
+    """Keep picker keys when a private home uses minimal config materialization."""
+    picker_config = _codex_picker_config(source_home)
+    if not picker_config:
+        return
+    config_path = target_home / "config.toml"
+    try:
+        document = (
+            tomlkit.parse(config_path.read_text()) if config_path.exists() else tomlkit.document()
+        )
+    except (OSError, ValueError):
+        return
+    document.update(picker_config)
+    _write_private_config(config_path, tomlkit.dumps(document))
+
+
 def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     """
     Persistent probe ``CODEX_HOME`` for one provider configuration.
@@ -1436,15 +1519,7 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
         minimal_config=True,
         supported_efforts=CODEX_NATIVE_EFFORTS,
     )
-    # A custom catalog replaces Codex's built-in choices, including visibility.
-    picker_config = _codex_picker_config(source_home)
-    if picker_config:
-        config_path = home / "config.toml"
-        document = (
-            tomlkit.parse(config_path.read_text()) if config_path.exists() else tomlkit.document()
-        )
-        document.update(picker_config)
-        config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    _restore_codex_picker_config(home, source_home)
     return home
 
 
@@ -1657,14 +1732,10 @@ def codex_catalog_fingerprint(
         binary_identity(invocation.executable),
     ]
     if invocation.argv_prefix:
-        prefix_identities = tuple(
-            (part, binary_identity(part))
-            for part in invocation.argv_prefix
-            if "=" not in part and not part.startswith("-")
-        )
-        fingerprint_parts.append(
-            (invocation.executable, invocation.argv_prefix, prefix_identities)
-        )
+        fingerprint_parts.append(("codex_invocation", _codex_invocation_identity(invocation)))
+    isaac_catalog_identity = _isaac_model_catalog_identity(invocation)
+    if isaac_catalog_identity is not None:
+        fingerprint_parts.append(("isaac_model_catalog", isaac_catalog_identity))
     return fingerprint_of(
         *fingerprint_parts,
     )
@@ -2063,6 +2134,8 @@ class CodexNativeAppServer:
                 self.codex_invocation if self.codex_invocation.argv_prefix else None
             ),
         )
+        if minimal_config:
+            _restore_codex_picker_config(self.codex_home, config_source)
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
             config_source,

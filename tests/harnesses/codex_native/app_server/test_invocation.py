@@ -10,6 +10,8 @@ import pytest
 from omnigent.harnesses.codex_native.app_server import (
     NativeCodexLaunch,
     _build_native_codex_app_server_argv,
+    _isaac_model_catalog_identity,
+    _model_discovery_cache_key,
     codex_catalog_fingerprint,
 )
 from omnigent.harnesses.codex_native.invocation import (
@@ -124,6 +126,79 @@ def test_catalog_fingerprint_includes_configured_prefix() -> None:
         codex_invocation=CodexInvocation("env", ("isaac", "codex", "--")),
     )
     assert bare != wrapped
+
+
+def test_catalog_fingerprint_tracks_isaac_catalog_path_and_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An Isaac catalog path or in-place edit selects a new disk cache entry."""
+    first = tmp_path / "catalog-a.json"
+    second = tmp_path / "catalog-b.json"
+    first.write_text("catalog-a")
+    second.write_text("catalog-b")
+    launch = NativeCodexLaunch([], None, None)
+    invocation = CodexInvocation("env", ("isaac", "codex", "--"))
+
+    monkeypatch.setenv("ISAAC_CODEX_MODEL_CATALOG_PATH", str(first))
+    path_a = codex_catalog_fingerprint(launch, codex_invocation=invocation)
+    monkeypatch.setenv("ISAAC_CODEX_MODEL_CATALOG_PATH", str(second))
+    path_b = codex_catalog_fingerprint(launch, codex_invocation=invocation)
+    assert path_a != path_b
+
+    second.write_text("catalog-b-updated-with-new-content")
+    path_b_updated = codex_catalog_fingerprint(launch, codex_invocation=invocation)
+    assert path_b_updated != path_b
+
+
+def test_discovery_cache_key_tracks_isaac_catalog_path_and_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Short-lived discovery does not replay rows after Isaac catalog edits."""
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text("catalog-v1")
+    invocation = CodexInvocation("env", ("isaac", "codex", "--"))
+
+    monkeypatch.setenv("ISAAC_CODEX_MODEL_CATALOG_PATH", str(catalog))
+    first = _model_discovery_cache_key(invocation)
+    catalog.write_text("catalog-v2-with-new-content")
+    second = _model_discovery_cache_key(invocation)
+    assert second != first
+
+    other = tmp_path / "other-catalog.json"
+    other.write_text("catalog-v2-with-new-content")
+    monkeypatch.setenv("ISAAC_CODEX_MODEL_CATALOG_PATH", str(other))
+    assert _model_discovery_cache_key(invocation) != second
+
+
+def test_discovery_cache_key_tracks_in_place_wrapper_replacement(tmp_path: Path) -> None:
+    """A wrapper update invalidates short-lived model discovery rows."""
+    wrapper = tmp_path / "isaac"
+    wrapper.write_text("wrapper-v1")
+    invocation = CodexInvocation(str(wrapper))
+    first = _model_discovery_cache_key(invocation)
+    wrapper.write_text("wrapper-v2-with-new-content")
+    assert _model_discovery_cache_key(invocation) != first
+
+
+def test_isaac_catalog_identity_fails_soft_and_keeps_raw_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing and looping paths never abort fingerprint calculation."""
+    missing = "relative/missing-catalog.json"
+    monkeypatch.chdir(tmp_path)
+    invocation = CodexInvocation("env", (f"ISAAC_CODEX_MODEL_CATALOG_PATH={missing}",))
+    missing_identity = _isaac_model_catalog_identity(invocation)
+    assert missing_identity == (missing, str(tmp_path / missing), None, None)
+
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    monkeypatch.setenv("ISAAC_CODEX_MODEL_CATALOG_PATH", str(loop_a))
+    loop_identity = _isaac_model_catalog_identity(CodexInvocation("env"))
+    assert loop_identity is not None
+    assert loop_identity[0] == str(loop_a)
+    assert loop_identity[1:] == (None, None, None)
 
 
 def test_debug_models_probe_uses_configured_prefix(
