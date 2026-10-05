@@ -249,8 +249,9 @@ describe("ServerSelectorV2", () => {
       await screen.findByRole("heading", { name: /where do you work today/i }),
     ).toBeInTheDocument();
     expect(getRunnerOptions).toHaveBeenCalledWith("https://team.example.com/");
-    fireEvent.click(screen.getByRole("combobox", { name: "Runner" }));
-    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["My laptop"]);
+    expect(screen.getAllByRole("radio")).toEqual([
+      screen.getByRole("radio", { name: /my laptop/i }),
+    ]);
   });
 
   it("a slow runner lookup can't replace a newer pick", async () => {
@@ -281,10 +282,11 @@ describe("ServerSelectorV2", () => {
       target: { value: "https://typed.example.com" },
     });
     fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
-    const runner = await screen.findByRole("combobox", { name: "Runner" });
+    const laptop = await screen.findByRole("radio", { name: /my laptop/i });
     resolveFirst({ remote: true });
     await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledTimes(2));
-    expect(runner).toHaveTextContent("My laptop");
+    expect(laptop).toBeChecked();
+    expect(screen.queryByRole("radio", { name: "Arca" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
     await waitFor(() =>
       expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function)),
@@ -301,8 +303,8 @@ describe("ServerSelectorV2", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
-    fireEvent.click(await screen.findByRole("combobox", { name: "Runner" }));
-    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["My laptop"]);
+    expect(await screen.findByRole("radio", { name: /my laptop/i })).toBeChecked();
+    expect(screen.getAllByRole("radio")).toHaveLength(1);
   });
 
   it("the runner step shows a direct connect's error", async () => {
@@ -330,10 +332,9 @@ describe("ServerSelectorV2", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
-    const runner = await screen.findByRole("combobox", { name: "Runner" });
-    expect(runner).toHaveTextContent("Arca");
-    fireEvent.click(runner);
-    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["Arca", "My laptop"]);
+    expect(await screen.findByRole("radio", { name: "Arca" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: /my laptop/i })).not.toBeChecked();
+    expect(screen.getAllByRole("radio")).toHaveLength(2);
   });
 
   it("the runner step connects to the preset, and Back returns to the landing", async () => {
@@ -364,7 +365,7 @@ describe("ServerSelectorV2", () => {
 
   async function installFromRunnerStep(
     over: Partial<ServerSelectorV2Setup>,
-    pick?: string,
+    pick?: string | RegExp,
     action: string | RegExp = /(install|open) omnigent/i,
   ) {
     render(
@@ -374,8 +375,7 @@ describe("ServerSelectorV2", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
     if (pick) {
-      fireEvent.click(await screen.findByRole("combobox", { name: "Runner" }));
-      fireEvent.click(screen.getByRole("option", { name: pick }));
+      fireEvent.click(await screen.findByRole("radio", { name: pick }));
     }
     fireEvent.click(await screen.findByRole("button", { name: action }));
   }
@@ -523,7 +523,7 @@ describe("ServerSelectorV2", () => {
     );
   });
 
-  it("tells a laptop runner, and only a laptop runner, what connecting grants", async () => {
+  it("tells the laptop option what connecting grants", async () => {
     const grant = "The server will be able to run agents on this laptop.";
     render(
       <ServerSelectorV2
@@ -534,11 +534,9 @@ describe("ServerSelectorV2", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
-    // Arca is the default: no laptop grant to explain.
-    fireEvent.click(await screen.findByRole("combobox", { name: "Runner" }));
-    expect(screen.queryByText(grant)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("option", { name: "My laptop" }));
-    expect(screen.getByText(grant)).toBeInTheDocument();
+    expect(await screen.findByRole("radio", { name: /my laptop/i })).toHaveAccessibleName(
+      expect.stringContaining(grant),
+    );
   });
 
   it("the laptop skips the install when its host CLI is bundled", async () => {
@@ -553,7 +551,7 @@ describe("ServerSelectorV2", () => {
         onConnect,
         getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
       },
-      "My laptop",
+      /my laptop/i,
       // Nothing is installed, so the action only opens.
       "Open Omnigent",
     );
