@@ -20,6 +20,7 @@ simply knows nothing about them until the host reconnects and re-reports.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -40,6 +41,7 @@ from omnigent.db.account_authority import (
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
+    IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     HostHelloFrame,
     HostMcpServersResultFrame,
     HostPluginsResultFrame,
@@ -52,6 +54,143 @@ _logger = logging.getLogger(__name__)
 _expected_host_owner: ContextVar[AccountAuthority | None] = ContextVar(
     "expected_host_owner", default=None
 )
+
+
+# Retain reservations through persistence and share the chunk reassembly cap.
+# Serialized JSON bytes estimate payload size, not exact Python heap usage.
+IMPORT_LOCAL_MAX_PENDING_BYTES = IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS
+
+
+class ImportLocalByteBudget:
+    """Connection-wide serialized-byte reservations for local imports."""
+
+    def __init__(self, max_bytes: int | None = None) -> None:
+        """Initialize an empty budget."""
+        self.max_bytes = IMPORT_LOCAL_MAX_PENDING_BYTES if max_bytes is None else max_bytes
+        self.used_bytes = 0
+
+    def reserve(self, size: int) -> bool:
+        """Reserve *size* bytes, returning ``False`` when the budget is full."""
+        if size < 0 or self.used_bytes + size > self.max_bytes:
+            return False
+        self.used_bytes += size
+        return True
+
+    def release(self, size: int) -> None:
+        """Release a prior reservation."""
+        self.used_bytes = max(0, self.used_bytes - size)
+
+
+@dataclass(frozen=True)
+class ImportLocalQueueItem:
+    """One queued import event and its retained-byte reservation."""
+
+    kind: str
+    data: dict[str, Any]
+    size: int = 0
+
+
+class ImportLocalQueue:
+    """Queue decoded import events with serialized-byte accounting."""
+
+    def __init__(self, budget: ImportLocalByteBudget | None = None) -> None:
+        """Create a queue backed by *budget* or a private default budget."""
+        self._queue: asyncio.Queue[ImportLocalQueueItem] = asyncio.Queue()
+        self._budget = budget or ImportLocalByteBudget()
+        self._reserved_bytes = 0
+        self._closed = False
+        self._progress_pending = False
+
+    @property
+    def reserved_bytes(self) -> int:
+        """Return bytes retained by this queue, including its active item."""
+        return self._reserved_bytes
+
+    @property
+    def budget(self) -> ImportLocalByteBudget:
+        """Return the shared connection budget."""
+        return self._budget
+
+    def put_nowait(
+        self,
+        item: tuple[str, dict[str, Any]] | ImportLocalQueueItem,
+        *,
+        byte_size: int | None = None,
+    ) -> None:
+        """Queue an event without waiting for the persistence consumer.
+
+        A zero-sized terminal or progress event is always admitted; a session
+        event raises :class:`asyncio.QueueFull` once its serialized payload
+        estimate would exceed the connection budget.
+        """
+        if self._closed:
+            raise asyncio.QueueFull
+        if isinstance(item, ImportLocalQueueItem):
+            queued = item
+        else:
+            kind, data = item
+            if byte_size is None:
+                byte_size = _import_local_payload_bytes(data) if kind == "session" else 0
+            queued = ImportLocalQueueItem(kind=kind, data=data, size=byte_size)
+        if queued.kind == "progress" and self._progress_pending:
+            return
+        if queued.kind == "progress":
+            self._progress_pending = True
+        if queued.size < 0 or not self._budget.reserve(queued.size):
+            if queued.kind == "progress":
+                self._progress_pending = False
+            raise asyncio.QueueFull
+        self._reserved_bytes += queued.size
+        try:
+            self._queue.put_nowait(queued)
+        except Exception:
+            if queued.kind == "progress":
+                self._progress_pending = False
+            self._reserved_bytes -= queued.size
+            self._budget.release(queued.size)
+            raise
+
+    def event_bytes(self, kind: str, data: Mapping[str, Any]) -> int:
+        """Return the reservation needed for one event."""
+        return _import_local_payload_bytes(data) if kind == "session" else 0
+
+    async def get(self) -> ImportLocalQueueItem:
+        """Wait for the next import event."""
+        item = await self._queue.get()
+        if item.kind == "progress":
+            self._progress_pending = False
+        return item
+
+    def qsize(self) -> int:
+        """Return the number of queued events."""
+        return self._queue.qsize()
+
+    def release(self, size: int) -> None:
+        """Release bytes after the persistence consumer finishes an event."""
+        if size <= 0 or self._reserved_bytes <= 0:
+            return
+        released = min(size, self._reserved_bytes)
+        self._reserved_bytes -= released
+        self._budget.release(released)
+
+    def close(self) -> None:
+        """Release all retained reservations when the import stream ends."""
+        if self._closed:
+            return
+        self._closed = True
+        self._progress_pending = False
+        self._budget.release(self._reserved_bytes)
+        self._reserved_bytes = 0
+
+
+def _import_local_payload_bytes(data: Mapping[str, Any]) -> int:
+    """Estimate one decoded session's serialized JSON bytes."""
+    try:
+        return len(json.dumps(data, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError):
+        # Decoded wire data is JSON by construction; keep a conservative floor
+        # for future payload extensions that are not yet JSON-serializable.
+        return len(repr(data).encode("utf-8"))
 
 
 @contextmanager
@@ -115,6 +254,8 @@ def _fail_pending_imports(conn: HostConnection) -> None:
                 },
             )
         )
+        if isinstance(queue, ImportLocalQueue):
+            queue.close()
 
 
 def _fail_pending_plugins(conn: HostConnection) -> None:
@@ -400,10 +541,14 @@ class HostConnection:
     pending_mcp_servers: dict[str, asyncio.Future[HostMcpServersResultFrame]] = field(
         default_factory=dict,
     )
+    pending_import_budget: ImportLocalByteBudget = field(default_factory=ImportLocalByteBudget)
     # Import streams one session per frame, so the tunnel pushes each onto a
     # per-request queue the /imports/local handler drains (vs a single future).
-    # Each item is a ("session", dict) or ("done", dict) tuple.
-    pending_import_local: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = field(
+    # Production queues retain a byte reservation until persistence resumes the
+    # stream.
+    pending_import_local: dict[
+        str, asyncio.Queue[tuple[str, dict[str, Any]]] | ImportLocalQueue
+    ] = field(
         default_factory=dict,
     )
 

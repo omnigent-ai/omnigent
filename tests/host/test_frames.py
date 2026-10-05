@@ -23,6 +23,8 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
+    HostImportLocalCancelFrame,
+    HostImportLocalCreditFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
     HostImportLocalSessionChunkFrame,
@@ -74,11 +76,16 @@ def test_import_local_frames_round_trip() -> None:
                 source="claude",
                 limit=3,
                 allow_session_chunks=True,
+                max_in_flight_sessions=1,
             )
         )
     )
     assert request == HostImportLocalFrame(
-        request_id="req_imp", source="claude", limit=3, allow_session_chunks=True
+        request_id="req_imp",
+        source="claude",
+        limit=3,
+        allow_session_chunks=True,
+        max_in_flight_sessions=1,
     )
 
     exact_request = decode_host_frame(
@@ -161,6 +168,18 @@ def test_import_local_frames_round_trip() -> None:
     )
     assert isinstance(done_failed, HostImportLocalDoneFrame)
     assert done_failed.failed == 2
+
+    credit = decode_host_frame(
+        encode_host_frame(HostImportLocalCreditFrame(request_id="req_imp", credits=1))
+    )
+    assert credit == HostImportLocalCreditFrame(request_id="req_imp", credits=1)
+
+    cancel = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalCancelFrame(request_id="req_imp", error="consumer closed")
+        )
+    )
+    assert cancel == HostImportLocalCancelFrame(request_id="req_imp", error="consumer closed")
 
 
 @pytest.mark.parametrize(

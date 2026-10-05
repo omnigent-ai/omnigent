@@ -406,6 +406,58 @@ async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
     assert conn.pending_import_local == {}
 
 
+async def test_stream_local_sessions_releases_bytes_and_acknowledges_credit() -> None:
+    """Persistence completion releases the queue reservation and producer credit."""
+    from omnigent.host.frames import (
+        CAP_IMPORT_LOCAL_BACKPRESSURE,
+        HostImportLocalCancelFrame,
+        HostImportLocalCreditFrame,
+    )
+    from omnigent.server.host_registry import ImportLocalByteBudget, ImportLocalQueue
+
+    conn = SimpleNamespace(
+        host_id="h1",
+        hello=SimpleNamespace(capabilities=[CAP_IMPORT_LOCAL_BACKPRESSURE]),
+        pending_import_budget=ImportLocalByteBudget(max_bytes=1024),
+        pending_import_local={},
+    )
+    sent: list[object] = []
+    canned = {
+        "external_session_id": "c1",
+        "workspace": None,
+        "items": [{"type": "message", "response_id": "r1", "data": {"text": "x"}}],
+        "title": "one",
+        "source": "claude",
+        "total": 1,
+    }
+
+    class _Reg:
+        def send_text(self, host_conn: object, frame: str) -> None:
+            from omnigent.host.frames import decode_host_frame
+
+            decoded = decode_host_frame(frame)
+            sent.append(decoded)
+            if not isinstance(decoded, (HostImportLocalCancelFrame, HostImportLocalCreditFrame)):
+                queue = next(iter(conn.pending_import_local.values()))
+                assert isinstance(queue, ImportLocalQueue)
+                queue.put_nowait(("session", canned))
+                queue.put_nowait(("done", {"status": "ok", "error": None}))
+
+    got = [
+        session
+        async for session in _stream_local_sessions_from_host(
+            host_registry=_Reg(),  # type: ignore[arg-type]
+            host_conn=conn,  # type: ignore[arg-type]
+            source="claude",
+            limit=1,
+        )
+    ]
+
+    assert [session["external_session_id"] for session in got] == ["c1"]
+    assert conn.pending_import_budget.used_bytes == 0
+    assert any(isinstance(frame, HostImportLocalCreditFrame) for frame in sent)
+
+
 async def test_stream_local_sessions_treats_chunk_progress_as_liveness() -> None:
     """Chunk heartbeats reset the wait without yielding malformed sessions."""
     conn = SimpleNamespace(host_id="h1", pending_import_local={})

@@ -56,6 +56,8 @@ CAP_CODEX_SIDE_CHAT = "codex_side_chat"
 CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
+# The server can pace local-session imports with one completed-session credit.
+CAP_IMPORT_LOCAL_BACKPRESSURE = "import_local_backpressure"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -64,6 +66,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_PLUGINS,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
+    CAP_IMPORT_LOCAL_BACKPRESSURE,
 ]
 
 
@@ -159,6 +162,8 @@ class HostFrameKind(str, Enum):
     IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
     IMPORT_LOCAL_SESSION_CHUNK = "host.import_local_session_chunk"
+    IMPORT_LOCAL_CREDIT = "host.import_local_credit"
+    IMPORT_LOCAL_CANCEL = "host.import_local_cancel"
     IMPORT_LOCAL_DONE = "host.import_local_done"
 
 
@@ -1109,12 +1114,16 @@ class HostImportLocalFrame:
     :param allow_session_chunks: Whether the requesting server understands
         ``host.import_local_session_chunk``. Missing from older servers, so the
         safe default is legacy whole-session framing.
+    :param max_in_flight_sessions: Optional producer credit window. A positive
+        value makes a current host wait for server credits between sessions;
+        absent on older servers and therefore defaults to legacy streaming.
     """
 
     request_id: str
     source: str
     limit: int = 10
     allow_session_chunks: bool = False
+    max_in_flight_sessions: int = 0
 
 
 @dataclass
@@ -1126,12 +1135,15 @@ class HostImportLocalByIdFrame:
     :param session_id: Exact harness-native session id to load.
     :param allow_session_chunks: Whether the requesting server understands
         ``host.import_local_session_chunk``. Missing from older servers.
+    :param max_in_flight_sessions: Optional producer credit window, as on
+        :class:`HostImportLocalFrame`.
     """
 
     request_id: str
     source: str
     session_id: str
     allow_session_chunks: bool = False
+    max_in_flight_sessions: int = 0
 
 
 @dataclass
@@ -1174,6 +1186,27 @@ class HostImportLocalSessionChunkFrame:
     seq: int
     last: bool
     data: str
+
+
+@dataclass
+class HostImportLocalCreditFrame:
+    """Server → host: release one local-session send credit.
+
+    Hosts that understand import backpressure wait for this acknowledgement
+    before reading and sending the next local transcript. Older hosts never
+    receive this frame because older servers do not opt into the request field.
+    """
+
+    request_id: str
+    credits: int = 1
+
+
+@dataclass
+class HostImportLocalCancelFrame:
+    """Server → host: stop a local import whose consumer went away."""
+
+    request_id: str
+    error: str | None = None
 
 
 @dataclass
@@ -1244,6 +1277,8 @@ HostFrame = (
     | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
     | HostImportLocalSessionChunkFrame
+    | HostImportLocalCreditFrame
+    | HostImportLocalCancelFrame
     | HostImportLocalDoneFrame
 )
 
@@ -1702,6 +1737,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "source": frame.source,
                 "limit": frame.limit,
                 "allow_session_chunks": frame.allow_session_chunks,
+                "max_in_flight_sessions": frame.max_in_flight_sessions,
             }
         )
     if isinstance(frame, HostImportLocalByIdFrame):
@@ -1712,6 +1748,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "source": frame.source,
                 "session_id": frame.session_id,
                 "allow_session_chunks": frame.allow_session_chunks,
+                "max_in_flight_sessions": frame.max_in_flight_sessions,
             }
         )
     if isinstance(frame, HostImportLocalSessionFrame):
@@ -1732,6 +1769,22 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "seq": frame.seq,
                 "last": frame.last,
                 "data": frame.data,
+            }
+        )
+    if isinstance(frame, HostImportLocalCreditFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_CREDIT.value,
+                "request_id": frame.request_id,
+                "credits": frame.credits,
+            }
+        )
+    if isinstance(frame, HostImportLocalCancelFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_CANCEL.value,
+                "request_id": frame.request_id,
+                "error": frame.error,
             }
         )
     if isinstance(frame, HostImportLocalDoneFrame):
@@ -2094,6 +2147,10 @@ def _decode_known_host_frame(
             return _decode_import_local_session(msg)
         case HostFrameKind.IMPORT_LOCAL_SESSION_CHUNK:
             return _decode_import_local_session_chunk(msg)
+        case HostFrameKind.IMPORT_LOCAL_CREDIT:
+            return _decode_import_local_credit(msg)
+        case HostFrameKind.IMPORT_LOCAL_CANCEL:
+            return _decode_import_local_cancel(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
             return _decode_import_local_done(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
@@ -2738,6 +2795,11 @@ def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:
         allow_session_chunks=(
             _required_bool(msg, "allow_session_chunks") if "allow_session_chunks" in msg else False
         ),
+        max_in_flight_sessions=(
+            _optional_nonnegative_int(msg, "max_in_flight_sessions")
+            if "max_in_flight_sessions" in msg
+            else 0
+        ),
     )
 
 
@@ -2749,6 +2811,11 @@ def _decode_import_local_by_id(msg: _JsonObject) -> HostImportLocalByIdFrame:
         session_id=_required_str(msg, "session_id"),
         allow_session_chunks=(
             _required_bool(msg, "allow_session_chunks") if "allow_session_chunks" in msg else False
+        ),
+        max_in_flight_sessions=(
+            _optional_nonnegative_int(msg, "max_in_flight_sessions")
+            if "max_in_flight_sessions" in msg
+            else 0
         ),
     )
 
@@ -2795,6 +2862,22 @@ def _decode_import_local_session_chunk(msg: _JsonObject) -> HostImportLocalSessi
         seq=_required_int(msg, "seq"),
         last=_required_bool(msg, "last"),
         data=_required_str(msg, "data"),
+    )
+
+
+def _decode_import_local_credit(msg: _JsonObject) -> HostImportLocalCreditFrame:
+    """Decode a server release of local-import producer credits."""
+    return HostImportLocalCreditFrame(
+        request_id=_required_str(msg, "request_id"),
+        credits=_optional_nonnegative_int(msg, "credits") if "credits" in msg else 1,
+    )
+
+
+def _decode_import_local_cancel(msg: _JsonObject) -> HostImportLocalCancelFrame:
+    """Decode a server cancellation of a local import."""
+    return HostImportLocalCancelFrame(
+        request_id=_required_str(msg, "request_id"),
+        error=_optional_nullable_str(msg, "error"),
     )
 
 
@@ -2845,6 +2928,14 @@ def _required_int(msg: _JsonObject, key: str) -> int:
     if not isinstance(val, int) or isinstance(val, bool):
         raise ValueError(f"frame missing required int field: {key!r}")
     return val
+
+
+def _optional_nonnegative_int(msg: _JsonObject, key: str) -> int:
+    """Return a non-negative integer optional protocol field."""
+    value = _required_int(msg, key)
+    if value < 0:
+        raise ValueError(f"frame field {key!r} must be non-negative")
+    return value
 
 
 def _required_bool(msg: _JsonObject, key: str) -> bool:

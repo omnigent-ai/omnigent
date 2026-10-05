@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -20,10 +21,17 @@ from omnigent.db.utils import builtin_agent_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import HostImportLocalByIdFrame, HostImportLocalFrame, encode_host_frame
+from omnigent.host.frames import (
+    CAP_IMPORT_LOCAL_BACKPRESSURE,
+    HostImportLocalByIdFrame,
+    HostImportLocalCancelFrame,
+    HostImportLocalCreditFrame,
+    HostImportLocalFrame,
+    encode_host_frame,
+)
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
-from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry, ImportLocalQueue
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
@@ -272,6 +280,12 @@ async def _stream_local_sessions_from_host(
             source=source,
             session_id=session_id,
             allow_session_chunks=True,
+            max_in_flight_sessions=(
+                1
+                if CAP_IMPORT_LOCAL_BACKPRESSURE
+                in getattr(getattr(host_conn, "hello", None), "capabilities", [])
+                else 0
+            ),
         )
         if session_id is not None
         else HostImportLocalFrame(
@@ -279,11 +293,19 @@ async def _stream_local_sessions_from_host(
             source=source,
             limit=limit,
             allow_session_chunks=True,
+            max_in_flight_sessions=(
+                1
+                if CAP_IMPORT_LOCAL_BACKPRESSURE
+                in getattr(getattr(host_conn, "hello", None), "capabilities", [])
+                else 0
+            ),
         )
     )
     frame = encode_host_frame(request_frame)
-    queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
+    budget = getattr(host_conn, "pending_import_budget", None)
+    queue = ImportLocalQueue(budget=budget)
     host_conn.pending_import_local[request_id] = queue
+    flow_control = request_frame.max_in_flight_sessions > 0
     try:
         try:
             host_registry.send_text(host_conn, frame)
@@ -294,7 +316,8 @@ async def _stream_local_sessions_from_host(
             ) from exc
         while True:
             try:
-                kind, data = await asyncio.wait_for(queue.get(), timeout=_HOST_IMPORT_TIMEOUT_S)
+                queued = await asyncio.wait_for(queue.get(), timeout=_HOST_IMPORT_TIMEOUT_S)
+                kind, data, retained_bytes = queued.kind, queued.data, queued.size
             except asyncio.TimeoutError as exc:
                 raise OmnigentError(
                     f"host '{host_conn.host_id}' stalled mid-import "
@@ -305,6 +328,21 @@ async def _stream_local_sessions_from_host(
                 continue
             if kind == "session":
                 yield data
+                if retained_bytes:
+                    queue.release(retained_bytes)
+                if flow_control:
+                    try:
+                        host_registry.send_text(
+                            host_conn,
+                            encode_host_frame(
+                                HostImportLocalCreditFrame(request_id=request_id, credits=1)
+                            ),
+                        )
+                    except ConnectionError as exc:
+                        raise OmnigentError(
+                            f"host '{host_conn.host_id}' connection lost during import",
+                            code=ErrorCode.CONFLICT,
+                        ) from exc
             else:  # "done"
                 if data.get("status") != "ok":
                     raise OmnigentError(
@@ -326,6 +364,18 @@ async def _stream_local_sessions_from_host(
                 return
     finally:
         host_conn.pending_import_local.pop(request_id, None)
+        if flow_control:
+            with contextlib.suppress(ConnectionError):
+                host_registry.send_text(
+                    host_conn,
+                    encode_host_frame(
+                        HostImportLocalCancelFrame(
+                            request_id=request_id,
+                            error="local import consumer closed",
+                        )
+                    ),
+                )
+        queue.close()
 
 
 def create_imports_router(

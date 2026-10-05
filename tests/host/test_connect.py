@@ -8252,6 +8252,332 @@ def test_fs_search_reuses_the_changed_files_snapshot_across_requests(
     assert [e["path"] for e in search.payload["data"]] == ["zzz/scratch.txt"], search.payload
 
 
+async def test_handle_import_local_waits_for_server_session_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negotiated import sends one session until persistence releases credit."""
+    from omnigent.host.frames import (
+        HostImportLocalCreditFrame,
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_local_session_ids",
+        lambda _source, *, limit: ["s_first", "s_second"][:limit],
+    )
+
+    loaded: list[str] = []
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        loaded.append(session_id)
+        item = SimpleNamespace(
+            type="message",
+            response_id=f"r_{session_id}",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title=session_id,
+            source=source,
+        )
+
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+    sent: list[object] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(decode_host_frame(text))
+
+    task = asyncio.create_task(
+        host._handle_import_local(
+            _FakeWs(),
+            HostImportLocalFrame(
+                request_id="req_credit",
+                source="claude",
+                limit=2,
+                max_in_flight_sessions=1,
+            ),
+        )
+    )
+    for _ in range(100):
+        if any(isinstance(frame, HostImportLocalSessionFrame) for frame in sent):
+            break
+        await asyncio.sleep(0.01)
+    assert len([frame for frame in sent if isinstance(frame, HostImportLocalSessionFrame)]) == 1
+    assert len(loaded) == 1
+
+    await asyncio.sleep(0.02)
+    assert len([frame for frame in sent if isinstance(frame, HostImportLocalSessionFrame)]) == 1
+    assert len(loaded) == 1
+
+    host._handle_import_credit(HostImportLocalCreditFrame(request_id="req_credit"))
+    for _ in range(100):
+        if len([frame for frame in sent if isinstance(frame, HostImportLocalSessionFrame)]) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert len([frame for frame in sent if isinstance(frame, HostImportLocalSessionFrame)]) == 2
+
+    host._handle_import_credit(HostImportLocalCreditFrame(request_id="req_credit"))
+    await asyncio.wait_for(task, timeout=2.0)
+    assert any(isinstance(frame, HostImportLocalDoneFrame) for frame in sent)
+    _cleanup_host(host)
+
+
+async def test_handle_import_cancel_with_available_credit_stops_before_next_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation wins over a credit that arrives just before the next read."""
+    from omnigent.host.frames import (
+        HostImportLocalCancelFrame,
+        HostImportLocalCreditFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_local_session_ids",
+        lambda _source, *, limit: ["s_first", "s_second"][:limit],
+    )
+    loaded: list[str] = []
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        loaded.append(session_id)
+        item = SimpleNamespace(
+            type="message",
+            response_id=f"r_{session_id}",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title=session_id,
+            source=source,
+        )
+
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+    sent: list[object] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(decode_host_frame(text))
+
+    task = asyncio.create_task(
+        host._handle_import_local(
+            _FakeWs(),
+            HostImportLocalFrame(
+                request_id="req_cancel_available",
+                source="claude",
+                limit=2,
+                max_in_flight_sessions=1,
+            ),
+        )
+    )
+    for _ in range(100):
+        if any(isinstance(frame, HostImportLocalSessionFrame) for frame in sent):
+            break
+        await asyncio.sleep(0.01)
+    assert loaded == ["s_second"]
+
+    host._handle_import_credit(HostImportLocalCreditFrame(request_id="req_cancel_available"))
+    host._handle_import_cancel(
+        HostImportLocalCancelFrame(request_id="req_cancel_available", error="cancelled")
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert loaded == ["s_second"]
+    assert not host._import_credits
+    assert not host._import_credit_events
+    assert not host._import_producer_tasks
+    _cleanup_host(host)
+
+
+async def test_handle_import_cancel_while_loading_terminates_whole_producer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during transcript loading does not skip to later sessions."""
+    from omnigent.host.frames import (
+        HostImportLocalCancelFrame,
+        HostImportLocalCreditFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_local_session_ids",
+        lambda _source, *, limit: ["s_second", "s_first"][:limit],
+    )
+    started = threading.Event()
+    release = threading.Event()
+    loaded: list[str] = []
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        loaded.append(session_id)
+        if session_id == "s_second":
+            started.set()
+            release.wait(timeout=2.0)
+        item = SimpleNamespace(
+            type="message",
+            response_id=f"r_{session_id}",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title=session_id,
+            source=source,
+        )
+
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+    sent: list[object] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(decode_host_frame(text))
+
+    request_id = "req_cancel_loading"
+    task = asyncio.create_task(
+        host._handle_import_local(
+            _FakeWs(),
+            HostImportLocalFrame(
+                request_id=request_id,
+                source="claude",
+                limit=2,
+                max_in_flight_sessions=1,
+            ),
+        )
+    )
+    for _ in range(100):
+        if any(isinstance(frame, HostImportLocalSessionFrame) for frame in sent):
+            break
+        await asyncio.sleep(0.01)
+    assert loaded == ["s_first"]
+    host._handle_import_credit(HostImportLocalCreditFrame(request_id=request_id))
+    for _ in range(100):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+
+    host._handle_import_cancel(HostImportLocalCancelFrame(request_id=request_id))
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert loaded == ["s_first", "s_second"]
+    assert not host._import_credits
+    assert not host._import_credit_events
+    assert not host._import_producer_tasks
+    _cleanup_host(host)
+
+
+async def test_import_cancel_before_producer_starts_cleans_registered_state() -> None:
+    """A cancel received immediately after scheduling cannot strand producer state."""
+    from omnigent.host.frames import (
+        HostImportLocalCancelFrame,
+        HostImportLocalFrame,
+        encode_host_frame,
+    )
+
+    host = _make_host_process()
+    request_id = "req_cancel_before_start"
+
+    class _FakeWs:
+        async def send(self, _text: str) -> None:
+            raise AssertionError("cancelled producer must not send")
+
+    host._start_frame_task(
+        _FakeWs(),
+        encode_host_frame(
+            HostImportLocalFrame(
+                request_id=request_id,
+                source="claude",
+                max_in_flight_sessions=1,
+            )
+        ),
+    )
+    assert request_id in host._import_producer_tasks
+    host._handle_import_cancel(HostImportLocalCancelFrame(request_id=request_id))
+    await asyncio.sleep(0)
+    await host._quiesce_frame_tasks()
+
+    assert request_id not in host._import_producer_tasks
+    assert request_id not in host._import_credits
+    assert request_id not in host._import_credit_events
+    _cleanup_host(host)
+
+
+async def test_import_disconnect_cancels_blocked_producer_without_lingering_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tunnel teardown cancels a credit waiter and clears all request state."""
+    from omnigent.host.frames import (
+        HostImportLocalFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+        encode_host_frame,
+    )
+
+    host = _make_host_process()
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_local_session_ids",
+        lambda _source, *, limit: ["s_first", "s_second"][:limit],
+    )
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        item = SimpleNamespace(
+            type="message",
+            response_id=f"r_{session_id}",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title=session_id,
+            source=source,
+        )
+
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+    sent: list[object] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(decode_host_frame(text))
+
+    request_id = "req_disconnect"
+    host._start_frame_task(
+        _FakeWs(),
+        encode_host_frame(
+            HostImportLocalFrame(
+                request_id=request_id,
+                source="claude",
+                limit=2,
+                max_in_flight_sessions=1,
+            )
+        ),
+    )
+    for _ in range(100):
+        if any(isinstance(frame, HostImportLocalSessionFrame) for frame in sent):
+            break
+        await asyncio.sleep(0.01)
+    assert any(isinstance(frame, HostImportLocalSessionFrame) for frame in sent)
+
+    await host._quiesce_frame_tasks()
+    assert request_id not in host._import_producer_tasks
+    assert request_id not in host._import_credits
+    assert request_id not in host._import_credit_events
+    _cleanup_host(host)
+
+
 def test_fs_reader_picks_up_a_repo_created_after_first_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -78,6 +78,8 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
+    HostImportLocalCancelFrame,
+    HostImportLocalCreditFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
     HostInstallHarnessFrame,
@@ -1251,6 +1253,12 @@ class HostProcess:
         # Status queries wait for this runner's queued launch before deciding
         # that an unregistered runner is unknown.
         self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
+        # Per-import producer credits released by the server after persistence
+        # consumes one decoded local session. These are event-loop-owned.
+        self._import_credits: dict[str, int] = {}
+        self._import_credit_events: dict[str, asyncio.Event] = {}
+        self._cancelled_imports: set[str] = set()
+        self._import_producer_tasks: dict[str, asyncio.Task[None]] = {}
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
@@ -2537,6 +2545,62 @@ class HostProcess:
             canonical_path=canonical,
         )
 
+    async def _wait_import_credit(self, request_id: str) -> None:
+        """Wait until the server releases one completed-session credit."""
+        event = self._import_credit_events[request_id]
+        if request_id in self._cancelled_imports:
+            raise asyncio.CancelledError
+        while self._import_credits.get(request_id, 0) <= 0:
+            await event.wait()
+            event.clear()
+            if request_id in self._cancelled_imports:
+                raise asyncio.CancelledError
+        self._import_credits[request_id] -= 1
+
+    def _register_import_producer(self, request_id: str, credits: int) -> None:
+        """Register flow state before an import handler task can run."""
+        self._import_credits.setdefault(request_id, credits)
+        self._import_credit_events.setdefault(request_id, asyncio.Event())
+
+    def _clear_import_producer(
+        self, request_id: str, task: asyncio.Task[None] | None = None
+    ) -> None:
+        """Drop flow state only when it still belongs to *task*."""
+        current = self._import_producer_tasks.get(request_id)
+        if task is not None and current is not task:
+            return
+        self._import_producer_tasks.pop(request_id, None)
+        self._import_credits.pop(request_id, None)
+        self._import_credit_events.pop(request_id, None)
+        self._cancelled_imports.discard(request_id)
+
+    def _release_import_credit(self, request_id: str) -> None:
+        """Return a locally consumed credit when a session was not sent."""
+        if request_id not in self._import_credits:
+            return
+        self._import_credits[request_id] += 1
+        self._import_credit_events[request_id].set()
+
+    def _handle_import_credit(self, frame: HostImportLocalCreditFrame) -> None:
+        """Apply server acknowledgement to an active local import."""
+        event = self._import_credit_events.get(frame.request_id)
+        if event is None or frame.request_id in self._cancelled_imports or frame.credits <= 0:
+            return
+        self._import_credits[frame.request_id] = (
+            self._import_credits.get(frame.request_id, 0) + frame.credits
+        )
+        event.set()
+
+    def _handle_import_cancel(self, frame: HostImportLocalCancelFrame) -> None:
+        """Wake a producer whose persistence consumer was cancelled."""
+        event = self._import_credit_events.get(frame.request_id)
+        task = self._import_producer_tasks.get(frame.request_id)
+        if event is None or task is None:
+            return
+        self._cancelled_imports.add(frame.request_id)
+        event.set()
+        task.cancel()
+
     async def _handle_import_local(
         self,
         ws: websockets.asyncio.client.ClientConnection,
@@ -2612,6 +2676,12 @@ class HostProcess:
             )
 
         try:
+            flow_control = frame.max_in_flight_sessions > 0
+            if flow_control:
+                self._register_import_producer(frame.request_id, frame.max_in_flight_sessions)
+                producer_task = asyncio.current_task()
+                if producer_task is not None:
+                    self._import_producer_tasks.setdefault(frame.request_id, producer_task)
             targets, enum_error = await asyncio.to_thread(_targets)
             if enum_error is not None:
                 await ws.send(
@@ -2628,9 +2698,17 @@ class HostProcess:
             total = len(ordered)
             failures: list[dict[str, object]] = []
             for source, session_id in ordered:
+                credit_acquired = False
                 try:
+                    if flow_control:
+                        await self._wait_import_credit(frame.request_id)
+                        credit_acquired = True
                     session, reason = await asyncio.to_thread(_load, source, session_id)
+                    if flow_control and frame.request_id in self._cancelled_imports:
+                        raise asyncio.CancelledError
                     if session is None:
+                        if credit_acquired:
+                            self._release_import_credit(frame.request_id)
                         # Unreadable/corrupt transcript: no frame to send, but
                         # report it (with a reason) on the done frame so the
                         # server's counts stay honest and the UI can explain it.
@@ -2653,6 +2731,8 @@ class HostProcess:
                     ):
                         await ws.send(text)
                 except ImportSessionChunkingUnsupportedError:
+                    if credit_acquired:
+                        self._release_import_credit(frame.request_id)
                     failures.append(
                         {
                             "external_session_id": session_id,
@@ -2664,11 +2744,15 @@ class HostProcess:
                         }
                     )
                     continue
+                except asyncio.CancelledError:
+                    raise
                 except ConnectionClosed:
                     # Dead tunnel: abort the batch (recovery is owned upstream),
                     # never a per-session skip — nothing more can be sent.
                     raise
                 except Exception:
+                    if credit_acquired:
+                        self._release_import_credit(frame.request_id)
                     # Any other failure reading, normalizing, encoding, or sending
                     # one session must not drop the rest of the batch: count it and
                     # move on so the remaining sessions still upload.
@@ -2707,6 +2791,8 @@ class HostProcess:
                         )
                     )
                 )
+        finally:
+            self._clear_import_producer(frame.request_id, asyncio.current_task())
 
     def _handle_list_dir(self, frame: HostListDirFrame) -> HostListDirResultFrame:
         """Handle a ``host.list_dir`` request from the server.
@@ -4583,7 +4669,22 @@ class HostProcess:
         :param raw: The raw text frame received off the socket.
         :returns: None.
         """
+        import_request_id: str | None = None
+        try:
+            frame = decode_host_frame(raw)
+        except ValueError:
+            frame = None
+        if isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
+            if frame.max_in_flight_sessions > 0:
+                self._register_import_producer(frame.request_id, frame.max_in_flight_sessions)
+                import_request_id = frame.request_id
+
         task = asyncio.create_task(self._run_frame_handler(ws, raw), name="host-frame")
+        if import_request_id is not None:
+            self._import_producer_tasks[import_request_id] = task
+            task.add_done_callback(
+                lambda completed: self._clear_import_producer(import_request_id, completed)
+            )
         self._frame_tasks.add(task)
         task.add_done_callback(self._frame_tasks.discard)
 
@@ -4595,6 +4696,9 @@ class HostProcess:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        for request_id, task in list(self._import_producer_tasks.items()):
+            if task in tasks:
+                self._clear_import_producer(request_id, task)
 
     async def _drain_runner_stop_tasks(self) -> None:
         """Await retained runner teardown tasks until no producer remains."""
@@ -4782,6 +4886,10 @@ class HostProcess:
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
             await ws.send(encode_host_frame(options_result))
+        elif isinstance(frame, HostImportLocalCreditFrame):
+            self._handle_import_credit(frame)
+        elif isinstance(frame, HostImportLocalCancelFrame):
+            self._handle_import_cancel(frame)
         elif isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             # Streams one host.import_local_session per session (reads run off the
             # event loop inside), then a terminal host.import_local_done.

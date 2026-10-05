@@ -19,14 +19,16 @@ from omnigent.host.frames import (
     HostImportedLocalSession,
     HostImportLocalDoneFrame,
     HostImportLocalSessionChunkFrame,
+    HostImportLocalSessionFrame,
     HostLaunchRunnerResultFrame,
     HostPluginsResultFrame,
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
 )
+from omnigent.runner.transports.ws_tunnel.frames import PongFrame, encode_frame
 from omnigent.server.auth import AuthProvider
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry, ImportLocalQueue
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.stores.host_store import HostStore
 from tests.budgets import budget
@@ -749,6 +751,67 @@ async def test_host_tunnel_caps_aggregate_chunk_reassembly_memory(
     kind, payload = await asyncio.wait_for(second.get(), timeout=2.0)
     assert kind == "session"
     assert "external_session_id" not in payload
+
+
+async def test_host_tunnel_bounds_completed_imports_without_blocking_pong(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A slow importer cannot retain two completed sessions or stall keepalives."""
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    queue = ImportLocalQueue(conn.pending_import_budget)
+    conn.pending_import_local["req_bounded"] = queue
+
+    first = HostImportedLocalSession(
+        external_session_id="s_first",
+        workspace="/repo",
+        items=[{"type": "message", "response_id": "r1", "data": {"text": "x" * 80}}],
+        source="claude",
+    )
+    second = HostImportedLocalSession(
+        external_session_id="s_second",
+        workspace="/repo",
+        items=[{"type": "message", "response_id": "r2", "data": {"text": "y" * 80}}],
+        source="claude",
+    )
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostImportLocalSessionFrame(request_id="req_bounded", total=2, session=first)
+            ),
+        }
+    )
+    first_item = await asyncio.wait_for(queue.get(), timeout=2.0)
+    assert first_item.kind == "session"
+    # Hold the first decoded payload as if persistence were still processing it.
+    conn.pending_import_budget.max_bytes = first_item.size
+
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostImportLocalSessionFrame(request_id="req_bounded", total=2, session=second)
+            ),
+        }
+    )
+    failed = await asyncio.wait_for(queue.get(), timeout=2.0)
+    assert failed.kind == "done"
+    assert failed.data["status"] == "failed"
+
+    before = conn.last_frame_at
+    await comm.send_input({"type": "websocket.receive", "text": encode_frame(PongFrame(ts=1))})
+    await asyncio.wait_for(_wait_for_frame_timestamp(conn, before), timeout=2.0)
+
+
+async def _wait_for_frame_timestamp(conn: HostConnection, previous: float) -> None:
+    """Wait until a host connection records a frame after *previous*."""
+    while conn.last_frame_at <= previous:
+        await asyncio.sleep(0.01)
 
 
 def _chunked_session(external_session_id: str, payload: str) -> HostImportedLocalSession:

@@ -10,7 +10,12 @@ import pytest
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame
-from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.host_registry import (
+    HostRegistry,
+    ImportLocalByteBudget,
+    ImportLocalQueue,
+    RunnerExitReports,
+)
 
 
 @dataclass
@@ -165,6 +170,40 @@ def test_deregister_fails_pending_import_streams() -> None:
     assert data["status"] == "failed"
     assert "disconnected mid-import" in str(data["error"])
     assert conn.pending_import_local == {}
+
+
+def test_import_queue_release_after_close_preserves_other_queue_reservations() -> None:
+    """A late consumer release cannot subtract another queue's reservation."""
+    budget = ImportLocalByteBudget(max_bytes=10)
+    first = ImportLocalQueue(budget)
+    second = ImportLocalQueue(budget)
+    first.put_nowait(("session", {}), byte_size=6)
+    second.put_nowait(("session", {}), byte_size=4)
+
+    first.close()
+    assert budget.used_bytes == 4
+    first.release(6)
+    assert budget.used_bytes == 4
+
+    second.release(4)
+    assert budget.used_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_import_queue_coalesces_progress_until_consumed() -> None:
+    """Repeated chunk progress stays bounded and resumes after consumption."""
+    queue = ImportLocalQueue(ImportLocalByteBudget(max_bytes=1))
+    queue.put_nowait(("progress", {}))
+    queue.put_nowait(("progress", {}))
+    queue.put_nowait(("progress", {}))
+    assert queue.qsize() == 1
+
+    first = await queue.get()
+    assert first.kind == "progress"
+    queue.put_nowait(("progress", {}))
+    assert queue.qsize() == 1
+    second = await queue.get()
+    assert second.kind == "progress"
 
 
 def test_register_replacement_fails_stale_pending_import_streams() -> None:
