@@ -537,7 +537,7 @@ async def test_slow_recovery_continues_without_closing_healthy_tunnel(
     )
     communicator = await _connect_route(app, _TUNNEL_PATH)
     try:
-        await _send_hello(communicator, registry)
+        await _send_hello(communicator, registry, connection_id="conn-recovery")
         await asyncio.wait_for(entered.wait(), budget(1))
 
         async def warned() -> None:
@@ -552,12 +552,19 @@ async def test_slow_recovery_continues_without_closing_healthy_tunnel(
         await asyncio.wait_for(finished.wait(), budget(1))
         assert registry.get(_RUNNER_ID) is not None
         assert not communicator.future.done()
-        outcomes = [
-            r.attributes["outcome"]
+        events = [
+            r.attributes
             for r in caplog.records
             if getattr(r, "event_name", None) == "runner_recovery"
         ]
-        assert outcomes == ["slow", "failed" if fail_recovery else "completed"]
+        assert [event["outcome"] for event in events] == [
+            "slow",
+            "failed" if fail_recovery else "completed",
+        ]
+        assert all(event["runner_id"] == _RUNNER_ID for event in events)
+        assert all(event["connection_id"] == "conn-recovery" for event in events)
+        terminal = events[-1]
+        assert isinstance(terminal["duration_s"], (int, float)) and terminal["duration_s"] >= 0
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         await communicator.wait(timeout=budget(1))
