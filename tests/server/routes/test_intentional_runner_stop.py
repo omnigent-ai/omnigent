@@ -343,6 +343,54 @@ async def test_stop_arriving_during_status_lookup_matches_the_departed_runner(
         await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=10)
 
 
+@pytest.mark.parametrize("rebound", [False, True])
+async def test_binding_lookup_failure_does_not_abort_offline_sweep(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    rebound: bool,
+) -> None:
+    store, ids = family
+    child_id = ids["active"]
+    snapshot = store.get_conversation(child_id)
+    if rebound:
+        store.replace_runner_id(child_id, "runner-replacement")
+    sessions._intentional_stop_sessions[child_id] = "runner-replacement"
+    sessions._intentional_stop_sessions[ids["cold"]] = _RUNNER
+    lookup = store.get_runner_liveness
+
+    def unavailable(_session_id):
+        raise RuntimeError("runner binding lookup unavailable")
+
+    monkeypatch.setattr(store, "get_runner_liveness", unavailable)
+    error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
+    await sessions._mark_runner_sessions_offline(
+        [snapshot, store.get_conversation(ids["cold"]), store.get_conversation(ids["grandchild"])],
+        error,
+        store,
+    )
+    assert sessions._intentional_stop_sessions[child_id] == "runner-replacement"
+    assert sessions._session_status_cache[child_id] == "running"
+    assert store.get_conversation(child_id).live_status == "running"
+    assert sessions._session_status_cache[ids["cold"]] == "idle"
+    assert ids["cold"] not in sessions._intentional_stop_sessions
+    assert sessions._session_status_cache[ids["grandchild"]] == "failed"
+    assert (
+        sessions._last_task_error_from_labels(store.get_conversation(ids["grandchild"]).labels)[
+            "code"
+        ]
+        == "runner_disconnected"
+    )
+
+    monkeypatch.setattr(store, "get_runner_liveness", lookup)
+    await sessions._mark_runner_sessions_offline([snapshot], error, store)
+    if rebound:
+        assert sessions._session_status_cache[child_id] == "running"
+        assert sessions._intentional_stop_sessions[child_id] == "runner-replacement"
+    else:
+        assert sessions._session_status_cache[child_id] == "failed"
+        assert child_id not in sessions._intentional_stop_sessions
+
+
 @pytest.mark.parametrize("stopped_runner", [_RUNNER, "runner-replacement"])
 @pytest.mark.parametrize("with_relay", [False, True])
 async def test_old_runner_sweep_preserves_rebound_session(

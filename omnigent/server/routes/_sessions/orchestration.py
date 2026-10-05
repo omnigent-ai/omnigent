@@ -3655,7 +3655,16 @@ async def _mark_runner_sessions_offline_impl(
                 _intentional_stop_sessions.pop(conv.id, None)
             continue
         if stopped_runner_id is not None and stopped_runner_id != conv.runner_id:
-            binding = await asyncio.to_thread(conversation_store.get_runner_liveness, conv.id)
+            try:
+                binding = await asyncio.to_thread(conversation_store.get_runner_liveness, conv.id)
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Cannot resolve runner binding for %s during offline sweep",
+                    conv.id,
+                    exc_info=True,
+                    extra={"session_id": conv.id},
+                )
+                continue
             if binding is None or binding[0] != conv.runner_id:
                 continue
             if _intentional_stop_sessions.get(conv.id) == stopped_runner_id:

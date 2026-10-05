@@ -370,51 +370,47 @@ def test_native_parent_teardown_preserves_child_outcome(
             time.sleep(
                 max(0, RUNNER_DISCONNECT_GRACE_S + 5 - (time.monotonic() - disconnected_at))
             )
-            evidence = {
-                "commit": subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], cwd=_REPO, text=True
-                ).strip(),
-                "test_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                "harness_version": subprocess.check_output(
-                    [harness, "--version"], text=True
-                ).strip(),
-                "harness": harness,
-                "action": action,
-                "parent_id": parent_id,
-                "child_id": child_id,
-                "runner_id": parent["runner_id"],
-                "before": before,
-                "events": stream.events,
-                "labels_after": _get(client, f"/v1/sessions/{child_id}/labels"),
-                "elapsed_s": time.monotonic() - stopped_at,
-                "offline_elapsed_s": time.monotonic() - disconnected_at,
-            }
-            (tmp_path / "evidence.json").write_text(json.dumps(evidence, indent=2))
-            stream.check_error()
-            failures = [
-                e
-                for e in stream.events
-                if e.get("status") == "failed" or e.get("type") == "response.failed"
-            ]
-            print(
-                json.dumps(
-                    {
-                        "harness": harness,
-                        "action": action,
-                        "before_status": before["status"],
-                        "native_session_id": before["external_session_id"],
-                        "failures": failures,
-                        "evidence": str(tmp_path / "evidence.json"),
-                    }
-                ),
-                flush=True,
-            )
-            if action == "crash":
-                assert failures, "An unexpected runner death must still fail an active child"
-            else:
-                assert not failures, f"Intentional {action} failed the child: {failures}"
-            after = _get(client, f"/v1/sessions/{child_id}")
-            if action == "crash":
-                assert after["status"] == "failed" and after["last_task_error"], after
-            else:
-                assert after["status"] == "idle" and after["last_task_error"] is None, after
+        events = list(stream.events)
+        evidence = {
+            "commit": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=_REPO, text=True
+            ).strip(),
+            "test_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "harness_version": subprocess.check_output([harness, "--version"], text=True).strip(),
+            "harness": harness,
+            "action": action,
+            "parent_id": parent_id,
+            "child_id": child_id,
+            "runner_id": parent["runner_id"],
+            "before": before,
+            "events": events,
+            "labels_after": _get(client, f"/v1/sessions/{child_id}/labels"),
+            "elapsed_s": time.monotonic() - stopped_at,
+            "offline_elapsed_s": time.monotonic() - disconnected_at,
+        }
+        (tmp_path / "evidence.json").write_text(json.dumps(evidence, indent=2))
+        failures = [
+            e for e in events if e.get("status") == "failed" or e.get("type") == "response.failed"
+        ]
+        print(
+            json.dumps(
+                {
+                    "harness": harness,
+                    "action": action,
+                    "before_status": before["status"],
+                    "native_session_id": before["external_session_id"],
+                    "failures": failures,
+                    "evidence": str(tmp_path / "evidence.json"),
+                }
+            ),
+            flush=True,
+        )
+        if action == "crash":
+            assert failures, "An unexpected runner death must still fail an active child"
+        else:
+            assert not failures, f"Intentional {action} failed the child: {failures}"
+        after = _get(client, f"/v1/sessions/{child_id}")
+        if action == "crash":
+            assert after["status"] == "failed" and after["last_task_error"], after
+        else:
+            assert after["status"] == "idle" and after["last_task_error"] is None, after

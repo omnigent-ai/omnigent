@@ -3936,6 +3936,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 decoded = decode_session_live_status(status) if status is not None else None
             except ValueError:
                 # A newer replica's status must not discard the rest of this page.
+                _logger.debug(
+                    "Unknown live status %r for session %s during runner teardown",
+                    status,
+                    session_id,
+                )
                 decoded = None
             statuses.append((session_id, decoded))
         return statuses
