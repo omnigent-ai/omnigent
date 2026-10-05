@@ -84,6 +84,7 @@ from omnigent.entities import (
     ConversationItem,
     NewConversationItem,
     PagedList,
+    bumps_conversation_activity,
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
@@ -2487,9 +2488,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                         if item.stable_id is not None
                     ]
 
-            # Bump updated_at on the conversation.
+            # Bump updated_at on the conversation — but only when an inserted
+            # item represents real activity. A batch of purely activity-neutral
+            # appends (resource lifecycle events on reconnect, meta messages)
+            # must not reorder the session to the top of the sidebar or light
+            # its unread badge. Dedup'd items don't count: they weren't inserted
+            # (the all-duplicate batch already returned above).
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if conv_row is not None:
+            inserted_items = [
+                item
+                for item in items
+                if item.stable_id is None or item.stable_id not in existing_by_id
+            ]
+            if conv_row is not None and any(
+                bumps_conversation_activity(item) for item in inserted_items
+            ):
                 conv_row.updated_at = now
 
             # Allocate item positions from the conversation's maintained

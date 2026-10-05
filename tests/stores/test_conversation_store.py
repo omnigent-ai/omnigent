@@ -2573,6 +2573,125 @@ def test_append_bumps_updated_at(
     )
 
 
+def test_append_resource_event_does_not_bump_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A resource lifecycle event is activity-neutral: it persists but must not
+    advance updated_at, which would reorder the session to the top of the
+    sidebar and light its unread badge for a reconnect-driven event.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="resource_event",
+                response_id="resp_res",
+                data=ResourceEventData(
+                    event_type="session.resource.created",
+                    resource_id="terminal_bash_s1",
+                    resource_type="terminal",
+                ),
+            ),
+        ],
+    )
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000, (
+        f"A resource_event append must not bump updated_at; got {fetched.updated_at}."
+    )
+    # The item is still persisted — only the bump is skipped.
+    assert len(conversation_store.list_items(conv.id).data) == 1
+
+
+def test_append_meta_message_does_not_bump_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A meta message (durable context replayed to the agent but hidden from the
+    transcript) is activity-neutral and must not advance updated_at.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_meta",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "injected context"}],
+                    is_meta=True,
+                ),
+            ),
+        ],
+    )
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000, (
+        f"A meta message must not bump updated_at; got {fetched.updated_at}."
+    )
+
+
+def test_append_mixed_batch_still_bumps_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A batch that mixes an activity-neutral item with a real message still bumps:
+    the real message is genuine activity.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="resource_event",
+                response_id="resp_mix",
+                data=ResourceEventData(
+                    event_type="session.resource.created",
+                    resource_id="file_abc123",
+                    resource_type="file",
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_mix",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hi"}],
+                ),
+            ),
+        ],
+    )
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 2000, (
+        f"A batch containing a real message must bump updated_at; got {fetched.updated_at}."
+    )
+
+
 def test_update_title_bumps_updated_at(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
