@@ -11,7 +11,12 @@ import type { CanvasSessions } from "@/canvas/canvasSessions";
 import { useCanvasSessions } from "@/canvas/canvasSessions";
 import type * as conversationsHook from "@/hooks/useConversations";
 import { useProjects, type Conversation } from "@/hooks/useConversations";
-import { fetchDeckSearch, fetchKitIndicator } from "@/lib/designDeckApi";
+import {
+  fetchDeckSearch,
+  fetchDesignIndex,
+  fetchKitIndicator,
+  reconcileDesignIndex,
+} from "@/lib/designDeckApi";
 import { DesignPage } from "./DesignPage";
 
 vi.mock("@/canvas/canvasSessions", async (importActual) => ({
@@ -23,7 +28,12 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useProjects: vi.fn(),
 }));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "me" }));
-vi.mock("@/lib/designDeckApi", () => ({ fetchDeckSearch: vi.fn(), fetchKitIndicator: vi.fn() }));
+vi.mock("@/lib/designDeckApi", () => ({
+  fetchDeckSearch: vi.fn(),
+  fetchDesignIndex: vi.fn(),
+  fetchKitIndicator: vi.fn(),
+  reconcileDesignIndex: vi.fn(),
+}));
 vi.mock("./design/DesignStudio", () => ({
   LIVE_QUERY: { staleTime: 0, refetchOnMount: true, refetchOnWindowFocus: true },
   DesignStudio: (props: {
@@ -72,6 +82,8 @@ const sessionsMock = vi.mocked(useCanvasSessions);
 const projectsMock = vi.mocked(useProjects);
 const searchMock = vi.mocked(fetchDeckSearch);
 const kitMock = vi.mocked(fetchKitIndicator);
+const indexMock = vi.mocked(fetchDesignIndex);
+const reconcileMock = vi.mocked(reconcileDesignIndex);
 const refreshMock = vi.fn(async () => {});
 
 function row(id: string, updatedAt: number, overrides: Partial<Conversation> = {}): Conversation {
@@ -132,6 +144,8 @@ function group(label: string): HTMLElement {
 beforeEach(() => {
   projectsMock.mockReturnValue({ data: [] } as unknown as ReturnType<typeof useProjects>);
   kitMock.mockResolvedValue({ status: "none" });
+  indexMock.mockResolvedValue(null);
+  reconcileMock.mockResolvedValue(undefined);
   refreshMock.mockClear();
 });
 
@@ -415,5 +429,57 @@ describe("DesignPage studio routing", () => {
     fireEvent.click(screen.getByRole("button", { name: "studio-back" }));
     expect(at()).toBe("/design");
     expect(await screen.findByRole("region", { name: "a" })).toBeInTheDocument();
+  });
+});
+
+describe("DesignPage server index", () => {
+  const indexed = (sessionId: string, path: string, workspace: string) => ({
+    session_id: sessionId,
+    path,
+    kind: "deck" as const,
+    updated_at: 9,
+    session_title: `Indexed ${sessionId}`,
+    workspace,
+  });
+
+  it("scans every recent session and never reconciles without the index", async () => {
+    stubSessions([row("a", 2), row("asleep", 1, { runner_online: false })]);
+    searchMock.mockResolvedValue({ status: "ok", paths: ["q3.slides.html"] });
+
+    renderPage();
+
+    expect(await within(group("asleep")).findByText("q3")).toBeInTheDocument();
+    expect(searchMock).toHaveBeenCalledWith("a");
+    expect(searchMock).toHaveBeenCalledWith("asleep");
+    expect(reconcileMock).not.toHaveBeenCalled();
+  });
+
+  it("scans only live sessions, reconciles them, and lists offline ones from the index", async () => {
+    stubSessions([row("a", 2), row("asleep", 1, { runner_online: false })]);
+    indexMock.mockResolvedValue([
+      indexed("asleep", "decks/old.slides.html", "/work/asleep"),
+      indexed("a", "decks/stale.slides.html", "/work/a"),
+      indexed("ancient", "pitch.slides.html", "/work/ancient"),
+    ]);
+    searchMock.mockResolvedValue({
+      status: "ok",
+      paths: ["decks/q3.slides.html", "node_modules/x/y.slides.html"],
+    });
+
+    renderPage();
+
+    expect(await within(group("a")).findByText("q3")).toBeInTheDocument();
+    expect(within(group("a")).queryByText("stale")).toBeNull();
+    expect(searchMock).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(reconcileMock).toHaveBeenCalledWith("a", ["decks/q3.slides.html"]));
+
+    const asleep = group("asleep");
+    expect(within(asleep).getByText(/Unavailable/)).toBeInTheDocument();
+    expect(within(asleep).getByRole("link", { name: /old/ })).toHaveAttribute(
+      "href",
+      expect.stringContaining("session=asleep"),
+    );
+    expect(within(group("ancient")).getByText("Indexed ancient")).toBeInTheDocument();
+    expect(kitMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -6,11 +6,14 @@ import {
   buildDesignGroups,
   deckName,
   filterDesignGroups,
+  indexDesignGroups,
   isDeckPath,
   isDesignListEmpty,
+  isSessionLive,
   kitIndicator,
   selectDesignWorkspaces,
   type DeckSearchState,
+  type DesignIndexEntry,
 } from "./designDecks";
 
 function row(id: string, updatedAt: number, overrides: Partial<Conversation> = {}): Conversation {
@@ -271,5 +274,86 @@ describe("filterDesignGroups", () => {
 
   it("drops groups that are not ready while searching", () => {
     expect(filterDesignGroups(groups, "offline")).toEqual([]);
+  });
+});
+
+function indexed(
+  sessionId: string,
+  path: string,
+  updatedAt: number,
+  workspace = `/work/${sessionId}`,
+): DesignIndexEntry {
+  return {
+    session_id: sessionId,
+    path,
+    kind: "deck",
+    updated_at: updatedAt,
+    session_title: `Indexed ${sessionId}`,
+    workspace,
+  };
+}
+
+describe("isSessionLive", () => {
+  it("is live unless the runner is known offline with no live host", () => {
+    expect(isSessionLive(row("a", 1))).toBe(true);
+    expect(isSessionLive(row("a", 1, { runner_online: true }))).toBe(true);
+    expect(isSessionLive(row("a", 1, { runner_online: false, host_online: true }))).toBe(true);
+    expect(isSessionLive(row("a", 1, { runner_online: false }))).toBe(false);
+  });
+});
+
+describe("indexDesignGroups", () => {
+  it("groups indexed decks by workspace, skipping workspaces the scan covers", () => {
+    const scanned = selectDesignWorkspaces([row("live", 5)], NO_PROJECTS, null);
+    const groups = indexDesignGroups(
+      [
+        indexed("old", "decks/b.slides.html", 9),
+        indexed("live", "decks/live.slides.html", 8),
+        indexed("old2", "decks/b.slides.html", 7, "/work/old/"),
+        indexed("old2", "decks/a.slides.html", 6, "/work/old"),
+        indexed("old", ".worktrees/x/c.slides.html", 5),
+        indexed("gone", "decks/z.slides.html", 4, ""),
+      ],
+      scanned,
+      [],
+      NO_PROJECTS,
+      null,
+    );
+
+    expect(groups).toHaveLength(1);
+    const [group] = groups;
+    expect(group.status).toBe("indexed");
+    expect(group.offline).toBe(true);
+    expect(group.workspace.label).toBe("old");
+    expect(group.decks).toEqual([
+      { sessionId: "old2", path: "decks/a.slides.html", name: "a", sessionTitle: "Indexed old2" },
+      { sessionId: "old", path: "decks/b.slides.html", name: "b", sessionTitle: "Indexed old" },
+    ]);
+  });
+
+  it("uses the loaded session for its label and liveness", () => {
+    const projects = [{ id: "p1", name: "Launch" }] as ProjectSummary[];
+    const loaded = row("far", 1, { title: "Far session", project_id: "p1" });
+    const [group] = indexDesignGroups(
+      [indexed("far", "q.slides.html", 3)],
+      [],
+      [loaded],
+      projects,
+      "me",
+    );
+    expect(group.workspace.label).toBe("Launch");
+    expect(group.offline).toBe(false);
+    expect(group.decks[0].sessionTitle).toBe("Far session");
+  });
+
+  it("keeps indexed groups searchable", () => {
+    const groups = indexDesignGroups(
+      [indexed("old", "pitch.slides.html", 1)],
+      [],
+      [],
+      NO_PROJECTS,
+      null,
+    );
+    expect(filterDesignGroups(groups, "pitch")).toHaveLength(1);
   });
 });

@@ -8,7 +8,7 @@ import { DESIGN_KIT_MAX_BYTES, parseDesignKit, type KitFile } from "@/shell/code
 import { conversationDisplayLabel, sessionBelongsToProject } from "@/shell/sidebarNav";
 import type { DesignSystemKind } from "./designSystem";
 
-/** Only this many recent sessions are scanned; a server index replaces the scan later. */
+/** Only this many recent sessions are scanned; the server index lists the rest. */
 export const DESIGN_SESSION_CAP = 50;
 export const DECK_SUFFIX = ".slides.html";
 /** The search endpoint needs a name substring; the glob narrows it to decks. */
@@ -50,12 +50,25 @@ export type DeckSearchState =
 
 export interface DesignGroup {
   workspace: DesignWorkspace;
-  status: "loading" | "ready" | "unavailable" | "error";
+  /** `indexed`: listed from the server index, not scanned. */
+  status: "loading" | "ready" | "unavailable" | "error" | "indexed";
   decks: DesignDeck[];
   kit: KitIndicatorState;
   /** True when the workspace search may have missed decks past the result cap. */
   truncated: boolean;
   error?: string;
+  /** An indexed group whose session has no live runner or host. */
+  offline?: boolean;
+}
+
+/** One deck from the server index (`GET /v1/design/artifacts`). */
+export interface DesignIndexEntry {
+  session_id: string;
+  path: string;
+  kind: "deck" | "wireframe";
+  updated_at: number;
+  session_title: string | null;
+  workspace: string | null;
 }
 
 function trimSlashes(path: string): string {
@@ -86,10 +99,24 @@ export function selectDesignWorkspaces(
     if (!session.workspace) continue;
     const path = trimSlashes(session.workspace);
     if (byPath.has(path)) continue;
-    const project = projects.find((p) => sessionBelongsToProject(session, p, viewerId));
-    byPath.set(path, { path, session, label: project?.name ?? folderName(path) });
+    byPath.set(path, { path, session, label: workspaceLabel(session, path, projects, viewerId) });
   }
   return [...byPath.values()];
+}
+
+/** Whether a session's files can be read now; unknown liveness counts as live. */
+export function isSessionLive(session: Conversation): boolean {
+  return session.runner_online !== false || session.host_online === true;
+}
+
+function workspaceLabel(
+  session: Conversation,
+  path: string,
+  projects: readonly ProjectSummary[],
+  viewerId: string | null,
+): string {
+  const project = projects.find((p) => sessionBelongsToProject(session, p, viewerId));
+  return project?.name ?? folderName(path);
 }
 
 /** A `*.slides.html` file outside nested worktrees and dependencies. */
@@ -172,6 +199,60 @@ export function buildDesignGroups(
 }
 
 /**
+ * Groups for indexed decks in workspaces the scan does not cover, in index
+ * order (newest first). A deck found through several sessions is listed once,
+ * through the newest. No reads run for these groups.
+ */
+export function indexDesignGroups(
+  entries: readonly DesignIndexEntry[],
+  scanned: readonly DesignWorkspace[],
+  sessions: readonly Conversation[],
+  projects: readonly ProjectSummary[],
+  viewerId: string | null,
+): DesignGroup[] {
+  const covered = new Set(scanned.map((w) => w.path));
+  const loaded = new Map(sessions.map((s) => [s.id, s]));
+  const groups = new Map<string, DesignGroup>();
+  for (const entry of entries) {
+    if (!entry.workspace || !isDeckPath(entry.path)) continue;
+    const path = trimSlashes(entry.workspace);
+    if (covered.has(path)) continue;
+    const known = loaded.get(entry.session_id);
+    const session: Conversation = known ?? {
+      id: entry.session_id,
+      object: "conversation",
+      title: entry.session_title,
+      created_at: 0,
+      updated_at: entry.updated_at,
+      labels: {},
+      permission_level: null,
+      workspace: entry.workspace,
+    };
+    let group = groups.get(path);
+    if (!group) {
+      const label = workspaceLabel(session, path, projects, viewerId);
+      group = {
+        workspace: { path, session, label },
+        status: "indexed",
+        decks: [],
+        kit: { status: "none" },
+        offline: !known || !isSessionLive(known),
+      };
+      groups.set(path, group);
+    }
+    if (group.decks.some((deck) => deck.path === entry.path)) continue;
+    group.decks.push({
+      sessionId: entry.session_id,
+      path: entry.path,
+      name: deckName(entry.path),
+      sessionTitle: conversationDisplayLabel(session),
+    });
+  }
+  for (const group of groups.values()) group.decks.sort((a, b) => a.path.localeCompare(b.path));
+  return [...groups.values()];
+}
+
+/**
  * Landing search: a group whose workspace label or session title matches keeps
  * all its decks, otherwise only decks whose name matches. Non-ready groups have
  * nothing to match and are dropped while searching.
@@ -181,7 +262,7 @@ export function filterDesignGroups(groups: DesignGroup[], query: string): Design
   if (!q) return groups;
   const has = (text: string) => text.toLowerCase().includes(q);
   return groups.flatMap((group) => {
-    if (group.status !== "ready") return [];
+    if (group.status !== "ready" && group.status !== "indexed") return [];
     if (has(group.workspace.label)) return [group];
     const decks = group.decks.filter((deck) => has(deck.name) || has(deck.sessionTitle));
     return decks.length > 0 ? [{ ...group, decks }] : [];

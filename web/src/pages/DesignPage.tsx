@@ -2,14 +2,16 @@
  * Design page (`/design`): a landing of every slide deck agents produced
  * across recent sessions, and a studio for one deck.
  *
- * - Landing: deck cards grouped by workspace (phase 1 data flow), a search,
- *   suggestion chips, and New design, which creates a session in place.
+ * - Landing: deck cards grouped by workspace, a search, suggestion chips, and
+ *   New design, which creates a session in place. The server deck index lists
+ *   decks; live sessions are scanned and reconciled into it. Without the
+ *   index, every recent session is scanned (phase 1 data flow).
  * - Studio (`?session=&file=`, plus `view=full` or the phone's `view=chat`):
  *   the session's compact chat beside the live deck preview.
  */
 
 import { useMemo, useState } from "react";
-import { useQueries, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
   PaletteIcon,
@@ -24,12 +26,20 @@ import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type ProjectSummary } from "@/hooks/useConversations";
 import { useViewerId } from "@/hooks/useViewerId";
-import { fetchDeckSearch, fetchKitIndicator, type DeckSearchResult } from "@/lib/designDeckApi";
+import {
+  fetchDeckSearch,
+  fetchDesignIndex,
+  fetchKitIndicator,
+  reconcileDesignIndex,
+  type DeckSearchResult,
+} from "@/lib/designDeckApi";
 import {
   buildDesignGroups,
   filterDesignGroups,
+  indexDesignGroups,
   isDeckPath,
   isDesignListEmpty,
+  isSessionLive,
   selectDesignWorkspaces,
   type DeckSearchState,
   type DesignDeck,
@@ -50,7 +60,7 @@ import { NewDesignDialog } from "./design/NewDesignDialog";
 const KIT_INSTRUCTIONS_URL =
   "https://github.com/omnigent-ai/omnigent/blob/main/examples/design-kits/sample/README.md";
 const EMPTY_PROJECTS: ProjectSummary[] = [];
-const QUERY_KEYS = ["design-deck-search", "design-kit", "design-deck"] as const;
+const QUERY_KEYS = ["design-index", "design-deck-search", "design-kit", "design-deck"] as const;
 
 /** Router state on landing links, so Back can pop history instead of pushing. */
 interface DesignLocationState {
@@ -113,14 +123,31 @@ function DesignLanding() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [prefill, setPrefill] = useState<string | undefined>(undefined);
 
+  const indexQuery = useQuery({
+    queryKey: ["design-index"],
+    queryFn: fetchDesignIndex,
+    retry: false,
+    ...LIVE_QUERY,
+  });
+  const indexSettled = !indexQuery.isPending;
+  const index = indexQuery.data ?? null;
+  // With the index, only sessions that can answer are scanned; it lists the rest.
   const workspaces = useMemo(
-    () => selectDesignWorkspaces(sessions, projects, viewerId),
-    [sessions, projects, viewerId],
+    () =>
+      selectDesignWorkspaces(index ? sessions.filter(isSessionLive) : sessions, projects, viewerId),
+    [index, sessions, projects, viewerId],
   );
   const searches = useQueries({
     queries: workspaces.map((workspace) => ({
       queryKey: ["design-deck-search", workspace.session.id],
-      queryFn: () => fetchDeckSearch(workspace.session.id),
+      queryFn: async () => {
+        const result = await fetchDeckSearch(workspace.session.id);
+        if (index && result.status === "ok") {
+          void reconcileDesignIndex(workspace.session.id, result.paths.filter(isDeckPath));
+        }
+        return result;
+      },
+      enabled: indexSettled,
       retry: false,
       ...LIVE_QUERY,
     })),
@@ -138,17 +165,20 @@ function DesignLanding() {
       };
     }),
   });
-  const groups = buildDesignGroups(
-    workspaces,
-    searchStates,
-    kits.map((kit) => kit.data),
-  );
+  const groups = [
+    ...buildDesignGroups(
+      workspaces,
+      searchStates,
+      kits.map((kit) => kit.data),
+    ),
+    ...(index ? indexDesignGroups(index, workspaces, sessions, projects, viewerId) : []),
+  ];
   const visibleGroups = filterDesignGroups(groups, query);
-  const empty = isDesignListEmpty(groups, loaded && !loadingMore && !error);
+  const empty = isDesignListEmpty(groups, loaded && !loadingMore && !error && indexSettled);
 
   const retrySearch = (sessionId: string) => {
-    const index = workspaces.findIndex((workspace) => workspace.session.id === sessionId);
-    void searches[index]?.refetch();
+    const i = workspaces.findIndex((workspace) => workspace.session.id === sessionId);
+    void searches[i]?.refetch();
   };
   const refreshAll = () => {
     void refresh();
@@ -264,17 +294,6 @@ function DeckGroup({
         >
           <div className="h-16 rounded-lg bg-muted" />
         </div>
-      ) : group.status === "unavailable" ? (
-        <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-          <span>Unavailable: open the session to start its runner</span>
-          <Link
-            to={`/c/${encodeURIComponent(sessionId)}`}
-            className="text-foreground underline underline-offset-2"
-            componentId="design.group.open_session"
-          >
-            Open session
-          </Link>
-        </div>
       ) : group.status === "error" ? (
         <ErrorRow
           message={`Search failed: ${group.error ?? ""}`}
@@ -282,6 +301,18 @@ function DeckGroup({
         />
       ) : (
         <>
+          {(group.status === "unavailable" || group.offline) && (
+            <div className="mb-2 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+              <span>Unavailable: open the session to start its runner</span>
+              <Link
+                to={`/c/${encodeURIComponent(sessionId)}`}
+                className="text-foreground underline underline-offset-2"
+                componentId="design.group.open_session"
+              >
+                Open session
+              </Link>
+            </div>
+          )}
           {group.decks.length > 0 && (
             <ul className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
               {group.decks.map((deck) => (

@@ -1,11 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import * as workspaceFiles from "@/hooks/useWorkspaceChangedFiles";
-import { fetchDeckSearch, fetchKitIndicator } from "./designDeckApi";
+import {
+  fetchDeckSearch,
+  fetchDesignIndex,
+  fetchKitIndicator,
+  reconcileDesignIndex,
+} from "./designDeckApi";
+import { authenticatedFetch } from "./identity";
 
 const { requestWorkspaceFileSearch } = workspaceFiles;
 
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
+vi.mock("./identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importActual) => ({
   ...(await importActual<typeof workspaceFiles>()),
   requestWorkspaceFileSearch: vi.fn(),
@@ -13,6 +20,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importActual) => ({
 
 const searchMock = vi.mocked(requestWorkspaceFileSearch);
 const contentMock = vi.mocked(fetchFileContent);
+const fetchMock = vi.mocked(authenticatedFetch);
 
 function response(status: number, body: unknown = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -28,6 +36,7 @@ function entry(path: string, type = "file") {
 beforeEach(() => {
   searchMock.mockReset();
   contentMock.mockReset();
+  fetchMock.mockReset();
 });
 
 describe("fetchDeckSearch", () => {
@@ -154,5 +163,46 @@ describe("fetchKitIndicator", () => {
       status: "invalid",
       reason: "500 Server Error",
     });
+  });
+});
+
+describe("fetchDesignIndex", () => {
+  const indexed = {
+    session_id: "conv_a",
+    path: "q3.slides.html",
+    kind: "deck",
+    updated_at: 5,
+    session_title: "Review",
+    workspace: "/work/a",
+  };
+
+  it("returns the indexed decks", async () => {
+    fetchMock.mockResolvedValue(response(200, { object: "list", data: [indexed] }));
+    expect(await fetchDesignIndex()).toEqual([indexed]);
+    expect(fetchMock).toHaveBeenCalledWith("/v1/design/artifacts?kind=deck");
+  });
+
+  it("returns null when the server has no index, so the page falls back to the scan", async () => {
+    fetchMock.mockResolvedValue(response(404, { detail: "not found" }));
+    expect(await fetchDesignIndex()).toBeNull();
+    fetchMock.mockResolvedValue(response(500));
+    expect(await fetchDesignIndex()).toBeNull();
+  });
+});
+
+describe("reconcileDesignIndex", () => {
+  it("replaces the session's deck rows with the scan's paths", async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
+    await reconcileDesignIndex("conv a", ["q3.slides.html"]);
+    expect(fetchMock).toHaveBeenCalledWith("/v1/sessions/conv%20a/design-artifacts", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths: ["q3.slides.html"], kind: "deck" }),
+    });
+  });
+
+  it("swallows failures; the index is best-effort", async () => {
+    fetchMock.mockRejectedValue(new Error("offline"));
+    await expect(reconcileDesignIndex("conv_a", [])).resolves.toBeUndefined();
   });
 });
