@@ -9,12 +9,21 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHosts, type Host } from "@/hooks/useHosts";
+import { fetchFileContent } from "@/hooks/useFileContent";
+import { writeFileContent } from "@/hooks/useWriteFileContent";
+import {
+  readRecentDesignSystems,
+  rememberDesignSystem,
+  serializeDesignSystemPointer,
+} from "@/lib/designSystem";
 import { readDesignDefaults, rememberDesignDefaults } from "@/lib/designStudio";
 import { nativeWrapperLabelsForAgent } from "@/lib/nativeCodingAgents";
 import { createSession, postEvent } from "@/lib/sessionsApi";
 import { testAgent } from "@/test/agentFixtures";
 import { NewDesignDialog } from "./NewDesignDialog";
 
+vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
+vi.mock("@/hooks/useWriteFileContent", () => ({ writeFileContent: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
@@ -58,6 +67,7 @@ const DESK: Host = { host_id: "host_2", name: "desk", owner: "me", status: "offl
 
 const createMock = vi.mocked(createSession);
 const postMock = vi.mocked(postEvent);
+const writeMock = vi.mocked(writeFileContent);
 const filesystemMock = vi.mocked(useHostFilesystem);
 let listings: Record<string, string[] | "missing">;
 
@@ -112,6 +122,8 @@ beforeEach(() => {
   );
   createMock.mockResolvedValue({ id: "conv_new" } as Awaited<ReturnType<typeof createSession>>);
   postMock.mockResolvedValue({ queued: true } as Awaited<ReturnType<typeof postEvent>>);
+  writeMock.mockResolvedValue(undefined);
+  vi.mocked(fetchFileContent).mockRejectedValue(new Error("404 Not Found"));
 });
 
 afterEach(() => {
@@ -293,5 +305,132 @@ describe("NewDesignDialog kit hint", () => {
     listings["/work/site/.omnigent/design-kit"] = "missing";
     renderDialog();
     expect(screen.getByText("No kit")).toBeInTheDocument();
+  });
+});
+
+describe("NewDesignDialog design system", () => {
+  const ACME = { path: "/brand/acme", kind: "full" as const, name: "Acme" };
+  beforeEach(() => rememberDesignDefaults("ag_claude", "host_1", "/work/site"));
+
+  const trigger = () => screen.getByTestId("design-system-trigger");
+  function openSystems() {
+    fireEvent.pointerDown(trigger(), new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(trigger());
+  }
+  function chooseSystemFolder() {
+    openSystems();
+    fireEvent.click(screen.getByRole("option", { name: "Choose folder" }));
+    fireEvent.click(screen.getByRole("button", { name: "pick-folder" }));
+  }
+  const sentText = () =>
+    (postMock.mock.calls[0][1] as { data: { content: { text: string }[] } }).data.content[0].text;
+
+  it("offers None, the folder kit, this host's recents, and Choose folder", () => {
+    listings["/work/site/.omnigent/design-kit"] = ["kit.json"];
+    rememberDesignSystem("host_1", ACME);
+    rememberDesignSystem("host_2", { path: "/other", kind: "skill", name: "Other" });
+    renderDialog();
+    expect(trigger()).toHaveTextContent("Folder kit");
+    openSystems();
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "None",
+      "Folder kit",
+      "Acme (full)",
+      "Choose folder",
+    ]);
+  });
+
+  it("defaults to the host's most recent system without a kit, else None", () => {
+    rememberDesignSystem("host_1", ACME);
+    const { unmount } = renderDialog();
+    expect(trigger()).toHaveTextContent("Acme (full)");
+    unmount();
+    localStorage.removeItem("omnigent.design.systems");
+    renderDialog();
+    expect(trigger()).toHaveTextContent("None");
+  });
+
+  it("accepts a chosen folder with SKILL.md as a skill-only system", () => {
+    listings["/work/picked"] = ["SKILL.md", "README.md"];
+    renderDialog();
+    chooseSystemFolder();
+    expect(trigger()).toHaveTextContent("picked (skill)");
+    expect(screen.queryByText(/Not a design system/)).toBeNull();
+  });
+
+  it("rejects a chosen folder without markers", () => {
+    listings["/work/picked"] = ["kit.json", "notes.md"];
+    renderDialog();
+    chooseSystemFolder();
+    expect(screen.getByText("Not a design system: no SKILL.md or _ds_manifest.json")).toBeVisible();
+    expect(trigger()).toHaveTextContent("None");
+  });
+
+  it("writes the pointer with the resolved name, then sends the instruction", async () => {
+    listings["/work/picked"] = ["_ds_manifest.json", "SKILL.md"];
+    vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
+      if (path === "/work/picked/_ds_manifest.json") {
+        return { encoding: "utf-8", content: '{"namespace":"Picked Brand"}' } as never;
+      }
+      throw new Error("404 Not Found");
+    });
+    const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+    chooseSystemFolder();
+    create();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+
+    const ref = { path: "/work/picked", kind: "full", name: "Picked Brand" } as const;
+    expect(fetchFileContent).toHaveBeenCalledWith("conv_new", "/work/picked/_ds_manifest.json");
+    expect(writeMock).toHaveBeenCalledWith(
+      "conv_new",
+      ".omnigent/design-system.json",
+      serializeDesignSystemPointer(ref),
+    );
+    expect(writeMock.mock.invocationCallOrder[0]).toBeLessThan(
+      postMock.mock.invocationCallOrder[0],
+    );
+    expect(sentText()).toContain(
+      "Follow the design system at `/work/picked` (`full`). Read its SKILL.md first.",
+    );
+    expect(readRecentDesignSystems("host_1")).toEqual([ref]);
+  });
+
+  it("keeps a recent's name when the system files cannot be read", async () => {
+    rememberDesignSystem("host_1", ACME);
+    vi.mocked(fetchFileContent).mockRejectedValue(new Error("403 Forbidden"));
+    const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+    create();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(writeMock).toHaveBeenCalledWith(
+      "conv_new",
+      ".omnigent/design-system.json",
+      serializeDesignSystemPointer(ACME),
+    );
+  });
+
+  it("keeps the dialog and the prompt when the pointer write fails", async () => {
+    rememberDesignSystem("host_1", ACME);
+    writeMock.mockRejectedValueOnce(new Error("503 Service Unavailable"));
+    const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+    create();
+    expect(await screen.findByRole("alert")).toHaveTextContent("503 Service Unavailable");
+    expect(screen.getByLabelText("Prompt")).toHaveValue("Pitch");
+    expect(postMock).not.toHaveBeenCalled();
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["None", false],
+    ["Folder kit", true],
+  ])("writes no pointer and no instruction for %s", async (label, kit) => {
+    if (kit) listings["/work/site/.omnigent/design-kit"] = ["kit.json"];
+    rememberDesignSystem("host_1", ACME);
+    const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+    openSystems();
+    fireEvent.click(screen.getByRole("option", { name: label }));
+    create();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(writeMock).not.toHaveBeenCalled();
+    expect(sentText()).not.toContain("Follow the design system");
   });
 });

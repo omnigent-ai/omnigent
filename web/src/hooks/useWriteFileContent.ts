@@ -5,7 +5,7 @@ import type { FileContentResponse } from "./useFileContent";
 
 const DEFAULT_ENVIRONMENT_ID = "default";
 
-async function writeFileContent(
+export async function writeFileContent(
   conversationId: string,
   path: string,
   content: string,

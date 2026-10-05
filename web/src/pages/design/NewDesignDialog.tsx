@@ -24,10 +24,25 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import { fetchFileContent } from "@/hooks/useFileContent";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHosts } from "@/hooks/useHosts";
+import { writeFileContent } from "@/hooks/useWriteFileContent";
 import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
 import { DECK_SUFFIX, deckName } from "@/lib/designDecks";
+import {
+  DESIGN_SYSTEM_POINTER,
+  DS_MANIFEST,
+  DS_SKILL,
+  NOT_A_DESIGN_SYSTEM,
+  designSystemName,
+  detectDesignSystemKind,
+  folderName,
+  readRecentDesignSystems,
+  rememberDesignSystem,
+  serializeDesignSystemPointer,
+  type DesignSystemRef,
+} from "@/lib/designSystem";
 import {
   deckSlug,
   designDeckPath,
@@ -44,6 +59,28 @@ import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 
 function joinPath(folder: string, rel: string): string {
   return `${folder.replace(/\/+$/, "")}/${rel}`;
+}
+
+const SYSTEM_NONE = "none";
+const SYSTEM_KIT = "kit";
+const SYSTEM_CHOOSE = "choose";
+const systemValue = (ref: DesignSystemRef) => `ds:${ref.path}`;
+
+/** The manifest or SKILL.md name, read through the new session; else the known name. */
+async function resolveSystemName(sessionId: string, ref: DesignSystemRef): Promise<string> {
+  const read = async (file: string) => {
+    try {
+      const f = await fetchFileContent(sessionId, joinPath(ref.path, file));
+      return f.encoding === "utf-8" ? f.content : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const [manifest, skill] = await Promise.all([
+    ref.kind === "full" ? read(DS_MANIFEST) : undefined,
+    read(DS_SKILL),
+  ]);
+  return manifest || skill ? designSystemName({ folder: ref.path, manifest, skill }) : ref.name;
 }
 
 export function NewDesignDialog({
@@ -69,6 +106,10 @@ export function NewDesignDialog({
   // null: use the remembered folder for the selected host.
   const [pickedFolder, setPickedFolder] = useState<string | null>(null);
   const [browserOpen, setBrowserOpen] = useState(false);
+  // null: the default (folder kit, else the host's most recent system, else none).
+  const [pickedSystem, setPickedSystem] = useState<string | null>(null);
+  const [systemFolder, setSystemFolder] = useState<string | null>(null);
+  const [systemBrowserOpen, setSystemBrowserOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   // A session created by a Create whose first message then failed; a retry
@@ -82,6 +123,8 @@ export function NewDesignDialog({
       setPickedAgentId(null);
       setPickedHostId(null);
       setPickedFolder(null);
+      setPickedSystem(null);
+      setSystemFolder(null);
       setError(null);
       created.current = null;
     }
@@ -114,6 +157,45 @@ export function NewDesignDialog({
       ? "No kit"
       : null;
 
+  const recents = useMemo(
+    () => (open && hostId ? readRecentDesignSystems(hostId) : []),
+    [open, hostId],
+  );
+  const systemListing = useHostFilesystem(hostId, systemFolder);
+  const systemListed =
+    systemFolder !== null && !!systemListing.data && !systemListing.isPlaceholderData;
+  const chosenKind = systemListed
+    ? detectDesignSystemKind(systemListing.data!.entries.map((e) => e.name))
+    : null;
+  const chosen: DesignSystemRef | null =
+    systemFolder && chosenKind
+      ? {
+          path: systemFolder,
+          kind: chosenKind,
+          name: recents.find((r) => r.path === systemFolder)?.name ?? folderName(systemFolder),
+        }
+      : null;
+  const systemProblem =
+    systemFolder === null
+      ? null
+      : systemListing.error
+        ? systemListing.error.message
+        : systemListed && !chosenKind
+          ? NOT_A_DESIGN_SYSTEM
+          : null;
+  const systems =
+    chosen && !recents.some((r) => r.path === chosen.path) ? [chosen, ...recents] : recents;
+  const kitFound = kitHint === "Kit found";
+  const systemOptions = [
+    SYSTEM_NONE,
+    ...(kitFound ? [SYSTEM_KIT] : []),
+    ...systems.map(systemValue),
+  ];
+  const defaultSystem = kitFound ? SYSTEM_KIT : systems[0] ? systemValue(systems[0]) : SYSTEM_NONE;
+  const systemChoice =
+    pickedSystem && systemOptions.includes(pickedSystem) ? pickedSystem : defaultSystem;
+  const system = systems.find((s) => systemValue(s) === systemChoice);
+
   const canCreate =
     prompt.trim() !== "" &&
     agent !== undefined &&
@@ -133,6 +215,7 @@ export function NewDesignDialog({
   function guardDismiss(event: { target: EventTarget | null; preventDefault: () => void }) {
     if (
       browserOpen ||
+      systemBrowserOpen ||
       shouldGuardDialogDismiss(event.target, {
         selectOpen: selectOpenCount.current > 0,
         msSinceSelectClose: Date.now() - selectClosedAt.current,
@@ -163,14 +246,19 @@ export function NewDesignDialog({
         sessionId = session.id;
         created.current = { key, id: sessionId };
       }
+      const ref = system && { ...system, name: await resolveSystemName(sessionId, system) };
+      if (ref) {
+        await writeFileContent(sessionId, DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer(ref));
+      }
       await postEvent(sessionId, {
         type: "message",
         data: {
           role: "user",
-          content: [{ type: "input_text", text: firstDesignMessage(prompt, path) }],
+          content: [{ type: "input_text", text: firstDesignMessage(prompt, path, ref) }],
         },
       });
       rememberDesignDefaults(agent.id, hostId, folder);
+      if (ref) rememberDesignSystem(hostId, ref);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       onCreated(sessionId, path);
       onOpenChange(false);
@@ -252,6 +340,8 @@ export function NewDesignDialog({
                 onValueChange={(next) => {
                   setPickedHostId(next);
                   setPickedFolder(null);
+                  setPickedSystem(null);
+                  setSystemFolder(null);
                   created.current = null;
                 }}
                 onOpenChange={handleSelectOpenChange}
@@ -311,6 +401,58 @@ export function NewDesignDialog({
                   {kitHint}
                 </p>
               )}
+            </div>
+          )}
+
+          {hostId && (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="design-system">Design system</Label>
+              <Select
+                value={systemChoice}
+                componentId="design.new.system"
+                onValueChange={(next) => {
+                  if (next === SYSTEM_CHOOSE) setSystemBrowserOpen(true);
+                  else setPickedSystem(next);
+                }}
+                onOpenChange={handleSelectOpenChange}
+              >
+                <SelectTrigger
+                  id="design-system"
+                  data-testid="design-system-trigger"
+                  className="w-full"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  <SelectItem value={SYSTEM_NONE}>None</SelectItem>
+                  {kitFound && <SelectItem value={SYSTEM_KIT}>Folder kit</SelectItem>}
+                  {systems.map((s) => (
+                    <SelectItem key={s.path} value={systemValue(s)}>
+                      {`${s.name} (${s.kind})`}
+                    </SelectItem>
+                  ))}
+                  <SelectItem value={SYSTEM_CHOOSE}>Choose folder</SelectItem>
+                </SelectContent>
+              </Select>
+              <WorkspacePickerDialog
+                open={systemBrowserOpen}
+                onOpenChange={setSystemBrowserOpen}
+                hostId={hostId}
+                initialPath={system?.path ?? folder}
+                onConfirm={(path) => {
+                  setSystemFolder(path);
+                  setPickedSystem(`ds:${path}`);
+                }}
+              />
+              {system && (
+                <p
+                  className="truncate font-mono text-sm text-muted-foreground"
+                  data-testid="design-system-path"
+                >
+                  {system.path}
+                </p>
+              )}
+              {systemProblem && <p className="text-sm text-destructive">{systemProblem}</p>}
             </div>
           )}
 
