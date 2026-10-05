@@ -203,14 +203,18 @@ class HostMcpTools:
         cached = self._cache.get(key)
         if cached is not None:
             return cached
+        attempted = False
         try:
             async with asyncio.timeout(PROBE_TIMEOUT_SECONDS):
                 async with self._slots:
                     cached = self._cache.get(key)
                     if cached is not None:
                         return cached
+                    attempted = True
                     result = await _probe_worker(payload)
         except TimeoutError:
+            if not attempted:
+                raise BlockingIOError("MCP probe capacity exhausted") from None
             result = _result("timeout")
         self._cache[key] = result
         return result

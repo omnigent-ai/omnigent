@@ -80,6 +80,7 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
     [
         (HostMcpToolsResultFrame("", "ok", **_TOOLS), 200),
         (HostMcpToolsResultFrame("", "failed", error="lookup failed"), 502),
+        (HostMcpToolsResultFrame("", "busy"), 503),
         # A malformed connection enum is a host failure.
         (
             HostMcpToolsResultFrame("", "ok", **{**_TOOLS, "connection": "bogus"}),

@@ -8400,13 +8400,14 @@ async def test_host_answers_mcp_tools_over_the_tunnel(monkeypatch):
     assert (result.request_id, result.status, result.connection) == ("m", "ok", "connected")
 
 
-async def test_host_mcp_tools_failure_is_private(monkeypatch, caplog):
+@pytest.mark.parametrize("error,status", [(RuntimeError, "failed"), (BlockingIOError, "busy")])
+async def test_host_mcp_tools_failure_is_private(monkeypatch, caplog, error, status):
     async def fail(*args):
-        raise RuntimeError("synthetic-private-config")
+        raise error("synthetic-private-config")
 
     monkeypatch.setattr("omnigent.host.mcp_tools.HostMcpTools.probe", fail)
     result = await _make_host_process()._handle_mcp_tools(
         HostMcpToolsFrame("m", "claude", "unknown")
     )
-    assert result.status == "failed"
+    assert result.status == status
     assert "synthetic-private-config" not in encode_host_frame(result) + caplog.text

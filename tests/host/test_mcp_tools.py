@@ -224,6 +224,17 @@ async def test_cache_config_digest_unknown_and_concurrency(monkeypatch):
     await expiring.probe("claude", "0")
     assert calls == 8
 
+    saturated = HostMcpTools()
+    with monkeypatch.context() as queued:
+        queued.setattr(mcp_tools, "PROBE_TIMEOUT_SECONDS", 0.01)
+        async with saturated._slots, saturated._slots:
+            with pytest.raises(BlockingIOError, match="capacity exhausted"):
+                await saturated.probe("claude", "0")
+    assert calls == 8
+    assert not saturated._cache
+    assert (await saturated.probe("claude", "0"))["connection"] == "connected"
+    assert calls == 9
+
 
 def test_effective_config_expansion_and_inheritance(tmp_path, monkeypatch):
     monkeypatch.setenv("EXPLICIT_TOKEN", "value")

@@ -580,7 +580,9 @@ function McpRow({
           <Notice>
             {query.error instanceof ApiError && query.error.status === 501
               ? `Update ${host.name} to list tools.`
-              : `Couldn't reach ${server.name}.`}
+              : query.error instanceof ApiError && query.error.status === 503
+                ? "Host is busy probing other MCP servers. Collapse and reopen to retry."
+                : `Couldn't reach ${server.name}.`}
           </Notice>
         ) : data ? (
           <>

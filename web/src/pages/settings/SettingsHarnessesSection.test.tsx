@@ -614,14 +614,17 @@ it("uses the same lazy tools accordion on plugin pages", () => {
   expect(mcpLookups).toContainEqual([ONLINE.host_id, "claude", "linear", "toolkit", true]);
 });
 
-it.each([501, 502, 504])("shows the MCP error for %s", (status) => {
+it.each([
+  [501, "Update my-laptop to list tools."],
+  [502, "Couldn't reach github."],
+  [503, "Host is busy probing other MCP servers. Collapse and reopen to retry."],
+  [504, "Couldn't reach github."],
+])("shows the MCP error for %s", (status, message) => {
   hosts = [ONLINE];
   mcpResult = { error: new ApiError("private", status, null), isPending: false };
   renderHarnesses("claude-native");
   fireEvent.click(screen.getByTestId("catalog-row-github"));
-  expect(
-    screen.getByText(status === 501 ? "Update my-laptop to list tools." : "Couldn't reach github."),
-  ).toBeTruthy();
+  expect(screen.getByText(message)).toBeTruthy();
   expect(screen.queryByText("private")).toBeNull();
 });
 
@@ -635,17 +638,23 @@ it("hides MCP expansion on old-server 404", () => {
   expect(screen.queryByText("Couldn't reach github.")).toBeNull();
 });
 
-it.each(["needs_auth", "timeout", "unreachable", "unsupported"])(
-  "reports probe status %s without a tool count",
-  (connection) => {
-    hosts = [ONLINE];
-    mcpResult = { data: { tools: [], connection, truncated: false }, isPending: false };
-    renderHarnesses("claude-native");
-    fireEvent.click(screen.getByTestId("catalog-row-github"));
-    expect(screen.getByRole("img")).toBeTruthy();
-    expect(screen.queryByText(/· 0 tools/)).toBeNull();
-  },
-);
+it.each([
+  [
+    "needs_auth",
+    "Authentication required. Harness sign-in credentials cannot be reused for this probe.",
+  ],
+  ["timeout", "MCP probe timed out."],
+  ["unreachable", "Couldn't reach this MCP server."],
+  ["unsupported", "This MCP configuration cannot be probed from the host."],
+])("reports probe status %s without a tool count", (connection, label) => {
+  hosts = [ONLINE];
+  mcpResult = { data: { tools: [], connection, truncated: false }, isPending: false };
+  renderHarnesses("claude-native");
+  fireEvent.click(screen.getByTestId("catalog-row-github"));
+  expect(screen.getByRole("img", { name: label })).toBeTruthy();
+  expect(screen.getByText(label)).toBeTruthy();
+  expect(screen.queryByText(/· 0 tools/)).toBeNull();
+});
 
 it.each([false, true])("uses installed MCP identity and honors enabled=%s", (enabled) => {
   hosts = [ONLINE];

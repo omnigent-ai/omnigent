@@ -73,6 +73,8 @@ def create_mcp_tools_router(
             plugin=body.plugin,
             source_id=body.source_id,
         )
+        if result.status == "busy":
+            raise HTTPException(status_code=503, detail="host MCP probe capacity exhausted")
         if result.status != "ok":
             raise HTTPException(status_code=502, detail="host MCP tools lookup failed")
         try:

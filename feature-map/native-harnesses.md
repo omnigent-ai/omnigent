@@ -147,6 +147,8 @@ Cross-harness journeys:
   Collapsed rows must not send probes or start processes. Reopen within five
   minutes to reuse results. Test an HTTP 401, a hanging stdio process and a
   missing executable; expect auth, timeout and unreachable states.
+  If both probe slots are occupied, an expired queued request reports that the
+  host is busy; collapse and reopen after capacity frees to retry immediately.
   A 501 shows an update hint; inject a 404 from the tools route to retain plain
   rows without expansion. Confirm no raw config, schemas or synthetic secrets
   appear in responses/logs and no probe processes survive cancellation/timeout.
