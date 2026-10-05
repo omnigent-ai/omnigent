@@ -2,6 +2,7 @@
 // `provider` id. A host that predates the field serves GitHub.
 
 import type { ComponentType } from "react";
+import AzureMono from "@lobehub/icons/es/Azure/components/Mono";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { GitPullRequestIcon } from "lucide-react";
 
@@ -91,7 +92,7 @@ export function gitProviderCopy(
     id,
     label,
     requestName,
-    Icon: GitPullRequestIcon,
+    Icon: id === "azure_devops" ? AzureMono : GitPullRequestIcon,
     prNumberPrefix: metadata?.number_prefix ?? "#",
     prUrlPlaceholder: `${requestName[0].toUpperCase()}${requestName.slice(1)} URL`,
     defaultHost: null,

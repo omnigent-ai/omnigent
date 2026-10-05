@@ -249,7 +249,8 @@ describe("PullRequestPanel", () => {
   it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
     const heading = screen.getByRole("heading", { name: "GitHub" });
-    expect(heading).toHaveClass("font-medium", "text-ui");
+    expect(heading).toHaveAttribute("title", "GitHub");
+    expect(screen.getByText("GitHub")).toHaveClass("sr-only");
     expect(heading.parentElement).toHaveClass("h-11");
     // Title + number live in the shared header (both tabs).
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
@@ -624,7 +625,7 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByTestId("diff")).toBeNull();
     // No provider serves the workspace, so the header names none.
     const heading = screen.getByRole("heading", { name: "Pull Requests" });
-    expect(heading.previousElementSibling).toHaveClass("lucide-git-pull-request");
+    expect(heading.querySelector("svg")).toHaveClass("lucide-git-pull-request");
     expect(screen.queryByRole("heading", { name: "GitHub" })).toBeNull();
   });
 
@@ -676,8 +677,8 @@ describe("PullRequestPanel", () => {
   describe("header when no provider is known", () => {
     const neutralHeading = () => {
       const heading = screen.getByRole("heading", { name: "Pull Requests" });
-      expect(heading.previousElementSibling).toHaveClass("lucide-git-pull-request");
-      expect(heading.previousElementSibling).toHaveAttribute("aria-hidden", "true");
+      expect(heading.querySelector("svg")).toHaveClass("lucide-git-pull-request");
+      expect(heading.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
       expect(screen.queryByText(/GitHub/)).toBeNull();
     };
 
@@ -781,7 +782,7 @@ describe("PullRequestPanel", () => {
       };
       renderPanel();
       const heading = screen.getByRole("heading", { name: "Pull Requests" });
-      expect(heading.previousElementSibling).toHaveClass("lucide-git-pull-request");
+      expect(heading.querySelector("svg")).toHaveClass("lucide-git-pull-request");
       expect(screen.queryByRole("heading", { name: "GitHub" })).toBeNull();
       // The picker names the PR in its own provider's style; the header does not.
       expect(screen.getByRole("combobox", { name: "Session pull request" })).toHaveTextContent(
@@ -793,7 +794,7 @@ describe("PullRequestPanel", () => {
       // The default fixture is a ready payload with no `provider`.
       renderPanel();
       const heading = screen.getByRole("heading", { name: "GitHub" });
-      expect(heading.previousElementSibling).toHaveAttribute("aria-hidden", "true");
+      expect(heading.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
       expect(screen.queryByRole("heading", { name: "Pull Requests" })).toBeNull();
     });
 
@@ -929,7 +930,7 @@ describe("PullRequestPanel", () => {
       state.info!.data = forge();
       renderPanel();
       const heading = screen.getByRole("heading", { name: "Example Forge" });
-      expect(heading.previousElementSibling).toHaveAttribute("aria-hidden", "true");
+      expect(heading.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
       expect(screen.getByText(/contoso\/web\/app/)).toBeInTheDocument();
       expect(screen.getByText("!7")).toBeInTheDocument();
       expect(screen.getByRole("link", { name: /Add the widget/ })).toHaveAttribute("href", prUrl);

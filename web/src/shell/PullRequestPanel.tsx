@@ -135,15 +135,14 @@ function PullRequestEmptyState({
   );
 }
 
-/** Header title: the provider's mark beside its name. Renders a fragment so
- *  both sit directly in the header row. */
+/** Keep the provider name accessible without taking space from the PR picker. */
 function PanelTitle({ copy }: { copy: GitProviderCopy }) {
   const Icon = copy.Icon;
   return (
-    <>
+    <h2 className="shrink-0" title={copy.label}>
       <Icon size={14} className="shrink-0" aria-hidden />
-      <h2 className="shrink-0 font-medium text-ui">{copy.label}</h2>
-    </>
+      <span className="sr-only">{copy.label}</span>
+    </h2>
   );
 }
 
