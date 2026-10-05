@@ -23,10 +23,10 @@ export function newMarkdownFileName(existingNames: Iterable<string>): string {
  * root — a unique ``untitled[-N].md`` — and opens it in the file viewer, where
  * a ``.md`` file lands in the rich-text editor with autosave.
  *
- * Reuses the write-file endpoint (which creates a missing file server-side) and
- * the same ``openFile`` the rail uses to show any path. Uniqueness is computed
- * against the workspace root listing; if it hasn't loaded yet the name falls
- * back to ``untitled.md``.
+ * Uses the create-only filesystem endpoint and the same ``openFile`` callback
+ * the rail uses to show any path. The action stays disabled until the root
+ * listing is available, so a missing listing can never fall back to an
+ * occupied filename.
  */
 export function useCreateMarkdownFile(
   conversationId: string,
