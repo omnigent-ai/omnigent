@@ -1179,6 +1179,21 @@ def test_child_label_handles_named_subagent_title() -> None:
     assert _child_label(conv) == "codex/auth-refactor"
 
 
+def test_child_label_strips_only_the_rows_own_closed_suffix() -> None:
+    """
+    The legacy ``:closed:<id>`` tombstone is dropped from the label, while
+    ``:closed:`` inside a user-chosen title is kept as ordinary text.
+    """
+    closed_id = "8af356d908005a65f872c246158c6293"
+    closed = _make_conv(id=closed_id, title=f"codex:auth-refactor:closed:{closed_id}")
+    assert _child_label(closed) == "codex/auth-refactor"
+
+    renamed = _make_conv(
+        id="fd996830e1375c7af31f7164fdab4de0", title="codex:notes about a :closed: door"
+    )
+    assert _child_label(renamed) == "codex/notes about a :closed: door"
+
+
 def test_child_label_falls_back_to_id_for_titleless_session() -> None:
     """
     A conversation with no title labels by id so the notice always

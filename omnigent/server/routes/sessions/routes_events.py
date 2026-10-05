@@ -1044,7 +1044,7 @@ def register_events_routes(
         if (
             body.type == "message"
             and body.data.get("role") == "user"
-            and is_session_closed(conv.labels, conv.title)
+            and is_session_closed(conv.labels, conv.title, conversation_id=conv.id)
         ):
             raise OmnigentError(
                 "Session is closed. Start a new sub-agent session to continue.",

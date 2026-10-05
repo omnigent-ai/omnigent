@@ -3371,9 +3371,17 @@ def test_subagent_read_tools_are_runner_local() -> None:
         pytest.param({"input": "continue"}, id="object-input-contract"),
     ],
 )
+@pytest.mark.parametrize(
+    "child_title",
+    [
+        pytest.param("issue-1756", id="plain-title"),
+        pytest.param("notes about a :closed: door", id="closed-text-title"),
+    ],
+)
 async def test_sys_session_send_reuses_existing_child_session(
     monkeypatch: pytest.MonkeyPatch,
     subagent_args: str | dict[str, str],
+    child_title: str,
 ) -> None:
     """
     Re-sending to the same ``(agent, title)`` continues the existing child.
@@ -3387,6 +3395,8 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param subagent_args: ``sys_session_send`` ``args`` payload.
+    :param child_title: The existing child's title; one case merely contains
+        ``:closed:``, which must not read as a closed child.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
@@ -3417,8 +3427,9 @@ async def test_sys_session_send_reuses_existing_child_session(
                     "data": [
                         {
                             "id": "conv_existing",
+                            "title": f"claude:{child_title}",
                             "tool": "claude",
-                            "session_name": "issue-1756",
+                            "session_name": child_title,
                             "busy": False,
                         }
                     ]
@@ -3447,7 +3458,7 @@ async def test_sys_session_send_reuses_existing_child_session(
                 arguments=json.dumps(
                     {
                         "agent": "claude",
-                        "title": "issue-1756",
+                        "title": child_title,
                         "args": subagent_args,
                     }
                 ),
@@ -6471,6 +6482,12 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "session_name": "legacy",
                     },
                     {
+                        "id": "c6",
+                        "title": "researcher:notes about a :closed: door",
+                        "tool": "researcher",
+                        "session_name": "notes about a :closed: door",
+                    },
+                    {
                         "id": "c4",
                         "title": "legacy-untyped",
                         "tool": "legacy-untyped",
@@ -6486,13 +6503,13 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
             )
         )
-    # c3 (explicitly closed despite its mixed-type label map), c5
-    # (legacy title tombstone), and c4
-    # (no colon) dropped; the ui:-added child surfaces under its bound
-    # agent + label.
+    # c3 (closed label), c5 (legacy tombstone) and c4 (no colon) dropped;
+    # the ui:-added child surfaces under its bound agent + label, and c6
+    # keeps its ``:closed:`` user text.
     assert out["sub_agents"] == [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
         {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
+        {"agent": "researcher", "title": "notes about a :closed: door", "conversation_id": "c6"},
     ]
 
 
@@ -6862,7 +6879,14 @@ async def test_session_peek_maps_access_errors(status: int, expected_error: str)
 
 
 @pytest.mark.asyncio
-async def test_session_close_patches_tombstoned_title() -> None:
+@pytest.mark.parametrize(
+    ("stored_title", "bare_title"),
+    [
+        pytest.param("researcher:auth", "auth", id="plain-title"),
+        pytest.param("researcher:my :closed: notes", "my :closed: notes", id="closed-text-title"),
+    ],
+)
+async def test_session_close_patches_tombstoned_title(stored_title: str, bare_title: str) -> None:
     """
     ``sys_session_close`` PATCHes a closed label and internal tombstone.
 
@@ -6874,6 +6898,10 @@ async def test_session_close_patches_tombstoned_title() -> None:
     The caller (``conv_caller``) and target (``conv_target``) share the
     same ``root_conversation_id`` and the target is a sub-agent, so the
     tree-scope gate passes and the PATCH is issued.
+
+    :param stored_title: The child's stored title; one case merely contains
+        ``:closed:`` text, which the rebuilt tombstone must keep whole.
+    :param bare_title: The title reported back once the agent prefix is dropped.
     """
     # _execute_session_query_tool is the runner's REST dispatch entry
     # point for session-query tools — called directly here because these
@@ -6890,7 +6918,7 @@ async def test_session_close_patches_tombstoned_title() -> None:
                 200,
                 json={
                     "id": "conv_target",
-                    "title": "researcher:auth",
+                    "title": stored_title,
                     "root_conversation_id": "conv_root",
                     "parent_session_id": "conv_caller",
                 },
@@ -6917,13 +6945,13 @@ async def test_session_close_patches_tombstoned_title() -> None:
     # Tombstone embeds the conv id so repeated closes stay unique, and
     # the explicit label makes the closed state observable without
     # exposing the suffix as UI text.
-    assert patched["title"] == "researcher:auth:closed:conv_target"
+    assert patched["title"] == f"{stored_title}:closed:conv_target"
     assert patched["labels"] == {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
     assert out == {
         "closed": True,
         "conversation_id": "conv_target",
         "agent": "researcher",
-        "title": "auth",
+        "title": bare_title,
     }
 
 

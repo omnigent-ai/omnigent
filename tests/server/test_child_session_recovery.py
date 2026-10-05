@@ -106,7 +106,8 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "exclusion", ["closed", "archived", "stopped", "hosted", "side_chat", "live_runner"]
+    "exclusion",
+    ["closed", "legacy_closed_title", "archived", "stopped", "hosted", "side_chat", "live_runner"],
 )
 async def test_do_not_restore_excluded_children(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, exclusion: str
@@ -117,6 +118,8 @@ async def test_do_not_restore_excluded_children(
     row = child()
     if exclusion == "closed":
         store.set_labels(row.id, {"omnigent.closed": "true"})
+    elif exclusion == "legacy_closed_title":
+        store.update_conversation(row.id, title=f"researcher:auth:closed:{row.id}")
     elif exclusion == "archived":
         store.update_conversation(row.id, archived=True)
     elif exclusion == "stopped":
@@ -138,6 +141,21 @@ async def test_do_not_restore_excluded_children(
         relay.assert_not_called()
     finally:
         _intentional_stop_sessions.discard(row.id)
+
+
+@pytest.mark.asyncio
+async def test_restore_child_whose_title_merely_contains_closed_text(recovery_tree: Any) -> None:
+    """Only the row's own ``:closed:<id>`` suffix marks a child closed, not user text."""
+    store, parent, child, relay, _, initializer = recovery_tree
+    row = child(title="researcher:notes about a :closed: door")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(201)), base_url="http://runner"
+    ) as client:
+        await restore_active_children(parent, client, store, initializer)
+
+    assert store.get_conversation(row.id).runner_id == "new"
+    relay.assert_called_once()
 
 
 @pytest.mark.asyncio

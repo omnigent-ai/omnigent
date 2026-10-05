@@ -83,6 +83,28 @@ def test_closed_marker_is_sticky_across_partial_updates() -> None:
     assert host.is_subagent_chattable("conv_c1") is False
 
 
+def test_legacy_title_marker_closes_only_the_row_it_names() -> None:
+    """A legacy ``:closed:<id>`` title suffix closes the child it names, while a
+    title that merely contains ``:closed:`` is user text and stays chattable."""
+    host = TerminalHost(model_name="test")
+    host.upsert_subagent(
+        "conv_legacy",
+        parent_id="conv_main",
+        child={
+            "id": "conv_legacy",
+            "tool": "reviewer",
+            "title": "reviewer:auth:closed:conv_legacy",
+        },
+    )
+    host.upsert_subagent(
+        "conv_open",
+        parent_id="conv_main",
+        child={"id": "conv_open", "tool": "coder", "title": "coder:notes about a :closed: door"},
+    )
+    assert host.is_subagent_chattable("conv_legacy") is False
+    assert host.is_subagent_chattable("conv_open") is True
+
+
 def test_status_label_last_task_error_outranks_completed() -> None:
     """``last_task_error`` reads ``Failed`` even when a stale ``completed``
     status lingers — mirroring the web ``childStatus`` precedence."""

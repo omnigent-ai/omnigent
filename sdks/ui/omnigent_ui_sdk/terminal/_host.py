@@ -3176,7 +3176,9 @@ class TerminalHost:
         if not node.closed:
             from omnigent.util.session_lifecycle import is_session_closed
 
-            if is_session_closed(child.get("labels"), child.get("title")):
+            if is_session_closed(
+                child.get("labels"), child.get("title"), conversation_id=session_id
+            ):
                 node.closed = True
         # ``done_at`` stamps a TERMINAL task OUTCOME (completed / failed /
         # cancelled, or a durable failure detail) — NOT a merely-not-busy loop.

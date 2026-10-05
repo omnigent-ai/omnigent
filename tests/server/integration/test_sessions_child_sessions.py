@@ -1043,6 +1043,88 @@ async def test_closed_child_session_display_is_sanitized_and_read_only(
     assert "Session is closed" in message_resp.text
 
 
+async def test_open_child_title_containing_closed_text_is_shown_verbatim(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    An open child whose title contains ``:closed:`` keeps its display title and stays open.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    title = "researcher:notes about a :closed: door"
+    child = _seed_child(
+        conv_store=SqlAlchemyConversationStore(db_uri),
+        parent_id=session["id"],
+        title=title,
+        agent_id=session["agent_id"],
+    )
+
+    children_resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    assert children_resp.status_code == 200
+    row = children_resp.json()["data"][0]
+    assert row["title"] == title
+    assert row["tool"] == "researcher"
+    assert row["session_name"] == "notes about a :closed: door"
+    assert CLOSED_LABEL_KEY not in row["labels"]
+
+    snapshot_resp = await client.get(f"/v1/sessions/{child.id}")
+    assert snapshot_resp.status_code == 200
+    assert snapshot_resp.json()["title"] == title
+    assert CLOSED_LABEL_KEY not in snapshot_resp.json()["labels"]
+
+
+async def test_a_user_title_containing_closed_does_not_close_the_session(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A user title containing ``:closed:`` reads back verbatim, carries no closed
+    label and keeps accepting messages.
+
+    :param client: The test HTTP client.
+    :param monkeypatch: Routes the accepted message to a fake runner.
+    """
+    agent = await create_test_agent(client)
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    renamed = await client.patch(
+        f"/v1/sessions/{session_id}", json={"title": "release:closed:beta"}
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["title"] == "release:closed:beta"
+    assert CLOSED_LABEL_KEY not in renamed.json()["labels"]
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(session_id: str, runner_router: object) -> httpx.AsyncClient:
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        message_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "still usable"}],
+                },
+            },
+        )
+        assert message_resp.status_code == 202, message_resp.text
+    finally:
+        await fake_runner.aclose()
+
+
 # ── Per-child attribution across a 5-10 fan-out ───────────
 
 

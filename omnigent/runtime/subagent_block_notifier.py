@@ -27,6 +27,8 @@ import threading
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+from omnigent.util.session_lifecycle import title_without_closed_marker
+
 if TYPE_CHECKING:
     from omnigent.entities.conversation import Conversation
     from omnigent.stores import ConversationStore
@@ -484,10 +486,9 @@ def _child_label(child: Conversation) -> str:
     :param child: The child :class:`Conversation`.
     :returns: A label like ``"codex/auth-refactor"``.
     """
-    title = child.title or ""
+    title = title_without_closed_marker(child.title, conversation_id=child.id) or ""
     if ":" in title:
-        agent, _, remainder = title.partition(":")
-        sa_title = remainder.partition(":closed:")[0]
+        agent, _, sa_title = title.partition(":")
         return f"{agent}/{sa_title}" if sa_title else agent
     return title or child.id
 
