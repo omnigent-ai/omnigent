@@ -7,6 +7,7 @@ I/O.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, TypeVar
@@ -57,6 +58,77 @@ async def _tee_stream_for_usage(
         if isinstance(event, ResponseCompletedEvent):
             _emit_usage_from_response(event.response)
         yield event
+
+
+async def _close_stream(stream: AsyncIterator[ResponseStreamEvent]) -> None:
+    """Close a failed async stream when its provider exposes ``aclose``."""
+    close = getattr(stream, "aclose", None)
+    if close is not None:
+        with contextlib.suppress(Exception):
+            await close()
+
+
+async def _stream_with_retry(
+    stream: AsyncIterator[ResponseStreamEvent],
+    *,
+    create_stream: Callable[[], Awaitable[Response | AsyncIterator[ResponseStreamEvent]]],
+    retry_config: RetryPolicy,
+    attempts_used: Callable[[], int],
+) -> AsyncIterator[ResponseStreamEvent]:
+    """Retry a stream only while it has yielded no typed event yet.
+
+    The initial stream factory attempt is counted by ``create_stream``. A
+    failed pre-output stream gets a fresh factory call under the same budget;
+    once an event has escaped, replaying the request could duplicate output or
+    a tool side effect, so the classified failure is propagated.
+    """
+    yielded = False
+    total_attempts = retry_config.max_retries + 1
+    current = stream
+    while True:
+        stream_error: tuple[Exception, BaseException] | None = None
+        try:
+            async for event in current:
+                yielded = True
+                yield event
+            return
+        except (PermanentLLMError, RetryableLLMError):
+            raise
+        except Exception as exc:
+            stream_error = (exc, classify_llm_error(exc, retry_config.retryable_status_codes))
+        finally:
+            # HTTPX's async-generator adapter owns the response/client context;
+            # close it before retrying so failed sockets and response bodies are
+            # released rather than retained until GC.
+            await _close_stream(current)
+
+        assert stream_error is not None
+        original_error, classified = stream_error
+        if yielded or isinstance(classified, PermanentLLMError):
+            raise classified from original_error
+        if attempts_used() >= total_attempts:
+            raise classified from original_error
+
+        while True:
+            await _backoff_sleep(attempts_used() - 1, retry_config)
+            try:
+                next_stream = await create_stream()
+                if isinstance(next_stream, Response):
+                    raise TypeError("streaming LLM call returned a Response")
+                current = next_stream
+                break
+            except (PermanentLLMError, RetryableLLMError):
+                raise
+            except Exception as exc:
+                classified_factory = classify_llm_error(
+                    exc,
+                    retry_config.retryable_status_codes,
+                )
+                if isinstance(classified_factory, PermanentLLMError):
+                    raise classified_factory from exc
+                if attempts_used() >= total_attempts:
+                    raise classified_factory from exc
+                continue
 
 
 class _ResponsesNamespace:
@@ -123,12 +195,16 @@ class _ResponsesNamespace:
             exhausted.
         """
 
+        factory_attempts = 0
+
         async def call_fn() -> Response | AsyncIterator[ResponseStreamEvent]:
             """
             Dispatch to the adapter.
 
             :returns: Response or streaming event iterator.
             """
+            nonlocal factory_attempts
+            factory_attempts += 1
             return await self._do_create(
                 input=input,
                 instructions=instructions,
@@ -148,6 +224,13 @@ class _ResponsesNamespace:
         if isinstance(result, Response):
             _emit_usage_from_response(result)
             return result
+        if retry is not None and stream:
+            result = _stream_with_retry(
+                result,
+                create_stream=call_fn,
+                retry_config=retry,
+                attempts_used=lambda: factory_attempts,
+            )
         return _tee_stream_for_usage(result)
 
     async def _do_create(
