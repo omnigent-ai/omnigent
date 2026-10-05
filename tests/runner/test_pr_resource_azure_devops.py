@@ -494,4 +494,4 @@ def test_all_remote_providers_are_discovered_without_configuration(
     else:
         assert info["selected_pr_url"] in expected.values()
     if failed_provider is not None:
-        assert any(failed_provider in warning for warning in info["warnings"])
+        assert any(failed_provider in warning for warning in info["discovery_warnings"])
