@@ -141,12 +141,6 @@ async def test_reinstall_updates_in_place(client) -> None:
     assert [row["description"] for row in (await _mine(client, ALICE))["data"]] == ["v2"]
 
 
-async def test_identical_reinstall_is_a_no_op(client) -> None:
-    first = (await _install(client, ALICE, "orion", "same")).json()
-    again = (await _install(client, ALICE, "orion", "same")).json()
-    assert (again["id"], again["version"]) == (first["id"], first["version"])
-
-
 def _retarred(bundle: bytes, mtime: int) -> bytes:
     """The same files tarred again, as the CLI does on every run: new timestamps,
     owner, and member order."""
@@ -163,18 +157,24 @@ def _retarred(bundle: bytes, mtime: int) -> bytes:
     return out.getvalue()
 
 
-async def test_reinstalling_the_same_files_tarred_again_is_a_no_op(client) -> None:
+@pytest.mark.parametrize(
+    "retar", [False, True], ids=["identical-bytes", "same-files-tarred-again"]
+)
+async def test_reinstalling_the_same_files_is_a_no_op(client, retar: bool) -> None:
+    """However the client tars the same files, reinstalling them keeps the id and version."""
     bundle = build_agent_bundle("orion", description="same")
-    versions = []
+    installed = []
     for mtime in (1, 2):
+        data = _retarred(bundle, mtime) if retar else bundle
         resp = await client.post(
             "/v1/agents",
             headers=ALICE,
-            files={"bundle": ("bundle.tar.gz", _retarred(bundle, mtime), "application/gzip")},
+            files={"bundle": ("bundle.tar.gz", data, "application/gzip")},
         )
         assert resp.status_code == 200, resp.text
-        versions.append(resp.json()["version"])
-    assert versions == [1, 1]
+        installed.append((resp.json()["id"], resp.json()["version"]))
+    assert installed[1] == installed[0]
+    assert installed[0][1] == 1
 
 
 async def test_same_name_for_another_user_is_a_separate_agent(client, agent_store) -> None:

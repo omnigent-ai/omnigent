@@ -22,8 +22,9 @@ the header menu), and each place is a separate entry point.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
-- `fork-custom-agent`: switch to a custom agent discovered from an existing
-  session, as well as to a built-in agent; the fork uses the chosen agent.
+- `fork-custom-agent`: switch to one of your custom agents (installed, imported,
+  or discovered from an existing session), as well as to a built-in agent; the
+  fork uses the chosen agent.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
@@ -54,8 +55,10 @@ renames. Sub-agent sessions hide owner-only actions.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
-dialog, keep the agent or choose another built-in or custom agent. To make a
-custom agent available, first run a session using its spec file.
+dialog, keep the agent or choose another built-in or custom agent. Your custom
+agents (installed with `omnigent agent add`, imported in the Create custom agent
+dialog, or uploaded by running a session with their spec) stay available until
+you remove them.
 
 **Archived view:** switch the sidebar to archived sessions and filter by project.
 
@@ -207,8 +210,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
-- A custom agent belongs to its original session; appearing in the picker does
-  not prove the fork API accepts it. Check the bound agent after navigation.
+- A custom agent outlives its sessions: forks of your own sessions share it,
+  and forking someone else's session gives you your own copy. Appearing in the
+  picker does not prove the fork API accepts it; check the bound agent after
+  navigation.
 - A copied web transcript does not prove the native CLI received that history.
   Native variants of the agent-switch test skip without `LLM_API_KEY`; record
   those skips and use a configured test harness before claiming native coverage.

@@ -10970,19 +10970,9 @@ def _create_session_from_bundle(
     """
     Validate, store, and persist a bundled session request.
 
-    A top-level upload binds the uploader's agent that holds exactly these
-    files under this name, creating it on first use
-    (:func:`~omnigent.server.bundles.uploaded_agent_for`), so every
-    ``omnigent run`` of one agent shares one row. A name alone never
-    selects a row, even when a template agent has the same spec name.
-    Agent names are user-authored labels, not global content identities:
-    reusing a template by name would make a fresh ``omnigent run
-    <yaml>`` session execute whatever bundle that template currently
-    points at, silently discarding the uploaded bundle and coupling
-    unrelated users who chose the same name. A sub-agent child upload
-    still creates its own row: binding an existing one goes through
-    ``create_conversation``, which adds a per-parent title check that
-    this create path never had.
+    Top-level uploads reuse the uploader's row with the same name and bundle
+    contents (:func:`~omnigent.server.bundles.uploaded_agent_for`), never a row
+    matched by name alone. Child uploads receive separate rows.
 
     :param conversation_store: Store that owns the atomic
         conversation-plus-agent transaction.
