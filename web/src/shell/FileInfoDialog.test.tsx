@@ -64,6 +64,14 @@ import { FileInfoDialog } from "./FileInfoDialog";
 import { FilesPanelFocusContext } from "./FileRowActions";
 import type { FileRowInfo } from "./FileRowActions";
 
+function expectTimezoneName(text: string | null | undefined, modifiedAt: number) {
+  const timezoneName = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+    .formatToParts(new Date(modifiedAt * 1000))
+    .find((part) => part.type === "timeZoneName")?.value;
+  expect(timezoneName).toBeTruthy();
+  expect(text).toContain(timezoneName);
+}
+
 function EscapeDrawer({ info }: { info: FileRowInfo }) {
   const [open, setOpen] = useState(true);
   const [dialogOpen, setDialogOpen] = useState(true);
@@ -166,7 +174,7 @@ it("shows only available client-side file metadata and copies its canonical path
   render(<FileInfoDialog info={info} onOpenChange={onOpenChange} returnFocus={null} />);
 
   expect(screen.getByRole("dialog", { name: "File info (last known)" })).toBeInTheDocument();
-  expect(screen.getByRole("heading", { level: 2, name: "same name # Ω.txt" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { level: 3, name: "same name # Ω.txt" })).toBeInTheDocument();
   expect(screen.getByText("deep/same name # Ω.txt")).toBeInTheDocument();
   expect(screen.getByText("Path", { selector: "dt" })).toBeInTheDocument();
   expect(screen.getByText("File (.txt)", { selector: "dd" })).toBeInTheDocument();
@@ -206,7 +214,7 @@ it("shows exact bytes, root location, and a timezone on an ordinary file", () =>
   expect(screen.getByText("226 KB (231,424 bytes)")).toBeInTheDocument();
   expect(screen.getByText("Modified · +12 −3 lines")).toBeInTheDocument();
   const modified = screen.getByText("Modified", { selector: "dt" }).nextElementSibling;
-  expect(modified?.textContent).toMatch(/\b(?:UTC|GMT|[A-Z]{2,5})\b/);
+  expectTimezoneName(modified?.textContent, 1_759_608_000);
 });
 
 it("shows Host path and copy retains the absolute canonical path", async () => {
@@ -246,7 +254,7 @@ it("labels a changed folder without file status wording or counts", () => {
   expect(screen.queryByText(/New file|\+12|−3/)).not.toBeInTheDocument();
   expect(screen.queryByText("Size", { selector: "dt" })).not.toBeInTheDocument();
   const modified = screen.getByText("Modified", { selector: "dt" }).nextElementSibling;
-  expect(modified?.textContent).toMatch(/\b(?:UTC|GMT|[A-Z]{2,5})\b/);
+  expectTimezoneName(modified?.textContent, 1_759_608_000);
 });
 
 it("uses Not available for metadata without known changes", () => {
