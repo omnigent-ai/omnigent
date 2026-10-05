@@ -742,10 +742,6 @@ class _RecordingLabelStore:
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
 
-    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
-        del conversation_id, runner_id
-        return self.live_status != "failed"
-
     def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
         return self._runner_liveness.get(conversation_id)
 
@@ -1299,21 +1295,35 @@ async def test_relay_same_turn_running_preserves_intentional_stop(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("earlier_stop", [False, True])
-async def test_relay_prior_terminal_does_not_clear_new_stop(
+@pytest.mark.parametrize(
+    ("earlier_stop", "outcome"),
+    [
+        ("none", "acknowledged"),
+        ("rolled_back", "acknowledged"),
+        ("retained", "acknowledged"),
+        ("retained", "timeout"),
+        ("retained", "rejected"),
+    ],
+)
+async def test_relay_terminal_observation_tracks_stop_attempt(
     monkeypatch: pytest.MonkeyPatch,
     db_uri: str,
-    earlier_stop: bool,
+    earlier_stop: str,
+    outcome: str,
 ) -> None:
-    """A completed response cannot invalidate stop intent installed afterward."""
-    from unittest.mock import AsyncMock
-
+    """A new Stop resets terminal observation, while rejection restores old intent."""
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.helpers import _HostRunnerStopAttempt
+
+    async def stop_host(*_args: object, attempt: _HostRunnerStopAttempt) -> bool:
+        attempt.dispatched = True
+        attempt.rejected = outcome == "rejected"
+        return outcome == "acknowledged"
 
     monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
-    monkeypatch.setattr(sessions_module, "_stop_session_host_runner", AsyncMock(return_value=True))
+    monkeypatch.setattr(sessions_module, "_stop_session_host_runner", stop_host)
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation()
     child = store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
@@ -1323,7 +1333,7 @@ async def test_relay_prior_terminal_does_not_clear_new_stop(
         store.set_runner_id(row.id, runner_id)
         store.set_session_live_status(row.id, "waiting")
         sessions_module._session_status_cache[row.id] = "waiting"
-    if earlier_stop:
+    if earlier_stop != "none":
         sessions_module._intentional_stop_sessions[session_id] = runner_id
     gate = asyncio.Event()
     runner = _ScriptedThenDropRunnerClient([], gate)
@@ -1333,11 +1343,12 @@ async def test_relay_prior_terminal_does_not_clear_new_stop(
         yield 'data: {"type": "session.heartbeat"}\n\n'
         await gate.wait()
         yield 'data: {"type": "response.cancelled"}\n\n'
-        # A rejected earlier attempt can roll back its marker before a new Stop.
-        sessions_module._intentional_stop_sessions.pop(session_id, None)
-        assert await orchestration._stop_host_runner_intentionally(
+        if earlier_stop == "rolled_back":
+            sessions_module._intentional_stop_sessions.pop(session_id, None)
+        acknowledged = await orchestration._stop_host_runner_intentionally(
             parent.id, "host", runner_id, None, store
         )
+        assert acknowledged is (outcome == "acknowledged")
         assert sessions_module._intentional_stop_sessions.get(session_id) == runner_id
         yield 'data: {"type": "session.status", "status": "running"}\n\n'
         raise ConnectionError("intentional runner teardown")
@@ -1360,12 +1371,19 @@ async def test_relay_prior_terminal_does_not_clear_new_stop(
         statuses = []
         while not collector.queue.empty():
             statuses.append(collector.queue.get_nowait())
-        assert not any(event.get("status") == "failed" for event in statuses), statuses
-        assert any(event.get("status") == "idle" for event in statuses), statuses
-        assert sessions_module._session_status_cache[session_id] == "idle"
         persisted = store.get_conversation(session_id)
         assert persisted is not None
-        assert sessions_module._last_task_error_from_labels(persisted.labels) is None
+        error = sessions_module._last_task_error_from_labels(persisted.labels)
+        failed = [event for event in statuses if event.get("status") == "failed"]
+        if outcome == "rejected":
+            assert failed and failed[-1]["error"]["code"] == "runner_disconnected", statuses
+            assert sessions_module._session_status_cache[session_id] == "failed"
+            assert error is not None and error["code"] == "runner_disconnected"
+        else:
+            assert not failed, statuses
+            assert any(event.get("status") == "idle" for event in statuses), statuses
+            assert sessions_module._session_status_cache[session_id] == "idle"
+            assert error is None
     finally:
         gate.set()
         if collector is not None:

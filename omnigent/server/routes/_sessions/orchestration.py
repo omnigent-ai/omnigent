@@ -791,6 +791,7 @@ async def _stop_host_runner_intentionally(
                 statuses.setdefault(related_id, None)
         statuses.setdefault(session_id, None)
         marked: set[str] = set()
+        completed_stop_relays: dict[str, _RelayHandle] = {}
         for related_id, persisted_status in statuses.items():
             handle = _runner_relay_tasks.get(related_id)
             if handle is not None and handle.runner_id != runner_id:
@@ -802,8 +803,10 @@ async def _stop_host_runner_intentionally(
             if _intentional_stop_sessions.get(related_id) != runner_id:
                 marked.add(related_id)
                 _intentional_stop_sessions[related_id] = runner_id
-                if handle is not None:
-                    handle.intentional_stop_turn_ended = False
+            if handle is not None:
+                if handle.intentional_stop_turn_ended:
+                    completed_stop_relays[related_id] = handle
+                handle.intentional_stop_turn_ended = False
 
         acknowledged = False
         attempt = _HostRunnerStopAttempt()
@@ -816,6 +819,13 @@ async def _stop_host_runner_intentionally(
                 for related_id in marked:
                     if _intentional_stop_sessions.get(related_id) == runner_id:
                         _intentional_stop_sessions.pop(related_id, None)
+                # Rejection must not revive stale intent from an earlier completed turn.
+                for related_id, handle in completed_stop_relays.items():
+                    if (
+                        _intentional_stop_sessions.get(related_id) == runner_id
+                        and _runner_relay_tasks.get(related_id) is handle
+                    ):
+                        handle.intentional_stop_turn_ended = True
         return acknowledged
 
 
