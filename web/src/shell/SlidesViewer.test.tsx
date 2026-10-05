@@ -548,6 +548,19 @@ describe("prepareSlidesDoc with a kit", () => {
     expect(kitAt).toBeLessThan(doc.lastIndexOf("<script>"));
     expect(kitAt).toBeLessThan(doc.indexOf("</body>"));
   });
+
+  it.each([
+    ["a head", "<html><head><style>body{color:red}</style></head><body><section>a</section>"],
+    ["no head", "<!DOCTYPE html><html><body><style>body{color:red}</style><section>a</section>"],
+    ["a bare fragment", "<style>body{color:red}</style><section>a</section>"],
+  ])("injects a design-system style before the deck's styles in %s", (_label, deck) => {
+    const ds = "<style data-omnigent-design-system>x</style>";
+    const doc = prepareSlidesDoc(deck, "<style data-omnigent-kit>k</style>", ds);
+    const dsAt = doc.indexOf(ds);
+    expect(dsAt).toBe(doc.indexOf('<base target="_blank">') + '<base target="_blank">'.length);
+    expect(dsAt).toBeLessThan(doc.indexOf("body{color:red}"));
+    expect(doc.indexOf("data-omnigent-kit")).toBeGreaterThan(doc.indexOf("body{color:red}"));
+  });
 });
 
 describe("SlidesViewer design kit", () => {

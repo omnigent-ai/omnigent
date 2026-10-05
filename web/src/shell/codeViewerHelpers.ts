@@ -386,6 +386,8 @@ export function detectLang(path: string): BundledLanguage | "text" {
 export const HTML_PREVIEW_SANDBOX =
   "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals";
 
+const HTML_PREVIEW_BASE_TAG = '<base target="_blank">';
+
 /**
  * In-frame handler for same-page links: a srcdoc document resolves `#x` against its
  * embedder, so with `<base target="_blank">` the host page would open in a new window.
@@ -677,10 +679,17 @@ function lastBodyCloseIndex(doc: string): number {
  * Build the slide-deck srcdoc: the HTML preview doc plus injected CSS/script
  * placed before the last real `</body>` (appended when there is none). The
  * file on disk is never modified. `kitStyle` (see `loadDesignKit`) is injected
- * after the deck's own styles so the brand's base rules win.
+ * after the deck's own styles so the brand's base rules win; `systemStyle` (a
+ * design system's tokens and fonts) right after the preview `<base>`, before
+ * them, so the deck's own rules still apply.
  */
-export function prepareSlidesDoc(html: string, kitStyle = ""): string {
-  const doc = prepareHtmlPreviewDoc(html);
+export function prepareSlidesDoc(html: string, kitStyle = "", systemStyle = ""): string {
+  let doc = prepareHtmlPreviewDoc(html);
+  if (systemStyle) {
+    const head = doc.match(/<head[^>]*>/i);
+    const at = (head?.index ?? 0) + (head?.[0].length ?? 0) + HTML_PREVIEW_BASE_TAG.length;
+    doc = doc.slice(0, at) + systemStyle + doc.slice(at);
+  }
   const injection = SLIDES_STYLE + kitStyle + SLIDES_SCRIPT;
   const at = lastBodyCloseIndex(doc);
   return at === -1 ? doc + injection : doc.slice(0, at) + injection + doc.slice(at);
