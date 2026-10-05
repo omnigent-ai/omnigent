@@ -1110,6 +1110,7 @@ class HostMcpToolsFrame:
     harness: str
     server: str
     plugin: str | None = None
+    source_id: str | None = None
 
 
 @dataclass
@@ -1746,6 +1747,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "harness": frame.harness,
                 "server": frame.server,
                 "plugin": frame.plugin,
+                "source_id": frame.source_id,
             }
         )
     if isinstance(frame, HostMcpToolsResultFrame):
@@ -2197,6 +2199,7 @@ def _decode_known_host_frame(
                 harness=_required_str(msg, "harness"),
                 server=_required_str(msg, "server"),
                 plugin=_optional_nullable_str(msg, "plugin"),
+                source_id=_optional_nullable_str(msg, "source_id"),
             )
         case HostFrameKind.MCP_TOOLS_RESULT:
             return _decode_mcp_tools_result(msg)
@@ -2789,7 +2792,7 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
 
 
 _MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
-_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host")
+_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id")
 
 
 def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:

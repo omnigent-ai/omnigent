@@ -17,9 +17,10 @@ import pytest
 def test_host_mcp_tools(live_server: str, tmp_path: Path) -> None:
     script = tmp_path / "mcp_server.py"
     script.write_text(
+        "import os\n"
         "from mcp.server.fastmcp import FastMCP\n"
         "mcp = FastMCP('fixture')\n"
-        "@mcp.tool()\n"
+        "@mcp.tool(name=os.environ.get('TOOL_NAME', 'read_docs'))\n"
         "def read_docs() -> str:\n"
         '    "Read documentation."\n'
         "    return 'never called'\n"
@@ -39,6 +40,28 @@ def test_host_mcp_tools(live_server: str, tmp_path: Path) -> None:
                 }
             }
         )
+    )
+    installs = {}
+    for market in ("first", "second"):
+        plugin = claude / "plugins" / "cache" / market
+        plugin.mkdir(parents=True)
+        installs[f"toolkit@{market}"] = [{"installPath": str(plugin)}]
+        (plugin / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "docs": {
+                            "command": sys.executable,
+                            "args": [str(script)],
+                            "env": {"TOOL_NAME": market},
+                        }
+                    }
+                }
+            )
+        )
+    (claude / "plugins" / "installed_plugins.json").write_text(json.dumps({"plugins": installs}))
+    (claude / "settings.json").write_text(
+        json.dumps({"enabledPlugins": dict.fromkeys(installs, True)})
     )
     config = tmp_path / "config"
     config.mkdir()
@@ -99,6 +122,23 @@ def test_host_mcp_tools(live_server: str, tmp_path: Path) -> None:
                 }
                 assert "synthetic-config-secret" not in response.text
                 assert str(tmp_path) not in response.text
+                plugins = client.get(f"/v1/hosts/{host_id}/plugins").json()["plugins"]
+                active = client.get(f"/v1/hosts/{host_id}/mcp-servers").json()["mcp_servers"]
+                active_ids = {server["source_id"] for server in active if server["plugin"]}
+                for plugin in plugins:
+                    asset = plugin["mcp_entries"][0]
+                    assert asset["id"] in active_ids
+                    response = client.post(
+                        f"/v1/hosts/{host_id}/mcp-servers/tools",
+                        json={
+                            "harness": "claude",
+                            "server": "docs",
+                            "plugin": "toolkit",
+                            "source_id": asset["id"],
+                        },
+                    )
+                    assert response.status_code == 200, response.text
+                    assert response.json()["tools"][0]["name"] == plugin["marketplace"]
             finally:
                 child.terminate()
                 try:

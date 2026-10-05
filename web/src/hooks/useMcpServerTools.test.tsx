@@ -24,7 +24,11 @@ it("probes only expanded rows and reuses fresh results", async () => {
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
   const { result, rerender } = renderHook(
-    ({ enabled }) => useMcpServerTools("host id", "claude", "odd/server", "toolkit", { enabled }),
+    ({ enabled }) =>
+      useMcpServerTools("host id", "claude", "odd/server", "toolkit", {
+        enabled,
+        sourceId: "source-id",
+      }),
     { wrapper, initialProps: { enabled: false } },
   );
   expect(authenticatedFetch).not.toHaveBeenCalled();
@@ -34,7 +38,12 @@ it("probes only expanded rows and reuses fresh results", async () => {
     "/v1/hosts/host%20id/mcp-servers/tools",
     expect.objectContaining({
       method: "POST",
-      body: JSON.stringify({ harness: "claude", server: "odd/server", plugin: "toolkit" }),
+      body: JSON.stringify({
+        harness: "claude",
+        server: "odd/server",
+        plugin: "toolkit",
+        source_id: "source-id",
+      }),
     }),
   );
   rerender({ enabled: false });

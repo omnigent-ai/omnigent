@@ -104,12 +104,20 @@ export function HarnessCatalog({
     plugins: mine(context.plugins),
   };
   const pluginMcps = (plugin: InventoryPlugin) =>
+    plugin.mcp_entries?.map(({ id, name }) => ({
+      id,
+      name,
+      sourceId: id,
+      harness: family,
+      plugin: plugin.name,
+    })) ??
     plugin.mcp_servers?.map((name) => ({
       id: `${plugin.id}:${name}`,
       name,
       harness: family,
       plugin: plugin.name,
-    })) ?? own.mcps.filter((server) => server.plugin === plugin.name);
+    })) ??
+    own.mcps.filter((server) => server.plugin === plugin.name);
   const loading = inventory.status === "loading";
   const failed = (kind: CatalogKind) =>
     kind === "plugins" && family !== "claude"
@@ -373,7 +381,17 @@ function PluginPage({
           </ul>
         </TabsContent>
         <TabsContent value="mcps">
-          <McpList host={host} servers={mcps} />
+          <McpList
+            host={host}
+            servers={mcps}
+            unavailableReason={
+              plugin.enabled === false
+                ? "This plugin is disabled. Enable it in Claude Code to inspect MCP tools."
+                : plugin.marketplace !== undefined && !plugin.mcp_entries
+                  ? `Update ${host.name} to inspect installed plugin MCP tools.`
+                  : undefined
+            }
+          />
         </TabsContent>
       </Tabs>
     </>
@@ -445,22 +463,33 @@ const SKILL_MARKDOWN_COMPONENTS: Components = {
   ),
 };
 
-function McpList({ host, servers }: { host: Host; servers: InventoryMcpServer[] }) {
+function McpList({
+  host,
+  servers,
+  unavailableReason,
+}: {
+  host: Host;
+  servers: InventoryMcpServer[];
+  unavailableReason?: string;
+}) {
   const [expanded, setExpanded] = useState<string[]>([]);
   const [supported, setSupported] = useState(true);
   if (servers.length === 0) return <Notice>No MCPs found.</Notice>;
-  if (!supported)
+  if (!supported || unavailableReason)
     return (
-      <ul className="flex flex-col gap-2">
-        {servers.map((server) => (
-          <CatalogRow
-            key={server.id}
-            icon={<LetterAvatar name={server.name} />}
-            name={server.name}
-            detail={server.detail}
-          />
-        ))}
-      </ul>
+      <>
+        {unavailableReason && <Notice>{unavailableReason}</Notice>}
+        <ul className="flex flex-col gap-2">
+          {servers.map((server) => (
+            <CatalogRow
+              key={server.id}
+              icon={<LetterAvatar name={server.name} />}
+              name={server.name}
+              detail={server.detail}
+            />
+          ))}
+        </ul>
+      </>
     );
   // Leading chevron and instant expansion match the harness catalog.
   return (
@@ -505,6 +534,7 @@ function McpRow({
 }) {
   const query = useMcpServerTools(host.host_id, server.harness, server.name, server.plugin, {
     enabled: expanded,
+    sourceId: server.sourceId,
   });
   const missingRoute = query.error instanceof ApiError && query.error.status === 404;
   useEffect(() => {

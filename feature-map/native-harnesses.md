@@ -139,6 +139,9 @@ Cross-harness journeys:
   `tests/server/routes/test_mcp_tools.py`, and the real-host test
   `tests/e2e/test_host_mcp_tools_e2e.py::test_host_mcp_tools` with plain pytest.
   Web coverage is in `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  Disabled plugin MCP rows stay visible without expansion or probes. Check
+  same-name plugins from different marketplaces return their respective tools.
+  HTTP probes honor the host's proxy and certificate environment settings.
   From both card and gear entry points, expand a standalone and a plugin server;
   verify the left chevron, immediate expansion, names, count and status dot.
   Collapsed rows must not send probes or start processes. Reopen within five

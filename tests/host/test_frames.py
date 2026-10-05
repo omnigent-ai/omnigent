@@ -2375,6 +2375,7 @@ def test_skill_content_allow_list_and_correlated_malformed_result():
     "frame",
     [
         HostMcpToolsFrame("m", "claude", "odd/server", "toolkit"),
+        HostMcpToolsFrame("m", "claude", "odd/server", "toolkit", "a" * 64),
         HostMcpToolsResultFrame(
             "m", "ok", tools=[{"name": "read", "description": None}], connection="connected"
         ),

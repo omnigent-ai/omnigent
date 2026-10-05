@@ -57,15 +57,17 @@ let mcpResult: {
   isPending: false,
 };
 let mcpLookups: [string, string, string, string | undefined, boolean][] = [];
+let mcpSources: (string | undefined)[] = [];
 vi.mock("@/hooks/useMcpServerTools", () => ({
   useMcpServerTools: (
     host: string,
     harness: string,
     server: string,
     plugin: string | undefined,
-    { enabled }: { enabled: boolean },
+    { enabled, sourceId }: { enabled: boolean; sourceId?: string },
   ) => {
     mcpLookups.push([host, harness, server, plugin, enabled]);
+    if (enabled) mcpSources.push(sourceId);
     return enabled ? mcpResult : { isPending: true };
   },
 }));
@@ -192,6 +194,7 @@ afterEach(() => {
     isPending: false,
   };
   mcpLookups = [];
+  mcpSources = [];
   cleanup();
   hosts = [];
   inventory = INVENTORY;
@@ -643,3 +646,64 @@ it.each(["needs_auth", "timeout", "unreachable", "unsupported"])(
     expect(screen.queryByText(/· 0 tools/)).toBeNull();
   },
 );
+
+it.each([false, true])("uses installed MCP identity and honors enabled=%s", (enabled) => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      plugins: ["first", "second"].map((marketplace) => ({
+        id: marketplace,
+        name: "toolkit",
+        harness: "claude",
+        marketplace,
+        enabled,
+        skills: [],
+        mcp_servers: ["docs"],
+        mcp_entries: [{ id: `${marketplace}-mcp`, name: "docs" }],
+      })),
+    },
+  };
+  renderHarnesses("claude-native");
+  selectTab("Plugins · 2");
+  fireEvent.click(screen.getAllByTestId("catalog-row-toolkit")[1]);
+  selectTab("MCPs · 1");
+  const row = screen.getByTestId("catalog-row-docs");
+  fireEvent.click(row);
+  if (enabled) {
+    expect(mcpSources).toContain("second-mcp");
+    expect(mcpSources).not.toContain("first-mcp");
+    expect(screen.getByText("read_docs")).toBeTruthy();
+  } else {
+    expect(row.tagName).not.toBe("BUTTON");
+    expect(screen.getByText(/This plugin is disabled/)).toBeTruthy();
+    expect(mcpSources).toEqual([]);
+    expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
+  }
+});
+
+it("requests a host update instead of guessing installed MCP identity", () => {
+  hosts = [ONLINE];
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      plugins: [
+        {
+          ...INVENTORY.context.plugins[0],
+          marketplace: "market",
+          enabled: true,
+          mcp_servers: ["docs"],
+        },
+      ],
+    },
+  };
+  renderHarnesses("claude-native");
+  selectTab("Plugins · 1");
+  fireEvent.click(screen.getByTestId("catalog-row-toolkit"));
+  selectTab("MCPs · 1");
+  expect(screen.getByText("Update my-laptop to inspect installed plugin MCP tools.")).toBeTruthy();
+  expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
+  expect(mcpSources).toEqual([]);
+});

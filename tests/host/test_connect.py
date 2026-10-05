@@ -8380,8 +8380,8 @@ async def test_host_skill_content_failure_is_private(monkeypatch, caplog):
 
 
 async def test_host_answers_mcp_tools_over_the_tunnel(monkeypatch):
-    async def probe(self, harness, server, plugin):
-        assert (harness, server, plugin) == ("claude", "docs", "toolkit")
+    async def probe(self, harness, server, plugin, source_id):
+        assert (harness, server, plugin, source_id) == ("claude", "docs", "toolkit", "a" * 64)
         return {
             "tools": [{"name": "read", "description": None}],
             "connection": "connected",
@@ -8392,7 +8392,7 @@ async def test_host_answers_mcp_tools_over_the_tunnel(monkeypatch):
     host = _make_host_process()
     ws = _RecordingWS()
     host._start_frame_task(
-        ws, encode_host_frame(HostMcpToolsFrame("m", "claude", "docs", "toolkit"))
+        ws, encode_host_frame(HostMcpToolsFrame("m", "claude", "docs", "toolkit", "a" * 64))
     )
     await _drain_frame_tasks(host)
     result = decode_host_frame(ws.sent[-1])

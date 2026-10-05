@@ -3318,6 +3318,17 @@
             "title": "Scope",
             "type": "string"
           },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
           "transport": {
             "description": "`stdio` for a local process, `http` for a remote server.",
             "enum": [
@@ -3420,6 +3431,18 @@
             "minLength": 1,
             "title": "Server",
             "type": "string"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
           }
         },
         "required": [

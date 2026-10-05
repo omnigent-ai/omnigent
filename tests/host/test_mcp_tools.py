@@ -154,7 +154,11 @@ async def test_cancellation_reaps_stdio_tree(tmp_path, monkeypatch):
             await task
 
 
-async def test_http_401_needs_auth_without_private_logs(monkeypatch, caplog, capfd):
+@pytest.mark.parametrize("via_proxy", [False, True])
+async def test_http_401_needs_auth_without_private_logs(monkeypatch, caplog, capfd, via_proxy):
+    for key in mcp_tools._HTTP_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+
     async def reject(reader, writer):
         await reader.read(8192)
         writer.write(
@@ -167,10 +171,14 @@ async def test_http_401_needs_auth_without_private_logs(monkeypatch, caplog, cap
     server = await asyncio.start_server(reject, "127.0.0.1", 0)
     async with server:
         port = server.sockets[0].getsockname()[1]
+        target = f"127.0.0.1:{port}"
+        if via_proxy:
+            monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{port}")
+            target = "synthetic-mcp.invalid"
         entry = _entry(
             {
                 "type": "http",
-                "url": f"http://127.0.0.1:{port}/mcp?token=synthetic-url-secret",
+                "url": f"http://{target}/mcp?token=synthetic-url-secret",
                 "headers": {"Authorization": "Bearer synthetic-header-secret"},
             }
         )
@@ -277,3 +285,119 @@ def test_transport_timeouts_keep_the_timeout_status():
     timeout = httpx.ReadTimeout("synthetic-private-URL")
     assert mcp_tools._failure_status(timeout) == "timeout"
     assert mcp_tools._failure_status(ExceptionGroup("transport", [timeout])) == "timeout"  # noqa: F821
+
+
+async def test_plugin_identity_selects_marketplace_and_never_probes_disabled(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    from omnigent.host.plugins import discover_plugins
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    claude = tmp_path / ".claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    installs = {}
+    for market in ("first", "second", "disabled"):
+        plugin = claude / "plugins" / "cache" / market
+        plugin.mkdir(parents=True)
+        installs[f"toolkit@{market}"] = [{"installPath": str(plugin)}]
+        (plugin / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "docs": {"command": f"fixture-{market}"},
+                    }
+                }
+            )
+        )
+    (claude / "plugins" / "installed_plugins.json").write_text(json.dumps({"plugins": installs}))
+    (claude / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {key: not key.endswith("@disabled") for key in installs}})
+    )
+    commands = []
+
+    async def probe(payload):
+        commands.append(json.loads(payload)["config"]["command"])
+        return mcp_tools._result("connected")
+
+    monkeypatch.setattr(mcp_tools, "_probe_worker", probe)
+    discovery = HostMcpTools()
+    plugins = {p["marketplace"]: p for p in discover_plugins()}
+    active_ids = {s.summary.get("source_id") for s in mcp_tools.configured_mcp_servers()}
+    for market in ("second", "first"):
+        source_id = plugins[market]["mcp_entries"][0]["id"]
+        assert source_id in active_ids
+        await discovery.probe("claude", "docs", "toolkit", source_id)
+        assert commands[-1] == f"fixture-{market}"
+    disabled_id = plugins["disabled"]["mcp_entries"][0]["id"]
+    assert disabled_id not in active_ids
+    with pytest.raises(LookupError):
+        await discovery.probe("claude", "docs", "toolkit", disabled_id)
+    with pytest.raises(LookupError):
+        await discovery.probe("claude", "docs", "toolkit")
+    assert commands == ["fixture-second", "fixture-first"]
+
+
+async def test_http_worker_inherits_only_network_settings(monkeypatch):
+    from types import SimpleNamespace
+
+    settings = {
+        key: f"synthetic-{key}"
+        for key in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        )
+    }
+    for key, value in settings.items():
+        monkeypatch.setenv(key, value)
+    for key in ("OMNIGENT_RUNNER_TOKEN", "DATABRICKS_TOKEN", "OPENAI_API_KEY"):
+        monkeypatch.setenv(key, "synthetic-private-token")
+    monkeypatch.setattr(
+        mcp_tools, "configured_mcp_servers", lambda: [_entry({"url": "https://example.test/mcp"})]
+    )
+    captured = {}
+
+    async def capture_spawn(*args, **kwargs):
+        captured.update(kwargs["env"])
+        raise RuntimeError("captured spawn")
+
+    local_asyncio = SimpleNamespace(**vars(asyncio))
+    local_asyncio.create_subprocess_exec = capture_spawn
+    monkeypatch.setattr(mcp_tools, "asyncio", local_asyncio)
+    with pytest.raises(RuntimeError, match="captured spawn"):
+        await HostMcpTools().probe("claude", "docs")
+    assert {key: captured[key] for key in settings} == settings
+    assert "synthetic-private-token" not in captured.values()
+
+
+async def test_http_network_settings_invalidate_probe_cache(monkeypatch):
+    monkeypatch.setattr(
+        mcp_tools, "configured_mcp_servers", lambda: [_entry({"url": "https://example.test/mcp"})]
+    )
+    calls = []
+
+    async def probe(payload):
+        calls.append(json.loads(payload)["network_env"])
+        return mcp_tools._result("connected")
+
+    monkeypatch.setattr(mcp_tools, "_probe_worker", probe)
+    discovery = HostMcpTools()
+    monkeypatch.setenv("HTTPS_PROXY", "http://first.example:8080")
+    await discovery.probe("claude", "docs")
+    await discovery.probe("claude", "docs")
+    monkeypatch.setenv("HTTPS_PROXY", "http://second.example:8080")
+    await discovery.probe("claude", "docs")
+    assert [env["HTTPS_PROXY"] for env in calls] == [
+        "http://first.example:8080",
+        "http://second.example:8080",
+    ]

@@ -27,6 +27,18 @@ PROBE_CACHE_SECONDS = 300.0
 MAX_TOOLS = 500
 MAX_TOOL_NAME = 256
 MAX_TOOL_DESCRIPTION = 300
+_HTTP_ENV_VARS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
 
 
 class McpProbeResult(TypedDict):
@@ -151,19 +163,23 @@ class HostMcpTools:
         self._slots = asyncio.Semaphore(2)
         self._cache: TTLCache[str, McpProbeResult] = TTLCache(maxsize=128, ttl=PROBE_CACHE_SECONDS)
 
-    async def probe(self, harness: str, name: str, plugin: str | None = None) -> McpProbeResult:
+    async def probe(
+        self, harness: str, name: str, plugin: str | None = None, source_id: str | None = None
+    ) -> McpProbeResult:
         servers = await asyncio.to_thread(configured_mcp_servers)
-        server = next(
-            (
-                s
-                for s in servers
-                if (s.summary["harness"], s.summary["name"], s.summary.get("plugin"))
-                == (harness, name, plugin)
-            ),
-            None,
-        )
-        if server is None:
-            raise LookupError("MCP server unavailable")
+        matches = [
+            s
+            for s in servers
+            if s.summary["harness"] == harness
+            and (
+                s.summary.get("source_id") == source_id
+                if source_id is not None
+                else (s.summary["name"], s.summary.get("plugin")) == (name, plugin)
+            )
+        ]
+        if len(matches) != 1:
+            raise LookupError("MCP server unavailable or ambiguous")
+        server = matches[0]
         try:
             config, cwd, transport = _effective_config(server)
         except PermissionError:
@@ -171,7 +187,17 @@ class HostMcpTools:
         except (ValueError, TypeError):
             return _result("unsupported")
         payload = json.dumps(
-            {"config": asdict(config), "cwd": str(cwd), "transport": transport}, sort_keys=True
+            {
+                "config": asdict(config),
+                "cwd": str(cwd),
+                "transport": transport,
+                "network_env": {
+                    key: os.environ[key]
+                    for key in _HTTP_ENV_VARS
+                    if config.transport == "http" and key in os.environ
+                },
+            },
+            sort_keys=True,
         )
         key = hashlib.sha256(payload.encode()).hexdigest()
         cached = self._cache.get(key)
@@ -193,6 +219,7 @@ class HostMcpTools:
 async def _probe_worker(payload: str) -> McpProbeResult:
     # Transport libraries and stdio servers may log secrets. Isolate their output.
     env = get_default_environment()
+    env.update(json.loads(payload).get("network_env", {}))
     if "PYTHONPATH" in os.environ:
         env["PYTHONPATH"] = os.environ["PYTHONPATH"]
     process = await asyncio.create_subprocess_exec(

@@ -32,6 +32,7 @@ export interface InventoryMcpServer {
   detail?: string;
   /** Plugin that bundles the server, e.g. ``"figma"``. */
   plugin?: string;
+  sourceId?: string;
 }
 
 export interface InventorySkill {
@@ -90,6 +91,7 @@ interface McpServerWire {
   transport: "stdio" | "http";
   scope: "user";
   plugin?: string | null;
+  source_id?: string | null;
   url_host?: string | null;
 }
 
@@ -176,11 +178,14 @@ export function buildInventoryContext(
         .filter(Boolean)
         .join(" · ");
       context.mcps.push({
-        id: `${harness}:${server.plugin ? `plugin:${server.plugin}:` : ""}${server.name}`,
+        id:
+          server.source_id ??
+          `${harness}:${server.plugin ? `plugin:${server.plugin}:` : ""}${server.name}`,
         name: server.name,
         harness,
         detail: detail || undefined,
         plugin: server.plugin ?? undefined,
+        sourceId: server.source_id ?? undefined,
       });
     }
     for (const [name, skills] of plugins) {

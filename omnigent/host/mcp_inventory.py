@@ -20,6 +20,7 @@ import tomllib
 from omnigent.spec.skill_sources import (
     SkillSourceContext,
     _enabled_plugin_keys,
+    _plugin_asset_id,
     _plugin_install_paths,
     _read_json,
 )
@@ -120,6 +121,7 @@ def _claude_servers(home: Path, env: Mapping[str, str]) -> list[ConfiguredMcpSer
                     and summary["name"] not in seen
                 ):
                     seen.add(summary["name"])
+                    summary["source_id"] = _plugin_asset_id(key, "mcp", summary["name"])
                     out.append(ConfiguredMcpServer(summary, config, install_path))
     return out
 

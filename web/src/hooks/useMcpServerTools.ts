@@ -13,17 +13,17 @@ export function useMcpServerTools(
   harness: string,
   server: string,
   plugin: string | undefined,
-  { enabled }: { enabled: boolean },
+  { enabled, sourceId }: { enabled: boolean; sourceId?: string },
 ) {
   return useQuery({
-    queryKey: ["mcp-tools", hostId, harness, server, plugin],
+    queryKey: ["mcp-tools", hostId, harness, server, plugin, sourceId],
     queryFn: async ({ signal }): Promise<McpServerTools> => {
       const response = await authenticatedFetch(
         `/v1/hosts/${encodeURIComponent(hostId)}/mcp-servers/tools`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ harness, server, plugin }),
+          body: JSON.stringify({ harness, server, plugin, source_id: sourceId }),
           signal,
         },
       );

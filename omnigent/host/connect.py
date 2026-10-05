@@ -3247,7 +3247,9 @@ class HostProcess:
 
     async def _handle_mcp_tools(self, frame: HostMcpToolsFrame) -> HostMcpToolsResultFrame:
         try:
-            result = await self._mcp_tools.probe(frame.harness, frame.server, frame.plugin)
+            result = await self._mcp_tools.probe(
+                frame.harness, frame.server, frame.plugin, frame.source_id
+            )
         except Exception:  # noqa: BLE001 — transport failures must not expose private config
             return HostMcpToolsResultFrame(
                 request_id=frame.request_id, status="failed", error="MCP tools lookup failed"

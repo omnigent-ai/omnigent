@@ -28,6 +28,7 @@ class McpToolsRequest(BaseModel):
     harness: Literal["claude", "codex", "cursor"]
     server: str = Field(min_length=1, max_length=1024)
     plugin: str | None = Field(default=None, max_length=1024)
+    source_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class McpToolSummary(BaseModel):
@@ -70,6 +71,7 @@ def create_mcp_tools_router(
             harness=body.harness,
             server=body.server,
             plugin=body.plugin,
+            source_id=body.source_id,
         )
         if result.status != "ok":
             raise HTTPException(status_code=502, detail="host MCP tools lookup failed")
@@ -96,6 +98,7 @@ async def request_host_mcp_tools(
     harness: str,
     server: str,
     plugin: str | None = None,
+    source_id: str | None = None,
 ) -> HostMcpToolsResultFrame:
     """Request an MCP server's tools over the host tunnel, with bounded waiting and cleanup."""
     request_id = secrets.token_hex(8)
@@ -106,7 +109,11 @@ async def request_host_mcp_tools(
             host_conn,
             encode_host_frame(
                 HostMcpToolsFrame(
-                    request_id=request_id, harness=harness, server=server, plugin=plugin
+                    request_id=request_id,
+                    harness=harness,
+                    server=server,
+                    plugin=plugin,
+                    source_id=source_id,
                 )
             ),
         )

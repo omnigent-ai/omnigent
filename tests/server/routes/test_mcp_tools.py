@@ -94,10 +94,13 @@ async def test_owner_gets_mcp_tools(
     conn = _register(registry, CAP_MCP_TOOLS)
     async with _client(app) as client:
         task = asyncio.create_task(
-            client.post(_URL, json=_REQUEST, headers={"x-test-user": "owner"})
+            client.post(
+                _URL, json={**_REQUEST, "source_id": "a" * 64}, headers={"x-test-user": "owner"}
+            )
         )
         frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
         assert isinstance(frame, HostMcpToolsFrame)
+        assert frame.source_id == "a" * 64
         assert (frame.harness, frame.server, frame.plugin) == ("claude", "odd/server", "toolkit")
         result.request_id = frame.request_id
         conn.pending_mcp_tools[frame.request_id].set_result(result)
