@@ -150,6 +150,87 @@ require(extensionPath)(pi);
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_delivery_drop_error_post_is_best_effort(tmp_path: Path) -> None:
+    """A dropped-follow-up notice does not retry or reject on transport failure."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    extension_path = (
+        Path(__file__).resolve().parents[3]
+        / "omnigent"
+        / "resources"
+        / "pi_native"
+        / "omnigent_pi_native_extension.js"
+    )
+
+    script = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const tmpDir = process.argv[2];
+const inboxDir = path.join(tmpDir, "inbox");
+const payloadPath = path.join(inboxDir, "000-msg.json");
+const configPath = path.join(tmpDir, "config.json");
+fs.mkdirSync(inboxDir, { recursive: true });
+fs.writeFileSync(
+  payloadPath,
+  JSON.stringify({ id: "msg-1", type: "user_message", content: "follow up" }),
+);
+fs.writeFileSync(
+  configPath,
+  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir }),
+);
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+let fetchCalls = 0;
+global.fetch = async () => {
+  fetchCalls += 1;
+  throw new Error("server unavailable");
+};
+let pollInbox = null;
+global.setInterval = (fn, _ms) => {
+  pollInbox = fn;
+  return { fakeInterval: true };
+};
+const handlers = {};
+const pi = {
+  registerCommand() {},
+  on(name, handler) { handlers[name] = handler; },
+  sendUserMessage() { throw new Error("Pi is not ready"); },
+};
+require(extensionPath)(pi);
+
+(async () => {
+  await handlers.session_start({}, {
+    sessionManager: { getSessionId: () => "native-session-1" },
+    ui: { setTitle() {}, setStatus() {}, notify() {} },
+  });
+  fetchCalls = 0;
+  for (let attempt = 0; attempt < 5; attempt += 1) pollInbox();
+  // Best-effort posts issue exactly one request and settle without an
+  // unhandled rejection; a durable retry would issue three requests here.
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(fs.existsSync(payloadPath), false);
+  assert.equal(fetchCalls, 1);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+
+    result = subprocess.run(
+        [node, "-e", script, str(extension_path), str(tmp_path)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def _run_extension_script(node: str, extension_path: Path, script: str) -> None:
     """Run a Node test ``script`` against the real extension; fail on nonzero exit."""
     result = subprocess.run(
@@ -813,7 +894,13 @@ const tmpDir = process.argv[2];
 const configPath = path.join(tmpDir, "config.json");
 fs.writeFileSync(
   configPath,
-  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1" }),
+  JSON.stringify({
+    serverUrl: "http://omnigent.test",
+    sessionId: "session-1",
+    // Keep the timeout regression fast; production uses the extension's
+    // five-second default when this test-only override is absent.
+    durableItemPostTimeoutMs: 10,
+  }),
 );
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
@@ -883,7 +970,7 @@ def test_durable_item_retries_non_2xx_and_reuses_source_id(tmp_path: Path) -> No
 def test_durable_item_surfaces_terminal_failure_after_bounded_retries(
     tmp_path: Path,
 ) -> None:
-    """A permanent item failure rejects the lifecycle callback after three tries."""
+    """A transient item failure rejects the lifecycle callback after three tries."""
     script = (
         _DURABILITY_HARNESS
         + r"""
@@ -911,6 +998,84 @@ def test_durable_item_surfaces_terminal_failure_after_bounded_retries(
   assert.equal(messages.length, 3, JSON.stringify(messages));
   const sourceIds = new Set(messages.map((event) => event.data.source_id));
   assert.equal(sourceIds.size, 1, JSON.stringify(messages));
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_durable_item_does_not_retry_permanent_http_failure(tmp_path: Path) -> None:
+    """A permanent HTTP failure rejects immediately instead of retrying."""
+    script = (
+        _DURABILITY_HARNESS
+        + r"""
+(async () => {
+  responses.push({ ok: false, status: 400 });
+  const message = {
+    id: "assistant-400",
+    role: "assistant",
+    content: [{ type: "text", text: "bad request" }],
+  };
+  let failure;
+  try {
+    await handlers.message_end({ message }, ctx);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, "permanent persistence failure must reject");
+  assert.match(String(failure && failure.message), /HTTP 400/);
+  assert.equal(fetchCalls, 1, JSON.stringify(posted));
+  assert.equal(items("message").length, 1, JSON.stringify(posted));
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_durable_item_timeout_is_retryable_and_aborts_each_attempt(
+    tmp_path: Path,
+) -> None:
+    """A hung durable POST is aborted and retried within the attempt budget."""
+    script = (
+        _DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const signals = [];
+  global.fetch = async (_url, request) => {
+    posted.push(JSON.parse(request.body));
+    fetchCalls += 1;
+    signals.push(request.signal);
+    await new Promise((resolve, reject) => {
+      request.signal.addEventListener("abort", () => {
+        reject(Object.assign(new Error("request timed out"), { name: "AbortError" }));
+      }, { once: true });
+    });
+    return { ok: true, status: 204 };
+  };
+  const message = {
+    id: "assistant-timeout",
+    role: "assistant",
+    content: [{ type: "text", text: "hung request" }],
+  };
+  let failure;
+  try {
+    await handlers.message_end({ message }, ctx);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, "exhausted timeout retries must reject");
+  assert.match(String(failure && failure.name), /AbortError/);
+  assert.equal(fetchCalls, 3, JSON.stringify(posted));
+  assert.equal(signals.length, 3);
+  assert.ok(signals.every((signal) => signal.aborted));
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
@@ -2249,6 +2414,96 @@ const ctx = {
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_compact_unavailable_error_post_is_best_effort(tmp_path: Path) -> None:
+    """A failed compact-unavailable POST must not reject the inbox poller."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    extension_path = (
+        Path(__file__).resolve().parents[3]
+        / "omnigent"
+        / "resources"
+        / "pi_native"
+        / "omnigent_pi_native_extension.js"
+    )
+
+    script = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const tmpDir = process.argv[2];
+const inboxDir = path.join(tmpDir, "inbox");
+const payloadPath = path.join(inboxDir, "000-compact.json");
+const configPath = path.join(tmpDir, "config.json");
+fs.mkdirSync(inboxDir, { recursive: true });
+fs.writeFileSync(payloadPath, JSON.stringify({ id: "compact-1", type: "compact" }));
+fs.writeFileSync(
+  configPath,
+  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir }),
+);
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+const postedEvents = [];
+global.fetch = async (_url, request) => {
+  postedEvents.push(JSON.parse(request.body));
+  return { ok: false, status: 400 };
+};
+let pollInbox = null;
+global.setInterval = (fn, _ms) => {
+  pollInbox = fn;
+  return { fakeInterval: true };
+};
+const handlers = {};
+const pi = {
+  registerCommand() {},
+  on(name, handler) { handlers[name] = handler; },
+  sendUserMessage() {},
+};
+require(extensionPath)(pi);
+
+const ctx = {
+  sessionManager: { getSessionId: () => "native-session-1" },
+  ui: { setTitle() {}, setStatus() {}, notify() {} },
+  abort() {},
+  isIdle: () => false,
+};
+(async () => {
+  await handlers.session_start({}, ctx);
+  pollInbox();
+  // Allow a mistaken durable retry/rejection to surface as an unhandled
+  // rejection; the best-effort path completes immediately.
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(fs.existsSync(payloadPath), false);
+  assert.equal(
+    postedEvents.filter(
+      (event) =>
+        event.type === "external_conversation_item" &&
+        event.data &&
+        event.data.item_data &&
+        event.data.item_data.code === "pi_compact_unavailable",
+    ).length,
+    1,
+    JSON.stringify(postedEvents),
+  );
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+
+    result = subprocess.run(
+        [node, "-e", script, str(extension_path), str(tmp_path)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_compact_payload_synchronous_throw_dismisses_spinner(
     tmp_path: Path,
 ) -> None:
@@ -3241,6 +3496,36 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
   const errs = errorItems();
   assert.equal(errs.length, 1, JSON.stringify(posted));
   assert.match(errs[0].data.item_data.message, /not available/);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_model_change_error_post_is_best_effort(tmp_path: Path) -> None:
+    """A failed model-error POST must not reject the inbox delivery task."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+  // The error item is auxiliary feedback; an unavailable server must not
+  // create an unhandled rejection in the fire-and-forget inbox poller.
+  global.fetch = async () => ({ ok: false, status: 400 });
+  await deliverModelChange("model-that-does-not-exist");
+  await sleep(250);
+
+  assert.equal(setModelCalls.length, 0, JSON.stringify(setModelCalls));
+  assert.equal(errorItems().length, 0, JSON.stringify(posted));
   finish();
 })().catch((error) => {
   finish();

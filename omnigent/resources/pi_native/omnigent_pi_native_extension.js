@@ -41,6 +41,9 @@ const _TRANSIENT_RETRY_MAX_BACKOFF_MS = 10_000;
 const _DURABLE_ITEM_MAX_ATTEMPTS = 3;
 const _DURABLE_ITEM_INITIAL_BACKOFF_MS = 50;
 const _DURABLE_ITEM_MAX_BACKOFF_MS = 250;
+// Keep a lost connection from wedging Pi's lifecycle callback indefinitely;
+// source_id makes retrying an acknowledged-but-unseen POST idempotent.
+const _DURABLE_ITEM_POST_TIMEOUT_MS = 5_000;
 // A genuine connect error (refused / reset) throws fast — well under the
 // per-attempt park timeout. A legitimate long-poll abort only throws once
 // our own _PARK_ATTEMPT_TIMEOUT_MS timer fires (the server held the
@@ -795,12 +798,14 @@ function boundedSourceId(sourceId) {
 function eventPostError(response) {
   const status = response && response.status;
   if (typeof status === "number" && Number.isFinite(status)) {
-    return new Error(`Omnigent event POST failed with HTTP ${status}`);
+    const error = new Error(`Omnigent event POST failed with HTTP ${status}`);
+    error.status = status;
+    return error;
   }
   return new Error("Omnigent event POST returned an invalid response");
 }
 
-async function postEvent(config, body) {
+async function postEvent(config, body, options = {}) {
   if (
     !config ||
     !config.serverUrl ||
@@ -809,11 +814,13 @@ async function postEvent(config, body) {
   )
     return;
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`;
-  const response = await fetch(url, {
+  const request = {
     method: "POST",
     headers: headers(config),
     body: JSON.stringify(body),
-  });
+  };
+  if (options && options.signal) request.signal = options.signal;
+  const response = await fetch(url, request);
   const status = response && response.status;
   if (
     !response ||
@@ -828,7 +835,7 @@ async function postEvent(config, body) {
 
 // Non-durable status, preview, and metadata events are intentionally
 // best-effort. Durable conversation items use postDurableConversationItem
-// below, which propagates exhaustion to the lifecycle callback instead.
+// below, which retries transient failures and propagates exhaustion instead.
 async function postEventBestEffort(config, body) {
   try {
     return await postEvent(config, body);
@@ -841,6 +848,36 @@ async function postEventBestEffort(config, body) {
 // The server-side source_id remains the correctness boundary, so this is only
 // an optimization that avoids needless duplicate requests in the common case.
 const pendingDurableItems = new Map();
+
+function durableItemPostTimeoutMs(config) {
+  const configured = config && config.durableItemPostTimeoutMs;
+  return typeof configured === "number" &&
+    Number.isFinite(configured) &&
+    configured > 0
+    ? configured
+    : _DURABLE_ITEM_POST_TIMEOUT_MS;
+}
+
+function isRetryableDurableError(error) {
+  const status = error && error.status;
+  if (typeof status !== "number") return true;
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+async function postDurableAttempt(config, body) {
+  // Abort each fetch independently so one hung request cannot consume the
+  // whole lifecycle callback's retry budget.
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    durableItemPostTimeoutMs(config),
+  );
+  try {
+    return await postEvent(config, body, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 async function postDurableConversationItem(config, data, sourceId) {
   const normalizedSourceId = boundedSourceId(sourceId);
@@ -857,10 +894,14 @@ async function postDurableConversationItem(config, data, sourceId) {
     let lastError;
     for (let attempt = 1; attempt <= _DURABLE_ITEM_MAX_ATTEMPTS; attempt += 1) {
       try {
-        return await postEvent(config, body);
+        return await postDurableAttempt(config, body);
       } catch (err) {
         lastError = err;
-        if (attempt === _DURABLE_ITEM_MAX_ATTEMPTS) break;
+        if (
+          attempt === _DURABLE_ITEM_MAX_ATTEMPTS ||
+          !isRetryableDurableError(err)
+        )
+          break;
         await sleep(backoff);
         backoff = Math.min(backoff * 2, _DURABLE_ITEM_MAX_BACKOFF_MS);
       }
@@ -922,9 +963,9 @@ function interruptActiveContext(ctx) {
 async function triggerCompaction(config, ctx, customInstructions) {
   if (!ctx || typeof ctx.compact !== "function") {
     const responseId = `pi-compact-unavailable-${Date.now()}`;
-    await postDurableConversationItem(
-      config,
-      {
+    await postEventBestEffort(config, {
+      type: "external_conversation_item",
+      data: {
         response_id: responseId,
         item_type: "error",
         item_data: {
@@ -936,8 +977,7 @@ async function triggerCompaction(config, ctx, customInstructions) {
             "Pi version may not support it.",
         },
       },
-      `pi:compact-unavailable:${responseId}`,
-    );
+    });
     return false;
   }
   try {
@@ -1091,9 +1131,9 @@ async function applyModelChange(pi, config, ctx, modelId) {
 
 async function postModelChangeError(config, message) {
   const responseId = `pi-model-change-error-${Date.now()}`;
-  await postDurableConversationItem(
-    config,
-    {
+  await postEventBestEffort(config, {
+    type: "external_conversation_item",
+    data: {
       response_id: responseId,
       item_type: "error",
       item_data: {
@@ -1102,8 +1142,7 @@ async function postModelChangeError(config, message) {
         message,
       },
     },
-    `pi:model-change-error:${responseId}`,
-  );
+  });
 }
 
 function modelReference(model) {
@@ -1282,9 +1321,9 @@ function startInboxPoller(
                 : payload.content
               : "";
           const responseId = `pi-deliver-dropped-${Date.now()}`;
-          void postDurableConversationItem(
-            config,
-            {
+          void postEventBestEffort(config, {
+            type: "external_conversation_item",
+            data: {
               response_id: responseId,
               item_type: "error",
               item_data: {
@@ -1296,9 +1335,6 @@ function startInboxPoller(
                   `and was dropped. Content preview: ${JSON.stringify(preview)}`,
               },
             },
-            `pi:followup-dropped:${id ?? fullPath}`,
-          ).catch((err) => {
-            console.error("Omnigent: failed to persist Pi follow-up error", err);
           });
           try {
             fs.unlinkSync(fullPath);
