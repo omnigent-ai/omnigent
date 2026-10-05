@@ -23,6 +23,7 @@ from omnigent.entities.conversation import (
     RoutingDecisionData,
     SlashCommandData,
     TerminalCommandData,
+    bumps_conversation_activity,
     parse_item_data,
     synthesize_conversation_title,
 )
@@ -82,6 +83,7 @@ __all__ = [
     "SlashCommandData",
     "StoredFile",
     "TerminalCommandData",
+    "bumps_conversation_activity",
     "filter_resources_by_type",
     "get_resource_by_id",
     "parse_item_data",

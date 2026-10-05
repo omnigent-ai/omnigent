@@ -794,6 +794,25 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
 )
 
 
+def bumps_conversation_activity(item: NewConversationItem) -> bool:
+    """Whether appending *item* should bump the conversation's ``updated_at``.
+
+    A bump both reorders the session to the top of the sidebar and lights its
+    unread badge, so "activity-neutral" appends — ones with no user- or
+    agent-visible content — must not bump, or they resurface an untouched
+    session as if it had new activity. ``resource_event`` items fire as
+    terminals/files/environments come and go on reconnect/snapshot, and a meta
+    message is durable context hidden from the transcript. Everything else
+    (including ``error``, ``routing_decision``, ``slash_command``) is real
+    activity and still bumps.
+    """
+    if item.type == "resource_event":
+        return False
+    if item.type == "message" and getattr(item.data, "is_meta", False):
+        return False
+    return True
+
+
 def parse_item_data(item_type: str, raw: dict[str, Any]) -> ItemData:
     """
     Parse a raw dict into the appropriate ItemData model.
