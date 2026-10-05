@@ -1,0 +1,139 @@
+// Kind-agnostic design-system injection: the system's tokens and fonts as a
+// <style>, plus `ds:` references in the content rewritten to data: URIs. The
+// folder is untrusted, so only CSS and data: URIs from it reach the output,
+// every path is confined to the folder, and assets are size-capped.
+
+import {
+  FONT_MIME,
+  IMAGE_MIME,
+  extension,
+  kitDataUri,
+  kitText,
+  type KitFile,
+} from "@/shell/codeViewerHelpers";
+
+export const DS_STYLESHEET = "colors_and_type.css";
+export const DS_ASSET_MAX_BYTES = 2 * 1024 * 1024;
+export const DS_DECK_MAX_BYTES = 20 * 1024 * 1024;
+
+const DS_MIME: Record<string, string> = { ...IMAGE_MIME, ...FONT_MIME };
+const DS_PATH_RE = /^[\w.-]+(?:\/[\w.-]+)*$/;
+const CSS_URL_RE = /url\(\s*(["']?)([^"')]*)\1\s*\)/gi;
+const ATTR_DS_RE = /(\s(?:src|href)\s*=\s*)(?:"ds:([^"]*)"|'ds:([^']*)'|ds:([^\s"'>]+))/gi;
+const URL_DS_RE = /url\(\s*(["']?)ds:([^"')\s]*)\1\s*\)/gi;
+
+/** Read a file relative to the design-system folder; `null` when it does not exist. */
+export type DesignSystemRead = (path: string) => Promise<KitFile | null>;
+type AssetUri = (path: string) => Promise<string>;
+
+export interface DesignSystemInjection {
+  /** `<style>` to inject before the content's own styles, or "". */
+  style: string;
+  /** The content with every `ds:` reference rewritten to a data: URI. */
+  content: string;
+}
+
+/** A `ds:` (or stylesheet-relative) path, confined to the folder, image or font only. */
+export function resolveDsPath(ref: string): string {
+  const path = ref.replace(/^ds:/, "");
+  if (!DS_PATH_RE.test(path) || path.split("/").some((s) => s === "." || s === "..")) {
+    throw new Error(`${ref} must be a relative path inside the design system`);
+  }
+  if (!DS_MIME[extension(path)]) {
+    throw new Error(`${ref} must be an image or font (${Object.keys(DS_MIME).join(", ")})`);
+  }
+  return path;
+}
+
+/** Data URIs per path, each read once, with the per-asset and per-deck caps. */
+function assetLoader(read: DesignSystemRead): AssetUri {
+  const uris = new Map<string, Promise<string>>();
+  let total = 0;
+  return (path) => {
+    let uri = uris.get(path);
+    if (!uri) {
+      uri = (async () => {
+        const file = await read(path);
+        if (!file) throw new Error(`${path} not found in the design system`);
+        const encoded = kitDataUri(file, path, DS_MIME[extension(path)]);
+        if (encoded.length > DS_ASSET_MAX_BYTES) {
+          throw new Error(`${path} is larger than ${DS_ASSET_MAX_BYTES / 1024 / 1024} MB`);
+        }
+        total += encoded.length;
+        if (total > DS_DECK_MAX_BYTES) {
+          throw new Error(
+            `design-system assets are larger than ${DS_DECK_MAX_BYTES / 1024 / 1024} MB`,
+          );
+        }
+        return encoded;
+      })();
+      uris.set(path, uri);
+    }
+    return uri;
+  };
+}
+
+/** Run `replace` over every match of `re`, awaiting all replacements first. */
+async function replaceAsync(
+  text: string,
+  re: RegExp,
+  replace: (match: RegExpExecArray) => Promise<string>,
+): Promise<string> {
+  const matches = [...text.matchAll(re)];
+  const values = await Promise.all(matches.map((m) => replace(m as RegExpExecArray)));
+  let out = "";
+  let at = 0;
+  matches.forEach((m, i) => {
+    out += text.slice(at, m.index) + values[i];
+    at = m.index + m[0].length;
+  });
+  return out + text.slice(at);
+}
+
+/**
+ * The system stylesheet, safe to inject: `@import` stripped, relative and
+ * `ds:` urls (including `@font-face` sources) inlined, remote urls dropped.
+ */
+export async function processDesignSystemCss(css: string, asset: AssetUri): Promise<string> {
+  if (/<\/style/i.test(css)) throw new Error(`${DS_STYLESHEET} must not contain "</style"`);
+  const stripped = css.replace(/@import\b[^;]*;?/gi, "");
+  return replaceAsync(stripped, CSS_URL_RE, async ([whole, quote, raw]) => {
+    const value = raw.trim();
+    if (/^data:/i.test(value)) return whole;
+    if (!/^ds:/i.test(value) && /^(?:[a-z][\w+.-]*:|\/)/i.test(value)) return "none";
+    return `url(${quote}${await asset(resolveDsPath(value.replace(/^\.\//, "")))}${quote})`;
+  });
+}
+
+/** Rewrite `ds:` in `src` and `href` attributes and CSS `url()` to data: URIs. */
+export async function rewriteDsReferences(content: string, asset: AssetUri): Promise<string> {
+  const attrs = await replaceAsync(content, ATTR_DS_RE, async ([, lead, dq, sq, bare]) => {
+    const ref = `ds:${dq ?? sq ?? bare}`;
+    return `${lead}"${await asset(resolveDsPath(ref))}"`;
+  });
+  return replaceAsync(
+    attrs,
+    URL_DS_RE,
+    async ([, quote, path]) => `url(${quote}${await asset(resolveDsPath(`ds:${path}`))}${quote})`,
+  );
+}
+
+/**
+ * Load the system's stylesheet and the assets `content` references. Throws an
+ * Error whose message is user-facing.
+ */
+export async function injectDesignSystem(
+  content: string,
+  read: DesignSystemRead,
+): Promise<DesignSystemInjection> {
+  const asset = assetLoader(read);
+  const sheet = await read(DS_STYLESHEET);
+  const [css, rewritten] = await Promise.all([
+    sheet ? processDesignSystemCss(kitText(sheet, DS_STYLESHEET), asset) : "",
+    rewriteDsReferences(content, asset),
+  ]);
+  return {
+    style: css ? `<style data-omnigent-design-system>\n${css}\n</style>` : "",
+    content: rewritten,
+  };
+}

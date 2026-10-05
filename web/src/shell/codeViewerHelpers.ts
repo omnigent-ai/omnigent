@@ -720,13 +720,13 @@ export type DesignKitState =
   | { status: "error"; reason: string }
   | { status: "ok"; name: string; style: string };
 
-const FONT_MIME: Record<string, string> = {
+export const FONT_MIME: Record<string, string> = {
   woff2: "font/woff2",
   woff: "font/woff",
   ttf: "font/ttf",
   otf: "font/otf",
 };
-const IMAGE_MIME: Record<string, string> = {
+export const IMAGE_MIME: Record<string, string> = {
   svg: "image/svg+xml",
   png: "image/png",
   jpg: "image/jpeg",
@@ -786,7 +786,7 @@ function kitPath(value: unknown, field: string, mimes: Record<string, string>): 
   return value;
 }
 
-const extension = (path: string) => path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+export const extension = (path: string) => path.slice(path.lastIndexOf(".") + 1).toLowerCase();
 
 function kitFont(value: unknown, field: string): DesignKitFont | undefined {
   if (value === undefined) return undefined;
@@ -865,13 +865,13 @@ function checkKitFile(file: KitFile, path: string): void {
   }
 }
 
-function kitText(file: KitFile, path: string): string {
+export function kitText(file: KitFile, path: string): string {
   checkKitFile(file, path);
   if (file.encoding !== "utf-8") throw new Error(`${path} is not a text file`);
   return file.content;
 }
 
-function kitDataUri(file: KitFile, path: string, mime: string): string {
+export function kitDataUri(file: KitFile, path: string, mime: string): string {
   checkKitFile(file, path);
   let b64 = file.content.replace(/\s/g, "");
   if (file.encoding === "utf-8") {

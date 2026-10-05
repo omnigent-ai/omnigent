@@ -1,0 +1,15 @@
+@import url("https://fonts.example.com/remote.css");
+
+@font-face {
+  font-family: "Fixture Sans";
+  src: url("fonts/fixture-sans.woff2") format("woff2");
+}
+
+:root {
+  --fx-primary: #0b5fff;
+  --fx-font: "Fixture Sans", sans-serif;
+}
+
+.fx-logo {
+  background-image: url(assets/logo.svg);
+}
