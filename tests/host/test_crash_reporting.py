@@ -11,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -209,3 +210,77 @@ def test_uncaught_crash_reaches_sink(tmp_path: Path) -> None:
     assert attrs["reason"] == "uncaught"
     assert attrs["exception_type"] == "RuntimeError"
     assert "daemon exploded" in str(row["stack_trace"])
+
+
+_SPOOLED_CHILD = """
+import logging, sys, threading, time
+from pathlib import Path
+from omnigent import debug_logging as dl
+from omnigent.debug_log_spool import DebugLogSpool
+from omnigent.host import crash_reporting as cr
+
+spool = DebugLogSpool(Path(sys.argv[1]), "https://zerobus.example/insert")
+uploading = threading.Event()
+
+def hung_send(batch):
+    uploading.set()
+    time.sleep(3600)  # ZeroBus never answers
+
+dl.DebugLogHandler._FLUSH_WAIT = 0.01
+sink = dl.DebugLogHandler("host", hung_send, spool=spool)
+dl._active_sink = sink
+root = logging.getLogger()
+root.setLevel(logging.INFO)
+root.addHandler(sink)
+cr.install_host_crash_hooks()
+cr.install_host_signal_handlers()
+logging.getLogger("omnigent.test").info("warm-up row")
+uploading.wait(5)
+print("ready", flush=True)
+while True:
+    time.sleep(0.05)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_sigterm_with_hung_upload_is_bounded_and_spools_exit_row(tmp_path: Path) -> None:
+    from omnigent.debug_log_spool import DebugLogSpool
+
+    spool_dir = tmp_path / "spool"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _SPOOLED_CHILD, str(spool_dir)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "ready"
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+        elapsed = time.monotonic() - started
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    assert proc.returncode == -signal.SIGTERM
+    # Shutdown waited on the hung POST only up to the network budget.
+    from omnigent import debug_logging as dl
+
+    bound = dl._CLOSE_NETWORK_BUDGET_S + dl._SPOOL_DUMP_BUDGET_S + 0.75
+    assert elapsed < bound, f"exit took {elapsed:.2f}s"
+
+    delivered: list[dict[str, object]] = []
+    result = DebugLogSpool(spool_dir, "https://zerobus.example/insert").replay(
+        lambda batch: delivered.extend(batch) or "delivered", should_continue=lambda: True
+    )
+    assert result == "done"
+    exit_rows = [r for r in delivered if r["event_name"] == cr.HOST_EXITING_EVENT]
+    assert len(exit_rows) == 1
+    attrs = exit_rows[0]["attributes"]
+    assert isinstance(attrs, dict)
+    assert attrs["reason"] == "signal"
+    assert attrs["spooled"] == "true"
+    # The warm-up row was in flight when the process died: never resent.
+    assert not any(r["message"] == "warm-up row" for r in delivered)

@@ -40,6 +40,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.debug_log_spool import DebugLogSpool, DeliveryResult
 from omnigent.errors import ErrorPhase, OmnigentError, classify_exception
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import RUNNER_ID_ENV_VAR
@@ -108,6 +109,31 @@ _QUEUE_MAX_RECORDS = 10_000
 _TOKEN_REFRESH_SKEW_S = 300.0
 _HTTP_TIMEOUT_S = 10.0
 _SECRET_COMMAND_TIMEOUT_S = 30.0
+# Spooled delivery: close() keeps delivering the queue over the network for at
+# most the network budget, then writes what is left to disk within the dump
+# budget. Worst case close() takes about the sum of the two.
+_CLOSE_NETWORK_BUDGET_S = 2.0
+_SPOOL_DUMP_BUDGET_S = 0.5
+# Don't start a POST with less time than this left before the close deadline.
+_MIN_POST_BUDGET_S = 0.1
+_REPLAY_INTERVAL_S = 60.0
+_FAILURE_BACKOFF_MIN_S = 5.0
+_FAILURE_BACKOFF_MAX_S = 300.0
+# Transport errors raised before the request body was fully sent, so ZeroBus
+# cannot have accepted it and a retry is safe. Any other transport error (e.g.
+# a read timeout) leaves the outcome unknown.
+_NOT_SENT_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+    httpx.ProxyError,
+    httpx.UnsupportedProtocol,
+    httpx.LocalProtocolError,
+)
+# Client errors that a retry cannot fix; 401/403 refresh the token instead.
+_RETRYABLE_CLIENT_STATUSES = frozenset({401, 403, 408, 429})
 # Logger-name prefixes the sink drops as noise: httpx/httpcore emit an
 # "HTTP Request: …" line per call — high-volume plumbing the debug view doesn't
 # want (and the sink's own uploads go through httpx).
@@ -623,11 +649,21 @@ class _TokenSource:
         self._expires_at = 0.0
         self._client_secret = config.client_secret
 
-    def token(self) -> str | None:
+    def token(self, *, deadline: float | None = None) -> str | None:
+        """Return a cached token or mint one.
+
+        With a monotonic *deadline*, the mint's HTTP call is bounded by it, and
+        an unresolved client-secret command (an unbounded subprocess) is not
+        run: the caller spools the rows instead.
+        """
         with self._lock:
             if self._token and time.time() < self._expires_at - _TOKEN_REFRESH_SKEW_S:
                 return self._token
-            minted = self._mint()
+            if deadline is not None and (
+                self._client_secret is None and self._config.client_secret_command is not None
+            ):
+                return None
+            minted = self._mint(deadline=deadline)
             if minted is None:
                 return None
             self._token, self._expires_at = minted
@@ -699,7 +735,7 @@ class _TokenSource:
             ]
         )
 
-    def _mint(self) -> tuple[str, float] | None:
+    def _mint(self, *, deadline: float | None = None) -> tuple[str, float] | None:
         client_secret = self._resolve_client_secret()
         if client_secret is None:
             return None
@@ -714,7 +750,7 @@ class _TokenSource:
                     "resource": resource,
                     "authorization_details": self._authorization_details(),
                 },
-                timeout=_HTTP_TIMEOUT_S,
+                timeout=_bounded_timeout(deadline),
             )
         except httpx.HTTPError as exc:
             _diag(
@@ -754,9 +790,37 @@ class _TokenSource:
 
 DebugLogRow = dict[str, object]
 DebugLogSend = Callable[[list[DebugLogRow]], None]
-
+# A sender that reports its outcome, so a spooled handler can keep or drop rows.
+_ReportingSend = Callable[[list[DebugLogRow]], DeliveryResult | None]
 # Queued by DebugLogHandler.close() to wake its worker; never sent.
 _CLOSE_WAKEUP: DebugLogRow = {}
+
+
+@dataclass
+class _WorkerState:
+    """Per-worker shutdown coordination between close() and the uploader."""
+
+    # Set while the worker is inside a network call.
+    in_network: threading.Event
+    # Monotonic time by which a closing worker must stop using the network.
+    close_deadline: float | None = None
+
+
+def _remaining(deadline: float | None) -> float | None:
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def _bounded_timeout(deadline: float | None) -> float:
+    """The HTTP timeout, cut to what is left before *deadline*."""
+    remaining = _remaining(deadline)
+    if remaining is None:
+        return _HTTP_TIMEOUT_S
+    return max(0.01, min(_HTTP_TIMEOUT_S, remaining))
+
+
+def _bounded_sleep(seconds: float, deadline: float | None) -> None:
+    remaining = _remaining(deadline)
+    time.sleep(seconds if remaining is None else max(0.0, min(seconds, remaining)))
 
 
 class DebugLogHandler(logging.Handler):
@@ -765,12 +829,25 @@ class DebugLogHandler(logging.Handler):
     ``send`` runs on the handler's daemon thread and receives a prepared batch
     of debug-log row objects. It owns only delivery; this handler retains record
     serialization, queue overflow, batching, flush timing, and shutdown drains.
+
+    With a ``spool``, ``send`` must report a :data:`DeliveryResult`. Rows that
+    definitely failed, and rows still queued at :meth:`close`, are written to
+    the spool and replayed later by whichever process holds its upload lock.
+    :meth:`close` then never waits on the network. Without a spool, close keeps
+    the legacy bounded drain through ``send``.
     """
 
-    def __init__(self, source: str, send: DebugLogSend) -> None:
+    def __init__(
+        self,
+        source: str,
+        send: DebugLogSend | _ReportingSend,
+        *,
+        spool: DebugLogSpool | None = None,
+    ) -> None:
         super().__init__()
         self._source = source
-        self._send = send
+        self._send: _ReportingSend = send
+        self._spool = spool
         self._closed = False
         self._start_worker()
         atexit.register(self.close)
@@ -782,11 +859,18 @@ class DebugLogHandler(logging.Handler):
         ``logging.config.dictConfig()`` (uvicorn) or an ``os.fork()`` (the
         runner ``_zygote``), which leave the handler attached but kill the
         thread. A fresh queue/thread lets delivery resume; the inherited ones
-        (whose locks are in an indeterminate post-fork state) are dropped.
+        (whose locks are in an indeterminate post-fork state) are dropped. The
+        worker receives its own queue and stop event, so a revive never hands
+        a stopping worker the new ones.
         """
-        self._queue: queue.Queue[DebugLogRow] = queue.Queue(maxsize=_QUEUE_MAX_RECORDS)
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="omnigent-debug-log", daemon=True)
+        work_queue: queue.Queue[DebugLogRow] = queue.Queue(maxsize=_QUEUE_MAX_RECORDS)
+        stop = threading.Event()
+        self._queue = work_queue
+        self._stop = stop
+        self._worker_state = _WorkerState(in_network=threading.Event())
+        self._thread = threading.Thread(
+            target=self._run, args=(work_queue, stop), name="omnigent-debug-log", daemon=True
+        )
         self._thread.start()
 
     @property
@@ -831,38 +915,172 @@ class DebugLogHandler(logging.Handler):
                 # acceptable for a best-effort sink shedding under overflow.
                 pass
 
-    def _run(self) -> None:
+    def _run(self, work_queue: queue.Queue[DebugLogRow], stop: threading.Event) -> None:
         try:
-            while not self._stop.is_set():
-                try:
-                    batch = self._collect_batch(self._FLUSH_WAIT)
-                    if batch:
-                        self._send(batch)
-                except Exception:  # noqa: BLE001 — the uploader thread must never die
-                    # A sender failure must not kill the worker: emit()'s
-                    # self-heal only revives a *stopped* thread, so a crash would
-                    # silently end delivery for the process. Drop and continue.
-                    time.sleep(0.1)
-            # Best-effort drain of everything left on shutdown, batch by batch;
-            # close()'s join timeout bounds how long this may run.
-            while remaining := self._collect_batch(0.0):
-                self._send(remaining)
+            if self._spool is None:
+                self._run_unspooled(work_queue, stop)
+            else:
+                self._run_spooled(work_queue, stop, self._spool, self._worker_state)
         except Exception:  # noqa: BLE001 — shutdown drain is best-effort
             pass
 
+    def _run_unspooled(self, work_queue: queue.Queue[DebugLogRow], stop: threading.Event) -> None:
+        while not stop.is_set():
+            try:
+                batch = self._collect_batch(work_queue, self._FLUSH_WAIT)
+                if batch:
+                    self._send(batch)
+            except Exception:  # noqa: BLE001 — the uploader thread must never die
+                # A sender failure must not kill the worker: emit()'s
+                # self-heal only revives a *stopped* thread, so a crash would
+                # silently end delivery for the process. Drop and continue.
+                time.sleep(0.1)
+        # Best-effort drain of everything left on shutdown, batch by batch;
+        # close()'s join timeout bounds how long this may run.
+        while remaining := self._collect_batch(work_queue, 0.0):
+            self._send(remaining)
+
+    def _run_spooled(
+        self,
+        work_queue: queue.Queue[DebugLogRow],
+        stop: threading.Event,
+        spool: DebugLogSpool,
+        state: _WorkerState,
+    ) -> None:
+        def deliver(batch: list[DebugLogRow]) -> DeliveryResult:
+            # Lets close() tell a POST (bounded by the deadline) from local work.
+            state.in_network.set()
+            try:
+                return self._deliver(batch, deadline=state.close_deadline)
+            finally:
+                state.in_network.clear()
+
+        backoff = 0.0
+        failing_until = 0.0
+        next_replay = 0.0  # replay a previous process's leftovers soon after start
+
+        def _note_failure() -> None:
+            nonlocal backoff, failing_until, next_replay
+            backoff = min(max(backoff * 2, _FAILURE_BACKOFF_MIN_S), _FAILURE_BACKOFF_MAX_S)
+            failing_until = time.monotonic() + backoff
+            next_replay = failing_until
+
+        pending: list[DebugLogRow] = []
+        while not stop.is_set():
+            try:
+                batch = self._collect_batch(work_queue, self._FLUSH_WAIT)
+                if stop.is_set():
+                    pending = batch  # not sent yet; the close drain handles it
+                    break
+                if batch:
+                    if time.monotonic() < failing_until:
+                        # Still backing off: no network attempt. Fill the batch
+                        # first so an outage doesn't produce one tiny file per row.
+                        batch += self._fill_batch(work_queue, stop, failing_until, len(batch))
+                        spool.write(batch)
+                    else:
+                        result = deliver(batch)
+                        if result == "failed":
+                            spool.write(batch)
+                            _note_failure()
+                        elif result == "delivered":
+                            backoff = failing_until = 0.0
+                now = time.monotonic()
+                if now >= next_replay and now >= failing_until:
+                    outcome = spool.replay(deliver, should_continue=_replay_gate(work_queue, stop))
+                    if outcome == "failed":
+                        _note_failure()
+                    elif outcome == "paused":
+                        next_replay = now
+                    else:
+                        next_replay = now + _REPLAY_INTERVAL_S
+            except Exception:  # noqa: BLE001 — the uploader thread must never die
+                time.sleep(0.1)
+        self._drain_on_close(
+            work_queue,
+            spool,
+            deliver,
+            pending,
+            deadline=state.close_deadline,
+            failing=time.monotonic() < failing_until,
+        )
+
+    def _drain_on_close(
+        self,
+        work_queue: queue.Queue[DebugLogRow],
+        spool: DebugLogSpool,
+        deliver: Callable[[list[DebugLogRow]], DeliveryResult],
+        pending: list[DebugLogRow],
+        *,
+        deadline: float | None,
+        failing: bool,
+    ) -> None:
+        """Deliver the queue live until *deadline*, then spool what is left.
+
+        Never spools a batch whose POST started: an abandoned in-flight batch
+        may still land, and resending it could duplicate it.
+        """
+        batch = pending
+        while True:
+            if not batch:
+                batch = self._collect_batch(work_queue, 0.0)
+            if not batch:
+                return
+            remaining = _remaining(deadline)
+            if failing or (remaining is not None and remaining < _MIN_POST_BUDGET_S):
+                rest = batch + _drain_queue(work_queue)
+                spool.write(rest, deadline=time.monotonic() + _SPOOL_DUMP_BUDGET_S)
+                return
+            result = deliver(batch)
+            if result == "failed":
+                spool.write(batch, deadline=time.monotonic() + _SPOOL_DUMP_BUDGET_S)
+                failing = True  # don't spend the budget re-probing a dead endpoint
+            batch = []
+
+    def _fill_batch(
+        self,
+        work_queue: queue.Queue[DebugLogRow],
+        stop: threading.Event,
+        until: float,
+        have: int,
+    ) -> list[DebugLogRow]:
+        """Collect more rows until a batch is full, *until* passes, or closing."""
+        more: list[DebugLogRow] = []
+        while have + len(more) < _BATCH_MAX_RECORDS and not stop.is_set():
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                item = work_queue.get(timeout=min(remaining, self._FLUSH_WAIT))
+            except queue.Empty:
+                continue
+            if item is not _CLOSE_WAKEUP:
+                more.append(item)
+        return more
+
+    def _deliver(
+        self,
+        batch: list[DebugLogRow],
+        deadline: float | None = None,  # noqa: ARG002 — a custom send can't be bounded
+    ) -> DeliveryResult:
+        result = self._send(batch)
+        return "delivered" if result is None else result
+
     _FLUSH_WAIT = _FLUSH_INTERVAL_S
 
-    def _collect_batch(self, wait: float) -> list[DebugLogRow]:
+    def _collect_batch(
+        self, work_queue: queue.Queue[DebugLogRow], wait: float
+    ) -> list[DebugLogRow]:
         batch: list[DebugLogRow] = []
         try:
-            first = self._queue.get(timeout=wait) if wait else self._queue.get_nowait()
+            first = work_queue.get(timeout=wait) if wait else work_queue.get_nowait()
         except queue.Empty:
             return batch
         if first is not _CLOSE_WAKEUP:
             batch.append(first)
         while len(batch) < _BATCH_MAX_RECORDS:
             try:
-                item = self._queue.get_nowait()
+                item = work_queue.get_nowait()
             except queue.Empty:
                 break
             if item is not _CLOSE_WAKEUP:
@@ -872,30 +1090,92 @@ class DebugLogHandler(logging.Handler):
     def close(self, timeout: float = 5.0) -> None:
         """Stop the sender thread after it drains queued rows.
 
+        With a spool, live delivery gets at most :data:`_CLOSE_NETWORK_BUDGET_S`
+        of *timeout* and the rest of the queue is spooled within the remainder.
+
         :param timeout: Max seconds to wait for the final drain, e.g. ``5.0``.
         """
         if self._closed:
             return
         # Capture the worker being stopped: a concurrent emit() can revive the
         # handler during the join and replace self._stop/self._thread.
-        stop, thread = self._stop, self._thread
+        stop, thread, work_queue = self._stop, self._thread, self._queue
+        state = self._worker_state
         self._closed = True
+        if self._spool is None:
+            stop.set()
+            # Wake a worker blocked waiting for rows so the timeout is spent on
+            # the drain, not on the idle wait. A full queue means it is not blocked.
+            with contextlib.suppress(queue.Full):
+                work_queue.put_nowait(_CLOSE_WAKEUP)
+            thread.join(timeout=timeout)
+            super().close()
+            return
+        dump_budget = min(_SPOOL_DUMP_BUDGET_S, max(0.0, timeout) / 2)
+        network_budget = max(0.0, min(_CLOSE_NETWORK_BUDGET_S, timeout - dump_budget))
+        # The worker drains the queue live until the deadline, then spools the
+        # rest. Every POST it makes is bounded by the same deadline.
+        state.close_deadline = time.monotonic() + network_budget
         stop.set()
-        # Wake a worker blocked waiting for rows so the timeout is spent on the
-        # drain, not on the idle wait. A full queue means it is not blocked.
         with contextlib.suppress(queue.Full):
-            self._queue.put_nowait(_CLOSE_WAKEUP)
-        thread.join(timeout=timeout)
+            work_queue.put_nowait(_CLOSE_WAKEUP)  # wake an idle worker
+        thread.join(timeout=network_budget)
+        # Past the network budget: still wait for local spooling, but abandon
+        # a POST that has not returned (its batch is never spooled).
+        dump_deadline = time.monotonic() + dump_budget
+        while thread.is_alive() and not state.in_network.is_set():
+            if time.monotonic() >= dump_deadline:
+                break
+            thread.join(timeout=0.01)
+        remaining = _drain_queue(work_queue)
+        if remaining:
+            with contextlib.suppress(Exception):
+                self._spool.write(remaining, deadline=dump_deadline)
         super().close()
+
+
+def _drain_queue(work_queue: queue.Queue[DebugLogRow]) -> list[DebugLogRow]:
+    rows: list[DebugLogRow] = []
+    while True:
+        try:
+            item = work_queue.get_nowait()
+        except queue.Empty:
+            return rows
+        if item is not _CLOSE_WAKEUP:
+            rows.append(item)
+
+
+def _replay_gate(
+    work_queue: queue.Queue[DebugLogRow], stop: threading.Event
+) -> Callable[[], bool]:
+    """Let replay send one file, then continue only while no live rows wait."""
+    first = True
+
+    def _should_continue() -> bool:
+        nonlocal first
+        if stop.is_set():
+            return False
+        if first:
+            first = False
+            return True
+        return work_queue.empty()
+
+    return _should_continue
 
 
 class ZerobusLogHandler(DebugLogHandler):
     """Default batched debug-log handler that delivers through ZeroBus."""
 
-    def __init__(self, config: DebugLogConfig, source: str) -> None:
+    def __init__(
+        self, config: DebugLogConfig, source: str, *, spool: DebugLogSpool | None = None
+    ) -> None:
         self._config = config
         self._delivered_any = False
-        super().__init__(source, self._post)
+        super().__init__(
+            source,
+            self._post,
+            spool=spool or DebugLogSpool.for_destination(config.insert_url, diag=_diag),
+        )
 
     def _start_worker(self) -> None:
         # Recreate the transport on every worker start. After a fork, inherited
@@ -904,24 +1184,38 @@ class ZerobusLogHandler(DebugLogHandler):
         self._tokens = _TokenSource(self._config, self._client)
         super()._start_worker()
 
-    def _run(self) -> None:
+    def _run(self, work_queue: queue.Queue[DebugLogRow], stop: threading.Event) -> None:
         # The worker owns the client captured at start, so close() never shuts
         # it down while a post or token mint is in flight.
         client = self._client
         try:
-            super()._run()
+            super()._run(work_queue, stop)
         finally:
             with contextlib.suppress(Exception):
                 client.close()
 
-    def _post(self, batch: list[DebugLogRow]) -> None:
+    def _deliver(self, batch: list[DebugLogRow], deadline: float | None = None) -> DeliveryResult:
+        return self._post(batch, deadline=deadline)
+
+    def _post(self, batch: list[DebugLogRow], *, deadline: float | None = None) -> DeliveryResult:
+        """POST *batch*, retrying only while ZeroBus cannot have accepted it.
+
+        A retry after an ambiguous failure (e.g. a read timeout) could insert
+        the batch twice, so those return ``"unknown"`` and the rows are dropped.
+        With a monotonic *deadline* (shutdown), every request, retry and
+        backoff sleep fits before it; running out of time returns ``"failed"``
+        for a batch that was not sent.
+        """
         payload = json.dumps(batch)
         for attempt in range(3):
-            token = self._tokens.token()
+            remaining = _remaining(deadline)
+            if remaining is not None and remaining < _MIN_POST_BUDGET_S:
+                return "failed"
+            token = self._tokens.token(deadline=deadline)
             if not token:
-                # Mint failed — _mint already logged why; note the data loss.
-                _diag("no_token", "no auth token (mint failing); dropping %d row(s)", len(batch))
-                return
+                # Mint failed — _mint already logged why; nothing was sent.
+                _diag("no_token", "no auth token (mint failing); %d row(s) not sent", len(batch))
+                return "failed"
             try:
                 response = self._client.post(
                     self._config.insert_url,
@@ -930,14 +1224,22 @@ class ZerobusLogHandler(DebugLogHandler):
                         "Content-Type": "application/json",
                     },
                     content=payload,
-                    timeout=_HTTP_TIMEOUT_S,
+                    timeout=_bounded_timeout(deadline),
                 )
-            except httpx.HTTPError as exc:
+            except _NOT_SENT_ERRORS as exc:
                 _diag(
                     "post_transport", "insert POST to %s failed: %s", self._config.insert_url, exc
                 )
-                time.sleep(min(0.5 * 2**attempt, 3.0))
+                _bounded_sleep(min(0.5 * 2**attempt, 3.0), deadline)
                 continue
+            except httpx.HTTPError as exc:
+                _diag(
+                    "post_unknown",
+                    "insert POST outcome unknown (%s); dropped %d row(s) to avoid duplicates",
+                    exc,
+                    len(batch),
+                )
+                return "unknown"
             if response.status_code == 200:
                 if not self._delivered_any:
                     self._delivered_any = True
@@ -946,7 +1248,7 @@ class ZerobusLogHandler(DebugLogHandler):
                         self._config.table,
                         len(batch),
                     )
-                return
+                return "delivered"
             if response.status_code in (401, 403):
                 # Wrong/expired token audience shows up here (not at mint).
                 _diag(
@@ -957,14 +1259,27 @@ class ZerobusLogHandler(DebugLogHandler):
                 )
                 self._tokens.invalidate()  # stale/rotated token — refresh and retry
                 continue
+            if (
+                400 <= response.status_code < 500
+                and response.status_code not in _RETRYABLE_CLIENT_STATUSES
+            ):
+                _diag(
+                    "post_rejected",
+                    "insert rejected permanently: status=%s body=%s; dropped %d row(s)",
+                    response.status_code,
+                    _body_snippet(response),
+                    len(batch),
+                )
+                return "rejected"
             _diag(
                 "post_status",
                 "insert failed: status=%s body=%s",
                 response.status_code,
                 _body_snippet(response),
             )
-            time.sleep(min(0.5 * 2**attempt, 3.0))
-        _diag("post_dropped", "dropped %d row(s) after 3 failed insert attempts", len(batch))
+            _bounded_sleep(min(0.5 * 2**attempt, 3.0), deadline)
+        _diag("post_failed", "insert failed 3 times; spooling %d row(s) for retry", len(batch))
+        return "failed"
 
 
 @dataclass(frozen=True, slots=True)

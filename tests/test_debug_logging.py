@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from omnigent import debug_logging as dl
+from omnigent.debug_log_spool import DebugLogSpool, DeliveryResult
 
 _INSERT_URL = (
     "https://3272836215725701.zerobus.us-west-2.cloud.databricks.com"
@@ -27,6 +28,12 @@ def _configured_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(dl.CLIENT_SECRET_ENV_VAR, "secret")
     monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com/")
     monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_spool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep ZeroBus handlers' default spool out of the shared test data dir."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
 
 
 @pytest.fixture(autouse=True)
@@ -1301,3 +1308,305 @@ def test_close_wakes_idle_worker_promptly() -> None:
     started = time.monotonic()
     sink.close(timeout=5.0)
     assert time.monotonic() - started < dl._FLUSH_INTERVAL_S / 2
+
+
+# ── spooled delivery ────────────────────────────────────────────────────────
+
+
+def _record(msg: str, level: int = logging.INFO) -> logging.LogRecord:
+    return logging.LogRecord("omnigent.test", level, __file__, 1, msg, (), None)
+
+
+def _spool_messages(spool: DebugLogSpool) -> list[str]:
+    messages: list[str] = []
+    for path in sorted(spool.directory.glob("*.jsonl")):
+        for line in path.read_text().splitlines()[1:]:
+            messages.append(json.loads(line)["message"])
+    return messages
+
+
+def test_close_waits_on_a_hung_post_only_up_to_the_network_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hung upload delays close() by the budget at most; queued rows survive."""
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_CLOSE_NETWORK_BUDGET_S", 0.3)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    in_flight = threading.Event()
+    release = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        in_flight.set()
+        release.wait(timeout=10)
+        return "delivered"
+
+    sink = dl.DebugLogHandler("host", send, spool=spool)
+    try:
+        sink.emit(_record("first"))
+        assert in_flight.wait(timeout=2)
+        for i in range(250):
+            sink.emit(_record(f"row {i}"))
+        sink.emit(_record("CRASH ROW", logging.CRITICAL))
+
+        started = time.monotonic()
+        sink.close()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert 0.25 <= elapsed < 0.3 + dl._SPOOL_DUMP_BUDGET_S + 0.2
+    spooled = _spool_messages(spool)
+    # The in-flight batch is never spooled: it may still land, never twice.
+    assert "first" not in spooled
+    assert spooled == [f"row {i}" for i in range(250)] + ["CRASH ROW"]
+
+
+def test_close_delivers_the_queue_live_when_the_network_is_healthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    delivered: list[str] = []
+    gate = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        gate.wait(timeout=5)  # hold the worker so the queue backs up first
+        delivered.extend(str(r["message"]) for r in batch)
+        return "delivered"
+
+    sink = dl.DebugLogHandler("host", send, spool=spool)
+    sink.emit(_record("first"))
+    for i in range(250):
+        sink.emit(_record(f"row {i}"))
+    gate.set()
+    sink.close()
+
+    assert delivered == ["first"] + [f"row {i}" for i in range(250)]
+    assert _spool_messages(spool) == []
+
+
+def test_close_splits_rows_between_live_and_spool_without_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows sent before the deadline aren't spooled; the rest are; none twice."""
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_CLOSE_NETWORK_BUDGET_S", 0.5)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    delivered: list[str] = []
+    gate = threading.Event()
+
+    def slow_send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        gate.wait(timeout=5)
+        time.sleep(0.15)
+        delivered.extend(str(r["message"]) for r in batch)
+        return "delivered"
+
+    sink = dl.DebugLogHandler("host", slow_send, spool=spool)
+    expected = [f"row {i}" for i in range(1000)]
+    for message in expected:
+        sink.emit(_record(message))
+    worker = sink._thread
+    gate.set()
+    started = time.monotonic()
+    sink.close()
+    assert time.monotonic() - started < 0.5 + dl._SPOOL_DUMP_BUDGET_S + 0.2
+    worker.join(timeout=5)  # let an abandoned in-flight POST finish
+
+    spooled = _spool_messages(spool)
+    assert delivered and spooled, "expected both live delivery and a spooled remainder"
+    assert not set(delivered) & set(spooled)
+    assert sorted(delivered + spooled) == sorted(expected)
+
+
+def test_failed_batches_spool_and_a_later_handler_replays_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    spool_dir = tmp_path / "spool"
+    failed_once = threading.Event()
+
+    def failing(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        failed_once.set()
+        return "failed"
+
+    sink = dl.DebugLogHandler(
+        "host", failing, spool=DebugLogSpool(spool_dir, "https://zerobus.example/insert")
+    )
+    sink.emit(_record("offline row"))
+    assert failed_once.wait(timeout=2)
+    sink.close()
+
+    delivered: list[dl.DebugLogRow] = []
+    got = threading.Event()
+
+    def working(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        delivered.extend(batch)
+        got.set()
+        return "delivered"
+
+    later = dl.DebugLogHandler(
+        "host", working, spool=DebugLogSpool(spool_dir, "https://zerobus.example/insert")
+    )
+    try:
+        assert got.wait(timeout=5)
+    finally:
+        later.close()
+    assert [r["message"] for r in delivered] == ["offline row"]
+    attrs = delivered[0]["attributes"]
+    assert isinstance(attrs, dict) and attrs["spooled"] == "true"
+    assert list(spool_dir.glob("*.jsonl")) == []
+
+
+class _InsertClient:
+    """Fake httpx client: mints a token, answers inserts from a script."""
+
+    def __init__(self, outcomes: list[object]) -> None:
+        self._outcomes = outcomes
+        self.inserts = 0
+
+    def post(self, url: str, **_: object) -> httpx.Response:
+        if url.endswith("/oidc/v1/token"):
+            return httpx.Response(200, json={"access_token": "token", "expires_in": 3600})
+        self.inserts += 1
+        outcome = self._outcomes[min(self.inserts, len(self._outcomes)) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert isinstance(outcome, int)
+        return httpx.Response(outcome)
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "expected", "inserts"),
+    [
+        ([200], "delivered", 1),
+        # The request may have landed: never resend it.
+        ([httpx.ReadTimeout("slow")], "unknown", 1),
+        ([httpx.RemoteProtocolError("reset")], "unknown", 1),
+        # Never sent: safe to retry, then spool.
+        ([httpx.ConnectError("offline")], "failed", 3),
+        ([httpx.ConnectError("blip"), 200], "delivered", 2),
+        ([503], "failed", 3),
+        ([429, 200], "delivered", 2),
+        # Permanently refused: dropping beats replaying it forever.
+        ([400], "rejected", 1),
+        ([413], "rejected", 1),
+    ],
+)
+def test_post_classifies_outcomes_for_at_most_once(
+    _configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[object],
+    expected: str,
+    inserts: int,
+) -> None:
+    monkeypatch.setattr(dl.time, "sleep", lambda _s: None)
+    config = dl.config_from_env()
+    assert config is not None
+    client = _InsertClient(outcomes)
+    sink = object.__new__(dl.ZerobusLogHandler)
+    sink._config = config
+    sink._client = client  # type: ignore[assignment]
+    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    sink._delivered_any = False
+
+    assert sink._post([{"message": "m"}]) == expected
+    assert client.inserts == inserts
+
+
+def test_backoff_coalesces_rows_and_close_keeps_the_workers_partial_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """During an outage rows fill whole spool files; close() still keeps them."""
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    failed = threading.Event()
+
+    def failing(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        failed.set()
+        return "failed"
+
+    sink = dl.DebugLogHandler("host", failing, spool=spool)
+    sink.emit(_record("trigger"))
+    assert failed.wait(timeout=2)
+    time.sleep(0.05)  # the worker is now backing off (5s), filling a batch locally
+    for i in range(30):
+        sink.emit(_record(f"offline {i}"))
+        time.sleep(0.002)
+    # A slow disk: the worker's spool write outlasts close()'s 0.1s grace.
+    real_write = spool.write
+
+    def slow_write(rows: list[dl.DebugLogRow], **kwargs: object) -> int:
+        time.sleep(0.25)
+        return real_write(rows, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(spool, "write", slow_write)
+    worker = sink._thread
+    sink.close()
+    # close() waited for local work, so exiting now would not lose the batch.
+    assert not worker.is_alive()
+
+    files = sorted(spool.directory.glob("*.jsonl"))
+    assert _spool_messages(spool) == ["trigger"] + [f"offline {i}" for i in range(30)]
+    # One file for the failed batch, one for the backoff batch: not 31 files.
+    assert len(files) <= 3
+
+
+def test_post_with_spent_deadline_sends_nothing(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = dl.config_from_env()
+    assert config is not None
+    client = _InsertClient([200])
+    sink = object.__new__(dl.ZerobusLogHandler)
+    sink._config = config
+    sink._client = client  # type: ignore[assignment]
+    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    sink._delivered_any = False
+
+    assert sink._post([{"message": "m"}], deadline=time.monotonic() - 1) == "failed"
+    assert client.inserts == 0
+
+
+def test_bounded_token_mint_skips_unresolved_secret_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The secret command is an unbounded subprocess; never run it at shutdown."""
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com")
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+    config = dl.config_from_env()
+    assert config is not None
+    ran: list[object] = []
+    monkeypatch.setattr(dl.subprocess, "run", lambda *a, **k: ran.append(a))
+    tokens = dl._TokenSource(config, _InsertClient([200]))  # type: ignore[arg-type]
+
+    assert tokens.token(deadline=time.monotonic() + 1) is None
+    assert ran == []
+
+
+def test_post_timeout_is_cut_to_the_deadline(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = dl.config_from_env()
+    assert config is not None
+    timeouts: list[float] = []
+
+    class Client(_InsertClient):
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            if not url.endswith("/oidc/v1/token"):
+                timeouts.append(float(kwargs["timeout"]))  # type: ignore[arg-type]
+            return super().post(url, **kwargs)
+
+    client = Client([200])
+    sink = object.__new__(dl.ZerobusLogHandler)
+    sink._config = config
+    sink._client = client  # type: ignore[assignment]
+    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    sink._delivered_any = False
+
+    assert sink._post([{"message": "m"}], deadline=time.monotonic() + 0.5) == "delivered"
+    assert len(timeouts) == 1 and 0 < timeouts[0] <= 0.5

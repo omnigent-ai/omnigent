@@ -48,10 +48,11 @@ HostExitReason = Literal[
 # Signals a supervisor or terminal sends to stop the daemon. SIGINT stays with
 # asyncio, which turns it into the graceful KeyboardInterrupt path.
 _STOP_SIGNAL_NAMES = ("SIGTERM", "SIGHUP")
-# Bound on draining the debug sink after a stop signal; ``host stop`` waits 5s.
-_SIGNAL_FLUSH_TIMEOUT_S = 2.0
+# Bound on closing the debug sink after a stop signal. A spooled ZeroBus sink
+# delivers live for up to 2s, then spools the rest; ``host stop`` waits 5s.
+_SIGNAL_FLUSH_TIMEOUT_S = 3.0
 # Hard deadline for the signal exit path, in case logging itself wedges.
-_SIGNAL_EXIT_DEADLINE_S = 3.0
+_SIGNAL_EXIT_DEADLINE_S = 4.0
 
 FAULTHANDLER_LOG_NAME = "faulthandler.log"
 
