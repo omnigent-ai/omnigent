@@ -12,15 +12,14 @@
 // replica happens to have them. Cross-device unread is best-effort by
 // design.
 //
-// A conversation is "unseen" when its server-side updated_at exceeds the
-// stored baseline. A conversation with no baseline anywhere seeds to its
-// updated_at at load ("read as of load") — pod-independent, so the
-// automatic dot for a turn finishing after load always works, and a
-// null server seed can no longer permanently disable a row's dot.
+// Unseen means visible-message activity beyond the baseline, or an explicit
+// unread override. Sessions without a baseline start read at their current
+// content watermark, even when the server has no read-state entry.
 
 import { useEffect, useRef, useSyncExternalStore } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
 
 // Bumped whenever the local mirror is written, so in-tab subscribers (the
 // sidebar rows, the dock badge) recompute unseen state right away — a PUT's
@@ -133,6 +132,7 @@ export interface ReadStateSeed {
   viewer_last_seen?: number | null;
   viewer_unread?: boolean;
   updated_at?: number;
+  last_message_at?: number | null;
 }
 
 /**
@@ -142,7 +142,7 @@ export interface ReadStateSeed {
  * optimistic write. The merge is max(localStorage baseline, server value) —
  * last-seen is monotonic, so taking the max is always safe and picks up a
  * newer read from another device when the serving replica has it. A session
- * with no baseline on either side seeds to its `updated_at` ("read as of
+ * with no baseline on either side seeds to its content watermark ("read as of
  * load"): pod-independent, so a replica that can't see the user's read-state
  * can never freeze a row's dot off. Flips {@link hydrated} on the first call
  * (even for an empty list) so the automatic mark-seen can resume.
@@ -157,7 +157,7 @@ export function seedReadState(conversations: readonly ReadStateSeed[]): void {
     let baseline =
       local !== undefined && server !== undefined ? Math.max(local, server) : (local ?? server);
     if (baseline === undefined && typeof conv.updated_at === "number") {
-      baseline = conv.updated_at;
+      baseline = conversationReadTimestamp(conv.updated_at, conv.last_message_at);
     }
     if (baseline !== undefined && baseline !== local) {
       lastSeenMap[conv.id] = baseline;
@@ -236,12 +236,8 @@ export function isExplicitlyUnread(conversationId: string): boolean {
   return explicitlyUnread.has(conversationId);
 }
 
-// `atSeconds` lets callers anchor the baseline to a server timestamp
-// (e.g. a PATCH response's `updated_at`) instead of the client's wall
-// clock — used to dismiss self-initiated `updated_at` bumps like a
-// rename, which would otherwise flag the conversation unseen because
-// the server's new updated_at can land slightly past the client's
-// nowSeconds() under clock skew.
+// `atSeconds` lets callers anchor the baseline to a server timestamp instead
+// of the client's wall clock when dismissing self-initiated changes.
 export function markConversationSeen(conversationId: string, atSeconds?: number): void {
   // A conversation the user explicitly marked unread stays unread until they
   // reopen it (which clears the override first). This guards every caller —
@@ -264,8 +260,8 @@ export function markConversationSeen(conversationId: string, atSeconds?: number)
 /**
  * Forces a conversation back to "unseen" — the inverse of
  * {@link markConversationSeen}, backing the kebab's "Mark as unread".
- * The dot's condition is `updated_at > stored`, so the baseline is
- * pinned just below the conversation's current `updated_at` (rather
+ * The dot's condition is `readTimestamp > stored`, so the baseline is
+ * pinned just below the conversation's current content watermark (rather
  * than cleared — a missing entry reads as *seen*, not unseen). The
  * row's status still gates the dot: a "running" session won't surface
  * it until the turn finishes.
@@ -276,9 +272,9 @@ export function markConversationSeen(conversationId: string, atSeconds?: number)
  * sticks. Both the baseline and the override are synced to the server, so
  * the flag also survives a reload and shows on the user's other devices.
  */
-export function markConversationUnread(conversationId: string, updatedAt: number): void {
+export function markConversationUnread(conversationId: string, readTimestamp: number): void {
   explicitlyUnread.add(conversationId);
-  lastSeenMap[conversationId] = updatedAt - 1;
+  lastSeenMap[conversationId] = readTimestamp - 1;
   persistToStorage();
   notifySubscribers();
   void syncReadState(conversationId);
@@ -289,13 +285,13 @@ export function markConversationUnread(conversationId: string, updatedAt: number
  * {@link markConversationUnread}, backing the row menu's and bulk bar's
  * "Mark as read". Clears the explicit-unread override first (it would
  * otherwise veto the baseline write), then anchors the baseline at or above
- * the row's `updated_at` so the dot clears even when the server clock leads
+ * the row's content watermark so the dot clears even when the server clock leads
  * the client. Explicit intent, so unlike {@link markConversationSeen} it is
  * exempt from the hydration gate.
  */
-export function markConversationRead(conversationId: string, updatedAt: number): void {
+export function markConversationRead(conversationId: string, readTimestamp: number): void {
   const hadOverride = explicitlyUnread.delete(conversationId);
-  const baseline = Math.max(nowSeconds(), updatedAt);
+  const baseline = Math.max(nowSeconds(), readTimestamp);
   const stored = lastSeenMap[conversationId];
   const advanced = stored === undefined || stored < baseline;
   if (advanced) lastSeenMap[conversationId] = baseline;
@@ -324,11 +320,11 @@ export function useUnseenTick(): number {
 
 export function useConversationReadState(
   conversationId: string,
-  updatedAt: number,
+  readTimestamp: number,
   status: string | undefined,
 ): { unseen: boolean; explicitlyUnread: boolean } {
   const read = () =>
-    (isConversationUnseen(conversationId, updatedAt, status) ? 1 : 0) |
+    (isConversationUnseen(conversationId, readTimestamp, status) ? 1 : 0) |
     (isExplicitlyUnread(conversationId) ? 2 : 0);
   const state = useSyncExternalStore(
     (onChange) => {
@@ -345,21 +341,22 @@ export function useConversationReadState(
 }
 
 /**
- * A conversation is "unseen" only when (a) the agent has finished
- * a turn — status is "idle" or "failed", not "running" — and
- * (b) the conversation's updated_at exceeds the wall-clock time the
- * user last had it open. This avoids false positives from the
- * user's own message sends and in-flight processing bumps.
+ * A conversation is "unseen" only after the agent has finished a turn —
+ * status is "idle" or "failed", not "running" — and either the conversation
+ * has an explicit unread override or its content watermark exceeds the wall-clock
+ * time the user last had it open. This avoids false positives from the user's
+ * own message sends and in-flight processing bumps.
  */
 export function isConversationUnseen(
   conversationId: string,
-  updatedAt: number,
+  readTimestamp: number,
   status: string | undefined,
 ): boolean {
   if (status === "running" || status === undefined) return false;
+  if (explicitlyUnread.has(conversationId)) return true;
   const stored = lastSeenMap[conversationId];
   if (stored === undefined) return false;
-  return updatedAt > stored;
+  return readTimestamp > stored;
 }
 
 /** True when the app window currently has focus (SSR-safe default true). */
@@ -369,61 +366,85 @@ function windowHasFocus(): boolean {
 }
 
 /**
- * Marks the active conversation as seen on mount, on every poll
- * refresh (updatedAt change keeps the stored time fresh), on the
+ * Marks the active conversation as seen while AppShell is mounted, on every poll
+ * refresh (watermark changes keep the stored time fresh), on the
  * window regaining focus, and on cleanup (navigation away).
  * Wall-clock time is stored so any server-side update that happened
  * while the user was viewing is captured, even if the conversations
  * poll hadn't picked it up yet.
  *
- * Every mark is gated on the window having focus: a thread open in a
- * blurred window is NOT being read, so a turn finishing there must
- * stay unseen (the dock badge counts it) until focus returns. The
- * focus listener covers the return path — refocusing while the
- * thread is open marks it seen at that moment.
+ * AppShell stays mounted while the route moves through non-chat pages, so an
+ * explicit unread is cleared when the user leaves a session and genuinely
+ * reopens it. The first AppShell mount is skipped to preserve an explicit
+ * unread across a hard reload.
+ *
+ * Focus is tracked from DOM focus/blur and user-interaction events. This is
+ * more reliable in native shells than polling `document.hasFocus()`.
  */
 export function useMarkConversationSeen(
   conversationId: string | undefined,
-  updatedAt: number | undefined,
+  readTimestamp: number | undefined,
 ): void {
-  // Opening a thread is reading it, so clear any explicit-unread
-  // override before the mark-seen below runs (and runs first, so
-  // markConversationSeen isn't no-op'd by a stale override). Keyed on
-  // the id alone: a poll bumping `updatedAt` while the thread stays
-  // open must NOT re-clear an override the user just set on it.
-  //
-  // The very first mount is skipped: an initial page load / reload while
-  // sitting on a thread must NOT clear the hydrated explicit-unread
-  // override (otherwise the dot you set silently vanishes on refresh).
-  // ChatPage stays mounted across in-app /c/:id navigations, so this ref
-  // only resets on a real reload — genuine reopens (the id changing while
-  // mounted) still clear, matching "reopen = read".
-  const isInitialMount = useRef(true);
+  // Only a route change clears an explicit unread flag; reloads and
+  // StrictMode effect replays preserve it.
+  const previousConversationId = useRef(conversationId);
+  const conversationIdRef = useRef(conversationId);
+  const readTimestampRef = useRef(readTimestamp);
+  conversationIdRef.current = conversationId;
+  readTimestampRef.current = readTimestamp;
+  const focusedRef = useRef(windowHasFocus());
+
   useEffect(() => {
-    const wasInitial = isInitialMount.current;
-    isInitialMount.current = false;
-    if (!conversationId) return;
-    if (wasInitial) return;
+    const markCurrentIfFocused = () => {
+      const id = conversationIdRef.current;
+      const timestamp = readTimestampRef.current;
+      if (!focusedRef.current || !id || timestamp === undefined) return;
+      markConversationSeen(id, Math.max(nowSeconds(), timestamp));
+    };
+    const onFocus = () => {
+      focusedRef.current = true;
+      markCurrentIfFocused();
+    };
+    const onBlur = () => {
+      focusedRef.current = false;
+    };
+    const onInteract = () => {
+      focusedRef.current = true;
+      markCurrentIfFocused();
+    };
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("pointerdown", onInteract);
+    window.addEventListener("keydown", onInteract);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("pointerdown", onInteract);
+      window.removeEventListener("keydown", onInteract);
+    };
+  }, []);
+
+  useEffect(() => {
+    const wasSameRoute = previousConversationId.current === conversationId;
+    previousConversationId.current = conversationId;
+    if (!conversationId || wasSameRoute) return;
     clearUnreadOverride(conversationId);
   }, [conversationId]);
 
   useEffect(() => {
-    if (!conversationId || updatedAt === undefined) return;
+    if (!conversationId || readTimestamp === undefined) return;
     const markIfFocused = () => {
-      // Anchor at or above the updated_at being viewed: a server clock that
-      // leads the client must not leave a just-read turn reading as unseen
-      // (updated_at > client wall clock). Wall clock still wins when it's
-      // ahead, capturing an update the poll hasn't picked up yet.
-      if (windowHasFocus()) markConversationSeen(conversationId, Math.max(nowSeconds(), updatedAt));
+      // Anchor at or above the content watermark being viewed. Wall clock wins
+      // when it is ahead, capturing an update the poll has not picked up yet.
+      if (focusedRef.current)
+        markConversationSeen(conversationId, Math.max(nowSeconds(), readTimestamp));
     };
     markIfFocused();
-    window.addEventListener("focus", markIfFocused);
     return () => {
-      window.removeEventListener("focus", markIfFocused);
       // Navigation away normally happens via user interaction (focused);
       // an unmount in a blurred window (e.g. the session deleted from
       // another client) must not silently mark the thread read.
       markIfFocused();
     };
-  }, [conversationId, updatedAt]);
+  }, [conversationId, readTimestamp]);
 }

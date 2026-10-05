@@ -59,6 +59,7 @@ import {
 } from "@/hooks/useConversations";
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
+import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNavigate } from "@/lib/routing";
@@ -288,7 +289,12 @@ export function HeaderConversationMenu({
       <DropdownMenuItem
         data-testid="header-mark-unread-conversation"
         className={itemClass}
-        onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+        onSelect={() =>
+          markConversationUnread(
+            conversation.id,
+            conversationReadTimestamp(conversation.updated_at, conversation.last_message_at),
+          )
+        }
       >
         <MailIcon className="size-3.5" />
         Mark as unread

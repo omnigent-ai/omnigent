@@ -2573,6 +2573,144 @@ def test_append_bumps_updated_at(
     )
 
 
+def test_last_message_at_ignores_hidden_metadata_and_metadata_writes(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only visible message appends advance the unread activity watermark."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    assert conv.last_message_at is None
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="meta",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hidden context"}],
+                    is_meta=True,
+                ),
+            )
+        ],
+    )
+    after_meta = conversation_store.get_conversation(conv.id)
+    assert after_meta is not None
+    assert after_meta.last_message_at is None
+    assert after_meta.updated_at == 2000
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 3000)
+    conversation_store.update_conversation(conv.id, reported_model="model-a")
+    after_metadata = conversation_store.get_conversation(conv.id)
+    assert after_metadata is not None
+    assert after_metadata.last_message_at is None
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 4000)
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="visible",
+                data=MessageData(
+                    role="assistant",
+                    agent="test-agent",
+                    content=[{"type": "output_text", "text": "visible"}],
+                ),
+            )
+        ],
+    )
+    after_visible = conversation_store.get_conversation(conv.id)
+    assert after_visible is not None
+    assert after_visible.last_message_at == 4000
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 5000)
+    conversation_store.update_conversation(conv.id, archived=True)
+    after_archive = conversation_store.get_conversation(conv.id)
+    assert after_archive is not None
+    assert after_archive.last_message_at == 4000
+
+
+def test_fork_carries_visible_message_watermark(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fork's copied visible history supplies its own message watermark."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    source = conversation_store.create_conversation()
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="visible",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "history"}],
+                ),
+            ),
+        ],
+    )
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="meta",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hidden"}],
+                    is_meta=True,
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 3000)
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="visible-later",
+                data=MessageData(
+                    role="assistant",
+                    agent="test-agent",
+                    content=[{"type": "output_text", "text": "later"}],
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 4000)
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="meta-later",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hidden later"}],
+                    is_meta=True,
+                ),
+            )
+        ],
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+    assert fork.last_message_at == 3000
+
+    truncated = conversation_store.fork_conversation(source.id, up_to_response_id="visible-later")
+    assert truncated.last_message_at == 3000
+
+
 def test_update_title_bumps_updated_at(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
@@ -7614,6 +7752,7 @@ def test_pure_dedupe_append_leaves_conversation_metadata_alone(
     after = conversation_store.get_conversation(conv.id)
     assert after is not None
     assert after.updated_at == before.updated_at
+    assert after.last_message_at == before.last_message_at
 
 
 def test_same_stable_id_twice_in_one_batch_inserts_once(

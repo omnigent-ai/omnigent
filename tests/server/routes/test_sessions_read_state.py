@@ -168,6 +168,7 @@ def test_list_item_defaults_when_user_never_saw_session() -> None:
     item = _build_item(None, _make_conversation("conv_untouched"))
     assert item.viewer_last_seen is None  # type: ignore[attr-defined]
     assert item.viewer_unread is False  # type: ignore[attr-defined]
+    assert item.last_message_at == 0  # type: ignore[attr-defined]
 
 
 def test_read_state_is_scoped_per_user() -> None:

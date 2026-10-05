@@ -12,13 +12,15 @@ land on a pod that never saw the user's PUT, so its ``viewer_unread`` /
 just acted on. The client's ``localStorage`` copy is the durable source;
 the server seed only ever *raises* a baseline (max-merge). These tests
 guard the wiring the mocked unit tests can't — that the real dot survives
-a real reload, and survives it specifically via ``localStorage`` when the
-serving replica's seed is empty.
+a real reload, survives it specifically via ``localStorage`` when the serving
+replica's seed is empty, and clears after the user deliberately reopens the
+thread following navigation away.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from urllib.parse import urlparse
 
 from playwright.sync_api import Locator, Page, Route, expect
@@ -34,6 +36,18 @@ def _row(page: Page, session_id: str) -> Locator:
 def _unread_dot(row: Locator) -> Locator:
     """Locate the row's unread (pink) dot — the unseen session-state badge."""
     return row.locator('[data-testid="session-state-badge"][data-state="unseen"]')
+
+
+def _append_assistant_message(page: Page, base_url: str, session_id: str, text: str) -> None:
+    """Append one visible assistant message through the authenticated events API."""
+    response = page.request.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        data={
+            "type": "external_assistant_message",
+            "data": {"agent": "hello_world", "text": text},
+        },
+    )
+    assert response.ok, response.text()
 
 
 def test_mark_unread_lights_the_dot_and_persists_across_reload(
@@ -71,6 +85,168 @@ def test_mark_unread_lights_the_dot_and_persists_across_reload(
     page.reload()
     expect(_row(page, session_id)).to_be_visible()
     expect(_unread_dot(_row(page, session_id))).to_be_visible()
+
+
+def test_marked_unread_clears_when_reopened_after_inbox_navigation(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Reopening a flagged thread after leaving it counts as reading it.
+
+    Marking the active session unread is intentionally durable across a hard
+    reload. A deliberate navigation away and back is different: returning to
+    the thread should clear the explicit unread override and its sidebar dot.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    row = _row(page, session_id)
+    expect(row).to_be_visible()
+    expect(_unread_dot(row)).to_have_count(0)
+
+    row.hover()
+    row.get_by_test_id("conversation-actions").click()
+    page.get_by_test_id("mark-unread-conversation").click()
+    expect(_unread_dot(row)).to_be_visible()
+
+    # Inbox is a separate route, so ChatPage unmounts. Returning through the
+    # persistent sidebar exercises the real reopen path rather than a simple
+    # in-place /c/a → /c/b switch.
+    page.get_by_test_id("inbox-button").click()
+    expect(page).to_have_url(f"{base_url}/inbox")
+    expect(page.get_by_role("heading", name="Inbox")).to_be_visible()
+
+    inbox_row = _row(page, session_id)
+    expect(inbox_row).to_be_visible()
+    inbox_row.locator(f'a[href="/c/{session_id}"]').click()
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+
+    expect(_unread_dot(_row(page, session_id))).to_have_count(0)
+
+
+def test_context_menu_unread_clears_when_reopened_after_inbox_navigation(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The context-menu read action follows the same reopen contract."""
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    row = _row(page, session_id)
+    link = row.locator(f'a[href="/c/{session_id}"]')
+    expect(link).to_be_visible()
+    link.click(button="right")
+    page.get_by_test_id("mark-unread-conversation").click()
+    expect(_unread_dot(row)).to_be_visible()
+
+    page.get_by_test_id("inbox-button").click()
+    expect(page).to_have_url(f"{base_url}/inbox")
+    inbox_row = _row(page, session_id)
+    expect(inbox_row).to_be_visible()
+    inbox_row.locator(f'a[href="/c/{session_id}"]').click()
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+
+    expect(_unread_dot(_row(page, session_id))).to_have_count(0)
+
+
+def test_metadata_update_does_not_light_dot_without_new_items(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A title-only update must not look like an unread assistant turn."""
+    base_url, session_id = seeded_session
+    _append_assistant_message(
+        page,
+        base_url,
+        session_id,
+        "Existing assistant answer for metadata coverage.",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    row = _row(page, session_id)
+    expect(row).to_be_visible()
+    expect(_unread_dot(row)).to_have_count(0)
+
+    before_items_response = page.request.get(
+        f"{base_url}/v1/sessions/{session_id}/items?limit=100&order=asc"
+    )
+    assert before_items_response.ok, before_items_response.text()
+    before_items = before_items_response.json()["data"]
+    before_content_items = [item for item in before_items if item.get("type") == "message"]
+    assert before_content_items, "the metadata test needs an existing visible transcript"
+
+    before_session_response = page.request.get(f"{base_url}/v1/sessions/{session_id}")
+    assert before_session_response.ok, before_session_response.text()
+    before_updated_at = int(before_session_response.json()["updated_at"])
+
+    # Leave the chat so the active-view read watermark is established, then
+    # allow the read watermark to age past the server's whole-second clock
+    # before the metadata write. A same-second PATCH would not distinguish
+    # this regression from an unchanged session.
+    page.get_by_test_id("inbox-button").click()
+    expect(page).to_have_url(f"{base_url}/inbox")
+    page.wait_for_timeout(2_100)
+
+    title = f"e2e-metadata-{int(time.time() * 1000)}"
+    update_response = page.request.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        data={"title": title},
+    )
+    assert update_response.ok, update_response.text()
+    updated_session = update_response.json()
+    assert int(updated_session["updated_at"]) > before_updated_at
+
+    after_items_response = page.request.get(
+        f"{base_url}/v1/sessions/{session_id}/items?limit=100&order=asc"
+    )
+    assert after_items_response.ok, after_items_response.text()
+    after_content_items = [
+        item for item in after_items_response.json()["data"] if item.get("type") == "message"
+    ]
+    assert after_content_items == before_content_items
+
+    # Reload the list so the assertion observes the metadata write rather than
+    # racing the sidebar's refresh/updates stream.
+    page.reload()
+    inbox_row = _row(page, session_id)
+    expect(inbox_row).to_be_visible()
+    expect(inbox_row).to_contain_text(title)
+    expect(_unread_dot(inbox_row)).to_have_count(0)
+
+
+def test_new_visible_message_lights_dot_and_reopen_clears_it(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A later visible turn lights the dot, and opening it marks it read."""
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    row = _row(page, session_id)
+    expect(row).to_be_visible()
+    expect(_unread_dot(row)).to_have_count(0)
+
+    page.get_by_test_id("inbox-button").click()
+    expect(page).to_have_url(f"{base_url}/inbox")
+    # Establish the active-chat watermark before the later turn is appended.
+    page.wait_for_timeout(2_100)
+    _append_assistant_message(
+        page,
+        base_url,
+        session_id,
+        "A later visible assistant answer.",
+    )
+
+    page.reload()
+    inbox_row = _row(page, session_id)
+    expect(inbox_row).to_be_visible()
+    expect(_unread_dot(inbox_row)).to_be_visible()
+
+    inbox_row.locator(f'a[href="/c/{session_id}"]').click()
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    expect(_unread_dot(_row(page, session_id))).to_have_count(0)
 
 
 def test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty(

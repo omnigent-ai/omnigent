@@ -11,6 +11,7 @@
 // unarchiving diffs against real prior state, not a phantom transition.
 
 import type { Conversation } from "@/hooks/useConversations";
+import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
 
 // Statuses that mean "the agent stopped working and is waiting on the
 // user" — the moment worth surfacing. "running" is excluded (still
@@ -102,7 +103,7 @@ export function detectNewElicitations(
  *   when on a non-chat route, e.g. \`"conv_a"\`.
  * :param windowFocused: Whether the app window itself has focus.
  * :param isUnseen: Predicate matching \`isConversationUnseen\`'s signature —
- *   whether a session has unseen activity, given its id, \`updated_at\`, and
+ *   whether a session has unseen activity, given its id, content watermark, and
  *   status.
  * :returns: The unread-session id set; its size is the badge number.
  */
@@ -117,7 +118,14 @@ export function computeUnreadBadgeIds(
     if (conversation.archived) continue;
     if (windowFocused && conversation.id === activeId) continue;
     const awaiting = (conversation.pending_elicitations_count ?? 0) > 0;
-    if (awaiting || isUnseen(conversation.id, conversation.updated_at, conversation.status)) {
+    if (
+      awaiting ||
+      isUnseen(
+        conversation.id,
+        conversationReadTimestamp(conversation.updated_at, conversation.last_message_at),
+        conversation.status,
+      )
+    ) {
       unread.add(conversation.id);
     }
   }

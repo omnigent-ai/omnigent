@@ -9,6 +9,7 @@ import { SessionStateBadge } from "@/components/SessionStateBadge";
 import type { Conversation } from "@/hooks/useConversations";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
+import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
@@ -41,7 +42,7 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
   const optimisticTitle = useOptimisticTitle(conversation.id);
   const readState = useConversationReadState(
     conversation.id,
-    conversation.updated_at,
+    conversationReadTimestamp(conversation.updated_at, conversation.last_message_at),
     conversation.status,
   );
   const state: SessionState | null =

@@ -47,6 +47,9 @@ class Conversation:
     :param created_at: Unix epoch timestamp of creation.
     :param updated_at: Unix epoch timestamp of the last
         update (item append, title change, etc.).
+    :param last_message_at: Unix epoch seconds of the latest user-visible
+        message item, or ``None`` when no visible message has been persisted.
+        Hidden ``is_meta`` messages do not advance this watermark.
     :param title: Optional user-assigned title. Phase 4 named
         sub-agents store ``"<type>:<name>"`` here so the partial
         unique index on ``(parent_conversation_id, title)`` can
@@ -273,6 +276,7 @@ class Conversation:
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
     project_id: str | None = None
+    last_message_at: int | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None

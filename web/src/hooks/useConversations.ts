@@ -151,6 +151,8 @@ export interface Conversation {
   title: string | null;
   created_at: number;
   updated_at: number;
+  /** Unix epoch seconds of the latest visible user/assistant message. */
+  last_message_at?: number | null;
   labels: Record<string, string>;
   permission_level: number | null;
   owner?: string | null;
@@ -226,11 +228,11 @@ export interface Conversation {
    */
   comments_updated_at?: number | null;
   /**
-   * The requesting user's "last seen" wall-clock baseline (seconds) for
-   * this session, or null/undefined when they've never seen it. Per-viewer,
-   * served by the per-user read-state cache; the sidebar's unread dot shows
-   * when `updated_at > viewer_last_seen` and the session is finished. The
-   * client seeds {@link useUnseenConversations}'s mirror from this on load.
+   * The requesting user's "last seen" wall-clock baseline (seconds) for this
+   * session, or null/undefined when they've never seen it. Per-viewer, served
+   * by the per-user read-state cache; the sidebar's unread dot compares the
+   * latest visible-message watermark to this baseline. The client seeds
+   * {@link useUnseenConversations}'s mirror from this on load.
    */
   viewer_last_seen?: number | null;
   /**
@@ -485,6 +487,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     title: wire.title ?? null,
     created_at: wire.created_at,
     updated_at: wire.updated_at ?? wire.created_at,
+    ...(wire.last_message_at !== undefined ? { last_message_at: wire.last_message_at } : {}),
     labels: wire.labels ?? {},
     permission_level: wire.permission_level ?? null,
     owner: wire.owner ?? null,

@@ -2665,14 +2665,14 @@ class ReadStatePutRequest(BaseModel):
     Sets the *calling user's* read tracking for one session. Mirrors the
     two values the web client keeps per session: a "last seen" wall-clock
     baseline (seconds since epoch) and an explicit "marked unread"
-    override. The unread dot shows when ``updated_at > last_seen`` and the
-    session is finished; ``unread`` separately pins the override so the
+    override. The unread dot shows when ``last_message_at > last_seen`` and
+    the session is finished; ``unread`` separately pins the override so the
     thread the user is *viewing* (or a running one) still surfaces the dot
     where the automatic "seen" logic would otherwise suppress it.
 
     :param last_seen: Wall-clock baseline in seconds, e.g. ``1717000000``.
         Marking seen sets this to "now"; marking unread pins it to
-        ``updated_at - 1`` so the row reads unseen.
+        ``last_message_at - 1`` so the row reads unseen.
     :param unread: Whether this session is explicitly flagged unread for
         the caller.
     """
@@ -2698,6 +2698,9 @@ class SessionListItem(BaseModel):
     :param status: Derived session lifecycle status.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
+    :param last_message_at: Unix epoch seconds of the latest user-visible
+        message item. ``0`` means no visible message is known. Unlike
+        ``updated_at``, metadata and lifecycle writes do not advance it.
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.
@@ -2772,7 +2775,7 @@ class SessionListItem(BaseModel):
         when they have never seen it. Per-viewer (built from the
         server's in-memory per-user read-state, written by
         ``PUT /v1/sessions/{id}/read-state``); the unread dot shows
-        when ``updated_at > viewer_last_seen`` and the session is
+        when ``last_message_at > viewer_last_seen`` and the session is
         finished. In-memory only — resets on a server restart.
     :param viewer_unread: Whether the *requesting user* explicitly
         marked this session unread. Per-viewer; lifts the active-row
@@ -2791,6 +2794,7 @@ class SessionListItem(BaseModel):
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
+    last_message_at: int = 0
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None

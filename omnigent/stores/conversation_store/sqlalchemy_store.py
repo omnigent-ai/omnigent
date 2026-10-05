@@ -82,6 +82,7 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    MessageData,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -214,6 +215,7 @@ def _to_conversation(
         id=row.id,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        last_message_at=row.last_message_at,
         title=row.title or None,  # empty string → None at entity layer
         # kind is derived from parent-nullness, not the stored metadata column:
         # a conversation is a sub-agent iff it has a parent. This is the single
@@ -2487,7 +2489,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                         if item.stable_id is not None
                     ]
 
-            # Bump updated_at on the conversation.
+            # Bump updated_at on the conversation. A separate watermark tracks
+            # visible message items so hidden metadata cannot light unread rows.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if conv_row is not None:
                 conv_row.updated_at = now
@@ -2521,6 +2524,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
             batch_stable: dict[str, ConversationItem] = {}
+            visible_message_appended = False
             for item, prepared, search in prepared_rows:
                 if item.stable_id is not None:
                     if item.stable_id in existing_by_id:
@@ -2542,6 +2546,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if search is not None:
                     fts_rows.append((item_id, conversation_id, search))
                 row_values.append(values)
+                visible_message_appended = visible_message_appended or (
+                    item.type == "message"
+                    and isinstance(item.data, MessageData)
+                    and not item.data.is_meta
+                )
                 persisted.append(
                     ConversationItem(
                         id=item_id,
@@ -2565,6 +2574,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row_values:
                 session.execute(insert(SqlConversationItem), row_values)
             insert_fts_bulk(session, fts_rows)
+
+            if conv_row is not None and visible_message_appended:
+                conv_row.last_message_at = max(conv_row.last_message_at or 0, now)
 
             # Persist the advanced counter so the next append reads it instead
             # of scanning; this also lazily backfills a pre-counter conversation.
@@ -4622,6 +4634,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             if cutoff_position is not None:
                 items_query = items_query.where(SqlConversationItem.position <= cutoff_position)
             source_items = session.execute(items_query).scalars().all()
+
+            # Forks copy history, so carry the visible-message watermark over.
+            # A full fork can reuse the source's persisted value; only a
+            # truncated fork (or a legacy/null source) needs to inspect the
+            # message payloads already loaded for this fork.
+            message_positions = [
+                pos
+                for pos, src_item in enumerate(source_items)
+                if decode_item_type(src_item.type) == "message"
+            ]
+            if not truncated and source.last_message_at is not None:
+                new_conv_values["last_message_at"] = source.last_message_at
+            elif message_positions:
+                decoded_messages = self._decode_item_data_batch(
+                    [source_items[pos].data for pos in message_positions]
+                )
+                visible_message_times = [
+                    source_items[pos].created_at
+                    for pos, decoded_data in zip(message_positions, decoded_messages, strict=True)
+                    if not json.loads(decoded_data).get("is_meta", False)
+                ]
+                new_conv_values["last_message_at"] = (
+                    max(visible_message_times) if visible_message_times else None
+                )
 
             # Compaction cursors refer to item IDs. Since every copied item gets
             # a fresh ID, build the complete mapping before copying any payloads

@@ -195,7 +195,6 @@ import {
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
-import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -415,14 +414,6 @@ export function ChatPage() {
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
     [conversationsData],
-  );
-
-  // Clear the "unseen messages" sidebar dot for the conversation the
-  // user is currently viewing. Re-fires when conversations refresh
-  // (every 4 s) so messages arriving while viewing are marked seen.
-  useMarkConversationSeen(
-    sessionConvId,
-    conversations?.find((c) => c.id === sessionConvId)?.updated_at,
   );
 
   // Sync the store's active conversation to the URL. Single source of

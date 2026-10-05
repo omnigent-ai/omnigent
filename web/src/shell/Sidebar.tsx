@@ -186,6 +186,7 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
+import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
@@ -2656,7 +2657,13 @@ function projectMarkerState(
       error = true;
     } else if (state?.kind === "disconnected") {
       disconnected = true;
-    } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
+    } else if (
+      isConversationUnseen(
+        c.id,
+        conversationReadTimestamp(c.updated_at, c.last_message_at),
+        c.status,
+      )
+    ) {
       unseen = true;
     }
   }
@@ -3868,7 +3875,7 @@ function ConversationRowImpl({
   // so useSyncExternalStore skips the heavy row render.
   const readState = useConversationReadState(
     conversation.id,
-    conversation.updated_at,
+    conversationReadTimestamp(conversation.updated_at, conversation.last_message_at),
     conversation.status,
   );
   // The dot shows when the conversation is content-unseen AND either the
@@ -4063,8 +4070,16 @@ function ConversationRowImpl({
     canMarkUnread,
     currentProject,
     onTogglePinned,
-    onMarkUnread: () => markConversationUnread(conversation.id, conversation.updated_at),
-    onMarkRead: () => markConversationRead(conversation.id, conversation.updated_at),
+    onMarkUnread: () =>
+      markConversationUnread(
+        conversation.id,
+        conversationReadTimestamp(conversation.updated_at, conversation.last_message_at),
+      ),
+    onMarkRead: () =>
+      markConversationRead(
+        conversation.id,
+        conversationReadTimestamp(conversation.updated_at, conversation.last_message_at),
+      ),
     onProjectAssigned,
     moveToProject,
     setShareOpen,
@@ -4671,6 +4686,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "archived",
   "status",
   "updated_at",
+  "last_message_at",
   "git_branch",
   "host_id",
   "runner_id",
@@ -5479,7 +5495,11 @@ function BulkActionBar({
   // offered direction always matches the dots the user sees.
   const unreadSelected = selectedConversations.filter(
     (c) =>
-      isConversationUnseen(c.id, c.updated_at, c.status) &&
+      isConversationUnseen(
+        c.id,
+        conversationReadTimestamp(c.updated_at, c.last_message_at),
+        c.status,
+      ) &&
       (c.id !== activeId || isExplicitlyUnread(c.id)),
   );
 
@@ -5570,12 +5590,16 @@ function BulkActionBar({
   // synchronous with a fire-and-forget server sync, so the bar can exit
   // immediately, matching the other bulk actions.
   function handleMarkRead() {
-    for (const c of unreadSelected) markConversationRead(c.id, c.updated_at);
+    for (const c of unreadSelected) {
+      markConversationRead(c.id, conversationReadTimestamp(c.updated_at, c.last_message_at));
+    }
     onExit();
   }
 
   function handleMarkUnread() {
-    for (const c of selectedConversations) markConversationUnread(c.id, c.updated_at);
+    for (const c of selectedConversations) {
+      markConversationUnread(c.id, conversationReadTimestamp(c.updated_at, c.last_message_at));
+    }
     onExit();
   }
 

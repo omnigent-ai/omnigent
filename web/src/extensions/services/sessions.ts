@@ -2,6 +2,7 @@ import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import type { ConversationsPage } from "@/hooks/useConversations";
 import { isConversationUnseen } from "@/hooks/useUnseenConversations";
+import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import type { ExtensionSessionPage, ExtensionSessionSummary } from "../types";
 import { isExtensionSessionPageWithinBudget } from "../rpc/validation";
@@ -128,12 +129,18 @@ function projectSession(value: unknown): ExtensionSessionSummary {
   const title = optionalBoundedString(row.title, "title", SESSION_TITLE_MAX_LENGTH);
   // Same provisional label the sidebar shows before the server seeds a title.
   const optimisticTitle = title === null ? getOptimisticTitle(id) : undefined;
+  const lastMessageAt =
+    typeof row.last_message_at === "number" && Number.isFinite(row.last_message_at)
+      ? row.last_message_at
+      : row.last_message_at === null
+        ? null
+        : undefined;
   return {
     id,
     title: title ?? optimisticTitle?.slice(0, SESSION_TITLE_MAX_LENGTH) ?? null,
     titleProvisional: title === null && optimisticTitle !== undefined,
     status: status as ExtensionSessionSummary["status"],
-    unread: isConversationUnseen(id, updatedAt, status),
+    unread: isConversationUnseen(id, conversationReadTimestamp(updatedAt, lastMessageAt), status),
     workspace: optionalBoundedString(row.workspace, "workspace", SESSION_WORKSPACE_MAX_LENGTH),
     gitBranch: optionalBoundedString(row.git_branch, "git_branch", SESSION_TITLE_MAX_LENGTH),
     projectId: optionalBoundedString(row.project_id, "project_id", SESSION_ID_MAX_LENGTH),

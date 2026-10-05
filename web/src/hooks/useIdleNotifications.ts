@@ -218,7 +218,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // Refocusing the window (focused on the open conversation) marks that
   // conversation read: recompute from the latest list with windowFocused
   // true, which drops the actively-viewed id from the count. The persistent
-  // last-seen baseline is advanced by ChatPage's `useMarkConversationSeen`,
+  // last-seen baseline is advanced by AppShell's `useMarkConversationSeen`,
   // so the next data tick agrees with this immediate recompute.
   useEffect(() => {
     const onFocus = () => {

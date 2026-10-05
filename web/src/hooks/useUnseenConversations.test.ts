@@ -1,7 +1,9 @@
 import type * as UseUnseenConversationsModule from "./useUnseenConversations";
 
 import { act, cleanup, renderHook } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
 
 // `authenticatedFetch` is mocked so we can assert the read-state PUT
 // round-trips without a server (the read path is the conversation list, fed
@@ -121,6 +123,43 @@ describe("isConversationUnseen", () => {
     expect(mod.isConversationUnseen("conv-1", 2_000, "idle")).toBe(true);
     expect(mod.isConversationUnseen("conv-1", 2_000, "failed")).toBe(true);
     expect(mod.isConversationUnseen("conv-1", 1_000, "idle")).toBe(false); // equal, not greater
+  });
+
+  it("keeps a server explicit-unread visible when the local baseline is newer", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 100, updated_at: 100 }]);
+    mod.markConversationSeen("conv-1", 200);
+
+    // A different device marked the session unread. Its older server baseline
+    // must not let the local newer baseline hide the explicit override.
+    const reloaded = await reloadKeepingStorage();
+    reloaded.seedReadState([
+      { id: "conv-1", viewer_last_seen: 99, viewer_unread: true, updated_at: 100 },
+    ]);
+
+    expect(reloaded.isConversationUnseen("conv-1", 100, "idle")).toBe(true);
+  });
+
+  it("uses the latest visible message instead of metadata timestamps", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 100, updated_at: 200, last_message_at: 100 },
+      { id: "conv-empty", viewer_last_seen: 0, updated_at: 200, last_message_at: null },
+      { id: "conv-old", viewer_last_seen: 100, updated_at: 200 },
+    ]);
+
+    expect(mod.isConversationUnseen("conv-1", conversationReadTimestamp(200, 100), "idle")).toBe(
+      false,
+    );
+    expect(mod.isConversationUnseen("conv-1", conversationReadTimestamp(201, 101), "idle")).toBe(
+      true,
+    );
+    expect(
+      mod.isConversationUnseen("conv-empty", conversationReadTimestamp(200, null), "idle"),
+    ).toBe(false);
+    expect(
+      mod.isConversationUnseen("conv-old", conversationReadTimestamp(201, undefined), "idle"),
+    ).toBe(true);
   });
 });
 
@@ -346,6 +385,51 @@ describe("useMarkConversationSeen", () => {
     expect(mod.isConversationUnseen("conv-1", 6_000, "idle")).toBe(false); // no baseline written
   });
 
+  it("uses focus and interaction events when document.hasFocus misreports", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 100, updated_at: 100 }]);
+    setWindowFocused(false);
+    vi.useFakeTimers({ now: 150_000 });
+
+    const { rerender } = renderHook(
+      ({ timestamp }) => mod.useMarkConversationSeen("conv-1", timestamp),
+      { initialProps: { timestamp: 100 } },
+    );
+
+    // The DOM focus event is authoritative even though hasFocus() says false.
+    act(() => window.dispatchEvent(new Event("focus")));
+    expect(mod.isConversationUnseen("conv-1", 100, "idle")).toBe(false);
+
+    // A real blur means a newer message must not be swallowed by effect cleanup.
+    act(() => window.dispatchEvent(new Event("blur")));
+    rerender({ timestamp: 200 });
+    expect(mod.isConversationUnseen("conv-1", 200, "idle")).toBe(true);
+
+    // Pointer/keyboard interaction re-establishes focus and reads the active
+    // thread, even when document.hasFocus() remains false.
+    act(() => {
+      window.dispatchEvent(new Event("pointerdown"));
+      window.dispatchEvent(new Event("keydown"));
+    });
+    expect(mod.isConversationUnseen("conv-1", 200, "idle")).toBe(false);
+  });
+
+  it("does not clear an explicit unread from focus or interaction events", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 99, viewer_unread: true }]);
+    setWindowFocused(false);
+
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 100));
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("pointerdown"));
+      window.dispatchEvent(new Event("keydown"));
+    });
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+    expect(mod.isConversationUnseen("conv-1", 100, "idle")).toBe(true);
+  });
+
   it("preserves a seeded explicit-unread on reload (first mount does not clear)", async () => {
     // Reload landing back on /c/conv-1: the list seeds the server's unread,
     // and the first mount must neither clear the override nor mark seen.
@@ -353,7 +437,7 @@ describe("useMarkConversationSeen", () => {
     mod.seedReadState([{ id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true }]);
     setWindowFocused(true);
 
-    renderHook(() => mod.useMarkConversationSeen("conv-1", 5_000));
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 5_000), { wrapper: StrictMode });
 
     expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
     expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
@@ -372,6 +456,26 @@ describe("useMarkConversationSeen", () => {
 
     rerender({ id: "conv-2" }); // navigate away
     rerender({ id: "conv-1" }); // reopen → override cleared, marked seen
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+  });
+
+  it("clears the override after leaving a chat route and reopening it", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true }]);
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 9_000_000 });
+
+    const { rerender } = renderHook(({ id }) => mod.useMarkConversationSeen(id, 5_000), {
+      initialProps: { id: "conv-1" as string | undefined },
+    });
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+
+    // AppShell remains mounted while the route leaves ChatPage for Inbox or
+    // Settings, so the next visit is an id -> undefined -> id transition.
+    rerender({ id: undefined });
+    rerender({ id: "conv-1" });
 
     expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
     expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
