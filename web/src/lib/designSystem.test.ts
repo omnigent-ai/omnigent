@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  DESIGN_SYSTEM_IMPORT_DIR,
   DESIGN_SYSTEM_RECENTS_MAX,
   designSystemInstruction,
   designSystemName,
@@ -69,6 +70,27 @@ describe("parseDesignSystemPointer", () => {
     expect(parseDesignSystemPointer('{"path":"C:\\\\brand","kind":"full","name":"W"}').path).toBe(
       "C:\\brand",
     );
+  });
+
+  it("round-trips an imported pointer's source as imported_from", () => {
+    const imported: DesignSystemRef = {
+      path: DESIGN_SYSTEM_IMPORT_DIR,
+      kind: "full",
+      name: "Acme",
+      importedFrom: "/Users/me/brand/acme",
+    };
+    const text = serializeDesignSystemPointer(imported);
+    expect(JSON.parse(text)).toEqual({
+      path: ".omnigent/design-system",
+      kind: "full",
+      name: "Acme",
+      imported_from: "/Users/me/brand/acme",
+    });
+    expect(parseDesignSystemPointer(text)).toEqual(imported);
+    expect(serializeDesignSystemPointer(ACME)).not.toContain("imported_from");
+    expect(
+      parseDesignSystemPointer('{"path":"a","kind":"full","imported_from":7}').importedFrom,
+    ).toBeUndefined();
   });
 
   it("strips a trailing slash and falls back to the folder name", () => {

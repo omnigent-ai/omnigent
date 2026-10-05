@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
-import { deleteFileContent, useWriteFileContent } from "./useWriteFileContent";
+import { deleteFileContent, useWriteFileContent, writeFileContent } from "./useWriteFileContent";
 
 const fetchMock = vi.fn();
 
@@ -46,6 +46,13 @@ describe("useWriteFileContent", () => {
     expect(url).toBe("/v1/sessions/sess_1/resources/environments/default/filesystem/src/notes.md");
     expect(init.method).toBe("PUT");
     expect(JSON.parse(init.body as string)).toEqual({ content: "# Hello", encoding: "utf-8" });
+  });
+
+  it("passes a base64 encoding through to the write route", async () => {
+    fetchMock.mockResolvedValue(okResponse());
+    await writeFileContent("sess_1", "fonts/a.woff2", "d09GMg==", "base64");
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ content: "d09GMg==", encoding: "base64" });
   });
 
   it("encodes special characters in path segments", async () => {

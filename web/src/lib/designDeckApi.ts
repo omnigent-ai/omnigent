@@ -9,7 +9,11 @@ import {
   requestWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { DESIGN_KIT_DIR, kitText } from "@/shell/codeViewerHelpers";
-import { DESIGN_SYSTEM_POINTER, parseDesignSystemPointer } from "./designSystem";
+import {
+  DESIGN_SYSTEM_IMPORT_DIR,
+  DESIGN_SYSTEM_POINTER,
+  parseDesignSystemPointer,
+} from "./designSystem";
 import {
   DECK_INCLUDE_GLOB,
   DECK_SEARCH_QUERY,
@@ -34,7 +38,10 @@ export async function fetchDeckSearch(sessionId: string): Promise<DeckSearchResu
   if (res.status === 404 || res.status === 503) return { status: "unavailable" };
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const { files, truncated, hasMore } = await readWorkspaceFileSearch(res);
-  const paths = files.filter((f) => f.type === "file").map((f) => f.path);
+  const imported = `/${DESIGN_SYSTEM_IMPORT_DIR}/`;
+  const paths = files
+    .filter((f) => f.type === "file" && !`/${f.path}`.includes(imported))
+    .map((f) => f.path);
   // Scan budget (`truncated`) or a full page of results (the server's `has_more`).
   // Count is only a stand-in when `has_more` is missing from the body.
   return {

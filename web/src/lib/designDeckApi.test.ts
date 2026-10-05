@@ -94,6 +94,25 @@ describe("fetchDeckSearch", () => {
     });
   });
 
+  it("leaves out decks inside an imported design system", async () => {
+    searchMock.mockResolvedValue(
+      response(200, {
+        object: "list",
+        data: [
+          entry(".omnigent/design-system/slides/title.slides.html"),
+          entry("decks/.omnigent/design-system/x.slides.html"),
+          entry("q3.slides.html"),
+        ],
+        has_more: false,
+      }),
+    );
+    expect(await fetchDeckSearch("conv_a")).toEqual({
+      status: "ok",
+      paths: ["q3.slides.html"],
+      truncated: false,
+    });
+  });
+
   it.each([404, 503])("reads a %s as an unavailable workspace", async (status) => {
     searchMock.mockResolvedValue(response(status, { error: { code: "runner_unavailable" } }));
     expect(await fetchDeckSearch("conv_a")).toEqual({ status: "unavailable" });

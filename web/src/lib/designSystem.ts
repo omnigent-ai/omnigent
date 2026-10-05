@@ -3,6 +3,8 @@
 // per host, and the agent instruction. Pure, so it is unit-testable.
 
 export const DESIGN_SYSTEM_POINTER = ".omnigent/design-system.json";
+/** Where an imported copy lives in the design's workspace. */
+export const DESIGN_SYSTEM_IMPORT_DIR = ".omnigent/design-system";
 export const DS_MANIFEST = "_ds_manifest.json";
 export const DS_SKILL = "SKILL.md";
 export const NOT_A_DESIGN_SYSTEM = "Not a design system: no SKILL.md or _ds_manifest.json";
@@ -17,6 +19,8 @@ export interface DesignSystemRef {
   path: string;
   kind: DesignSystemKind;
   name: string;
+  /** The absolute folder an imported copy came from. */
+  importedFrom?: string;
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> =>
@@ -80,11 +84,17 @@ export function parseDesignSystemPointer(text: string): DesignSystemRef {
     throw new Error('"kind" must be "full" or "skill"');
   }
   const name = (typeof raw.name === "string" ? raw.name.trim() : "") || folderName(path);
-  return { path, kind: raw.kind, name: name.slice(0, NAME_MAX) };
+  const ref: DesignSystemRef = { path, kind: raw.kind, name: name.slice(0, NAME_MAX) };
+  if (typeof raw.imported_from === "string" && raw.imported_from) {
+    ref.importedFrom = raw.imported_from;
+  }
+  return ref;
 }
 
 export function serializeDesignSystemPointer(ref: DesignSystemRef): string {
-  return `${JSON.stringify({ path: ref.path, kind: ref.kind, name: ref.name }, null, 2)}\n`;
+  const { path, kind, name, importedFrom } = ref;
+  const pointer = { path, kind, name, ...(importedFrom ? { imported_from: importedFrom } : {}) };
+  return `${JSON.stringify(pointer, null, 2)}\n`;
 }
 
 /** An absolute host path (POSIX, drive letter, or UNC) rather than a workspace path. */

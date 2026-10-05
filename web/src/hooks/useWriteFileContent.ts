@@ -9,6 +9,7 @@ export async function writeFileContent(
   conversationId: string,
   path: string,
   content: string,
+  encoding: "utf-8" | "base64" = "utf-8",
 ): Promise<void> {
   // Same slash-merge-safe wire form as the read path, via the shared helpers:
   // a bare per-segment-encoded path, and `?base=host` for an absolute location
@@ -22,7 +23,7 @@ export async function writeFileContent(
   const res = await authenticatedFetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content, encoding: "utf-8" }),
+    body: JSON.stringify({ content, encoding }),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
 }

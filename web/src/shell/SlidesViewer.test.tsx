@@ -687,23 +687,30 @@ describe("SlidesViewer design system", () => {
   const DS_DECK = `<html><head><style>h1{color:red}</style></head><body>
 <section><h1>One</h1><img src="ds:assets/logo.svg"></section>
 </body></html>`;
-  const pointerFile = (kind: "full" | "skill") =>
-    text(serializeDesignSystemPointer({ path: FOLDER, kind, name: "Fixture Brand" }));
+  const pointerFile = (kind: "full" | "skill", folder: string) =>
+    text(serializeDesignSystemPointer({ path: folder, kind, name: "Fixture Brand" }));
   const serveSystem = (
     kind: "full" | "skill",
-    opts: { owner?: boolean; fail?: string; hang?: boolean; logoGate?: Promise<void> } = {},
+    opts: {
+      owner?: boolean;
+      fail?: string;
+      hang?: boolean;
+      logoGate?: Promise<void>;
+      folder?: string;
+    } = {},
   ) => {
+    const folder = opts.folder ?? FOLDER;
     vi.mocked(getSessionSlim).mockResolvedValue({
       permissionLevel: opts.owner === false ? 1 : null,
     } as Awaited<ReturnType<typeof getSessionSlim>>);
     vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
-      if (path === DESIGN_SYSTEM_POINTER) return { ...pointerFile(kind), path } as never;
-      if (path.startsWith(`${FOLDER}/`)) {
+      if (path === DESIGN_SYSTEM_POINTER) return { ...pointerFile(kind, folder), path } as never;
+      if (path.startsWith(`${folder}/`)) {
         if (opts.hang) await new Promise(() => {});
         if (opts.logoGate && path.endsWith("/logo.svg")) await opts.logoGate;
-        if (path === `${FOLDER}/assets/extra.svg`) return { ...text("<svg/>"), path } as never;
+        if (path === `${folder}/assets/extra.svg`) return { ...text("<svg/>"), path } as never;
         if (opts.fail) throw new Error(opts.fail);
-        const f = readFixtureFile(path.slice(FOLDER.length + 1));
+        const f = readFixtureFile(path.slice(folder.length + 1));
         if (f) return { ...f, path } as never;
       }
       throw new Error("404 Not Found");
@@ -752,6 +759,26 @@ describe("SlidesViewer design system", () => {
     );
     expect(fetchFileContent).toHaveBeenCalledTimes(1);
     expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
+  });
+
+  it("brands an imported system for a collaborator through workspace reads", async () => {
+    const imported = ".omnigent/design-system";
+    serveSystem("full", { owner: false, folder: imported });
+    render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+    expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
+    expect(srcdoc()).toContain("--fx-primary: #0b5fff");
+    expect(srcdoc()).toMatch(/<img src="data:image\/svg\+xml;base64,[^"]+">/);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(fetchFileContent).toHaveBeenCalledWith("conv_1", `${imported}/colors_and_type.css`);
+    expect(getSessionSlim).not.toHaveBeenCalled();
+  });
+
+  it("names a failed read of an imported system without asking to import", async () => {
+    serveSystem("full", { folder: ".omnigent/design-system", fail: "403 Forbidden" });
+    render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Design system not applied: 403 Forbidden",
+    );
   });
 
   it("asks to import when the session cannot read the folder", async () => {
