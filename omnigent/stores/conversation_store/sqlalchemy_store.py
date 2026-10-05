@@ -42,6 +42,7 @@ from omnigent.db.db_models import (
     SqlConversationItem,
     SqlConversationLabel,
     SqlConversationMetadata,
+    SqlDesignArtifact,
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
@@ -86,6 +87,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
+from omnigent.entities.design_artifact import DesignArtifact, design_artifact_kind
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
@@ -2741,6 +2743,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        conversation_ids: list[str] | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -2911,6 +2914,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             if qualifying_ids is not None:
                 stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
+            if conversation_ids is not None:
+                stmt = stmt.where(SqlConversation.id.in_(conversation_ids))
 
             if acl_pushdown:
                 # Correlated on both PK members so Postgres can drive the
@@ -3796,6 +3801,90 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
+
+    def record_design_artifact(
+        self,
+        session_id: str,
+        path: str,
+        kind: str,
+        *,
+        deleted: bool = False,
+        now: int | None = None,
+    ) -> None:
+        """Upsert one artifact row, or mark an existing one deleted. See the abstract method."""
+        stamp = now if now is not None else now_epoch()
+
+        def write(session: Session) -> None:
+            row = session.get(SqlDesignArtifact, (current_workspace_id(), session_id, path))
+            if deleted:
+                if row is not None:
+                    row.deleted = True
+                    row.updated_at = stamp
+                return
+            # ponytail: get-then-insert; a racing first write from another replica is dropped
+            if row is None:
+                session.add(
+                    SqlDesignArtifact(
+                        session_id=session_id, path=path, kind=kind, updated_at=stamp
+                    )
+                )
+            else:
+                row.kind = kind
+                row.deleted = False
+                row.updated_at = stamp
+
+        run_write_transaction(self._conv_session_immediate, "record_design_artifact", write)
+
+    def list_design_artifacts(self, kind: str | None = None) -> list[DesignArtifact]:
+        """List the workspace's live artifacts, newest first. See the abstract method."""
+        stmt = select(SqlDesignArtifact).where(
+            SqlDesignArtifact.workspace_id == current_workspace_id(),
+            SqlDesignArtifact.deleted.is_(False),
+        )
+        if kind is not None:
+            stmt = stmt.where(SqlDesignArtifact.kind == kind)
+        stmt = stmt.order_by(SqlDesignArtifact.updated_at.desc(), SqlDesignArtifact.path)
+        with self._conv_session("list_design_artifacts") as session:
+            return [
+                DesignArtifact(
+                    session_id=row.session_id,
+                    path=row.path,
+                    kind=row.kind,
+                    updated_at=row.updated_at,
+                )
+                for row in session.execute(stmt).scalars()
+            ]
+
+    def replace_design_artifacts(
+        self, session_id: str, paths: list[str], *, now: int | None = None
+    ) -> None:
+        """Replace a session's artifact rows with *paths*. See the abstract method."""
+        stamp = now if now is not None else now_epoch()
+        wanted = {path: kind for path in paths if (kind := design_artifact_kind(path)) is not None}
+
+        def write(session: Session) -> None:
+            rows = session.execute(
+                select(SqlDesignArtifact).where(
+                    SqlDesignArtifact.workspace_id == current_workspace_id(),
+                    SqlDesignArtifact.session_id == session_id,
+                )
+            ).scalars()
+            existing = {row.path: row for row in rows}
+            for path, row in existing.items():
+                if path not in wanted:
+                    session.delete(row)
+                elif row.deleted:
+                    row.deleted = False
+                    row.updated_at = stamp
+            for path, kind in wanted.items():
+                if path not in existing:
+                    session.add(
+                        SqlDesignArtifact(
+                            session_id=session_id, path=path, kind=kind, updated_at=stamp
+                        )
+                    )
+
+        run_write_transaction(self._conv_session_immediate, "replace_design_artifacts", write)
 
     def replace_runner_id(
         self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None

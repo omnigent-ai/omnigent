@@ -15,6 +15,7 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
 )
+from omnigent.entities.design_artifact import DesignArtifact
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
 if TYPE_CHECKING:
@@ -749,6 +750,7 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        conversation_ids: list[str] | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -860,6 +862,8 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param conversation_ids: When set, only return conversations with
+            these ids. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
@@ -1485,6 +1489,56 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier.
         :param count: Outstanding elicitations, ``>= 0``.
+        """
+        ...
+
+    @abstractmethod
+    def record_design_artifact(
+        self,
+        session_id: str,
+        path: str,
+        kind: str,
+        *,
+        deleted: bool = False,
+        now: int | None = None,
+    ) -> None:
+        """
+        Record a change to a Design page artifact a session wrote.
+
+        A live change upserts the row and clears ``deleted``; ``deleted=True``
+        only marks an existing row, so a missing file never creates one.
+
+        :param session_id: Session the file was written through.
+        :param path: Path relative to the session's workspace.
+        :param kind: ``"deck"`` or ``"wireframe"``.
+        :param deleted: The file was deleted or a read found it missing.
+        :param now: Epoch seconds to stamp; defaults to the current time.
+        """
+        ...
+
+    @abstractmethod
+    def list_design_artifacts(self, kind: str | None = None) -> list[DesignArtifact]:
+        """
+        List the workspace's live Design page artifacts, newest first.
+
+        :param kind: ``"deck"`` or ``"wireframe"``; ``None`` lists both.
+        :returns: Non-deleted rows across every session in the workspace.
+        """
+        ...
+
+    @abstractmethod
+    def replace_design_artifacts(
+        self, session_id: str, paths: list[str], *, now: int | None = None
+    ) -> None:
+        """
+        Replace a session's artifact rows with exactly *paths*.
+
+        Rows for paths already indexed keep their ``updated_at``; new paths
+        are stamped *now*. Paths that are not artifacts are ignored.
+
+        :param session_id: Session whose workspace was scanned.
+        :param paths: Every artifact path the scan found.
+        :param now: Epoch seconds to stamp; defaults to the current time.
         """
         ...
 

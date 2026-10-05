@@ -1128,6 +1128,37 @@ class SqlConversationLabel(ConversationBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+class SqlDesignArtifact(ConversationBase):
+    """
+    SQLAlchemy model for the ``design_artifacts`` table.
+
+    The Design page's index of slide decks and wireframes across sessions.
+    One row per file a session wrote; there is no DB foreign key (Rule R032).
+
+    :param session_id: Session the file was written through.
+    :param path: Path relative to the session's workspace.
+    :param kind: ``"deck"`` or ``"wireframe"``.
+    :param updated_at: Unix epoch seconds of the last recorded change.
+    :param deleted: The file was deleted or a read found it missing.
+    """
+
+    __tablename__ = "design_artifacts"
+    __table_args__ = (Index("ix_design_artifacts_session", "workspace_id", "session_id"),)
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    path: Mapped[str] = mapped_column(String(512), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    updated_at: Mapped[int] = mapped_column(Integer)
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+
+
 class SqlComment(OmnigentBase):
     """SQLAlchemy model for the ``comments`` table.
 
