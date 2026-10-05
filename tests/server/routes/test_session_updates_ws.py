@@ -24,9 +24,9 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
-from omnigent.db.db_models import SqlConversation
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.feature_flags import FEATURES_ENV_VAR, Feature, FeatureFlags
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -96,17 +96,14 @@ def comment_store(db_uri: str) -> SqlAlchemyCommentStore:
     return SqlAlchemyCommentStore(db_uri)
 
 
-@pytest.fixture
-def app(
+def _build_app(
     stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
     liveness_state: dict[str, SessionLiveness],
     comment_store: SqlAlchemyCommentStore,
+    *,
+    feature_flags: FeatureFlags | None = None,
 ) -> FastAPI:
-    """Minimal app mounting only the sessions router, with header-based
-    auth and a real permission store — the surface the updates stream
-    actually exercises. ``liveness_lookup`` reads the mutable
-    ``liveness_state`` (default runner online, no host) so tests control
-    liveness."""
+    """Build the focused sessions app with an immutable feature snapshot."""
     conversation_store, agent_store, permission_store = stores
 
     def _liveness_lookup(ids: list[str]) -> dict[str, SessionLiveness]:
@@ -124,10 +121,36 @@ def app(
             permission_store=permission_store,
             liveness_lookup=_liveness_lookup,
             comment_store=comment_store,
+            feature_flags=feature_flags,
         ),
         prefix="/v1",
     )
     return app
+
+
+@pytest.fixture
+def app(
+    stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
+    liveness_state: dict[str, SessionLiveness],
+    comment_store: SqlAlchemyCommentStore,
+) -> FastAPI:
+    """Minimal default-off app mounting only the sessions router."""
+    return _build_app(stores, liveness_state, comment_store)
+
+
+@pytest.fixture
+def watermark_app(
+    stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
+    liveness_state: dict[str, SessionLiveness],
+    comment_store: SqlAlchemyCommentStore,
+) -> FastAPI:
+    """Sessions app with the server-only watermark rollout enabled."""
+    return _build_app(
+        stores,
+        liveness_state,
+        comment_store,
+        feature_flags=FeatureFlags(frozenset({Feature.UNREAD_MESSAGE_WATERMARK})),
+    )
 
 
 def _seed_session(
@@ -200,6 +223,55 @@ def test_watch_returns_snapshot_of_accessible_sessions(app: FastAPI, stores) -> 
         # would drop the key (stream dumps full rows, so it must be present).
         assert items[s1]["runner_online"] is True
         assert items[s1]["host_online"] is None
+
+
+def test_watermark_enabled_projects_visible_and_empty_rows(
+    watermark_app: FastAPI,
+    stores,
+    fast_rescan: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The enabled snapshot exposes visible timestamps and empty rows as 0."""
+    empty_id = _seed_session(stores, owner=ALICE, title="empty")
+    visible_id = _seed_session(stores, owner=ALICE, title="visible")
+    stores[0].append(
+        visible_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="visible-watermark",
+                data=MessageData(
+                    role="assistant",
+                    agent="test-agent",
+                    content=[{"type": "output_text", "text": "visible"}],
+                ),
+            )
+        ],
+    )
+    # The router captured its FeatureFlags snapshot at construction; changing
+    # the environment after that point must not change the WS projection.
+    monkeypatch.setenv(FEATURES_ENV_VAR, "")
+
+    client = TestClient(watermark_app)
+    get_response = client.get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
+    assert get_response.status_code == 200
+    get_items = {item["id"]: item for item in get_response.json()["data"]}
+    assert get_items[empty_id]["last_message_at"] == 0
+    assert get_items[visible_id]["last_message_at"] > 0
+
+    with client.websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [empty_id, visible_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        stores[0].update_conversation(visible_id, title="visible-updated")
+        changed = _recv_until(ws, {"changed"})
+
+    items = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
+    assert items[empty_id]["last_message_at"] == 0
+    assert items[visible_id]["last_message_at"] > 0
+    changed_items = {item["id"]: item for item in changed["items"]}  # type: ignore[index]
+    assert changed_items[visible_id]["last_message_at"] > 0
 
 
 def test_child_busy_rollup_flows_through_updates_stream(
@@ -299,17 +371,17 @@ def test_list_sessions_omits_liveness_fields(
     assert "host_online" not in items[s1]
 
 
-@pytest.mark.parametrize("scenario", ["null_marker", "populated_stale"])
-def test_stale_watermark_omits_get_field_and_sends_ws_null(
+@pytest.mark.parametrize("scenario", ["empty", "populated"])
+def test_default_off_watermark_omits_get_field_and_sends_ws_null(
     app: FastAPI,
     stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
     fast_rescan: None,
     scenario: str,
 ) -> None:
-    """Mixed-version rows fall back conservatively on both list surfaces."""
+    """The default-off rollout hides empty and populated watermarks."""
     conversation_store = stores[0]
     session_id = _seed_session(stores, owner=ALICE, title="legacy")
-    if scenario == "populated_stale":
+    if scenario == "populated":
         conversation_store.append(
             session_id,
             [
@@ -323,15 +395,6 @@ def test_stale_watermark_omits_get_field_and_sends_ws_null(
                 )
             ],
         )
-    with conversation_store._session("test_setup") as session:
-        row = session.get(SqlConversation, (0, session_id))
-        assert row is not None
-        if scenario == "null_marker":
-            row.last_message_observed_position = None
-            row.next_position = 0
-        else:
-            assert row.last_message_observed_position == 1
-            row.next_position = 2
     conversation_store.append(
         session_id,
         [
@@ -346,15 +409,6 @@ def test_stale_watermark_omits_get_field_and_sends_ws_null(
             )
         ],
     )
-    stale = conversation_store.get_conversation(session_id)
-    assert stale is not None
-    assert stale.last_message_observed_position == (None if scenario == "null_marker" else 1)
-    with conversation_store._session("test_setup") as session:
-        raw = session.get(SqlConversation, (0, session_id))
-        assert raw is not None
-        assert raw.next_position == (1 if scenario == "null_marker" else 3)
-    assert stale.last_message_at_fresh is False
-
     client = TestClient(app)
     get_response = client.get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
     assert get_response.status_code == 200

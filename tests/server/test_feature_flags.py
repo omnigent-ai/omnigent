@@ -58,6 +58,16 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled_names() == ("canvas",)
 
 
+def test_unread_message_watermark_is_server_only_and_defaults_off() -> None:
+    off = resolve_feature_flags({})
+    assert not off.enabled(Feature.UNREAD_MESSAGE_WATERMARK)
+
+    on = resolve_feature_flags({FEATURES_ENV_VAR: "unread_message_watermark"})
+    assert on.enabled(Feature.UNREAD_MESSAGE_WATERMARK)
+    assert "unread_message_watermark" not in on.frontend_dict()
+    assert on.enabled_names() == ("unread_message_watermark",)
+
+
 def test_unknown_feature_fails_with_known_names() -> None:
     with pytest.raises(ValueError) as exc_info:
         resolve_feature_flags({FEATURES_ENV_VAR: "usage-pgae"})

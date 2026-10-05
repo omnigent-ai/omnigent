@@ -106,6 +106,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
 - **`read-state`, reload and reopen:**
+  Enable the `unread_message_watermark` server feature when starting the isolated
+  environment; its fresh database needs no historical backfill. Owned pytest
+  servers enable it by default, while existing environments must opt in at startup.
   `tests/e2e_ui/sessions/test_sidebar_mark_unread.py`.
   **Live messages, metadata, hidden context, and fallback polling:**
   `tests/e2e_ui/sessions/test_unread_live_updates.py`.

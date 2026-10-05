@@ -2705,10 +2705,11 @@ class SessionListItem(BaseModel):
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
     :param last_message_at: Unix epoch seconds of the latest user-visible
-        message item. ``0`` means no visible message is known. ``None`` means
-        the row's watermark is not yet authoritative; readers fall back to
-        ``updated_at`` until reconciliation completes. Unlike ``updated_at``,
-        metadata and lifecycle writes do not advance it.
+        message item when the ``unread_message_watermark`` rollout is enabled.
+        ``0`` means no visible message is known. ``None`` means the rollout is
+        disabled or the row's watermark is not yet authoritative; readers fall
+        back to ``updated_at``. Unlike ``updated_at``, metadata and lifecycle
+        writes do not advance it.
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.

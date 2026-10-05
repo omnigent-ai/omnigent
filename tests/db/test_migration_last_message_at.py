@@ -105,19 +105,13 @@ def _base_rows(engine: sa.Engine) -> dict[tuple[int, bytes], tuple[int, int, byt
         }
 
 
-def _watermarks(engine: sa.Engine) -> dict[tuple[int, bytes], tuple[int | None, int | None]]:
-    """Read the staged nullable columns using raw SQL."""
+def _watermarks(engine: sa.Engine) -> dict[tuple[int, bytes], int | None]:
+    """Read the staged nullable column using raw SQL."""
     with engine.connect() as connection:
         return {
-            (row.workspace_id, bytes(row.id)): (
-                row.last_message_at,
-                row.last_message_observed_position,
-            )
+            (row.workspace_id, bytes(row.id)): row.last_message_at
             for row in connection.execute(
-                sa.text(
-                    "SELECT workspace_id, id, last_message_at, "
-                    "last_message_observed_position FROM conversations"
-                )
+                sa.text("SELECT workspace_id, id, last_message_at FROM conversations")
             )
         }
 
@@ -140,14 +134,13 @@ def test_last_message_at_columns_preserve_rows_and_reenter(db_uri: str) -> None:
         columns = {
             column["name"]: column for column in sa.inspect(engine).get_columns("conversations")
         }
-        assert {"last_message_at", "last_message_observed_position"} <= set(columns)
+        assert "last_message_at" in columns
         assert columns["last_message_at"]["nullable"] is True
-        assert columns["last_message_observed_position"]["nullable"] is True
         assert _base_rows(engine) == before
         assert _watermarks(engine) == {
-            (0, b"\x01" * 16): (None, None),
-            (0, b"\x02" * 16): (None, None),
-            (17, b"\x01" * 16): (None, None),
+            (0, b"\x01" * 16): None,
+            (0, b"\x02" * 16): None,
+            (17, b"\x01" * 16): None,
         }
 
         # Application reconciliation may populate a marker before a migration
@@ -155,23 +148,21 @@ def test_last_message_at_columns_preserve_rows_and_reenter(db_uri: str) -> None:
         with engine.begin() as connection:
             connection.execute(
                 sa.text(
-                    "UPDATE conversations SET last_message_at = :last_message_at, "
-                    "last_message_observed_position = :observed "
+                    "UPDATE conversations SET last_message_at = :last_message_at "
                     "WHERE workspace_id = :workspace_id AND id = :id"
                 ),
                 {
                     "last_message_at": 777,
-                    "observed": 42,
                     "workspace_id": 0,
                     "id": b"\x01" * 16,
                 },
             )
         _direct_upgrade(engine, migration)
-        assert _watermarks(engine)[(0, b"\x01" * 16)] == (777, 42)
+        assert _watermarks(engine)[(0, b"\x01" * 16)] == 777
         assert _base_rows(engine) == before
 
         _migrate(engine, db_uri, _PREVIOUS_REVISION, downgrade=True)
-        assert not {"last_message_at", "last_message_observed_position"} & {
+        assert "last_message_at" not in {
             column["name"] for column in sa.inspect(engine).get_columns("conversations")
         }
         assert _base_rows(engine) == before
@@ -201,23 +192,23 @@ def test_last_message_at_partial_ddl_retry_preserves_markers_and_data(db_uri: st
             )
 
         _migrate(engine, db_uri, "head")
-        assert _watermarks(engine)[(0, b"\x11" * 16)] == (888, None)
+        assert _watermarks(engine)[(0, b"\x11" * 16)] == 888
         assert _base_rows(engine) == before
 
-        # A writer from before the schema release omits both new columns.
+        # A writer from before the schema release omits the new column.
         old_style_row = (23, b"\x12" * 16, 700)
         _insert_conversations(engine, [old_style_row])
-        assert _watermarks(engine)[(23, b"\x12" * 16)] == (None, None)
+        assert _watermarks(engine)[(23, b"\x12" * 16)] is None
 
         # Simulate a partial downgrade, then retry it and retry it again.
-        _alter_watermark_column(engine, "last_message_observed_position", add=False)
+        _alter_watermark_column(engine, "last_message_at", add=False)
         _direct_downgrade(engine, migration)
-        assert not {"last_message_at", "last_message_observed_position"} & {
+        assert "last_message_at" not in {
             column["name"] for column in sa.inspect(engine).get_columns("conversations")
         }
         assert _base_rows(engine) == {**before, (23, b"\x12" * 16): (699, 700, b"\x12" * 16)}
         _direct_downgrade(engine, migration)
-        assert not {"last_message_at", "last_message_observed_position"} & {
+        assert "last_message_at" not in {
             column["name"] for column in sa.inspect(engine).get_columns("conversations")
         }
     finally:

@@ -1,124 +1,120 @@
 # Unread watermark rollout
 
-Unread indicators distinguish visible messages from metadata updates using
-`conversations.last_message_at`. Deploy its schema separately from the
-application behavior, and retain the additive columns when rolling back.
+Unread indicators use one nullable column, `conversations.last_message_at`,
+maintained only by visible-message writes. Reader activation is a deployment
+decision, controlled by the server-only `unread_message_watermark` release
+feature. There is no per-conversation freshness or backfill-progress column.
 
-## Schema preparation
+## Deploy in stages
 
-Deploy the schema-only release containing revision `mn1a2b3c4d5e` first. It adds
-two nullable integer columns, with no data scan, backfill, or reader activation:
+1. **Schema:** deploy the schema-only release containing revision
+   `mn1a2b3c4d5e`. It adds nullable integer `last_message_at` without a default,
+   data scan, or backfill. Existing rows and old-style inserts remain null.
+   Upgrade and downgrade can be re-entered safely.
+2. **Writers, readers off:** deploy the application release everywhere with
+   `unread_message_watermark` absent from `OMNIGENT_FEATURES`. New writers
+   maintain the timestamp for visible messages, independent of the flag.
+   Readers omit it from REST and send WebSocket null, retaining the
+   `updated_at` fallback even when the stored timestamp is populated.
+3. **Drain and backfill:** confirm every writer is running the new code and
+   all old writer processes have stopped. Run the bounded maintenance command
+   to completion for every workspace using the deployment's actual decoder.
+4. **Readers on:** only after every workspace completes, add
+   `unread_message_watermark` to the deployment's existing comma-separated
+   `OMNIGENT_FEATURES` value and restart/redeploy the serving processes.
+   Flags are captured at process construction; editing the environment alone
+   does not change an already-running server.
 
-- `last_message_at`: the latest visible-message timestamp in the observed prefix.
-- `last_message_observed_position`: the exclusive item-position boundary covered
-  by that timestamp. A null boundary means the prefix is unknown.
+The schema PR must merge before the application PR. While under review, the
+application PR targets the schema branch so its diff excludes schema changes.
+After the schema PR merges, retarget the application PR to `main`; do not
+merge application changes into the schema-preparation branch.
 
-Existing rows and rows created by old writers keep null markers. Already-running
-old binaries can continue using the existing columns. The preparation release
-declares the new ORM fields but otherwise retains the old read/write behavior.
-It is the supported application rollback target after the schema is installed;
-older-than-preparation binaries can reject the newer schema at startup.
+The gate defaults off, including in single-user installations. Before activation,
+metadata-driven unread indicators retain legacy behavior. After activation,
+a null stored timestamp means no visible messages and is exposed as zero.
+Session sorting continues to use `updated_at`.
 
-The schema PR must merge before its dependent application PR. While under review,
-the application PR can target the schema branch to keep its diff application-only.
-Retarget it to `main` after the schema PR merges; do not merge the application
-into the schema-preparation branch.
+This design relies on the deployment order: an old writer returning after
+activation can leave a non-null timestamp stale, and there is no per-row marker
+to detect it. Prevent that operationally. The temporary reader gate is scheduled
+for review in release `0.18.0`; do not remove it before the compatibility window
+has closed.
 
-## Application rollout
+## Bounded backfill
 
-Deploy the application release only after schema preparation succeeds. New empty
-sessions start with both the observed boundary and `next_position` at zero. New
-writers advance the boundary with the item allocator, but advance the timestamp
-only for visible, non-meta messages.
-
-A reader trusts the timestamp only when the observed boundary is non-null and
-equals the non-null `next_position`. A fresh empty session is exposed as timestamp
-zero. An unknown or stale row omits the REST field or sends WebSocket null, so
-clients use the legacy `updated_at` fallback. Full updates from old servers also
-clear any newer cached watermark. Sorting continues to use `updated_at`.
-
-An old writer advances `next_position` without advancing the observed boundary.
-This invalidates even a previously repaired timestamp. New appends to an unknown
-prefix leave it untrusted until reconciliation observes the missing history.
-There is no global readiness flag that can mask a late old-writer append.
-
-During compatibility mode, unreconciled sessions can still show metadata-driven
-unread indicators. The fallback deliberately preserves detection of real activity
-instead of treating an unknown timestamp as an authoritative empty session.
-
-## Bounded reconciliation
-
-After all old writers have drained, run the application release's
-`scripts/reconcile_message_watermarks.py` once per workspace. Supply the same
-storage locations and decoder configuration as the deployment. The script is
-introduced by the application PR, not by the schema-preparation release.
-
-For the standard SQLAlchemy store, set `UNREAD_STORAGE_LOCATION` to the intended
-database URI and start with conservative bounds:
+Run `scripts/reconcile_message_watermarks.py` from the application release while
+readers are off and old writers have drained. Set `UNREAD_STORAGE_LOCATION` to
+the intended database URI. For the standard SQLAlchemy store:
 
 ```sh
 uv run --no-sync python scripts/reconcile_message_watermarks.py \
   --storage-location "$UNREAD_STORAGE_LOCATION" \
   --workspace-id 0 \
-  --conversation-batch-limit 100 \
   --item-batch-limit 1000 \
   --max-pages 100
 ```
 
-If conversation data uses a separate database, supply
-`--conversation-storage-location`. For encrypted or custom stores, supply
-`--store-factory package.module:factory`; the factory receives the storage and
-conversation-storage locations and must return the deployment's configured
-`ConversationStore`, including its actual decoder. Do not run the default
-plaintext decoder against encrypted data.
+Supply `--conversation-storage-location` when conversations use a separate
+database. For encrypted or custom stores, supply
+`--store-factory package.module:factory`; the factory receives the two storage
+locations and must return the deployment's configured `ConversationStore`,
+including its actual decoder. Do not use the plaintext decoder on encrypted data.
 
-Each invocation of the store operation inspects a bounded primary-key page and
-repairs at most one conversation's bounded message page in its own transaction.
-Message reads use the existing workspace/conversation/type/position index. The
-store decodes payloads in application code; the database never inspects JSON or
-ciphertext. Row locking and a compare-and-set on the old allocator and boundary
-protect concurrent appends. Null and stale watermarks are both repaired.
+Each call seeks one conversation by primary key and decodes at most one bounded
+message page through the existing type/position index. Progress and the running
+maximum timestamp are returned in a job cursor, not stored on the conversation.
+Partial scans do not publish a partial timestamp. A completed scan updates
+`last_message_at` under the same row lock used by appends; new-writer appends
+between pages are included as the scan advances. Reconciliation never advances
+`updated_at`.
 
-The command prints JSON progress after each committed call:
+The command prints `{"complete": false, "next_cursor": {...}}` after each
+committed call. Exit `2` means the page budget ended before completion; exit
+`0` means the workspace completed. Pass the exact returned `next_cursor`
+object back as `--cursor` to resume:
 
-```json
-{"complete":false,"next_after":[0,"conversation-id"]}
+```sh
+uv run --no-sync python scripts/reconcile_message_watermarks.py \
+  --storage-location "$UNREAD_STORAGE_LOCATION" \
+  --workspace-id 0 \
+  --cursor "$UNREAD_RESUME_CURSOR" \
+  --item-batch-limit 1000 \
+  --max-pages 100
 ```
 
-Exit status `2` means `--max-pages` stopped an unfinished run; `0` means the
-workspace scan completed. Resume using both `--after-workspace-id` and
-`--after-conversation-id` from the last returned `next_after`. When it is null,
-omit both options. The cursor advances only past completed conversations; a
-partial message page persists its own prefix boundary and resumes the same
-conversation. Restarting from the beginning is also safe and skips fresh rows.
-A decode error rolls back that page without advertising its prefix as complete.
+Keep the cursor intact and scoped to the same database/workspace. Without a
+saved cursor, restart from the beginning; rescanning is safe. Malformed payloads
+fail without publishing an incomplete result. The scan recomputes null and
+non-null timestamps, so repeat it after any old-writer rollback and re-upgrade.
 
-Run a final pass from the beginning after old writers are definitely gone. A
-writer can invalidate a row already passed by an earlier scan, including a scan
-run during deployment. Later old writes remain detectable and use the fallback;
-repeat reconciliation after any application rollback and re-upgrade.
+## Rollback
 
-## Rollback and verification
+First remove `unread_message_watermark` from every serving process's feature
+configuration and restart/redeploy all readers. Only then roll writers back.
+Keep the additive column and use the schema-preparation release as the rollback
+target; older-than-preparation binaries can reject the schema at startup.
 
-Roll back the application to the schema-preparation release while keeping both
-columns. Its legacy behavior does not depend on either watermark. Re-upgrading
-the application and rerunning reconciliation restores authoritative prefixes.
+To re-enable readers, upgrade all writers again, drain the old ones, and rerun
+backfill from the beginning for every workspace. A previously completed cursor
+does not prove timestamps stayed current during an old-writer rollback.
 
-Prefer retaining these additive columns. Use the migration's schema downgrade
-only in a controlled rollback after **all schema-aware binaries are stopped**,
-including the preparation release whose ORM selects the new fields. Start the
-older schema-compatible release only after downgrade completes. Do not drop the
-columns beneath a running preparation or application release.
+Prefer retaining the column. A schema downgrade is only safe after all
+schema-aware binaries are stopped, including the preparation release whose ORM
+selects the new column. Earlier development versions of this unmerged PR may
+have left an unused extra column in preview databases; this update does not
+drop that development data automatically.
 
-Migration tests cover upgrade, nullable existing rows across workspaces,
-idempotent re-entry, and downgrade row preservation using the shared database
-fixture. Run them for each supported engine:
+## Verify
+
+Run the migration suite against each supported isolated database:
 
 ```sh
 uv run --no-sync pytest tests/db/test_migration_last_message_at.py -q
 ```
 
-For a deployed application smoke check, read a session, leave for Inbox, and
-rename it from another tab: it should remain read once reconciled. Add a visible
-reply while away: it should become unread, then clear when reopened. An explicit
-Mark as unread must survive reload and clear only after leaving and reopening.
+With readers off, REST must omit `last_message_at` and WebSocket rows must send
+null even when writers have populated it. After backfill and reader activation,
+read a chat, leave for Inbox, and rename it from another tab: no unread dot.
+Add a visible reply while away: the dot appears and clears when reopened.
+Explicit Mark as unread survives reload and clears after leaving and reopening.

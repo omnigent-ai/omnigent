@@ -50,9 +50,6 @@ class Conversation:
     :param last_message_at: Unix epoch seconds of the latest user-visible
         message item, or ``None`` when no visible message has been persisted.
         Hidden ``is_meta`` messages do not advance this watermark.
-    :param last_message_observed_position: Internal item-position freshness
-        marker; ``None`` or a stale value means the caller must fall back to
-        ``updated_at`` until reconciliation catches up.
     :param title: Optional user-assigned title. Phase 4 named
         sub-agents store ``"<type>:<name>"`` here so the partial
         unique index on ``(parent_conversation_id, title)`` can
@@ -283,9 +280,6 @@ class Conversation:
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None
-    last_message_observed_position: int | None = None
-    # Readers expose the timestamp only after the store proves the prefix.
-    last_message_at_fresh: bool = False
 
 
 # ── Conversation item data types ───────────────────────

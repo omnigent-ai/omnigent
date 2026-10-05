@@ -10,7 +10,10 @@ from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import (
+    ConversationStore,
+    WatermarkReconciliationCursor,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -57,9 +60,10 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--workspace-id", type=int, default=0)
-    parser.add_argument("--after-workspace-id", type=int)
-    parser.add_argument("--after-conversation-id")
-    parser.add_argument("--conversation-batch-limit", type=_positive, default=100)
+    parser.add_argument(
+        "--cursor",
+        help="JSON checkpoint returned by a previous bounded call",
+    )
     parser.add_argument("--item-batch-limit", type=_positive, default=1000)
     parser.add_argument(
         "--max-pages",
@@ -69,12 +73,59 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_cursor(
+    raw: str | None,
+    workspace_id: int,
+    parser: argparse.ArgumentParser,
+) -> WatermarkReconciliationCursor | None:
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        parser.error(f"--cursor must be valid JSON: {exc.msg}")
+    if not isinstance(value, dict):
+        parser.error("--cursor must be a JSON object")
+    required = {
+        "workspace_id",
+        "conversation_id",
+        "item_position",
+        "max_visible_message_at",
+    }
+    if set(value) != required:
+        parser.error("--cursor must contain exactly the four checkpoint fields")
+    cursor_workspace = value["workspace_id"]
+    conversation_id = value["conversation_id"]
+    item_position = value["item_position"]
+    max_visible = value["max_visible_message_at"]
+    if not isinstance(cursor_workspace, int) or isinstance(cursor_workspace, bool):
+        parser.error("cursor workspace_id must be an integer")
+    if cursor_workspace != workspace_id:
+        parser.error("cursor workspace_id must match --workspace-id")
+    if conversation_id is not None and not isinstance(conversation_id, str):
+        parser.error("cursor conversation_id must be a string or null")
+    if item_position is not None and (
+        not isinstance(item_position, int) or isinstance(item_position, bool) or item_position < 0
+    ):
+        parser.error("cursor item_position must be a non-negative integer or null")
+    if item_position is not None and conversation_id is None:
+        parser.error("a continuing cursor requires conversation_id")
+    if max_visible is not None and (
+        not isinstance(max_visible, int) or isinstance(max_visible, bool)
+    ):
+        parser.error("cursor max_visible_message_at must be an integer or null")
+    return WatermarkReconciliationCursor(
+        cursor_workspace,
+        conversation_id,
+        item_position,
+        max_visible,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    if (args.after_workspace_id is None) != (args.after_conversation_id is None):
-        _parser().error("--after-workspace-id and --after-conversation-id must be paired")
-    if args.after_workspace_id is not None and args.after_workspace_id != args.workspace_id:
-        _parser().error("after workspace must match --workspace-id")
+    parser = _parser()
+    args = parser.parse_args(argv)
+    cursor = _parse_cursor(args.cursor, args.workspace_id, parser)
 
     store: ConversationStore
     if args.store_factory:
@@ -88,17 +139,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.conversation_storage_location,
         )
 
-    cursor = (
-        (args.after_workspace_id, args.after_conversation_id)
-        if args.after_workspace_id is not None
-        else None
-    )
     pages = 0
     with workspace_scope(args.workspace_id):
         while True:
             result = store.reconcile_last_message_watermarks(
-                after=cursor,
-                conversation_batch_limit=args.conversation_batch_limit,
+                cursor=cursor,
                 item_batch_limit=args.item_batch_limit,
             )
             pages += 1
@@ -106,7 +151,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 json.dumps(
                     {
                         "complete": result.complete,
-                        "next_after": result.next_after,
+                        "next_cursor": (
+                            result.next_cursor._asdict()
+                            if result.next_cursor is not None
+                            else None
+                        ),
                     },
                     separators=(",", ":"),
                 )
@@ -115,7 +164,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             if args.max_pages is not None and pages >= args.max_pages:
                 return 2
-            cursor = result.next_after
+            cursor = result.next_cursor
 
 
 if __name__ == "__main__":

@@ -233,10 +233,19 @@ class CreatedSession:
     agent: Agent
 
 
+class WatermarkReconciliationCursor(NamedTuple):
+    """External checkpoint for one bounded watermark-repair page."""
+
+    workspace_id: int
+    conversation_id: str | None
+    item_position: int | None
+    max_visible_message_at: int | None
+
+
 class WatermarkReconciliationResult(NamedTuple):
     """Continuation returned by a bounded unread-watermark reconciliation."""
 
-    next_after: tuple[int, str] | None
+    next_cursor: WatermarkReconciliationCursor | None
     complete: bool
 
 
@@ -734,16 +743,14 @@ class ConversationStore(ABC):
 
     def reconcile_last_message_watermarks(
         self,
-        after: tuple[int, str] | None = None,
-        conversation_batch_limit: int = 100,
+        cursor: WatermarkReconciliationCursor | None = None,
         item_batch_limit: int = 1000,
     ) -> WatermarkReconciliationResult:
         """Reconcile a bounded page of visible-message watermarks.
 
-        ``after`` is a workspace/conversation keyset cursor. A result whose
-        ``complete`` flag is false may return the same cursor when the current
-        conversation needed another bounded item page; callers should invoke
-        the method again with that cursor until ``complete`` is true.
+        The checkpoint is external to the conversation row. A result whose
+        ``complete`` flag is false must be passed back unchanged until the
+        workspace scan finishes.
         """
         raise NotImplementedError
 

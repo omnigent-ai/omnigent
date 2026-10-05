@@ -1024,6 +1024,7 @@ def _build_session_list_item(
     pending_count: int,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
+    unread_message_watermark_enabled: bool = False,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -1065,6 +1066,8 @@ def _build_session_list_item(
         wired — emitted as ``comments_count=0`` /
         ``comments_updated_at=None`` so the two states look identical
         on the wire.
+    :param unread_message_watermark_enabled: Whether to expose the visible
+        message watermark. Defaults off for direct helper callers.
     :returns: The assembled :class:`SessionListItem`.
     """
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
@@ -1086,10 +1089,10 @@ def _build_session_list_item(
         ),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        # A stale/null observed-position marker must be omitted from GET and
-        # sent as null on WS so clients fall back to ``updated_at``. Fresh
-        # empty rows use the historical explicit zero sentinel.
-        last_message_at=(conv.last_message_at or 0) if conv.last_message_at_fresh else None,
+        # The rollout gate is captured by the router, not read from the
+        # environment per row. Once enabled, None is the explicit empty-row
+        # sentinel represented as zero; disabled projections stay legacy-null.
+        last_message_at=(conv.last_message_at or 0) if unread_message_watermark_enabled else None,
         title=title_without_closed_marker(conv.title),
         # Collapse per-user pin keys to the canonical bare key for this viewer
         # (never leak another user's pin key), then add the closed marker.

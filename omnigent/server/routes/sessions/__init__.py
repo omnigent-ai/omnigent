@@ -129,6 +129,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
@@ -799,6 +800,7 @@ def create_sessions_router(
     mcp_pool: ServerMcpPool | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
     comment_store: CommentStore | None = None,
+    feature_flags: FeatureFlags | None = None,
     runner_tunnel_tokens: frozenset[str] | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     host_registry: HostRegistry | None = None,
@@ -854,6 +856,10 @@ def create_sessions_router(
         can refresh its comment list when another user or the agent
         mutates comments. ``None`` (e.g. in focused tests or servers
         without comments wired) emits the no-comments shape.
+    :param feature_flags: Immutable deployment release-feature snapshot.
+        When omitted, resolves ``OMNIGENT_FEATURES`` once at router
+        construction. Direct projection helpers fail closed when called
+        without the router's resolved gate.
     :param runner_tunnel_tokens: The server's runner tunnel-token
         allow-list (same value the tunnel router receives), used to
         authorize runner writes to the policy-owned ``cost_control.*``
@@ -876,6 +882,8 @@ def create_sessions_router(
         ``/sessions`` endpoints.
     """
     router = APIRouter()
+    flags = feature_flags or resolve_feature_flags()
+    unread_message_watermark_enabled = flags.enabled(Feature.UNREAD_MESSAGE_WATERMARK)
 
     from omnigent.server.routes.sessions.routes_agent import register_agent_routes
     from omnigent.server.routes.sessions.routes_browser import register_browser_routes
@@ -904,6 +912,7 @@ def create_sessions_router(
         host_registry=host_registry,
         project_store=project_store,
         background_title_coordinator=background_title_coordinator,
+        unread_message_watermark_enabled=unread_message_watermark_enabled,
     )
 
     register_hooks_routes(

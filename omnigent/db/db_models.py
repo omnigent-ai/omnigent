@@ -865,10 +865,8 @@ class SqlConversation(ConversationBase):
         created.
     :param updated_at: Unix epoch seconds when the conversation was
         last updated (item append, title change, etc.).
-    :param last_message_at: Latest visible-message timestamp, or ``None`` when
-        no visible message is recorded. Trusted only for a complete prefix.
-    :param last_message_observed_position: Item prefix covered by the watermark;
-        ``None`` means no authoritative prefix has been established.
+    :param last_message_at: Latest visible-message timestamp, or ``None`` until
+        initialized or when no visible message exists.
     :param title: Human-readable title; empty string when untitled.
     :param parent_conversation_id: For Phase 4 named sub-agents,
         points at the parent conversation. ``None`` for top-level
@@ -899,7 +897,6 @@ class SqlConversation(ConversationBase):
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
     last_message_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    last_message_observed_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     title: Mapped[str] = mapped_column(String(768), nullable=False, server_default="")
     parent_conversation_id: Mapped[str | None] = mapped_column(
         Uuid16(),

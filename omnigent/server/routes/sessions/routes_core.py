@@ -330,6 +330,7 @@ def register_core_routes(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    unread_message_watermark_enabled: bool = False,
 ) -> None:
     """Register the core session routes on router."""
 
@@ -1583,6 +1584,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                unread_message_watermark_enabled=unread_message_watermark_enabled,
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -1714,6 +1716,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                unread_message_watermark_enabled=unread_message_watermark_enabled,
             )
             for conv in convs
         ]

@@ -26,9 +26,8 @@ def upgrade() -> None:
     """Add nullable storage; leave initialization to bounded reconciliation."""
     bind = op.get_bind()
     existing = {column["name"] for column in sa.inspect(bind).get_columns("conversations")}
-    for name in ("last_message_at", "last_message_observed_position"):
-        if name not in existing:
-            op.add_column("conversations", sa.Column(name, sa.Integer(), nullable=True))
+    if "last_message_at" not in existing:
+        op.add_column("conversations", sa.Column("last_message_at", sa.Integer(), nullable=True))
 
 
 def downgrade() -> None:
@@ -36,8 +35,6 @@ def downgrade() -> None:
     existing = {
         column["name"] for column in sa.inspect(op.get_bind()).get_columns("conversations")
     }
-    for name in ("last_message_observed_position", "last_message_at"):
-        if name not in existing:
-            continue
+    if "last_message_at" in existing:
         with op.batch_alter_table("conversations") as batch:
-            batch.drop_column(name)
+            batch.drop_column("last_message_at")
