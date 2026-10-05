@@ -172,11 +172,16 @@ describe("mobile side-chats drawer", () => {
     useChatStore.setState({ ...initialStoreState, sessionHarness: "openai-agents" });
     // Two already-open tabs, so a drawer that opens has something to show.
     writeSessionWorkspaceState("conv_ws", {
+      open: false,
       openSideChats: ["conv_side_a"],
       selectedSideChatId: "conv_side_a",
     });
   });
   afterEach(() => useChatStore.setState(initialStoreState));
+
+  /** The desktop rail. Queried by DOM, not role: a collapsed rail sets
+   *  `aria-hidden`, so it is absent from the accessibility tree. */
+  const rail = () => document.querySelector('aside[aria-label="Workspace"]');
 
   /** Publish the one-shot "a side chat is ready" signal for `parentId`. */
   function signal(parentId: string, childId = "conv_side_a") {
@@ -193,6 +198,8 @@ describe("mobile side-chats drawer", () => {
 
     expect(drawer).toHaveAttribute("data-state", "open");
     expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a");
+    // The same signal reveals the rail, which is what desktop shows it in.
+    expect(rail()).toHaveAttribute("data-state", "open");
   });
 
   it("stays shut for a side chat belonging to another conversation", () => {
@@ -203,6 +210,9 @@ describe("mobile side-chats drawer", () => {
     act(() => signal("conv_other", "conv_side_elsewhere"));
 
     expect(screen.getByTestId("side-chats-panel-drawer")).toHaveAttribute("data-state", "closed");
+    // Nor is the rail revealed — the same gate covers the desktop surface, so a
+    // foreign side chat can't pop open an empty rail over this conversation.
+    expect(rail()).toHaveAttribute("data-state", "closed");
     // The signal is left for its own parent to consume, not dropped.
     expect(useChatStore.getState().sideChatToOpen).toEqual({
       childId: "conv_side_elsewhere",
