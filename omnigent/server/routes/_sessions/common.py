@@ -19,6 +19,11 @@ import httpx
 from pydantic import TypeAdapter
 
 from omnigent._platform import normalize_interactive_shells
+from omnigent._wrapper_labels import (
+    ACP_SUBAGENT_ID_LABEL_KEY,
+    ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+    WRAPPER_LABEL_KEY,
+)
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities.conversation import (
@@ -168,7 +173,7 @@ _EXTERNAL_ACP_SUBAGENT_START_TYPE: str = "external_acp_subagent_start"
 # parent, so leaving the wrapper unset lets the child's harness resolve to the
 # parent's (e.g. ``devin``) and the UI label it accordingly, instead of
 # mislabeling it as another vendor.
-_ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+_ACP_SUBAGENT_ID_LABEL_KEY = ACP_SUBAGENT_ID_LABEL_KEY
 
 
 _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY = "omnigent.acp.subagent_description"
@@ -255,7 +260,7 @@ _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE: str = "external_antigravity_subagent_start"
 
 
-_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "antigravity-native-ui-subagent"
+_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE
 
 
 _ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY = (
@@ -305,13 +310,19 @@ _LAST_TASK_ERROR_CAUSE_LABEL_KEY: str = "omnigent.last_task_error_cause"
 _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediation"
 
 
+# The persisted item a ``runner_rejected_event`` failure refers to, so a client
+# whose POST answer was lost can tell its own refused send from another message's
+# rejection when the snapshot comes back. Empty for failures without an item.
+_LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: str = "omnigent.last_task_error_item_id"
+
+
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 
 _EXTERNAL_SESSION_TODOS_TYPE: str = "external_session_todos"
 
 
-_CLAUDE_NATIVE_WRAPPER_LABEL_KEY = "omnigent.wrapper"
+_CLAUDE_NATIVE_WRAPPER_LABEL_KEY = WRAPPER_LABEL_KEY
 
 
 _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE = CLAUDE_NATIVE_CODING_AGENT.wrapper_label
@@ -397,6 +408,9 @@ _NATIVE_POLICY_NOT_ENFORCED_CODE = "native_policy_not_enforced"
 
 
 _HOST_BOUND_RUNNER_CONNECT_GRACE_S = 10.0
+
+
+_HOST_RECONNECT_GRACE_S = 30.0
 
 
 _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
@@ -1095,6 +1109,7 @@ __all__ = [
     "_HOOK_ELICITATION_ID_RE",
     "_HOST_BOUND_RUNNER_CONNECT_GRACE_S",
     "_HOST_LAUNCH_RESULT_TIMEOUT_S",
+    "_HOST_RECONNECT_GRACE_S",
     "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
     "_HOST_RUNNER_STATUS_TIMEOUT_S",
     "_INTERRUPT_TYPE",

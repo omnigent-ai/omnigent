@@ -121,7 +121,7 @@ function assetLists(context: ImportContext, harness: ImportHarness): AssetList[]
       rows: own(context.plugins).map((plugin) => ({
         id: plugin.id,
         name: plugin.name,
-        metadata: countLabel(plugin.skillCount, "skill"),
+        metadata: countLabel(plugin.skills.length || undefined, "skill"),
       })),
     },
   ];
@@ -154,6 +154,7 @@ function AssetRows({ list }: { list: AssetList }) {
 const UNAVAILABLE_LABEL: Record<InventoryAssetKind, string> = {
   mcps: "MCP servers",
   skills: "skills and plugins",
+  plugins: "plugins",
 };
 
 /** Names the asset kinds the host couldn't report, e.g. "Couldn't read MCP servers". */

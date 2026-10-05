@@ -57,6 +57,12 @@ from omnigent.native._native_post_delivery import (
     post_external_session_status,
     post_may_have_been_delivered,
 )
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    failure_log_attributes,
+    native_failure_id,
+    normalize_failure_context,
+)
 from omnigent.process_logging import harness_stderr_capture_enabled
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.session_event_batch import (
@@ -64,6 +70,7 @@ from omnigent.session_event_batch import (
     encode_session_event_batch,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+from omnigent.version import VERSION
 
 _FORWARDER_STATE_FILE = "transcript_forwarder.json"
 _HOOK_STATE_FILE = "hook_forwarder.json"
@@ -1079,10 +1086,13 @@ async def _forward_claude_diagnostics(
     bridge_dir: Path,
     session_id: str,
     poll_interval_s: float,
-) -> AsyncIterator[None]:
+) -> AsyncIterator[Callable[[], FailureContext]]:
     """Follow diagnostics independently of transcript discovery and HTTP progress."""
     if not harness_stderr_capture_enabled():
-        yield
+        yield lambda: {
+            "diagnostic_capture_enabled": False,
+            "diagnostic_capture_state": "disabled",
+        }
         return
 
     follower = ClaudeDebugLogFollower(bridge_dir)
@@ -1113,7 +1123,7 @@ async def _forward_claude_diagnostics(
 
     task = asyncio.create_task(poll(), name=f"claude-diagnostics-{session_id}")
     try:
-        yield
+        yield follower.health_snapshot
     finally:
         stop.set()
         # Let an in-flight thread finish before closing its descriptor. A second
@@ -1225,7 +1235,7 @@ async def forward_claude_transcript_to_session(
     from omnigent.cli_auth import open_server_client
 
     async with (
-        _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s),
+        _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s) as diagnostic_health,
         open_server_client(
             base_url,
             headers=headers,
@@ -1441,6 +1451,7 @@ async def forward_claude_transcript_to_session(
                             # above, so ``state.current_response_id`` is the active
                             # turn's id.
                             response_id=state.current_response_id,
+                            diagnostic_health=diagnostic_health,
                         )
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
                         # the hook phase so the ``failed`` post always follows
@@ -1995,6 +2006,8 @@ async def _post_external_conversation_item_batch(
     encoded = _encoded_subagent_batch(items)
     if len(encoded) > MAX_SUBAGENT_EVENT_BATCH_BYTES:
         raise ValueError("encoded session event batch exceeds the 5 MiB forwarder limit")
+    for entry in items:
+        _log_transcript_failure(session_id, entry.item)
     response = await client.post(
         f"/v1/sessions/{session_id}/events",
         content=encoded,
@@ -3496,19 +3509,108 @@ def _is_subagent_hook_record(
     subagents share the parent's session id and transcript path, so an
     ``agent_id`` marks them. Fallback: the ``subagents/`` path component.
     """
+    return _subagent_hook_reason(record, parent_claude_session_ids) is not None
+
+
+def _subagent_hook_reason(
+    record: ClaudeHookRecord, parent_claude_session_ids: Collection[str] | None
+) -> str | None:
+    """Explain the existing subagent suppression decision without changing it."""
     if record.agent_id is not None:
-        return True
+        return "native_agent_id"
     # Primary: id not in any id the parent has ever held → subagent.
     if (
         parent_claude_session_ids
         and record.claude_session_id
         and record.claude_session_id not in parent_claude_session_ids
     ):
-        return True
+        return "foreign_native_session_id"
     # Fallback: subagent directory structure.
     if record.transcript_path is None:
-        return False
-    return "subagents" in record.transcript_path.parts
+        return None
+    return "subagent_transcript_path" if "subagents" in record.transcript_path.parts else None
+
+
+def _stop_failure_context(
+    record: ClaudeHookRecord,
+    *,
+    session_id: str,
+    parent_claude_session_ids: Collection[str],
+    diagnostic_health: Callable[[], FailureContext] | None = None,
+) -> FailureContext:
+    """Preserve hook evidence separately from last-assistant display text."""
+    reason = _subagent_hook_reason(record, parent_claude_session_ids)
+    context: dict[str, object] = {
+        **(record.failure_context or {}),
+        "failure_id": native_failure_id(
+            "claude_hook",
+            session_id,
+            record.claude_session_id,
+            record.agent_id,
+            record.event_cursor,
+            record.byte_offset,
+            record.recorded_at,
+        ),
+        "failure_source": "claude_hook",
+        "native_harness": "claude-native",
+        "native_error_category": record.failure_category,
+        "native_session_id": record.claude_session_id,
+        "native_agent_id": record.agent_id,
+        "native_agent_role": "subagent"
+        if reason
+        else (
+            "session_agent" if record.claude_session_id in parent_claude_session_ids else "unknown"
+        ),
+        "failure_decision": "suppressed" if reason else "session_failed",
+        "suppression_reason": reason,
+        "detail_source": (
+            "hook_last_assistant_message"
+            if record.failure_message is not None
+            else "hook_error_category"
+            if record.failure_category is not None
+            else "missing"
+        ),
+        "native_hook_event": record.event_name,
+        "native_hook_cursor": record.event_cursor,
+        "native_hook_offset": record.byte_offset,
+        "native_hook_recorded_at": record.recorded_at,
+        "runner_version": VERSION,
+    }
+    if reason and len(parent_claude_session_ids) == 1:
+        context["native_parent_session_id"] = next(iter(parent_claude_session_ids))
+    if diagnostic_health is not None:
+        try:
+            context.update(diagnostic_health())
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot interrupt forwarding
+            _logger.debug("Claude diagnostic health snapshot failed: %s", type(exc).__name__)
+    return normalize_failure_context(context)
+
+
+def _log_transcript_failure(session_id: str, item: ClaudeTranscriptItem) -> None:
+    """Observe explicit API errors without manufacturing a failed status edge."""
+    if item.failure_context is None:
+        return
+    try:
+        context = {
+            **item.failure_context,
+            "failure_id": native_failure_id("claude_transcript", session_id, item.source_id),
+            "failure_source": "claude_transcript",
+            "detail_source": "explicit_api_error",
+            "failure_decision": "observed",
+            "runner_version": VERSION,
+        }
+        _logger.info(
+            "Claude native API-error evidence observed; session=%s",
+            session_id,
+            extra=debug_event(
+                "native_failure_observed",
+                session_id=session_id,
+                response_id=item.response_id,
+                **failure_log_attributes(context),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - telemetry cannot interrupt forwarding
+        _logger.debug("Claude transcript failure telemetry failed: %s", type(exc).__name__)
 
 
 def _is_fork_hook_record(record: ClaudeHookRecord) -> bool:
@@ -3730,6 +3832,7 @@ async def _forward_available_status_events(
     task_statuses: dict[str, str],
     task_order: list[str],
     response_id: str | None = None,
+    diagnostic_health: Callable[[], FailureContext] | None = None,
 ) -> HookForwardState:
     """
     Forward currently available hook events as ``session.status``.
@@ -3772,6 +3875,7 @@ async def _forward_available_status_events(
         closes the streaming ``activeResponse`` opened by the matching
         turn-start ``running`` edge. ``None`` when no turn id is known
         (the status still posts, just without a turn association).
+    :param diagnostic_health: Latest metadata-only diagnostic follower snapshot.
     :returns: Updated state. On post failure, returns the last
         durable state so successfully-posted statuses are not
         retried and the failing event is retried later.
@@ -3815,6 +3919,29 @@ async def _forward_available_status_events(
         if status is not None and _is_subagent_hook_record(
             record, parent_claude_session_ids=parent_claude_session_ids
         ):
+            if status == "failed":
+                try:
+                    _logger.info(
+                        "Claude native subagent failure suppressed; session=%s",
+                        session_id,
+                        extra=debug_event(
+                            "native_failure_observed",
+                            session_id=session_id,
+                            response_id=response_id,
+                            **failure_log_attributes(
+                                _stop_failure_context(
+                                    record,
+                                    session_id=session_id,
+                                    parent_claude_session_ids=parent_claude_session_ids,
+                                    diagnostic_health=diagnostic_health,
+                                )
+                            ),
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 - telemetry must not affect status
+                    _logger.debug(
+                        "Claude subagent failure telemetry failed: %s", type(exc).__name__
+                    )
             _logger.debug(
                 "Skipping subagent hook status; session=%s event=%s status=%s transcript=%s",
                 session_id,
@@ -4064,6 +4191,17 @@ async def _forward_available_status_events(
         retry_key = f"hook:{record.event_cursor}:{record.byte_offset}:{status}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return durable
+        failure_context: FailureContext | None = None
+        if status == "failed":
+            try:
+                failure_context = _stop_failure_context(
+                    record,
+                    session_id=session_id,
+                    parent_claude_session_ids=parent_claude_session_ids,
+                    diagnostic_health=diagnostic_health,
+                )
+            except Exception as exc:  # noqa: BLE001 - telemetry must not prevent status delivery
+                _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)
         try:
             await post_external_session_status(
                 client,
@@ -4088,6 +4226,7 @@ async def _forward_available_status_events(
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
                 failure_detail=_stop_failure_detail(record) if status == "failed" else None,
+                failure_context=failure_context,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
@@ -4108,6 +4247,7 @@ async def _forward_available_status_events(
                         client,
                         session_id=session_id,
                         reason=f"hook status {status} rejected",
+                        source_id=retry_key,
                         response_id=response_id,
                     )
                 durable = next_durable
@@ -4639,6 +4779,7 @@ async def _forward_available_items(
                     client,
                     session_id=session_id,
                     reason=f"transcript item {item.source_id} rejected",
+                    source_id=retry_key,
                     response_id=current_response_id,
                 )
                 seen.add(item.source_id)
@@ -5163,6 +5304,8 @@ async def _post_external_conversation_item(
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     from omnigent.runtime import telemetry
+
+    _log_transcript_failure(session_id, item)
 
     # The forwarder is the decoupled response path (it tails Claude's
     # transcript and re-POSTs items under its own trace, not the request's).
@@ -6090,6 +6233,7 @@ async def _post_forwarder_failed_status(
     *,
     session_id: str,
     reason: str,
+    source_id: str,
     response_id: str | None = None,
 ) -> None:
     """
@@ -6099,6 +6243,7 @@ async def _post_forwarder_failed_status(
     :param session_id: Omnigent session/conversation id.
     :param reason: Diagnostic reason for the failure event, e.g.
         ``"transcript item item-1 rejected"``.
+    :param source_id: Retry key of the rejected hook or transcript item.
     :param response_id: Active turn's response id, so this ``failed``
         edge closes the streaming ``activeResponse`` for the matching
         turn rather than leaving its tool cards spinning. ``None`` when
@@ -6112,6 +6257,15 @@ async def _post_forwarder_failed_status(
             status="failed",
             output=reason,
             response_id=response_id,
+            failure_context={
+                "failure_id": native_failure_id("forwarder_delivery", session_id, source_id),
+                "failure_source": "forwarder_delivery",
+                "forwarder_source_id": source_id,
+                "native_harness": "claude-native",
+                "detail_source": "forwarder_delivery_error",
+                "failure_decision": "session_failed",
+                "runner_version": VERSION,
+            },
         )
     except httpx.HTTPError:
         _logger.warning(

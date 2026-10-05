@@ -524,7 +524,7 @@ def test_claude_command_resume_binds_session_and_passes_unknown_args(
 
     The wrapper's defensive strip (``_strip_resume_from_claude_args``)
     runs INSIDE ``run_claude_native`` and is tested separately at
-    ``tests/test_claude_native.py::test_strip_resume_from_claude_args_*``.
+    ``tests/harnesses/claude_native/test_claude_native.py::test_strip_resume_from_claude_args_*``.
     This test mocks ``run_claude_native`` so it covers the Click
     parsing seam: ``--resume`` is consumed by Click, the post-``--``
     tokens land in ``claude_args`` raw, and the wrapper takes it from

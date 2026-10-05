@@ -6,7 +6,7 @@ import asyncio
 import logging
 import sys
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -23,7 +23,7 @@ from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.kiro_native import main as kiro_native
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, model_option_routes, subagent_work
 from omnigent.runner.resource_registry import (
     KIRO_NATIVE_TERMINAL_ROLE,
 )
@@ -962,8 +962,12 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
         return spec
 
     def resolve_launch(
-        *, model: str | None, spec: AgentSpec | None = None
+        *,
+        model: str | None,
+        spec: AgentSpec | None = None,
+        terminal_launch_args: Sequence[str] = (),
     ) -> codex.NativeCodexLaunch:
+        del terminal_launch_args
         if case == "invalid-config":
             raise RuntimeError("provider configuration unavailable")
         selected = spec.executor.auth.profile if spec is not None else "default"
@@ -1317,7 +1321,6 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     expiring — the second read joins it instead of restarting it.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
-    from omnigent.runner import app as runner_app_module
     from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
 
     monkeypatch.setattr(
@@ -1356,7 +1359,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.probe_claude_model_options", _slow_probe
     )
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 0.01)
+    monkeypatch.setattr(model_option_routes, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 0.01)
 
     async def _fake_auto_create(
         session_id: str,
@@ -1396,7 +1399,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         # The 0.01s wait above exists only to make the first read time out.
         # Keep it that tight here and a loaded machine answers 503 again
         # before the woken probe is even scheduled.
-        monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 5.0)
+        monkeypatch.setattr(model_option_routes, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 5.0)
         resolved = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
         cached = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
 
@@ -1504,7 +1507,9 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
-    monkeypatch.setattr("omnigent.runner.app._CLAUDE_MODEL_OPTIONS_CACHE_TTL_S", 0.0)
+    monkeypatch.setattr(
+        "omnigent.runner.model_option_routes._CLAUDE_MODEL_OPTIONS_CACHE_TTL_S", 0.0
+    )
     conv_id = "8c1f2e3d4a5b46c7d8e9f0a1b2c3d4e5"
     claude_spec = _harness_spec("claude-native")
 
@@ -2741,7 +2746,6 @@ async def test_stop_session_on_native_subagent_reclaims_work_entry(
     Pre-fix the kill happened but the entry was never reclaimed (the parent could
     hang thinking the worker was still running).
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "c4315225d4a12d320df065ed1ac8baad"
     worker_id = "8dcfd4c64c7a29cddaefa4af686da1da"
@@ -2753,8 +2757,8 @@ async def test_stop_session_on_native_subagent_reclaims_work_entry(
 
     app, _ = await _build_app_for_spec(native_spec)
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=worker_id,
         agent="claude_code",
@@ -2774,8 +2778,8 @@ async def test_stop_session_on_native_subagent_reclaims_work_entry(
             )
             assert stop_resp.status_code == 204, stop_resp.text
     finally:
-        runner_app.unregister_subagent_work(worker_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(worker_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # The killed worker's entry was reclaimed: a single cancelled completion
     # landed in the parent's inbox. If 0, the stop path killed the pane but
@@ -2801,7 +2805,6 @@ async def test_stop_session_on_native_subagent_without_parent_inbox_returns_204(
     204 so Omnigent can finish host-runner teardown and write the deliberate-stop
     label even if parent delivery cannot be confirmed.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "a87dd01585f0c6f0f82f73d74e4124c0"
     worker_id = "d2af8cd6293253c5937d8c7d35fb3d6b"
@@ -2811,7 +2814,7 @@ async def test_stop_session_on_native_subagent_without_parent_inbox_returns_204(
     native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=worker_id,
         agent="claude_code",
@@ -2829,9 +2832,9 @@ async def test_stop_session_on_native_subagent_without_parent_inbox_returns_204(
                 f"/v1/sessions/{worker_id}/events",
                 json={"type": "stop_session"},
             )
-        entry = runner_app.get_subagent_work(worker_id)
+        entry = subagent_work.get_subagent_work(worker_id)
     finally:
-        runner_app.unregister_subagent_work(worker_id)
+        subagent_work.unregister_subagent_work(worker_id)
 
     assert stop_resp.status_code == 204, stop_resp.text
     assert entry is not None
@@ -3068,7 +3071,6 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
     :param caplog: Captures the attributed failure log row.
     """
     caplog.set_level(logging.ERROR, logger="omnigent.runner.app")
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
@@ -3107,15 +3109,15 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
         terminal_registry=terminal_registry,
     )
     resource_registry = app.state.session_resource_registry
-    runner_app._session_inboxes_ref[parent_id] = parent_inbox
-    runner_app.register_child_session(
+    subagent_work._session_inboxes_ref[parent_id] = parent_inbox
+    subagent_work.register_child_session(
         conv_id,
         parent_session_id=parent_id,
         title="worker:main",
         tool="worker",
         session_name="main",
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=conv_id,
         agent="worker",
@@ -3153,9 +3155,9 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         _session_event_queues_ref.pop(parent_id, None)
-        runner_app.unregister_subagent_work(conv_id)
-        runner_app.unregister_child_session(conv_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(conv_id)
+        subagent_work.unregister_child_session(conv_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert terminal_registry.get(conv_id, "worker", "main") is None
     assert {
@@ -3305,7 +3307,6 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
 
     :param tmp_path: Temporary directory for fake terminal paths.
     """
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
@@ -3341,15 +3342,15 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         terminal_registry=terminal_registry,
     )
     resource_registry = app.state.session_resource_registry
-    runner_app._session_inboxes_ref[parent_id] = parent_inbox
-    runner_app.register_child_session(
+    subagent_work._session_inboxes_ref[parent_id] = parent_inbox
+    subagent_work.register_child_session(
         conv_id,
         parent_session_id=parent_id,
         title="worker:main",
         tool="worker",
         session_name="main",
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=conv_id,
         agent="worker",
@@ -3391,9 +3392,9 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         _session_event_queues_ref.pop(parent_id, None)
-        runner_app.unregister_subagent_work(conv_id)
-        runner_app.unregister_child_session(conv_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(conv_id)
+        subagent_work.unregister_child_session(conv_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # The terminal resource is still removed...
     assert terminal_registry.get(conv_id, "worker", "main") is None
@@ -3480,7 +3481,6 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
 
     :param terminal_name: The native terminal that the user quit cleanly.
     """
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
@@ -3523,7 +3523,7 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
             await asyncio.sleep(0)
     finally:
         _session_event_queues_ref.pop(conv_id, None)
-        runner_app.unregister_child_session(conv_id)
+        subagent_work.unregister_child_session(conv_id)
 
     # The terminal resource is removed and a final idle clears the spinner...
     assert {
@@ -3554,7 +3554,6 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
     must detect the banner and treat the exit as a clean stop: publish idle,
     release the harness, and never render a red required_terminal_exited card.
     """
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
@@ -3600,7 +3599,7 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
             await asyncio.sleep(0)
     finally:
         _session_event_queues_ref.pop(conv_id, None)
-        runner_app.unregister_child_session(conv_id)
+        subagent_work.unregister_child_session(conv_id)
 
     # The terminal resource is removed and a final idle clears the spinner.
     assert {
@@ -3635,7 +3634,6 @@ async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
     """
     import logging
 
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
@@ -3677,7 +3675,7 @@ async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
                 await asyncio.sleep(0)
     finally:
         _session_event_queues_ref.pop(conv_id, None)
-        runner_app.unregister_child_session(conv_id)
+        subagent_work.unregister_child_session(conv_id)
 
     assert {
         "type": "session.resource.deleted",
@@ -3707,7 +3705,6 @@ async def test_non_claude_terminal_with_resume_banner_still_fails() -> None:
     The voluntary-exit banner check is scoped to terminal_name=="claude". Another
     CLI printing similar text with exit 0 must not bypass the failure path.
     """
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
@@ -3748,7 +3745,7 @@ async def test_non_claude_terminal_with_resume_banner_still_fails() -> None:
             await asyncio.sleep(0)
     finally:
         _session_event_queues_ref.pop(conv_id, None)
-        runner_app.unregister_child_session(conv_id)
+        subagent_work.unregister_child_session(conv_id)
 
     # Non-claude terminal: the banner does not suppress the failure card.
     assert [

@@ -14,6 +14,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import {
@@ -1069,6 +1070,15 @@ describe("Sidebar session list", () => {
     const sessionsSection = screen.getByText("Sessions").closest("section");
     expect(sessionsSection).not.toBeNull();
 
+    const newSession = within(sessionsSection!).getByRole("link", {
+      name: "New session",
+    });
+    expect(newSession).toHaveAttribute("data-testid", "sessions-new-session");
+    expect(newSession).toHaveAttribute("href", "/");
+    expect(newSession).toHaveAttribute("data-size", "icon-xs");
+    expect(newSession).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    expect(newSession).not.toHaveTextContent("New session");
+
     const selectSessions = within(sessionsSection!).getByRole("button", {
       name: "Select sessions",
     });
@@ -1076,7 +1086,11 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
-    expect(selectSessions.parentElement).toHaveClass(
+    expect(
+      newSession.compareDocumentPosition(selectSessions) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(selectSessions.parentElement).toHaveClass("flex", "gap-0.5");
+    expect(selectSessions.parentElement?.parentElement).toHaveClass(
       "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
@@ -1097,6 +1111,7 @@ describe("Sidebar session list", () => {
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
     expect(within(sessionsSection!).queryByRole("button", { name: "Select sessions" })).toBeNull();
+    expect(within(sessionsSection!).queryByRole("link", { name: "New session" })).toBeNull();
   });
 
   it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
@@ -1122,6 +1137,28 @@ describe("Sidebar session list", () => {
     );
     expect(scheduled.compareDocumentPosition(inbox) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("reveals the new-session shortcut within the row on hover or keyboard focus", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const newSession = screen.getByTestId("new-chat-button");
+    const shortcut = newSession.querySelector<HTMLElement>('[data-slot="shortcut-keys"]');
+
+    expect(newSession).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+N`);
+    expect(
+      Array.from(newSession.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+    ).toEqual([MOD_KEY, ALT_KEY, "N"]);
+    expect(shortcut).toHaveClass(
+      "absolute",
+      "top-1/2",
+      "right-2",
+      "-translate-y-1/2",
+      "opacity-0",
+      "group-focus-visible/new-session:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100",
     );
   });
 

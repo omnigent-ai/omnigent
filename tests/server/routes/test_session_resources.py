@@ -2464,7 +2464,7 @@ async def test_downscaled_upload_reaches_native_resolver(
 
     from omnigent.inner.codex_native_executor import _content_to_input_items
     from omnigent.inner.native_attachments import framework_notices
-    from omnigent.runner.app import _resolve_forwarded_message_content
+    from omnigent.runner.app_support import _resolve_forwarded_message_content
     from omnigent.runtime import content_resolver
 
     monkeypatch.setattr(content_resolver, "IMAGE_MODEL_BUDGET_BYTES", 1024)

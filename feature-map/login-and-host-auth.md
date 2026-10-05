@@ -6,7 +6,9 @@ sign-in flow depends on the server: an accounts server asks for a username and
 password, an OIDC server uses a browser ticket, a header-mode server needs no
 login, and a Databricks-fronted server uses the user's Databricks workspace
 credentials. Databricks credentials come in several kinds, and which one a host
-actually uses decides how it behaves when a token expires.
+actually uses decides how it behaves when a token expires. Applications can
+also embed Omnigent with their own authentication provider; their users should
+be able to write resources without a separate Omnigent account.
 
 ## Sub-features
 
@@ -26,6 +28,11 @@ actually uses decides how it behaves when a token expires.
 - `host-inline-login`: `omnigent host` against a Databricks-fronted server that
   the user is not signed in to runs the login flow first; `--non-interactive`
   fails with the login command instead.
+- `embedded-resource-write`: an identity from a custom `AuthProvider` can
+  create, rename, and reorder its own projects; unauthenticated and other users
+  remain restricted.
+- `embedded-auth-context`: HTTP, WebSocket, and background writes use the
+  app's account mode; an embedded app must not weaken a separate accounts app.
 
 ## How to get to it (user POV)
 
@@ -38,6 +45,11 @@ and `disable`.
 
 **Web:** a harness that needs sign-in is marked in the harness picker, and a
 session whose host went offline offers reconnect (see [sessions](./sessions.md)).
+
+**Embedded API:** construct `create_app(auth_provider=...)` with the embedding
+application's provider and stores, then use its authenticated REST client to
+create a project, rename it, reorder projects, and read the result back.
+This entry point has no CLI login step.
 
 ## Driving it with the repro environment
 
@@ -60,6 +72,20 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 - **`host-lifecycle`:** run `omnigent host --help` and the management commands
   inside cli-setup-verify's sandbox; the system service commands change the
   user's login items, so only run them on a disposable machine.
+- **`embedded-resource-write` (in-process app and real stores):**
+  `tests/server/test_external_account_authority.py::test_custom_auth_project_routes_without_users`.
+  Run with plain `uv run pytest`; it constructs `create_app` with a custom
+  provider and no local users table. It checks project writes and readback,
+  missing identity (401), and another user's denied writes.
+- **`embedded-auth-context` (middleware and store integration):**
+  `tests/server/test_external_account_authority.py::test_external_auth_lifespan_and_websocket_writes`,
+  `tests/server/test_external_account_authority.py::test_account_mode_is_isolated_between_apps`.
+  These use small ASGI apps, not the full server lifecycle: they cover custom,
+  header, OIDC, and no-provider contexts, plus concurrent app isolation.
+  Run the existing `tests/db/test_account_authority.py` and
+  `tests/server/test_account_revocation.py` alongside changes to shared account
+  handling; revocation and saved-identity restrictions must still hold. Report backend
+  skips separately. These are not browser or live identity-provider checks.
 
 ## Gotchas
 
@@ -75,5 +101,11 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   Reproduce with the reporter's proxy settings, including `NO_PROXY`.
 - Header-mode servers, including the verification instance, never show a
   sign-in prompt. A missing prompt there proves nothing about other modes.
+- An embedded app's explicitly supplied provider decides its account mode;
+  the environment's default provider may differ. Test a real resource write
+  through `create_app`, not only identity extraction or a standalone store.
+- External authentication does not grant access to another user's resources.
+  Keep the ownership checks in the journey. Project coverage alone does not
+  establish every resource endpoint or a real host-registration flow.
 - Sign-in can open a browser even with `--no-open`; use `--non-interactive` in
   scripted runs.

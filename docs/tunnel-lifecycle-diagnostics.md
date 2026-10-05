@@ -30,14 +30,23 @@ both ends.
 
 ## Server events (`source = 'server'`)
 
-- `runner_tunnel` with `phase` `connected`, `closed`, `disconnected` or
+- `runner_tunnel` with `phase` `connected`, `disconnected` or
   `error`: `connection_id` from the runner's hello, `connection_age_s`,
   `last_frame_age_s`, `ended_by` (the helper tasks that had finished when the
-  end was observed, comma-separated: `tunnel-receive` for a peer close,
-  `tunnel-ping` for a server-declared timeout, both when the peer's close
-  reply had already arrived), plus the close `code` and `reason` on
-  `disconnected`. `closed` covers a server-initiated end the peer has not yet
-  acknowledged, such as a ping timeout, which previously left no row.
+  end was observed, comma-separated: `tunnel-receive`, `tunnel-ping`, or
+  `tunnel-sender`), plus the close `code` and `reason` on `disconnected`.
+  When a helper reports a peer disconnect, the event preserves its observed
+  code and reason. Otherwise it records the first server-requested close,
+  including retirement, replacement, or ping timeout, without implying that
+  the peer acknowledged it. Concurrent close requests can make the recorded
+  code and reason differ from those sent on the socket. A stale receive or
+  ping helper can end before the sender, so `ended_by` alone does not identify
+  the close cause.
+
+  During a rollout, queries should accept both `closed` (older servers) and
+  `disconnected`, and allow missing close details on older `closed` rows.
+  Update queries that select only `closed` to use `disconnected` after the
+  server upgrade is complete.
 - `runner_ping_timeout`: `runner_id`, `connection_id`, `connection_age_s`,
   `silent_s`.
 - `runner_stream_transport_lost`: one row per outage when the relay first

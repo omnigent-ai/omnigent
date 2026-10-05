@@ -43,36 +43,20 @@ Run::
 
 from __future__ import annotations
 
-import json
-import os
-import secrets
 import shutil
-import signal
-import socket
-import subprocess
-import sys
 import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._helpers.native_session import create_native_session
+from tests._helpers.server_runner import server_runner
 
 # CI shells can carry an egress proxy in the environment; every HTTP call in
 # this test targets 127.0.0.1, so bypass proxy autodetection entirely.
 _http = httpx.Client(trust_env=False)
 
-# The runner imports ``omnigent_client`` / ``omnigent_ui_sdk``; in a worktree
-# they resolve from sdks/, in an installed venv from site-packages.
-_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
 
 # Runner bootstrap: wrap ``_codex_native_launch_config`` so only the FIRST
 # snapshot GET raises the deployed ``httpx.ReadTimeout``; every later attempt
@@ -116,7 +100,6 @@ from omnigent.runner._entry import main
 main()
 """
 
-_HEALTH_TIMEOUT_S = 120.0
 _POLL_S = 1.0
 # Terminal auto-create includes the pre-launch snapshot read + spec resolve, one
 # retried config fetch, then the tmux terminal + forwarder wiring; generous for CI.
@@ -134,109 +117,6 @@ pytestmark = [
 ]
 
 
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
-    """Subprocess env with worktree imports and no proxy in the way.
-
-    :param extra: Overrides/additions applied after the base env.
-    :returns: Environment mapping for ``subprocess.Popen``.
-    """
-    env = {
-        **os.environ,
-        "PYTHONPATH": _PYTHONPATH,
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-    }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    """Best-effort SIGTERM -> SIGKILL teardown for a spawned process."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _wait_http_ok(url: str, deadline: float) -> None:
-    """Poll *url* until it returns 200 or *deadline* (monotonic) passes."""
-    last = "not polled"
-    while time.monotonic() < deadline:
-        try:
-            if _http.get(url, timeout=2.0).status_code == 200:
-                return
-            last = "non-200"
-        except httpx.HTTPError as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        time.sleep(_POLL_S)
-    raise AssertionError(f"{url} never became healthy: {last}")
-
-
-def _create_codex_native_session(base_url: str) -> str:
-    """Create a codex-native wrapper session exactly like ``omnigent codex``.
-
-    Reuses the production spec materializer and stamps the same wrapper /
-    terminal-first labels the CLI writes, so the runner's codex-native
-    auto-bootstrap recognizes the session.
-
-    :param base_url: Spawned server base URL.
-    :returns: The new session/conversation id.
-    """
-    import io
-    import tarfile
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        CODEX_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        yaml_text = _materialize_codex_agent_spec(Path(tmp), model=None).read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("codex-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
-    }
-    create = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"labels": labels})},
-        files={
-            "bundle": (
-                "codex-native-ui.tar.gz",
-                buf.getvalue(),
-                "application/gzip",
-            )
-        },
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    return str(create.json()["session_id"])
-
-
 def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
     tmp_path: Path,
 ) -> None:
@@ -250,84 +130,24 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
 
     :param tmp_path: Per-test temp dir (server DB, runner HOME, workspace).
     """
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    db_path = tmp_path / "chat.db"
-    database_uri = f"sqlite:///{db_path}"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    runner_home = tmp_path / "home"
-    runner_home.mkdir()
     # Pin the runner's process log to a known file so the launch records are
     # readable from the test without globbing ~/.omnigent/logs/runner/.
     runner_log_file = tmp_path / "runner-process.log"
 
-    binding_token = secrets.token_urlsafe(32)
-    from omnigent.runner.identity import token_bound_runner_id
-
-    runner_id = token_bound_runner_id(binding_token)
-
-    server_log = (tmp_path / "server.log").open("w")
-    runner_stdout = (tmp_path / "runner.stdout.log").open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    runner_proc: subprocess.Popen[bytes] | None = None
-
-    def _runner_log() -> str:
-        return runner_log_file.read_text() if runner_log_file.exists() else ""
-
-    try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                database_uri,
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env({"OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}),
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
+    with server_runner(tmp_path) as stack:
+        base_url, runner_id = stack.base_url, stack.runner_id
+        stack.start_runner(
+            bootstrap=_RUNNER_BOOTSTRAP,
+            env={
+                "OMNIGENT_PROCESS_LOG_FILE": str(runner_log_file),
+                "OMNIGENT_LOG_LEVEL": "INFO",
+            },
         )
-        _wait_http_ok(f"{base_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
 
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-c", _RUNNER_BOOTSTRAP],
-            env=_localhost_env(
-                {
-                    "OMNIGENT_RUNNER_ID": runner_id,
-                    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-                    "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                    "RUNNER_SERVER_URL": base_url,
-                    "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
-                    "HOME": str(runner_home),
-                    "OMNIGENT_PROCESS_LOG_FILE": str(runner_log_file),
-                    "OMNIGENT_LOG_LEVEL": "INFO",
-                }
-            ),
-            stdout=runner_stdout,
-            stderr=subprocess.STDOUT,
-        )
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        online = False
-        while time.monotonic() < deadline:
-            try:
-                status = _http.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2.0)
-                if status.status_code == 200 and status.json().get("online") is True:
-                    online = True
-                    break
-            except httpx.HTTPError:
-                pass
-            time.sleep(_POLL_S)
-        assert online, f"runner never came online; log:\n{_runner_log()[-3000:]}"
+        def _runner_log() -> str:
+            return runner_log_file.read_text() if runner_log_file.exists() else ""
 
-        session_id = _create_codex_native_session(base_url)
+        session_id = str(create_native_session(_http, base_url, harness="codex")["session_id"])
 
         # ---- Launch path: binding the runner auto-creates the Codex terminal.
         # The first launch-config fetch times out; the retried read recovers and
@@ -389,8 +209,3 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
             "ensure path logged a start failure despite the launch having recovered; "
             f"runner log:\n{_runner_log()[-4000:]}"
         )
-    finally:
-        _terminate(runner_proc)
-        _terminate(server_proc)
-        server_log.close()
-        runner_stdout.close()

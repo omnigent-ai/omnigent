@@ -379,7 +379,9 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",
-        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch([], model, "test-profile"),
+        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
+            [], model, "test-profile"
+        ),
     )
 
     task = asyncio.create_task(
@@ -540,6 +542,14 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     app_server = _FakeCodexAppServer()
     build_calls: list[dict[str, Any]] = []
+    resolve_calls: list[dict[str, Any]] = []
+    real_resolve_launch = codex_app_mod.resolve_native_codex_launch
+
+    def _recording_resolve_launch(**kwargs: Any) -> codex_app_mod.NativeCodexLaunch:
+        resolve_calls.append(kwargs)
+        return real_resolve_launch(**kwargs)
+
+    monkeypatch.setattr(codex_app_mod, "resolve_native_codex_launch", _recording_resolve_launch)
 
     def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
         """
@@ -734,6 +744,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["trust_project"] is True
     assert build_calls[0]["reconcile_process_registry"] is False
     assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
+    # Persisted pass-through args must reach launch resolution (--profile layering).
+    assert resolve_calls and all(
+        call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
+        for call in resolve_calls
+    )
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "codex-wrapper"
@@ -4073,7 +4088,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",
-        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch(
+        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
             config_overrides=[], model=model, profile=None
         ),
     )
@@ -4322,7 +4337,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",
-        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch(
+        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
             config_overrides=[], model=model, profile=None
         ),
     )
@@ -4501,3 +4516,95 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
     # through to the launch, which translates it to codex's slug downstream.
     assert build_calls, "a servable override was refused as unknown"
     assert build_calls[0]["model"] == override
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launch_fails", [False, True])
+async def test_codex_tui_recovery_preserves_live_control_plane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_fails: bool
+) -> None:
+    """A lost TUI reattaches to the live app-server without cancelling the forwarder.
+
+    The app-server owns thread state and the forwarder owns transcript delivery.
+    Replacing only the TUI must not disturb either — even if the new TUI fails to
+    launch.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.runner.native import orchestration as native
+    from omnigent.runner.native.orchestration import (
+        _CodexNativeLaunchConfig,
+        _CodexNativeTuiLaunch,
+    )
+
+    session_id = "tui-recovery-test-session"
+    server_url = "ws://127.0.0.1:9876"
+    thread_id = "thread-live-1234"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path=server_url,
+            thread_id=thread_id,
+            codex_home=str(tmp_path),
+        ),
+    )
+    config = _CodexNativeLaunchConfig(
+        workspace=tmp_path,
+        policy_server_url="http://localhost",
+        terminal_launch_args=None,
+        model_override=None,
+        external_session_id=thread_id,
+        fork_source_id=None,
+        fork_source_external_id=None,
+        fork_carry_history=False,
+        bypass_sandbox=False,
+    )
+    fake_server = SimpleNamespace(
+        proc=SimpleNamespace(returncode=None),
+        listen_url=server_url,
+        codex_home=tmp_path,
+    )
+    forwarder = asyncio.create_task(asyncio.Event().wait())
+    monkeypatch.setitem(native._AUTO_CODEX_APP_SERVERS, session_id, fake_server)
+    monkeypatch.setitem(native._AUTO_FORWARDER_TASKS, session_id, forwarder)
+    monkeypatch.setattr(native, "_codex_native_launch_config", AsyncMock(return_value=config))
+    cancel = AsyncMock()
+    monkeypatch.setattr(native, "_cancel_auto_forwarder_task", cancel)
+    fake_view = SessionResourceView(
+        id="terminal_codex_main", type="terminal", session_id=session_id, name="Codex"
+    )
+    launch_result = _CodexNativeTuiLaunch(fake_view, None, None)
+    launch = AsyncMock(
+        side_effect=RuntimeError("TUI launch failed") if launch_fails else None,
+        return_value=launch_result,
+    )
+    monkeypatch.setattr(native, "_launch_codex_native_tui", launch)
+    try:
+        if launch_fails:
+            with pytest.raises(RuntimeError, match="TUI launch failed"):
+                await native._auto_create_codex_terminal(
+                    session_id, cast(Any, None), lambda *_: None
+                )
+        else:
+            result = await native._auto_create_codex_terminal(
+                session_id, cast(Any, None), lambda *_: None
+            )
+            assert result is fake_view
+        cancel.assert_not_awaited()
+        assert not forwarder.done()
+        assert native._AUTO_CODEX_APP_SERVERS.get(session_id) is fake_server
+        assert launch.await_count == 1
+        assert launch.await_args is not None
+        assert launch.await_args.kwargs["app_server"] is fake_server
+        assert launch.await_args.kwargs["thread_id"] == thread_id
+    finally:
+        forwarder.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await forwarder
+        native._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        native._AUTO_FORWARDER_TASKS.pop(session_id, None)

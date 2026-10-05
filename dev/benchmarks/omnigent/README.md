@@ -81,7 +81,7 @@ journey needs no server or runner; registering it here rides hook spawn cost
 on the same nightly/release regression comparison as everything else
 (`omnigent/__init__` re-exports lazily so this stays ~interpreter-sized). The
 import-graph side of the guarantee is pinned deterministically by
-`tests/test_claude_native_message_display_hook.py`.
+`tests/harnesses/claude_native/test_claude_native_message_display_hook.py`.
 
 ### Full-turn (runner + mock LLM)
 

@@ -40,6 +40,8 @@ from omnigent.host.frames import (
     HostMcpServersResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPluginsFrame,
+    HostPluginsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -2269,3 +2271,44 @@ def test_list_worktrees_legacy_request_defaults_to_picker_mode() -> None:
     )
     assert isinstance(frame, HostListWorktreesFrame)
     assert frame.for_cleanup is False
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostPluginsFrame("p"),
+        HostPluginsResultFrame("p", "ok", plugins=[{"name": "tool"}]),
+        HostPluginsResultFrame("p", "failed", error="failed"),
+    ],
+)
+def test_plugins_frames_round_trip(frame) -> None:
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_plugins_result_allow_list_and_malformed_payload() -> None:
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.plugins_result",
+                "request_id": "p",
+                "status": "ok",
+                "plugins": [
+                    {
+                        "name": "tool",
+                        "env": {"TOKEN": "secret"},
+                        "installPath": "/private",
+                        "commands": "secret",
+                    }
+                ],
+            }
+        )
+    )
+    assert isinstance(frame, HostPluginsResultFrame)
+    assert frame.plugins == [{"name": "tool"}]
+    malformed = decode_host_frame(
+        json.dumps(
+            {"kind": "host.plugins_result", "request_id": "p", "status": "ok", "plugins": "secret"}
+        )
+    )
+    assert isinstance(malformed, HostPluginsResultFrame)
+    assert malformed.plugins is None

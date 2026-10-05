@@ -222,14 +222,24 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
+# Mid-stream upstream failures the gateway usually recovers from on its own;
+# the runner itself stays healthy, so the turn can be continued by the user.
+_TRANSIENT_UPSTREAM_FRAGMENTS = (
+    "server error mid-response",
+    "connection lost mid-response",
+    "overloaded",
+)
+_TRANSIENT_UPSTREAM_STATUSES = {"500", "502", "503", "504", "529"}
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
-    """Refine a native turn's generic code when its text identifies a rate limit.
+    """Refine a native turn's generic code when its text identifies the cause.
 
-    Also corrects ``codex_reauth_required`` when the message reveals that the
-    real cause is a budget/usage-limit exhaustion (older runners misclassify
-    the gateway's 403 as auth; the server fixes it on deploy).
+    Recognizes rate limits and transient upstream model-gateway failures so
+    the web UI can offer a one-click retry instead of a terminal error. Also
+    corrects ``codex_reauth_required`` when the message reveals that the real
+    cause is a budget/usage-limit exhaustion (older runners misclassify the
+    gateway's 403 as auth; the server fixes it on deploy).
 
     :param code: Existing error code; specific diagnoses are preserved.
     :param message: Native harness error text, from its status or transcript.
@@ -246,6 +256,10 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return code
     if status == "429" or _RATE_LIMIT_ERROR.search(message):
         return "rate_limit_exceeded"
+    if status in _TRANSIENT_UPSTREAM_STATUSES or any(
+        fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS
+    ):
+        return "transient_upstream_error"
     return code
 
 
@@ -280,6 +294,10 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "codex_thread_not_started": "Codex stopped before it could start, so this turn never ran.",
     "native_turn_error": "The agent ran into an error during this turn.",
     "rate_limit_exceeded": "The model's rate limit was reached. You can retry this turn.",
+    "transient_upstream_error": (
+        "The model service hit a temporary error mid-response; retrying usually "
+        "continues the turn."
+    ),
     "budget_exhausted": (
         "The AI gateway refused this turn because a spending budget or usage limit is "
         "exhausted. Contact an admin to raise it, or use a different budget."

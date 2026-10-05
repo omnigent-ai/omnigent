@@ -48,6 +48,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
 # ── Controllable mock LLM ─────────────────────────────
 
@@ -678,6 +679,37 @@ async def client(
 ) -> AsyncIterator[httpx.AsyncClient]:
     """HTTP client with real stores and mock LLM responses."""
     async with _app_client(app, mock_llm, tmp_path) as client:
+        yield client
+
+
+@pytest.fixture()
+def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """App with real policy storage; runtime policy wiring belongs to the client."""
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        policy_store=SqlAlchemyPolicyStore(db_uri),
+    )
+
+
+@pytest_asyncio.fixture()
+async def policy_client(
+    policy_app: FastAPI,
+    mock_llm: ControllableMockClient,
+    tmp_path: Path,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Serve policy routes and expose their database to runtime policy evaluation."""
+    from omnigent.runtime import _globals
+
+    async with _app_client(policy_app, mock_llm, tmp_path) as client:
+        monkeypatch.setattr(_globals, "_policy_store", SqlAlchemyPolicyStore(db_uri))
         yield client
 
 

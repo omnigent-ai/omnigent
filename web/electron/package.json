@@ -71,6 +71,7 @@
       "find/**/*",
       "return-banner/**/*",
       "connection-loading/**/*",
+      "reconnect-overlay/**/*",
       "icons/**/*",
       "overlay/**/*"
     ],

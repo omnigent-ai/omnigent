@@ -1235,7 +1235,7 @@ async def _prepare_codex_terminal(
         # so `omnigent codex` honors the provider selection like the
         # in-process codex harness. Resolved before any rollout synthesis
         # so session_meta can name the provider the launch routes through.
-        _codex_launch = resolve_native_codex_launch(model=model)
+        _codex_launch = resolve_native_codex_launch(model=model, terminal_launch_args=codex_args)
         if thread_id is not None:
             await _ensure_local_codex_resume_rollout(
                 client,

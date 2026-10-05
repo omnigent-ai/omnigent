@@ -1055,6 +1055,11 @@ def _codex_home_config_source_from_env() -> Path:
     )
 
 
+def codex_minimal_config_requested() -> bool:
+    """Whether the worker should omit ambient user tools and instructions."""
+    return os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -1136,11 +1141,7 @@ def _populate_codex_home_config(
         return
 
     if minimal_config is None:
-        minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
+        minimal_config = codex_minimal_config_requested()
     symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
     if not include_credentials:
         symlink_files = tuple(
@@ -1245,6 +1246,9 @@ def materialize_codex_provider_config(
     commands. Persist them in the session-owned ``config.toml`` instead so
     process arguments contain only non-secret routing and behavior overrides.
 
+    Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) stay
+    untouched: Codex rejects unsupported fields there by discarding the whole config.
+
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
     :param retry_policy: Omnigent retry policy to apply through Codex's native
@@ -1290,9 +1294,13 @@ def materialize_codex_provider_config(
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
 
+    from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
         if not isinstance(provider_config, MutableMapping):
+            continue
+        if provider_name in CODEX_BUILTIN_PROVIDERS:
             continue
         if isinstance(provider_config, tomlkit.items.InlineTable):
             inline_provider = tomlkit.inline_table()

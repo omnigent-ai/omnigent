@@ -256,6 +256,7 @@ from omnigent.server.routes._sessions.common import (
     _HOOK_ELICITATION_ID_RE as _HOOK_ELICITATION_ID_RE,
     _HOST_BOUND_RUNNER_CONNECT_GRACE_S as _HOST_BOUND_RUNNER_CONNECT_GRACE_S,
     _HOST_LAUNCH_RESULT_TIMEOUT_S as _HOST_LAUNCH_RESULT_TIMEOUT_S,
+    _HOST_RECONNECT_GRACE_S as _HOST_RECONNECT_GRACE_S,
     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S as _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
     _HOST_RUNNER_STATUS_TIMEOUT_S as _HOST_RUNNER_STATUS_TIMEOUT_S,
     _INTERRUPT_TYPE as _INTERRUPT_TYPE,
@@ -506,7 +507,6 @@ from omnigent.server.routes._sessions.helpers import (
     _require_external_status_forward as _require_external_status_forward,
     _require_host_conn_for_worktree as _require_host_conn_for_worktree,
     _require_permission_mode_forward as _require_permission_mode_forward,
-    _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch_impl,
     _resolve_llm_model as _resolve_llm_model,
     _resolve_skill_meta_text_via_runner as _resolve_skill_meta_text_via_runner,
     _resolve_subagent_spec as _resolve_subagent_spec,
@@ -581,9 +581,6 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.helpers import (
     _publish_sandbox_status_impl as _publish_sandbox_status,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch,
 )
 from omnigent.server.routes._sessions.helpers import (
     _resolve_harness_impl as _resolve_harness,
@@ -662,6 +659,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _spawn_native_approval_popup_forward as _spawn_native_approval_popup_forward,
     _spawn_native_blocked_notice_forward as _spawn_native_blocked_notice_forward,
     _wait_for_host_bound_runner_client as _wait_for_host_bound_runner_client,
+    _wait_for_host_reconnect as _wait_for_host_reconnect,
     _wake_parent_for_blocked_child as _wake_parent_for_blocked_child,
     configure_subagent_block_notifier as configure_subagent_block_notifier,
     ensure_runner_connected as ensure_runner_connected,
@@ -719,7 +717,6 @@ from omnigent.server.schemas import (
     SessionResourceObject,
     SessionResourcePaginatedList,
     SessionResponse,
-    SessionSwitchAgentRequest,
     SkillSummary,
     UpdateSessionRequest,
 )
@@ -768,7 +765,6 @@ if TYPE_CHECKING:
         "_presentation_labels_for_agent",
         "_publish_runner_recovered_status",
         "_publish_sandbox_status",
-        "_reset_runner_resources_after_switch",
         "_resolve_harness",
         "_same_provider_family",
         "_signal_terminal_resolved_harness_elicitation",

@@ -33,6 +33,9 @@ and steers messages while the agent is busy.
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
   and always-steer preference, keeping their element screenshots.
+- `pi-compact`: `/compact` follows the normal queue/Always steer preference.
+  Send now interrupts the turn and compacts. During compaction, queued messages
+  wait in the web queue; immediate sends are retained by the Pi integration.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
@@ -52,13 +55,16 @@ and steers messages while the agent is busy.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
-- Open the Browser tab, navigate to a page, enable Design mode, and click an
-  element. Type an instruction in the floating popup and use Send or Enter.
+- Choose **+ → Browser** to open a Browser soft tab, navigate to a page, enable
+  Design mode, and click an element. Type an instruction in the floating popup
+  and use Send or Enter.
 - Change Settings → Always steer to choose whether busy-session follow-ups
   queue or send immediately. Existing queued messages retain FIFO ordering.
 
 **New-session composer** (landing page, or New session):
 
+- From any page, press ⌘/Ctrl+Alt+N to open and focus a clean new-session
+  composer.
 - Hover the model/effort pill to see the tooltip.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi), and permission mode before the session exists.
@@ -123,8 +129,16 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   Repeat in a fresh session with Always steer on: both entry points send while
   busy and the pointer popup says "Sent to agent." If older messages are already
   queued, new pointer instructions must join them even with Always steer on.
+- **`pi-compact`:** in a Pi session, start a long turn, type `/comp`, press Tab,
+  then Enter. With Always steer off, confirm `/compact` queues; use Send now to
+  interrupt and compact. With Always steer on and an empty queue, Enter should
+  compact immediately. During compaction, send a follow-up in each mode: normal
+  queue mode keeps its queue row; Always steer hands it to Pi. Both should run
+  once after compaction. Repeat the queued flow while viewing another session.
 - **`draft-persistence`:**
   `tests/e2e_ui/chat/test_draft_survives_incoming_messages.py::test_mid_typing_answer_survives_arriving_prompt`
+- **`new-session-hotkey`:**
+  `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
 - **`mobile-labels`, new-session composer:**
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
 

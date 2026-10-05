@@ -100,11 +100,11 @@ from omnigent.stores.conversation_store import (
     FORK_SOURCE_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
-    SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
     CreatedSession,
+    DailyCostState,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -1273,6 +1273,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             ).all()
         return {row.id: row.runner_id for row in rows}
 
+    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+        """Read one session's bound runner and heartbeat from the metadata DB only."""
+        with self._session("get_runner_liveness") as session:
+            row = session.execute(
+                select(
+                    SqlConversationMetadata.runner_id,
+                    SqlConversationMetadata.runner_last_seen,
+                ).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+            ).one_or_none()
+        return (row.runner_id, row.runner_last_seen) if row is not None else None
+
     def get_session_connectivity(
         self, conversation_ids: list[str]
     ) -> dict[str, SessionConnectivity]:
@@ -1688,7 +1702,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE in one
             # transaction (race-safe under SERIALIZABLE / SQLite's
             # single-writer semantics).
-            existing = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            existing = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc),
+            )
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
@@ -1749,7 +1766,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
             stmt = pg_insert(SqlUserDailyCost)
-        stmt = stmt.values(user_id=user_id, day_utc=day_utc, cost_usd=delta_usd, updated_at=now)
+        stmt = stmt.values(
+            user_id=user_id,
+            day_utc=day_utc,
+            cost_usd=delta_usd,
+            updated_at=now,
+        )
         stmt = stmt.on_conflict_do_update(
             index_elements=["workspace_id", "user_id", "day_utc"],
             set_={
@@ -1770,7 +1792,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``(user_id, day_utc)``.
         """
         with self._session("get_daily_cost") as session:
-            row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            row = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc),
+            )
             return float(row.cost_usd) if row is not None else 0.0
 
     def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
@@ -1788,16 +1813,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .where(func.length(SqlUserDailyCost.day_utc) == 10)
             ).scalar_one()
             return float(total or 0.0)
 
     def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+        """
+        List a user's per-day LLM spend for all days ``>= since_day_utc``.
+
+        Filters to daily rows only (``LENGTH(day_utc) = 10``) to exclude
+        period rollup rows (week/month/quarter/year) stored in the same table.
+        """
         with self._session("list_daily_costs") as session:
             rows = session.execute(
                 select(SqlUserDailyCost.day_utc, SqlUserDailyCost.cost_usd)
                 .where(SqlUserDailyCost.workspace_id == current_workspace_id())
                 .where(SqlUserDailyCost.user_id == user_id)
                 .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .where(func.length(SqlUserDailyCost.day_utc) == 10)
                 .order_by(SqlUserDailyCost.day_utc.asc())
             ).all()
             return [(row.day_utc, float(row.cost_usd)) for row in rows]
@@ -1817,7 +1850,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             both ``0.0`` when no row exists for ``(user_id, day_utc)``.
         """
         with self._session("get_daily_cost_state") as session:
-            row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            row = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc),
+            )
             if row is None:
                 return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
             return {
@@ -1879,7 +1915,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 session.execute(stmt)
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
-            existing = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
+            existing = session.get(
+                SqlUserDailyCost,
+                (current_workspace_id(), user_id, day_utc),
+            )
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
@@ -1899,6 +1938,36 @@ class SqlAlchemyConversationStore(ConversationStore):
             "set_daily_ask_approved",
             write,
         )
+
+    def list_daily_cost_states(
+        self,
+        user_id: str,
+        since_day_utc: str,
+    ) -> list[DailyCostState]:
+        """
+        Return daily cost states for a user from since_day_utc onward.
+
+        Reads cost_usd, ask_approved_usd, and day_utc for each day
+        >= since_day_utc. Used by period cost policies to aggregate
+        daily records at read time.
+        """
+        with self._session("list_daily_cost_states") as session:
+            rows = session.execute(
+                select(SqlUserDailyCost)
+                .where(SqlUserDailyCost.workspace_id == current_workspace_id())
+                .where(SqlUserDailyCost.user_id == user_id)
+                .where(SqlUserDailyCost.day_utc >= since_day_utc)
+                .order_by(SqlUserDailyCost.day_utc.asc())
+            ).scalars()
+            return [
+                {
+                    "cost_usd": float(row.cost_usd),
+                    "ask_approved_usd": float(row.ask_approved_usd or 0.0),
+                    "day_utc": row.day_utc,
+                    "user_id": row.user_id,
+                }
+                for row in rows
+            ]
 
     def get_session_owner(self, conversation_id: str, *, owner_only: bool = False) -> str | None:
         """
@@ -4842,160 +4911,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
 
         return _to_conversation(new_conv, fork_meta, fork_labels)
-
-    def switch_conversation_agent(
-        self,
-        conversation_id: str,
-        *,
-        new_agent_id: str,
-        new_agent_name: str,
-        new_agent_bundle_location: str,
-        new_agent_description: str | None,
-        copy_model_settings: bool,
-        carry_history_into_native: bool,
-        presentation_labels: dict[str, str],
-        previous_builtin_id: str | None,
-    ) -> Conversation:
-        """
-        Rebind a session in place to a different (cloned) agent.
-
-        See :meth:`ConversationStore.switch_conversation_agent` for the
-        full contract. The AP binding and label phase commits before the
-        Omnigent agent and metadata phase. Each transaction retries
-        independently because the two databases cannot share a commit.
-
-        :param conversation_id: Session to switch, e.g. ``"conv_abc123"``.
-        :param new_agent_id: Pre-generated id for the new agent row.
-        :param new_agent_name: Name for the new agent row.
-        :param new_agent_bundle_location: Artifact-store key to clone.
-        :param new_agent_description: Optional spec description.
-        :param copy_model_settings: Keep model settings when ``True``,
-            else reset to ``None`` (cross-family switch).
-        :param carry_history_into_native: Stamp / clear
-            :data:`FORK_CARRY_HISTORY_LABEL_KEY`.
-        :param presentation_labels: Target-harness ui/wrapper labels.
-        :param previous_builtin_id: Built-in switched away from, or
-            ``None``.
-        :returns: The updated :class:`Conversation`.
-        :raises LookupError: If *conversation_id* does not exist.
-        """
-        now = now_epoch()
-        drop_keys = (
-            set(_INSTANCE_SCOPED_LABEL_KEYS)
-            | {FORK_SOURCE_LABEL_KEY, FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY}
-            | {UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY}
-            # Always drop the previous-builtin pointer, then re-stamp below
-            # only when this switch supplies one — otherwise a stale pointer
-            # from an earlier switch survives and offers the wrong "switch
-            # back" target (the label is overwritten on each switch).
-            | {SWITCH_PREVIOUS_BUILTIN_LABEL_KEY}
-        )
-        if not carry_history_into_native:
-            drop_keys.add(FORK_CARRY_HISTORY_LABEL_KEY)
-        upserts: dict[str, str] = dict(presentation_labels)
-        if carry_history_into_native:
-            upserts[FORK_CARRY_HISTORY_LABEL_KEY] = "1"
-        if previous_builtin_id is not None:
-            upserts[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] = previous_builtin_id
-        encoded_agent_kind = encode_agent_kind("session")
-
-        # AP holds the conversation (agent binding + overrides) + labels;
-        # Omnigent holds agent+metadata. Read old_agent_id before overwriting it.
-        def update_ap(ap_sess: Session) -> str | None:
-            row_query = select(SqlConversation).where(
-                SqlConversation.workspace_id == current_workspace_id(),
-                SqlConversation.id == conversation_id,
-            )
-            if self._supports_for_update:
-                row_query = row_query.with_for_update()
-            row = ap_sess.scalar(row_query)
-            if row is None:
-                raise LookupError(f"conversation not found: {conversation_id!r}")
-            old_agent_id = row.agent_id
-            row.agent_id = new_agent_id
-            # Keep this deterministic merge beside the locked read so a concurrent
-            # partial override update is not replaced from a stale pre-transaction copy.
-            overrides = _decode_session_overrides(row.session_overrides)
-            if not copy_model_settings:
-                overrides["model_override"] = None
-                overrides["reasoning_effort"] = None
-            # The brain-harness override never survives a rebind.
-            overrides["harness_override"] = None
-            row.session_overrides = _encode_session_overrides(overrides)
-            row.updated_at = now
-
-            existing = _fetch_labels(ap_sess, conversation_id)
-            present_drop = [key for key in drop_keys if key in existing]
-            if present_drop:
-                ap_sess.execute(
-                    delete(SqlConversationLabel).where(
-                        SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.conversation_id == conversation_id,
-                        SqlConversationLabel.key.in_(present_drop),
-                    )
-                )
-            if upserts:
-                _upsert_labels(ap_sess, conversation_id, upserts, now)
-            return old_agent_id
-
-        old_agent_id = run_write_transaction(
-            self._conv_session_immediate,
-            "switch_conversation_agent_conversation",
-            update_ap,
-        )
-
-        # Update agent + metadata on the Omnigent side.
-        def update_metadata(session: Session) -> None:
-            if old_agent_id is not None:
-                old_agent = session.get(SqlAgent, (current_workspace_id(), old_agent_id))
-                if old_agent is not None and old_agent.kind == encode_agent_kind("session"):
-                    session.delete(old_agent)
-                    session.flush()
-
-            session.add(
-                # created_by is left unset. A switch only binds a vetted
-                # built-in, and an unowned session-scoped agent is admin-only to
-                # mutate (see require_agent_owner), so a shared editor who
-                # switches cannot then edit the replacement. Assigning the
-                # session owner here is left to a full switch implementation.
-                SqlAgent(
-                    id=new_agent_id,
-                    created_at=now,
-                    name=new_agent_name,
-                    bundle_location=new_agent_bundle_location,
-                    version=1,
-                    kind=encoded_agent_kind,
-                    description=new_agent_description,
-                )
-            )
-
-            meta_query = select(SqlConversationMetadata).where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.id == conversation_id,
-            )
-            if self._meta_supports_for_update:
-                meta_query = meta_query.with_for_update()
-            meta = session.scalars(meta_query).first()
-            if meta is not None:
-                meta.external_session_id = None
-                state, _ = _decode_session_state(meta.session_state)
-                meta.session_state = _encode_session_state(state, None)
-                # Launch flags are CLI-specific: a switch to a different CLI
-                # (e.g. claude-code → pi) leaves the prior CLI's flags stale —
-                # Claude Code's ``--permission-mode`` makes pi exit 1 at launch.
-                # Clear them so the new CLI launches with its own defaults.
-                meta.terminal_launch_args = None
-
-        run_write_transaction(
-            self._session_immediate,
-            "switch_conversation_agent_metadata",
-            update_metadata,
-        )
-
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise LookupError(f"conversation not found: {conversation_id!r}")
-        return conv
 
     def has_other_live_session_in_workspace(
         self,

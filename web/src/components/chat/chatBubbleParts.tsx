@@ -43,6 +43,7 @@ import {
 } from "@/components/blocks/BlockRenderer";
 import {
   CompactionMarker,
+  CONTINUE_TURN_ERROR_CODES,
   ErrorBanner,
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
@@ -63,7 +64,7 @@ import {
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
+import { continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -966,7 +967,7 @@ function AssistantBubble({
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
       if (!conversationId) throw new Error("Session is not available");
-      if (item.code === "rate_limit_exceeded") {
+      if (CONTINUE_TURN_ERROR_CODES.has(item.code)) {
         // Read a FRESH snapshot of the target conversation at click time: the
         // scoped child's own entry in a side chat, else the root store. The
         // child tab is fixed, so only the main chat guards against the user
@@ -989,7 +990,7 @@ function AssistantBubble({
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
-        await retryRateLimitedTurn(conversationId);
+        await continueFailedTurn(conversationId);
         return;
       }
       const result = await retrySession(conversationId);

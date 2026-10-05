@@ -1496,10 +1496,10 @@ async def _record_subagent_receipt(
     :param work_id: Dispatch id, e.g. ``"subagent_a1b2c3d4e5f6"``.
     :returns: None.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
     error = await _patch_subagent_label(
-        server_client, child_session_id, _runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY, work_id
+        server_client, child_session_id, _subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY, work_id
     )
     if error is not None:
         _logger.warning(
@@ -1615,7 +1615,7 @@ async def _send_to_in_flight_child(
     :param created_by: Human actor that sent the nudge, if known.
     :returns: A JSON handle on success; a descriptive error string otherwise.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
     # Post first — before any register/stamp — so a failure leaves the live
     # turn's tracking untouched (nothing to roll back, never a teardown).
@@ -1637,8 +1637,8 @@ async def _send_to_in_flight_child(
             f"{msg_resp.status_code} {msg_resp.text[:200]}"
         )
 
-    async with _runner_app.in_flight_send_lock(child_session_id):
-        entry = _runner_app.get_subagent_work(child_session_id)
+    async with _subagent_work.in_flight_send_lock(child_session_id):
+        entry = _subagent_work.get_subagent_work(child_session_id)
         if entry is not None and entry.status in ("running", "waiting"):
             # The tracked turn is still active, so the post was buffered into it.
             # Reuse the one entry so its single completion delivers under it;
@@ -1649,15 +1649,15 @@ async def _send_to_in_flight_child(
             # or the in-flight turn was untracked locally (post-restart). Track
             # it freshly so the completion is delivered, directly as "running"
             # (never "launching") to stay clear of the launch-timeout reaper.
-            work_id = _runner_app.new_subagent_work_id()
-            _runner_app.register_child_session(
+            work_id = _subagent_work.new_subagent_work_id()
+            _subagent_work.register_child_session(
                 child_session_id,
                 parent_session_id=conversation_id,
                 title=child_display_title,
                 tool=agent,
                 session_name=title,
             )
-            fresh = _runner_app.register_subagent_work(
+            fresh = _subagent_work.register_subagent_work(
                 parent_session_id=conversation_id,
                 child_session_id=child_session_id,
                 agent=agent,
@@ -1673,7 +1673,7 @@ async def _send_to_in_flight_child(
             stamp_error = await _patch_subagent_label(
                 server_client,
                 child_session_id,
-                _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY,
+                _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY,
                 work_id,
             )
             if stamp_error is not None:
@@ -1925,11 +1925,11 @@ async def _teardown_failed_child(
     :returns: ``None`` when no server cleanup was needed or cleanup
         succeeded, otherwise a parent-visible warning string.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
-    entry = _runner_app.get_subagent_work(child_session_id)
-    _runner_app.unregister_child_session(child_session_id)
-    _runner_app.unregister_subagent_work(child_session_id)
+    entry = _subagent_work.get_subagent_work(child_session_id)
+    _subagent_work.unregister_child_session(child_session_id)
+    _subagent_work.unregister_subagent_work(child_session_id)
     if not created_child:
         if entry is not None:
             await _record_subagent_receipt(server_client, child_session_id, entry.work_id)
@@ -2469,6 +2469,7 @@ async def _execute_subagent_tool(
     """
     # Lazy import to avoid circular dependency at module load.
     from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
     message = _subagent_message_from_args(args)
     if message is None or not message.strip():
@@ -2478,8 +2479,8 @@ async def _execute_subagent_tool(
     if conversation_id is None:
         return "Error: sys_session_send requires conversation_id"
     if session_inbox is not None:
-        _runner_app._session_inboxes_ref.setdefault(conversation_id, session_inbox)
-    elif conversation_id not in _runner_app._session_inboxes_ref:
+        _subagent_work._session_inboxes_ref.setdefault(conversation_id, session_inbox)
+    elif conversation_id not in _subagent_work._session_inboxes_ref:
         return "Error: sys_session_send requires parent session inbox"
 
     try:
@@ -2621,7 +2622,7 @@ async def _execute_subagent_tool(
     assert not isinstance(existing, str)
     created_child = False
     child_wrapper_label: str | None = None
-    work_id = _runner_app.new_subagent_work_id()
+    work_id = _subagent_work.new_subagent_work_id()
     if existing is not None:
         child_session_id = existing.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
@@ -2664,7 +2665,7 @@ async def _execute_subagent_tool(
                 "fresh session with the requested budget."
             )
         child_wrapper_label = _session_wrapper_label(existing)
-        existing_work = _runner_app.get_subagent_work(child_session_id)
+        existing_work = _subagent_work.get_subagent_work(child_session_id)
         if existing_work is not None and existing_work.status == "launching":
             # The child's turn hasn't started streaming yet, so there is no
             # active turn to inject into and a send now could race a parallel
@@ -2717,12 +2718,12 @@ async def _execute_subagent_tool(
                     f"{sub_agent_name!r}: failed to list existing "
                     f"children — {_all_children}"
                 )
-            _runner_app.recover_subagent_ordinals(
+            _subagent_work.recover_subagent_ordinals(
                 conversation_id,
                 str(sub_agent_name),
                 _all_children,
             )
-            ordinal = _runner_app.next_subagent_ordinal(
+            ordinal = _subagent_work.next_subagent_ordinal(
                 conversation_id,
                 str(sub_agent_name),
             )
@@ -2801,7 +2802,7 @@ async def _execute_subagent_tool(
             "parent_session_id": conversation_id,
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
-            "labels": {_runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id},
+            "labels": {_subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id},
         }
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
@@ -2890,7 +2891,7 @@ async def _execute_subagent_tool(
                     and _auto_ordinal
                     and _ordinal_attempt < _max_ordinal_retries
                 ):
-                    ordinal = _runner_app.next_subagent_ordinal(
+                    ordinal = _subagent_work.next_subagent_ordinal(
                         conversation_id,
                         str(sub_agent_name),
                     )
@@ -3021,18 +3022,18 @@ async def _execute_subagent_tool(
         # child keeps its session, so the id is written first. A missing
         # stamp would let the previous turn's receipt mask this turn's result.
         stamp_error = await _patch_subagent_label(
-            server_client, child_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+            server_client, child_session_id, _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
         )
         if stamp_error is not None:
             return f"Error: failed to record sub-agent dispatch: {stamp_error}"
-    _runner_app.register_child_session(
+    _subagent_work.register_child_session(
         child_session_id,
         parent_session_id=conversation_id,
         title=f"{sub_agent_name}:{session_name}",
         tool=sub_agent_name,
         session_name=session_name,
     )
-    _runner_app.register_subagent_work(
+    _subagent_work.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=child_session_id,
         agent=str(sub_agent_name),
@@ -3160,7 +3161,7 @@ async def _send_to_existing_session(
         parent of the target.
     :returns: JSON handle on success; a JSON/text error otherwise.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
     try:
         snap = await server_client.get(f"/v1/sessions/{target_session_id}", timeout=30.0)
@@ -3204,7 +3205,7 @@ async def _send_to_existing_session(
         or "agent"
     )
     instance_title = parsed.title if parsed.title is not None else (display_title or "")
-    existing_work = _runner_app.get_subagent_work(target_session_id)
+    existing_work = _subagent_work.get_subagent_work(target_session_id)
     if existing_work is not None and existing_work.status == "launching":
         # No active turn to inject into yet; a send now could race a parallel
         # start. Ask the caller to retry once it is running.
@@ -3232,20 +3233,20 @@ async def _send_to_existing_session(
             wrapper_label=_session_wrapper_label(snap_data),
             created_by=created_by,
         )
-    work_id = _runner_app.new_subagent_work_id()
+    work_id = _subagent_work.new_subagent_work_id()
     stamp_error = await _patch_subagent_label(
-        server_client, target_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        server_client, target_session_id, _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
     )
     if stamp_error is not None:
         return f"Error: failed to record sub-agent dispatch: {stamp_error}"
-    _runner_app.register_child_session(
+    _subagent_work.register_child_session(
         target_session_id,
         parent_session_id=conversation_id,
         title=display_title or "",
         tool=agent_label,
         session_name=instance_title,
     )
-    _runner_app.register_subagent_work(
+    _subagent_work.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
         agent=agent_label,
@@ -3375,7 +3376,7 @@ def _finalize_created_session(
     :returns: JSON handle ``{conversation_id, kind, agent_id,
         agent_name, title, status}``.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
     from omnigent.server.schemas import SessionCreatedEvent
 
     child_id = data.get("id")
@@ -3384,7 +3385,7 @@ def _finalize_created_session(
     agent_name = data.get("agent_name")
     agent_label = agent_name if isinstance(agent_name, str) and agent_name else "agent"
     label = title if isinstance(title, str) else ""
-    _runner_app.register_child_session(
+    _subagent_work.register_child_session(
         child_id,
         parent_session_id=conversation_id,
         title=label,
@@ -8137,9 +8138,9 @@ async def _cleanup_drained_subagent_work(
     work_id = payload.get("work_id")
     if not isinstance(work_id, str) or not work_id:
         return
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
-    _runner_app.unregister_subagent_work(
+    _subagent_work.unregister_subagent_work(
         child_id,
         work_id=work_id,
         remember_drained_delivery=True,
@@ -8739,7 +8740,7 @@ async def _cancel_subagent_task(
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON cancellation result.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
     from omnigent.runner.native.interrupt import native_cancel_capability
 
     task_id = args.get("task_id") or args.get("handle_id")
@@ -8747,7 +8748,7 @@ async def _cancel_subagent_task(
         return 'Error: sys_cancel_task requires "task_id"'
     if conversation_id is None:
         return "Error: sys_cancel_task requires conversation_id"
-    entry = _runner_app.get_subagent_work(str(task_id))
+    entry = _subagent_work.get_subagent_work(str(task_id))
     if entry is None:
         return await _cancel_evicted_native_subagent(
             str(task_id),
@@ -8790,7 +8791,7 @@ async def _cancel_subagent_task(
             f"Error: sys_cancel_task {event_type} returned {resp.status_code}: {resp.text[:200]}"
         )
 
-    updated = _runner_app.get_subagent_work(str(task_id)) or entry
+    updated = _subagent_work.get_subagent_work(str(task_id)) or entry
     if updated.status == "cancelled":
         return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
     if capability == "best_effort":
