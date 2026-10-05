@@ -949,6 +949,8 @@ function WorkspacePanelImpl({
   // compute is freed, then drop the browser-local tab.
   const closeSideChat = (childId: string) => {
     if (!childId.startsWith("pending:")) void stopSession(childId).catch(() => {});
+    // The tab is gone, so its unsent text/attachments have nowhere to return to.
+    useChatStore.getState().clearSideChatComposer(childId);
     sideChats.close(childId);
   };
 

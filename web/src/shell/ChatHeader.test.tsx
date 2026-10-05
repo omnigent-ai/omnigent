@@ -925,6 +925,23 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(onOpenSideChats).toHaveBeenCalled();
   });
 
+  it("hides the side-chats entry for a harness without side chat", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      mobileMenu: { ...mobileMenu, showSideChats: false },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    expect(screen.queryByRole("menuitem", { name: "Side chats" })).toBeNull();
+  });
+
   it("keeps the rail entries reachable when the session isn't owner-managed", () => {
     // No owner menu and nothing else to offer: the fallback kebab must still
     // render, or the drawers have no mobile entry point at all.

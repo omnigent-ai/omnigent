@@ -28,7 +28,11 @@ import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
-import { useChatStore, ensureConversationStreamed } from "@/store/chatStore";
+import {
+  EMPTY_SIDE_CHAT_COMPOSER,
+  ensureConversationStreamed,
+  useChatStore,
+} from "@/store/chatStore";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useSession } from "@/hooks/useSession";
@@ -346,8 +350,23 @@ function SideChatComposer({
   const send = useChatStore((s) => s.send);
   const queryClient = useQueryClient();
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
-  const [text, setText] = useState("");
-  const [files, setFiles] = useState<File[]>([]);
+  // Unsent text + attachments live in the store, keyed by child id, NOT in
+  // component state: this pane mounts in the desktop rail or the mobile
+  // drawer's portal, so crossing the `md` breakpoint (a phone rotating) moves
+  // it between subtrees and unmounts it, and so does switching rail tabs.
+  const composer = useChatStore((s) => s.sideChatComposers[childId]);
+  const { text, files } = composer ?? EMPTY_SIDE_CHAT_COMPOSER;
+  const updateComposer = useChatStore((s) => s.updateSideChatComposer);
+  const clearComposer = useChatStore((s) => s.clearSideChatComposer);
+  const setText = useCallback(
+    (next: string) => updateComposer(childId, (current) => ({ ...current, text: next })),
+    [childId, updateComposer],
+  );
+  const setFiles = useCallback(
+    (mutate: (current: File[]) => File[]) =>
+      updateComposer(childId, (current) => ({ ...current, files: mutate(current.files) })),
+    [childId, updateComposer],
+  );
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -372,10 +391,13 @@ function SideChatComposer({
   // switching tabs) defers the send instead of discarding the only copy.
   useEffect(() => {
     if (autoSend === undefined || agentId === null) return;
-    // Clear before sending: the store drop re-renders this with no draft, so a
-    // second run of this effect can't send the same question twice.
+    // Re-read and consume the LIVE draft rather than the one captured at
+    // render: a replayed mount effect (React StrictMode in development) would
+    // otherwise send the captured question a second time.
+    const question = useChatStore.getState().sideChatDrafts[childId];
+    if (question === undefined) return;
     clearSideChatDraft(childId);
-    void send(autoSend, agentId, undefined, { pinnedConversationId: childId }).finally(
+    void send(question, agentId, undefined, { pinnedConversationId: childId }).finally(
       refreshLabels,
     );
   }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels]);
@@ -405,9 +427,8 @@ function SideChatComposer({
       return;
     }
     if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
-    setText("");
     const outgoing = files;
-    setFiles([]);
+    clearComposer(childId);
     void send(trimmed, agentId, outgoing.length > 0 ? outgoing : undefined, {
       pinnedConversationId: childId,
     }).finally(refreshLabels);
