@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.imports import (
@@ -310,11 +311,72 @@ async def test_force_import_replaces_existing_session(
         replaced.json()["session_id"]
     )
     assert conversation is not None
-    assert conversation.workspace == "/repo/new"
-    assert conversation.title == "new prompt"
+    # Refreshing a transcript preserves the user's existing session metadata.
+    assert conversation.workspace == "/repo/old"
+    assert conversation.title == "old prompt"
     items = await client.get(f"/v1/sessions/{conversation.id}/items")
     assert items.status_code == 200
     assert [item["content"][0]["text"] for item in items.json()["data"]] == ["new prompt"]
+
+
+@pytest.mark.parametrize("live_status", ["running", "launching"])
+async def test_force_import_rejects_active_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_status: str,
+) -> None:
+    """Replacement must not delete a conversation with a live turn."""
+    from omnigent.server.routes._sessions.common import _session_status_cache
+
+    _seed_claude_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    payload = {
+        "source": "claude",
+        "external_session_id": "claude-force-active",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:old",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old prompt"}],
+                },
+            }
+        ],
+    }
+    created = await client.post("/v1/imports", json=payload)
+    assert created.status_code == 201
+    session_id = created.json()["session_id"]
+    if live_status == "running":
+        store.set_session_live_status(session_id, live_status)
+    else:
+        # ``launching`` is a transient relay/cache status and is not persisted
+        # by the live-status codec, but it still means the runner is starting.
+        _session_status_cache[session_id] = live_status
+
+    payload["force"] = True
+    payload["items"] = [
+        {
+            "type": "message",
+            "response_id": "claude:new",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "new prompt"}],
+            },
+        }
+    ]
+    try:
+        replaced = await client.post("/v1/imports", json=payload)
+    finally:
+        _session_status_cache.pop(session_id, None)
+
+    assert replaced.status_code == 409
+    existing = store.get_conversation(session_id)
+    assert existing is not None
+    assert existing.live_status == ("running" if live_status == "running" else None)
+    assert [item.data.content[0]["text"] for item in store.list_items(session_id).data] == [
+        "old prompt"
+    ]
 
 
 async def test_import_session_rejects_empty_history(client: httpx.AsyncClient) -> None:
@@ -351,6 +413,9 @@ def test_exact_local_import_requires_one_harness_and_trims_id() -> None:
 
     with pytest.raises(ValueError, match="requires a specific harness"):
         LocalImportRequest(host_id="h1", source="all", session_id="exact-id")
+
+    with pytest.raises(ValueError, match="requires an exact session id"):
+        LocalImportRequest(host_id="h1", source="claude", force=True)
 
 
 async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
@@ -613,6 +678,415 @@ async def test_local_import_binds_session_to_importing_host(
     assert unbound is not None
     assert unbound.host_id is None
     assert unbound.workspace is None
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
+async def test_local_import_force_replaces_exact_snapshot(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """Exact local replacement keeps the stable id in both response modes."""
+    from fastapi import FastAPI
+
+    from omnigent.server.routes import imports as imports_module
+
+    agent_id = _seed_claude_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    external_id = "claude-local-force"
+    from omnigent.server.routes.imports import _import_conversation_id
+
+    existing = store.create_conversation(
+        agent_id=agent_id,
+        title="Old snapshot",
+        conversation_id=_import_conversation_id("claude", external_id),
+    )
+    store.set_external_session_id(existing.id, external_id)
+    # A resumed import may retain a runner binding after that runner has died;
+    # cleared liveness makes the safe replacement path explicit.
+    store.replace_runner_id(existing.id, "runner_dead")
+    store.clear_runner_liveness("runner_dead")
+
+    async def _fake_stream(**_kwargs: object):
+        yield {
+            "external_session_id": external_id,
+            "workspace": None,
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "claude:new",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "latest prompt"}],
+                    },
+                }
+            ],
+            "title": "Latest snapshot",
+            "source": "claude",
+        }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=SimpleNamespace(  # type: ignore[arg-type]
+                get_host=lambda _host_id: SimpleNamespace(user_id=None)
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        deduped = await client.post(
+            f"/v1/imports/local{'/stream' if stream else ''}",
+            json={
+                "host_id": host_conn.host_id,
+                "source": "claude",
+                "session_id": external_id,
+            },
+        )
+        assert deduped.status_code == 200
+        if stream:
+            deduped_events = [
+                json.loads(line) for line in deduped.text.splitlines() if line.strip()
+            ]
+            assert not [event for event in deduped_events if event["event"] == "session"]
+            assert deduped_events[-1]["already_imported"] == 1
+        else:
+            assert deduped.json()["already_imported"] == 1
+
+        response = await client.post(
+            f"/v1/imports/local{'/stream' if stream else ''}",
+            json={
+                "host_id": host_conn.host_id,
+                "source": "claude",
+                "session_id": external_id,
+                "force": True,
+            },
+        )
+
+    assert response.status_code == 200
+    if stream:
+        events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+        session_id = next(event["session_id"] for event in events if event["event"] == "session")
+        assert events[-1]["already_imported"] == 0
+    else:
+        body = response.json()
+        session_id = body["sessions"][0]["session_id"]
+        assert body["already_imported"] == 0
+    assert session_id == existing.id
+
+    replaced = store.get_conversation(existing.id)
+    assert replaced is not None
+    assert replaced.title == "Old snapshot"
+    assert [item.data.content[0]["text"] for item in store.list_items(existing.id).data] == [
+        "latest prompt"
+    ]
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
+async def test_local_exact_import_rejects_mismatched_host_identity(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """An exact request never looks up or replaces a host-returned mismatch."""
+    from fastapi import FastAPI
+
+    from omnigent.server.routes import imports as imports_module
+    from omnigent.server.routes.imports import _import_conversation_id
+
+    agent_id = _seed_claude_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    requested_id = "claude-local-exact"
+    other_id = "claude-local-other"
+    for external_id, text in ((requested_id, "requested old"), (other_id, "other old")):
+        conversation = store.create_conversation(
+            agent_id=agent_id,
+            title=text,
+            conversation_id=_import_conversation_id("claude", external_id),
+        )
+        store.set_external_session_id(conversation.id, external_id)
+        store.append(
+            conversation.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="old",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": text}],
+                    ),
+                )
+            ],
+        )
+
+    async def _fake_stream(**_kwargs: object):
+        # Wrong external id, then wrong harness with the requested id. Both
+        # payloads contain valid replacement items, so lookup ordering is the
+        # only thing preventing a mutation.
+        for external_id, source in ((other_id, "claude"), (requested_id, "codex")):
+            yield {
+                "external_session_id": external_id,
+                "workspace": None,
+                "items": [
+                    {
+                        "type": "message",
+                        "response_id": "new",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "must not land"}],
+                        },
+                    }
+                ],
+                "title": "Mismatch",
+                "source": source,
+            }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+    lookup_calls: list[str] = []
+    original_find = store.find_conversation_by_external_session_id
+
+    def _record_lookup(external_id: str):
+        lookup_calls.append(external_id)
+        return original_find(external_id)
+
+    monkeypatch.setattr(store, "find_conversation_by_external_session_id", _record_lookup)
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=SimpleNamespace(  # type: ignore[arg-type]
+                get_host=lambda _host_id: SimpleNamespace(user_id=None)
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/imports/local{'/stream' if stream else ''}",
+            json={
+                "host_id": host_conn.host_id,
+                "source": "claude",
+                "session_id": requested_id,
+                "force": True,
+            },
+        )
+
+    assert response.status_code == 200
+    if stream:
+        events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+        assert [event["event"] for event in events if event["event"] == "session"] == []
+        assert events[-1]["failed"] == 2
+        assert all(event["event"] == "failed" for event in events[:-1])
+    else:
+        body = response.json()
+        assert (body["imported"], body["already_imported"], body["failed"]) == (0, 0, 2)
+    assert lookup_calls == []
+    for external_id, text in ((requested_id, "requested old"), (other_id, "other old")):
+        conversation = store.find_conversation_by_external_session_id(external_id)
+        assert conversation is not None
+        assert [
+            item.data.content[0]["text"] for item in store.list_items(conversation.id).data
+        ] == [text]
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
+async def test_local_import_force_rejects_active_snapshot(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """An active exact snapshot is never deleted by a forced local import."""
+    from fastapi import FastAPI
+
+    from omnigent.server.routes import imports as imports_module
+    from omnigent.server.routes.imports import _import_conversation_id
+
+    agent_id = _seed_claude_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    external_id = "claude-local-force-active"
+    existing = store.create_conversation(
+        agent_id=agent_id,
+        title="Active snapshot",
+        conversation_id=_import_conversation_id("claude", external_id),
+    )
+    store.set_external_session_id(existing.id, external_id)
+    store.set_session_live_status(existing.id, "running")
+
+    async def _fake_stream(**_kwargs: object):
+        yield {
+            "external_session_id": external_id,
+            "workspace": None,
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "claude:new",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "latest prompt"}],
+                    },
+                }
+            ],
+            "title": "Should not replace",
+            "source": "claude",
+        }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=SimpleNamespace(  # type: ignore[arg-type]
+                get_host=lambda _host_id: SimpleNamespace(user_id=None)
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/imports/local{'/stream' if stream else ''}",
+            json={
+                "host_id": host_conn.host_id,
+                "source": "claude",
+                "session_id": external_id,
+                "force": True,
+            },
+        )
+
+    if stream:
+        events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+        assert not [event for event in events if event["event"] == "session"]
+        assert any(event["event"] == "error" for event in events)
+    else:
+        assert response.status_code == 409
+    preserved = store.get_conversation(existing.id)
+    assert preserved is not None
+    assert preserved.title == "Active snapshot"
+    assert preserved.live_status == "running"
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
+async def test_local_import_force_serializes_same_source(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    """Concurrent exact replacements do not race delete/recreate."""
+    from fastapi import FastAPI
+
+    from omnigent.server.routes import imports as imports_module
+    from omnigent.server.routes.imports import _import_conversation_id
+
+    agent_id = _seed_claude_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    external_id = "claude-local-force-race"
+    existing = store.create_conversation(
+        agent_id=agent_id,
+        title="Old snapshot",
+        conversation_id=_import_conversation_id("claude", external_id),
+    )
+    store.set_external_session_id(existing.id, external_id)
+    active = 0
+    maximum_active = 0
+
+    async def _fake_stream(**_kwargs: object):
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        try:
+            await asyncio.sleep(0.05)
+            yield {
+                "external_session_id": external_id,
+                "workspace": None,
+                "items": [
+                    {
+                        "type": "message",
+                        "response_id": "claude:new",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "latest prompt"}],
+                        },
+                    }
+                ],
+                "title": "Latest snapshot",
+                "source": "claude",
+            }
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=SimpleNamespace(  # type: ignore[arg-type]
+                get_host=lambda _host_id: SimpleNamespace(user_id=None)
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = await asyncio.gather(
+            *(
+                client.post(
+                    f"/v1/imports/local{'/stream' if stream else ''}",
+                    json={
+                        "host_id": host_conn.host_id,
+                        "source": "claude",
+                        "session_id": external_id,
+                        "force": True,
+                    },
+                )
+                for _ in range(2)
+            )
+        )
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert maximum_active == 1
+    if stream:
+        session_ids = [
+            next(
+                event["session_id"]
+                for event in (
+                    json.loads(line) for line in response.text.splitlines() if line.strip()
+                )
+                if event["event"] == "session"
+            )
+            for response in responses
+        ]
+    else:
+        session_ids = [response.json()["sessions"][0]["session_id"] for response in responses]
+    assert session_ids == [existing.id, existing.id]
+    assert store.get_conversation(existing.id) is not None
 
 
 async def test_local_import_stream_emits_ndjson_session_then_done(

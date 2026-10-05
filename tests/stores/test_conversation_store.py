@@ -33,10 +33,16 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import (
+    ConversationReplacementConflictError,
+    ConversationReplacementTooLargeError,
+    ConversationStoreOperationUnsupportedError,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 # ── CRUD ──────────────────────────────────────────────
 
@@ -743,6 +749,200 @@ def test_append_encodes_item_data_in_one_batch_call(db_uri: str) -> None:
     assert [item.data.content[0]["text"] for item in persisted] == texts
     read_back = store.list_items(conv.id).data
     assert [item.data.content[0]["text"] for item in read_back] == texts
+
+
+def _replacement_item(text: str, response_id: str = "replacement") -> NewConversationItem:
+    """Build a small validated user item for transcript replacement tests."""
+    return NewConversationItem(
+        type="message",
+        response_id=response_id,
+        data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+    )
+
+
+def _replacement_expectations(
+    store: SqlAlchemyConversationStore, conversation_id: str
+) -> dict[str, object]:
+    """Capture the binding/liveness compare-and-swap inputs for a conversation."""
+    current = store.get_conversation(conversation_id)
+    assert current is not None
+    return {
+        "expected_runner_id": current.runner_id,
+        "expected_runner_last_seen": current.runner_last_seen,
+        "expected_live_status": current.live_status,
+    }
+
+
+def test_replace_imported_transcript_preserves_identity_metadata_and_grants(
+    db_uri: str,
+) -> None:
+    """Replacement changes items only, retaining session identity and ownership."""
+    store = SqlAlchemyConversationStore(db_uri)
+    project_id = "b" * 32
+    conversation = store.create_conversation(title="User title", project_id=project_id)
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="child",
+        parent_conversation_id=conversation.id,
+        agent_id=conversation.agent_id,
+    )
+    store.set_labels(conversation.id, {"keep": "yes"})
+    store.append(conversation.id, [_replacement_item("old")])
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("alice@example.com")
+    permissions.grant("alice@example.com", conversation.id, 4)
+    expectations = _replacement_expectations(store, conversation.id)
+
+    replaced = store.replace_imported_transcript(
+        conversation.id,
+        [_replacement_item("new")],
+        **expectations,
+    )
+
+    assert replaced.id == conversation.id
+    assert replaced.title == "User title"
+    assert replaced.project_id == project_id
+    assert replaced.labels["keep"] == "yes"
+    assert store.get_conversation(child.id) is not None
+    assert permissions.get("alice@example.com", conversation.id) is not None
+    assert [item.data.content[0]["text"] for item in store.list_items(conversation.id).data] == [
+        "new"
+    ]
+
+
+def test_replace_imported_transcript_rolls_back_after_write_failure(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A write failure after deletion leaves the transcript and grants intact."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_module
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(title="User title")
+    store.append(conversation.id, [_replacement_item("old")])
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("alice@example.com")
+    permissions.grant("alice@example.com", conversation.id, 4)
+    expectations = _replacement_expectations(store, conversation.id)
+
+    def fail_fts(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected replacement write failure")
+
+    monkeypatch.setattr(store_module, "insert_fts_bulk", fail_fts)
+    with pytest.raises(RuntimeError, match="injected replacement write failure"):
+        store.replace_imported_transcript(
+            conversation.id,
+            [_replacement_item("new")],
+            **expectations,
+        )
+
+    assert [item.data.content[0]["text"] for item in store.list_items(conversation.id).data] == [
+        "old"
+    ]
+    assert permissions.get("alice@example.com", conversation.id) is not None
+
+
+def test_replace_imported_transcript_encodes_before_mutating(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An encoding failure happens before the replacement transaction opens."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    store.append(conversation.id, [_replacement_item("old")])
+    expectations = _replacement_expectations(store, conversation.id)
+
+    def fail_encode(_data: list[str]) -> list[str]:
+        raise RuntimeError("injected encode failure")
+
+    monkeypatch.setattr(store, "_encode_item_data_batch", fail_encode)
+    with pytest.raises(RuntimeError, match="injected encode failure"):
+        store.replace_imported_transcript(
+            conversation.id,
+            [_replacement_item("new")],
+            **expectations,
+        )
+
+    assert [item.data.content[0]["text"] for item in store.list_items(conversation.id).data] == [
+        "old"
+    ]
+
+
+def test_replace_imported_transcript_rechecks_liveness_at_commit(
+    db_uri: str,
+) -> None:
+    """A live-state change after preparation prevents replacement."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    store.append(conversation.id, [_replacement_item("old")])
+    expectations = _replacement_expectations(store, conversation.id)
+    store.set_session_live_status(conversation.id, "running")
+
+    with pytest.raises(ConversationReplacementConflictError):
+        store.replace_imported_transcript(
+            conversation.id,
+            [_replacement_item("new")],
+            **expectations,
+        )
+    assert [item.data.content[0]["text"] for item in store.list_items(conversation.id).data] == [
+        "old"
+    ]
+
+
+def test_replace_imported_transcript_rejects_oversized_old_and_new(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hard cap is checked before any replacement mutation."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_IMPORTED_TRANSCRIPT_ITEMS", 1)
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    store.append(conversation.id, [_replacement_item("old")])
+    expectations = _replacement_expectations(store, conversation.id)
+
+    with pytest.raises(ConversationReplacementTooLargeError):
+        store.replace_imported_transcript(
+            conversation.id,
+            [_replacement_item("a"), _replacement_item("b")],
+            **expectations,
+        )
+    assert [item.data.content[0]["text"] for item in store.list_items(conversation.id).data] == [
+        "old"
+    ]
+
+    store.append(conversation.id, [_replacement_item("second")])
+    expectations = _replacement_expectations(store, conversation.id)
+    with pytest.raises(ConversationReplacementTooLargeError):
+        store.replace_imported_transcript(
+            conversation.id,
+            [_replacement_item("new")],
+            **expectations,
+        )
+    assert [item.data.content[0]["text"] for item in store.list_items(conversation.id).data] == [
+        "old",
+        "second",
+    ]
+
+
+def test_replace_imported_transcript_rejects_split_store_before_writes(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A split AP/metadata store rejects the operation before mutation."""
+    store = SqlAlchemyConversationStore(
+        db_uri,
+        conversation_storage_location=f"sqlite:///{tmp_path / 'conversation.db'}",
+    )
+    with pytest.raises(ConversationStoreOperationUnsupportedError):
+        store.replace_imported_transcript(
+            "a" * 32,
+            [_replacement_item("new")],
+            expected_runner_id=None,
+            expected_runner_last_seen=None,
+            expected_live_status=None,
+        )
 
 
 def test_append_retry_reuses_prepared_id_and_encoded_payload(

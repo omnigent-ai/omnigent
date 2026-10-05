@@ -574,6 +574,8 @@ function toImportFailureRef(evt: Record<string, unknown>): ImportFailureRef {
  * that machine, not the server); already-imported sessions are skipped.
  * Passing `sessionId` loads that exact session from `source` without listing
  * local history. Otherwise, `source` may be "all" for every harness at once.
+ * `force` is an explicit, exact-session-only replacement of the existing
+ * Omnigent snapshot; it is never used for recent/batch imports.
  *
  * Prefers the streaming endpoint `POST /v1/imports/local/stream` (NDJSON):
  * `onSession` fires for each newly imported session as its frame lands, so
@@ -591,8 +593,18 @@ export async function importLocalSessions(
   limit: number,
   onSession?: (session: ImportedSessionRef) => void,
   sessionId?: string,
+  force = false,
 ): Promise<LocalImportResult> {
-  const body = { host_id: hostId, source, limit, session_id: sessionId };
+  if (force && sessionId === undefined) {
+    throw new Error("Replacement import requires an exact session ID.");
+  }
+  const body = {
+    host_id: hostId,
+    source,
+    limit,
+    session_id: sessionId,
+    force: force ? true : undefined,
+  };
   const res = await authenticatedFetch("/v1/imports/local/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
@@ -602,7 +614,11 @@ export async function importLocalSessions(
   // import so a newer client still works against it.
   if (res.status === 404) {
     if (sessionId !== undefined) {
-      throw new Error("Direct session import is not supported by this server.");
+      throw new Error(
+        force
+          ? "Replacement import is not supported by this server."
+          : "Direct session import is not supported by this server.",
+      );
     }
     return importLocalSessionsBuffered(hostId, source, limit, onSession);
   }
@@ -668,6 +684,9 @@ export async function importLocalSessions(
   }
 
   if (errorMessage !== null) throw new Error(errorMessage);
+  if (force && alreadyImported > 0) {
+    throw new Error("Replacement import is not supported by this server.");
+  }
   return { imported, alreadyImported, failed, sessions, failures };
 }
 

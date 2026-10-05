@@ -7,6 +7,8 @@ import { MemoryRouter } from "react-router-dom";
 import { ImportSessionsPanel } from "./ImportSessionsPanel";
 import { useHosts } from "@/hooks/useHosts";
 import { importLocalSessions } from "@/lib/sessionsApi";
+import { bindConversationForTest } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/lib/sessionsApi", () => ({ importLocalSessions: vi.fn() }));
@@ -56,7 +58,10 @@ beforeEach(() => {
   importLocalSessionsMock.mockReset();
 });
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  conversationRegistry.clear();
+});
 
 describe("ImportSessionsPanel", () => {
   it("prompts to start a host when none are online", () => {
@@ -88,6 +93,7 @@ describe("ImportSessionsPanel", () => {
     });
 
     renderPanel();
+    expect(screen.queryByTestId("import-replace-toggle")).toBeNull();
     fireEvent.click(screen.getByTestId("import-submit"));
 
     await waitFor(() => expect(screen.getByTestId("import-result")).toBeInTheDocument());
@@ -170,6 +176,83 @@ describe("ImportSessionsPanel", () => {
         25,
         expect.any(Function),
         "session-exact",
+      ),
+    );
+  });
+
+  it("reconciles an exact replacement delivered before a stream error", async () => {
+    const partialId = "partial-replacement";
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    bindConversationForTest(partialId);
+    importLocalSessionsMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: partialId, title: "Latest partial snapshot" });
+      throw new Error("host disconnected after replacement");
+    });
+
+    renderPanel();
+    fireEvent.change(screen.getAllByRole("combobox")[1], {
+      target: { value: "session" },
+    });
+    fireEvent.change(screen.getByTestId("import-session-id"), {
+      target: { value: "source-session" },
+    });
+    fireEvent.click(screen.getByTestId("import-replace-toggle"));
+    fireEvent.click(screen.getByTestId("import-submit"));
+    fireEvent.click(await screen.findByTestId("import-replace-confirm"));
+
+    await waitFor(() => expect(screen.getByTestId("import-error")).toBeInTheDocument());
+    expect(screen.getByTestId("import-error")).toHaveTextContent(
+      "host disconnected after replacement",
+    );
+    expect(screen.getByTestId("import-error")).toHaveTextContent("Imported 1 session before");
+    expect(screen.getByTestId(`import-result-link-${partialId}`)).toHaveTextContent(
+      "Latest partial snapshot",
+    );
+    expect(conversationRegistry.peek(partialId)).toBeUndefined();
+  });
+
+  it("requires confirmation before replacing an exact snapshot", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockResolvedValue({
+      imported: 1,
+      alreadyImported: 0,
+      failed: 0,
+      sessions: [{ id: "c1", title: "Latest snapshot" }],
+      failures: [],
+    });
+
+    renderPanel();
+    fireEvent.change(screen.getAllByRole("combobox")[1], {
+      target: { value: "session" },
+    });
+    fireEvent.change(screen.getByTestId("import-session-id"), {
+      target: { value: "session-exact" },
+    });
+    fireEvent.click(screen.getByTestId("import-replace-toggle"));
+    fireEvent.click(screen.getByTestId("import-submit"));
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByText(/Omnigent-only changes.*will be removed/)).toBeInTheDocument();
+    expect(importLocalSessionsMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("import-replace-cancel"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(importLocalSessionsMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("import-submit"));
+    fireEvent.click(await screen.findByTestId("import-replace-confirm"));
+    await waitFor(() =>
+      expect(importLocalSessionsMock).toHaveBeenCalledWith(
+        "host_1",
+        "claude",
+        25,
+        expect.any(Function),
+        "session-exact",
+        true,
       ),
     );
   });

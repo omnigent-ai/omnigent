@@ -21,7 +21,11 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
+from uuid import uuid4
 
+import httpx
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 _HOST_ID = "host_e2e"
@@ -129,6 +133,261 @@ def test_settings_import_panel_imports_one_session_by_id(
         "limit": 25,
         "session_id": "session-exact",
     }
+
+
+@pytest.mark.parametrize("submit_via", ["button", "enter"])
+def test_settings_import_panel_replaces_exact_snapshot_after_confirmation(
+    page: Page,
+    live_server: str,
+    submit_via: str,
+) -> None:
+    """Replacement is opt-in and confirmed from both exact-ID submit gestures."""
+    captured: dict[str, object] = {}
+
+    def _handle_import(route: Route) -> None:
+        captured["post"] = route.request.post_data_json
+        _fulfill_ndjson(
+            route,
+            [
+                {"event": "session", "session_id": "conv_replaced", "title": "Latest"},
+                {"event": "done", "imported": 1, "already_imported": 0, "failed": 0},
+            ],
+        )
+
+    page.route("**/v1/hosts", lambda r: _fulfill_json(r, _HOSTS_BODY))
+    page.route("**/v1/imports/local/stream", _handle_import)
+    page.goto(f"{live_server}/settings/import")
+
+    expect(page.get_by_test_id("import-sessions-panel")).to_be_visible(timeout=30_000)
+    page.get_by_test_id("import-mode-select").click()
+    page.get_by_role("option", name="Session by ID").click()
+    page.get_by_test_id("import-source-select").click()
+    page.get_by_role("option", name="Codex").click()
+    session_input = page.get_by_test_id("import-session-id")
+    session_input.fill("session-exact")
+    page.get_by_test_id("import-replace-toggle").click()
+
+    if submit_via == "button":
+        page.get_by_test_id("import-submit").click()
+    else:
+        session_input.press("Enter")
+    expect(page.get_by_role("dialog")).to_be_visible()
+    expect(page.get_by_role("dialog")).to_contain_text("Omnigent-only changes")
+    assert "post" not in captured
+
+    if submit_via == "button":
+        page.get_by_test_id("import-replace-cancel").click()
+    else:
+        page.keyboard.press("Escape")
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert "post" not in captured
+
+    if submit_via == "button":
+        page.get_by_test_id("import-submit").click()
+    else:
+        session_input.press("Enter")
+    page.get_by_test_id("import-replace-confirm").click()
+    expect(page.get_by_test_id("import-result")).to_contain_text("Imported 1", timeout=30_000)
+    assert captured["post"] == {
+        "host_id": _HOST_ID,
+        "source": "codex",
+        "limit": 25,
+        "session_id": "session-exact",
+        "force": True,
+    }
+
+
+def test_replaced_exact_session_rehydrates_on_same_id_navigation(
+    page: Page,
+    live_server: str,
+    output_path: str,
+) -> None:
+    """Replacement drops retained chat state before navigating back to its id."""
+    external_id = f"e2e-replace-{uuid4().hex}"
+    old_text = "old imported snapshot text"
+    new_text = "new imported snapshot text"
+    imported = httpx.post(
+        f"{live_server}/v1/imports",
+        json={
+            "source": "claude",
+            "external_session_id": external_id,
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "old-response",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": old_text}],
+                    },
+                }
+            ],
+        },
+        timeout=30.0,
+    )
+    imported.raise_for_status()
+    session_id = imported.json()["session_id"]
+
+    def _handle_replacement(route: Route) -> None:
+        replacement = httpx.post(
+            f"{live_server}/v1/imports",
+            json={
+                "source": "claude",
+                "external_session_id": external_id,
+                "force": True,
+                "items": [
+                    {
+                        "type": "message",
+                        "response_id": "new-response",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": new_text}],
+                        },
+                    }
+                ],
+            },
+            timeout=30.0,
+        )
+        replacement.raise_for_status()
+        _fulfill_ndjson(
+            route,
+            [
+                {"event": "session", "session_id": session_id, "title": old_text},
+                {"event": "done", "imported": 1, "already_imported": 0, "failed": 0},
+            ],
+        )
+
+    page.route("**/v1/hosts", lambda r: _fulfill_json(r, _HOSTS_BODY))
+    page.route("**/v1/imports/local/stream", _handle_replacement)
+
+    page.goto(f"{live_server}/c/{session_id}")
+    old_bubble = page.locator('[data-testid="message-bubble"][data-role="user"]').filter(
+        has_text=old_text
+    )
+    expect(old_bubble).to_be_visible(timeout=30_000)
+
+    page.evaluate("(id) => { window.__importDocument = id; }", external_id)
+    page.get_by_role("link", name="Settings", exact=True).click()
+    page.get_by_role("link", name="Import sessions", exact=True).click()
+    expect(page.get_by_test_id("import-sessions-panel")).to_be_visible(timeout=30_000)
+    page.get_by_test_id("import-mode-select").click()
+    page.get_by_role("option", name="Session by ID").click()
+    page.get_by_test_id("import-session-id").fill(external_id)
+    page.get_by_test_id("import-replace-toggle").click()
+    page.get_by_test_id("import-submit").click()
+    page.screenshot(
+        path=str(Path(output_path) / "replace-confirmation.png"), animations="disabled"
+    )
+    page.get_by_test_id("import-replace-confirm").click()
+    expect(page.get_by_test_id("import-result")).to_contain_text("Imported 1", timeout=30_000)
+
+    # The browser keeps the same URL id across this navigation. A stale
+    # conversationRegistry entry would paint ``old_text`` and never fetch the
+    # replacement's new item ids.
+    page.get_by_test_id(f"import-result-link-{session_id}").click()
+    new_bubble = page.locator('[data-testid="message-bubble"][data-role="user"]').filter(
+        has_text=new_text
+    )
+    expect(new_bubble).to_be_visible(timeout=30_000)
+    expect(old_bubble).to_have_count(0)
+    assert page.evaluate("window.__importDocument") == external_id
+    page.screenshot(path=str(Path(output_path) / "replacement-transcript.png"))
+
+
+def test_replaced_exact_session_rehydrates_after_partial_stream_failure(
+    page: Page,
+    live_server: str,
+    output_path: str,
+) -> None:
+    """A committed replacement stays fresh when its import stream fails afterward."""
+    external_id = f"e2e-partial-replace-{uuid4().hex}"
+    old_text = "old partial imported snapshot text"
+    new_text = "new partial imported snapshot text"
+    imported = httpx.post(
+        f"{live_server}/v1/imports",
+        json={
+            "source": "claude",
+            "external_session_id": external_id,
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "old-response",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": old_text}],
+                    },
+                }
+            ],
+        },
+        timeout=30.0,
+    )
+    imported.raise_for_status()
+    session_id = imported.json()["session_id"]
+
+    def _handle_partial_failure(route: Route) -> None:
+        replacement = httpx.post(
+            f"{live_server}/v1/imports",
+            json={
+                "source": "claude",
+                "external_session_id": external_id,
+                "force": True,
+                "items": [
+                    {
+                        "type": "message",
+                        "response_id": "new-response",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": new_text}],
+                        },
+                    }
+                ],
+            },
+            timeout=30.0,
+        )
+        replacement.raise_for_status()
+        _fulfill_ndjson(
+            route,
+            [
+                {"event": "session", "session_id": session_id, "title": new_text},
+                {"event": "error", "message": "host disconnected after replacement"},
+                {"event": "done", "imported": 1, "already_imported": 0, "failed": 0},
+            ],
+        )
+
+    page.route("**/v1/hosts", lambda r: _fulfill_json(r, _HOSTS_BODY))
+    page.route("**/v1/imports/local/stream", _handle_partial_failure)
+
+    page.goto(f"{live_server}/c/{session_id}")
+    old_bubble = page.locator('[data-testid="message-bubble"][data-role="user"]').filter(
+        has_text=old_text
+    )
+    expect(old_bubble).to_be_visible(timeout=30_000)
+
+    page.evaluate("(id) => { window.__importDocument = id; }", external_id)
+    page.get_by_role("link", name="Settings", exact=True).click()
+    page.get_by_role("link", name="Import sessions", exact=True).click()
+    expect(page.get_by_test_id("import-sessions-panel")).to_be_visible(timeout=30_000)
+    page.get_by_test_id("import-mode-select").click()
+    page.get_by_role("option", name="Session by ID").click()
+    page.get_by_test_id("import-session-id").fill(external_id)
+    page.get_by_test_id("import-replace-toggle").click()
+    page.get_by_test_id("import-submit").click()
+    page.get_by_test_id("import-replace-confirm").click()
+    expect(page.get_by_test_id("import-error")).to_contain_text(
+        "host disconnected after replacement", timeout=30_000
+    )
+    expect(page.get_by_test_id(f"import-result-link-{session_id}")).to_be_visible()
+    page.screenshot(path=str(Path(output_path) / "partial-import-result.png"))
+
+    # The replacement committed before the stream error. Same-id navigation
+    # must therefore bind the new transcript even though the API rejected.
+    page.get_by_test_id(f"import-result-link-{session_id}").click()
+    new_bubble = page.locator('[data-testid="message-bubble"][data-role="user"]').filter(
+        has_text=new_text
+    )
+    expect(new_bubble).to_be_visible(timeout=30_000)
+    expect(old_bubble).to_have_count(0)
+    assert page.evaluate("window.__importDocument") == external_id
+    page.screenshot(path=str(Path(output_path) / "partial-replacement-transcript.png"))
 
 
 def test_empty_landing_import_button_opens_settings(

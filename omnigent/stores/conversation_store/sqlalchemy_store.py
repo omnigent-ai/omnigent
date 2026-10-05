@@ -98,15 +98,21 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    IMPORTED_TRANSCRIPT_WRITE_BATCH_SIZE,
+    MAX_IMPORTED_TRANSCRIPT_ITEMS,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
+    ConversationReplacementConflictError,
+    ConversationReplacementTooLargeError,
     ConversationStore,
+    ConversationStoreOperationUnsupportedError,
     CreatedSession,
     DailyCostState,
     SessionConnectivity,
     pinned_label_key,
+    runner_seen_is_fresh,
 )
 from omnigent.stores.conversation_store.overrides import (
     decode_session_overrides as _decode_session_overrides,
@@ -2576,6 +2582,138 @@ class SqlAlchemyConversationStore(ConversationStore):
         return run_write_transaction(
             self._conv_session_immediate,
             "append_conversation_items",
+            write,
+        )
+
+    def replace_imported_transcript(
+        self,
+        conversation_id: str,
+        items: list[NewConversationItem],
+        *,
+        expected_runner_id: str | None,
+        expected_runner_last_seen: int | None,
+        expected_live_status: str | None,
+    ) -> Conversation:
+        """Atomically replace bounded imported items without changing identity.
+
+        The AP and metadata tables must share one engine for the commit-time
+        binding check. Split databases reject before any write because they
+        cannot provide the required cross-table transaction.
+        """
+        if self._conv_engine is not self._engine:
+            raise ConversationStoreOperationUnsupportedError(
+                "atomic imported-transcript replacement requires a shared AP/metadata database"
+            )
+        if len(items) > MAX_IMPORTED_TRANSCRIPT_ITEMS:
+            raise ConversationReplacementTooLargeError(
+                f"imported transcript exceeds {MAX_IMPORTED_TRANSCRIPT_ITEMS} items"
+            )
+
+        now = now_epoch()
+        workspace_id = current_workspace_id()
+        raw_jsons = [
+            strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True))) for item in items
+        ]
+        encoded_data = self._encode_item_data_batch(raw_jsons)
+        prepared_rows: list[tuple[NewConversationItem, dict[str, object], str | None]] = []
+        for item, data in zip(items, encoded_data, strict=True):
+            search = self._item_search_text(item)
+            values: dict[str, object] = {
+                "workspace_id": workspace_id,
+                "id": item.stable_id or generate_item_id(item.type),
+                "conversation_id": conversation_id,
+                "response_id": item.response_id,
+                "created_at": now,
+                "status": encode_item_status("completed"),
+                "type": encode_item_type(item.type),
+                "data": data,
+                "created_by": item.created_by,
+            }
+            if search is not None:
+                values["search_text"] = search
+            prepared_rows.append((item, values, search))
+
+        def write(session: Session) -> Conversation:
+            self._lock_conversation(session, conversation_id)
+            row = session.get(SqlConversation, (workspace_id, conversation_id))
+            if row is None:
+                raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+            meta_query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == workspace_id,
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                meta_query = meta_query.with_for_update()
+            meta = session.scalar(meta_query)
+            if meta is None:
+                raise ConversationNotFoundError(
+                    f"conversation metadata {conversation_id!r} does not exist"
+                )
+            current_status = (
+                decode_session_live_status(meta.live_status)
+                if meta.live_status is not None
+                else None
+            )
+            if (
+                meta.runner_id != expected_runner_id
+                or meta.runner_last_seen != expected_runner_last_seen
+                or current_status != expected_live_status
+            ):
+                raise ConversationReplacementConflictError(
+                    f"conversation {conversation_id!r} changed while replacement was prepared"
+                )
+            if current_status in ("running", "waiting") or (
+                meta.runner_id is not None and runner_seen_is_fresh(meta.runner_last_seen)
+            ):
+                raise ConversationReplacementConflictError(
+                    f"conversation {conversation_id!r} is active"
+                )
+
+            old_item_ids = list(
+                session.execute(
+                    select(SqlConversationItem.id)
+                    .where(
+                        SqlConversationItem.workspace_id == workspace_id,
+                        SqlConversationItem.conversation_id == conversation_id,
+                    )
+                    .order_by(SqlConversationItem.position)
+                    .limit(MAX_IMPORTED_TRANSCRIPT_ITEMS + 1)
+                ).scalars()
+            )
+            if len(old_item_ids) > MAX_IMPORTED_TRANSCRIPT_ITEMS:
+                raise ConversationReplacementTooLargeError(
+                    f"existing transcript exceeds {MAX_IMPORTED_TRANSCRIPT_ITEMS} items"
+                )
+
+            delete_fts_by_conversation_ids(session, [conversation_id])
+            session.execute(
+                delete(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == workspace_id,
+                    SqlConversationItem.conversation_id == conversation_id,
+                )
+            )
+            row.updated_at = now
+            row.next_position = 0
+
+            for start in range(0, len(prepared_rows), IMPORTED_TRANSCRIPT_WRITE_BATCH_SIZE):
+                chunk = prepared_rows[start : start + IMPORTED_TRANSCRIPT_WRITE_BATCH_SIZE]
+                row_values: list[dict[str, object]] = []
+                fts_rows: list[tuple[str, str, str]] = []
+                for offset, (_item, prepared, search) in enumerate(chunk, start=start):
+                    values = dict(prepared)
+                    values["position"] = offset
+                    row_values.append(values)
+                    if search is not None:
+                        fts_rows.append((cast(str, values["id"]), conversation_id, search))
+                if row_values:
+                    session.execute(insert(SqlConversationItem), row_values)
+                insert_fts_bulk(session, fts_rows)
+            row.next_position = len(prepared_rows)
+            return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
+
+        return run_write_transaction(
+            self._conv_session_immediate,
+            "replace_imported_transcript",
             write,
         )
 

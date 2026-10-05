@@ -2,9 +2,20 @@ import { useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useHosts } from "@/hooks/useHosts";
 import { Link } from "@/lib/routing";
+import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
+import { releaseConversation } from "@/store/chatStore";
 import { HostLabel } from "./HostLabel";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -50,6 +61,8 @@ export function ImportSessionsPanel() {
   const [limit, setLimit] = useState(25);
   const [mode, setMode] = useState<ImportMode>("recent");
   const [sessionId, setSessionId] = useState("");
+  const [replaceExisting, setReplaceExisting] = useState(false);
+  const [confirmReplaceOpen, setConfirmReplaceOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   // Sessions appended as their frames stream in, so the list fills live rather
   // than appearing all at once when the import finishes.
@@ -76,7 +89,7 @@ export function ImportSessionsPanel() {
     return () => clearInterval(id);
   }, [submitting, queryClient]);
 
-  async function handleImport(): Promise<void> {
+  async function submitImport(): Promise<void> {
     if (hostId === null) return;
     const exactSessionId = sessionId.trim();
     if (mode === "session" && exactSessionId.length === 0) return;
@@ -84,20 +97,59 @@ export function ImportSessionsPanel() {
     setError(null);
     setResult(null);
     setStreamed([]);
+    const reconciledSessionIds = new Set<string>();
+    const pendingReconciliations: Promise<void>[] = [];
+    const reconcileSession = (id: string): void => {
+      if (reconciledSessionIds.has(id)) return;
+      reconciledSessionIds.add(id);
+      // A replacement commits before its session event. Release synchronously
+      // so a later stream error cannot leave the old chat entry live.
+      if (replaceExisting) releaseConversation(id);
+      pendingReconciliations.push(
+        Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["session", id] }),
+          queryClient.invalidateQueries({ queryKey: sessionItemsQueryKey(id) }),
+        ]).then(
+          () => undefined,
+          () => undefined,
+        ),
+      );
+    };
     try {
-      const onSession = (s: ImportedSessionRef) => setStreamed((prev) => [...prev, s]);
+      const onSession = (s: ImportedSessionRef) => {
+        setStreamed((prev) => [...prev, s]);
+        reconcileSession(s.id);
+      };
       const res =
         mode === "session"
-          ? await importLocalSessions(hostId, source, limit, onSession, exactSessionId)
+          ? replaceExisting
+            ? await importLocalSessions(hostId, source, limit, onSession, exactSessionId, true)
+            : await importLocalSessions(hostId, source, limit, onSession, exactSessionId)
           : await importLocalSessions(hostId, source, limit, onSession);
+      // Keep the cleanup correct for buffered/mock callers that return session
+      // refs without invoking the incremental callback.
+      res.sessions.forEach(({ id }) => reconcileSession(id));
+      await Promise.all(pendingReconciliations);
       setResult(res);
       // Newly imported sessions land in the sidebar list.
       await queryClient.invalidateQueries({ queryKey: ["conversations"] });
     } catch (e) {
+      // The stream may have committed one or more replacements before its
+      // terminal error. Wait for their invalidations while retaining links to
+      // those delivered sessions and surfacing the original stream error.
+      await Promise.all(pendingReconciliations);
       setError(e instanceof Error ? e.message : "Import failed. Try again.");
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function requestImport(): void {
+    if (mode === "session" && replaceExisting) {
+      setConfirmReplaceOpen(true);
+      return;
+    }
+    void submitImport();
   }
 
   if (onlineHosts.length === 0) {
@@ -140,6 +192,7 @@ export function ImportSessionsPanel() {
             const nextMode = value as ImportMode;
             setMode(nextMode);
             if (nextMode === "session" && source === "all") setSource("claude");
+            if (nextMode === "recent") setReplaceExisting(false);
           }}
         >
           <SelectTrigger className="w-full sm:w-56 sm:shrink-0" data-testid="import-mode-select">
@@ -193,24 +246,46 @@ export function ImportSessionsPanel() {
           </Select>
         </div>
       ) : (
-        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-border py-4">
-          <label htmlFor="import-session-id" className="text-ui font-medium">
-            Session ID
-          </label>
-          <Input
-            id="import-session-id"
-            data-testid="import-session-id"
-            value={sessionId}
-            maxLength={128}
-            autoComplete="off"
-            placeholder="Enter a session ID"
-            className="w-full sm:w-56 sm:shrink-0"
-            onChange={(event) => setSessionId(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") void handleImport();
-            }}
-          />
-        </div>
+        <>
+          <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-border py-4">
+            <label htmlFor="import-session-id" className="text-ui font-medium">
+              Session ID
+            </label>
+            <Input
+              id="import-session-id"
+              data-testid="import-session-id"
+              value={sessionId}
+              maxLength={128}
+              autoComplete="off"
+              placeholder="Enter a session ID"
+              className="w-full sm:w-56 sm:shrink-0"
+              onChange={(event) => setSessionId(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  requestImport();
+                }
+              }}
+            />
+          </div>
+          <div className="flex items-start justify-between gap-x-6 gap-y-3 border-b border-border py-4">
+            <div className="flex min-w-0 flex-1 flex-col">
+              <span id="import-replace-label" className="text-ui font-medium">
+                Replace existing snapshot
+              </span>
+              <p className="text-sm text-muted-foreground">
+                Re-import the latest source transcript when this session is already in Omnigent.
+              </p>
+            </div>
+            <Switch
+              aria-labelledby="import-replace-label"
+              checked={replaceExisting}
+              onCheckedChange={setReplaceExisting}
+              data-testid="import-replace-toggle"
+            />
+          </div>
+        </>
       )}
 
       <div className="flex justify-end pt-4">
@@ -218,7 +293,7 @@ export function ImportSessionsPanel() {
           data-testid="import-submit"
           loading={submitting}
           disabled={hostId === null || (mode === "session" && sessionId.trim().length === 0)}
-          onClick={() => void handleImport()}
+          onClick={requestImport}
         >
           Import
         </Button>
@@ -280,7 +355,7 @@ export function ImportSessionsPanel() {
                   size="sm"
                   data-testid="import-retry"
                   loading={submitting}
-                  onClick={() => void handleImport()}
+                  onClick={requestImport}
                 >
                   Retry failed
                 </Button>
@@ -295,8 +370,43 @@ export function ImportSessionsPanel() {
       {error !== null && (
         <p className="text-sm text-destructive" data-testid="import-error">
           {error}
+          {streamed.length > 0 &&
+            ` Imported ${streamed.length} session${streamed.length === 1 ? "" : "s"} before the failure.`}
         </p>
       )}
+      <Dialog open={confirmReplaceOpen} onOpenChange={setConfirmReplaceOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Replace imported snapshot?</DialogTitle>
+            <DialogDescription>
+              This replaces the Omnigent snapshot with the latest source transcript. Any
+              Omnigent-only changes, including messages or edits made here, will be removed. The
+              source session on your machine is not changed.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="import-replace-cancel"
+              onClick={() => setConfirmReplaceOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              data-testid="import-replace-confirm"
+              onClick={() => {
+                setConfirmReplaceOpen(false);
+                void submitImport();
+              }}
+            >
+              Replace snapshot
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

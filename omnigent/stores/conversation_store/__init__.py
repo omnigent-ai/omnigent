@@ -83,6 +83,12 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
 
+# Imported transcript replacement is intentionally finite: the whole swap is
+# one transaction, while INSERT statements are kept smaller for remote SQL
+# backends. Keep this cap aligned with the import route's item validation.
+MAX_IMPORTED_TRANSCRIPT_ITEMS = 100_000
+IMPORTED_TRANSCRIPT_WRITE_BATCH_SIZE = 500
+
 
 class DailyCostState(TypedDict):
     """Daily cost state record returned by list_daily_cost_states.
@@ -313,6 +319,18 @@ class ConversationNotFoundError(Exception):
 
 class ConversationAlreadyExistsError(Exception):
     """Raised when a caller-supplied conversation id is already in use."""
+
+
+class ConversationStoreOperationUnsupportedError(RuntimeError):
+    """Raised when a backend cannot provide a required atomic store operation."""
+
+
+class ConversationReplacementConflictError(RuntimeError):
+    """Raised when a conversation changed while an atomic replacement was prepared."""
+
+
+class ConversationReplacementTooLargeError(ValueError):
+    """Raised when an imported transcript exceeds the replacement hard cap."""
 
 
 class NameAlreadyExistsError(Exception):
@@ -724,6 +742,47 @@ class ConversationStore(ABC):
             with store-assigned IDs and timestamps.
         """
         ...
+
+    def replace_imported_transcript(
+        self,
+        conversation_id: str,
+        items: list[NewConversationItem],
+        *,
+        expected_runner_id: str | None,
+        expected_runner_last_seen: int | None,
+        expected_live_status: str | None,
+    ) -> Conversation:
+        """Atomically replace imported transcript rows while preserving identity.
+
+        Backends that cannot perform the bounded replacement in one managed
+        transaction must reject before mutating any row. The SQLAlchemy store
+        implements this operation; lightweight backends can opt in explicitly.
+
+        :param conversation_id: Stable conversation id to retain.
+        :param items: Validated imported items, capped by the backend.
+        :param expected_runner_id: Runner binding observed before preparation.
+        :param expected_runner_last_seen: Liveness stamp observed before
+            preparation.
+        :param expected_live_status: Relay-observed status observed before
+            preparation.
+        :returns: The preserved conversation row after replacement.
+        :raises ConversationStoreOperationUnsupportedError: When the backend
+            cannot provide the atomic operation.
+        :raises ConversationReplacementConflictError: When binding or liveness
+            changed before the commit.
+        :raises ConversationReplacementTooLargeError: When the old or new
+            transcript exceeds the backend's hard cap.
+        """
+        _ = (
+            conversation_id,
+            items,
+            expected_runner_id,
+            expected_runner_last_seen,
+            expected_live_status,
+        )
+        raise ConversationStoreOperationUnsupportedError(
+            "atomic imported-transcript replacement is not supported by this store"
+        )
 
     @abstractmethod
     def list_conversations(

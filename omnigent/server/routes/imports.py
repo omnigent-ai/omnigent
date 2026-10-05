@@ -9,6 +9,7 @@ import logging
 import secrets
 import threading
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, cast, get_args
 
@@ -28,6 +29,7 @@ from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import resolve_project_session_create
+from omnigent.server.routes._sessions.common import _session_status_cache
 from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
@@ -36,7 +38,14 @@ from omnigent.session_import import (
     title_from_items,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.conversation_store import ConversationAlreadyExistsError
+from omnigent.stores.conversation_store import (
+    MAX_IMPORTED_TRANSCRIPT_ITEMS,
+    ConversationAlreadyExistsError,
+    ConversationReplacementConflictError,
+    ConversationReplacementTooLargeError,
+    ConversationStoreOperationUnsupportedError,
+    runner_seen_is_fresh,
+)
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
@@ -45,7 +54,7 @@ _logger = logging.getLogger(__name__)
 
 # Upper bound on items in one imported session, shared by the CLI-normalized
 # ``/imports`` body and the host-streamed ``/imports/local`` path.
-_MAX_IMPORT_ITEMS = 100_000
+_MAX_IMPORT_ITEMS = MAX_IMPORTED_TRANSCRIPT_ITEMS
 _LOCAL_IMPORT_STREAM_ERROR_MESSAGE = (
     "The local session import stopped unexpectedly. Retry the import or contact an administrator."
 )
@@ -135,6 +144,7 @@ class LocalImportRequest(BaseModel):
     source: ImportSource | Literal["all"]
     limit: int = Field(default=10, ge=1, le=100)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    force: bool = False
 
     @field_validator("session_id")
     @classmethod
@@ -152,6 +162,8 @@ class LocalImportRequest(BaseModel):
         """An id is only meaningful within one harness namespace."""
         if self.session_id is not None and self.source == "all":
             raise ValueError("an exact session import requires a specific harness")
+        if self.force and self.session_id is None:
+            raise ValueError("replacement import requires an exact session id")
         return self
 
 
@@ -205,9 +217,7 @@ class _ImportLockEntry:
     users: int = 0
 
 
-_IMPORT_LOCKS: WorkspaceScopedCache[tuple[ImportSource, str], _ImportLockEntry] = (
-    WorkspaceScopedCache()
-)
+_IMPORT_LOCKS: WorkspaceScopedCache[tuple[str, str], _ImportLockEntry] = WorkspaceScopedCache()
 _IMPORT_LOCKS_GUARD = threading.Lock()
 
 
@@ -222,9 +232,10 @@ def _import_event_line(payload: dict[str, object]) -> bytes:
     return (json.dumps(payload) + "\n").encode()
 
 
-async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[None]:
-    """Serialize concurrent imports for one source identity in this server."""
-    key = (body.source, body.external_session_id)
+@asynccontextmanager
+async def _serialize_import_identity(source: str, external_session_id: str) -> AsyncIterator[None]:
+    """Serialize imports for one source identity in this server."""
+    key = (source, external_session_id)
     with _IMPORT_LOCKS_GUARD:
         entry = _IMPORT_LOCKS.setdefault(key, _ImportLockEntry(lock=asyncio.Lock()))
         entry.users += 1
@@ -236,6 +247,30 @@ async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[
             entry.users -= 1
             if entry.users == 0:
                 _IMPORT_LOCKS.pop(key, None)
+
+
+async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[None]:
+    """Serialize concurrent imports for one source identity in this server."""
+    async with _serialize_import_identity(body.source, body.external_session_id):
+        yield
+
+
+def _ensure_import_replacement_safe(existing: Any) -> None:
+    """Reject replacement while the existing Omnigent session is active.
+
+    Replacement preserves the session id, so a later runner event could write
+    against the newly imported transcript and mix the old turn into it.
+    """
+    status = _session_status_cache.get(existing.id, existing.live_status)
+    runner_live = existing.runner_id is not None and runner_seen_is_fresh(
+        existing.runner_last_seen
+    )
+    if runner_live or status in ("launching", "running", "waiting"):
+        raise OmnigentError(
+            "Cannot replace an active session. Stop and disconnect its runner before importing "
+            "the latest snapshot.",
+            code=ErrorCode.CONFLICT,
+        )
 
 
 # Per-frame (inter-session) timeout: the host streams one session at a time, so
@@ -341,6 +376,64 @@ def create_imports_router(
     """Create the local-session import router."""
     router = APIRouter()
 
+    async def _resolve_import_metadata(
+        *,
+        source: ImportSource,
+        workspace: str | None,
+        user_id: str | None,
+        project_id: str | None,
+        host_id: str | None,
+    ) -> tuple[Any, Any]:
+        """Validate import agent/host/project metadata without mutating it."""
+        native_agent = native_coding_agent_for_harness(f"{source}-native")
+        if native_agent is None:
+            raise OmnigentError(
+                f"Unsupported import source: {source}", code=ErrorCode.INVALID_INPUT
+            )
+        agent_id = builtin_agent_id(native_agent.agent_name)
+        if await asyncio.to_thread(agent_store.get, agent_id) is None:
+            raise OmnigentError(
+                f"The {native_agent.display_name} built-in agent is unavailable",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        create_kwargs: dict[str, Any] = {"agent_id": agent_id}
+        if workspace is not None:
+            create_kwargs["workspace"] = workspace
+            if host_id is not None:
+                create_kwargs["host_id"] = host_id
+        if project_id is not None:
+            create_kwargs["project_id"] = project_id
+        resolved_create = await resolve_project_session_create(
+            body=SessionCreateRequest(**create_kwargs),
+            user_id=user_id,
+            project_store=project_store,
+        )
+        return native_agent, resolved_create
+
+    async def _replace_imported_transcript(
+        existing: Any,
+        items: list[NewConversationItem],
+    ) -> None:
+        """Replace one authorized imported transcript through the store."""
+        try:
+            await asyncio.to_thread(
+                conversation_store.replace_imported_transcript,
+                existing.id,
+                items,
+                expected_runner_id=existing.runner_id,
+                expected_runner_last_seen=existing.runner_last_seen,
+                expected_live_status=existing.live_status,
+            )
+        except ConversationReplacementConflictError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+        except ConversationReplacementTooLargeError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        except ConversationStoreOperationUnsupportedError as exc:
+            raise OmnigentError(
+                "This server cannot atomically replace imported transcripts.",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
+
     async def _persist_import(
         *,
         source: ImportSource,
@@ -365,37 +458,12 @@ def create_imports_router(
         check constraint). Caller handles the already-imported / force decision
         first. Returns ``(conversation id, title)``.
         """
-        native_agent = native_coding_agent_for_harness(f"{source}-native")
-        if native_agent is None:
-            raise OmnigentError(
-                f"Unsupported import source: {source}",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        agent_id = builtin_agent_id(native_agent.agent_name)
-        if await asyncio.to_thread(agent_store.get, agent_id) is None:
-            raise OmnigentError(
-                f"The {native_agent.display_name} built-in agent is unavailable",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        # Route the optional target project through the shared create
-        # chokepoint: ownership (unowned/unknown → 404), default-fill of
-        # omitted fields from the project config, and mismatch warnings all
-        # behave exactly as on POST /v1/sessions. Only genuinely-present
-        # fields go into the body so absent ones stay defaultable.
-        create_kwargs: dict[str, Any] = {"agent_id": agent_id}
-        if workspace is not None:
-            create_kwargs["workspace"] = workspace
-            # The workspace path lives on the importing host; bind there so
-            # resume lands on the right machine. Requires a workspace (check
-            # constraint), so only set host_id when one is recorded.
-            if host_id is not None:
-                create_kwargs["host_id"] = host_id
-        if project_id is not None:
-            create_kwargs["project_id"] = project_id
-        resolved_create = await resolve_project_session_create(
-            body=SessionCreateRequest(**create_kwargs),
+        native_agent, resolved_create = await _resolve_import_metadata(
+            source=source,
+            workspace=workspace,
             user_id=user_id,
-            project_store=project_store,
+            project_id=project_id,
+            host_id=host_id,
         )
         agent_id = resolved_create.body.agent_id
         workspace = resolved_create.body.workspace
@@ -477,9 +545,21 @@ def create_imports_router(
                     f"This {body.source} session already exists as {existing.id}",
                     code=ErrorCode.CONFLICT,
                 )
-
-        if existing is not None:
-            await conversation_store.delete_conversation(existing.id)
+            _ensure_import_replacement_safe(existing)
+            await _resolve_import_metadata(
+                source=body.source,
+                workspace=body.workspace,
+                user_id=user_id,
+                project_id=body.project_id,
+                host_id=body.host_id,
+            )
+            await _replace_imported_transcript(existing, items)
+            response.status_code = 201
+            return ImportSessionResponse(
+                session_id=existing.id,
+                status="imported",
+                item_count=len(items),
+            )
 
         session_id, _title = await _persist_import(
             source=body.source,
@@ -578,9 +658,20 @@ def create_imports_router(
             external_session_id = session.get("external_session_id")
             raw_items = session.get("items")
             session_source = session.get("source")
+            # Exact requests must not let another harness/id reach deduplication
+            # or mutation; check the host identity before looking up a session.
+            if body.session_id is not None and (
+                external_session_id != body.session_id or session_source != body.source
+            ):
+                _fail(
+                    external_session_id,
+                    session_source,
+                    "The host returned a different session than the one requested.",
+                )
+                continue
             source = (
                 session_source
-                if session_source in valid_sources
+                if isinstance(session_source, str) and session_source in valid_sources
                 else (body.source if body.source in valid_sources else None)
             )
             if (
@@ -605,12 +696,51 @@ def create_imports_router(
                 conversation_store.find_conversation_by_external_session_id,
                 external_session_id,
             )
-            if existing is not None:
-                counts["already_imported"] += 1
-                continue
             try:
                 items = [ImportItemInput.model_validate(raw).to_item() for raw in raw_items]
-                workspace = session.get("workspace")
+            except (OmnigentError, ValueError) as exc:
+                reason = (
+                    exc.message
+                    if isinstance(exc, OmnigentError)
+                    else "This session's data could not be imported."
+                )
+                _fail(external_session_id, source, reason)
+                continue
+            session_workspace = session.get("workspace")
+
+            if existing is not None:
+                if not body.force:
+                    counts["already_imported"] += 1
+                    continue
+                if not items:
+                    _fail(
+                        external_session_id,
+                        source,
+                        "An empty transcript cannot replace an existing snapshot.",
+                    )
+                    continue
+                await require_access(
+                    user_id,
+                    existing.id,
+                    LEVEL_OWNER,
+                    permission_store,
+                    conversation_store,
+                )
+                _ensure_import_replacement_safe(existing)
+                await _resolve_import_metadata(
+                    source=source,
+                    workspace=session_workspace if isinstance(session_workspace, str) else None,
+                    user_id=user_id,
+                    project_id=None,
+                    host_id=body.host_id,
+                )
+                await _replace_imported_transcript(existing, items)
+                counts["imported"] += 1
+                yield ImportedSessionRef(session_id=existing.id, title=existing.title)
+                continue
+
+            try:
+                workspace = session_workspace
                 native_title = session.get("title")
                 session_id, title = await _persist_import(
                     source=source,
@@ -650,6 +780,22 @@ def create_imports_router(
             for _ in range(int(stats.get("host_failed", 0))):
                 _fail(None, None, "This session could not be read on the host.")
 
+    async def _import_local_serialized(
+        body: LocalImportRequest,
+        user_id: str | None,
+        host_conn: HostConnection,
+        counts: dict[str, int],
+        failures: list[ImportFailureRef],
+    ) -> AsyncIterator[ImportedSessionRef]:
+        """Serialize exact-session imports through the shared source lock."""
+        if body.session_id is None:
+            async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
+                yield ref
+            return
+        async with _serialize_import_identity(body.source, body.session_id):
+            async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
+                yield ref
+
     @router.post(
         "/imports/local",
         response_model=LocalImportResponse,
@@ -677,7 +823,7 @@ def create_imports_router(
         sessions: list[ImportedSessionRef] = []
         failures: list[ImportFailureRef] = []
         try:
-            async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
+            async for ref in _import_local_serialized(body, user_id, host_conn, counts, failures):
                 sessions.append(ref)
         except OmnigentError as exc:
             error_id, message = _record_local_import_failure()
@@ -731,7 +877,9 @@ def create_imports_router(
             failures: list[ImportFailureRef] = []
             error: tuple[str, str] | None = None
             try:
-                async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
+                async for ref in _import_local_serialized(
+                    body, user_id, host_conn, counts, failures
+                ):
                     yield _import_event_line(
                         {"event": "session", "session_id": ref.session_id, "title": ref.title}
                     )

@@ -21,6 +21,7 @@ import {
   getSessionSlim,
   getSessionUsage,
   importLocalSessions,
+  type ImportedSessionRef,
   interrupt,
   listRunners,
   openSessionStream,
@@ -1766,6 +1767,29 @@ describe("importLocalSessions", () => {
     expect(seen).toEqual(["c1"]);
   });
 
+  it("delivers an exact replacement before surfacing a later stream error", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c_exact", title: "Replaced" }),
+        JSON.stringify({ event: "error", message: "host disconnected after replacement" }),
+        JSON.stringify({ event: "done", imported: 1, already_imported: 0, failed: 0 }),
+      ]),
+    );
+
+    const seen: ImportedSessionRef[] = [];
+    await expect(
+      importLocalSessions(
+        "host_1",
+        "codex",
+        25,
+        (session) => seen.push(session),
+        "source-id",
+        true,
+      ),
+    ).rejects.toThrow("host disconnected after replacement");
+    expect(seen).toEqual([{ id: "c_exact", title: "Replaced" }]);
+  });
+
   it("sends an exact session ID with its harness", async () => {
     fetchMock.mockResolvedValueOnce(
       mockNdjsonResponse([
@@ -1785,6 +1809,33 @@ describe("importLocalSessions", () => {
     });
   });
 
+  it("sends force only for an exact session replacement", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "Replaced" }),
+        JSON.stringify({ event: "done", imported: 1, already_imported: 0, failed: 0 }),
+      ]),
+    );
+
+    await importLocalSessions("host_1", "codex", 25, undefined, "session-exact", true);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_id: "host_1",
+      source: "codex",
+      limit: 25,
+      session_id: "session-exact",
+      force: true,
+    });
+  });
+
+  it("rejects force without an exact session ID", async () => {
+    await expect(
+      importLocalSessions("host_1", "all", 25, undefined, undefined, true),
+    ).rejects.toThrow("Replacement import requires an exact session ID");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("does not fall back to a server that cannot distinguish an exact import", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
 
@@ -1792,6 +1843,27 @@ describe("importLocalSessions", () => {
       importLocalSessions("host_1", "codex", 25, undefined, "session-exact"),
     ).rejects.toThrow("Direct session import is not supported");
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not label an old server's unsupported replacement as replaced", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
+
+    await expect(
+      importLocalSessions("host_1", "codex", 25, undefined, "session-exact", true),
+    ).rejects.toThrow("Replacement import is not supported");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a server that silently ignores replacement force", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "done", imported: 0, already_imported: 1, failed: 0 }),
+      ]),
+    );
+
+    await expect(
+      importLocalSessions("host_1", "codex", 25, undefined, "session-exact", true),
+    ).rejects.toThrow("Replacement import is not supported");
   });
 
   it("falls back to the buffered endpoint when the stream endpoint 404s", async () => {
