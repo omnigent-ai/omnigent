@@ -30,6 +30,7 @@ import {
   stopSession,
   updateSession,
 } from "./sessionsApi";
+import { ACTIVITY_AGE_HEADER, recordActivity, resetActivityForTests } from "./activity";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
 import { getSessionHost, setSessionHost } from "./sessionHost";
 
@@ -1490,6 +1491,17 @@ describe("openSessionStream", () => {
     expect(url).toBe("/v1/sessions/conv_abc/stream");
     expect(new Headers(init.headers).get("Accept")).toBe("text/event-stream");
     expect(init.signal).toBe(signal);
+  });
+
+  it("carries the activity age, so only real interaction can renew the session", async () => {
+    recordActivity();
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+
+    await openSessionStream("conv_abc", new AbortController().signal);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(new Headers(init.headers).get(ACTIVITY_AGE_HEADER)).toMatch(/^\d+$/);
+    resetActivityForTests();
   });
 });
 

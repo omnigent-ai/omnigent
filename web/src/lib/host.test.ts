@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ACTIVITY_AGE_HEADER, recordActivity, resetActivityForTests } from "./activity";
 import { getCliServerUrl, hostFetch, resolveWebSocketUrl, setOmnigentHostConfig } from "./host";
 
 afterEach(() => {
@@ -40,7 +41,20 @@ describe("hostFetch base path", () => {
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(null, { status: 200 }));
     await hostFetch("/v1/sessions");
-    expect(fetchSpy).toHaveBeenCalledWith("/proxy/6767/v1/sessions", undefined);
+    expect(fetchSpy).toHaveBeenCalledWith("/proxy/6767/v1/sessions", expect.any(Object));
+  });
+
+  it("attaches the activity age to standalone requests", async () => {
+    recordActivity();
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    await hostFetch("/v1/sessions", { headers: { Accept: "application/json" } });
+    const init = fetchSpy.mock.calls[0][1] as RequestInit;
+    const headers = new Headers(init.headers);
+    expect(headers.get(ACTIVITY_AGE_HEADER)).toMatch(/^\d+$/);
+    expect(headers.get("Accept")).toBe("application/json");
+    resetActivityForTests();
   });
 
   it("does not rebase when embedded (a host fetcher is installed)", async () => {
