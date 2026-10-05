@@ -14,7 +14,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
-from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
 from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
 from omnigent.util.session_lifecycle import is_session_closed
 
@@ -293,6 +293,8 @@ async def restore_active_children(
                         generation=generation,
                         store_slots=store_slots,
                     )
+                    if is_session_agent_removed(response):
+                        return False  # nothing to restore; already logged as expected
                     response.raise_for_status()
                 initializer.require_generation(runner_id, client, generation)
                 _ensure_runner_relay(child.id, parent.runner_id, client, store, conversation=child)

@@ -7717,11 +7717,15 @@ def _native_terminal_start_error_response(
     :param exc: Exception raised by terminal auto-create.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :param session_id: Session whose terminal ensure failed.
-    :returns: HTTP 500 response with an ``error`` object carrying the
-        real failure message.
+    :returns: HTTP 410 when the session's agent was removed (the status of
+        ``session_agent_missing``), else 500, with an ``error`` object
+        carrying the real failure message.
     """
+    status_code = 500
+    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
+        status_code = exc.http_status
     return JSONResponse(
-        status_code=500,
+        status_code=status_code,
         content={
             "error": _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
         },

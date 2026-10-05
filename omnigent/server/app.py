@@ -119,7 +119,7 @@ from omnigent.server.routes.sessions import (
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
-from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -1541,6 +1541,7 @@ def create_app(
         server_version=_server_version(),
         conversation_store=conversation_store,
         file_store=file_store,
+        agent_store=agent_store,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -3670,6 +3671,9 @@ def create_app(
                             generation=connection.generation,
                             store_slots=store_slots,
                         )
+                        # A removed agent was already logged as expected.
+                        if is_session_agent_removed(response):
+                            return
                         response.raise_for_status()
                     prefetch_session_routing_catalogs(conv.id, conv, client)
                     # Clear only a root's disconnect failure, after successful init.

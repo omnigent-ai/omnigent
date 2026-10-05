@@ -291,6 +291,23 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
         assert "(cause ReadTimeout)" in payload["message"]
 
 
+def test_ensure_response_for_a_removed_agent_is_410() -> None:
+    """A removed agent is the session's state, not a runner failure: 410, the status
+    of ``session_agent_missing`` (as for a fork of it). Other failures stay 500."""
+    removed = _native_terminal_start_error_response(
+        OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
+        "Claude",
+        session_id="conv_1",
+    )
+    assert removed.status_code == 410
+    assert json.loads(removed.body)["error"]["code"] == ErrorCode.SESSION_AGENT_MISSING
+
+    other = _native_terminal_start_error_response(
+        OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR), "Claude", session_id="conv_1"
+    )
+    assert other.status_code == 500
+
+
 def test_ensure_response_and_diagnostic_share_error_and_session_ids(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

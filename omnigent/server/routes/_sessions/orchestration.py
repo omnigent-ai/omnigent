@@ -155,6 +155,7 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
+from omnigent.server.routes._errors import agent_removed as _agent_removed
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._session_create_validation import (
     validate_session_agent,
@@ -5091,8 +5092,17 @@ async def _ensure_runner_session_initialized(
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
-        from omnigent.server.runner_session_init import runner_inference_verified
+        from omnigent.server.runner_session_init import (
+            is_session_agent_removed,
+            runner_inference_verified,
+        )
 
+        if is_session_agent_removed(resp):
+            # Forwarded anyway, the message gets the runner's own "this agent no
+            # longer exists" reply; a caller that needs the runner ready gets it now.
+            if require_success or conv.inference_snapshot is not None:
+                raise _agent_removed()
+            return False
         if not runner_inference_verified(conv, resp):
             raise OmnigentError(
                 "The runner did not accept this session's saved inference configuration",
