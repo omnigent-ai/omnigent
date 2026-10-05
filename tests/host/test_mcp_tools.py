@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from contextlib import suppress
+from dataclasses import asdict
 
 import psutil
 import pytest
@@ -12,11 +14,15 @@ import pytest
 from omnigent.host import mcp_tools
 from omnigent.host.mcp_inventory import ConfiguredMcpServer
 from omnigent.host.mcp_tools import HostMcpTools, _effective_config
+from tests.budgets import budget
 
 SERVER_SCRIPT = """import json, os, subprocess, sys, time
 from pathlib import Path
+time.sleep(float(os.environ.get("STARTUP_DELAY", "0")))
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
-Path(os.environ["PID_FILE"]).write_text(json.dumps([os.getpid(), child.pid]))
+pid_file = Path(os.environ["PID_FILE"])
+pid_file.with_suffix(".tmp").write_text(json.dumps([os.getpid(), child.pid]))
+pid_file.with_suffix(".tmp").replace(pid_file)
 print("synthetic-stderr-secret", file=sys.stderr, flush=True)
 filler = os.environ.get("FILLER", "x")
 if os.environ.get("HANG"):
@@ -74,6 +80,14 @@ def _assert_reaped(tmp_path):
         assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
 
 
+async def _wait_for_stdio_tree(tmp_path, task):
+    async with asyncio.timeout(budget(15)):
+        while not (tmp_path / "pids.json").exists():
+            if task.done():
+                pytest.fail(f"Probe exited before starting the stdio fixture: {await task}")
+            await asyncio.sleep(0.02)
+
+
 @pytest.mark.parametrize("filler", ["x", "😀"])
 async def test_stdio_caps_pagination_private_output_and_cleanup(
     tmp_path, monkeypatch, caplog, capfd, filler
@@ -99,24 +113,45 @@ async def test_stdio_caps_pagination_private_output_and_cleanup(
     _assert_reaped(tmp_path)
 
 
-async def test_timeout_reaps_stdio_tree(tmp_path, monkeypatch):
-    monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [_stdio(tmp_path, HANG="1")])
-    monkeypatch.setattr(mcp_tools, "PROBE_TIMEOUT_SECONDS", 2)
-    result = await HostMcpTools().probe("claude", "docs")
-    assert result["connection"] == "timeout"
-    _assert_reaped(tmp_path)
+@pytest.mark.parametrize("startup_delay", [0, 3])
+async def test_timeout_reaps_stdio_tree(tmp_path, monkeypatch, startup_delay):
+    entry = _stdio(tmp_path, HANG="1", STARTUP_DELAY=str(startup_delay))
+    monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [entry])
+    config, cwd, transport = _effective_config(entry)
+    payload = json.dumps({"config": asdict(config), "cwd": str(cwd), "transport": transport})
+    worker = asyncio.create_task(mcp_tools._probe_worker(payload))
+
+    async def running_worker(_payload):
+        return await worker
+
+    try:
+        # Start the real process tree before exercising the probe's short deadline.
+        await _wait_for_stdio_tree(tmp_path, worker)
+        monkeypatch.setattr(mcp_tools, "_probe_worker", running_worker)
+        monkeypatch.setattr(mcp_tools, "PROBE_TIMEOUT_SECONDS", 0.05)
+        result = await HostMcpTools().probe("claude", "docs")
+        assert result["connection"] == "timeout"
+        _assert_reaped(tmp_path)
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
 
 
 async def test_cancellation_reaps_stdio_tree(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [_stdio(tmp_path, HANG="1")])
+    monkeypatch.setattr(mcp_tools, "PROBE_TIMEOUT_SECONDS", budget(30))
     task = asyncio.create_task(HostMcpTools().probe("claude", "docs"))
-    async with asyncio.timeout(5):
-        while not (tmp_path / "pids.json").exists():
-            await asyncio.sleep(0.02)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    _assert_reaped(tmp_path)
+    try:
+        await _wait_for_stdio_tree(tmp_path, task)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        _assert_reaped(tmp_path)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 async def test_http_401_needs_auth_without_private_logs(monkeypatch, caplog, capfd):
