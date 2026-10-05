@@ -108,7 +108,9 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
     label: `Copy ${isAbsoluteComposerPath(props.path) ? "absolute" : "relative"} path`,
     icon: CopyIcon,
     onSelect: () => {
-      void copyText(props.path).catch(() => toast.error("Copy failed"));
+      void copyText(props.path)
+        .then(() => toast.success("Copied to clipboard."))
+        .catch(() => toast.error("Copy failed"));
     },
   });
   if (revealTarget) {
