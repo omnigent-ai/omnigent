@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { splitNameTemplate, TemplateNameInput } from "./TemplateNameInput";
@@ -38,6 +38,25 @@ describe("splitNameTemplate", () => {
 });
 
 describe("TemplateNameInput", () => {
+  it("moves the backdrop text by the full input scroll offset", () => {
+    render(
+      <TemplateNameInput
+        aria-label="Name"
+        value={`Long automation name ${"weekly release ".repeat(16)}{{MMM DD}}`}
+        onChange={vi.fn()}
+      />,
+    );
+
+    const input = screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement;
+    const backdrop = screen.getByTestId("task-name-template-overlay");
+    const backdropText = backdrop.firstElementChild as HTMLElement;
+
+    input.scrollLeft = 1237;
+    fireEvent.scroll(input);
+
+    expect(backdropText.style.transform).toBe("translateX(-1237px)");
+  });
+
   it.each(["First\nSecond {{YYYY}}", "First\rSecond {{YYYY}}", "First {{YYYY\nMM}} Second"])(
     "keeps the backdrop aligned with the native single-line value (%s)",
     (name) => {
