@@ -28,6 +28,11 @@ vi.mock("./hooks/useTerminals", async (importOriginal) => ({
   useCreateTerminal: () => ({ mutate: () => {}, isPending: false, isError: false }),
 }));
 vi.mock("./hooks/useAgents", () => ({ useSessionAgent: () => ({ data: undefined }) }));
+// Layout-only coverage does not exercise filesystem creation; keep the real
+// WorkspacePanel mounted without introducing its react-query dependency.
+vi.mock("@/hooks/useCreateMarkdownFile", () => ({
+  useCreateMarkdownFile: () => ({ create: () => {}, disabled: false }),
+}));
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
