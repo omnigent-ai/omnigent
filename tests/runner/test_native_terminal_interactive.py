@@ -7,6 +7,7 @@ from collections import deque
 
 import pytest
 
+from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
 from omnigent.runner.native.orchestration import _observe_terminal_interactive
 
 
@@ -83,3 +84,60 @@ async def test_observer_records_unobserved_without_raising(
         if record.event_name == "terminal_interactive_unobserved"
     )
     assert record.attributes["reason"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_observer_timeout_keeps_last_screen_when_capture_enabled(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pane stuck before its prompt records what it showed when the wait ended."""
+    monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
+    terminal = _FakeTerminal(["Waiting for OAuth callback on port 8020"])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        await _observe_terminal_interactive(
+            session_id="conv_stuck",
+            terminal_id="terminal_claude_main",
+            harness="claude-native",
+            readiness_signal="claude_composer",
+            instance=terminal,  # type: ignore[arg-type]
+            is_interactive=lambda _pane: False,
+            timeout_s=0.0,
+            poll_interval_s=0.0,
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.event_name == "terminal_interactive_unobserved"
+    )
+    assert record.attributes["reason"] == "TimeoutError"
+    assert "Waiting for OAuth callback on port 8020" in record.attributes["terminal_last_output"]
+
+
+@pytest.mark.asyncio
+async def test_observer_timeout_omits_screen_when_capture_disabled(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the stderr-capture opt-in, the unobserved event stays content-free."""
+    monkeypatch.delenv(HARNESS_STDERR_ENABLED_ENV_VAR, raising=False)
+    terminal = _FakeTerminal(["Waiting for OAuth callback on port 8020"])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        await _observe_terminal_interactive(
+            session_id="conv_stuck",
+            terminal_id="terminal_claude_main",
+            harness="claude-native",
+            readiness_signal="claude_composer",
+            instance=terminal,  # type: ignore[arg-type]
+            is_interactive=lambda _pane: False,
+            timeout_s=0.0,
+            poll_interval_s=0.0,
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.event_name == "terminal_interactive_unobserved"
+    )
+    assert "terminal_last_output" not in record.attributes
