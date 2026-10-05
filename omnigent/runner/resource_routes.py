@@ -66,6 +66,7 @@ from omnigent.runner.resource_registry import (
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
+from omnigent.runner.tool_dispatch import publish_design_artifact_change
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
@@ -1454,6 +1455,9 @@ def register_resource_routes(
         )
         if filesystem_registry is not None:
             filesystem_registry.record_change(relative_path, result.operation, session_id)
+            publish_design_artifact_change(
+                session_id, relative_path, result.operation, filesystem_registry, _publish_event
+            )
         return JSONResponse(
             status_code=200,
             content={
@@ -1505,6 +1509,9 @@ def register_resource_routes(
         result = await fs.edit_text(relative_path, edit_req)
         if filesystem_registry is not None:
             filesystem_registry.record_change(relative_path, result.operation, session_id)
+            publish_design_artifact_change(
+                session_id, relative_path, result.operation, filesystem_registry, _publish_event
+            )
         return JSONResponse(
             status_code=200,
             content={
@@ -1540,6 +1547,9 @@ def register_resource_routes(
         result = await fs.delete(relative_path, recursive=recursive)
         if filesystem_registry is not None and result.type == "file":
             filesystem_registry.record_change(relative_path, "deleted", session_id)
+            publish_design_artifact_change(
+                session_id, relative_path, "deleted", filesystem_registry, _publish_event
+            )
         return JSONResponse(
             status_code=200,
             content={

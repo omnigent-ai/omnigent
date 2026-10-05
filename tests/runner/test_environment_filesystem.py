@@ -2515,3 +2515,47 @@ async def test_default_read_still_follows_a_symlink_into_a_read_grant(tmp_path: 
             await fs.read("escape/note.txt")
     finally:
         os_env.close()
+
+
+def _design_events(app: FastAPI) -> list[dict[str, object]]:
+    queue = app.state.session_event_queues.get("conv_test")
+    events: list[dict[str, object]] = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if event.get("type") == "session.design_artifact.changed":
+            events.append(event)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_file_routes_emit_design_artifact_changes(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    """PUT, PATCH, and DELETE of a deck or wireframe each emit the index event."""
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    assert (
+        await client.put(f"{base}/decks/q3.slides.html", json={"content": "<p>a</p>"})
+    ).status_code == 200
+    assert (
+        await client.patch(f"{base}/decks/q3.slides.html", json={"old_text": "a", "new_text": "b"})
+    ).status_code == 200
+    assert (await client.delete(f"{base}/decks/q3.slides.html")).status_code == 200
+    assert (
+        await client.put(f"{base}/flow.wireframe.html", json={"content": "<p>w</p>"})
+    ).status_code == 200
+    assert (await client.put(f"{base}/notes.html", json={"content": "x"})).status_code == 200
+
+    assert _design_events(app) == [
+        {
+            "type": "session.design_artifact.changed",
+            "session_id": "conv_test",
+            "path": path,
+            "deleted": deleted,
+        }
+        for path, deleted in [
+            ("decks/q3.slides.html", False),
+            ("decks/q3.slides.html", False),
+            ("decks/q3.slides.html", True),
+            ("flow.wireframe.html", False),
+        ]
+    ]

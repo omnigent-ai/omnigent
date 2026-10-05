@@ -122,3 +122,47 @@ def test_non_string_baseline_is_dropped() -> None:
         )
     )
     assert changes == [NativeFileChange(path="src/app.py", operation="modified", baseline=None)]
+
+
+def test_record_native_file_changes_records_and_emits_design_events(tmp_path) -> None:
+    from omnigent.runner.native_file_observer import record_native_file_changes
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+
+    workspace = tmp_path.resolve()
+    registry = AgentEditFilesystemRegistry(workspace)
+    published: list[tuple[str, dict[str, object]]] = []
+    deck = str(workspace / "q3.slides.html")
+
+    recorded = record_native_file_changes(
+        _payload(
+            tool_input={"file_path": deck, "content": "<p>a</p>"},
+            tool_response={"type": "create", "filePath": deck},
+        ),
+        registry,
+        "conv_native",
+        lambda sid, event: published.append((sid, event)),
+    )
+    # A non-artifact write is recorded but emits nothing.
+    record_native_file_changes(
+        _payload(tool_input={"file_path": str(workspace / "notes.md"), "content": "x"}),
+        registry,
+        "conv_native",
+        lambda sid, event: published.append((sid, event)),
+    )
+
+    assert recorded is True
+    assert {c["path"] for c in registry.list_changed_files("conv_native", limit=10)} == {
+        "q3.slides.html",
+        "notes.md",
+    }
+    assert published == [
+        (
+            "conv_native",
+            {
+                "type": "session.design_artifact.changed",
+                "session_id": "conv_native",
+                "path": "q3.slides.html",
+                "deleted": False,
+            },
+        )
+    ]

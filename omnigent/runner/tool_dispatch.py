@@ -6604,6 +6604,7 @@ async def execute_tool(
                 conversation_id=conversation_id,
                 runner_workspace=runner_workspace,
                 filesystem_registry=filesystem_registry,
+                publish_event=publish_event,
             )
         elif tool_name in _REST_TOOLS:
             output = await _execute_rest_tool(
@@ -6901,6 +6902,43 @@ def _maybe_signal_changed_files(
     )
 
 
+def publish_design_artifact_change(
+    conversation_id: str,
+    path: str,
+    operation: str,
+    filesystem_registry: FilesystemRegistry,
+    publish_event: _EventPublisher | None,
+) -> None:
+    """Publish ``session.design_artifact.changed`` for a deck or wireframe change.
+
+    Called wherever a file change is recorded, so the server can index the
+    Design page's artifacts. Paths outside the workspace are skipped.
+
+    :param conversation_id: Session that made the change.
+    :param path: Changed path, absolute or workspace-relative.
+    :param operation: ``"created"``, ``"modified"``, or ``"deleted"``.
+    :param filesystem_registry: Registry whose root the path is relative to.
+    :param publish_event: Per-session SSE emitter, or ``None`` (no-op).
+    """
+    from omnigent.entities.design_artifact import design_artifact_kind
+    from omnigent.runtime.filesystem_registry import _normalize_path
+
+    if publish_event is None or design_artifact_kind(path) is None:
+        return
+    relative = _normalize_path(path, filesystem_registry.cwd)
+    if relative is None:
+        return
+    publish_event(
+        conversation_id,
+        {
+            "type": "session.design_artifact.changed",
+            "session_id": conversation_id,
+            "path": Path(relative).as_posix(),
+            "deleted": operation == "deleted",
+        },
+    )
+
+
 async def dispatch_tool_locally(
     *,
     tool_name: str,
@@ -7170,6 +7208,7 @@ async def _execute_os_env_tool(
     runner_workspace: Path | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     resource_registry: SessionResourceRegistry | None = None,
+    publish_event: _EventPublisher | None = None,
 ) -> str:
     """
     Execute sys_os_* through a runner-local OSEnvironment.
@@ -7188,6 +7227,8 @@ async def _execute_os_env_tool(
         ``GET …/changes`` endpoint can surface them. ``sys_os_shell``
         is not tracked — shell side-effects cannot be attributed to a
         session.
+    :param publish_event: Per-session SSE emitter for design artifact
+        change events, or ``None``.
     :returns: Serialized tool result string.
     """
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
@@ -7250,6 +7291,9 @@ async def _execute_os_env_tool(
                 was_created = isinstance(result, dict) and result.get("created") is True
                 status = "created" if was_created else "modified"
                 filesystem_registry.record_change(_path, status, conversation_id)
+                publish_design_artifact_change(
+                    conversation_id, _path, status, filesystem_registry, publish_event
+                )
         elif tool_name == SysOsEditTool.name():
             _path = cast("str", args.get("path", ""))
             if filesystem_registry is not None and conversation_id is not None:
@@ -7262,6 +7306,9 @@ async def _execute_os_env_tool(
             )
             if filesystem_registry is not None and conversation_id is not None:
                 filesystem_registry.record_change(_path, "modified", conversation_id)
+                publish_design_artifact_change(
+                    conversation_id, _path, "modified", filesystem_registry, publish_event
+                )
         elif tool_name == SysOsShellTool.name():
             result = await os_env.shell(
                 command=cast("str", args.get("command", "")),

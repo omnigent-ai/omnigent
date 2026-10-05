@@ -4616,24 +4616,19 @@ def create_runner_app(
 
             :param payload: Hook JSON object from ``/hook/observe-tool``.
             """
-            from omnigent.runner.native_file_observer import native_file_changes
+            from omnigent.runner.native_file_observer import (
+                native_file_changes,
+                record_native_file_changes,
+            )
             from omnigent.runner.tool_dispatch import _maybe_signal_changed_files
 
             try:
-                changes = native_file_changes(payload)
-                if not changes:
+                if not native_file_changes(payload):
                     return
                 registry = await _resolve_session_fs_registry(_captured_session_id)
                 if registry is None:
                     return
-                for change in changes:
-                    if change.baseline is not None:
-                        registry.seed_snapshot(
-                            change.path,
-                            change.baseline,
-                            session_id=_captured_session_id,
-                        )
-                    registry.record_change(change.path, change.operation, _captured_session_id)
+                record_native_file_changes(payload, registry, _captured_session_id, _publish_event)
                 _maybe_signal_changed_files(
                     _captured_session_id,
                     _publish_event,

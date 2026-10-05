@@ -12837,3 +12837,44 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
     failed = [e for e in published if e.get("type") == "response.failed"]
     assert failed, "response.failed was not published"
     assert failed[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+
+
+@pytest.mark.asyncio
+async def test_os_write_and_edit_emit_design_artifact_changes(tmp_path: Path) -> None:
+    """sys_os_write and sys_os_edit of a deck emit the index event; other files do not."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+
+    root = tmp_path.resolve()
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(root), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    published: list[tuple[str, dict[str, object]]] = []
+
+    async def run(tool: str, args: dict[str, object]) -> None:
+        await _execute_os_env_tool(
+            tool,
+            args,
+            agent_spec=spec,
+            conversation_id="conv_design",
+            filesystem_registry=AgentEditFilesystemRegistry(root),
+            publish_event=lambda sid, event: published.append((sid, event)),
+        )
+
+    await run("sys_os_write", {"path": "q3.slides.html", "content": "<p>a</p>"})
+    await run(
+        "sys_os_edit", {"path": str(root / "q3.slides.html"), "oldText": "a", "newText": "b"}
+    )
+    await run("sys_os_write", {"path": "notes.md", "content": "x"})
+
+    event = {
+        "type": "session.design_artifact.changed",
+        "session_id": "conv_design",
+        "path": "q3.slides.html",
+        "deleted": False,
+    }
+    assert published == [("conv_design", event), ("conv_design", event)]

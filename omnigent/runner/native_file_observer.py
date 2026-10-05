@@ -12,7 +12,12 @@ native writes appear in ``GET .../changes`` for non-git workspaces.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from omnigent.runtime.filesystem_registry import FilesystemRegistry
+    from omnigent.util.json_types import JsonObject
 
 # Native file-mutating tools and the tool_input key naming the touched file.
 # Shell-like tools (Bash) are deliberately absent: their side effects cannot
@@ -102,3 +107,32 @@ def native_file_changes(payload: Mapping[str, object]) -> list[NativeFileChange]
             baseline=baseline if isinstance(baseline, str) else None,
         )
     ]
+
+
+def record_native_file_changes(
+    payload: Mapping[str, object],
+    registry: FilesystemRegistry,
+    session_id: str,
+    publish_event: Callable[[str, JsonObject], None] | None,
+) -> bool:
+    """Record a native hook payload's file changes in *registry*.
+
+    Deck and wireframe changes also publish ``session.design_artifact.changed``.
+
+    :param payload: Hook JSON object from ``/hook/observe-tool``.
+    :param registry: The session's filesystem registry.
+    :param session_id: Session the native harness runs for.
+    :param publish_event: Per-session SSE emitter, or ``None``.
+    :returns: Whether the payload described any file change.
+    """
+    from omnigent.runner.tool_dispatch import publish_design_artifact_change
+
+    changes = native_file_changes(payload)
+    for change in changes:
+        if change.baseline is not None:
+            registry.seed_snapshot(change.path, change.baseline, session_id=session_id)
+        registry.record_change(change.path, change.operation, session_id)
+        publish_design_artifact_change(
+            session_id, change.path, change.operation, registry, publish_event
+        )
+    return bool(changes)
