@@ -170,6 +170,9 @@ vi.mock("three", () => {
     setClearColor(_color: number, alpha = 1) {
       this.record.clearAlpha = alpha;
     }
+    setClearAlpha(alpha: number) {
+      this.record.clearAlpha = alpha;
+    }
     render() {}
     dispose() {
       this.record.disposed = true;
@@ -309,15 +312,15 @@ function paintsOwnBackground(record: RendererRecord | null): boolean {
   return !record.alpha || (record.clearAlpha ?? 0) > 0 || lastScene?.background != null;
 }
 
-// `bg-*` classes and computed background colors on the canvas host and its
-// ModelViewer wrappers, which would cover the pane's theme background.
-function backgroundsAbove(host: HTMLElement): string[] {
+// `bg-*` classes and inline or computed backgrounds on anything ModelViewer
+// renders (canvas, host, wrappers, siblings), which would cover the pane.
+function backgroundsPainted(): string[] {
   const found: string[] = [];
-  for (let el: HTMLElement | null = host; el && el !== document.body; el = el.parentElement) {
-    // Variant-prefixed utilities too (`dark:bg-…`); jsdom applies no Tailwind.
-    found.push(...Array.from(el.classList).filter((c) => /(^|:)bg-/.test(c)));
+  for (const el of document.body.querySelectorAll<HTMLElement>("*")) {
+    // Variant and important forms too (`dark:bg-…`, `!bg-…`); jsdom applies no Tailwind.
+    found.push(...Array.from(el.classList).filter((c) => /(^|:)!?bg-/.test(c)));
     // Inline values jsdom can't resolve (e.g. `var(--background)`) never reach the computed color.
-    const inline = el.style.background || el.style.backgroundColor;
+    const inline = el.style.background || el.style.backgroundColor || el.style.backgroundImage;
     if (inline) found.push(inline);
     const color = getComputedStyle(el).backgroundColor;
     if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") found.push(color);
@@ -459,7 +462,7 @@ describe("ModelViewer theme awareness", () => {
     // The canvas is transparent and no wrapper paints its own background, so
     // the pane's theme token shows through; the STL material tracks the theme.
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
-    expect(backgroundsAbove(screen.getByLabelText(/3D preview of/))).toEqual([]);
+    expect(backgroundsPainted()).toEqual([]);
     expect(lastMaterial?.color).toBe(light.stlMaterial);
   });
 
@@ -468,6 +471,7 @@ describe("ModelViewer theme awareness", () => {
     render(<ModelViewer data={makeData()} path="part.stl" />);
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
+    expect(backgroundsPainted()).toEqual([]);
     expect(lastMaterial?.color).toBe(dark.stlMaterial);
     // Dark theme brightens the lights so the mesh stays legible.
     expect(dark.ambientIntensity).toBeGreaterThan(light.ambientIntensity);
@@ -492,6 +496,7 @@ describe("ModelViewer theme awareness", () => {
     await waitFor(() => expect(lastMaterial?.color).toBe(dark.stlMaterial));
     // The toggle must not paint an opaque per-mode color over the pane.
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
+    expect(backgroundsPainted()).toEqual([]);
     expect(lastRenderer).toBe(rendererBefore);
     expect(parseCalls.length).toBe(parsesBefore);
   });
