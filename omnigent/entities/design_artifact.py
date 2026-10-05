@@ -10,10 +10,14 @@ DESIGN_ARTIFACT_SUFFIXES: dict[str, str] = {
 }
 # Paths longer than this are not indexed; it keeps the primary key indexable.
 DESIGN_ARTIFACT_PATH_MAX = 512
+# An imported design system's templates are not the user's artifacts.
+IMPORTED_DESIGN_SYSTEM_DIR = ".omnigent/design-system/"
 
 
 def design_artifact_kind(path: str) -> str | None:
     """Return ``"deck"`` or ``"wireframe"`` for an artifact path, else ``None``."""
+    if f"/{IMPORTED_DESIGN_SYSTEM_DIR}" in f"/{path}":
+        return None
     name = path.rsplit("/", 1)[-1]
     for suffix, kind in DESIGN_ARTIFACT_SUFFIXES.items():
         if name.endswith(suffix) and name != suffix:

@@ -2618,6 +2618,8 @@ async def test_file_routes_emit_design_artifact_changes(
             f"{base}/decks/b64.slides.html", json={"content": encoded, "encoding": "base64"}
         )
     ).status_code == 200
+    imported = f"{base}/.omnigent/design-system/slides/title.slides.html"
+    assert (await client.put(imported, json={"content": "<p>t</p>"})).status_code == 200
 
     assert _design_events(app) == [
         {
