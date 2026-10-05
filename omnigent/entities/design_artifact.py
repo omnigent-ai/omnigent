@@ -21,6 +21,13 @@ def design_artifact_kind(path: str) -> str | None:
     return None
 
 
+def is_safe_artifact_path(path: str) -> bool:
+    """Whether *path* is a plain workspace-relative POSIX path the index may store."""
+    if not path or len(path) > DESIGN_ARTIFACT_PATH_MAX or path.startswith("/") or "\\" in path:
+        return False
+    return all(segment not in ("", ".", "..") for segment in path.split("/"))
+
+
 @dataclass(frozen=True)
 class DesignArtifact:
     """One indexed artifact file in a session's workspace.

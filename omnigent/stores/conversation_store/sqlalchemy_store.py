@@ -88,9 +88,9 @@ from omnigent.entities import (
     parse_item_data,
 )
 from omnigent.entities.design_artifact import (
-    DESIGN_ARTIFACT_PATH_MAX,
     DesignArtifact,
     design_artifact_kind,
+    is_safe_artifact_path,
 )
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
@@ -3872,7 +3872,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         wanted = {
             path: path_kind
             for path in paths
-            if len(path) <= DESIGN_ARTIFACT_PATH_MAX
+            if is_safe_artifact_path(path)
             and (path_kind := design_artifact_kind(path)) is not None
             and kind in (None, path_kind)
         }
@@ -5211,8 +5211,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         Collects the full subtree of conversation IDs (the target plus
         all direct/indirect children), then deletes their items, labels,
-        comments, policies, and session-permission rows before deleting
-        the conversation rows themselves (children before parent).
+        Design page index rows, comments, policies, and session-permission
+        rows before deleting the conversation rows themselves (children
+        before parent).
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -5258,6 +5259,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 delete(SqlConversationLabel).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(subtree_ids),
+                )
+            )
+            ap_sess.execute(
+                delete(SqlDesignArtifact).where(
+                    SqlDesignArtifact.workspace_id == current_workspace_id(),
+                    SqlDesignArtifact.session_id.in_(subtree_ids),
                 )
             )
             ap_sess.execute(

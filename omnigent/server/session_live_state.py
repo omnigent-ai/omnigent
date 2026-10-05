@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.entities.design_artifact import DESIGN_ARTIFACT_PATH_MAX, design_artifact_kind
+from omnigent.entities.design_artifact import design_artifact_kind, is_safe_artifact_path
 
 if TYPE_CHECKING:
     from omnigent.stores import ConversationStore
@@ -312,7 +312,7 @@ def persist_design_artifact(session_id: str, path: object, *, deleted: bool) -> 
     if store is None or not _design_index or not isinstance(path, str):
         return
     kind = design_artifact_kind(path)
-    if kind is None or len(path) > DESIGN_ARTIFACT_PATH_MAX:
+    if kind is None or not is_safe_artifact_path(path):
         return
     submit(
         "design_artifact",

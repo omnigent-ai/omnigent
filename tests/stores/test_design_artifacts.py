@@ -124,3 +124,36 @@ def test_list_conversations_filters_to_given_ids(
     page = conversation_store.list_conversations(conversation_ids=[a.id])
     assert [c.id for c in page.data] == [a.id]
     assert conversation_store.list_conversations(conversation_ids=[]).data == []
+
+
+async def test_delete_conversation_removes_the_subtree_rows(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(parent_conversation_id=parent.id)
+    other = conversation_store.create_conversation()
+    for conv in (parent, child, other):
+        conversation_store.record_design_artifact(conv.id, "a.slides.html", "deck", now=1)
+
+    assert await conversation_store.delete_conversation(parent.id)
+
+    assert _live(conversation_store) == [(other.id, "a.slides.html")]
+
+
+def test_conversation_ids_only_narrow_accessible_by(db_uri: str) -> None:
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("alice")
+    mine = store.create_conversation()
+    also_mine = store.create_conversation()
+    not_mine = store.create_conversation()
+    permissions.grant("alice", mine.id, LEVEL_OWNER)
+    permissions.grant("alice", also_mine.id, LEVEL_OWNER)
+
+    page = store.list_conversations(
+        accessible_by="alice", conversation_ids=[mine.id, not_mine.id], limit=10
+    )
+    assert [c.id for c in page.data] == [mine.id]

@@ -3291,3 +3291,39 @@ async def test_relay_indexes_design_artifact_changes(db_uri: str) -> None:
         ]
     finally:
         session_live_state.configure(None)
+
+
+@pytest.mark.asyncio
+async def test_relay_never_forwards_design_artifact_events(db_uri: str) -> None:
+    """The index event is consumed by the relay; live clients never see it."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    release = asyncio.Event()
+    release.set()
+    events = [
+        {
+            "type": "session.design_artifact.changed",
+            "session_id": conv.id,
+            "path": "q3.slides.html",
+            "deleted": False,
+        },
+        # A forwarded event after it proves the collector was listening.
+        {"type": "session.changed_files.invalidated", "session_id": conv.id},
+    ]
+    collector = await start_session_stream_collector(conv.id)
+    try:
+        await _relay_runner_stream_once(
+            conv.id,
+            _ScriptedRunnerClient(release, events),
+            store,  # type: ignore[arg-type]
+        )
+        seen: list[str] = []
+        while not seen or seen[-1] != "session.changed_files.invalidated":
+            seen.append((await collector.next_event())["type"])
+        assert "session.design_artifact.changed" not in seen
+    finally:
+        await collector.stop()
+        session_stream.close(conv.id)

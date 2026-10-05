@@ -161,3 +161,55 @@ async def test_both_routes_are_dark_without_the_design_flag(stores) -> None:  # 
 
 async def test_list_requires_a_user(client) -> None:  # type: ignore[no-untyped-def]
     assert (await client.get("/v1/design/artifacts")).status_code == 401
+
+
+async def test_list_excludes_archived_and_sub_agent_sessions(stores, client) -> None:  # type: ignore[no-untyped-def]
+    store, permissions = stores
+    live = store.create_conversation(workspace="/ws/live")
+    archived = store.create_conversation(workspace="/ws/archived")
+    child = store.create_conversation(parent_conversation_id=live.id, workspace="/ws/live")
+    for conv in (live, archived, child):
+        permissions.grant("alice", conv.id, LEVEL_OWNER)
+        store.record_design_artifact(conv.id, f"{conv.id}.slides.html", "deck", now=1)
+    store.update_conversation(archived.id, archived=True)
+
+    resp = await client.get("/v1/design/artifacts", headers=_as("alice"))
+    assert [a["session_id"] for a in resp.json()["data"]] == [live.id]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/abs/a.slides.html",
+        "decks\\a.slides.html",
+        "decks//a.slides.html",
+        "./a.slides.html",
+        "decks/../a.slides.html",
+        "",
+        "x" * 500 + "/a.slides.html",
+    ],
+)
+async def test_reconcile_rejects_unsafe_paths(stores, client, path: str) -> None:  # type: ignore[no-untyped-def]
+    store, permissions = stores
+    conv = store.create_conversation()
+    permissions.grant("alice", conv.id, LEVEL_OWNER)
+    resp = await client.put(
+        f"/v1/sessions/{conv.id}/design-artifacts",
+        json={"paths": ["decks/a.slides.html", path]},
+        headers=_as("alice"),
+    )
+    assert resp.status_code == 422
+    assert store.list_design_artifacts() == []
+
+
+async def test_reconcile_accepts_a_nested_relative_path(stores, client) -> None:  # type: ignore[no-untyped-def]
+    store, permissions = stores
+    conv = store.create_conversation()
+    permissions.grant("alice", conv.id, LEVEL_OWNER)
+    resp = await client.put(
+        f"/v1/sessions/{conv.id}/design-artifacts",
+        json={"paths": ["decks/a.slides.html"]},
+        headers=_as("alice"),
+    )
+    assert resp.status_code == 204
+    assert [a.path for a in store.list_design_artifacts()] == ["decks/a.slides.html"]

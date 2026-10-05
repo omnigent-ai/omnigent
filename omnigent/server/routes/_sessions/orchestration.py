@@ -8159,17 +8159,17 @@ async def _relay_runner_stream_once(
                             _llm_response_denied_turns.pop(session_id, None)
                         continue
 
-                    # Terminal spin-up status from the runner's auto-create
-                    # path. Re-publish via _publish_terminal_pending so the
-                    # event carries conversation_id and the cache write
-                    # (read by the snapshot) stays coherent with the stream.
-                    # Indexed for the Design page only; clients never see it.
+                    # Design page index update; persisted, never forwarded to clients.
                     if evt_type == "session.design_artifact.changed":
                         session_live_state.persist_design_artifact(
                             session_id, event.get("path"), deleted=event.get("deleted") is True
                         )
                         continue
 
+                    # Terminal spin-up status from the runner's auto-create
+                    # path. Re-publish via _publish_terminal_pending so the
+                    # event carries conversation_id and the cache write
+                    # (read by the snapshot) stays coherent with the stream.
                     if evt_type == "session.terminal_pending":
                         # Use ``is True`` (not bool()) so a malformed frame
                         # with a string like ``"false"`` can't strand the

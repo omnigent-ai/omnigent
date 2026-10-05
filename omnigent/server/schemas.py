@@ -30,6 +30,7 @@ from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     ConversationItem,
 )
+from omnigent.entities.design_artifact import is_safe_artifact_path
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 
 # ── Shared ──────────────────────────────────────────────────────
@@ -2971,6 +2972,14 @@ class ReplaceDesignArtifactsRequest(BaseModel):
 
     paths: list[str] = Field(max_length=10_000)
     kind: Literal["deck", "wireframe"] | None = None
+
+    @field_validator("paths")
+    @classmethod
+    def _relative_paths_only(cls, paths: list[str]) -> list[str]:
+        for path in paths:
+            if not is_safe_artifact_path(path):
+                raise ValueError(f"not a workspace-relative path: {path[:80]!r}")
+        return paths
 
 
 class GrantPermissionRequest(BaseModel):
