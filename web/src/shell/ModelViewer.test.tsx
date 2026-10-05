@@ -339,6 +339,13 @@ function scheduleFrame(callback: FrameRequestCallback): number {
   return id;
 }
 
+// Resolves on the next macrotask, after any pending zero-delay timers.
+function nextTask(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
 beforeEach(() => {
   behavior.mode = "valid";
   behavior.orbitThrows = false;
@@ -509,12 +516,7 @@ describe("ModelViewer error states", () => {
     expect(await screen.findByText(/256 MiB preview limit/)).toBeDefined();
     expect(screen.queryByText(/truncated by the server/)).toBeNull();
     // Let the delayed status-region fill run before checking that nothing is announced.
-    await act(
-      () =>
-        new Promise((resolve) => {
-          setTimeout(resolve, 0);
-        }),
-    );
+    await act(nextTask);
     expect(screen.getByRole("status").textContent).toBe("");
     expect(screen.queryByText(/Downloading model/)).toBeNull();
   });
@@ -705,12 +707,7 @@ describe("ModelViewer loading state", () => {
     expect(screen.getByRole("status").textContent).toBe("");
     expect(screen.getByText("Preparing model…")).toBeDefined();
 
-    await act(
-      () =>
-        new Promise((resolve) => {
-          setTimeout(resolve, 0);
-        }),
-    );
+    await act(nextTask);
     expect(screen.getByRole("status").textContent).toBe("Preparing model…");
     expect(
       screen.getByText("Preparing model…", { selector: '[aria-hidden="true"]' }),
@@ -914,12 +911,7 @@ describe("ModelViewer loading state", () => {
     expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
 
     // Let the delayed status-region fill run before checking it stayed empty.
-    await act(
-      () =>
-        new Promise((resolve) => {
-          setTimeout(resolve, 0);
-        }),
-    );
+    await act(nextTask);
     expect(screen.getByRole("status").textContent).toBe("");
     expect(screen.queryByText(/Preparing model/)).toBeNull();
     expect(parseCalls).toEqual([]);
@@ -953,9 +945,7 @@ describe("ModelViewer loading state", () => {
     unmount();
     await act(async () => {
       frames.splice(0).forEach((frame) => frame(performance.now()));
-      await new Promise((resolve) => {
-        setTimeout(resolve, 0);
-      });
+      await nextTask();
     });
 
     expect(parseCalls).toEqual([]);
