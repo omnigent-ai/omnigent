@@ -253,144 +253,149 @@ export function CreateAgentForm({
       {notice && <p className="text-ui text-muted-foreground">{notice}</p>}
       {/* px-1/-mx-1 give the fields' 3px focus ring room to paint:
             overflow-y-auto also clips horizontally at the padding box. */}
-      <fieldset
-        disabled={pending || importing}
-        className="-mx-1 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-1"
-      >
-        {/* Name */}
-        <div className="flex flex-col gap-1.5">
-          <label htmlFor="create-agent-name" className="text-sm font-medium text-muted-foreground">
-            Name <span className="text-destructive">*</span>
-          </label>
-          <Input
-            id="create-agent-name"
-            data-testid="create-agent-name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            required
-            pattern="[a-zA-Z0-9_\-]+"
-            title="Use letters, numbers, hyphens, and underscores."
-            placeholder="my-agent"
-            aria-invalid={nameInvalid || undefined}
-            aria-describedby={nameInvalid ? "create-agent-name-error" : undefined}
-            autoFocus
-          />
-          {nameInvalid && (
-            <p
-              id="create-agent-name-error"
-              data-testid="create-agent-name-error"
-              className="text-xs text-destructive"
+      <div className="-mx-1 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
+        <fieldset disabled={pending || importing} className="contents">
+          {/* Name */}
+          <div className="flex flex-col gap-1.5">
+            <label
+              htmlFor="create-agent-name"
+              className="text-sm font-medium text-muted-foreground"
             >
-              Use only letters, numbers, hyphens, and underscores.
-            </p>
-          )}
-        </div>
-
-        {/* Description */}
-        <div className="flex flex-col gap-1.5">
-          <label
-            htmlFor="create-agent-description"
-            className="text-sm font-medium text-muted-foreground"
-          >
-            Description
-          </label>
-          <Input
-            id="create-agent-description"
-            data-testid="create-agent-description"
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            placeholder="A short summary of what this agent does"
-          />
-        </div>
-
-        {/* Harness */}
-        <div className="flex flex-col gap-1.5">
-          <label className="text-sm font-medium text-muted-foreground">
-            Harness <span className="text-destructive">*</span>
-          </label>
-          <Select
-            value={harness}
-            onValueChange={setHarness}
-            componentId="create_agent.harness"
-            valueHasNoPii
-          >
-            <SelectTrigger
-              aria-label="Harness"
-              data-testid="create-agent-harness"
-              className="w-full"
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {harnessOptions.map((opt) => (
-                <SelectItem key={opt.value} value={opt.value}>
-                  {opt.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        {/* Model */}
-        <div className="flex flex-col gap-1.5">
-          <label htmlFor="create-agent-model" className="text-sm font-medium text-muted-foreground">
-            Model <span className="text-destructive">*</span>
-          </label>
-          <Input
-            id="create-agent-model"
-            data-testid="create-agent-model"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            required
-            placeholder="Model ID"
-          />
-        </div>
-
-        {/* Instructions / System Prompt */}
-        <div className="flex flex-col gap-1.5">
-          <label
-            htmlFor="create-agent-instructions"
-            className="text-sm font-medium text-muted-foreground"
-          >
-            System instructions
-          </label>
-          <Textarea
-            id="create-agent-instructions"
-            data-testid="create-agent-instructions"
-            value={instructions}
-            onChange={(e) => setInstructions(e.target.value)}
-            placeholder="You are a helpful assistant that..."
-            className="min-h-[120px]"
-            componentId="create_agent.instructions"
-          />
-        </div>
-
-        {/* MCP Servers */}
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between">
-            <span className="text-sm font-medium text-muted-foreground">MCP Tools</span>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={addMCPServer}
-              data-testid="create-agent-add-mcp"
-              className="h-6 gap-1 px-2 text-sm text-muted-foreground"
-            >
-              <PlusIcon className="size-3" />
-              Add server
-            </Button>
-          </div>
-          {mcpEntries.map((entry) => (
-            <MCPServerRow
-              key={entry.key}
-              entry={entry}
-              onChange={(patch) => updateMCPEntry(entry.key, patch)}
-              onRemove={() => removeMCPServer(entry.key)}
+              Name <span className="text-destructive">*</span>
+            </label>
+            <Input
+              id="create-agent-name"
+              data-testid="create-agent-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+              pattern="[a-zA-Z0-9_\-]+"
+              title="Use letters, numbers, hyphens, and underscores."
+              placeholder="my-agent"
+              aria-invalid={nameInvalid || undefined}
+              aria-describedby={nameInvalid ? "create-agent-name-error" : undefined}
+              autoFocus
             />
-          ))}
-        </div>
-      </fieldset>
+            {nameInvalid && (
+              <p
+                id="create-agent-name-error"
+                data-testid="create-agent-name-error"
+                className="text-xs text-destructive"
+              >
+                Use only letters, numbers, hyphens, and underscores.
+              </p>
+            )}
+          </div>
+
+          {/* Description */}
+          <div className="flex flex-col gap-1.5">
+            <label
+              htmlFor="create-agent-description"
+              className="text-sm font-medium text-muted-foreground"
+            >
+              Description
+            </label>
+            <Input
+              id="create-agent-description"
+              data-testid="create-agent-description"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="A short summary of what this agent does"
+            />
+          </div>
+
+          {/* Harness */}
+          <div className="flex flex-col gap-1.5">
+            <label className="text-sm font-medium text-muted-foreground">
+              Harness <span className="text-destructive">*</span>
+            </label>
+            <Select
+              value={harness}
+              onValueChange={setHarness}
+              componentId="create_agent.harness"
+              valueHasNoPii
+            >
+              <SelectTrigger
+                aria-label="Harness"
+                data-testid="create-agent-harness"
+                className="w-full"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {harnessOptions.map((opt) => (
+                  <SelectItem key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Model */}
+          <div className="flex flex-col gap-1.5">
+            <label
+              htmlFor="create-agent-model"
+              className="text-sm font-medium text-muted-foreground"
+            >
+              Model <span className="text-destructive">*</span>
+            </label>
+            <Input
+              id="create-agent-model"
+              data-testid="create-agent-model"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              required
+              placeholder="claude-sonnet-4-20250514"
+            />
+          </div>
+
+          {/* Instructions / System Prompt */}
+          <div className="flex flex-col gap-1.5">
+            <label
+              htmlFor="create-agent-instructions"
+              className="text-sm font-medium text-muted-foreground"
+            >
+              System instructions
+            </label>
+            <Textarea
+              id="create-agent-instructions"
+              data-testid="create-agent-instructions"
+              value={instructions}
+              onChange={(e) => setInstructions(e.target.value)}
+              placeholder="You are a helpful assistant that..."
+              className="min-h-[120px]"
+              componentId="create_agent.instructions"
+            />
+          </div>
+
+          {/* MCP Servers */}
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium text-muted-foreground">MCP Tools</span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={addMCPServer}
+                data-testid="create-agent-add-mcp"
+                className="h-6 gap-1 px-2 text-sm text-muted-foreground"
+              >
+                <PlusIcon className="size-3" />
+                Add server
+              </Button>
+            </div>
+            {mcpEntries.map((entry) => (
+              <MCPServerRow
+                key={entry.key}
+                entry={entry}
+                onChange={(patch) => updateMCPEntry(entry.key, patch)}
+                onRemove={() => removeMCPServer(entry.key)}
+              />
+            ))}
+          </div>
+        </fieldset>
+      </div>
       {error && (
         <p role="alert" className="text-ui text-destructive">
           {error}

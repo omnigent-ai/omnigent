@@ -142,7 +142,10 @@ describe("Custom agents settings", () => {
       target: { value: "Keep this draft." },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save agent" }));
+    expect(screen.getByLabelText(/Name/)).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Add server" })).toBeDisabled();
     expect(await screen.findByRole("alert")).toHaveTextContent("Invalid bundle");
+    expect(screen.getByLabelText(/Name/)).toBeEnabled();
     expect(screen.getByLabelText("System instructions")).toHaveValue("Keep this draft.");
     failSave = false;
     fireEvent.click(screen.getByRole("button", { name: "Save agent" }));
