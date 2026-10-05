@@ -384,6 +384,8 @@ def test_slide_decks_explains_using_a_design_system(tool_ctx: ToolContext) -> No
     assert "Never embed base64 copies" in flat
     assert "`uploads/`, `ui_kits/`, and `preview/`" in flat
     assert ".omnigent/design-system.json" in flat
+    assert "use the system's tokens and only the fonts listed in its `fontFamilies`" in flat
+    assert "N brand warnings" in flat
 
 
 def test_wireframes_skill_listed_and_points_to_design_systems(tool_ctx: ToolContext) -> None:

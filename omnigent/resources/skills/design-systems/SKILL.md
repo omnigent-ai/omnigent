@@ -25,6 +25,10 @@ guidance from the user's chosen source.
 - The viewer injects the system's `colors_and_type.css` (tokens and fonts)
   before the design's styles, so use its tokens and font families rather
   than raw values, and do not copy that file in.
+- When the folder has `_adherence.oxlintrc.json`, use the system's tokens and
+  only the fonts listed in its `fontFamilies`, not raw hex colors or pixel
+  sizes. The deck viewer shows "N brand warnings" for raw values the system's
+  templates do not use; fix them rather than ignoring the badge.
 - Design-system CSS must not use backslash escapes (e.g. `content:"\2022"`),
   or the viewer rejects the whole stylesheet; use the literal character.
 - Reference fonts and images as `ds:<path relative to the design system>`,
