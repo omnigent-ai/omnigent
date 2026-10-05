@@ -79,6 +79,35 @@ describe("processDesignSystemCss", () => {
     ).rejects.toThrow('colors_and_type.css must not contain "</style"');
   });
 
+  it.each([
+    ['@\\69mport "https://evil.example/x.css";', "must not contain backslash escapes"],
+    [".a{background:u\\72l(https://evil.example/a)}", "must not contain backslash escapes"],
+    ['.a{background:image-set("https://evil.example/a.png" 1x)}', "must not use image-set()"],
+    [
+      '.a{background:-webkit-image-set("https://evil.example/a.png" 1x)}',
+      "must not use image-set()",
+    ],
+    ["@@import;import url(https://evil.example/x.css);", "must not use @import"],
+    [".a{background:url(https://evil.example/a b)}", "has a url() that is not a data: URI"],
+  ])("rejects %s", async (input, reason) => {
+    await expect(processDesignSystemCss(input, asset)).rejects.toThrow(
+      `colors_and_type.css ${reason}`,
+    );
+  });
+
+  it.each(['.a{background:url("https://evil.example/a)b")}', `.a{background:url("https://e/x'y")}`])(
+    "drops the quoted remote url in %s",
+    async (input) => {
+      expect(await processDesignSystemCss(input, asset)).toBe(".a{background:none}");
+    },
+  );
+
+  it("applies the synthetic design-system stylesheet", async () => {
+    const css = await processDesignSystemCss(readFixtureFile("colors_and_type.css")!.content, asset);
+    expect(css).toContain('url("data:x/fonts/fixture-sans.woff2")');
+    expect(css).toContain("url(data:x/assets/logo.svg)");
+  });
+
   it("rejects a url that escapes the folder", async () => {
     await expect(processDesignSystemCss(".a{background:url(../x.png)}", asset)).rejects.toThrow(
       "../x.png must be a relative path inside the design system",

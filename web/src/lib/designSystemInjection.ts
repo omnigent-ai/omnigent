@@ -18,7 +18,7 @@ export const DS_DECK_MAX_BYTES = 20 * 1024 * 1024;
 
 const DS_MIME: Record<string, string> = { ...IMAGE_MIME, ...FONT_MIME };
 const DS_PATH_RE = /^[\w.-]+(?:\/[\w.-]+)*$/;
-const CSS_URL_RE = /url\(\s*(["']?)([^"')]*)\1\s*\)/gi;
+const CSS_URL_RE = /url\(\s*("[^"]*"|'[^']*'|[^)'"\s]*)\s*\)/gi;
 const ATTR_DS_RE = /(\s(?:src|href)\s*=\s*)(?:"ds:([^"]*)"|'ds:([^']*)'|ds:([^\s"'>]+))/gi;
 const URL_DS_RE = /url\(\s*(["']?)ds:([^"')\s]*)\1\s*\)/gi;
 
@@ -95,21 +95,33 @@ async function replaceAsync(
  * `ds:` urls (including `@font-face` sources) inlined, remote urls dropped.
  */
 export async function processDesignSystemCss(css: string, asset: AssetUri): Promise<string> {
-  assertSafeCss(css);
+  assertSafeCss(css, false);
   const stripped = css.replace(/@import\b[^;]*;?/gi, "");
-  const out = await replaceAsync(stripped, CSS_URL_RE, async ([whole, quote, raw]) => {
-    const value = raw.trim();
+  const out = await replaceAsync(stripped, CSS_URL_RE, async ([whole, arg]) => {
+    const quote = /^["']/.test(arg) ? arg[0] : "";
+    const value = (quote ? arg.slice(1, -1) : arg).trim();
     if (/^data:/i.test(value)) return whole;
     if (!/^ds:/i.test(value) && /^(?:[a-z][\w+.-]*:|\/)/i.test(value)) return "none";
     return `url(${quote}${await asset(resolveDsPath(value.replace(/^\.\//, "")))}${quote})`;
   });
-  assertSafeCss(out);
+  assertSafeCss(out, true);
   return out;
 }
 
-/** Fail closed on anything that could end the `<style>` early. */
-function assertSafeCss(css: string): void {
-  if (/<\/style/i.test(css)) throw new Error(`${DS_STYLESHEET} must not contain "</style"`);
+/**
+ * Fail closed rather than sanitize: no way to close the `<style>`, no CSS
+ * escapes, and in the final CSS no `@import` and only data: urls.
+ */
+function assertSafeCss(css: string, final: boolean): void {
+  const fail = (reason: string) => {
+    throw new Error(`${DS_STYLESHEET} ${reason}`);
+  };
+  if (/<\/style/i.test(css)) fail('must not contain "</style"');
+  if (css.includes("\\")) fail("must not contain backslash escapes");
+  if (/image-set\(/i.test(css)) fail("must not use image-set()");
+  if (!final) return;
+  if (/@import/i.test(css)) fail("must not use @import");
+  if (/url\((?!\s*["']?data:)/i.test(css)) fail("has a url() that is not a data: URI");
 }
 
 /** Rewrite `ds:` in `src` and `href` attributes and CSS `url()` to data: URIs. */
