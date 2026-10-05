@@ -8,7 +8,10 @@ deployed server.
 
 from __future__ import annotations
 
+import gzip
+import io
 import json
+import tarfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -142,6 +145,36 @@ async def test_identical_reinstall_is_a_no_op(client) -> None:
     first = (await _install(client, ALICE, "orion", "same")).json()
     again = (await _install(client, ALICE, "orion", "same")).json()
     assert (again["id"], again["version"]) == (first["id"], first["version"])
+
+
+def _retarred(bundle: bytes, mtime: int) -> bytes:
+    """The same files tarred again, as the CLI does on every run: new timestamps,
+    owner, and member order."""
+    out = io.BytesIO()
+    with (
+        tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as src,
+        gzip.GzipFile(fileobj=out, mode="wb", mtime=mtime) as gz,
+        tarfile.open(fileobj=gz, mode="w") as dst,
+    ):
+        for member in reversed(src.getmembers()):
+            data = src.extractfile(member) if member.isfile() else None
+            member.mtime, member.uid, member.uname = mtime, 501, "runner"
+            dst.addfile(member, data)
+    return out.getvalue()
+
+
+async def test_reinstalling_the_same_files_tarred_again_is_a_no_op(client) -> None:
+    bundle = build_agent_bundle("orion", description="same")
+    versions = []
+    for mtime in (1, 2):
+        resp = await client.post(
+            "/v1/agents",
+            headers=ALICE,
+            files={"bundle": ("bundle.tar.gz", _retarred(bundle, mtime), "application/gzip")},
+        )
+        assert resp.status_code == 200, resp.text
+        versions.append(resp.json()["version"])
+    assert versions == [1, 1]
 
 
 async def test_same_name_for_another_user_is_a_separate_agent(client, agent_store) -> None:
@@ -458,6 +491,79 @@ async def test_a_same_named_upload_and_install_stay_separately_manageable(
     removed = await c.delete(f"/v1/agents/{uploaded['id']}?force=true", headers=ALICE)
     assert removed.status_code == 200, removed.text
     assert [row["id"] for row in (await _mine(c, ALICE))["data"]] == [installed["id"]]
+
+
+async def _upload(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    bundle: bytes,
+    metadata: dict[str, str] | None = None,
+) -> dict:
+    """What ``omnigent run`` sends: a multipart session create carrying the bundle."""
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps(metadata or {})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+async def test_repeated_runs_of_one_agent_share_its_row(
+    multi_user_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Each ``omnigent run --harness codex`` re-tars the same files; the runs bind
+    one agent instead of adding a row per run."""
+    c = multi_user_client
+    bundle = build_agent_bundle("codex")
+    runs = [await _upload(c, ALICE, _retarred(bundle, mtime)) for mtime in (1, 2, 3)]
+
+    assert len({run["session_id"] for run in runs}) == 3
+    assert len({run["agent_id"] for run in runs}) == 1
+    agent_id = runs[0]["agent_id"]
+    conversations = SqlAlchemyConversationStore(db_uri)
+    assert conversations.count_sessions_for_agent(agent_id, 10) == 3
+    assert [row["id"] for row in (await _mine(c, ALICE))["data"]] == [agent_id]
+
+    changed = await _upload(c, ALICE, build_agent_bundle("codex", description="changed"))
+    bobs = await _upload(c, BOB, bundle)
+    assert len({agent_id, changed["agent_id"], bobs["agent_id"]}) == 3
+    assert SqlAlchemyAgentStore(db_uri).get(bobs["agent_id"]).created_by == "bob@example.com"
+
+
+async def test_a_run_after_an_mcp_edit_starts_on_the_uploaded_files(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """An MCP edit reaches every session on the shared row, but a later run gets
+    exactly the files it uploaded, on one new row rather than one per run."""
+    c = multi_user_client
+    bundle = build_agent_bundle("codex")
+    first = await _upload(c, ALICE, bundle)
+    server = {"name": "docs", "transport": "http", "url": "https://example.invalid/mcp"}
+    added = await c.post(
+        f"/v1/sessions/{first['session_id']}/agent/mcp-servers", json=server, headers=ALICE
+    )
+    assert added.status_code == 200, added.text
+
+    later = [await _upload(c, ALICE, _retarred(bundle, mtime)) for mtime in (1, 2)]
+    assert later[0]["agent_id"] == later[1]["agent_id"] != first["agent_id"]
+    listed = await c.get(f"/v1/sessions/{later[0]['session_id']}/agent/mcp-servers", headers=ALICE)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["data"] == []
+
+
+async def test_sub_agent_uploads_keep_a_row_each(multi_user_client: httpx.AsyncClient) -> None:
+    """A child upload creates its own row, as before: binding an existing one would add
+    the per-parent title check of ``create_conversation``."""
+    c = multi_user_client
+    parent = await _upload(c, ALICE, build_agent_bundle("orchestrator"))
+    helper = build_agent_bundle("helper")
+    children = [
+        await _upload(c, ALICE, helper, {"parent_session_id": parent["session_id"]})
+        for _ in range(2)
+    ]
+    assert children[0]["agent_id"] != children[1]["agent_id"]
 
 
 async def test_children_and_schedules_run_another_users_agent_on_your_copy(

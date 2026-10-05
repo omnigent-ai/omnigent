@@ -157,26 +157,33 @@ function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
 
 /**
  * Fetch the caller's own agents, `GET /v1/agents?scope=user` (installed with
- * `omnigent agent add` or uploaded). Follows the cursor until 50 agents, since
- * a page can come back empty when the server skipped only copies.
+ * `omnigent agent add` or uploaded). Follows the cursor until 50 agent names,
+ * since a page can come back empty when the server skipped only copies, or
+ * repeat one name (servers before shared uploads kept a row per run).
  */
 export async function fetchUserAgents(): Promise<AvailableAgent[]> {
   const rows: BuiltinAgentWire[] = [];
+  const names = new Set<string>();
   let after: string | null = null;
-  // ponytail: 5 pages (250 rows); copies beyond that can still hide an older agent.
+  // ponytail: 5 pages (250 rows); copies or repeats beyond that can still hide an older agent.
   /* oxlint-disable no-await-in-loop */
-  for (let page = 0; page < 5 && rows.length < 50; page++) {
+  for (let page = 0; page < 5 && names.size < 50; page++) {
     const params = new URLSearchParams({ scope: "user", limit: "50" });
     if (after !== null) params.set("after", after);
     const res = await authenticatedFetch(`/v1/agents?${params}`);
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
-    rows.push(...body.data);
+    for (const row of body.data) {
+      const name = agentRootName(row.name);
+      if (names.size >= 50 && !names.has(name)) continue;
+      names.add(name);
+      rows.push(row);
+    }
     if (body.has_more !== true || !body.last_id || body.last_id === after) break;
     after = body.last_id;
   }
   /* oxlint-enable no-await-in-loop */
-  return rows.slice(0, 50).map((a) => ({ ...agentFromWire(a), updated_at: a.updated_at ?? null }));
+  return rows.map((a) => ({ ...agentFromWire(a), updated_at: a.updated_at ?? null }));
 }
 
 interface DiscoveredSessionAgent {

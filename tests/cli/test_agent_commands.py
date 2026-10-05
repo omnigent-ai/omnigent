@@ -116,6 +116,30 @@ def test_list_pages_through_your_agents(server: _FakeServer) -> None:
     ]
 
 
+@pytest.mark.parametrize("configured", [None, "local"])
+def test_server_local_means_the_local_server(
+    server: _FakeServer, monkeypatch: pytest.MonkeyPatch, configured: str | None
+) -> None:
+    """``local`` (the flag, or the configured default) is the local server, as for
+    ``omnigent run``, not a remote URL to reject."""
+    from types import SimpleNamespace
+
+    def refuse(_server: str | None, _configured: object) -> None:
+        raise AssertionError("'local' must not be resolved as a remote URL")
+
+    monkeypatch.setattr(cli_mod, "_resolve_attach_server_url", refuse)
+    monkeypatch.setattr(cli_mod, "_load_effective_config", lambda: {"server": configured})
+    monkeypatch.setattr(
+        cli_mod,
+        "ensure_local_omnigent_server",
+        lambda: SimpleNamespace(url="http://127.0.0.1:6767"),
+    )
+    args = ["agent", "list"] + (["--server", "local"] if configured is None else [])
+    result = CliRunner().invoke(cli_mod.cli, args)
+    assert result.exit_code == 0, result.output
+    assert {r.url.host for r in server.seen} == {"127.0.0.1"}
+
+
 def test_list_without_agents_says_how_to_add_one(server: _FakeServer) -> None:
     server.pages = [{"data": [], "has_more": False, "last_id": None}]
     result = CliRunner().invoke(cli_mod.cli, ["agent", "list"])

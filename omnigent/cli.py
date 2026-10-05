@@ -11458,7 +11458,13 @@ def _agent_api_client(server: str | None) -> Iterator[Any]:  # type: ignore[expl
 
     from omnigent.chat import _remote_headers
 
-    resolved = _resolve_attach_server_url(server, _load_effective_config().get("server"))
+    configured = _load_effective_config().get("server")
+    chosen = server if server is not None else configured
+    resolved = (
+        None
+        if isinstance(chosen, str) and _is_local_server_request(chosen)
+        else _resolve_attach_server_url(server, configured)
+    )
     if resolved is None:
         resolved = ServerUrl(ensure_local_omnigent_server().url)
     base_url = resolved.api_base

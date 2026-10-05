@@ -130,7 +130,12 @@ from omnigent.server.background_session_titles import (
     background_session_titles_enabled,
     prepare_background_session_title,
 )
-from omnigent.server.bundles import agent_for_user, bundle_location, validate_agent_bundle
+from omnigent.server.bundles import (
+    agent_for_user,
+    bundle_location,
+    uploaded_agent_for,
+    validate_agent_bundle,
+)
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
@@ -287,6 +292,7 @@ from omnigent.server.routes._sessions.helpers import (
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
     _persist_native_policy_notice,
+    _persist_session_for_uploaded_agent,
     _persist_session_status_error_labels,
     _persist_stored_session_bundle,
     _policy_notice_from_ensure_response,
@@ -10949,17 +10955,24 @@ def _create_session_from_bundle(
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
     created_by: str | None = None,
+    agent_store: AgentStore | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
 
-    Each upload creates a session-scoped agent row, even when a
-    template agent with the same spec name already exists. Agent
-    names are user-authored labels, not global content identities:
+    A top-level upload binds the uploader's agent that holds exactly these
+    files under this name, creating it on first use
+    (:func:`~omnigent.server.bundles.uploaded_agent_for`), so every
+    ``omnigent run`` of one agent shares one row. A name alone never
+    selects a row, even when a template agent has the same spec name.
+    Agent names are user-authored labels, not global content identities:
     reusing a template by name would make a fresh ``omnigent run
     <yaml>`` session execute whatever bundle that template currently
     points at, silently discarding the uploaded bundle and coupling
-    unrelated users who chose the same name.
+    unrelated users who chose the same name. A sub-agent child upload
+    still creates its own row: binding an existing one goes through
+    ``create_conversation``, which adds a per-parent title check that
+    this create path never had.
 
     :param conversation_store: Store that owns the atomic
         conversation-plus-agent transaction.
@@ -10981,6 +10994,8 @@ def _create_session_from_bundle(
     :param created_by: Identity of the creating user, recorded on the
         new session-scoped agent so its code can only be mutated by the
         owner. ``None`` in single-user mode.
+    :param agent_store: Store holding the uploader's agents. ``None``
+        gives every upload its own row.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -11036,6 +11051,24 @@ def _create_session_from_bundle(
             ) from exc
         if terminal_launch_args is not None:
             metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
+
+    if agent_store is not None and metadata.parent_session_id is None:
+        agent = uploaded_agent_for(
+            agent_store,
+            artifact_store,
+            owner=created_by,
+            spec=spec,
+            bundle_bytes=bundle_bytes,
+        )
+        if agent is not None:
+            return _persist_session_for_uploaded_agent(
+                conversation_store,
+                metadata,
+                agent,
+                runner_id=runner_id,
+                inference_snapshot=inference_snapshot,
+                inference_model=inference_model,
+            )
 
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)

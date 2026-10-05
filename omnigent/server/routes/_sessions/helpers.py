@@ -10287,6 +10287,59 @@ def _persist_stored_session_bundle(
     )
 
 
+def _persist_session_for_uploaded_agent(
+    conversation_store: ConversationStore,
+    metadata: SessionCreateMetadata,
+    agent: Agent,
+    *,
+    runner_id: str | None = None,
+    inference_snapshot: dict[str, Any] | None = None,
+    inference_model: str | None = None,
+) -> CreatedSessionResponse:
+    """
+    Persist a top-level session bound to the agent row of an earlier, identical upload.
+
+    Other sessions may use the row and its bundle, so a failure here leaves both.
+
+    :param conversation_store: Store for the new conversation.
+    :param metadata: Validated top-level session metadata.
+    :param agent: The upload's agent (:func:`omnigent.server.bundles.uploaded_agent_for`).
+    :param runner_id: Optional runner binding, e.g. ``"runner_abc123"``.
+    :returns: Response with the new session id.
+    :raises OmnigentError: If the conversation insert violates integrity checks.
+    :raises SQLAlchemyError: If the database transaction fails for
+        any non-integrity reason.
+    """
+    try:
+        conversation = conversation_store.create_conversation(
+            agent_id=agent.id,
+            title=metadata.title,
+            runner_id=runner_id,
+            host_id=metadata.host_id,
+            workspace=metadata.workspace,
+            terminal_launch_args=metadata.terminal_launch_args,
+            project_id=metadata.project_id,
+            inference_snapshot=inference_snapshot,
+            labels=metadata.labels,
+            reasoning_effort=metadata.reasoning_effort,
+            model_override=inference_model,
+        )
+    except IntegrityError as exc:
+        raise OmnigentError(
+            f"session write failed integrity checks: {exc.orig}",
+            code=ErrorCode.ALREADY_EXISTS,
+        ) from exc
+
+    from omnigent.runtime import telemetry
+
+    telemetry.set_session_id(conversation.id)
+    return CreatedSessionResponse(
+        session_id=conversation.id,
+        agent_id=agent.id,
+        agent_name=agent.name,
+    )
+
+
 def _delete_stored_session_bundle_after_failure(
     artifact_store: ArtifactStore,
     agent_bundle_location: str,

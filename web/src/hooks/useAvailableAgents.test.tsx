@@ -1319,6 +1319,35 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     });
   });
 
+  it("follows the cursor past a page of one name's repeats to older agents", async () => {
+    // An older server kept a row per `omnigent run --harness codex`.
+    const codexRuns = Array.from({ length: 50 }, (_, i) => ({
+      id: `ag_codex_${i}`,
+      name: "codex",
+      harness: "codex",
+      builtin: false,
+      created_at: 100 - i,
+    }));
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      [MINE_URL]: sessionResponse({ object: "list", data: [], has_more: false }),
+      [USER_AGENTS_URL]: mockResponse({ data: codexRuns, has_more: true, last_id: "ag_codex_49" }),
+      [`${USER_AGENTS_URL}&after=ag_codex_49`]: mockResponse({
+        data: [{ id: "ag_orion", name: "orion", builtin: false, created_at: 1 }],
+        has_more: false,
+        last_id: "ag_orion",
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() => {
+      expect(result.current.isPlaceholderData).toBe(false);
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_codex_0", "ag_orion"]);
+    });
+  });
+
   it("shows the most recently changed of same-named agents, so an install is selectable", async () => {
     routeFetch({
       [BUILTINS_URL]: CATALOG,

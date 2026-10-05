@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
+import posixpath
+import tarfile
 import tempfile
+import zlib
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING
 
-from omnigent.db.utils import generate_agent_id
+from sqlalchemy.exc import IntegrityError
+
+from omnigent.db.utils import generate_agent_id, uploaded_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
@@ -236,3 +243,116 @@ def bundle_location(agent_id: str, bundle_bytes: bytes) -> str:
     """
     digest = hashlib.sha256(bundle_bytes).hexdigest()
     return f"{agent_id}/{digest}"
+
+
+def bundle_content_digest(bundle_bytes: bytes) -> str | None:
+    """
+    SHA-256 of the files a bundle extracts to, ignoring archive metadata.
+
+    Tarballs of the same files hash alike even when their timestamps, owners, or
+    member order differ (the CLI re-tars on every run), so this identifies an
+    upload's content where :func:`bundle_location`'s byte hash cannot. Covers
+    each entry's path, type, executable bit, and content or link target; a
+    later entry for a path replaces an earlier one, as extraction does.
+
+    :param bundle_bytes: Tarball already checked by :func:`validate_agent_bundle`.
+    :returns: A 64-char hex digest, or ``None`` when the archive can't be read
+        or holds an entry other than a file, directory, or link.
+    """
+    entries: dict[str, tuple[str, str]] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:*") as tar:
+            for member in tar:
+                path = posixpath.normpath(member.name)
+                if path == ".":
+                    continue
+                if member.isfile():
+                    data = tar.extractfile(member)
+                    if data is None:
+                        return None
+                    kind = "x" if member.mode & 0o111 else "f"
+                    entries[path] = (kind, hashlib.sha256(data.read()).hexdigest())
+                elif member.isdir():
+                    entries[path] = ("d", "")
+                elif member.issym() or member.islnk():
+                    entries[path] = ("s" if member.issym() else "h", member.linkname)
+                else:
+                    return None
+    except (tarfile.TarError, OSError, EOFError, zlib.error):
+        return None
+    canonical = json.dumps(sorted(entries.items()), separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def content_bundle_location(agent_id: str, bundle_bytes: bytes) -> str:
+    """
+    Artifact key for a bundle named by its content (:func:`bundle_content_digest`).
+
+    A re-upload of the same files gets the same key, so comparing locations tells
+    whether an agent's content changed. Falls back to :func:`bundle_location`.
+
+    :param agent_id: The agent's id, e.g. ``"0f1a2b3c..."``.
+    :param bundle_bytes: Tarball already checked by :func:`validate_agent_bundle`.
+    :returns: ``"{agent_id}/{sha256_hex}"``.
+    """
+    digest = bundle_content_digest(bundle_bytes)
+    if digest is None:
+        return bundle_location(agent_id, bundle_bytes)
+    return f"{agent_id}/{digest}"
+
+
+# An MCP edit moves a row off its upload's content, so later uploads of that
+# content take the next id; past this many edited rows they get fresh rows.
+_UPLOADED_AGENT_ATTEMPTS = 3
+
+
+def uploaded_agent_for(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    *,
+    owner: str | None,
+    spec: AgentSpec,
+    bundle_bytes: bytes,
+) -> Agent | None:
+    """
+    Return *owner*'s agent holding exactly this upload, creating it on first use.
+
+    The id comes from owner, name, and content (:func:`uploaded_agent_id`), so
+    every identical upload binds one row and concurrent ones collide on its
+    primary key. A row whose bundle an MCP edit has changed no longer matches
+    and is passed over for the next id, so a session always starts on the
+    uploaded files.
+
+    :param owner: Uploading user, or ``None`` on an auth-less server.
+    :param spec: The upload's validated spec (its name and description).
+    :param bundle_bytes: Tarball already checked by :func:`validate_agent_bundle`.
+    :returns: The agent to bind, or ``None`` when the store has no user agents
+        or the bundle can't be digested; the caller then creates a fresh row.
+    """
+    name = spec.name
+    if name is None or not agent_store.supports_user_agents:
+        return None
+    digest = bundle_content_digest(bundle_bytes)
+    if digest is None:
+        return None
+    for attempt in range(_UPLOADED_AGENT_ATTEMPTS):
+        agent_id = uploaded_agent_id(owner, name, digest, attempt)
+        location = f"{agent_id}/{digest}"
+        agent = agent_store.get(agent_id)
+        if agent is None:
+            artifact_store.put(location, bundle_bytes)
+            try:
+                return agent_store.create_user_agent(
+                    agent_id, name, location, owner=owner, description=spec.description
+                )
+            except IntegrityError:
+                agent = agent_store.get(agent_id)  # a concurrent identical upload won
+        if (
+            agent is not None
+            and agent.kind == "user"
+            and agent.created_by == owner
+            and agent.name == name
+            and agent.bundle_location == location
+        ):
+            return agent
+    return None

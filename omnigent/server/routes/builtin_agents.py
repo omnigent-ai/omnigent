@@ -31,7 +31,7 @@ from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider, local_single_user_enabled
-from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
@@ -192,7 +192,9 @@ def install_user_agent(
             code=ErrorCode.CONFLICT,
         )
     agent_id = installed_agent_id(owner, name)
-    location = bundle_location(agent_id, bundle_bytes)
+    # Named by content, so reinstalling the same files is a no-op however the
+    # client tarred them.
+    location = content_bundle_location(agent_id, bundle_bytes)
     existing = agent_store.get(agent_id)
     if existing is None:
         artifact_store.put(location, bundle_bytes)
