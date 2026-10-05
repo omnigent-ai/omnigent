@@ -1449,9 +1449,10 @@ def _accumulate_session_usage(
     Cost is computed when the model's per-token pricing is
     available from the MLflow catalog (looked up once per call
     from the response's ``model`` field). When the harness instead
-    reports an authoritative per-turn ``cost_usd`` (e.g. Copilot's
-    AI-credit total), that value is used directly in preference to
-    the catalog estimate. The ``total_cost_usd`` key is written
+    reports an authoritative per-turn ``cost_usd`` (Copilot's
+    AI-credit total, or the per-request cost a LiteLLM gateway
+    returns), that value is used directly in preference to the
+    catalog estimate. The ``total_cost_usd`` key is written
     **only when the turn is priced** (catalog pricing available or a
     harness-reported cost) — an unpriced session leaves it absent
     (its presence is what distinguishes a priced ``$0.00`` from

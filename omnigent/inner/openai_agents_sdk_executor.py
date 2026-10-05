@@ -14,8 +14,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
 import json
 import logging
+import math
 import os
 import subprocess
 import time
@@ -956,6 +958,63 @@ def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIC
     return client
 
 
+# Per-request USD cost a LiteLLM-style gateway reports on each response.
+_GATEWAY_COST_HEADER = "x-litellm-response-cost"
+
+# Gateway-reported costs of the turn in progress. Set per ``run_turn`` call;
+# the SDK's request tasks inherit the list and the response hook appends to it.
+_turn_gateway_costs: contextvars.ContextVar[list[float] | None] = contextvars.ContextVar(
+    "openai_agents_turn_gateway_costs", default=None
+)
+
+
+def _parse_gateway_cost(value: str | None) -> float | None:
+    """Parse a gateway cost header value into a non-negative finite USD amount.
+
+    :param value: Raw header value, e.g. ``"0.0123"``; ``None`` when absent.
+    :returns: The cost, or ``None`` when the header is missing or malformed.
+    """
+    if not value:
+        return None
+    try:
+        cost = float(value)
+    except ValueError:
+        return None
+    if not math.isfinite(cost) or cost < 0:
+        return None
+    return cost
+
+
+async def _record_gateway_cost(response: httpx.Response) -> None:
+    """httpx response hook: credit a successful response's reported cost to the turn."""
+    costs = _turn_gateway_costs.get()
+    if costs is None or not response.is_success:
+        return
+    cost = _parse_gateway_cost(response.headers.get(_GATEWAY_COST_HEADER))
+    if cost is not None:
+        costs.append(cost)
+
+
+def _install_gateway_cost_hook(client: AsyncOpenAIClient) -> None:
+    """Observe the gateway cost header on every HTTP response *client* receives.
+
+    The Agents SDK exposes no response headers, so the hook sits on the
+    ``AsyncOpenAI`` client's underlying httpx client. Clients without one
+    (unit-test stand-ins) are left untouched.
+
+    :param client: The ``AsyncOpenAI`` (or compatible) client the SDK will use.
+    """
+    http_client = getattr(client, "_client", None)
+    if not isinstance(http_client, httpx.AsyncClient):
+        return
+    hooks = http_client.event_hooks
+    if _record_gateway_cost not in hooks["response"]:
+        http_client.event_hooks = {
+            **hooks,
+            "response": [*hooks["response"], _record_gateway_cost],
+        }
+
+
 def _count_output_items(new_items: Sequence[object]) -> int:
     """Count run items that represent user-visible output.
 
@@ -1098,6 +1157,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                 model=model,
             )
         )
+        _install_gateway_cost_hook(raw_client)
         # Wrap the chat.completions path to strip list-type delta.content
         # (reasoning blocks emitted by models like Kimi K2).  The SDK's
         # ChatCmplStreamHandler validates delta as str; list input raises
@@ -1488,6 +1548,8 @@ class OpenAIAgentsSDKExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         cfg = config or ExecutorConfig()
+        gateway_costs: list[float] = []
+        _turn_gateway_costs.set(gateway_costs)
         # cfg.model (per-request /model override; agent name no longer
         # leaks here) wins over the spec default
         # (HARNESS_OPENAI_AGENTS_MODEL → self._model_override).
@@ -1883,6 +1945,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                 }
                 if cached_tok:
                     turn_usage["cache_read_input_tokens"] = cached_tok
+                if gateway_costs:
+                    # What the gateway billed; the server prefers it over a catalog estimate.
+                    turn_usage["cost_usd"] = sum(gateway_costs)
         _notify_usage_from_dict(model=model, usage=turn_usage)
 
         # Emit CompactionComplete if the SDK compacted this turn.
