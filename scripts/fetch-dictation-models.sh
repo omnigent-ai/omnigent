@@ -3,19 +3,23 @@
 # (designs/server-dictation.md) into ~/.omnigent/models/dictation/:
 #   asr/    streaming Nemotron transducer (int8, ~650 MB) — the recognizer
 #   punct/  online CNN-BiLSTM punctuation (int8, ~38 MB) — live re-punctuation
+#   punct-final/  offline Chinese/English CT-Transformer (int8 model, ~72 MB) —
+#                 final Web Speech and server-transcript punctuation
 #
-# Both are Apache-2.0 upstream releases packaged by k2-fsa. If these exact
+# All three are Apache-2.0 upstream releases packaged by k2-fsa. If these exact
 # URLs move, the catalogs are:
 #   https://k2-fsa.github.io/sherpa/onnx/pretrained_models/index.html
 #   https://k2-fsa.github.io/sherpa/onnx/punctuation/pretrained_models.html
 # Any streaming transducer dir (encoder/decoder/joiner + tokens.txt) works;
-# point OMNIGENT_DICTATION_MODEL_DIR / OMNIGENT_DICTATION_PUNCT_DIR at
-# alternates.
+# point OMNIGENT_DICTATION_MODEL_DIR / OMNIGENT_DICTATION_PUNCT_DIR /
+# OMNIGENT_DICTATION_FINAL_PUNCT_MODEL at alternates. Overriding
+# OMNIGENT_DICTATION_MODEL_ROOT does not change those runtime variables.
 set -euo pipefail
 
 DEST="${OMNIGENT_DICTATION_MODEL_ROOT:-$HOME/.omnigent/models/dictation}"
 ASR_TARBALL="sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25"
 PUNCT_TARBALL="sherpa-onnx-online-punct-en-2024-08-06"
+FINAL_PUNCT_TARBALL="sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
 ASR_GH="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
 PUNCT_GH="https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models"
 
@@ -43,6 +47,7 @@ fetch() { # fetch <tarball-stem> <base-url> <dest-subdir> <label>
 
 fetch "$ASR_TARBALL" "$ASR_GH" "asr" "streaming ASR model (~650 MB)"
 fetch "$PUNCT_TARBALL" "$PUNCT_GH" "punct" "punctuation model (~38 MB)"
+fetch "$FINAL_PUNCT_TARBALL" "$PUNCT_GH" "punct-final" "Chinese/English final punctuation model (~72 MB model)"
 
 echo ">> dictation models ready under $DEST"
 ls -d "$DEST"/*/
