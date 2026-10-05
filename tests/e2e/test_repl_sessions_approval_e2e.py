@@ -238,7 +238,11 @@ def test_sessions_single_approval_allows_llm_response(
     try:
         _wait_for_prompt_ready(child)
         child.send("Hello\r")
-        child.expect("approval required", timeout=30)
+        # The ready toolbar confirms that prompt_toolkit accepts input, but the
+        # submitted turn can still wait for the local sessions server on a cold,
+        # contended CI worker. Keep the assertion event-driven with a bounded
+        # service-startup allowance rather than resubmitting the turn.
+        child.expect("approval required", timeout=60)
         child.send("y\r")
         child.expect("approved", timeout=10)
 
@@ -298,19 +302,23 @@ def test_sessions_two_turns_fires_one_approval_per_turn(
     try:
         _wait_for_prompt_ready(child)
 
-        # Turn 1.
+        # Turn 1. Wait for its reply before starting turn 2: the TUI accepts
+        # only one submitted turn at a time, so a fixed drain window can drop
+        # the second input under CI load.
         child.send("First message\r")
         child.expect("approval required", timeout=30)
         child.send("y\r")
         child.expect("approved", timeout=10)
-        _read_pending(child, seconds=5.0)
+        child.expect("Response 1:", timeout=30)
+        _read_pending(child, seconds=0.3)
 
         # Turn 2.
         child.send("Second message\r")
         child.expect("approval required", timeout=30)
         child.send("y\r")
         child.expect("approved", timeout=10)
-        buffered = _read_pending(child, seconds=5.0)
+        child.expect("Response 2:", timeout=30)
+        buffered = _read_pending(child, seconds=0.3)
         assert re.search(r"[A-Za-z]{3,}", buffered), (
             f"No reply after second-turn approval.\nBuffer:\n{buffered[:800]}"
         )

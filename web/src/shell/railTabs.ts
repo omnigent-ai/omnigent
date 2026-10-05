@@ -6,8 +6,9 @@
 
 /** The selectable tabs in the right workspace rail, in display order.
  *  "browser" and "sidechat" are dynamic-tab modes (a browser tab / a side-chat
- *  tab is selected), not fixed nav tabs — the nav strip renders the first four. */
-export type RightRailTab = "files" | "changes" | "github" | "subagents" | "browser" | "sidechat";
+ *  tab is selected), not fixed nav tabs — the nav strip renders the first five. */
+export type RightRailTab =
+  "files" | "changes" | "github" | "gitlab" | "subagents" | "browser" | "sidechat";
 
 /**
  * Count/status badge geometry. Fixed height with min-width == height keeps a

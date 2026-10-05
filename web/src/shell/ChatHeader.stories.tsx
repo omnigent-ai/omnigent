@@ -25,6 +25,9 @@ const mobileMenu = {
   onOpenSubagents: () => undefined,
   githubPanelOpen: false,
   onOpenGithub: () => undefined,
+  showGitlabTab: false,
+  gitlabPanelOpen: false,
+  onOpenGitlab: () => undefined,
   onOpenMainExecutionLog: () => undefined,
 };
 

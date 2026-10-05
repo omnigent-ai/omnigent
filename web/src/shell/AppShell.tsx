@@ -115,6 +115,7 @@ import {
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { GithubPanel } from "./GithubPanel";
+import { GitlabPanel } from "./GitlabPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
@@ -438,6 +439,7 @@ export function AppShell() {
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
   const [githubPanelOpen, setGithubPanelOpen] = useState(false);
+  const [gitlabPanelOpen, setGitlabPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
   // state per session. A brand-new session (no saved `open`) follows the
   // Appearance "Workspace panel" default; reopening a session restores how
@@ -884,6 +886,12 @@ export function AppShell() {
     enabled: canBrowseWorkspace,
   });
   const showFilesPanel = canBrowseWorkspace && environmentQuery.data?.available !== false;
+  // Connection providers are deployment capabilities. Keep provider-specific
+  // workspace tabs out of the rail when their backend routes are not mounted;
+  // Settings remains responsible for prompting users to connect an enabled
+  // provider. Wait for /v1/info instead of showing a tab that may disappear.
+  const gitlabConfigured =
+    serverInfo !== "loading" && serverInfo.enabled_connections.includes("gitlab");
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -894,9 +902,11 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
-        // GitHub tab: shares the Files/workspace gate. Non-git workspaces and
-        // other unavailable reasons are shown as empty states in the panel.
+        // GitHub remains available for ordinary git workspaces. GitLab is an
+        // optional connection provider, so do not surface its session tab when
+        // the deployment has not configured it.
         github: showFilesPanel,
+        gitlab: showFilesPanel && gitlabConfigured,
         // Browser soft tabs: available only when the shell hosts the embedded
         // WebContentsView. Plain web and older desktop builds hide the "+"
         // option entirely so they never surface a dead tab whose calls no-op.
@@ -908,7 +918,7 @@ export function AppShell() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel],
+    [gitlabConfigured, showFilesPanel],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -1091,6 +1101,7 @@ export function AppShell() {
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
     setGithubPanelOpen(false);
+    setGitlabPanelOpen(false);
     setFilesPanelShowHidden(true);
     // Drop shell interaction state carried from the outgoing session: a
     // still-armed create ref would otherwise auto-focus an unrelated shell in
@@ -1928,7 +1939,8 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
-    setGithubPanelOpen(false); // close mobile github drawer
+    setGithubPanelOpen(false); // close mobile GitHub drawer
+    setGitlabPanelOpen(false); // close mobile GitLab drawer
     setExecutionLogsKey(key);
   }
 
@@ -1941,10 +1953,12 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
-    setGithubPanelOpen(false); // close mobile github drawer
+    setGithubPanelOpen(false); // close mobile GitHub drawer
+    setGitlabPanelOpen(false); // close mobile GitLab drawer
     setFilesDrawerFlatView(flatView);
     setFilesPanelOpen(true);
   }
+
   const openFilesPanel = () => openFilesDrawer(false);
   const openChangesPanel = () => openFilesDrawer(true);
 
@@ -1957,7 +1971,8 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
-    setGithubPanelOpen(false); // close mobile github drawer
+    setGithubPanelOpen(false); // close mobile GitHub drawer
+    setGitlabPanelOpen(false); // close mobile GitLab drawer
     setSubagentsPanelOpen(true);
   }
 
@@ -1972,26 +1987,39 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
-    setGithubPanelOpen(false); // close mobile github drawer
+    setGithubPanelOpen(false); // close mobile GitHub drawer
+    setGitlabPanelOpen(false); // close mobile GitLab drawer
     setShellsPanelOpen(true);
   }
 
-  // Mobile FAB → "GitHub" opens the GitHub panel as a full-screen drawer
-  // (matches the desktop rail's GitHub tab; the panel handles all states —
-  // not-a-git-repo, no gh CLI, unauthenticated, no PR — itself).
+  // Mobile FAB → "GitHub" / "GitLab" opens the matching review panel as a
+  // full-screen drawer, mirroring the desktop workspace rail tabs.
   const openGithubPanel = useCallback(() => {
-    setSelectedFilePath(null); // close file viewer
+    setSelectedFilePath(null);
     clearFileViewerUrl();
-    setPanelInitialKey(null); // close terminals panel
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
+    setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setShellsPanelOpen(false);
+    setGitlabPanelOpen(false);
     setGithubPanelOpen(true);
   }, [clearFileViewerUrl, setPanelInitialKey]);
 
-  // Composer links open the mobile drawer or reveal the desktop GitHub tab.
-  // Deselect files/shells so the chosen panel owns its content slot.
+  const openGitlabPanel = useCallback(() => {
+    setSelectedFilePath(null);
+    clearFileViewerUrl();
+    setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setShellsPanelOpen(false);
+    setGithubPanelOpen(false);
+    setGitlabPanelOpen(true);
+  }, [clearFileViewerUrl, setPanelInitialKey]);
+
+  // Composer review links open a full-screen drawer on mobile or reveal the
+  // matching desktop workspace tab.
   const openGithubTab = useCallback(() => {
     if (isMobileViewport()) {
       openGithubPanel();
@@ -2014,6 +2042,22 @@ export function AppShell() {
     setRightPanelOpenAnimated,
   ]);
 
+  const openGitlabTab = useCallback(() => {
+    if (isMobileViewport()) {
+      openGitlabPanel();
+      return;
+    }
+    setSelectedFilePath(null);
+    setSelectedTerminalKey(null);
+    if (!terminalFirst) setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setRightRailTab("gitlab");
+    setRightPanelOpen(true);
+    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+  }, [conversationId, terminalFirst, setPanelInitialKey, openGitlabPanel]);
+
   function openMainExecutionLog() {
     // Mobile FAB → "Execution logs" jumps straight to the main thread.
     // Children are reachable via the panel's tab switcher.
@@ -2030,6 +2074,7 @@ export function AppShell() {
       openFile: openFileViewer,
       registerNavigationGuard,
       openGithubTab,
+      openGitlabTab,
       isChangedPath,
       conversationId,
       workspaceRoot,
@@ -2040,6 +2085,7 @@ export function AppShell() {
       openFileViewer,
       registerNavigationGuard,
       openGithubTab,
+      openGitlabTab,
       isChangedPath,
       conversationId,
       workspaceRoot,
@@ -2394,6 +2440,8 @@ export function AppShell() {
                       subagentsPanelOpen,
                       shellsPanelOpen,
                       githubPanelOpen,
+                      gitlabPanelOpen,
+                      showGitlabTab: railTabsAvailable.gitlab,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2411,6 +2459,7 @@ export function AppShell() {
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
                       onOpenGithub: openGithubPanel,
+                      onOpenGitlab: openGitlabPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -2462,6 +2511,7 @@ export function AppShell() {
                     onRightRailTabChange={handleRightRailTabChange}
                     showFilesPanel={showFilesPanel}
                     showGithubTab={railTabsAvailable.github}
+                    showGitlabTab={railTabsAvailable.gitlab}
                     showBrowserTab={railTabsAvailable.browser}
                     onBrowserTabOpened={revealRightPanel}
                     changedCount={changedCount}
@@ -2573,6 +2623,16 @@ export function AppShell() {
                   testId="github-panel-drawer"
                 >
                   <GithubPanel conversationId={conversationId} />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && railTabsAvailable.gitlab && (
+                <MobilePanelDrawer
+                  open={gitlabPanelOpen}
+                  title="GitLab"
+                  onClose={() => setGitlabPanelOpen(false)}
+                  testId="gitlab-panel-drawer"
+                >
+                  <GitlabPanel conversationId={conversationId} />
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}

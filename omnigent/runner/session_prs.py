@@ -38,8 +38,9 @@ def _valid_hostname(host: str) -> bool:
 
 
 class PullRequestRef(BaseModel):
-    """A PR belongs to its base repository, including for fork PRs."""
+    """A GitHub pull request or GitLab merge request in its base project."""
 
+    provider: Literal["github", "gitlab"] = "github"
     host: str
     repository: str
     number: int
@@ -47,11 +48,16 @@ class PullRequestRef(BaseModel):
 
     @classmethod
     def from_url(cls, value: str) -> PullRequestRef:
-        """Normalize a GitHub PR URL, rejecting non-PR and credential-bearing URLs."""
+        """Normalize an HTTPS GitHub PR or GitLab MR URL without credentials."""
         parsed = urlsplit(value.strip())
         host = (parsed.hostname or "").lower()
-        match = re.fullmatch(
+        github_match = re.fullmatch(
             r"/([\w.-]+/[\w.-]+)/pull/([1-9][0-9]*)(?:/(?:files|commits|checks))?/?",
+            parsed.path,
+            flags=re.ASCII,
+        )
+        gitlab_match = re.fullmatch(
+            r"/([\w.-]+(?:/[\w.-]+)+)/-/merge_requests/([1-9][0-9]*)/?",
             parsed.path,
             flags=re.ASCII,
         )
@@ -59,23 +65,25 @@ class PullRequestRef(BaseModel):
             parsed.scheme != "https"
             or not _valid_hostname(host)
             or parsed.netloc.lower() != host
-            or match is None
+            or (github_match is None and gitlab_match is None)
         ):
-            raise ValueError("Expected an HTTPS GitHub pull request URL")
+            raise ValueError("Expected an HTTPS GitHub pull request or GitLab merge request URL")
+        match = github_match or gitlab_match
+        assert match is not None
+        provider: Literal["github", "gitlab"] = "github" if github_match else "gitlab"
         repository = match[1].lower()
         if any(part in {".", ".."} for part in repository.split("/")):
             raise ValueError("Invalid repository")
         number = int(match[2])
-        return cls(
-            host=host,
-            repository=repository,
-            number=number,
-            url=f"https://{host}/{repository}/pull/{number}",
-        )
+        if provider == "github":
+            url = f"https://{host}/{repository}/pull/{number}"
+        else:
+            url = f"https://{host}/{repository}/-/merge_requests/{number}"
+        return cls(provider=provider, host=host, repository=repository, number=number, url=url)
 
     @property
     def repo_argument(self) -> str:
-        """Explicit gh repository selector, including GitHub Enterprise host."""
+        """Explicit repository selector, including the provider host."""
         return f"{self.host}/{self.repository}"
 
 

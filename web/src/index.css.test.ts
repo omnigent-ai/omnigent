@@ -515,6 +515,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           onRightRailTabChange: () => {},
           showFilesPanel: true,
           showGithubTab: false,
+          showGitlabTab: false,
           showBrowserTab: false,
           changedCount: 0,
           subagentsWorking: 0,

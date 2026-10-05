@@ -1316,6 +1316,8 @@ def create_app(
     sandbox_config: ManagedSandboxDeployment | None = None,
     github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
+    gitlab_config: Any | None = None,  # GitLabAppConfig — GitLab OAuth integration
+    gitlab_store: Any | None = None,  # GitlabConnectionStore — GitLab OAuth integration
     databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
@@ -1852,6 +1854,7 @@ def create_app(
 
     _connection_inputs = {
         "github": (github_config, github_store),
+        "gitlab": (gitlab_config, gitlab_store),
         "databricks": (databricks_config, databricks_store),
     }
     for _provider in connection_providers():
@@ -2898,7 +2901,7 @@ def create_app(
         # and its connection store are present.
         enabled_connections = [
             provider
-            for provider in ("github", "databricks")
+            for provider in ("github", "gitlab", "databricks")
             if getattr(app.state, f"{provider}_config", None) is not None
             and getattr(app.state, f"{provider}_store", None) is not None
         ]

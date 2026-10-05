@@ -57,10 +57,12 @@ import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { GitlabIcon } from "@/components/icons/GitlabIcon";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import { GithubPanel } from "./GithubPanel";
+import { GitlabPanel } from "./GitlabPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -648,6 +650,8 @@ interface WorkspacePanelProps {
   showFilesPanel: boolean;
   /** Whether the GitHub tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
+  /** Whether the deployment-enabled GitLab tab is available for this workspace. */
+  showGitlabTab: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
   /** Reveal the workspace after a Browser tab is opened by a global shortcut. */
@@ -754,6 +758,7 @@ function WorkspacePanelImpl({
   onRightRailTabChange,
   showFilesPanel,
   showGithubTab,
+  showGitlabTab,
   showBrowserTab,
   onBrowserTabOpened,
   changedCount,
@@ -959,6 +964,7 @@ function WorkspacePanelImpl({
   const visiblePermanentTabs: RightRailTab[] = tabOrder.filter((tab) => {
     if (tab === "subagents") return true;
     if (tab === "github") return pending || showGithubTab;
+    if (tab === "gitlab") return pending || showGitlabTab;
     return pending || showFilesPanel;
   });
   const shortcutFor = (tab: RightRailTab) => {
@@ -991,6 +997,7 @@ function WorkspacePanelImpl({
     tabOrder.find((tab) => {
       if (tab === "subagents") return true;
       if (tab === "github") return showGithubTab;
+      if (tab === "gitlab") return showGitlabTab;
       return showFilesPanel;
     }) ?? "subagents";
   useEffect(() => {
@@ -1054,6 +1061,21 @@ function WorkspacePanelImpl({
         >
           <GithubMono size={16} />
           <span className="sr-only">GitHub</span>
+        </TabsTrigger>
+      </WorkspaceTabTooltip>
+    ),
+    gitlab: (pending || showGitlabTab) && (
+      <WorkspaceTabTooltip key="gitlab" label="GitLab" shortcut={shortcutFor("gitlab")}>
+        <TabsTrigger
+          value="gitlab"
+          aria-label="GitLab"
+          aria-keyshortcuts={shortcutFor("gitlab")}
+          data-workspace-tab="gitlab"
+          disabled={pending}
+          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+        >
+          <GitlabIcon className="size-4" />
+          <span className="sr-only">GitLab</span>
         </TabsTrigger>
       </WorkspaceTabTooltip>
     ),
@@ -1426,6 +1448,8 @@ function WorkspacePanelImpl({
             />
           ) : rightRailTab === "github" && showGithubTab ? (
             <GithubPanel conversationId={conversationId} />
+          ) : rightRailTab === "gitlab" && showGitlabTab ? (
+            <GitlabPanel conversationId={conversationId} />
           ) : rightRailTab === "subagents" && rootSessionId ? (
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
           ) : (

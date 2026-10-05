@@ -341,9 +341,10 @@ describe("Composer status line (branch + context ring)", () => {
     useComposerGitStatusMock.mockReturnValue(
       composerGitStatus({
         branch: "geist",
-        branchState: "ready",
+        branchState: "branch",
         isWorktree: true,
         worktreePath: "/workspace/geist",
+        repoDetected: true,
       }),
     );
     renderComposer();
@@ -394,9 +395,10 @@ describe("Composer status line (branch + context ring)", () => {
     useComposerGitStatusMock.mockReturnValue(
       composerGitStatus({
         branch: "geist",
-        branchState: "ready",
+        branchState: "branch",
         isWorktree: true,
         worktreePath: "/workspace/geist",
+        repoDetected: true,
       }),
     );
     renderComposer({ subAgentLabel: "check-eligibility" });

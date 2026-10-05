@@ -47,11 +47,16 @@ def connection_providers() -> list[ConnectionProvider]:
     from omnigent.server.databricks_identity import resolve_databricks_credential
     from omnigent.server.github_app_client import GitHubAppClient
     from omnigent.server.github_identity import resolve_github_credential
+    from omnigent.server.gitlab_app_client import GitLabAppClient
+    from omnigent.server.gitlab_identity import resolve_gitlab_credential
     from omnigent.server.routes.connections_databricks import (
         create_connections_databricks_router,
     )
     from omnigent.server.routes.connections_github import (
         create_connections_github_router,
+    )
+    from omnigent.server.routes.connections_gitlab import (
+        create_connections_gitlab_router,
     )
 
     return [
@@ -60,6 +65,12 @@ def connection_providers() -> list[ConnectionProvider]:
             client_factory=GitHubAppClient,
             router_factory=create_connections_github_router,
             credential_resolver=resolve_github_credential,
+        ),
+        ConnectionProvider(
+            name="gitlab",
+            client_factory=GitLabAppClient,
+            router_factory=create_connections_gitlab_router,
+            credential_resolver=resolve_gitlab_credential,
         ),
         ConnectionProvider(
             name="databricks",
