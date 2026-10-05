@@ -833,9 +833,10 @@ async function postEvent(config, body, options = {}) {
   return response;
 }
 
-// Non-durable status, preview, and metadata events are intentionally
-// best-effort. Durable conversation items use postDurableConversationItem
-// below, which retries transient failures and propagates exhaustion instead.
+// Authoritative user, assistant, tool, and reasoning transcript items use
+// postDurableConversationItem below, which retries transient failures and
+// propagates exhaustion. Auxiliary error/status, preview, and metadata events
+// use postEventBestEffort and intentionally fail open.
 async function postEventBestEffort(config, body) {
   try {
     return await postEvent(config, body);
