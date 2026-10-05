@@ -51,6 +51,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    level_satisfies,
 )
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import (
@@ -749,7 +750,11 @@ def register_resources_routes(
         # ``level is None`` means permissions are disabled (single-user); admins
         # resolve to owner. Edit collaborators keep the workspace unconditionally;
         # a view-only grant reaches it only once the owner shares its files.
-        if access.level is None or access.level >= LEVEL_EDIT or conv.share_workspace_files:
+        if (
+            access.level is None
+            or level_satisfies(access.level, LEVEL_EDIT)
+            or conv.share_workspace_files
+        ):
             return conv
         raise OmnigentError(
             f"{user_id!r} needs edit access to browse the workspace of session "

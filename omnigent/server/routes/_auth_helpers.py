@@ -41,7 +41,7 @@ from omnigent.server.permissions import (
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
-_LEVEL_NAMES = {1: "read", 2: "edit", 3: "manage", 4: "owner"}
+_LEVEL_NAMES = {1: "read", 2: "edit", 3: "manage", 4: "owner", 5: "comment"}
 
 
 def get_user_id(
@@ -407,7 +407,7 @@ def get_session_owner_id(
         return None
     grants, _ = permission_store.list_for_session(conversation_id, limit=1000)
     for g in grants:
-        if g.level >= LEVEL_OWNER:
+        if g.level == LEVEL_OWNER:
             return g.user_id
     return None
 

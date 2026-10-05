@@ -1304,10 +1304,10 @@ def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
 
     :param grants: All grants for the session, as returned by
         ``permission_store.list_for_sessions()[conv_id]``.
-    :returns: The ``user_id`` of the first grant whose level is at least
+    :returns: The ``user_id`` of the first grant whose level is
         :data:`LEVEL_OWNER`, or ``None`` if no such grant exists.
     """
-    return next((g.user_id for g in grants if g.level >= LEVEL_OWNER), None)
+    return next((g.user_id for g in grants if g.level == LEVEL_OWNER), None)
 
 
 def _session_status_from_cache(
