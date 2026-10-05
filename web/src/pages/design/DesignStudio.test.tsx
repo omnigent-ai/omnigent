@@ -43,9 +43,13 @@ vi.mock("@/components/chat/SideChatPane", () => ({
 vi.mock("@/shell/SlidesViewer", async () => {
   const { useState } = await import("react");
   return {
-    SlidesViewer: ({ content }: { content: string }) => {
+    SlidesViewer: ({ content, path }: { content: string; path?: string }) => {
       useState(() => (viewerMounts.count += 1));
-      return <div data-testid="slides-viewer">{content}</div>;
+      return (
+        <div data-testid="slides-viewer" data-path={path}>
+          {content}
+        </div>
+      );
     },
   };
 });
@@ -121,6 +125,7 @@ describe("DesignStudio on desktop", () => {
     expect(await screen.findByTestId("slides-viewer")).toHaveTextContent(
       "<section>Title</section>",
     );
+    expect(screen.getByTestId("slides-viewer")).toHaveAttribute("data-path", PATH);
     const chat = screen.getByTestId("side-chat");
     expect(chat).toHaveAttribute("data-session", SESSION);
     expect(chat).toHaveAttribute("data-full", "true");

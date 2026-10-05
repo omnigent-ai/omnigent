@@ -4,7 +4,11 @@
 
 import { act, cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchFileContent, type FileContentResponse } from "@/hooks/useFileContent";
+import {
+  fetchFileContent,
+  triggerBrowserDownload,
+  type FileContentResponse,
+} from "@/hooks/useFileContent";
 import {
   HTML_PREVIEW_HEAD,
   DESIGN_KIT_DIR,
@@ -30,7 +34,10 @@ import {
   isIgnoredNavKey,
 } from "./SlidesViewer";
 
-vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
+vi.mock("@/hooks/useFileContent", () => ({
+  fetchFileContent: vi.fn(),
+  triggerBrowserDownload: vi.fn(),
+}));
 vi.mock("@/lib/sessionsApi", () => ({ getSessionSlim: vi.fn() }));
 
 const DECK = `<!DOCTYPE html>
@@ -57,6 +64,18 @@ function fromFrame(
       new MessageEvent("message", { data: { source: SLIDES_MSG_SOURCE, ...data }, source }),
     );
   });
+}
+
+const downloadButton = () => screen.getByRole("button", { name: "Download HTML" });
+
+/** Clicks Download HTML and returns the saved file's name and text. */
+async function download() {
+  vi.mocked(triggerBrowserDownload).mockClear();
+  fireEvent.click(downloadButton());
+  expect(triggerBrowserDownload).toHaveBeenCalledTimes(1);
+  const [blob, name] = vi.mocked(triggerBrowserDownload).mock.calls[0];
+  expect(blob.type).toBe("text/html");
+  return { name, html: await blob.text() };
 }
 
 const keyFromFrame = (key: string, source?: Window | null) =>
@@ -350,6 +369,22 @@ describe("SlidesViewer", () => {
     const post = spyOnFrame();
     fireEvent.click(screen.getByRole("button", { name: "Print / Save as PDF" }));
     expect(post).toHaveBeenCalledWith({ source: SLIDES_MSG_SOURCE, type: "print" }, "*");
+  });
+
+  it("downloads the rendered deck as <deck>.html without navigating", async () => {
+    render(<SlidesViewer content={DECK} path="decks/Pitch.slides.html" />);
+    expect(await download()).toEqual({ name: "Pitch.html", html: prepareSlidesExport(DECK) });
+    expect(screen.getByTitle("Slide deck")).toBeInTheDocument();
+  });
+
+  it("names the download deck.html without a path", async () => {
+    render(<SlidesViewer content={DECK} />);
+    expect((await download()).name).toBe("deck.html");
+  });
+
+  it("disables Download HTML for a truncated deck", () => {
+    render(<SlidesViewer content={DECK} truncated />);
+    expect(downloadButton()).toBeDisabled();
   });
 
   it("shows a friendly empty state for a deck with no sections", () => {
@@ -709,12 +744,21 @@ describe("SlidesViewer design kit", () => {
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
+  it("exports the deck with the exact kit style the viewer rendered", async () => {
+    serve(KIT_FILES);
+    render(<SlidesViewer content={DECK} conversationId="conv_1" />);
+    expect(await screen.findByTitle("Design kit: Acme")).toBeInTheDocument();
+    const kitStyle = srcdoc().match(/<style data-omnigent-kit>[\s\S]*?<\/style>/)![0];
+    expect((await download()).html).toBe(prepareSlidesExport(DECK, kitStyle));
+  });
+
   it("renders the deck without the kit and names the reason when the kit is invalid", async () => {
     serve({ "kit.json": text("{") });
     render(<SlidesViewer content={DECK} conversationId="conv_1" />);
     expect(await screen.findByRole("status")).toHaveTextContent(
       "Design kit not applied: kit.json is not valid JSON",
     );
+    expect(downloadButton()).toBeDisabled();
     expect(srcdoc()).toBe(prepareSlidesDoc(DECK));
     expect(screen.getByText("1 / 3")).toBeInTheDocument();
     expect(screen.queryByTitle(/Design kit:/)).not.toBeInTheDocument();
@@ -734,8 +778,10 @@ describe("SlidesViewer design kit", () => {
       vi.mocked(fetchFileContent).mockReturnValue(new Promise(() => {}));
       render(<SlidesViewer content={DECK} conversationId="conv_1" />);
       expect(srcdoc()).toBe("");
+      expect(downloadButton()).toBeDisabled();
       act(() => vi.advanceTimersByTime(DESIGN_KIT_TIMEOUT_MS + 1));
       expect(srcdoc()).toBe(prepareSlidesDoc(DECK));
+      expect(downloadButton()).toBeDisabled();
       expect(screen.getByRole("status")).toHaveTextContent(
         "Design kit not applied: design kit timed out",
       );
@@ -853,12 +899,26 @@ describe("SlidesViewer design system", () => {
     expect(fetchFileContent).toHaveBeenCalledWith("conv_1", `${FOLDER}/colors_and_type.css`);
   });
 
+  it("exports the rewritten deck with the rendered system style", async () => {
+    serveSystem("full");
+    render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+    expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
+    const reads = vi.mocked(fetchFileContent).mock.calls.length;
+    const { html } = await download();
+    const style = srcdoc().match(/<style data-omnigent-design-system>[\s\S]*?<\/style>/)![0];
+    expect(html).toContain(style);
+    expect(html).toMatch(/<img src="data:image\/svg\+xml;base64,[^"]+">/);
+    expect(html).not.toContain("ds:assets");
+    expect(fetchFileContent).toHaveBeenCalledTimes(reads);
+  });
+
   it("renders the deck without the system and names the reason on failure", async () => {
     serveSystem("full", { fail: "500 Server Error" });
     render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
     expect(await screen.findByRole("status")).toHaveTextContent(
       "Design system not applied: 500 Server Error",
     );
+    expect(downloadButton()).toBeDisabled();
     expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
   });
 
@@ -869,6 +929,7 @@ describe("SlidesViewer design system", () => {
       "Design system is only available to the session owner",
     );
     expect(fetchFileContent).toHaveBeenCalledTimes(1);
+    expect(downloadButton()).toBeDisabled();
     expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
   });
 
@@ -912,6 +973,7 @@ describe("SlidesViewer design system", () => {
       expect(screen.getByRole("status")).toHaveTextContent(
         "Design system not applied: design system timed out",
       );
+      expect(downloadButton()).toBeDisabled();
     } finally {
       vi.useRealTimers();
     }

@@ -229,6 +229,7 @@ export function DesignStudio({
                 key={viewerKey}
                 content={deck.data.content}
                 truncated={deck.data.truncated}
+                path={path}
                 conversationId={sessionId}
               />
             ) : preview === "loading" ? (

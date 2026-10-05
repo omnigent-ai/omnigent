@@ -7,6 +7,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   CodeIcon,
+  DownloadIcon,
   Maximize2Icon,
   Minimize2Icon,
   PaletteIcon,
@@ -14,7 +15,7 @@ import {
   PrinterIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { fetchFileContent } from "@/hooks/useFileContent";
+import { fetchFileContent, triggerBrowserDownload } from "@/hooks/useFileContent";
 import { DESIGN_SYSTEM_POINTER } from "@/lib/designSystem";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { getSessionSlim } from "@/lib/sessionsApi";
@@ -26,6 +27,7 @@ import {
   SLIDES_MSG_SOURCE,
   countSlideSections,
   prepareSlidesDoc,
+  prepareSlidesExport,
   type KitFile,
 } from "./codeViewerHelpers";
 import {
@@ -83,6 +85,8 @@ async function isSessionOwner(conversationId: string): Promise<boolean> {
 export interface SlidesViewerProps {
   content: string;
   truncated?: boolean;
+  /** The deck's file path; names the HTML download. */
+  path?: string;
   /** Session whose workspace may hold `.omnigent/design-kit/`. */
   conversationId?: string;
   /** Switches the file viewer to the existing source view. */
@@ -92,6 +96,7 @@ export interface SlidesViewerProps {
 export function SlidesViewer({
   content,
   truncated = false,
+  path: deckPath,
   conversationId,
   onRequestSourceMode,
 }: SlidesViewerProps) {
@@ -249,6 +254,14 @@ export function SlidesViewer({
   );
 
   const empty = total === 0;
+  // A notice means the kit or design system did not load, so assets would be missing.
+  const canExport = brandingReady && !truncated && !branding.notice;
+  const downloadHtml = () => {
+    const file = deckPath?.split("/").at(-1) ?? "deck.slides.html";
+    const name = file.replace(/\.slides\.html$/i, "");
+    const html = prepareSlidesExport(deckContent, kitStyle, systemStyle);
+    triggerBrowserDownload(new Blob([html], { type: "text/html" }), `${name}.html`);
+  };
 
   // One tree for both states so the iframe stays mounted (hidden) while empty
   // and can still report a runtime count.
@@ -352,6 +365,23 @@ export function SlidesViewer({
             >
               <PrinterIcon className="size-4" />
               <span className="hidden sm:inline">Print / Save as PDF</span>
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              aria-label="Download HTML"
+              title={
+                canExport
+                  ? "Download HTML"
+                  : "Download HTML needs the full deck with its branding loaded"
+              }
+              disabled={!canExport}
+              onClick={downloadHtml}
+              className="h-8 gap-1.5 px-2"
+            >
+              <DownloadIcon className="size-4" />
+              <span className="hidden sm:inline">Download HTML</span>
             </Button>
             {sourceButton}
             {fullscreenSupported && (

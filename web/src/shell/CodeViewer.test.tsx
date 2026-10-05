@@ -40,7 +40,17 @@ vi.mock("./ModelViewer", () => ({
   ),
 }));
 
+// The deck viewer reads its kit through fetchFileContent; a 404 means no kit.
+vi.mock("@/hooks/useFileContent", async (importActual) => ({
+  ...(await importActual<Record<string, unknown>>()),
+  fetchFileContent: vi.fn(async () => {
+    throw new Error("404 Not Found");
+  }),
+  triggerBrowserDownload: vi.fn(),
+}));
+
 import * as permissions from "@/hooks/usePermissions";
+import { triggerBrowserDownload } from "@/hooks/useFileContent";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -773,6 +783,18 @@ describe("CodeViewer rendered previews skip Shiki highlighting", () => {
     vi.mocked(highlightCode).mockClear();
     rerender(build("analysis.ipynb"));
     expect(highlightCode).not.toHaveBeenCalled();
+  });
+});
+
+describe("CodeViewer slide deck", () => {
+  it("offers Download HTML and saves the deck as <deck>.html", async () => {
+    renderViewer("<section>One</section>", true, "decks/talk.slides.html", {
+      viewMode: "preview",
+    });
+    const button = await screen.findByRole("button", { name: "Download HTML" });
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    expect(triggerBrowserDownload).toHaveBeenCalledWith(expect.any(Blob), "talk.html");
   });
 });
 

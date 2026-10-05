@@ -877,6 +877,7 @@ export function CodeViewer({
           <SlidesViewer
             content={content}
             truncated={truncated}
+            path={path}
             conversationId={conversationId}
             onRequestSourceMode={onRequestSourceMode}
           />
