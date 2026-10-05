@@ -54,6 +54,16 @@ const DEBOUNCE_MS = 250;
 const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
 
 /**
+ * Older servers omit fields added to the session-list row. Treat those rows
+ * as authoritative so an omitted watermark clears a newer cached value.
+ */
+function normalizeFullSessionRows(items: SessionListWireItem[]): SessionListWireItem[] {
+  return items.map((item) =>
+    "last_message_at" in item ? item : { ...item, last_message_at: undefined },
+  );
+}
+
+/**
  * Overlay wire items onto every cached `["conversations", ...]` variant.
  *
  * @param queryClient - The app QueryClient.
@@ -419,7 +429,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           }
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,
-            frame.items,
+            normalizeFullSessionRows(frame.items),
             activeIdRef.current,
             getCurrentUserId(),
           );

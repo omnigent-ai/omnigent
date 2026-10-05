@@ -16,10 +16,10 @@ from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm
 from tests.e2e_ui.sessions.test_sidebar_mark_unread import (
-    _append_assistant_message,
     _row,
     _unread_dot,
 )
+from tests.e2e_ui.sessions.unread_helpers import append_assistant_message
 
 _ASSISTANT_BUBBLE = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING_INDICATOR = '[data-testid="working-indicator"]'
@@ -74,18 +74,13 @@ def _leave_chat(page: Page, base_url: str, session_id: str) -> Locator:
     return row
 
 
-def _seed_visible_message(page: Page, base_url: str, session_id: str, text: str) -> None:
-    """Append a settled assistant item before opening the session."""
-    _append_assistant_message(page, base_url, session_id, text)
-
-
 def test_metadata_model_report_and_hidden_meta_stay_read_live(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
     """Metadata and hidden context updates do not light an unread dot live."""
     base_url, session_id = seeded_session
-    _seed_visible_message(page, base_url, session_id, "Existing visible answer.")
+    append_assistant_message(page, base_url, session_id, "Existing visible answer.")
 
     page.goto(f"{base_url}/c/{session_id}")
     row = _row(page, session_id)
@@ -159,7 +154,7 @@ def test_visible_message_lights_dot_via_live_updates_and_reopen_clears_it(
 ) -> None:
     """A visible assistant event lights the row without a reload."""
     base_url, session_id = seeded_session
-    _seed_visible_message(page, base_url, session_id, "Read before leaving.")
+    append_assistant_message(page, base_url, session_id, "Read before leaving.")
 
     page.goto(f"{base_url}/c/{session_id}")
     row = _row(page, session_id)
@@ -169,7 +164,7 @@ def test_visible_message_lights_dot_via_live_updates_and_reopen_clears_it(
     _leave_chat(page, base_url, session_id)
 
     live_text = f"live-away-answer-{uuid.uuid4().hex[:8]}"
-    _append_assistant_message(page, base_url, session_id, live_text)
+    append_assistant_message(page, base_url, session_id, live_text)
 
     expect(_unread_dot(row)).to_be_visible(timeout=20_000)
     after = _list_item(page, base_url, session_id)
@@ -189,7 +184,7 @@ def test_running_suppresses_live_message_until_idle(
 ) -> None:
     """A live visible message waits for an idle status before lighting."""
     base_url, session_id = seeded_session
-    _seed_visible_message(page, base_url, session_id, "Settled baseline.")
+    append_assistant_message(page, base_url, session_id, "Settled baseline.")
 
     page.goto(f"{base_url}/c/{session_id}")
     row = _row(page, session_id)
@@ -209,7 +204,7 @@ def test_running_suppresses_live_message_until_idle(
     expect(running_badge).to_be_visible(timeout=20_000)
 
     live_text = f"running-answer-{uuid.uuid4().hex[:8]}"
-    _append_assistant_message(page, base_url, session_id, live_text)
+    append_assistant_message(page, base_url, session_id, live_text)
     expect(_unread_dot(row)).to_have_count(0)
     assert any(
         live_text in str(item.get("content")) for item in _items(page, base_url, session_id)
@@ -238,7 +233,7 @@ def test_focused_chat_receives_live_message_and_stays_read_after_leaving(
     expect(_unread_dot(row)).to_have_count(0)
 
     live_text = f"focused-answer-{uuid.uuid4().hex[:8]}"
-    _append_assistant_message(page, base_url, session_id, live_text)
+    append_assistant_message(page, base_url, session_id, live_text)
     expect(page.locator(_ASSISTANT_BUBBLE, has_text=live_text)).to_be_visible(timeout=20_000)
     expect(_unread_dot(row)).to_have_count(0)
 
@@ -276,7 +271,7 @@ def test_real_composer_turn_then_live_followup_marks_unread(
 
     row = _leave_chat(page, base_url, session_id)
     followup = f"followup-away-{uuid.uuid4().hex[:8]}"
-    _append_assistant_message(page, base_url, session_id, followup)
+    append_assistant_message(page, base_url, session_id, followup)
     expect(_unread_dot(row)).to_be_visible(timeout=20_000)
 
     row.locator(f'a[href="/c/{session_id}"]').click()
@@ -318,7 +313,7 @@ def test_archive_unarchive_keeps_read_watermark_live(
 ) -> None:
     """Archiving and restoring a read session does not create a false dot."""
     base_url, session_id = seeded_session
-    _seed_visible_message(page, base_url, session_id, "Archive lifecycle baseline.")
+    append_assistant_message(page, base_url, session_id, "Archive lifecycle baseline.")
 
     page.goto(f"{base_url}/c/{session_id}")
     row = _row(page, session_id)
@@ -352,7 +347,7 @@ def test_visible_message_reaches_unread_via_real_fallback_poll(
 ) -> None:
     """A disconnected updates stream falls back to the real session list poll."""
     base_url, session_id = seeded_session
-    _seed_visible_message(page, base_url, session_id, "Fallback baseline.")
+    append_assistant_message(page, base_url, session_id, "Fallback baseline.")
     list_requests: list[str] = []
 
     def record_list_request(request: Any) -> None:
@@ -372,7 +367,7 @@ def test_visible_message_reaches_unread_via_real_fallback_poll(
     initial_list_requests = len(list_requests)
 
     live_text = f"fallback-away-{uuid.uuid4().hex[:8]}"
-    _append_assistant_message(page, base_url, session_id, live_text)
+    append_assistant_message(page, base_url, session_id, live_text)
 
     # The normal mine-session fallback is 60 s; keep this explicit upper bound
     # long enough to distinguish a dead poll from a slow but real response.

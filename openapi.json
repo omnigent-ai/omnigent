@@ -6175,11 +6175,17 @@
             "type": "object"
           },
           "last_message_at": {
-            "default": 0,
-            "description": "Unix epoch seconds of the latest user-visible message item. `0` means no visible message is known. Unlike `updated_at`, metadata and lifecycle writes do not advance it.",
-            "format": "int64",
-            "title": "Last Message At",
-            "type": "integer"
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds of the latest user-visible message item. `0` means no visible message is known. `None` means the row's watermark is not yet authoritative; readers fall back to `updated_at` until reconciliation completes. Unlike `updated_at`, metadata and lifecycle writes do not advance it.",
+            "title": "Last Message At"
           },
           "owner": {
             "anyOf": [

@@ -12,7 +12,11 @@ import {
   sessionListQuery,
 } from "./sessions";
 
-import { markConversationUnread, resetReadStateForTests } from "@/hooks/useUnseenConversations";
+import {
+  markConversationUnread,
+  resetReadStateForTests,
+  seedReadState,
+} from "@/hooks/useUnseenConversations";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
@@ -134,6 +138,52 @@ describe("projectSessionPage", () => {
     const page = { data: [{ ...wireRow, status: "idle" }], has_more: false, last_id: null };
     expect(projectSessionPage(page, 25).sessions[0].unread).toBe(true);
     expect(projectSessionPage({ ...page, data: [wireRow] }, 25).sessions[0].unread).toBe(false);
+  });
+
+  it("uses the content watermark and falls back for legacy rows", () => {
+    seedReadState([
+      { id: "conv_meta", viewer_last_seen: 100, updated_at: 300, last_message_at: 100 },
+      { id: "conv_empty", viewer_last_seen: 0, updated_at: 300, last_message_at: 0 },
+      { id: "conv_unknown", viewer_last_seen: 100, updated_at: 300, last_message_at: null },
+      { id: "conv_legacy", viewer_last_seen: 100, updated_at: 300 },
+    ]);
+    const page = {
+      data: [
+        {
+          ...wireRow,
+          id: "conv_meta",
+          status: "idle",
+          updated_at: 300,
+          last_message_at: 100,
+          viewer_unread: false,
+        },
+        {
+          ...wireRow,
+          id: "conv_empty",
+          status: "idle",
+          updated_at: 300,
+          last_message_at: 0,
+          viewer_unread: false,
+        },
+        {
+          ...wireRow,
+          id: "conv_unknown",
+          status: "idle",
+          updated_at: 300,
+          last_message_at: null,
+          viewer_unread: false,
+        },
+        { ...wireRow, id: "conv_legacy", status: "idle", updated_at: 300, viewer_unread: false },
+      ],
+      has_more: false,
+      last_id: null,
+    };
+
+    const sessions = projectSessionPage(page, 25).sessions;
+    expect(sessions.find((session) => session.id === "conv_meta")?.unread).toBe(false);
+    expect(sessions.find((session) => session.id === "conv_empty")?.unread).toBe(false);
+    expect(sessions.find((session) => session.id === "conv_unknown")?.unread).toBe(true);
+    expect(sessions.find((session) => session.id === "conv_legacy")?.unread).toBe(true);
   });
 
   it("falls back to the sidebar's provisional first-message title", () => {

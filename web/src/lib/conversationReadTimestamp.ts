@@ -3,5 +3,5 @@ export function conversationReadTimestamp(
   updatedAt: number,
   lastMessageAt: number | null | undefined,
 ): number {
-  return lastMessageAt === undefined ? updatedAt : (lastMessageAt ?? 0);
+  return lastMessageAt ?? updatedAt;
 }

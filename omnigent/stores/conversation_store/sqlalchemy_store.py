@@ -107,6 +107,7 @@ from omnigent.stores.conversation_store import (
     CreatedSession,
     DailyCostState,
     SessionConnectivity,
+    WatermarkReconciliationResult,
     pinned_label_key,
 )
 from omnigent.stores.conversation_store.overrides import (
@@ -211,6 +212,11 @@ def _to_conversation(
     if meta and meta.session_usage:
         session_usage = json.loads(meta.session_usage)
     overrides = _decode_session_overrides(row.session_overrides)
+    last_message_at_fresh = (
+        row.last_message_observed_position is not None
+        and row.next_position is not None
+        and row.last_message_observed_position == row.next_position
+    )
     return Conversation(
         id=row.id,
         created_at=row.created_at,
@@ -267,6 +273,8 @@ def _to_conversation(
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
         project_id=meta.project_id if meta else None,
+        last_message_observed_position=row.last_message_observed_position,
+        last_message_at_fresh=last_message_at_fresh,
     )
 
 
@@ -318,6 +326,7 @@ def _new_session_conversation_row(
         root_conversation_id=root_conversation_id or conversation_id,
         agent_id=agent_id,
         session_overrides=session_overrides,
+        last_message_observed_position=0,
     )
 
 
@@ -921,7 +930,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversationMetadata, (current_workspace_id(), conversation_id)
             )
 
-    def _lock_conversation(self, session: Session, conversation_id: str) -> None:
+    def _lock_conversation(
+        self,
+        session: Session,
+        conversation_id: str,
+        *,
+        workspace_id: int | None = None,
+    ) -> None:
         """
         Acquire a row-level lock on the conversation to serialize
         position writes.
@@ -954,12 +969,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param session: The active SQLAlchemy session.
         :param conversation_id: The conversation to lock,
             e.g. ``"conv_abc123"``.
+        :param workspace_id: Workspace key for the row. Defaults to the
+            current workspace.
         """
+        lock_workspace_id = current_workspace_id() if workspace_id is None else workspace_id
         if self._supports_for_update:
             stmt = (
                 select(SqlConversation.id)
                 .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.workspace_id == lock_workspace_id,
                     SqlConversation.id == conversation_id,
                 )
                 .with_for_update()
@@ -973,10 +991,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             # short-circuit on equal values), which is what we
             # want here.
             session.execute(
-                text("UPDATE conversations SET updated_at = updated_at WHERE id = :id"),
+                text(
+                    "UPDATE conversations SET updated_at = updated_at "
+                    "WHERE workspace_id = :workspace_id AND id = :id"
+                ),
                 # Raw SQL bypasses the Uuid16 decorator; bind the 16-byte form
                 # so the WHERE matches the binary id column.
-                {"id": uuid_to_bytes(conversation_id)},
+                {
+                    "workspace_id": lock_workspace_id,
+                    "id": uuid_to_bytes(conversation_id),
+                },
             )
 
     def create_conversation(
@@ -1143,6 +1167,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     root_conversation_id=root_id,
                     agent_id=agent_id,
                     session_overrides=encoded_overrides,
+                    last_message_observed_position=0,
                 )
                 ap_sess.add(row)
                 if prepared_labels:
@@ -2492,6 +2517,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Bump updated_at on the conversation. A separate watermark tracks
             # visible message items so hidden metadata cannot light unread rows.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            prior_next_position = conv_row.next_position if conv_row is not None else None
+            prior_observed_position = (
+                conv_row.last_message_observed_position if conv_row is not None else None
+            )
+            marker_was_fresh = (
+                conv_row is not None
+                and prior_observed_position is not None
+                and prior_next_position is not None
+                and prior_observed_position == prior_next_position
+            )
             if conv_row is not None:
                 conv_row.updated_at = now
 
@@ -2576,12 +2611,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             insert_fts_bulk(session, fts_rows)
 
             if conv_row is not None and visible_message_appended:
-                conv_row.last_message_at = max(conv_row.last_message_at or 0, now)
+                if marker_was_fresh:
+                    conv_row.last_message_at = max(conv_row.last_message_at or 0, now)
 
             # Persist the advanced counter so the next append reads it instead
             # of scanning; this also lazily backfills a pre-counter conversation.
             if conv_row is not None:
                 conv_row.next_position = next_pos
+                # Mixed-version writers can advance ``next_position`` without
+                # advancing the marker; reconciliation must observe the gap.
+                if marker_was_fresh:
+                    conv_row.last_message_observed_position = next_pos
 
             return persisted
 
@@ -2589,6 +2629,202 @@ class SqlAlchemyConversationStore(ConversationStore):
             self._conv_session_immediate,
             "append_conversation_items",
             write,
+        )
+
+    def reconcile_last_message_watermarks(
+        self,
+        after: tuple[int, str] | None = None,
+        conversation_batch_limit: int = 100,
+        item_batch_limit: int = 1000,
+    ) -> WatermarkReconciliationResult:
+        """Advance visible-message watermarks through bounded item pages.
+
+        The returned cursor advances only past conversations whose item prefix
+        was fully observed. When one conversation has more than
+        ``item_batch_limit`` rows, its observed marker records the page cursor
+        while the conversation cursor remains unchanged; the next invocation
+        therefore resumes that same row without skipping later history.
+        """
+        if conversation_batch_limit <= 0:
+            raise ValueError("conversation_batch_limit must be positive")
+        if item_batch_limit <= 0:
+            raise ValueError("item_batch_limit must be positive")
+
+        workspace_id = current_workspace_id()
+        if after is not None and after[0] != workspace_id:
+            raise ValueError("after workspace must match the current workspace")
+
+        def reconcile(session: Session) -> WatermarkReconciliationResult:
+            stmt = (
+                select(SqlConversation)
+                .where(SqlConversation.workspace_id == workspace_id)
+                .order_by(SqlConversation.workspace_id.asc(), SqlConversation.id.asc())
+                .limit(conversation_batch_limit)
+            )
+            if after is not None:
+                stmt = stmt.where(SqlConversation.id > after[1])
+            with query_name_scope(
+                "omnigent.conversation_store.reconcile_last_message_watermarks.inspect_conversations"
+            ):
+                rows = list(session.execute(stmt).scalars().all())
+
+            if not rows:
+                return WatermarkReconciliationResult(None, True)
+
+            # Inspect the bounded conversation page without taking locks, then
+            # repair only its first stale row. This keeps one transaction and
+            # one decrypt page bounded even when a maintenance batch is large.
+            stale_index: int | None = None
+            for index, row in enumerate(rows):
+                if (
+                    row.last_message_observed_position is None
+                    or row.next_position is None
+                    or row.last_message_observed_position != row.next_position
+                ):
+                    stale_index = index
+                    break
+            if stale_index is None:
+                return WatermarkReconciliationResult(
+                    (workspace_id, rows[-1].id),
+                    len(rows) < conversation_batch_limit,
+                )
+
+            cursor = after if stale_index == 0 else (workspace_id, rows[stale_index - 1].id)
+            row = rows[stale_index]
+
+            # The lock serializes normal append writers. Refresh after it so
+            # the CAS below compares against the locked row's snapshot.
+            self._lock_conversation(session, row.id, workspace_id=workspace_id)
+            session.refresh(row)
+            old_marker = row.last_message_observed_position
+            old_next_position = row.next_position
+            if (
+                old_marker is not None
+                and old_next_position is not None
+                and old_marker == old_next_position
+            ):
+                return WatermarkReconciliationResult(
+                    (workspace_id, row.id),
+                    stale_index == len(rows) - 1 and len(rows) < conversation_batch_limit,
+                )
+
+            if old_next_position is None:
+                with query_name_scope(
+                    "omnigent.conversation_store.reconcile_last_message_watermarks.inspect_position"
+                ):
+                    last_position = session.execute(
+                        select(SqlConversationItem.position)
+                        .where(
+                            SqlConversationItem.workspace_id == workspace_id,
+                            SqlConversationItem.conversation_id == row.id,
+                        )
+                        .order_by(SqlConversationItem.position.desc())
+                        .limit(1)
+                    ).scalar_one_or_none()
+                target_next_position = (last_position + 1) if last_position is not None else 0
+            else:
+                target_next_position = old_next_position
+
+            start_position = old_marker if old_marker is not None else 0
+            reset_watermark = start_position > target_next_position
+            if reset_watermark:
+                start_position = 0
+
+            with query_name_scope(
+                "omnigent.conversation_store.reconcile_last_message_watermarks.inspect_unobserved_messages"
+            ):
+                message_rows = session.execute(
+                    select(
+                        SqlConversationItem.position,
+                        SqlConversationItem.created_at,
+                        SqlConversationItem.data,
+                    )
+                    .where(
+                        SqlConversationItem.workspace_id == workspace_id,
+                        SqlConversationItem.conversation_id == row.id,
+                        SqlConversationItem.type == encode_item_type("message"),
+                        SqlConversationItem.position >= start_position,
+                        SqlConversationItem.position < target_next_position,
+                    )
+                    .order_by(SqlConversationItem.position.asc())
+                    .limit(item_batch_limit + 1)
+                ).all()
+
+            has_more_messages = len(message_rows) > item_batch_limit
+            scanned_rows = message_rows[:item_batch_limit]
+            decoded_data = self._decode_item_data_batch([item.data for item in scanned_rows])
+            candidate_last_message_at = (
+                None if old_marker is None or reset_watermark else row.last_message_at
+            )
+            for item, data_json in zip(scanned_rows, decoded_data, strict=True):
+                try:
+                    item_data = json.loads(data_json)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"invalid message payload while reconciling conversation {row.id!r}"
+                    ) from exc
+                if not isinstance(item_data, dict):
+                    raise ValueError(
+                        f"invalid message payload while reconciling conversation {row.id!r}"
+                    )
+                is_meta = item_data.get("is_meta", False)
+                if not isinstance(is_meta, bool):
+                    raise ValueError(
+                        f"invalid message metadata while reconciling conversation {row.id!r}"
+                    )
+                if is_meta:
+                    continue
+                if candidate_last_message_at is None:
+                    candidate_last_message_at = item.created_at
+                else:
+                    candidate_last_message_at = max(candidate_last_message_at, item.created_at)
+
+            observed_position = (
+                scanned_rows[-1].position + 1
+                if has_more_messages and scanned_rows
+                else target_next_position
+            )
+            complete_row = not has_more_messages
+            values = {
+                "last_message_at": candidate_last_message_at,
+                "last_message_observed_position": observed_position,
+                "next_position": target_next_position,
+            }
+            conditions = [
+                SqlConversation.workspace_id == workspace_id,
+                SqlConversation.id == row.id,
+                (
+                    SqlConversation.last_message_observed_position.is_(None)
+                    if old_marker is None
+                    else SqlConversation.last_message_observed_position == old_marker
+                ),
+                (
+                    SqlConversation.next_position.is_(None)
+                    if old_next_position is None
+                    else SqlConversation.next_position == old_next_position
+                ),
+            ]
+            with query_name_scope(
+                "omnigent.conversation_store.reconcile_last_message_watermarks.advance_read_watermark"
+            ):
+                result = session.execute(
+                    update(SqlConversation).where(*conditions).values(**values)
+                )
+            if cast(_RowCountResult, result).rowcount != 1:
+                # An old writer may not take the row lock. Do not claim
+                # progress when its allocator changed underneath us.
+                return WatermarkReconciliationResult(cursor, False)
+            if not complete_row:
+                return WatermarkReconciliationResult(cursor, False)
+            return WatermarkReconciliationResult(
+                (workspace_id, row.id),
+                stale_index == len(rows) - 1 and len(rows) < conversation_batch_limit,
+            )
+
+        return run_write_transaction(
+            self._conv_session_immediate,
+            "reconcile_last_message_watermarks",
+            reconcile,
         )
 
     def list_projects(
@@ -4635,18 +4871,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 items_query = items_query.where(SqlConversationItem.position <= cutoff_position)
             source_items = session.execute(items_query).scalars().all()
 
-            # Forks copy history, so carry the visible-message watermark over.
-            # A full fork can reuse the source's persisted value; only a
-            # truncated fork (or a legacy/null source) needs to inspect the
-            # message payloads already loaded for this fork.
+            # Reuse a full source watermark only when its marker is fresh.
+            source_watermark_fresh = (
+                source.last_message_observed_position is not None
+                and source.next_position is not None
+                and source.last_message_observed_position == source.next_position
+            )
             message_positions = [
                 pos
                 for pos, src_item in enumerate(source_items)
                 if decode_item_type(src_item.type) == "message"
             ]
-            if not truncated and source.last_message_at is not None:
+            if not truncated and source_watermark_fresh:
                 new_conv_values["last_message_at"] = source.last_message_at
-            elif message_positions:
+            else:
                 decoded_messages = self._decode_item_data_batch(
                     [source_items[pos].data for pos in message_positions]
                 )
@@ -4658,6 +4896,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 new_conv_values["last_message_at"] = (
                     max(visible_message_times) if visible_message_times else None
                 )
+
+            # The fork's copied item set is complete even when the source was
+            # stale, so its marker starts authoritative at the copied count.
+            new_conv_values["last_message_observed_position"] = len(source_items)
 
             # Compaction cursors refer to item IDs. Since every copied item gets
             # a fresh ID, build the complete mapping before copying any payloads

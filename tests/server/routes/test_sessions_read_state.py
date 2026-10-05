@@ -72,6 +72,7 @@ def _make_conversation(conv_id: str = "conv_a") -> Conversation:
         root_conversation_id=conv_id,
         title="A session",
         agent_id="ag_test",
+        last_message_at_fresh=True,
     )
 
 

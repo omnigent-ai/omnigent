@@ -14,6 +14,8 @@ import uuid
 
 from playwright.sync_api import Locator, Page, expect
 
+from tests.e2e_ui.sessions.unread_helpers import append_assistant_message
+
 
 def _row(page: Page, session_id: str) -> Locator:
     """Locate a session row in normal or mobile sidebar layouts."""
@@ -38,17 +40,6 @@ def _set_title(page: Page, base_url: str, session_id: str, title: str) -> None:
     response = page.request.patch(
         f"{base_url}/v1/sessions/{session_id}",
         data={"title": title},
-    )
-    assert response.ok, response.text()
-
-
-def _append_assistant_message(page: Page, base_url: str, session_id: str, text: str) -> None:
-    response = page.request.post(
-        f"{base_url}/v1/sessions/{session_id}/events",
-        data={
-            "type": "external_assistant_message",
-            "data": {"agent": "hello_world", "text": text},
-        },
     )
     assert response.ok, response.text()
 
@@ -251,7 +242,7 @@ def test_collapsed_project_marker_follows_focus_read_without_route_change(
     # Browser emulation of the focus source used by the native-shell path.
     page.evaluate("window.dispatchEvent(new Event('blur'))")
     page.wait_for_timeout(2_100)
-    _append_assistant_message(
+    append_assistant_message(
         page,
         base_url,
         session_id,

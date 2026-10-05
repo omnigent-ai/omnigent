@@ -73,6 +73,26 @@ describe("SessionCard", () => {
     expect(screen.getByText("New messages")).toBeInTheDocument();
   });
 
+  it("ignores a metadata-only timestamp after the visible message was read", () => {
+    seedReadState([{ id: "conv_1", viewer_last_seen: 100, updated_at: 200, last_message_at: 100 }]);
+    const { card } = renderCard({
+      conversation: conversation({ status: "idle", updated_at: 200, last_message_at: 100 }),
+    });
+    expect(card).toHaveAttribute("data-state", "idle");
+    expect(screen.queryByText("New messages")).toBeNull();
+  });
+
+  it("falls back to updated_at for an unknown message watermark", () => {
+    seedReadState([
+      { id: "conv_1", viewer_last_seen: 100, updated_at: 200, last_message_at: null },
+    ]);
+    const { card } = renderCard({
+      conversation: conversation({ status: "idle", updated_at: 200, last_message_at: null }),
+    });
+    expect(card).toHaveAttribute("data-state", "unseen");
+    expect(screen.getByText("New messages")).toBeInTheDocument();
+  });
+
   it("falls back to idle and failed labels", () => {
     renderCard({ conversation: conversation({ status: "idle" }) });
     expect(screen.getByTestId("session-card")).toHaveAttribute("data-state", "idle");

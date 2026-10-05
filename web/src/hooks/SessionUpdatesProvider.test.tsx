@@ -36,6 +36,7 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
 import { SidebarDataContext, SidebarDataProvider, useSidebarView } from "./useSidebarData";
 import { useCanEdit } from "./usePermissions";
 import { sidebarConfig } from "@/lib/sidebarConfig";
+import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
 import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
 import { useSaveProjectOrder } from "./useProjectOrder";
 import * as projectsApi from "@/lib/projectsApi";
@@ -346,6 +347,43 @@ describe("SessionUpdatesProvider project folders", () => {
     ]);
     expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
   });
+});
+
+describe("SessionUpdatesProvider legacy session rows", () => {
+  it.each(["snapshot", "changed"] as const)(
+    "clears a cached message watermark when an older server omits it in a %s frame",
+    (type) => {
+      const client = new QueryClient();
+      const row = { ...conv("conv_a"), last_message_at: 100 };
+      client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
+        pages: [
+          {
+            data: [row],
+            first_id: row.id,
+            last_id: row.id,
+            has_more: false,
+          },
+        ],
+        pageParams: [undefined],
+      });
+      renderProvider(client, ["/"]);
+      const handler = frameHandler();
+
+      // A replica on the older schema sends a full row with updated_at but no
+      // last_message_at. The omitted watermark must not survive in the cache.
+      act(() =>
+        handler({
+          type,
+          items: [{ ...conv("conv_a"), updated_at: 200 }],
+        }),
+      );
+
+      const cached = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+        .pages[0].data[0]!;
+      expect(cached.last_message_at).toBeUndefined();
+      expect(conversationReadTimestamp(cached.updated_at, cached.last_message_at)).toBe(200);
+    },
+  );
 });
 
 describe("SessionUpdatesProvider fingerprint pruning", () => {

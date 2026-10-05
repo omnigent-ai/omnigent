@@ -1030,9 +1030,10 @@ def _build_session_list_item(
         ),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        # ``0`` is explicit on the wire so old empty sessions survive the
-        # GET endpoint's exclude-none serialization and WS null normalization.
-        last_message_at=conv.last_message_at or 0,
+        # A stale/null observed-position marker must be omitted from GET and
+        # sent as null on WS so clients fall back to ``updated_at``. Fresh
+        # empty rows use the historical explicit zero sentinel.
+        last_message_at=(conv.last_message_at or 0) if conv.last_message_at_fresh else None,
         title=title_without_closed_marker(conv.title),
         # Collapse per-user pin keys to the canonical bare key for this viewer
         # (never leak another user's pin key), then add the closed marker.

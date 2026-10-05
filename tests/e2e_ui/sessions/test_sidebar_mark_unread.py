@@ -23,9 +23,11 @@ import json
 import time
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.e2e_ui.conftest import fetch_with_retry
+from tests.e2e_ui.sessions.unread_helpers import append_assistant_message
 
 
 def _row(page: Page, session_id: str) -> Locator:
@@ -36,18 +38,6 @@ def _row(page: Page, session_id: str) -> Locator:
 def _unread_dot(row: Locator) -> Locator:
     """Locate the row's unread (pink) dot — the unseen session-state badge."""
     return row.locator('[data-testid="session-state-badge"][data-state="unseen"]')
-
-
-def _append_assistant_message(page: Page, base_url: str, session_id: str, text: str) -> None:
-    """Append one visible assistant message through the authenticated events API."""
-    response = page.request.post(
-        f"{base_url}/v1/sessions/{session_id}/events",
-        data={
-            "type": "external_assistant_message",
-            "data": {"agent": "hello_world", "text": text},
-        },
-    )
-    assert response.ok, response.text()
 
 
 def test_mark_unread_lights_the_dot_and_persists_across_reload(
@@ -87,9 +77,11 @@ def test_mark_unread_lights_the_dot_and_persists_across_reload(
     expect(_unread_dot(_row(page, session_id))).to_be_visible()
 
 
+@pytest.mark.parametrize("mark_entrypoint", ["row-kebab", "context-menu"])
 def test_marked_unread_clears_when_reopened_after_inbox_navigation(
     page: Page,
     seeded_session: tuple[str, str],
+    mark_entrypoint: str,
 ) -> None:
     """Reopening a flagged thread after leaving it counts as reading it.
 
@@ -105,8 +97,11 @@ def test_marked_unread_clears_when_reopened_after_inbox_navigation(
     expect(row).to_be_visible()
     expect(_unread_dot(row)).to_have_count(0)
 
-    row.hover()
-    row.get_by_test_id("conversation-actions").click()
+    if mark_entrypoint == "row-kebab":
+        row.hover()
+        row.get_by_test_id("conversation-actions").click()
+    else:
+        row.locator(f'a[href="/c/{session_id}"]').click(button="right")
     page.get_by_test_id("mark-unread-conversation").click()
     expect(_unread_dot(row)).to_be_visible()
 
@@ -125,39 +120,13 @@ def test_marked_unread_clears_when_reopened_after_inbox_navigation(
     expect(_unread_dot(_row(page, session_id))).to_have_count(0)
 
 
-def test_context_menu_unread_clears_when_reopened_after_inbox_navigation(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """The context-menu read action follows the same reopen contract."""
-    base_url, session_id = seeded_session
-
-    page.goto(f"{base_url}/c/{session_id}")
-
-    row = _row(page, session_id)
-    link = row.locator(f'a[href="/c/{session_id}"]')
-    expect(link).to_be_visible()
-    link.click(button="right")
-    page.get_by_test_id("mark-unread-conversation").click()
-    expect(_unread_dot(row)).to_be_visible()
-
-    page.get_by_test_id("inbox-button").click()
-    expect(page).to_have_url(f"{base_url}/inbox")
-    inbox_row = _row(page, session_id)
-    expect(inbox_row).to_be_visible()
-    inbox_row.locator(f'a[href="/c/{session_id}"]').click()
-    expect(page).to_have_url(f"{base_url}/c/{session_id}")
-
-    expect(_unread_dot(_row(page, session_id))).to_have_count(0)
-
-
 def test_metadata_update_does_not_light_dot_without_new_items(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
     """A title-only update must not look like an unread assistant turn."""
     base_url, session_id = seeded_session
-    _append_assistant_message(
+    append_assistant_message(
         page,
         base_url,
         session_id,
@@ -232,7 +201,7 @@ def test_new_visible_message_lights_dot_and_reopen_clears_it(
     expect(page).to_have_url(f"{base_url}/inbox")
     # Establish the active-chat watermark before the later turn is appended.
     page.wait_for_timeout(2_100)
-    _append_assistant_message(
+    append_assistant_message(
         page,
         base_url,
         session_id,

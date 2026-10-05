@@ -24,6 +24,8 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
+from omnigent.db.db_models import SqlConversation
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -295,6 +297,78 @@ def test_list_sessions_omits_liveness_fields(
     # the per-list connectivity + hosts queries this change removed.
     assert "runner_online" not in items[s1]
     assert "host_online" not in items[s1]
+
+
+@pytest.mark.parametrize("scenario", ["null_marker", "populated_stale"])
+def test_stale_watermark_omits_get_field_and_sends_ws_null(
+    app: FastAPI,
+    stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
+    fast_rescan: None,
+    scenario: str,
+) -> None:
+    """Mixed-version rows fall back conservatively on both list surfaces."""
+    conversation_store = stores[0]
+    session_id = _seed_session(stores, owner=ALICE, title="legacy")
+    if scenario == "populated_stale":
+        conversation_store.append(
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="before-legacy-gap",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "before"}],
+                    ),
+                )
+            ],
+        )
+    with conversation_store._session("test_setup") as session:
+        row = session.get(SqlConversation, (0, session_id))
+        assert row is not None
+        if scenario == "null_marker":
+            row.last_message_observed_position = None
+            row.next_position = 0
+        else:
+            assert row.last_message_observed_position == 1
+            row.next_position = 2
+    conversation_store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="legacy-response",
+                data=MessageData(
+                    role="assistant",
+                    agent="test-agent",
+                    content=[{"type": "output_text", "text": "legacy"}],
+                ),
+            )
+        ],
+    )
+    stale = conversation_store.get_conversation(session_id)
+    assert stale is not None
+    assert stale.last_message_observed_position == (None if scenario == "null_marker" else 1)
+    with conversation_store._session("test_setup") as session:
+        raw = session.get(SqlConversation, (0, session_id))
+        assert raw is not None
+        assert raw.next_position == (1 if scenario == "null_marker" else 3)
+    assert stale.last_message_at_fresh is False
+
+    client = TestClient(app)
+    get_response = client.get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
+    assert get_response.status_code == 200
+    get_item = next(item for item in get_response.json()["data"] if item["id"] == session_id)
+    assert "last_message_at" not in get_item
+
+    with client.websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        ws_item = snapshot["items"][0]  # type: ignore[index]
+        assert "last_message_at" in ws_item
+        assert ws_item["last_message_at"] is None
 
 
 def test_title_change_pushes_changed_frame(app: FastAPI, stores, fast_rescan: None) -> None:

@@ -16,7 +16,7 @@
 // unread override. Sessions without a baseline start read at their current
 // content watermark, even when the server has no read-state entry.
 
-import { useEffect, useRef, useSyncExternalStore } from "react";
+import { useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
 import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
@@ -390,27 +390,43 @@ export function useMarkConversationSeen(
   const previousConversationId = useRef(conversationId);
   const conversationIdRef = useRef(conversationId);
   const readTimestampRef = useRef(readTimestamp);
-  conversationIdRef.current = conversationId;
-  readTimestampRef.current = readTimestamp;
   const focusedRef = useRef(windowHasFocus());
+  const authoritativeFocusRef = useRef(false);
+  const focusAtMark = () => {
+    if (!authoritativeFocusRef.current) focusedRef.current = windowHasFocus();
+    return focusedRef.current;
+  };
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    conversationIdRef.current = conversationId;
+    readTimestampRef.current = readTimestamp;
+    // Before a DOM focus/blur/interact event has arrived, refresh the probe on
+    // each committed render; native shells can report it late at mount.
+    if (!authoritativeFocusRef.current) focusedRef.current = windowHasFocus();
+  }, [conversationId, readTimestamp]);
+
+  useLayoutEffect(() => {
     const markCurrentIfFocused = () => {
       const id = conversationIdRef.current;
       const timestamp = readTimestampRef.current;
-      if (!focusedRef.current || !id || timestamp === undefined) return;
+      if (!focusAtMark() || !id || timestamp === undefined) return;
       markConversationSeen(id, Math.max(nowSeconds(), timestamp));
     };
     const onFocus = () => {
+      const wasFocused = focusedRef.current;
+      authoritativeFocusRef.current = true;
       focusedRef.current = true;
-      markCurrentIfFocused();
+      if (!wasFocused) markCurrentIfFocused();
     };
     const onBlur = () => {
+      authoritativeFocusRef.current = true;
       focusedRef.current = false;
     };
     const onInteract = () => {
+      const wasFocused = focusedRef.current;
+      authoritativeFocusRef.current = true;
       focusedRef.current = true;
-      markCurrentIfFocused();
+      if (!wasFocused) markCurrentIfFocused();
     };
     window.addEventListener("focus", onFocus);
     window.addEventListener("blur", onBlur);
@@ -436,7 +452,7 @@ export function useMarkConversationSeen(
     const markIfFocused = () => {
       // Anchor at or above the content watermark being viewed. Wall clock wins
       // when it is ahead, capturing an update the poll has not picked up yet.
-      if (focusedRef.current)
+      if (focusAtMark())
         markConversationSeen(conversationId, Math.max(nowSeconds(), readTimestamp));
     };
     markIfFocused();

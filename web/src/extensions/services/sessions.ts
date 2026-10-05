@@ -129,12 +129,12 @@ function projectSession(value: unknown): ExtensionSessionSummary {
   const title = optionalBoundedString(row.title, "title", SESSION_TITLE_MAX_LENGTH);
   // Same provisional label the sidebar shows before the server seeds a title.
   const optimisticTitle = title === null ? getOptimisticTitle(id) : undefined;
-  const lastMessageAt =
-    typeof row.last_message_at === "number" && Number.isFinite(row.last_message_at)
-      ? row.last_message_at
-      : row.last_message_at === null
-        ? null
-        : undefined;
+  let lastMessageAt: number | null | undefined;
+  if (typeof row.last_message_at === "number" && Number.isFinite(row.last_message_at)) {
+    lastMessageAt = row.last_message_at;
+  } else if (row.last_message_at === null) {
+    lastMessageAt = null;
+  }
   return {
     id,
     title: title ?? optimisticTitle?.slice(0, SESSION_TITLE_MAX_LENGTH) ?? null,

@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -231,6 +231,13 @@ class CreatedSession:
 
     conversation: Conversation
     agent: Agent
+
+
+class WatermarkReconciliationResult(NamedTuple):
+    """Continuation returned by a bounded unread-watermark reconciliation."""
+
+    next_after: tuple[int, str] | None
+    complete: bool
 
 
 @dataclass(frozen=True)
@@ -724,6 +731,21 @@ class ConversationStore(ABC):
             with store-assigned IDs and timestamps.
         """
         ...
+
+    def reconcile_last_message_watermarks(
+        self,
+        after: tuple[int, str] | None = None,
+        conversation_batch_limit: int = 100,
+        item_batch_limit: int = 1000,
+    ) -> WatermarkReconciliationResult:
+        """Reconcile a bounded page of visible-message watermarks.
+
+        ``after`` is a workspace/conversation keyset cursor. A result whose
+        ``complete`` flag is false may return the same cursor when the current
+        conversation needed another bounded item page; callers should invoke
+        the method again with that cursor until ``complete`` is true.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def list_conversations(

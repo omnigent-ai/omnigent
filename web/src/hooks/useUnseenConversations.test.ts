@@ -144,7 +144,8 @@ describe("isConversationUnseen", () => {
     const mod = await loadFresh();
     mod.seedReadState([
       { id: "conv-1", viewer_last_seen: 100, updated_at: 200, last_message_at: 100 },
-      { id: "conv-empty", viewer_last_seen: 0, updated_at: 200, last_message_at: null },
+      { id: "conv-empty", viewer_last_seen: 0, updated_at: 200, last_message_at: 0 },
+      { id: "conv-unknown", viewer_last_seen: 100, updated_at: 200, last_message_at: null },
       { id: "conv-old", viewer_last_seen: 100, updated_at: 200 },
     ]);
 
@@ -154,9 +155,13 @@ describe("isConversationUnseen", () => {
     expect(mod.isConversationUnseen("conv-1", conversationReadTimestamp(201, 101), "idle")).toBe(
       true,
     );
+    expect(mod.isConversationUnseen("conv-empty", conversationReadTimestamp(200, 0), "idle")).toBe(
+      false,
+    );
+    expect(conversationReadTimestamp(200, null)).toBe(200);
     expect(
-      mod.isConversationUnseen("conv-empty", conversationReadTimestamp(200, null), "idle"),
-    ).toBe(false);
+      mod.isConversationUnseen("conv-unknown", conversationReadTimestamp(200, null), "idle"),
+    ).toBe(true);
     expect(
       mod.isConversationUnseen("conv-old", conversationReadTimestamp(201, undefined), "idle"),
     ).toBe(true);
@@ -412,6 +417,56 @@ describe("useMarkConversationSeen", () => {
       window.dispatchEvent(new Event("keydown"));
     });
     expect(mod.isConversationUnseen("conv-1", 200, "idle")).toBe(false);
+  });
+
+  it("refreshes the focus probe on a commit before any focus event", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 100, updated_at: 100 }]);
+    const focusProbe = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    vi.useFakeTimers({ now: 150_000 });
+
+    const { rerender } = renderHook(({ id }) => mod.useMarkConversationSeen(id, 100), {
+      initialProps: { id: "conv-1" as string | undefined },
+    });
+    focusProbe.mockReturnValue(true);
+    rerender({ id: undefined });
+
+    expect(lastPutBody()).toEqual({ last_seen: 150, unread: false });
+  });
+
+  it("does not write repeatedly for interactions while already focused", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 150_000 });
+    renderHook(() => mod.useMarkConversationSeen("conv-1", 100));
+    authFetch.mockClear();
+
+    act(() => {
+      vi.setSystemTime(151_000);
+      window.dispatchEvent(new Event("pointerdown"));
+      vi.setSystemTime(152_000);
+      window.dispatchEvent(new Event("keydown"));
+    });
+
+    expect(authFetch).not.toHaveBeenCalled();
+  });
+
+  it("reprobes focus during cleanup before an authoritative event", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 100, updated_at: 100 }]);
+    const focusProbe = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.useFakeTimers({ now: 150_000 });
+    const { unmount } = renderHook(() => mod.useMarkConversationSeen("conv-1", 100));
+    expect(lastPutBody()).toEqual({ last_seen: 150, unread: false });
+
+    authFetch.mockClear();
+    focusProbe.mockReturnValue(false);
+    vi.setSystemTime(200_000);
+    unmount();
+
+    expect(authFetch).not.toHaveBeenCalled();
+    expect(mod.isConversationUnseen("conv-1", 180, "idle")).toBe(true);
   });
 
   it("does not clear an explicit unread from focus or interaction events", async () => {
