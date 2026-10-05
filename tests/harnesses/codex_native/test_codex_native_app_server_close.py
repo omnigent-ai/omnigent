@@ -32,8 +32,11 @@ async def test_cancelled_close_contains_child_and_releases_owned_state(
     child = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
-        ("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"),
-        stdout=asyncio.subprocess.DEVNULL,
+        (
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); time.sleep(60)"
+        ),
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
@@ -72,6 +75,8 @@ async def test_cancelled_close_contains_child_and_releases_owned_state(
 
     server.stderr_task = asyncio.create_task(server._stderr_loop())
     try:
+        assert child.stdout is not None
+        assert await asyncio.wait_for(child.stdout.readline(), timeout=10.0) == b"ready\n"
         for _ in range(100):
             if server._stderr_diagnostics is not None:
                 break
