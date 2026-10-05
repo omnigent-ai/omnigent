@@ -740,6 +740,21 @@ describe("ModelViewer loading state", () => {
     expect(screen.getByText("2.0 MB received")).toBeDefined();
   });
 
+  it("falls back to received bytes when more arrives than the declared size", async () => {
+    const downloads = holdDownloads();
+    render(
+      <ModelViewer data={makeData({ truncated: true })} path="big.3mf" conversationId="conv_1" />,
+    );
+    await waitFor(() => expect(downloads).toHaveLength(1));
+
+    act(() =>
+      downloads[0].onProgress?.({ receivedBytes: 2 * 1024 * 1024, totalBytes: 1024 * 1024 }),
+    );
+
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.getByText("2.0 MB received")).toBeDefined();
+  });
+
   it("switches to the preparing phase and yields a frame before parsing", async () => {
     const downloads = holdDownloads();
     const frames = holdFrames();
