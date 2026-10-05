@@ -400,6 +400,9 @@ class _CodexForwarderState:
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
+    :param pending_item_claims: Stable-id message keys reserved while their POST is
+        in flight. A rejected or cancelled POST releases the reservation so a
+        replay can retry it; an accepted POST moves it to ``synced_item_keys``.
     :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
         ``error`` notification was already surfaced. Used to suppress a later
         terminal boundary for the same turn.
@@ -457,6 +460,7 @@ class _CodexForwarderState:
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     synced_item_keys: set[str] = field(default_factory=set)
+    pending_item_claims: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
@@ -805,11 +809,43 @@ class _CodexForwarderState:
             ``"thread_c:turn_c:item-1"``.
         :returns: ``True`` when the item should be posted.
         """
-        if item_key in self.synced_item_keys:
+        if item_key in self.synced_item_keys or item_key in self.pending_item_claims:
             _logger.info("Codex forwarder skipped duplicate item: key=%s", item_key)
             return False
         self.synced_item_keys.add(item_key)
         return True
+
+    def reserve_item_key(
+        self,
+        item_key: str,
+    ) -> bool:
+        """Reserve a stable-id message key until its durable POST is accepted.
+
+        A replay arriving while the original POST is in flight is still a
+        duplicate. Unlike :meth:`claim_item_key`, a failed reservation can be
+        released without losing the item or advancing an anonymous counter.
+        """
+        if item_key in self.synced_item_keys or item_key in self.pending_item_claims:
+            _logger.info("Codex forwarder skipped duplicate item: key=%s", item_key)
+            return False
+        self.pending_item_claims.add(item_key)
+        return True
+
+    def commit_item_key(self, item_key: str) -> None:
+        """Commit a reserved message key after its POST succeeds."""
+        self.pending_item_claims.discard(item_key)
+        self.synced_item_keys.add(item_key)
+
+    def release_item_key(self, item_key: str) -> None:
+        """Release a failed message reservation so replay can retry it."""
+        self.pending_item_claims.discard(item_key)
+
+    def settle_item_key(self, item_key: str, *, accepted: bool) -> None:
+        """Commit or release a message reservation after its POST returns."""
+        if accepted:
+            self.commit_item_key(item_key)
+        else:
+            self.release_item_key(item_key)
 
     def peek_anon_item_key(self, thread_id: str, turn_id: str) -> str:
         """
@@ -4977,14 +5013,16 @@ def _claim_completed_item(
     params: _JsonObject,
     item: _JsonObject,
     forwarder_state: _CodexForwarderState | None,
+    *,
+    defer_commit: bool = False,
 ) -> str | None:
     """
     Claim one completed Codex transcript item for Omnigent posting.
 
     Returns the stable source id when the caller should post the item; ``None``
-    when it was already posted this connection (dedup gate). Also advances the
-    anonymous-item counter on a successful claim so the next anonymous
-    item in the same (thread, turn) gets a fresh key.
+    when it was already posted or reserved this connection (dedup gate).
+    Message items may defer the commit until their POST succeeds so a failed
+    delivery remains replayable.
 
     When ``forwarder_state`` is ``None``, dedup is disabled and the function
     derives a source id directly (used in tests that bypass ``supervise_forwarder``).
@@ -4993,11 +5031,19 @@ def _claim_completed_item(
     :param item: Codex item payload.
     :param forwarder_state: Optional mutable state holding synced-item
         keys and anonymous-item counters.
+    :param defer_commit: Reserve the key until the caller reports POST success.
     :returns: Stable source id when the item should be posted to AP, otherwise ``None``.
     """
     if forwarder_state is None:
         return _source_id(params, item)
     item_key, is_anon = _completed_item_key(params, item, forwarder_state)
+    # Positional anonymous keys are intentionally legacy: they are claimed
+    # immediately and their counter advances before delivery, as before. Only
+    # stable native ids can safely be reserved for replay.
+    if defer_commit and not is_anon:
+        if not forwarder_state.reserve_item_key(item_key):
+            return None
+        return item_key
     if not forwarder_state.claim_item_key(item_key):
         return None
     if is_anon:
@@ -5099,11 +5145,36 @@ async def _handle_completed_item_inner(
                 if forwarder_state is not None:
                     forwarder_state.compaction_item_persisted = True
         return
-    source_id = _claim_completed_item(params, item, forwarder_state)
+    message_item = item_type in {
+        "userMessage",
+        "agentMessage",
+        "plan",
+        *_REVIEW_MODE_ITEM_TYPES,
+    }
+    replayable_item = message_item and _completed_item_has_stable_id(item)
+    source_id = _claim_completed_item(
+        params,
+        item,
+        forwarder_state,
+        defer_commit=replayable_item,
+    )
     if source_id is None:
         return
     if item_type == "userMessage":
-        posted = await _post_user_message(client, session_id, params, item, source_id=source_id)
+        try:
+            posted = await _post_user_message(
+                client,
+                session_id,
+                params,
+                item,
+                source_id=source_id,
+            )
+        except BaseException:
+            if forwarder_state is not None and replayable_item:
+                forwarder_state.release_item_key(source_id)
+            raise
+        if forwarder_state is not None and replayable_item:
+            forwarder_state.settle_item_key(source_id, accepted=posted)
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
             if turn_id:
@@ -5119,14 +5190,63 @@ async def _handle_completed_item_inner(
         # and the web UI renders strictly by position, that inverts the
         # bubbles. Recover and post the turn's user message first so it
         # always takes the earlier position.
-        await _ensure_user_message_posted(client, session_id, params, forwarder_state)
-        await _post_agent_message(client, session_id, params, item, source_id=source_id)
+        try:
+            user_ready = await _ensure_user_message_posted(
+                client,
+                session_id,
+                params,
+                forwarder_state,
+            )
+            if user_ready is False and forwarder_state is not None:
+                # Do not let a rejected recovery POST put the assistant ahead
+                # of a user bubble that a later resume replay can still save.
+                forwarder_state.release_item_key(source_id)
+                return
+            posted = await _post_agent_message(
+                client,
+                session_id,
+                params,
+                item,
+                source_id=source_id,
+            )
+        except BaseException:
+            if forwarder_state is not None and replayable_item:
+                forwarder_state.release_item_key(source_id)
+            raise
+        if forwarder_state is not None and replayable_item:
+            forwarder_state.settle_item_key(source_id, accepted=posted)
         return
     if item_type == "plan":
-        await _post_plan_item(client, session_id, params, item, source_id=source_id)
+        try:
+            posted = await _post_plan_item(
+                client,
+                session_id,
+                params,
+                item,
+                source_id=source_id,
+            )
+        except BaseException:
+            if forwarder_state is not None and replayable_item:
+                forwarder_state.release_item_key(source_id)
+            raise
+        if forwarder_state is not None and replayable_item:
+            forwarder_state.settle_item_key(source_id, accepted=posted)
         return
     if item_type in _REVIEW_MODE_ITEM_TYPES:
-        await _post_review_mode_marker(client, session_id, params, item, source_id=source_id)
+        try:
+            posted = await _post_review_mode_marker(
+                client,
+                session_id,
+                params,
+                item,
+                source_id=source_id,
+            )
+        except BaseException:
+            if forwarder_state is not None and replayable_item:
+                forwarder_state.release_item_key(source_id)
+            raise
+        if forwarder_state is not None and replayable_item:
+            forwarder_state.settle_item_key(source_id, accepted=posted)
         return
     if item_type in _TOOL_ITEM_TYPES:
         if item_type == "fileChange":
@@ -5970,7 +6090,7 @@ async def _ensure_user_message_posted(
     session_id: str,
     params: _JsonObject,
     forwarder_state: _CodexForwarderState | None,
-) -> None:
+) -> bool | None:
     """
     Guarantee a turn's user message is posted before its assistant reply.
 
@@ -5993,17 +6113,19 @@ async def _ensure_user_message_posted(
         message whose turn's user message must already be posted.
     :param forwarder_state: Mutable forwarder state tracking posted user
         turns and holding the Codex app-server client.
-    :returns: None.
+    :returns: ``True`` when the user item is already or newly posted,
+        ``False`` when a recovered item was rejected, or ``None`` when no
+        recoverable user item was found.
     """
     if forwarder_state is None:
-        return
+        return None
     turn_id = _turn_id_from_payload(params)
     if not turn_id or forwarder_state.has_posted_user_message(turn_id):
-        return
+        return True if turn_id else None
     codex_client = forwarder_state.codex_client
     thread_id = _thread_id_from_params(params)
     if codex_client is None or thread_id is None:
-        return
+        return None
     try:
         response = await codex_client.request("thread/resume", {"threadId": thread_id})
     except asyncio.CancelledError:
@@ -6015,26 +6137,49 @@ async def _ensure_user_message_posted(
             turn_id,
             exc_info=True,
         )
-        return
+        return None
     user_item = _find_turn_user_message(response, turn_id)
     if user_item is None:
-        return
+        return None
     recovered_params: _JsonObject = {
         "threadId": thread_id,
         "turnId": turn_id,
         "item": user_item,
     }
-    source_id = _claim_completed_item(recovered_params, user_item, forwarder_state)
-    if source_id is None:
-        return
-    if await _post_user_message(
-        client,
-        session_id,
+    replayable_user = _completed_item_has_stable_id(user_item)
+    source_id = _claim_completed_item(
         recovered_params,
         user_item,
-        source_id=source_id,
-    ):
+        forwarder_state,
+        defer_commit=replayable_user,
+    )
+    if source_id is None:
+        pending_key, _ = _completed_item_key(recovered_params, user_item, forwarder_state)
+        if replayable_user and pending_key in forwarder_state.pending_item_claims:
+            return False
+        return True if forwarder_state.has_posted_user_message(turn_id) else None
+    try:
+        posted = await _post_user_message(
+            client,
+            session_id,
+            recovered_params,
+            user_item,
+            source_id=source_id,
+        )
+    except BaseException:
+        forwarder_state.release_item_key(source_id)
+        raise
+    if posted:
+        if replayable_user:
+            forwarder_state.commit_item_key(source_id)
         forwarder_state.note_user_message_posted(turn_id)
+        return True
+    if replayable_user:
+        forwarder_state.release_item_key(source_id)
+    # An anonymous or permanently rejected user item has no safe replay
+    # identity. Let the valid assistant output through rather than hiding it
+    # forever behind an item that cannot be retried reliably.
+    return None
 
 
 def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject | None:
@@ -8287,3 +8432,9 @@ def _completed_item_key(
     if isinstance(item_id, str) and item_id:
         return f"{thread_id}:{turn_id}:{item_id}", False
     return forwarder_state.peek_anon_item_key(thread_id, turn_id), True
+
+
+def _completed_item_has_stable_id(item: _JsonObject) -> bool:
+    """Whether a completed item carries a replay-safe native id."""
+    item_id = item.get("id")
+    return isinstance(item_id, str) and bool(item_id)
