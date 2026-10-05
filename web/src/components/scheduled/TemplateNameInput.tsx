@@ -1,4 +1,10 @@
-import { useRef, type ComponentPropsWithoutRef, type UIEvent } from "react";
+import {
+  useCallback,
+  useLayoutEffect,
+  useRef,
+  type ComponentPropsWithoutRef,
+  type UIEvent,
+} from "react";
 
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -55,13 +61,24 @@ export function TemplateNameInput({
   ...inputProps
 }: TemplateNameInputProps) {
   const backdropTextRef = useRef<HTMLSpanElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const parts = splitNameTemplate(value);
   let offset = 0;
 
-  const syncScroll = (event: UIEvent<HTMLInputElement>) => {
+  const syncBackdropScroll = useCallback((scrollLeft: number) => {
     if (backdropTextRef.current) {
-      backdropTextRef.current.style.transform = `translateX(-${event.currentTarget.scrollLeft}px)`;
+      backdropTextRef.current.style.transform = `translateX(-${scrollLeft}px)`;
     }
+  }, []);
+
+  useLayoutEffect(() => {
+    if (inputRef.current) {
+      syncBackdropScroll(inputRef.current.scrollLeft);
+    }
+  }, [syncBackdropScroll, value]);
+
+  const handleScroll = (event: UIEvent<HTMLInputElement>) => {
+    syncBackdropScroll(event.currentTarget.scrollLeft);
     onScroll?.(event);
   };
 
@@ -93,11 +110,12 @@ export function TemplateNameInput({
       </div>
       <Input
         {...inputProps}
+        ref={inputRef}
         className={cn(
           className,
           "relative bg-transparent dark:bg-transparent text-transparent caret-foreground selection:bg-accent selection:text-accent-foreground",
         )}
-        onScroll={syncScroll}
+        onScroll={handleScroll}
         value={value}
       />
     </div>
