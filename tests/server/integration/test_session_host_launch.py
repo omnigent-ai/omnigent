@@ -1507,6 +1507,328 @@ async def test_stopped_host_session_message_relaunches_runner(
     )
 
 
+async def test_relaunch_retries_enqueue_on_replaced_host_generation(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host replacement during binding must not lose the relaunch frame.
+
+    The relaunch binds a fresh runner id in a worker thread before it enqueues
+    the host frame. If the host is replaced in that window, the stale
+    ``HostConnection`` rejects the frame before queueing it. The same binding
+    must be authorized and enqueued once on the replacement generation so the
+    user's message reaches the runner.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 10.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    old_runner_id = session["runner_id"]
+    registry = app.state.host_registry
+    old_conn = registry.get(_HOST_ID)
+    assert old_conn is not None
+
+    set_runner_client(None)
+    runner_ready = asyncio.Event()
+    replacement_ready = asyncio.Event()
+    replacement_holder: dict[str, HostConnection] = {}
+    launch_frames: list[HostLaunchRunnerFrame] = []
+    runner_events: list[dict[str, Any]] = []
+    admitted_connections: list[HostConnection] = []
+    real_admit_launch = registry.admit_launch
+
+    async def _admit_launch(conn: HostConnection, conversation_id: str, **kwargs: Any) -> None:
+        admitted_connections.append(conn)
+        await real_admit_launch(conn, conversation_id, **kwargs)
+
+    monkeypatch.setattr(registry, "admit_launch", _admit_launch)
+
+    def _runner_response(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            payload = json.loads(request.content)
+            assert isinstance(payload, dict)
+            runner_events.append(payload)
+            return httpx.Response(202, json={})
+        return httpx.Response(200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_response),
+        base_url="http://runner",
+    )
+
+    async def _resolve_runner(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        del args, kwargs
+        return fake_runner if runner_ready.is_set() else None
+
+    async def _wait_for_runner(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        del args, kwargs
+        try:
+            await asyncio.wait_for(runner_ready.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            return None
+        return fake_runner
+
+    monkeypatch.setattr(routes_events, "_get_runner_client", _resolve_runner)
+    monkeypatch.setattr(routes_events, "_wait_for_runner_client", _wait_for_runner)
+    monkeypatch.setattr(
+        routes_events,
+        "_ensure_runner_session_initialized",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
+
+    loop = asyncio.get_running_loop()
+    replacement_created = threading.Event()
+    original_replace = SqlAlchemyConversationStore.replace_runner_id
+
+    def _replace_runner_id(
+        store: SqlAlchemyConversationStore,
+        conversation_id: str,
+        runner_id: str,
+        *,
+        expected_runner_id: str | None = None,
+    ) -> Conversation:
+        result = original_replace(
+            store,
+            conversation_id,
+            runner_id,
+            expected_runner_id=expected_runner_id,
+        )
+        if conversation_id == session_id and not replacement_created.is_set():
+
+            def _replace_host_generation() -> None:
+                replacement = registry.register(
+                    _HOST_ID,
+                    _NoopRunnerWS(),
+                    old_conn.hello,
+                    old_conn.owner,
+                    workspace_id=old_conn.workspace_id,
+                    registered_with_managed_token=old_conn.registered_with_managed_token,
+                )
+                replacement_holder["conn"] = replacement
+                replacement_ready.set()
+                replacement_created.set()
+
+            loop.call_soon_threadsafe(_replace_host_generation)
+            assert replacement_created.wait(10.0), "host replacement callback did not run"
+        return result
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "replace_runner_id", _replace_runner_id)
+
+    async def _serve_replacement() -> None:
+        await replacement_ready.wait()
+        replacement = replacement_holder["conn"]
+        while True:
+            data = await asyncio.wait_for(replacement.outbound_queue.get(), timeout=10.0)
+            if data is None:
+                return
+            frame = decode_host_frame(data)
+            if isinstance(frame, HostStopRunnerFrame):
+                future = replacement.pending_stops.get(frame.request_id)
+                if future is not None and not future.done():
+                    future.set_result({"status": "stopped", "error": None})
+                continue
+            if isinstance(frame, HostLaunchRunnerFrame):
+                launch_frames.append(frame)
+                future = replacement.pending_launches.pop(frame.request_id, None)
+                assert future is not None
+                future.set_result(
+                    {
+                        "status": "launched",
+                        "runner_id": token_bound_runner_id(frame.binding_token),
+                        "error": None,
+                    }
+                )
+                runner_ready.set()
+                return
+
+    responder = asyncio.create_task(_serve_replacement())
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}],
+                },
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await responder
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert response.status_code == 202, response.text
+    assert len(launch_frames) == 1, "replacement must receive exactly one launch"
+    assert [event.get("content") for event in runner_events if event.get("type") == "message"] == [
+        [{"type": "input_text", "text": "continue"}]
+    ]
+    assert admitted_connections[0] is old_conn
+    assert admitted_connections[-1] is replacement_holder["conn"]
+    launch = launch_frames[0]
+    assert token_bound_runner_id(launch.binding_token) != old_runner_id
+    assert not old_conn.pending_launches
+    assert not replacement_holder["conn"].pending_launches
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conversation is not None
+    assert conversation.runner_id == token_bound_runner_id(launch.binding_token)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["host_gone", "replacement_denied", "second_replacement", "ack_timeout", "cancel"],
+)
+async def test_relaunch_retry_guards_do_not_replay_or_leak_pending_launches(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """The pre-enqueue retry has bounded, cancellation-safe failure modes."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions import helpers as helpers_module
+
+    class _Store:
+        def __init__(self) -> None:
+            self.conversation = Conversation(
+                id="conv_relaunch_guard",
+                created_at=0,
+                updated_at=0,
+                root_conversation_id="conv_relaunch_guard",
+                host_id="host_relaunch_guard",
+                workspace="/work/repo",
+            )
+
+        def replace_runner_id(
+            self,
+            conversation_id: str,
+            runner_id: str,
+            **kwargs: object,
+        ) -> Conversation:
+            del kwargs
+            assert conversation_id == self.conversation.id
+            self.conversation.runner_id = runner_id
+            return self.conversation
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.old = SimpleNamespace(
+                host_id="host_relaunch_guard",
+                workspace_id=0,
+                owner="owner",
+                account_generation=None,
+                pending_launches={},
+            )
+            self.replacement = SimpleNamespace(
+                host_id=self.old.host_id,
+                workspace_id=0,
+                owner="owner",
+                account_generation=None,
+                pending_launches={},
+            )
+            self.second_replacement = SimpleNamespace(
+                host_id=self.old.host_id,
+                workspace_id=0,
+                owner="owner",
+                account_generation=None,
+                pending_launches={},
+            )
+            self.current = (
+                None
+                if mode == "host_gone"
+                else self.replacement
+                if mode in {"replacement_denied", "second_replacement"}
+                else self.old
+            )
+            self.admitted: list[object] = []
+            self.sent: list[tuple[object, asyncio.Future[dict[str, str | None]]]] = []
+            self.sent_event = asyncio.Event()
+
+        async def admit_launch(self, conn: object, conversation_id: str, **kwargs: object) -> None:
+            del conversation_id, kwargs
+            self.admitted.append(conn)
+            if mode == "replacement_denied" and conn is self.replacement:
+                raise RuntimeError("launch permission denied")
+
+        def get(self, host_id: str, *, workspace_id: int) -> object | None:
+            assert host_id == self.old.host_id
+            assert workspace_id == 0
+            return self.current
+
+        def send_text(self, conn: Any, data: str) -> None:
+            frame = decode_host_frame(data)
+            assert isinstance(frame, HostLaunchRunnerFrame)
+            pending = conn.pending_launches
+            future = pending[frame.request_id]
+            self.sent.append((conn, future))
+            self.sent_event.set()
+            if mode == "host_gone" and conn is self.old:
+                raise ConnectionError("host connection disappeared")
+            if mode == "replacement_denied" and conn is self.old:
+                raise ConnectionError("host connection replaced")
+            if mode == "second_replacement" and conn is self.old:
+                raise ConnectionError("host connection replaced")
+            if mode == "second_replacement" and conn is self.replacement:
+                self.current = self.second_replacement
+                raise ConnectionError("replacement connection replaced again")
+            if mode in {"ack_timeout", "cancel"}:
+                return
+            raise AssertionError(f"unexpected launch send in mode {mode!r}")
+
+    monkeypatch.setattr(helpers_module, "_resolve_harness", lambda _conv: None)
+    monkeypatch.setattr(
+        helpers_module, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 60.0 if mode == "cancel" else 0.0
+    )
+    store = _Store()
+    registry = _Registry()
+    task = asyncio.create_task(
+        helpers_module._launch_runner_on_host_locked(
+            store.conversation,
+            store,  # type: ignore[arg-type]
+            registry,  # type: ignore[arg-type]
+            registry.old,  # type: ignore[arg-type]
+        )
+    )
+
+    if mode == "cancel":
+        await registry.sent_event.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif mode == "replacement_denied":
+        with pytest.raises(RuntimeError, match="permission denied"):
+            await task
+    else:
+        attempt = await task
+        assert attempt.acknowledged is False
+
+    if mode == "host_gone":
+        assert len(registry.sent) == 1
+        assert registry.admitted == [registry.old]
+    elif mode == "replacement_denied":
+        assert len(registry.sent) == 1
+        assert registry.admitted == [registry.old, registry.replacement]
+    elif mode == "second_replacement":
+        assert len(registry.sent) == 2
+        assert registry.admitted == [registry.old, registry.replacement]
+    elif mode in {"ack_timeout", "cancel"}:
+        assert len(registry.sent) == 1
+        assert registry.admitted == [registry.old]
+    assert all(future.cancelled() for _conn, future in registry.sent)
+    assert not registry.old.pending_launches
+    assert not registry.replacement.pending_launches
+    assert not registry.second_replacement.pending_launches
+
+
 @pytest.mark.parametrize("wrapper", ["claude-code-native-ui", "codex-native-ui"])
 @pytest.mark.parametrize("liveness_source", ["missing", "local", "sibling"])
 async def test_message_relaunch_classifies_replacement_runner_liveness(

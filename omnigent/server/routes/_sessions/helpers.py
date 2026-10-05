@@ -5945,10 +5945,6 @@ async def _launch_runner_on_host_locked(
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         request_id = secrets.token_hex(8)
-        launch_future: asyncio.Future[dict[str, str | None]] = (
-            asyncio.get_running_loop().create_future()
-        )
-        host_conn.pending_launches[request_id] = launch_future
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -5964,31 +5960,77 @@ async def _launch_runner_on_host_locked(
                 ),
             )
         )
+
+        def _discard_pending_launch(
+            conn: HostConnection,
+            future: asyncio.Future[dict[str, str | None]],
+        ) -> None:
+            """Remove and settle a launch acknowledgement waiter."""
+            conn.pending_launches.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+
+        launch_conn = host_conn
+        launch_future: asyncio.Future[dict[str, str | None]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        launch_conn.pending_launches[request_id] = launch_future
         try:
-            host_registry.send_text(host_conn, launch_frame)
+            host_registry.send_text(launch_conn, launch_frame)
         except ConnectionError:
-            host_conn.pending_launches.pop(request_id, None)
-            _logger.warning(
-                "Host %s connection lost while launching runner for %s",
-                conv.host_id,
-                conv.id,
-                extra=debug_event(
-                    "runner_launch_failed",
-                    session_id=conv.id,
-                    stage="runner_launch",
-                    error_code="host_launch_failed",
-                ),
+            _discard_pending_launch(launch_conn, launch_future)
+            # ``send_text`` checks the registry before enqueueing, so this
+            # frame was never visible to the old host generation. Re-authorize
+            # one current replacement and reuse the same binding/token once.
+            replacement = host_registry.get(
+                launch_conn.host_id,
+                workspace_id=launch_conn.workspace_id,
             )
-            return _HostLaunchAttempt(runner_id=new_runner_id)
+            if replacement is None or replacement is launch_conn:
+                _logger.warning(
+                    "Host %s connection lost while launching runner for %s",
+                    conv.host_id,
+                    conv.id,
+                    extra=debug_event(
+                        "runner_launch_failed",
+                        session_id=conv.id,
+                        stage="runner_launch",
+                        error_code="host_launch_failed",
+                    ),
+                )
+                return _HostLaunchAttempt(runner_id=new_runner_id)
+            await host_registry.admit_launch(replacement, conv.id)
+            launch_conn = replacement
+            launch_future = asyncio.get_running_loop().create_future()
+            launch_conn.pending_launches[request_id] = launch_future
+            try:
+                host_registry.send_text(launch_conn, launch_frame)
+            except ConnectionError:
+                _discard_pending_launch(launch_conn, launch_future)
+                _logger.warning(
+                    "Replacement host %s connection lost while launching runner for %s",
+                    conv.host_id,
+                    conv.id,
+                    extra=debug_event(
+                        "runner_launch_failed",
+                        session_id=conv.id,
+                        stage="runner_launch",
+                        error_code="host_launch_failed",
+                    ),
+                )
+                return _HostLaunchAttempt(runner_id=new_runner_id)
         try:
             result = await asyncio.wait_for(
                 launch_future,
                 timeout=_HOST_LAUNCH_RESULT_TIMEOUT_S,
             )
+        except asyncio.CancelledError:
+            _discard_pending_launch(launch_conn, launch_future)
+            raise
         except asyncio.TimeoutError:
             # No result yet — fall through to the caller's connect wait, which
             # preserves the prior fire-and-forget timing for a slow-but-fine host.
-            host_conn.pending_launches.pop(request_id, None)
+            _discard_pending_launch(launch_conn, launch_future)
             # A slow host, not a refusal: the launch may still land.
             _logger.warning(
                 "Host launch acknowledgement timed out",
