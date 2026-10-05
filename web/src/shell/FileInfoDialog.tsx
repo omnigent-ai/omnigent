@@ -70,7 +70,7 @@ export function FileInfoDialog({
         >
           <DialogHeader>
             <DialogTitle>{title}</DialogTitle>
-            <h2 className="break-words text-base font-medium">{info.name}</h2>
+            <h3 className="break-words text-base font-medium">{info.name}</h3>
           </DialogHeader>
           <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-ui">
             <dt className="text-muted-foreground">
