@@ -13,9 +13,12 @@ import {
   PaletteIcon,
   PresentationIcon,
   PrinterIcon,
+  TriangleAlertIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
+import type { BrandWarning } from "@/lib/brandRules";
 import { cn } from "@/lib/utils";
 import {
   HTML_PREVIEW_SANDBOX,
@@ -59,6 +62,42 @@ export function slidesExportFilename(path?: string | null): string {
     .trim()
     .replace(/^\.+|\.+$/g, "");
   return `${base || "deck"}.html`;
+}
+
+/** Toolbar badge for raw values outside a full design system; never blocks the deck. */
+function BrandWarnings({ warnings }: { warnings: BrandWarning[] }) {
+  const label = `${warnings.length} brand warning${warnings.length === 1 ? "" : "s"}`;
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          aria-label={label}
+          title={label}
+          className="h-8 gap-1.5 px-2"
+        >
+          <TriangleAlertIcon className="size-4 text-warning" />
+          <span className="hidden sm:inline">{label}</span>
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-80">
+        <p className="font-medium text-foreground">Values outside the design system</p>
+        <ul className="flex max-h-64 flex-col gap-1 overflow-auto">
+          {warnings.map((w) => (
+            <li key={w.value} className="flex min-w-0 items-baseline gap-2">
+              <code className="shrink-0 text-foreground">{w.value}</code>
+              <span className="shrink-0">{w.property}</span>
+              <span className="truncate text-muted-foreground" title={w.where}>
+                {w.where}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </PopoverContent>
+    </Popover>
+  );
 }
 
 export interface SlidesViewerProps {
@@ -292,6 +331,9 @@ export function SlidesViewer({
                 <PaletteIcon className="size-3.5 shrink-0" aria-hidden />
                 <span className="max-w-32 truncate max-sm:sr-only">{branding.badge.name}</span>
               </span>
+            )}
+            {!!branding?.brandWarnings?.length && (
+              <BrandWarnings warnings={branding.brandWarnings} />
             )}
             <Button
               type="button"

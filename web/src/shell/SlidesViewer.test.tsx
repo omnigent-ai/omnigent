@@ -25,7 +25,8 @@ import {
 } from "./codeViewerHelpers";
 import { DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer } from "@/lib/designSystem";
 import { getSessionSlim } from "@/lib/sessionsApi";
-import { readFixtureFile } from "@/test/designSystemFixture";
+import { fetchWorkspaceDirectory } from "@/hooks/useWorkspaceChangedFiles";
+import { listFixtureDir, readFixtureFile } from "@/test/designSystemFixture";
 import {
   DESIGN_KIT_TIMEOUT_MS,
   DESIGN_SYSTEM_TIMEOUT_MS,
@@ -40,6 +41,10 @@ vi.mock("@/hooks/useFileContent", () => ({
   triggerBrowserDownload: vi.fn(),
 }));
 vi.mock("@/lib/sessionsApi", () => ({ getSessionSlim: vi.fn() }));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (orig) => ({
+  ...(await orig<object>()),
+  fetchWorkspaceDirectory: vi.fn(),
+}));
 
 const DECK = `<!DOCTYPE html>
 <html><head><title>Deck</title></head><body>
@@ -911,8 +916,60 @@ describe("SlidesViewer design system", () => {
       }
       throw new Error("404 Not Found");
     });
+    vi.mocked(fetchWorkspaceDirectory).mockImplementation(async (_id, dir) => {
+      if (dir !== `${folder}/templates`) throw new Error("404 Not Found");
+      return listFixtureDir("templates").map((e) => ({ ...e, path: `${dir}/${e.name}` })) as never;
+    });
   };
   const srcdoc = () => deckFrame().getAttribute("srcdoc") ?? "";
+  const OFF_BRAND = DS_DECK.replace(
+    "h1{color:red}",
+    ".title h1{color:#0b5fff}h2{color:#FF0000;margin:13px}",
+  );
+  const warningsButton = () => screen.queryByRole("button", { name: /brand warning/ });
+
+  describe("brand warnings", () => {
+    it("lists raw values outside a full system and still renders and exports", async () => {
+      serveSystem("full");
+      render(<SlidesViewer content={OFF_BRAND} conversationId="conv_1" />);
+      fireEvent.click(await screen.findByRole("button", { name: "2 brand warnings" }));
+      const items = screen.getAllByRole("listitem").map((li) => li.textContent);
+      expect(items).toEqual([
+        expect.stringMatching(/#FF0000.*color.*<style> h2/),
+        expect.stringMatching(/13px.*margin.*<style> h2/),
+      ]);
+      expect(srcdoc()).toContain("data-omnigent-design-system");
+      const { html } = await download();
+      expect(html).not.toMatch(/brand warning/i);
+      expect(fetchWorkspaceDirectory).toHaveBeenCalledWith("conv_1", `${FOLDER}/templates`);
+    });
+
+    it("shows no badge for a deck that follows the system", async () => {
+      serveSystem("full");
+      render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
+      expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
+      expect(warningsButton()).not.toBeInTheDocument();
+    });
+
+    it("shows no badge for a skill-only system", async () => {
+      serveSystem("skill");
+      render(<SlidesViewer content={OFF_BRAND} conversationId="conv_1" />);
+      expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
+      expect(warningsButton()).not.toBeInTheDocument();
+      expect(fetchWorkspaceDirectory).not.toHaveBeenCalled();
+    });
+
+    it("shows no badge for a kit deck", async () => {
+      vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
+        if (path === ".omnigent/design-kit/kit.json")
+          return { ...text('{"name":"Acme"}'), path } as never;
+        throw new Error("404 Not Found");
+      });
+      render(<SlidesViewer content={OFF_BRAND} conversationId="conv_1" />);
+      expect(await screen.findByTitle("Design kit: Acme")).toBeInTheDocument();
+      expect(warningsButton()).not.toBeInTheDocument();
+    });
+  });
   beforeEach(() => vi.clearAllMocks());
 
   it("shows a skill-only system's name and leaves the deck unbranded", async () => {

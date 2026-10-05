@@ -47,6 +47,13 @@ slide to PDF, and a Source toggle back to the code view.
   imported system (`path: ".omnigent/design-system"`) reads through the
   normal workspace file read, so collaborators see it and there is no
   owner-only notice.
+- `deck-brand-warnings`: with a full system that has `_adherence.oxlintrc.json`,
+  the toolbar shows "N brand warnings" for raw hex colors, raw pixel sizes,
+  and fonts outside the system's `fontFamilies`, found in the deck's
+  `<style>` and `style` attributes (never slide text). Clicking it lists
+  each value once with its property and where it first appears. Values the
+  system's `templates/*` use are allowed. It never blocks the deck or changes
+  the export. Kits, skill-only systems, and wireframes show no badge.
 
 ## How to get to it (user POV)
 
@@ -104,6 +111,10 @@ doctor`) and the built web UI.
   the session's host, ask for a deck that uses `ds:assets/...` images, and
   check the fonts, tokens, and images load. Open the same deck as a viewer
   the session is shared with to see the owner-only notice.
+- Brand warnings (rules, noise rules, template baseline, hostile configs, the
+  badge): `cd web && pnpm exec vitest run src/lib/brandRules.test.ts src/shell/deckBranding.test.ts src/shell/SlidesViewer.test.tsx`.
+  By hand: add `h2{color:#ff0000}` to a deck's `<style>` on a full system
+  with an adherence file and reopen it; the badge lists `#ff0000`.
 
 ## Gotchas
 
