@@ -336,7 +336,7 @@ def test_isolated_framework_bundle_carries_only_the_framework_skill(
 
     skills_dir = isolated / "skills"
     seeded = {p.name for p in skills_dir.iterdir()} if skills_dir.is_dir() else set()
-    assert seeded <= {"build-omnigent", "slide-decks"}
+    assert seeded <= {"build-omnigent", "slide-decks", "wireframes", "design-systems"}
     # No parent asset reached the isolated bundle by any route.
     assert not list(isolated.rglob("parent-only"))
     assert not list(isolated.rglob("config.yaml"))

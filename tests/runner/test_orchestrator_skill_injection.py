@@ -27,7 +27,7 @@ from omnigent.runner.tool_dispatch import _execute_skill_tool
 from omnigent.spec import load
 
 SKILL_NAME = "build-omnigent"
-FRAMEWORK_SKILLS = ["build-omnigent", "slide-decks"]
+FRAMEWORK_SKILLS = ["build-omnigent", "design-systems", "slide-decks", "wireframes"]
 _POLLY_BUNDLE = Path(__file__).resolve().parents[2] / "examples" / "polly"
 
 
@@ -92,6 +92,20 @@ def test_polly_loads_slide_decks_without_bundling_it(
     )
 
     assert "## Deck format" in loaded
+
+
+def test_polly_loads_wireframes_without_bundling_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """polly reaches the wireframes skill the same way as slide-decks."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = load(_POLLY_BUNDLE)
+
+    loaded = _execute_skill_tool(
+        "load_skill", {"name": "wireframes"}, agent_spec=spec, runner_workspace=tmp_path
+    )
+
+    assert "## Wireframe format" in loaded
 
 
 def test_codex_resolves_the_injected_skill(tmp_path: Path) -> None:

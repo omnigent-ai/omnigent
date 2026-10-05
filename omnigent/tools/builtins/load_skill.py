@@ -21,6 +21,8 @@ _PACKAGE_DIR = Path(omnigent.__file__).resolve().parent
 FRAMEWORK_SKILL_DIRS: tuple[Path, ...] = (
     _PACKAGE_DIR / "onboarding" / "agent" / "skills" / "build-omnigent",
     _PACKAGE_DIR / "resources" / "skills" / "slide-decks",
+    _PACKAGE_DIR / "resources" / "skills" / "wireframes",
+    _PACKAGE_DIR / "resources" / "skills" / "design-systems",
 )
 
 

@@ -367,9 +367,12 @@ def test_slide_decks_workflow_writes_one_slide_per_edit(tool_ctx: ToolContext) -
 
 def test_slide_decks_explains_using_a_design_system(tool_ctx: ToolContext) -> None:
     """A design system section says what to read, what to copy, and how to reference assets."""
-    content = LoadSkillTool([], skills_filter="none").invoke(
-        json.dumps({"name": "slide-decks"}), tool_ctx
-    )
+    tool = LoadSkillTool([], skills_filter="none")
+    decks = tool.invoke(json.dumps({"name": "slide-decks"}), tool_ctx)
+    pointer = decks.split("## Using a design system", 1)[1].split("\n## ", 1)[0]
+    assert "load the `design-systems` skill" in " ".join(pointer.split())
+
+    content = tool.invoke(json.dumps({"name": "design-systems"}), tool_ctx)
     section = content.split("## Using a design system", 1)[1].split("\n## ", 1)[0]
     flat = " ".join(section.split())
 
@@ -381,6 +384,25 @@ def test_slide_decks_explains_using_a_design_system(tool_ctx: ToolContext) -> No
     assert "Never embed base64 copies" in flat
     assert "`uploads/`, `ui_kits/`, and `preview/`" in flat
     assert ".omnigent/design-system.json" in flat
+
+
+def test_wireframes_skill_listed_and_points_to_design_systems(tool_ctx: ToolContext) -> None:
+    """wireframes ships beside slide-decks and shares its design-system guidance."""
+    tool = LoadSkillTool([], skills_filter="none")
+    listing = tool.get_schema()["function"]["description"]
+    assert "wireframes" in listing
+    assert "design-systems" in listing
+
+    content = tool.invoke(json.dumps({"name": "wireframes"}), tool_ctx)
+    flat = " ".join(content.split())
+    assert "## Wireframe format" in content
+    assert '`<section data-screen="id" data-title="...">`' in flat
+    assert "`data-goto`" in flat
+    assert "grayscale first" in flat.lower()
+    assert "@media" in flat
+    assert "load the `design-systems` skill" in flat
+    workflow = content.split("## Workflow", 1)[1].split("\n## ", 1)[0]
+    assert "never leave unclosed tags between edits" in workflow
 
 
 def test_bundled_skill_wins_over_framework_skill(tool_ctx: ToolContext) -> None:
@@ -402,7 +424,7 @@ def test_missing_framework_skill_source_is_skipped(
     monkeypatch.setattr(load_skill, "FRAMEWORK_SKILL_DIRS", (tmp_path / "missing", *real))
 
     names = [s.name for s in LoadSkillTool([], skills_filter="none").skills]
-    assert names == ["build-omnigent", "slide-decks"]
+    assert names == ["build-omnigent", "slide-decks", "wireframes", "design-systems"]
 
 
 @pytest.mark.parametrize("skill_md", [None, "no frontmatter here", "---\nname: [oops\n---\nBody."])
@@ -425,6 +447,11 @@ def test_broken_framework_skill_is_skipped_with_warning(
     with caplog.at_level("WARNING", logger=load_skill.__name__):
         tool = LoadSkillTool([], skills_filter="none")
 
-    assert [s.name for s in tool.skills] == ["build-omnigent", "slide-decks"]
+    assert [s.name for s in tool.skills] == [
+        "build-omnigent",
+        "slide-decks",
+        "wireframes",
+        "design-systems",
+    ]
     assert "slide-decks" in tool.get_schema()["function"]["description"]
     assert "Skipping broken framework skill broken:" in caplog.text
