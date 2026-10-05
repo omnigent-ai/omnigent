@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import json
 import logging
 import os
@@ -57,7 +55,6 @@ from omnigent.inner.native_attachments import (
     attachment_reference_line,
     codex_resize_metadata_path,
     materialize_attachment,
-    parse_data_uri,
     requires_filesystem,
     unresolved_attachment_marker,
 )
@@ -719,9 +716,8 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     materialized to disk and referenced as
     ``{"type": "localImage", "path": ...}`` — sending the base64 data
     URI inline as text would blow past the app-server's 1 MiB input
-    limit. Files inline their decoded text when they are textual;
-    binary files are materialized and referenced by path in a text
-    item so the model can open them with its tools.
+    limit. Files are materialized to disk and referenced by path in a
+    text item so the model can open them with its tools.
 
     :param content: Message content, e.g. a string or a list of content
         blocks like ``{"type": "input_text", "text": "..."}`` and
@@ -762,9 +758,7 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
                 else:
                     items.append({"type": "text", "text": unresolved_attachment_marker(block)})
             elif block_type == "input_file":
-                file_item = _file_block_to_input_item(block, bridge_dir)
-                if file_item is not None:
-                    items.append(file_item)
+                items.append(_file_block_to_input_item(block, bridge_dir))
         return items
     if content is None:
         return []
@@ -792,33 +786,25 @@ def _apply_resize_notice_to_latest_image(
 def _file_block_to_input_item(
     block: Mapping[str, object],
     bridge_dir: Path,
-) -> dict[str, object] | None:
+) -> dict[str, object]:
     """
     Convert an ``input_file`` block into a Codex input item.
 
-    The Codex app-server has no native file input item, so a textual
-    file (``text/*``) is inlined as a ``text`` item. A binary file is
-    materialized to disk and referenced by path in a ``text`` item so
-    the model can open it with its tools. This keeps multi-megabyte
-    base64 payloads out of the turn's text input.
+    The Codex app-server has no native file input item, so every file,
+    textual or binary, is materialized to disk and referenced by path in
+    a ``text`` item the model can open with its tools. The file's source
+    is never inlined: Codex echoes the turn input back as the mirrored
+    user message, so inlined content would leak into the transcript
+    bubble and the seeded session title.
 
     :param block: An ``input_file`` content block, expected to carry a
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
     :param bridge_dir: Session bridge path identifying the attachment cache.
-    :returns: A Codex ``text`` input item; a visible could-not-load
-        marker item when the file failed to materialize; or ``None``
-        for an empty text file.
+    :returns: A Codex ``text`` input item referencing the file, or a
+        visible could-not-load marker item when the file failed to
+        materialize.
     """
-    file_data = block.get("file_data")
-    if isinstance(file_data, str) and file_data.startswith("data:"):
-        try:
-            parsed = parse_data_uri(file_data)
-            if parsed.mime_type.startswith("text/"):
-                text = base64.b64decode(parsed.base64_payload).decode("utf-8", errors="replace")
-                return {"type": "text", "text": text} if text else None
-        except (ValueError, binascii.Error):
-            _logger.warning("Failed to decode input_file data URI", exc_info=True)
     path = materialize_attachment(block, bridge_dir)
     if path is not None:
         # Marker format is load-bearing: codex echoes this text item back
