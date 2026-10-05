@@ -163,6 +163,10 @@ class BrandingInfo(BaseModel):
     powered_by: bool
 
 
+class DesignKitInfo(BaseModel):
+    name: str
+
+
 class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
     single_user: bool
@@ -192,6 +196,8 @@ class ServerInfoResponse(BaseModel):
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
     branding: BrandingInfo
+    # The organization design kit served from ``/v1/design-kit/``, or null.
+    design_kit: DesignKitInfo | None = None
 
 
 def _resolve_extension_state(
@@ -1478,12 +1484,14 @@ def create_app(
 
     from omnigent.server.server_config import (
         load_branding_snapshot,
+        load_design_kit,
         load_server_config,
         session_title_instructions,
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
     branding_snapshot = load_branding_snapshot(resolved_server_config)
+    design_kit = load_design_kit(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
     resolved_extension_state = _resolve_extension_state(extension_state)
@@ -3011,6 +3019,7 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "agent_install": agent_store.supports_user_agents,
                 "branding": branding_snapshot.config(),
+                "design_kit": {"name": design_kit.name} if design_kit else None,
             }
         )
 
@@ -3168,6 +3177,7 @@ def create_app(
             auth_provider=auth_provider,
             feature_flags=resolved_feature_flags,
             project_store=project_store,
+            design_kit=design_kit,
         ),
         prefix="/v1",
         tags=["design"],

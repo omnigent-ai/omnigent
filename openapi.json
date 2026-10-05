@@ -1695,6 +1695,19 @@
         "title": "DesignDefaultSystem",
         "type": "object"
       },
+      "DesignKitInfo": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "DesignKitInfo",
+        "type": "object"
+      },
       "ElicitationRequestEvent": {
         "description": "Synchronous request for a decision from upstream.\n\nEmitted by Omnigent (or, under the new contract, by a harness)\nwhen the LLM / a tool / a policy needs a verdict before\nproceeding. The consumer replies via\n`POST /v1/sessions/{session_id}/events` with\n`type == \"approval\"` and\n`omnigent.server.schemas.ElicitationResult` fields in\n`data`. This preserves MCP request/reply correlation by id\nwithout threading elicitations through PATCH.\n\nWire shape matches the existing emit at\n`omnigent/runtime/policies/approval.py:175`.",
         "properties": {
@@ -5418,6 +5431,16 @@
           "databricks_features": {
             "title": "Databricks Features",
             "type": "boolean"
+          },
+          "design_kit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DesignKitInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "dictation_available": {
             "title": "Dictation Available",
@@ -10048,6 +10071,45 @@
           }
         },
         "summary": "Branding Logo"
+      }
+    },
+    "/v1/design-kit/{path}": {
+      "get": {
+        "description": "Serve one validated file of the organization design kit to a signed-in user.",
+        "operationId": "design_kit_asset_v1_design_kit__path__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "Not a file in the organization design kit"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Design Kit Asset",
+        "tags": [
+          "design"
+        ]
       }
     },
     "/v1/design/artifacts": {

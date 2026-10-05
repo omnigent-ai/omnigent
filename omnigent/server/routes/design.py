@@ -18,6 +18,7 @@ from omnigent.server.schemas import (
     DesignDefaultBody,
     ReplaceDesignArtifactsRequest,
 )
+from omnigent.server.server_config import DesignKitSnapshot
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
@@ -30,6 +31,7 @@ def create_design_router(
     auth_provider: AuthProvider | None,
     feature_flags: FeatureFlags | None = None,
     project_store: ProjectStore | None = None,
+    design_kit: DesignKitSnapshot | None = None,
 ) -> APIRouter:
     """
     Create the Design page index router (mounted under ``/v1``).
@@ -42,6 +44,7 @@ def create_design_router(
     :param auth_provider: Auth provider for user identity, or ``None``.
     :param feature_flags: Release-feature snapshot; resolved when omitted.
     :param project_store: Holds user preferences; the default routes 404 without it.
+    :param design_kit: The validated organization kit, or ``None`` when unset.
     :returns: The configured router.
     """
     flags = feature_flags or resolve_feature_flags()
@@ -136,5 +139,26 @@ def create_design_router(
             functools.partial(store.save_design_default, value, user_id=user_id)
         )
         return body
+
+    @router.get(
+        "/design-kit/{path:path}",
+        response_class=Response,
+        responses={404: {"description": "Not a file in the organization design kit"}},
+    )
+    async def design_kit_asset(path: str, request: Request) -> Response:
+        """Serve one validated file of the organization design kit to a signed-in user."""
+        _require_enabled()
+        require_user(request, auth_provider)
+        asset = design_kit.assets.get(path) if design_kit is not None else None
+        if asset is None:
+            raise HTTPException(status_code=404, detail="not found")
+        return Response(
+            content=asset.content,
+            media_type=asset.media_type,
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+            },
+        )
 
     return router

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ from fastapi.responses import JSONResponse
 from omnigent.errors import OmnigentError
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes.design import create_design_router
+from omnigent.server.server_config import BrandingAsset, DesignKitSnapshot
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
@@ -24,7 +26,23 @@ class _HeaderAuth:
         return getattr(request, "headers", {}).get("x-test-user")
 
 
-def _app(db_uri: str, *, enabled: bool = True) -> FastAPI:
+_LOGO = b'<svg xmlns="http://www.w3.org/2000/svg"/>'
+_KIT = DesignKitSnapshot(
+    name="Acme Kit",
+    assets={
+        "kit.json": BrandingAsset(
+            path=Path("/kit/kit.json"), media_type="application/json", content=b'{"name":"A"}'
+        ),
+        "img/logo.svg": BrandingAsset(
+            path=Path("/kit/img/logo.svg"), media_type="image/svg+xml", content=_LOGO
+        ),
+    },
+)
+
+
+def _app(
+    db_uri: str, *, enabled: bool = True, design_kit: DesignKitSnapshot | None = _KIT
+) -> FastAPI:
     app = FastAPI()
 
     @app.exception_handler(OmnigentError)
@@ -40,6 +58,7 @@ def _app(db_uri: str, *, enabled: bool = True) -> FastAPI:
             auth_provider=_HeaderAuth(),
             feature_flags=flags,
             project_store=SqlAlchemyProjectStore(db_uri),
+            design_kit=design_kit,
         ),
         prefix="/v1",
     )
@@ -123,3 +142,46 @@ async def test_design_default_is_hidden_with_the_flag_off(db_uri: str) -> None:
         assert (await client.get(_URL, headers=_as("alice"))).status_code == 404
         put = await client.put(_URL, json={"design_default": None}, headers=_as("alice"))
         assert put.status_code == 404
+
+
+async def test_design_kit_asset_requires_sign_in(client: httpx.AsyncClient) -> None:
+    assert (await client.get("/v1/design-kit/kit.json")).status_code == 401
+
+
+async def test_design_kit_serves_validated_files_with_their_type(
+    client: httpx.AsyncClient,
+) -> None:
+    response = await client.get("/v1/design-kit/img/logo.svg", headers=_as("alice"))
+    assert response.status_code == 200
+    assert response.content == _LOGO
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert "sandbox" in response.headers["content-security-policy"]
+    kit_json = await client.get("/v1/design-kit/kit.json", headers=_as("alice"))
+    assert kit_json.headers["content-type"].startswith("application/json")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "img",
+        "img/",
+        "missing.css",
+        "../config.yaml",
+        "%2e%2e/config.yaml",
+        "img%2F..%2F..%2Fx",
+    ],
+)
+async def test_design_kit_serves_nothing_outside_the_validated_set(
+    client: httpx.AsyncClient, path: str
+) -> None:
+    response = await client.get(f"/v1/design-kit/{path}", headers=_as("alice"))
+    assert response.status_code == 404
+
+
+async def test_design_kit_404s_when_unset_or_flag_off(db_uri: str) -> None:
+    for app in (_app(db_uri, design_kit=None), _app(db_uri, enabled=False)):
+        async for client in _client(app):
+            response = await client.get("/v1/design-kit/kit.json", headers=_as("alice"))
+            assert response.status_code == 404

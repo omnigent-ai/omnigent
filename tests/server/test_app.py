@@ -511,6 +511,30 @@ def test_session_title_instructions_are_wired_into_coordinator(
 
 
 @pytest.mark.asyncio
+async def test_info_advertises_the_org_design_kit_only_when_valid(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("design_kit: true\n")
+    kit = tmp_path / "design-kit"
+    kit.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    async def info(label: str) -> object:
+        app = _build_branding_app(db_uri, tmp_path, label, server_config={"design_kit": True})
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return (await client.get("/v1/info")).json()["design_kit"]
+
+    assert await info("kit-missing") is None
+    (kit / "kit.json").write_text('{"name": "Acme Kit"}')
+    assert await info("kit-set") == {"name": "Acme Kit"}
+
+
+@pytest.mark.asyncio
 async def test_branding_logo_route_serves_only_validated_asset_pre_auth(
     db_uri: str,
     runtime_init: None,
