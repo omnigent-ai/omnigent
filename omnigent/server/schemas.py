@@ -741,20 +741,26 @@ class ChildSessionSummary(BaseModel):
         route's ``session_id`` path parameter), e.g.
         ``"conv_parent987"``. Stable join key for clients that
         cache child rows across multiple parents.
-    :param title: Sub-agent title, ``"{agent_type}:{session_name}"``
-        as written by :func:`omnigent.tools.builtins.spawn._spawn_one`,
-        e.g. ``"researcher:auth"``. ``None`` only for legacy /
-        malformed rows; the spawn path always sets it.
-    :param tool: UI-facing sub-agent label. For Omnigent-spawned
-        children this is derived from the prefix of ``title`` before
-        the first ``":"``, e.g. ``"researcher"``. For Codex-native
-        children this is the Codex-assigned ``agent_nickname`` when
-        available, then ``agent_role``, then ``"Codex"``. Falls back
-        to the raw title for legacy / malformed rows; ``None`` only
-        when ``title`` itself is ``None`` or empty.
-    :param session_name: Sub-agent instance name, the suffix of
-        ``title`` after the first ``":"``, e.g. ``"auth"``. ``None``
-        if ``title`` is ``None`` or missing a colon.
+    :param title: Stored child title: ``"{agent_type}:{session_name}"``
+        for a framework-named child (e.g. ``"researcher:auth"``), the
+        Web UI's ``"ui:{agent}:{label}"`` sentinel, or the caller's
+        verbatim ``sys_session_create`` title (e.g. ``"research:pricing"``).
+        ``None`` only for legacy / malformed rows.
+    :param tool: UI-facing sub-agent label. For framework-named children
+        (rows stamped with ``sub_agent_name``) this is the prefix of
+        ``title`` before the first ``":"``, e.g. ``"researcher"``; for the
+        ``"ui:"`` sentinel it is the ``{agent}`` segment; for an unstamped
+        verbatim title it is the bound agent's name (``None`` when that
+        binding does not resolve). For Codex-native children this is the
+        Codex-assigned ``agent_nickname`` when available, then
+        ``agent_role``, then ``"Codex"``. Falls back to the raw title for
+        a stamped title without a colon; ``None`` only when ``title``
+        itself is ``None`` or empty.
+    :param session_name: Sub-agent instance name: the suffix of a
+        framework-named ``title`` after the first ``":"`` (e.g. ``"auth"``),
+        the ``{label}`` segment of the ``"ui:"`` sentinel, or the whole
+        verbatim title for an unstamped child. ``None`` if ``title`` is
+        ``None`` or a stamped title has no colon.
     :param kind: Conversation kind discriminator, always
         ``"sub_agent"`` for rows surfaced by this endpoint.
     :param created_at: Unix epoch timestamp of child creation.

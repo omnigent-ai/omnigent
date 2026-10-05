@@ -228,6 +228,7 @@ from omnigent.server.routes._sessions.helpers import (
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
     _await_settled_managed_launch,
+    _bound_agent_names,
     _build_new_item,
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
@@ -10661,14 +10662,15 @@ async def _child_session_summaries_from_conversations(
     conv_store: ConversationStore,
 ) -> list[ChildSessionSummary]:
     """
-    Build child summaries with one batched message-preview lookup.
+    Build child summaries with batched message-preview and agent lookups.
 
     ``ChildSessionSummary.last_message_preview`` needs the latest visible
     message per child. Loading those by calling ``list_items`` once per
     child blocks the event loop and creates N+1 database traffic. This
     helper reads newest message items for all child ids in a worker
-    thread, computes previews in memory, then builds summaries without
-    further store access.
+    thread, resolves the bound agent names the same way, computes
+    previews in memory, then builds summaries without further store
+    access.
 
     :param children: Child conversation rows from
         ``list_conversations(kind="sub_agent")``.
@@ -10689,11 +10691,15 @@ async def _child_session_summaries_from_conversations(
         child_id: _latest_message_preview(message_items)
         for child_id, message_items in message_items_by_child.items()
     }
+    agent_names = await asyncio.to_thread(
+        _bound_agent_names, [child for child in children if child.sub_agent_name is None]
+    )
     return [
         _child_session_summary_from_conversation(
             child,
             parent_session_id,
             previews.get(child.id),
+            agent_names=agent_names,
         )
         for child in children
     ]

@@ -84,20 +84,26 @@ async def _create_parent_session(
     return resp.json()
 
 
+_DERIVE_SUB_AGENT_NAME = "__derive_from_title__"
+
+
 def _seed_child(
     *,
     conv_store: SqlAlchemyConversationStore,
     parent_id: str,
     title: str,
     agent_id: str | None = None,
+    sub_agent_name: str | None = _DERIVE_SUB_AGENT_NAME,
 ) -> Conversation:
     """
     Create a child sub-agent conversation.
 
-    Mirrors what :func:`omnigent.tools.builtins.spawn._spawn_one` does,
-    minus the workflow start and SSE publish. The tasks table has been
-    removed — ``current_task_id``, ``current_task_status``, and
-    ``agent_name`` fields in the summary are always ``None``.
+    Mirrors what the framework spawn paths do, minus the workflow start
+    and SSE publish — including the ``sub_agent_name`` stamp every named
+    spawn writes alongside its ``"{agent_type}:{session_name}"`` title.
+    The tasks table has been removed — ``current_task_id``,
+    ``current_task_status``, and ``agent_name`` fields in the summary
+    are always ``None``.
 
     :param conv_store: Store for the child conversation.
     :param parent_id: Parent conversation id, e.g. ``"0c4b962f26d3fb76dce69d9dade142f5"``.
@@ -106,13 +112,21 @@ def _seed_child(
         e.g. ``"researcher:auth"``.
     :param agent_id: Agent id to bind to this conversation (populates
         the ``agent_id`` field in the summary).
+    :param sub_agent_name: Explicit stamp for the row. Defaults to the
+        title's pre-colon head (the named-spawn convention); pass
+        ``None`` to seed an unstamped child — a ``sys_session_create``
+        verbatim title or a Web-UI "Add agent" row.
     :returns: The created child :class:`Conversation`.
     """
+    if sub_agent_name == _DERIVE_SUB_AGENT_NAME:
+        head, sep, _ = title.partition(":")
+        sub_agent_name = head if sep else None
     return conv_store.create_conversation(
         kind="sub_agent",
         title=title,
         parent_conversation_id=parent_id,
         agent_id=agent_id,
+        sub_agent_name=sub_agent_name,
     )
 
 
@@ -718,6 +732,51 @@ async def test_child_status_edge_fans_out_to_parent_stream(
         session_stream.close(session["id"])
 
 
+async def test_child_status_edge_fans_out_verbatim_identity(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    The parent-stream fan-out carries a verbatim child's whole title and bound agent.
+
+    ``session.child_session.updated`` is built from the same summary as the
+    listing route, so an unstamped ``research:pricing`` child must not be
+    split there either.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from omnigent.runtime import session_stream
+    from tests.server.helpers import start_session_stream_collector
+
+    session = await _create_parent_session(client, agent_name="orchestrator-fanout")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="research:pricing",
+        agent_id=session["agent_id"],
+        sub_agent_name=None,
+    )
+    collector = await start_session_stream_collector(session["id"])
+    try:
+        sessions_module._publish_status(child.id, "running")
+        while True:
+            event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+            if event.get("type") == "session.child_session.updated":
+                break
+        assert event["child_session_id"] == child.id
+        assert event["child"]["title"] == "research:pricing"
+        assert (event["child"]["tool"], event["child"]["session_name"]) == (
+            "orchestrator-fanout",
+            "research:pricing",
+        )
+    finally:
+        await collector.stop()
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(session["id"])
+
+
 async def test_child_sessions_truncates_long_message_preview(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -773,12 +832,12 @@ async def test_child_sessions_handles_title_without_colon(
     db_uri: str,
 ) -> None:
     """
-    A child whose title has no ``:`` is still surfaced.
+    A stamped child whose title has no ``:`` is still surfaced.
 
-    The canonical spawn path always writes ``"type:name"``, but the
-    schema does not enforce it. The route must treat the title as
-    opaque-but-displayable (tool = raw title, session_name = None)
-    rather than dropping the row or crashing.
+    The canonical spawn path stamps ``sub_agent_name`` and writes
+    ``"type:name"``, but the schema does not enforce the title shape. The
+    route must treat such a title as opaque-but-displayable (tool = raw
+    title, session_name = None) rather than dropping the row or crashing.
 
     :param client: The test HTTP client.
     :param db_uri: Per-test SQLite database URI.
@@ -791,6 +850,7 @@ async def test_child_sessions_handles_title_without_colon(
         parent_id=session["id"],
         title="legacy-untyped",
         agent_id=session["agent_id"],
+        sub_agent_name="researcher",
     )
 
     resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
@@ -853,6 +913,9 @@ async def test_child_sessions_parses_ui_added_agent_title(
         parent_id=session["id"],
         title=title,
         agent_id=session["agent_id"],
+        # The Add Agent flow stamps no sub_agent_name; the reserved "ui"
+        # head alone must keep the 3-segment parse working.
+        sub_agent_name=None,
     )
 
     resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
@@ -861,6 +924,70 @@ async def test_child_sessions_parses_ui_added_agent_title(
     assert row["title"] == title
     assert row["tool"] == expected_tool
     assert row["session_name"] == expected_session_name
+
+
+async def test_child_sessions_keeps_verbatim_title_without_agent_binding(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A verbatim title stays whole even when the child has no resolvable agent.
+
+    With nothing to resolve the summary leaves ``tool`` unset rather than
+    inventing a handle from the title; the runner relay supplies its own
+    last-resort label.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="research:pricing",
+        agent_id=None,
+        sub_agent_name=None,
+    )
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    assert resp.status_code == 200
+    row = {r["id"]: r for r in resp.json()["data"]}[child.id]
+    assert row["agent_id"] is None
+    assert (row["tool"], row["session_name"]) == (None, "research:pricing")
+
+
+async def test_child_sessions_splits_stamped_child_with_colon_in_name(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A stamped (framework-named) child still splits on the first colon.
+
+    The named-spawn paths write ``"<agent>:<title>"`` and stamp
+    ``sub_agent_name``; that stamp is what licenses the split, so the
+    parse keeps working even when the instance name itself contains a
+    colon.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:queue:retry",
+        agent_id=session["agent_id"],
+        sub_agent_name="researcher",
+    )
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert row["tool"] == "researcher"
+    assert row["session_name"] == "queue:retry"
 
 
 # ── Multiple children, ordering, pagination ───────────────
@@ -2281,4 +2408,50 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
     child_ids = {row["id"] for row in children.json()["data"]}
     assert child_ids == {child.id}, (
         f"parent's children must be exactly the untouched source, got {child_ids}"
+    )
+
+
+# ── sys_session_create child with a verbatim colon title ──────────
+
+
+@pytest.mark.parametrize("title", ["research:pricing", "deploy: prod", "auth refactor"])
+async def test_child_sessions_keeps_verbatim_colon_title_whole(
+    client: httpx.AsyncClient,
+    title: str,
+) -> None:
+    """
+    A child created the way ``sys_session_create`` creates it (JSON
+    ``POST /v1/sessions`` with ``agent_id`` + ``parent_session_id`` and the
+    caller's verbatim ``title``, no ``sub_agent_name``) is summarised with
+    its bound agent as ``tool`` and the untouched title as ``session_name``.
+    The first colon of a verbatim title is not the framework's
+    ``"<agent>:<title>"`` separator, so it must not be split on; a
+    colon-free verbatim title is identified the same way.
+
+    :param client: The test HTTP client.
+    :param title: Verbatim caller title.
+    """
+    parent = await _create_parent_session(client, agent_name="orchestrator-verbatim")
+    child_agent = await create_test_agent(client, name="pricing_probe_child")
+
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": child_agent["id"],
+            "parent_session_id": parent["id"],
+            "title": title,
+        },
+    )
+    assert created.status_code == 201, created.text
+    child_id = created.json()["id"]
+
+    resp = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    assert resp.status_code == 200, resp.text
+    rows = {row["id"]: row for row in resp.json()["data"]}
+    row = rows[child_id]
+    assert row["title"] == title
+    assert row["agent_id"] == child_agent["id"]
+    assert (row["tool"], row["session_name"]) == (child_agent["name"], title), (
+        f"verbatim title {title!r} was split into tool={row['tool']!r} "
+        f"session_name={row['session_name']!r}"
     )

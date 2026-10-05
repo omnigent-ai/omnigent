@@ -65,7 +65,8 @@ async def _add_child_agent(
     :param client: The test HTTP client.
     :param parent_session_id: Existing parent session id.
     :param child_agent_id: Durable id of the agent to attach.
-    :param title: Child title in ``"{tool}:{name}"`` form, e.g. ``"codex:reviewer"``.
+    :param title: Child title. The dialog writes the reserved
+        ``"ui:{agent}:{label}"`` sentinel, e.g. ``"ui:codex:reviewer"``.
     :param initial_message: Optional user message to seed the child with.
     :param terminal_launch_args: Optional native-terminal launch args to
         persist on the child, e.g.
@@ -134,7 +135,7 @@ async def test_added_child_appears_in_parent_child_sessions(
         client,
         parent_session_id=parent["id"],
         child_agent_id=reviewer["id"],
-        title="codex:reviewer",
+        title="ui:codex:reviewer",
     )
     assert add.status_code == 201, add.text
     child_id = add.json()["id"]
@@ -144,7 +145,9 @@ async def test_added_child_appears_in_parent_child_sessions(
     rows = {row["id"]: row for row in resp.json()["data"]}
     assert child_id in rows, f"added child {child_id} missing from {list(rows)}"
     row = rows[child_id]
-    # Title parses into tool/session_name the UI badges the child with.
+    # The reserved "ui:" sentinel parses into the tool/session_name the UI
+    # badges the child with; a non-sentinel title stays verbatim (no
+    # sub_agent_name stamp licenses a split on this manual-create path).
     assert row["tool"] == "codex"
     assert row["session_name"] == "reviewer"
     assert row["parent_session_id"] == parent["id"]
