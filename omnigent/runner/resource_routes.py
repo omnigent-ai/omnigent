@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import logging
 import mimetypes
@@ -1437,7 +1438,20 @@ def register_resource_routes(
         content_str = body.get("content", "")
         encoding = body.get("encoding", "utf-8")
         create_parents = body.get("create_parents", True)
-        content_bytes = content_str.encode(encoding)
+        binary = encoding == "base64"
+        try:
+            if not isinstance(content_str, str):
+                raise ValueError("content must be a string")
+            if binary:
+                content_bytes = base64.b64decode(content_str, validate=True)
+            else:
+                content_bytes = content_str.encode(encoding)
+        except (ValueError, LookupError, TypeError) as exc:
+            message = "content is not valid base64" if binary else str(exc)
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "invalid_content", "message": message}},
+            )
         try:
             existing = await fs.read(relative_path, limit=None)
             if existing.encoding and filesystem_registry is not None:
@@ -1452,6 +1466,7 @@ def register_resource_routes(
             relative_path,
             content_bytes,
             create_parents=create_parents,
+            binary=binary,
         )
         if filesystem_registry is not None:
             filesystem_registry.record_change(relative_path, result.operation, session_id)
@@ -1691,8 +1706,6 @@ def register_resource_routes(
             payload["encoding"] = content.encoding
             payload["content"] = content.data.decode(content.encoding)
         else:
-            import base64
-
             payload["encoding"] = "base64"
             payload["content"] = base64.b64encode(content.data).decode()
         return JSONResponse(status_code=200, content=payload)

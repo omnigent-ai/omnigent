@@ -1187,6 +1187,7 @@ print(json.dumps({'r': results, 't': truncated}))
         content: bytes,
         *,
         create_parents: bool = True,  # noqa: ARG002
+        binary: bool = False,
     ) -> WriteFileResult:
         """Write/replace a file via the sandboxed helper.
 
@@ -1198,15 +1199,19 @@ print(json.dumps({'r': results, 't': truncated}))
         :param content: Bytes to write.
         :param create_parents: Accepted for API compat; OSEnvironment
             always creates parents.
+        :param binary: Write *content* as raw bytes instead of UTF-8 text.
         :returns: Write result with change tracking.
         """
         target, direct = self._write_route(path)
-        content_str = content.decode("utf-8")
+        encoding = "base64" if binary else "utf-8"
+        content_str = base64.b64encode(content).decode() if binary else content.decode("utf-8")
 
         if direct is not None:
-            result = await _run_impl_direct(_write_impl, direct, content_str)
+            result = await _run_impl_direct(_write_impl, direct, content_str, encoding)
         else:
-            result = await _run_os_env_async(self._os_env.write, target, content_str)
+            result = await _run_os_env_async(
+                self._os_env.write, target, content_str, encoding=encoding
+            )
         if "error" in result:
             raise FilesystemPathNotFound(result.get("error", f"Write failed for {path!r}"))
 

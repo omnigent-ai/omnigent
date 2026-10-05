@@ -15,6 +15,7 @@ import pytest
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     _child_shell_env,
+    _handle_helper_request,
     _project_root,
     _read_impl,
     _shell_impl,
@@ -515,3 +516,29 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"content": base64.b64encode(b"\x00\xff").decode(), "encoding": "base64"}, b"\x00\xff"),
+        ({"content": "caf\u00e9"}, "caf\u00e9".encode()),
+        ({"content": "!!", "encoding": "base64"}, {"error": "content is not valid base64"}),
+        ({"content": "x", "encoding": "latin-1"}, {"error": "encoding must be utf-8 or base64"}),
+    ],
+)
+def test_helper_write_encoding(tmp_path: Path, extra: dict[str, str], expected: object) -> None:
+    """The helper's write op writes base64 as bytes, defaults to text, and rejects the rest."""
+    result = _handle_helper_request(
+        request={"op": "write", "path": "out.bin", **extra},
+        cwd=tmp_path,
+        shell_path="/bin/sh",
+        sandbox=_inactive_policy(),
+    )
+    target = tmp_path / "out.bin"
+    if isinstance(expected, bytes):
+        assert result["bytes_written"] == len(expected)
+        assert target.read_bytes() == expected
+    else:
+        assert result == expected
+        assert not target.exists()

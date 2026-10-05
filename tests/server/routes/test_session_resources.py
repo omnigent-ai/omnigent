@@ -3721,6 +3721,25 @@ async def test_filesystem_write_proxies_to_runner(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_write_surfaces_runner_invalid_content(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 400 for bad base64 content reaches the client as a 400."""
+    fake_runner = _FakeRunnerClient(
+        status_code=400,
+        payload={"error": {"code": "invalid_content", "message": "content is not valid base64"}},
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.put(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/a.png",
+        json={"content": "not base64!", "encoding": "base64"},
+    )
+    assert resp.status_code == 400
+    assert "not valid base64" in resp.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fail_first_wake", [False, True])
 @pytest.mark.parametrize("method", ["PUT", "DELETE"])
 async def test_filesystem_save_reconnects_runner_on_live_host(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import binascii
 import codecs
 import contextlib
 import json
@@ -326,7 +327,8 @@ class OSEnvironment(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def write(self, path: str, content: str) -> OpResult:
+    async def write(self, path: str, content: str, *, encoding: str = "utf-8") -> OpResult:
+        """Write a file; ``encoding="base64"`` means *content* is base64 bytes."""
         raise NotImplementedError
 
     @abstractmethod
@@ -919,15 +921,11 @@ class CallerProcessOSEnvironment(OSEnvironment):
         )
         return cast(OpResult, result)
 
-    async def write(self, path: str, content: str) -> OpResult:
-        result = await run_sync_on_thread(
-            self._helper.request,
-            {
-                "op": "write",
-                "path": path,
-                "content": content,
-            },
-        )
+    async def write(self, path: str, content: str, *, encoding: str = "utf-8") -> OpResult:
+        request: OpRequest = {"op": "write", "path": path, "content": content}
+        if encoding != "utf-8":
+            request["encoding"] = encoding
+        result = await run_sync_on_thread(self._helper.request, request)
         return cast(OpResult, result)
 
     async def edit(
@@ -1094,7 +1092,13 @@ def _handle_helper_request(
             content = raw_content
         else:
             return {"error": "content must be a string"}
-        return _write_impl(path, content)
+        encoding = request.get("encoding", "utf-8")
+        if encoding not in ("utf-8", "base64"):
+            return {"error": "encoding must be utf-8 or base64"}
+        try:
+            return _write_impl(path, content, encoding)
+        except binascii.Error:
+            return {"error": "content is not valid base64"}
 
     if op == "edit":
         raw_path = request.get("path")
@@ -1429,13 +1433,18 @@ def _read_impl(
     }
 
 
-def _write_impl(path: Path, content: str) -> OpResult:
+def _write_impl(path: Path, content: str, encoding: str = "utf-8") -> OpResult:
+    """Write *content*: UTF-8 text, or bytes decoded from base64 when *encoding* is ``base64``."""
+    data = base64.b64decode(content, validate=True) if encoding == "base64" else None
     path.parent.mkdir(parents=True, exist_ok=True)
     existed = path.exists()
-    path.write_text(content, encoding="utf-8")
+    if data is None:
+        path.write_text(content, encoding="utf-8")
+    else:
+        path.write_bytes(data)
     return {
         "path": str(path),
-        "bytes_written": len(content.encode("utf-8")),
+        "bytes_written": len(content.encode("utf-8")) if data is None else len(data),
         "created": not existed,
     }
 

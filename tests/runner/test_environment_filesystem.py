@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import subprocess
@@ -299,6 +300,73 @@ async def test_write_file(
     assert body["created"] is True
     assert body["bytes_written"] == 11
     assert (workspace / "new.txt").read_text() == "new content"
+
+
+_FS_BASE = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+
+
+@pytest.mark.asyncio
+async def test_write_file_base64_writes_bytes(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """``encoding: base64`` writes the decoded bytes, including non-UTF-8 ones."""
+    data = b"wOF2\x00\x01\xff\xfe\r\n"
+    resp = await client.put(
+        f"{_FS_BASE}/fonts/brand.woff2",
+        json={"content": base64.b64encode(data).decode(), "encoding": "base64"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["bytes_written"] == len(data)
+    assert (workspace / "fonts/brand.woff2").read_bytes() == data
+
+
+@pytest.mark.asyncio
+async def test_write_file_base64_outside_workspace(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """An absolute path written in-process (unconfined) also gets the raw bytes."""
+    target = tmp_path / "outside" / "logo.png"
+    data = b"\x89PNG\r\n\x1a\n\x00"
+    resp = await client.put(
+        f"{_FS_BASE}/%2F{str(target).lstrip('/')}",
+        json={"content": base64.b64encode(data).decode(), "encoding": "base64"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert target.read_bytes() == data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"content": "not base64!", "encoding": "base64"},
+        {"content": "QUJD", "encoding": "base32"},
+        {"content": 7, "encoding": "base64"},
+    ],
+)
+async def test_write_file_rejects_bad_content(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    body: dict[str, object],
+) -> None:
+    """Invalid base64, an unknown encoding, or non-string content is a 400 that writes nothing."""
+    resp = await client.put(f"{_FS_BASE}/bad.bin", json=body)
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_content"
+    assert not (workspace / "bad.bin").exists()
+
+
+@pytest.mark.asyncio
+async def test_write_file_defaults_to_text(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """Without ``encoding`` the content is written as UTF-8 text, as before."""
+    resp = await client.put(f"{_FS_BASE}/notes.md", json={"content": "caf\u00e9 QUJD"})
+    assert resp.status_code == 200, resp.text
+    assert (workspace / "notes.md").read_text(encoding="utf-8") == "caf\u00e9 QUJD"
 
 
 @pytest.mark.asyncio
@@ -2544,6 +2612,12 @@ async def test_file_routes_emit_design_artifact_changes(
         await client.put(f"{base}/flow.wireframe.html", json={"content": "<p>w</p>"})
     ).status_code == 200
     assert (await client.put(f"{base}/notes.html", json={"content": "x"})).status_code == 200
+    encoded = base64.b64encode(b"<p>b</p>").decode()
+    assert (
+        await client.put(
+            f"{base}/decks/b64.slides.html", json={"content": encoded, "encoding": "base64"}
+        )
+    ).status_code == 200
 
     assert _design_events(app) == [
         {
@@ -2557,5 +2631,6 @@ async def test_file_routes_emit_design_artifact_changes(
             ("decks/q3.slides.html", False),
             ("decks/q3.slides.html", True),
             ("flow.wireframe.html", False),
+            ("decks/b64.slides.html", False),
         ]
     ]
