@@ -460,6 +460,109 @@ describe("authenticatedFetch", () => {
       },
     );
 
+    // A host demoted to keyless whose keyless request still comes back
+    // wrong_replica (e.g. it re-registered keyed after an upgrade): the request
+    // is valid, just misrouted, so it is re-sent once WITH the key.
+    function wrongReplica(): Response {
+      return {
+        ok: false,
+        status: 400,
+        statusText: "Bad Request",
+        json: async () => ({ error: { code: "wrong_replica", message: "Wrong replica." } }),
+        clone: function () {
+          return this;
+        },
+      } as unknown as Response;
+    }
+
+    async function importWithDemotedHost() {
+      const clearHostKeyless = vi.fn();
+      const markHostKeyless = vi.fn();
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => null),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn((hostId: string) => hostId === "host_target"),
+        markHostKeyless,
+        clearHostKeyless,
+        modalHostId: vi.fn(() => "host_modal"),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+      }));
+      const { authenticatedFetch } = await import("./identity");
+      const response = await authenticatedFetch("/v1/imports/local/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host_id: "host_target", source: "all", limit: 5 }),
+      });
+      const keys = fetchMock.mock.calls.map((call) =>
+        new Headers((call[1] as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
+      );
+      return { response, keys, clearHostKeyless, markHostKeyless };
+    }
+
+    it("re-sends a keyless wrong_replica once with the routing key", async () => {
+      fetchMock.mockResolvedValueOnce(wrongReplica());
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+
+      const { response, keys, clearHostKeyless, markHostKeyless } = await importWithDemotedHost();
+
+      // Keyless first (the host was demoted), then exactly one keyed re-send.
+      expect(keys).toEqual([null, "host_target"]);
+      expect(response.status).toBe(200);
+      // The demotion is cleared so later requests key from the start.
+      expect(clearHostKeyless).toHaveBeenCalledExactlyOnceWith("host_target");
+      expect(markHostKeyless).not.toHaveBeenCalled();
+    });
+
+    it("returns the keyed re-send's wrong_replica as-is (no third attempt)", async () => {
+      fetchMock.mockResolvedValueOnce(wrongReplica());
+      fetchMock.mockResolvedValueOnce(wrongReplica());
+
+      const { response, keys } = await importWithDemotedHost();
+
+      expect(keys).toEqual([null, "host_target"]);
+      expect(response.status).toBe(400);
+    });
+
+    it("does not re-send keyed after a keyed→keyless re-address also misses", async () => {
+      // The keyed attempt already failed, so a keyless miss must not loop back.
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => null),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => "host_modal"),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+      }));
+      fetchMock.mockResolvedValueOnce(wrongReplica());
+      fetchMock.mockResolvedValueOnce(wrongReplica());
+      const { authenticatedFetch } = await import("./identity");
+
+      const response = await authenticatedFetch("/v1/imports/local/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host_id: "host_target", source: "all", limit: 5 }),
+      });
+
+      const keys = fetchMock.mock.calls.map((call) =>
+        new Headers((call[1] as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
+      );
+      expect(keys).toEqual(["host_target", null]);
+      expect(response.status).toBe(400);
+    });
+
     it("keys /v1/imports/local by its body host_id, not the modal host", async () => {
       // The import reads the CHOSEN host's transcripts over that host's tunnel,
       // so it must route to the replica keyed by the body host_id — never the

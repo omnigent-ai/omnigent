@@ -21,7 +21,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -41,6 +41,7 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalDoneFrame,
+    HostImportLocalProgressFrame,
     HostImportLocalSessionChunkFrame,
     HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
@@ -58,6 +59,7 @@ from omnigent.host.frames import (
     HostStoreSecretResultFrame,
     ImportLocalSessionChunkAssembler,
     decode_host_frame,
+    decode_imported_local_session_json,
     encode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
@@ -565,6 +567,69 @@ def _import_session_queue_payload(total: int, session: HostImportedLocalSession)
     }
 
 
+class LazyImportSessionPayload(Mapping[str, Any]):
+    """A reassembled chunked session's queue payload, decoded on first read.
+
+    The host sends a batch faster than the server saves it, so the queue holds
+    every session read so far. Chunked ones are the large ones, and decoded
+    they take up to ~4x their JSON (100,000 small items: 25 MiB of JSON, 83 MiB
+    of dicts), so they wait as text until the import loop takes one to save it
+    (:meth:`take`). One that fails to decode reads as the ``{"total": ...}``
+    placeholder the import loop counts as one failed session, as an eagerly
+    decoded one did. ``total`` is read without decoding.
+    """
+
+    __slots__ = ("_decoded", "_host_id", "_text", "_total")
+
+    def __init__(self, total: int, text: str, host_id: str) -> None:
+        self._total = total
+        self._text: str | None = text
+        self._host_id = host_id
+        self._decoded: dict[str, Any] | None = None
+
+    @property
+    def decoded(self) -> bool:
+        """Whether the session JSON has been decoded (and its text released)."""
+        return self._text is None
+
+    def _payload(self) -> dict[str, Any]:
+        if self._decoded is None:
+            text, self._text = self._text, None
+            try:
+                session = decode_imported_local_session_json(text or "")
+            except ValueError as exc:
+                _logger.warning(
+                    "Host %s sent an unusable chunked import session: %s",
+                    self._host_id,
+                    exc,
+                )
+                self._decoded = {"total": self._total}
+            else:
+                self._decoded = _import_session_queue_payload(self._total, session)
+        return self._decoded
+
+    def take(self) -> dict[str, Any]:
+        """Decode and hand the payload over, keeping no reference to it.
+
+        Whatever still holds this object (a queue entry, a frame local) then
+        pins nothing while the save runs. Call once.
+        """
+        payload = self._payload()
+        self._decoded = {"total": self._total}
+        return payload
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "total":
+            return self._total
+        return self._payload()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._payload())
+
+    def __len__(self) -> int:
+        return len(self._payload())
+
+
 async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
@@ -899,7 +964,7 @@ async def _receive_loop(
                 if request_id != frame.request_id
             )
             try:
-                session = assembler.add(
+                session_json = assembler.add_text(
                     frame,
                     budget=IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS - buffered_elsewhere,
                 )
@@ -914,9 +979,21 @@ async def _receive_loop(
                 # (and the rest of the batch) alive.
                 queue.put_nowait(("session", {"total": frame.total}))
                 continue
-            if session is None:
+            if session_json is None:
                 continue
-            queue.put_nowait(("session", _import_session_queue_payload(frame.total, session)))
+            queue.put_nowait(
+                ("session", LazyImportSessionPayload(frame.total, session_json, host_id))
+            )
+            continue
+        if isinstance(frame, HostImportLocalProgressFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is not None:
+                queue.put_nowait(
+                    (
+                        "progress",
+                        {"done": frame.done, "total": frame.total, "skipped": frame.skipped},
+                    )
+                )
             continue
         if isinstance(frame, HostImportLocalDoneFrame):
             queue = conn.pending_import_local.get(frame.request_id)
@@ -934,6 +1011,7 @@ async def _receive_loop(
                             "error": frame.error,
                             "failed": frame.failed,
                             "failures": frame.failures,
+                            "skipped": frame.skipped,
                         },
                     )
                 )

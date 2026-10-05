@@ -81,6 +81,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native._native_resume_backup import keep_original_resume_transcript
 from omnigent.native._native_resume_hint import echo_native_resume_hint
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
 from omnigent.native.native_terminal import (
@@ -1929,6 +1930,8 @@ async def _ensure_local_codex_resume_rollout(
     rollout remains a best-effort fallback. A successful server fetch wins even
     when its committed history is empty or shorter than the local file;
     local-only records are intentionally discarded.
+    The first local rollout it replaces is kept beside it as
+    ``<rollout>.jsonl.omnigent-backup``.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -2016,6 +2019,7 @@ async def _ensure_local_codex_resume_rollout(
             for record in records:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
         assert tmp is not None
+        keep_original_resume_transcript(target)
         os.replace(tmp, target)
     except OSError as exc:
         raise click.ClickException(

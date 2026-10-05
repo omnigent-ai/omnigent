@@ -41,7 +41,8 @@ const SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
 // Server error code (errors.py ErrorCode.WRONG_REPLICA) returned when a keyed
 // request reached a replica that doesn't hold the session's host tunnel — the
 // key doesn't match where the tunnel lives. The request is valid, just
-// misrouted, so we re-address it ONCE without the key and route by the default.
+// misrouted, so we re-address it ONCE without the key and route by the default
+// (or, when we sent it keyless for a host demoted to keyless, once WITH the key).
 // Distinct from "runner_unavailable" (the runner is offline everywhere), which
 // no re-addressing can fix.
 const WRONG_REPLICA_CODE = "wrong_replica";
@@ -531,9 +532,19 @@ export async function authenticatedFetch(
   ) {
     // We sent this keyless BECAUSE the host was demoted, yet it still came back
     // wrong_replica — so keying was not the problem (e.g. the host re-registered
-    // keyed after a CLI upgrade). Clear the demotion so the next request
-    // re-evaluates by trying keyed again.
+    // keyed after a CLI upgrade). Clear the demotion so later requests key
+    // again, and re-address THIS one ONCE with the key: wrong_replica means the
+    // request is valid but misrouted, so returning it would fail an action the
+    // keyed route can serve. No further fallback — if the keyed attempt misses
+    // too, that response is returned as-is.
     clearHostKeyless(derivedHostId);
+    const retryHeaders = new Headers(headers);
+    retryHeaders.set(SLICE_KEY_HEADER, derivedHostId);
+    res = await hostFetch(url, {
+      ...init,
+      headers: retryHeaders,
+      cache: "no-store",
+    });
   }
 
   if (

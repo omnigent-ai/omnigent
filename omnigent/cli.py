@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -6485,6 +6486,11 @@ def resume(
 
 
 _IMPORT_BATCH_MAX_WORKERS = 8
+# One ``POST /v1/imports`` may carry a full ``IMPORT_MAX_ITEMS`` session, which
+# can take ~130 s to save on a remote conversation store, past a 120 s timeout.
+# Matches the server's 270 s stream budget, under the ~300 s route timeout of
+# typical ingress proxies; see ``session_import.local.IMPORT_READ_BUDGET_BYTES``.
+_IMPORT_REQUEST_TIMEOUT_S = 270.0
 
 
 @dataclass
@@ -6496,11 +6502,206 @@ class _SessionImportResult:
     """
 
     session_id: str
-    status: Literal["imported", "already", "unreachable", "failed", "load_error"]
+    status: Literal["imported", "already", "empty", "unreachable", "failed", "load_error"]
     item_count: int = 0
     link: str | None = None
     message: str | None = None
     raw_exc: BaseException | None = None
+    # Stable import code from the server (``ImportErrorCode``), when it sent one.
+    code: str | None = None
+    retryable: bool = True
+    # "label: command" lines that fix the failure, printed indented under it.
+    fix_commands: tuple[str, ...] = ()
+    # HTTP status of a failed import request, when the server answered.
+    http_status: int | None = None
+    # Latest items left out because the history was over the import cap.
+    trimmed_item_count: int = 0
+    # An uncounted amount of later history was left out (reading stopped early).
+    later_history_omitted: bool = False
+
+
+def _trimmed_note(result: _SessionImportResult) -> str:
+    """`` (later N left out: too long to import in full)`` for a trimmed import."""
+    if result.later_history_omitted:
+        return " (later history left out: too long to import in full)"
+    if result.trimmed_item_count <= 0:
+        return ""
+    return f" (later {result.trimmed_item_count:,} left out: too long to import in full)"
+
+
+@dataclass(frozen=True)
+class _ImportErrorBody:
+    """What a failed ``POST /v1/imports`` response says, across server versions."""
+
+    message: str
+    import_code: str | None = None
+    retryable: bool = True
+    fix_commands: tuple[str, ...] = ()
+    # The existing session a duplicate (409) import points at.
+    session_id: str | None = None
+    # Server log correlation id for an ``internal`` failure.
+    error_id: str | None = None
+
+
+def _fix_command_lines(value: object) -> tuple[str, ...]:
+    """``fix_commands`` as printable lines.
+
+    Newer servers send ``{"label", "command"}`` entries (printed
+    ``label: command``); older ones plain strings (printed as-is).
+    """
+    if not isinstance(value, list):
+        return ()
+    lines: list[str] = []
+    for entry in value:
+        if isinstance(entry, str) and entry.strip():
+            lines.append(entry)
+        elif isinstance(entry, dict):
+            command = entry.get("command")
+            label = entry.get("label")
+            if not isinstance(command, str) or not command.strip():
+                continue
+            lines.append(f"{label}: {command}" if isinstance(label, str) and label else command)
+    return tuple(lines)
+
+
+def _import_cli_error(message: str, *, host_related: bool = False) -> click.ClickException:
+    """A ClickException for ``omnigent import`` that names only the real cause.
+
+    The top-level stale-host hint (``omnigent stop``) is advice for runner
+    tunnel rejections; an import failure (an oversized session, a storage
+    error, a bad transcript) gets it only when the failure is the host's tunnel.
+    """
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    exc = click.ClickException(message)
+    if not host_related:
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    return exc
+
+
+def _is_host_related_import_failure(code: str | None, status: int | None) -> bool:
+    """Whether a failed import is about the host tunnel (or a 401 rejection).
+
+    Only those failures can be helped by the stale-host ``omnigent stop`` hint.
+    """
+    from omnigent.session_import.errors import ImportErrorCode
+
+    host_tunnel_codes = (
+        ImportErrorCode.HOST_OFFLINE,
+        ImportErrorCode.HOST_UNREACHABLE,
+        ImportErrorCode.HOST_DISCONNECTED,
+        ImportErrorCode.HOST_UNRESPONSIVE,
+    )
+    return code in host_tunnel_codes or status == 401
+
+
+# Older servers name the existing session only in the 409 message.
+_EXISTING_SESSION_RE = re.compile(r"already exists as (\S+?)\.?$")
+
+
+def _parse_import_error(response: Any) -> _ImportErrorBody:  # type: ignore[explicit-any]
+    """Extract a readable failure from an import error response.
+
+    Newer servers send ``{"error": {"message", "import_code", "retryable",
+    ...}}``; older ones only ``message`` (or FastAPI's ``detail``). Falls back
+    to the raw body so nothing is ever reported blank.
+    """
+    from omnigent.session_import.errors import ImportErrorCode, import_code_is_retryable
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        message = error.get("message")
+        import_code = error.get("import_code")
+        code = import_code if isinstance(import_code, str) and import_code else None
+        retryable = error.get("retryable")
+        fixes = error.get("fix_commands")
+        error_id = error.get("error_id")
+        session_id = error.get("session_id")
+        if not isinstance(session_id, str) and isinstance(message, str):
+            match = _EXISTING_SESSION_RE.search(message)
+            session_id = match.group(1) if match else None
+        return _ImportErrorBody(
+            session_id=session_id if isinstance(session_id, str) and session_id else None,
+            message=message if isinstance(message, str) and message else response.text,
+            import_code=code,
+            retryable=(
+                retryable
+                if isinstance(retryable, bool)
+                else (import_code_is_retryable(code) if code else True)
+            ),
+            fix_commands=_fix_command_lines(fixes),
+            error_id=error_id if isinstance(error_id, str) and error_id else None,
+        )
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, str) and detail:
+        return _ImportErrorBody(message=detail)
+    if isinstance(detail, list):
+        readable = _first_validation_message(detail)
+        if readable is not None:
+            return _ImportErrorBody(
+                message=readable,
+                import_code=ImportErrorCode.INVALID_REQUEST,
+                retryable=False,
+            )
+    return _ImportErrorBody(message=response.text or f"HTTP {response.status_code}")
+
+
+# A field path longer than this reads worse than the bare message.
+_MAX_VALIDATION_PATH_CHARS = 40
+
+
+def _first_validation_message(detail: list[object]) -> str | None:
+    """The first readable message of a FastAPI 422 ``detail`` list.
+
+    E.g. ``items.0.response_id: String should have at most 64 characters``
+    rather than the raw pydantic error list.
+    """
+    for entry in detail:
+        if not isinstance(entry, dict):
+            continue
+        msg = entry.get("msg")
+        if not isinstance(msg, str) or not msg:
+            continue
+        msg = msg.removeprefix("Value error, ")
+        loc = entry.get("loc")
+        # FastAPI prefixes body fields with "body"; a field named "body" stays.
+        if isinstance(loc, list) and loc[:1] == ["body"]:
+            loc = loc[1:]
+        parts = [str(part) for part in loc] if isinstance(loc, list) else []
+        path = ".".join(parts)
+        if path and len(path) <= _MAX_VALIDATION_PATH_CHARS:
+            return f"{path}: {msg}"
+        return msg
+    return None
+
+
+def _unreadable_session_message(harness: str, session_id: str, exc: BaseException) -> str:
+    """A classified message for a transcript that failed to load.
+
+    The exception text can hold local paths and parser internals, so only its
+    kind is named.
+    """
+    from omnigent.session_import.models import IMPORT_SOURCE_LABELS
+
+    label = IMPORT_SOURCE_LABELS.get(harness, harness)
+    if isinstance(exc, UnicodeDecodeError):
+        reason = "its transcript isn't valid UTF-8"
+    elif isinstance(exc, OSError):
+        reason = f"its transcript file couldn't be opened ({type(exc).__name__})"
+    else:
+        reason = f"its transcript couldn't be parsed ({type(exc).__name__})"
+    return f"Couldn't read {label} session {session_id}: {reason}."
+
+
+def _echo_import_failure(prefix: str, outcome: _SessionImportResult) -> None:
+    """Print one failed session: the reason, then any fix commands indented."""
+    click.echo(f"{prefix}{outcome.message}", err=True)
+    for command in outcome.fix_commands:
+        click.echo(f"    {command}", err=True)
 
 
 @cli.command("import")
@@ -6575,11 +6776,13 @@ def import_session_command(
         ImportSource,
         SessionImportNotFoundError,
     )
+    from omnigent.session_import.errors import ImportErrorCode
     from omnigent.session_import.local import (
         list_recent_local_session_ids,
         list_recent_sessions_across_harnesses,
         load_local_session,
     )
+    from omnigent.session_import.models import IMPORT_SOURCE_LABELS, SessionImportEmptyError
 
     if (source_session_id is None) == (recent_session_count is None):
         raise click.UsageError("Provide exactly one of --session or --last.")
@@ -6600,19 +6803,30 @@ def import_session_command(
             # Merge every harness into one global recency order, keep the top N
             # (so "last N" is N total, not N per harness). Oldest first so the
             # newest import lands atop the sidebar.
-            import_targets = list(
-                reversed(list_recent_sessions_across_harnesses(limit=recent_session_count))
-            )
+            recent = list_recent_sessions_across_harnesses(limit=recent_session_count)
+            import_targets = list(reversed(recent))
+            for skipped_source, error_type in getattr(recent, "skipped_harnesses", ()):
+                label = IMPORT_SOURCE_LABELS.get(skipped_source, skipped_source)
+                click.echo(
+                    f"Warning: couldn't list local {label} sessions ({error_type}); "
+                    "they were skipped.",
+                    err=True,
+                )
         else:
             src = cast(ImportSource, harness)
             try:
                 recent_ids = list_recent_local_session_ids(src, limit=recent_session_count)
             except SessionImportNotFoundError as exc:
-                raise click.ClickException(str(exc)) from exc
+                raise _import_cli_error(str(exc)) from exc
+            except Exception as exc:  # a classified message, not a crash report
+                label = IMPORT_SOURCE_LABELS.get(src, src)
+                raise _import_cli_error(
+                    f"Couldn't list local {label} sessions ({type(exc).__name__})."
+                ) from exc
             import_targets = [(src, sid) for sid in reversed(recent_ids)]
         if not import_targets:
             scope = "any harness" if all_harnesses else harness
-            raise click.ClickException(f"No local {scope} parent sessions were found")
+            raise _import_cli_error(f"No local {scope} parent sessions were found")
     else:
         assert source_session_id is not None
         import_targets = [(cast(ImportSource, harness), source_session_id)]
@@ -6636,10 +6850,30 @@ def import_session_command(
         current_source, sid = target
         try:
             imported = load_local_session(current_source, sid)
+        except SessionImportEmptyError as exc:
+            # Nothing to import (e.g. opened and closed without a prompt): a
+            # note, not a failure, so it never fails the command on its own.
+            return _SessionImportResult(
+                sid,
+                "empty",
+                message=str(exc),
+                raw_exc=exc,
+                code=ImportErrorCode.SESSION_EMPTY,
+                retryable=False,
+            )
         except SessionImportNotFoundError as exc:
-            return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
-        except (OSError, TypeError, ValueError) as exc:
-            return _SessionImportResult(sid, "load_error", message=str(exc), raw_exc=exc)
+            return _SessionImportResult(
+                sid, "load_error", message=str(exc), raw_exc=exc, retryable=False
+            )
+        except Exception as exc:  # noqa: BLE001 - one session's fault must not end the batch
+            # A read fault may be transient; a parse fault won't change on retry.
+            return _SessionImportResult(
+                sid,
+                "load_error",
+                message=_unreadable_session_message(current_source, sid, exc),
+                raw_exc=exc,
+                retryable=isinstance(exc, OSError) and not isinstance(exc, UnicodeDecodeError),
+            )
 
         payload: dict[str, object] = {
             "source": imported.source,
@@ -6663,7 +6897,7 @@ def import_session_command(
                 f"{base_url}/v1/imports",
                 json=payload,
                 headers=_remote_headers(server_url=base_url, host_id=None),
-                timeout=120.0,
+                timeout=_IMPORT_REQUEST_TIMEOUT_S,
             )
         except httpx.RequestError as exc:
             return _SessionImportResult(
@@ -6674,14 +6908,31 @@ def import_session_command(
             )
 
         if response.is_error:
-            try:
-                body = response.json()
-                detail = body.get("error", {}).get("message") or body.get("detail")
-            except (ValueError, AttributeError):
-                detail = None
-            message = f"Import failed ({response.status_code}): {detail or response.text}"
-            status = "already" if response.status_code == 409 else "failed"
-            return _SessionImportResult(sid, status, message=message)
+            error = _parse_import_error(response)
+            message = f"Import failed ({response.status_code}): {error.message}"
+            if error.error_id is not None and error.error_id not in message:
+                message += f" (error ID: {error.error_id})"
+            # A 409 is a duplicate unless a newer server classified it as
+            # something else (e.g. the host's Python lacks SQLite).
+            duplicate = response.status_code == 409 and error.import_code in (
+                None,
+                ImportErrorCode.ALREADY_IMPORTED,
+            )
+            status = "already" if duplicate else "failed"
+            return _SessionImportResult(
+                sid,
+                status,
+                link=(
+                    conversation_url(base_url, error.session_id)
+                    if duplicate and error.session_id
+                    else None
+                ),
+                message=message,
+                code=error.import_code,
+                retryable=error.retryable,
+                fix_commands=error.fix_commands,
+                http_status=response.status_code,
+            )
 
         try:
             result = response.json()
@@ -6702,21 +6953,37 @@ def import_session_command(
             "imported",
             item_count=item_count,
             link=conversation_url(base_url, session_id),
+            trimmed_item_count=imported.trimmed_item_count,
+            later_history_omitted=imported.later_history_omitted,
         )
 
     if not is_batch:
         result = _import_one(import_targets[0])
         if result.status == "imported":
-            click.echo(f"Imported {result.item_count} item(s) into {result.link}")
+            click.echo(
+                f"Imported {result.item_count} item(s){_trimmed_note(result)} into {result.link}"
+            )
+            return
+        if result.status == "already":
+            # Re-running an import is the common case (and the batch path
+            # already treats it as a skip), so it is not an error.
+            where = f" as {result.link}" if result.link else ""
+            click.echo(f"Already imported{where} (use --force to replace)")
+            return
+        if result.status == "empty":
+            click.echo(f"Nothing to import: {result.message}")
             return
         if result.status == "load_error":
-            # A missing session is a clean CLI error; a corrupt transcript keeps
-            # its original exception so the traceback points at the parse fault.
+            # A missing or unreadable session is a clean CLI error (a local
+            # fault, never a stale host), not a crash report.
             if isinstance(result.raw_exc, SessionImportNotFoundError):
-                raise click.ClickException(str(result.raw_exc)) from result.raw_exc
-            assert result.raw_exc is not None
-            raise result.raw_exc
-        raise click.ClickException(result.message or "Import failed")
+                raise _import_cli_error(str(result.raw_exc)) from result.raw_exc
+            raise _import_cli_error(result.message or "Import failed") from result.raw_exc
+        fixes = "".join(f"\n    {command}" for command in result.fix_commands)
+        raise _import_cli_error(
+            f"{result.message or 'Import failed'}{fixes}",
+            host_related=_is_host_related_import_failure(result.code, result.http_status),
+        )
 
     # Distinct sessions are independent conversations on the server (their own
     # ids, row locks, and position counters), so importing them concurrently
@@ -6730,33 +6997,65 @@ def import_session_command(
         futures = {executor.submit(_import_one, target): target for target in import_targets}
         for future in concurrent.futures.as_completed(futures):
             target = futures[future]
-            results[target] = future.result()
+            try:
+                results[target] = future.result()
+            except Exception as exc:  # noqa: BLE001 - keep the batch summary
+                results[target] = _SessionImportResult(
+                    target[1],
+                    "failed",
+                    message=f"Import failed unexpectedly ({type(exc).__name__}).",
+                    raw_exc=exc,
+                )
 
     # A per-session network failure (e.g. one large session's read timeout) is
     # reported and counted like any other failure so the rest of the batch still
     # imports; only the single-session path treats unreachable as fatal.
     imported_count = 0
     already_imported_count = 0
+    skipped_count = 0
     failed_count = 0
+    retryable_count = 0
+    host_related = False
     # Report in the caller's requested order, not worker completion order.
     for target in import_targets:
         sid = target[1]
         outcome = results[target]
         if outcome.status == "imported":
             imported_count += 1
-            click.echo(f"Imported {outcome.item_count} item(s) from {sid} into {outcome.link}")
+            click.echo(
+                f"Imported {outcome.item_count} item(s){_trimmed_note(outcome)} from {sid} "
+                f"into {outcome.link}"
+            )
         elif outcome.status == "already":
             already_imported_count += 1
-            click.echo(f"Already imported {sid}; skipped.")
+            where = f" as {outcome.link}" if outcome.link else ""
+            click.echo(f"Already imported {sid}{where}; skipped.")
+        elif outcome.status == "empty":
+            skipped_count += 1
+            click.echo(f"Skipped {sid}: no history to import.")
         else:
             failed_count += 1
-            click.echo(f"Failed {sid}: {outcome.message}", err=True)
+            if outcome.retryable:
+                retryable_count += 1
+            host_related = host_related or _is_host_related_import_failure(
+                outcome.code, outcome.http_status
+            )
+            _echo_import_failure(f"Failed {sid}: ", outcome)
 
     click.echo(f"\nImported: {imported_count}")
     click.echo(f"Already imported: {already_imported_count}")
+    if skipped_count:
+        click.echo(f"Skipped (no history to import): {skipped_count}")
     click.echo(f"Failed: {failed_count}")
     if failed_count:
-        raise click.ClickException(f"{failed_count} session(s) failed to import")
+        if retryable_count:
+            click.echo(
+                "Run the same command again to retry; sessions already imported are skipped.",
+                err=True,
+            )
+        raise _import_cli_error(
+            f"{failed_count} session(s) failed to import", host_related=host_related
+        )
 
 
 def _render_usage(report: dict[str, Any], limit: int) -> None:  # type: ignore[explicit-any]

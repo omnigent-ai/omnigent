@@ -2264,7 +2264,9 @@ def create_app(
             )
         return JSONResponse(
             status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
+            # ``details`` only adds fields: ``code``/``message`` keep the shape
+            # every existing client parses.
+            content={"error": {**exc.details, "code": exc.code, "message": exc.message}},
         )
 
     @app.exception_handler(RequestValidationError)

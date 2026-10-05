@@ -160,10 +160,8 @@ def test_deregister_fails_pending_import_streams() -> None:
 
     assert registry.deregister("host_imp") is True
 
-    kind, data = queue.get_nowait()
-    assert kind == "done"
-    assert data["status"] == "failed"
-    assert "disconnected mid-import" in str(data["error"])
+    # A terminal marker the import handler reports as host_disconnected.
+    assert queue.get_nowait() == ("disconnected", {})
     assert conn.pending_import_local == {}
 
 
@@ -177,9 +175,7 @@ def test_register_replacement_fails_stale_pending_import_streams() -> None:
 
     registry.register("host_imp2", FakeWebSocket(), _make_hello(), owner="bob")
 
-    kind, data = queue.get_nowait()
-    assert kind == "done"
-    assert data["status"] == "failed"
+    assert queue.get_nowait() == ("disconnected", {})
 
 
 def test_deregister_returns_false_for_unknown() -> None:

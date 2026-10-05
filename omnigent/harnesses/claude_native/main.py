@@ -120,6 +120,7 @@ from omnigent.models.claude_model_vocabulary import (
     claude_model_alias,
     served_canonical_overrides,
 )
+from omnigent.native._native_resume_backup import keep_original_resume_transcript
 from omnigent.native._native_resume_hint import echo_native_resume_hint
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
 from omnigent.native.native_terminal import (
@@ -5315,6 +5316,8 @@ async def _ensure_local_claude_resume_transcript(
     wrapper always rewrites it from committed Omnigent items before launch so
     Omnigent remains the source of truth when a previous local Claude JSONL
     has diverged.
+    The first local transcript it replaces is kept beside it as
+    ``<sid>.jsonl.omnigent-backup``.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g.
@@ -5389,6 +5392,7 @@ async def _ensure_local_claude_resume_transcript(
         with tmp.open("w", encoding="utf-8") as handle:
             for record in records:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        keep_original_resume_transcript(target)
         os.replace(tmp, target)
     except OSError as exc:
         raise click.ClickException(

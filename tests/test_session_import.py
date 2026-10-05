@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -1987,3 +1988,34 @@ def test_list_recent_sessions_across_harnesses_normalizes_millisecond_recency(
     result = local_import.list_recent_sessions_across_harnesses(limit=1)
 
     assert result == [("claude", "c1")]
+
+
+def test_list_recent_sessions_across_harnesses_skips_only_a_broken_harness(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One harness whose listing raises unexpectedly hides only its own sessions."""
+
+    def fake_recency(source: str, *, limit: int) -> list[tuple[str, float]]:
+        if source == "codex":
+            raise ModuleNotFoundError("No module named '_sqlite3'")
+        if source == "claude":
+            return [("c1", 2.0), ("c2", 1.0)]
+        return []
+
+    monkeypatch.setattr(local_import, "_recent_local_sessions_with_recency", fake_recency)
+
+    with caplog.at_level("WARNING", logger=local_import.__name__):
+        result = local_import.list_recent_sessions_across_harnesses(limit=5)
+
+    assert result == [("claude", "c1"), ("claude", "c2")]
+    assert "Skipping codex sessions" in caplog.text
+
+
+def test_codex_native_title_falls_back_without_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Python without SQLite skips the state-db title lookup instead of failing the import."""
+    (tmp_path / "state_5.sqlite").write_text("")
+    monkeypatch.setitem(sys.modules, "sqlite3", None)
+
+    assert local_import._codex_native_title(tmp_path, "thread-1") is None
