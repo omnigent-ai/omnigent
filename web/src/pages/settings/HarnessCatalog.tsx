@@ -156,6 +156,8 @@ export function HarnessCatalog({
   const ownList = (kind: CatalogKind, count: number, list: ReactNode) => {
     const noun = KINDS.find((k) => k.id === kind)?.noun;
     if (loading) return <Notice>Loading {noun}…</Notice>;
+    if (kind === "mcps" && inventory.mcpUnsupported)
+      return <Notice>Please update host {host.name} to list MCP servers.</Notice>;
     if (failed(kind))
       return (
         <Notice>

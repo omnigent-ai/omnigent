@@ -94,6 +94,7 @@ vi.mock("@/hooks/useHosts", async (importActual) => ({
 const INVENTORY: HarnessInventory = {
   status: "ready",
   unavailable: [],
+  mcpUnsupported: false,
   isEmpty: false,
   context: {
     credentials: [],
@@ -370,7 +371,7 @@ describe("Harness details", () => {
     );
   });
 
-  it("shows loading, then a per-tab error for a listing the host couldn't report", () => {
+  it.each([false, true])("shows the MCP listing error (unsupported: %s)", (mcpUnsupported) => {
     hosts = [ONLINE];
     inventory = { ...INVENTORY, status: "loading" };
     renderHarnesses("claude-native");
@@ -378,9 +379,15 @@ describe("Harness details", () => {
     expect(screen.getByRole("tab", { name: "MCP servers" })).toBeTruthy();
     cleanup();
 
-    inventory = { ...INVENTORY, unavailable: ["mcps"] };
+    inventory = { ...INVENTORY, unavailable: ["mcps"], mcpUnsupported };
     renderHarnesses("claude-native");
-    expect(screen.getByText("Couldn't load MCP servers from my-laptop.")).toBeTruthy();
+    expect(
+      screen.getByText(
+        mcpUnsupported
+          ? "Please update host my-laptop to list MCP servers."
+          : "Couldn't load MCP servers from my-laptop.",
+      ),
+    ).toBeTruthy();
   });
 
   it("says the catalog isn't listed for a ready harness the inventory doesn't cover", () => {

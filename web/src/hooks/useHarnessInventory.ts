@@ -80,6 +80,8 @@ export interface HarnessInventory {
   context: HarnessInventoryContext;
   /** Asset kinds the host couldn't report; what did load is still in `context`. */
   unavailable: InventoryAssetKind[];
+  /** The host needs an update before it can report MCP inventory. */
+  mcpUnsupported: boolean;
   /** No MCP servers, skills, or plugins (credentials alone don't count). */
   isEmpty: boolean;
 }
@@ -330,6 +332,7 @@ export function useHarnessInventory(
         : "ready",
     context,
     unavailable,
+    mcpUnsupported: online && mcpQuery.error instanceof ApiError && mcpQuery.error.status === 501,
     isEmpty: context.mcps.length + context.skills.length + context.plugins.length === 0,
   };
 }

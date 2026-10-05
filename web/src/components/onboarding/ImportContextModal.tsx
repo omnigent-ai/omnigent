@@ -244,6 +244,7 @@ export interface ImportContextModalProps {
   hostName?: string;
   /** Asset kinds the host couldn't report. */
   unavailable?: InventoryAssetKind[];
+  mcpUnsupported?: boolean;
   /** Replaces the default loading copy, e.g. while the host is still connecting. */
   loadingMessage?: string;
 }
@@ -280,10 +281,19 @@ function ImportContextBody({
   status = "ready",
   hostName,
   unavailable = NONE_UNAVAILABLE,
+  mcpUnsupported = false,
   loadingMessage = "Checking your harnesses…",
 }: Omit<ImportContextModalProps, "open" | "onOpenChange">) {
   const harnesses = detectedHarnesses(context);
-  const notice = unavailableNotice(unavailable);
+  const notice =
+    [
+      mcpUnsupported && "Please update this host to list MCP servers.",
+      unavailableNotice(
+        mcpUnsupported ? unavailable.filter((kind) => kind !== "mcps") : unavailable,
+      ),
+    ]
+      .filter(Boolean)
+      .join(" ") || null;
   const machine = hostName ?? "This machine";
 
   let content: ReactNode;

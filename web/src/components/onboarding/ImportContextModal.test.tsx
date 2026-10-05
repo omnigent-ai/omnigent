@@ -141,24 +141,36 @@ describe("ImportContextModal – host and status", () => {
     expect(screen.queryAllByRole("tab")).toHaveLength(0);
   });
 
-  it("keeps what loaded and notes what couldn't be read", () => {
-    renderModal({ ...MOCK_IMPORT_CONTEXT, mcps: [] }, { unavailable: ["mcps"] });
+  it.each([false, true])(
+    "keeps loaded assets and explains MCP errors (unsupported: %s)",
+    (mcpUnsupported) => {
+      renderModal({ ...MOCK_IMPORT_CONTEXT, mcps: [] }, { unavailable: ["mcps"], mcpUnsupported });
 
-    expect(assetTabNames()).toEqual(["Skills 10", "Plugins 3"]);
-    expect(screen.getByRole("status").textContent).toBe(
-      "Couldn't read MCP servers from this machine.",
-    );
-  });
+      expect(assetTabNames()).toEqual(["Skills 10", "Plugins 3"]);
+      expect(screen.getByRole("status").textContent).toBe(
+        mcpUnsupported
+          ? "Please update this host to list MCP servers."
+          : "Couldn't read MCP servers from this machine.",
+      );
+    },
+  );
 
-  it("uses the failure as the empty state when nothing loaded", () => {
-    renderModal(
-      { credentials: [], mcps: [], skills: [], plugins: [] },
-      { unavailable: ["mcps", "skills"] },
-    );
-    expect(
-      screen.getByText("Couldn't read MCP servers or skills and plugins from this machine."),
-    ).toBeTruthy();
-  });
+  it.each([false, true])(
+    "explains all failures when nothing loaded (unsupported MCPs: %s)",
+    (mcpUnsupported) => {
+      renderModal(
+        { credentials: [], mcps: [], skills: [], plugins: [] },
+        { unavailable: ["mcps", "skills"], mcpUnsupported },
+      );
+      expect(
+        screen.getByText(
+          mcpUnsupported
+            ? "Please update this host to list MCP servers. Couldn't read skills and plugins from this machine."
+            : "Couldn't read MCP servers or skills and plugins from this machine.",
+        ),
+      ).toBeTruthy();
+    },
+  );
 });
 
 describe("ImportContextModal – empty states", () => {
