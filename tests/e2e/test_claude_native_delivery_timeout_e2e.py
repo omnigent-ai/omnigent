@@ -83,6 +83,7 @@ PROMPT_GLYPH = "\\u276f"
 RULE = "\\u2500" * 30
 STALL_TRIGGER = sys.argv[1]
 STALL_S = float(sys.argv[2])
+BLOCK_NOTICE = sys.argv[3] if len(sys.argv) > 3 else ""
 
 
 def render(draft, transcript):
@@ -113,7 +114,11 @@ def main():
                 break
             if byte == 13:  # Enter submits a non-empty draft
                 if chars:
-                    transcript.append("sent: " + "".join(chars))
+                    # A UserPromptSubmit hook that blocks the prompt empties the
+                    # box like a submit but prints its notice instead of an echo.
+                    transcript.append(
+                        "  \u23bf  " + BLOCK_NOTICE if BLOCK_NOTICE else "sent: " + "".join(chars)
+                    )
                     chars = []
                     render("", transcript)
                 continue
@@ -136,14 +141,16 @@ main()
 """
 
 
-@pytest.fixture
-def stalling_claude_pane() -> Iterator[tuple[Path, str]]:
-    """A claude-native bridge dir advertising a real tmux pane whose fake TUI
-    commits the pasted draft, stalls past the legacy submit window, then
-    accepts the queued submit.
+@contextlib.contextmanager
+def _fake_claude_pane(stall_s: float, block_notice: str = "") -> Iterator[tuple[Path, str]]:
+    """Serve a claude-native bridge dir advertising a real tmux pane that runs
+    the fake TUI.
 
-    Yields the bridge dir and the tmux socket path. The tmux server is always
-    killed on teardown, even when the test body raises.
+    :param stall_s: Seconds the fake TUI stays unresponsive once the draft commits.
+    :param block_notice: When set, a submit prints this hook-block notice
+        instead of echoing the message into the transcript.
+    :yields: The bridge dir and the tmux socket path. The tmux server is always
+        killed on exit, even when the body raises.
     """
     work = Path(tempfile.mkdtemp(prefix="slowtui-"))
     # Keep the socket path short: a long path overflows the AF_UNIX limit.
@@ -167,7 +174,8 @@ def stalling_claude_pane() -> Iterator[tuple[Path, str]]:
             sys.executable,
             str(tui_path),
             _MESSAGE,
-            str(_TUI_STALL_S),
+            str(stall_s),
+            *([block_notice] if block_notice else []),
         ],
         check=True,
         timeout=30.0,
@@ -197,6 +205,30 @@ def stalling_claude_pane() -> Iterator[tuple[Path, str]]:
             for child in work.iterdir():
                 child.unlink()
             work.rmdir()
+
+
+@pytest.fixture
+def stalling_claude_pane() -> Iterator[tuple[Path, str]]:
+    """A claude-native bridge dir advertising a real tmux pane whose fake TUI
+    commits the pasted draft, stalls past the legacy submit window, then
+    accepts the queued submit.
+
+    Yields the bridge dir and the tmux socket path.
+    """
+    with _fake_claude_pane(_TUI_STALL_S) as pane:
+        yield pane
+
+
+@pytest.fixture
+def hook_blocking_claude_pane() -> Iterator[tuple[Path, str]]:
+    """A claude-native bridge dir advertising a real tmux pane whose fake TUI
+    empties the input box on submit but prints a UserPromptSubmit hook's block
+    notice instead of recording the message.
+
+    Yields the bridge dir and the tmux socket path.
+    """
+    with _fake_claude_pane(0.0, "UserPromptSubmit operation blocked by hook: denied") as pane:
+        yield pane
 
 
 def test_inject_user_message_delivers_despite_stalled_submit(
@@ -253,3 +285,40 @@ async def test_run_turn_completes_despite_stalled_submit(
     assert not any(
         "failed to deliver message to harness" in record.getMessage() for record in caplog.records
     ), [record.getMessage() for record in caplog.records]
+
+
+def test_inject_user_message_does_not_accept_a_hook_blocked_prompt(
+    hook_blocking_claude_pane: tuple[Path, str],
+) -> None:
+    """A submit that empties the input box but prints a hook's block notice is
+    not reported accepted: the prompt was dropped, so the server must not treat
+    the message as taken."""
+    bridge_dir, socket_path = hook_blocking_claude_pane
+
+    accepted = inject_user_message(bridge_dir, content=_MESSAGE)
+
+    pane = _capture_pane(socket_path, "claude")
+    assert "blocked by hook" in pane and "sent: " not in pane, pane
+    assert accepted is False
+
+
+async def test_run_turn_reports_a_hook_blocked_prompt_as_not_accepted(
+    hook_blocking_claude_pane: tuple[Path, str],
+) -> None:
+    """``ClaudeNativeExecutor.run_turn`` still completes the turn (the message
+    reached the pane) but without the acceptance proof."""
+    bridge_dir, _socket_path = hook_blocking_claude_pane
+    executor = ClaudeNativeExecutor(bridge_dir=bridge_dir)
+
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": _MESSAGE}],
+            tools=[],
+            system_prompt="",
+            config=None,
+        )
+    ]
+
+    assert len(events) == 1 and isinstance(events[0], TurnComplete), events
+    assert events[0].input_accepted is False

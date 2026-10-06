@@ -346,6 +346,13 @@ _UNKNOWN_COMMAND_WATCH_TIMEOUT_S = 3.0
 # command name is appended at the call site so a rejection of an older
 # message cannot match a different name.
 _UNKNOWN_COMMAND_REJECTION_PREFIX = "Unknown command: "
+# How long to watch for a UserPromptSubmit hook's block notice after a
+# submit. The hook runs before the model call, so a block prints within
+# about a second; a slower hook can outlast the watch.
+_HOOK_BLOCK_WATCH_TIMEOUT_S = 1.0
+# The notice Claude Code prints when a UserPromptSubmit hook blocks a
+# prompt: it drops the prompt without recording it in the transcript.
+_HOOK_BLOCK_NOTICE = "UserPromptSubmit operation blocked by hook"
 # Claude Code collapses large pastes into this placeholder in the
 # input box instead of rendering the text itself.
 _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
@@ -4048,6 +4055,11 @@ def inject_user_message(
     silently swallowed. A recognized skill prints no rejection and runs
     exactly as before.
 
+    A ``UserPromptSubmit`` hook that blocks the prompt (a policy denial)
+    also empties the input box, so the pane is watched briefly for its
+    notice (see :func:`_not_blocked_by_hook`) before the submit counts as
+    accepted.
+
     :param bridge_dir: Bridge directory path.
     :param content: User text from the Omnigent web UI. Must be non-empty.
     :param timeout_s: Seconds to wait for each readiness gate
@@ -4057,9 +4069,10 @@ def inject_user_message(
         :func:`_wait_for_claude_prompt_ready`), so a slow host connect
         delivers the message late instead of dropping it.
     :returns: ``True`` when the terminal was seen to take the message: its
-        draft left a visible input box, which is the one positive proof of
-        acceptance there is. ``False`` when the draft was never identifiable
-        (a blind submit), so nothing is known either way.
+        draft left a visible input box and no hook then blocked it, which is
+        the best proof of acceptance there is. ``False`` when the draft was
+        never identifiable (a blind submit) or a hook blocked it, so nothing
+        is known either way.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
         invocation fails, or if the draft never leaves the input box
@@ -4101,16 +4114,16 @@ def inject_user_message(
     unknown_name = _passthrough_slash_command_name(content)
     rejection_needle: str | None = None
     rejection_baseline = 0
+    baseline_pane = _capture_pane(socket_path, tmux_target)
+    hook_baseline = _count_pane_notices(baseline_pane, _HOOK_BLOCK_NOTICE)
     if unknown_name is not None:
         rejection_needle = f"{_UNKNOWN_COMMAND_REJECTION_PREFIX}/{unknown_name}"
-        rejection_baseline = _count_unknown_command_rejections(
-            _capture_pane(socket_path, tmux_target), rejection_needle
-        )
+        rejection_baseline = _count_pane_notices(baseline_pane, rejection_needle)
     accepted = _paste_and_submit(
         bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle
     )
     if rejection_needle is None:
-        return accepted
+        return _not_blocked_by_hook(accepted, socket_path, tmux_target, hook_baseline)
     if not _unknown_command_rejection_appeared(
         socket_path,
         tmux_target,
@@ -4118,8 +4131,11 @@ def inject_user_message(
         baseline=rejection_baseline,
     ):
         # No rejection: Claude Code accepted the command (a real skill or
-        # custom command) and the turn is underway.
-        return accepted
+        # custom command) and the turn is underway; the watch above already
+        # outlasted the hook window, so this is a single look.
+        return _not_blocked_by_hook(
+            accepted, socket_path, tmux_target, hook_baseline, timeout_s=0.0
+        )
     # Claude Code dropped the message. Re-deliver it escaped so the text
     # reaches the model as a regular user message instead of vanishing.
     _logger.info(
@@ -4127,13 +4143,58 @@ def inject_user_message(
         "re-delivering the message escaped as plain text",
         unknown_name,
     )
-    return _paste_and_submit(
+    hook_baseline = _count_pane_notices(
+        _capture_pane(socket_path, tmux_target), _HOOK_BLOCK_NOTICE
+    )
+    accepted = _paste_and_submit(
         bridge_dir,
         socket_path,
         tmux_target,
         text=_escape_slash_command_text(content),
         needle=needle,
     )
+    return _not_blocked_by_hook(accepted, socket_path, tmux_target, hook_baseline)
+
+
+def _not_blocked_by_hook(
+    accepted: bool,
+    socket_path: str,
+    tmux_target: str,
+    baseline: int,
+    *,
+    timeout_s: float | None = None,
+) -> bool:
+    """
+    Downgrade an accepted submit when a UserPromptSubmit hook then blocked it.
+
+    A blocked prompt leaves the input box like an accepted one but is dropped
+    without being recorded, so acceptance only stands if no fresh block notice
+    prints. A stale notice in scrollback keeps the count at *baseline* and does
+    not count; a submit that was never accepted is returned as is, unwatched.
+
+    :param accepted: Whether the submit was seen to leave the input box.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param baseline: Block-notice count captured before the submit.
+    :param timeout_s: Seconds to keep watching for the notice; ``0`` looks once.
+        Defaults to :data:`_HOOK_BLOCK_WATCH_TIMEOUT_S`.
+    :returns: ``accepted``, or ``False`` when a fresh block notice appeared.
+    """
+    if not accepted:
+        return False
+    window = _HOOK_BLOCK_WATCH_TIMEOUT_S if timeout_s is None else timeout_s
+    deadline = time.monotonic() + window
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _count_pane_notices(pane, _HOOK_BLOCK_NOTICE) > baseline:
+            _logger.warning(
+                "claude-native: a UserPromptSubmit hook blocked the submitted message; "
+                "reporting it as not accepted"
+            )
+            return False
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
 def _paste_and_submit(
@@ -4360,24 +4421,24 @@ def _verify_submit_accepted(
     return False
 
 
-def _count_unknown_command_rejections(pane: str, needle: str) -> int:
+def _count_pane_notices(pane: str, needle: str) -> int:
     """
-    Count rejections of one command name in a captured pane.
+    Count occurrences of one Claude Code notice in a captured pane.
 
-    Claude Code's TUI reflows the rejection at the pane width — on a
-    narrow pane "Unknown command:" and the ``/<name>`` land on separate
-    lines (a long name can even hard-wrap mid-word) — so the match must
-    ignore line structure and whitespace entirely: composer rows (any line
-    carrying the prompt glyph — the live draft and transcript echoes of
-    submitted messages both render behind it) are dropped so a user
-    message merely *containing* the rejection words cannot count, then the
-    rest is collapsed to a whitespace-free string and searched for the
-    equally collapsed needle.
+    Claude Code's TUI reflows a notice at the pane width — on a narrow
+    pane "Unknown command:" and the ``/<name>`` land on separate lines (a
+    long name can even hard-wrap mid-word) — so the match must ignore line
+    structure and whitespace entirely: composer rows (any line carrying
+    the prompt glyph — the live draft and transcript echoes of submitted
+    messages both render behind it) are dropped so a user message merely
+    *containing* the notice words cannot count, then the rest is collapsed
+    to a whitespace-free string and searched for the equally collapsed
+    needle.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :param needle: The exact rejection text, e.g.
+    :param needle: The exact notice text, e.g.
         ``"Unknown command: /my-cmd"``.
-    :returns: Number of rejections for this name currently visible.
+    :returns: Number of occurrences currently visible.
     """
     lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH not in line]
     collapsed = "".join("".join(line.split()) for line in lines)
@@ -4417,7 +4478,7 @@ def _unknown_command_rejection_appeared(
     deadline = time.monotonic() + _UNKNOWN_COMMAND_WATCH_TIMEOUT_S
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
-        if _count_unknown_command_rejections(pane, needle) > baseline:
+        if _count_pane_notices(pane, needle) > baseline:
             return True
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     return False

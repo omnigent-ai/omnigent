@@ -4650,7 +4650,7 @@ def test_rejection_line_matching_ignores_message_echo() -> None:
     and the name can land on separate lines — so a wrapped rejection must
     still count.
     """
-    counter = claude_native_bridge._count_unknown_command_rejections
+    counter = claude_native_bridge._count_pane_notices
     needle = "Unknown command: /x"
     assert counter("● Unknown command: /x\n❯ \n", needle) == 1
     # Echoed in the composer draft — not a rejection line.
@@ -4662,6 +4662,228 @@ def test_rejection_line_matching_ignores_message_echo() -> None:
     long_needle = "Unknown command: /definitely-not-a-real-command"
     long_wrapped = "● Unknown command:\n  /definitely-not-a-real-command\n❯ \n"
     assert counter(long_wrapped, long_needle) == 1
+
+
+def _hook_block_pane(reason: str = "denied by policy") -> str:
+    """
+    Render the pane Claude Code leaves after a UserPromptSubmit hook blocks a prompt.
+
+    :param reason: The hook's stated reason, printed under the notice.
+    :returns: The pane text: the notice above the (now empty) composer.
+    """
+    return f"""\
+  ⎿  UserPromptSubmit operation blocked by hook:
+     {reason}
+{_composer_pane()}"""
+
+
+def _run_hook_block_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    content: str,
+    blocked_submits: frozenset[int] = frozenset(),
+    rejected_submits: frozenset[int] = frozenset(),
+    scrollback: str = "",
+    echo_submitted: bool = False,
+    notice_after_captures: int = 0,
+    watch_s: float = 0.0,
+) -> tuple[bool, list[bytes]]:
+    """
+    Drive ``inject_user_message`` against a fake TUI whose hook may block a submit.
+
+    :param tmp_path: Test temp dir for the bridge directory.
+    :param monkeypatch: Pytest monkeypatch for subprocess + timeouts.
+    :param content: User text to inject.
+    :param blocked_submits: 1-based submit Enters after which the hook's
+        block notice prints.
+    :param rejected_submits: 1-based submit Enters that print an
+        "Unknown command" rejection of the leading ``/name`` instead.
+    :param scrollback: Text already above the composer before the submit.
+    :param echo_submitted: Echo the submitted message into the transcript
+        behind the prompt glyph once it is submitted, as Claude Code does.
+    :param notice_after_captures: Pane captures after the Enter before a
+        block notice becomes visible (a slow hook).
+    :param watch_s: Hook-block watch window to run with.
+    :returns: ``(accepted, byte payloads loaded via load-buffer)``.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    monkeypatch.setattr(claude_native_bridge, "_HOOK_BLOCK_WATCH_TIMEOUT_S", watch_s)
+    monkeypatch.setattr(claude_native_bridge, "_UNKNOWN_COMMAND_WATCH_TIMEOUT_S", 0.5)
+    loaded_payloads: list[bytes] = []
+    tui: dict[str, Any] = {
+        "pane": scrollback + _composer_pane(),
+        "submits": 0,
+        "captures_after_enter": 0,
+        "pending_block": False,
+    }
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Serve the fake pane and advance it on paste / Enter.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            if tui["pending_block"]:
+                tui["captures_after_enter"] += 1
+                if tui["captures_after_enter"] > notice_after_captures:
+                    tui["pane"] = scrollback + _hook_block_pane()
+                    tui["pending_block"] = False
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = scrollback + _composer_pane("[Pasted text #1 +2 lines]")
+        if cmd[-1] == "Enter":
+            tui["submits"] += 1
+            tui["captures_after_enter"] = 0
+            name = content.split()[0].lstrip("/")
+            echo = f"❯ {content}\n" if echo_submitted else ""
+            if tui["submits"] in rejected_submits:
+                tui["pane"] = scrollback + _rejection_pane(name)
+            elif tui["submits"] in blocked_submits:
+                tui["pending_block"] = True
+                tui["pane"] = scrollback + echo + _composer_pane()
+            else:
+                tui["pane"] = scrollback + echo + _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    accepted = inject_user_message(bridge_dir, content=content)
+    return accepted, loaded_payloads
+
+
+def test_hook_blocked_submit_is_not_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A prompt a UserPromptSubmit hook blocks leaves the box but is not accepted.
+
+    The block empties the composer exactly like a real submit, yet the prompt
+    is dropped without a transcript record; reporting it accepted would hide
+    the loss as a quiet drain.
+    """
+    accepted, payloads = _run_hook_block_injection(
+        tmp_path, monkeypatch, content="deploy it", blocked_submits=frozenset({1})
+    )
+
+    assert accepted is False
+    assert len(payloads) == 1
+
+
+def test_submit_without_a_hook_block_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordinary submit, which prints no block notice, still reports acceptance."""
+    accepted, _payloads = _run_hook_block_injection(tmp_path, monkeypatch, content="deploy it")
+
+    assert accepted is True
+
+
+def test_stale_hook_block_notice_in_scrollback_does_not_void_acceptance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A block notice already in scrollback before the submit is not this message's.
+
+    The watch counts notices against the count taken before the paste, so an
+    earlier blocked message does not condemn every later one.
+    """
+    accepted, _payloads = _run_hook_block_injection(
+        tmp_path, monkeypatch, content="deploy it", scrollback=_hook_block_pane()
+    )
+
+    assert accepted is True
+
+
+def test_message_quoting_the_block_notice_does_not_void_acceptance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A message that merely contains the notice words is echoed behind the prompt glyph.
+
+    The echo appears only after the submit, so it would raise the notice count
+    above the pre-submit baseline were composer rows not left out of the count.
+    """
+    accepted, _payloads = _run_hook_block_injection(
+        tmp_path,
+        monkeypatch,
+        content="why do I see UserPromptSubmit operation blocked by hook?",
+        echo_submitted=True,
+    )
+
+    assert accepted is True
+
+
+def test_slow_hook_block_is_caught_inside_the_watch_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A notice that prints a few polls after the submit still downgrades it."""
+    accepted, _payloads = _run_hook_block_injection(
+        tmp_path,
+        monkeypatch,
+        content="deploy it",
+        blocked_submits=frozenset({1}),
+        notice_after_captures=3,
+        watch_s=3.0,
+    )
+
+    assert accepted is False
+
+
+def test_hook_block_of_an_accepted_unknown_slash_command_is_not_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A passthrough skill name that the hook then blocks is one paste, not accepted."""
+    accepted, payloads = _run_hook_block_injection(
+        tmp_path,
+        monkeypatch,
+        content="/my-real-skill do the thing",
+        blocked_submits=frozenset({1}),
+    )
+
+    assert accepted is False
+    assert len(payloads) == 1
+
+
+def test_hook_block_of_the_escaped_redelivery_is_not_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected name is re-sent escaped; a block of that second submit still counts."""
+    accepted, payloads = _run_hook_block_injection(
+        tmp_path,
+        monkeypatch,
+        content="/not-a-skill hello",
+        rejected_submits=frozenset({1}),
+        blocked_submits=frozenset({2}),
+    )
+
+    assert accepted is False
+    assert len(payloads) == 2
+
+
+def test_rejected_unknown_slash_command_redelivered_and_unblocked_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The escaped redelivery that no hook blocks is accepted."""
+    accepted, payloads = _run_hook_block_injection(
+        tmp_path,
+        monkeypatch,
+        content="/not-a-skill hello",
+        rejected_submits=frozenset({1}),
+    )
+
+    assert accepted is True
+    assert len(payloads) == 2
 
 
 def test_inject_user_message_raises_when_tmux_target_never_published(
