@@ -112,6 +112,25 @@ False` after earlier rows for the same `runner_id` is a new process; `pid`
 confirms it. A repeating `connection_age_s` across drops points at an
 intermediary timeout rather than either endpoint.
 
+## Host heartbeat persistence
+
+Host application pings and database heartbeat writes run in separate tasks.
+The ping loop requests a write only while incoming traffic remains within the
+liveness window. Requests coalesce while a write is pending, keeping one write
+in flight per connection without blocking pings or disconnect cleanup.
+
+`host_heartbeat_failed` warns on the first failed write and at most once per
+minute thereafter. It includes `host_id`, consecutive `failure_count`,
+`error_type`, and the write's `duration_s`, without database error text.
+`host_heartbeat_recovered` records the first successful write after failures,
+with their count and the successful write's duration. These are persistence
+diagnostics, not proof of a network failure. During a database outage, other
+replicas may still see stale host liveness until a heartbeat can be saved.
+
+Disconnect cancels the writer task without waiting for a stuck database call.
+An already-running thread may finish later, but a heartbeat never changes an
+offline host's status. Actual silent hosts still time out normally.
+
 ## Credential recovery
 
 `auth token refresh failed; falling back to previous token` describes a
