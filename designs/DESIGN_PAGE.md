@@ -260,8 +260,8 @@ until import exists.
 - After the session is created, the page writes
   `.omnigent/design-system.json` in the design's folder with
   `{"path": "<absolute folder>", "kind": "full" | "skill", "name": "<name>"}`
-  through the existing workspace file write path. The plan must confirm that
-  path exists; adding a server endpoint needs approval first.
+  through the existing workspace file write path, so no new server endpoint
+  is needed.
 
 ### Agent instructions
 
@@ -333,8 +333,8 @@ from the user's chosen source.
 
 ## Later phases
 
-Designed and approved for the same `design` flag, including the new server
-surface listed in the build order. Each item is its own PR, in the build order
+Planned for the same `design` flag, including the new server surface listed
+in the build order. Each item is its own PR, in the build order
 at the end of this section.
 
 ### Server deck index
