@@ -152,6 +152,7 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._session_create_validation import (
+    validate_env_passthrough_values,
     validate_session_agent,
     validate_session_model_metadata,
 )
@@ -6642,6 +6643,11 @@ async def _forward_event_to_runner(
     if _effective_harness is not None and _effective_harness != "auto":
         runner_body["harness_override"] = _effective_harness
 
+    # Create-time env values ride every forward: the runner rebuilds the spawn
+    # env on any respawn, and the create envelope is long gone by then.
+    if conv.env_passthrough_values:
+        runner_body["env_passthrough_values"] = conv.env_passthrough_values
+
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
@@ -9703,6 +9709,34 @@ async def _routing_host_for_create(
     )
 
 
+def _create_declared_env_passthrough(
+    agent: Agent,
+    agent_cache: AgentCache | None,
+) -> list[str] | None:
+    """The env-var names the agent's spec declares as passthrough, before any row.
+
+    :param agent: The bound agent row.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: The declared names, or ``None`` when the spec declares no
+        ``os_env.sandbox`` block or could not be loaded — both of which leave
+        the caller with nothing to supply values for.
+    """
+    if agent_cache is None:
+        return None
+    try:
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+        # An unloadable spec declares nothing; the create's own validation
+        # reports the real problem.
+        _logger.debug("create-time env passthrough: agent %r failed to load", agent.name)
+        return None
+    os_env = getattr(loaded.spec, "os_env", None)
+    sandbox = getattr(os_env, "sandbox", None) if os_env is not None else None
+    return getattr(sandbox, "env_passthrough", None)
+
+
 def _create_resolved_harness(
     agent: Agent,
     harness_override: str | None,
@@ -10221,6 +10255,12 @@ async def _create_session_from_existing_agent(
     subagent_routing_override = _validated_subagent_routing_override(
         body.subagent_routing_override
     )
+    # Rejected before any row exists: an undeclared name is a spec change the
+    # caller has to make, not something to silently drop on a live session.
+    env_passthrough_values = validate_env_passthrough_values(
+        body.env_passthrough_values,
+        _create_declared_env_passthrough(agent, agent_cache),
+    )
 
     # A child of an auto-harness parent whose subagent-routing switch is on is
     # routed regardless of the harness/model the orchestrator chose: force the
@@ -10630,6 +10670,10 @@ async def _create_session_from_existing_agent(
                 "cost_control_mode_override": cost_control_mode_override,
                 "subagent_routing_override": subagent_routing_override,
                 "harness_override": harness_override,
+                # Checked here too: these values are caller-supplied and share
+                # the blob's length budget, so an oversized one must 400
+                # instead of persisting after the session already exists.
+                "env_passthrough_values": env_passthrough_values,
             }
         )
         with creation_stage("create_persistence_ms"):
@@ -10709,6 +10753,23 @@ async def _create_session_from_existing_agent(
         harness=selected_harness,
     )
     telemetry.set_session_id(conv.id)
+
+    if env_passthrough_values is not None:
+        # ``create_conversation`` takes the scalar overrides directly, but not
+        # this mapping; persist it before the runner reads the snapshot — the
+        # first turn happens only after create returns and the caller posts a
+        # message event.
+        updated_conv = await asyncio.to_thread(
+            conversation_store.update_conversation,
+            conv.id,
+            env_passthrough_values=env_passthrough_values,
+        )
+        if updated_conv is None:
+            raise OmnigentError(
+                f"Session {conv.id!r} disappeared while persisting session overrides",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        conv = updated_conv
 
     if _native_smart_routing:
         # Surface the create-time pick as a transcript card, so the user sees

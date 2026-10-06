@@ -20,6 +20,7 @@ from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_access
+from omnigent.spec.parser import ENV_VAR_NAME_RE
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.project_store import ProjectStore
@@ -216,6 +217,50 @@ def validate_session_model_metadata(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
     return validated_model, validated_effort
+
+
+def validate_env_passthrough_values(
+    values: dict[str, str] | None,
+    declared: list[str] | None,
+) -> dict[str, str] | None:
+    """Validate per-session env values against the spec's declared names.
+
+    The values land on the harness subprocess environment, so the spec author
+    — not the dispatching client — decides which names are reachable. Anything
+    the spec did not declare in ``os_env.sandbox.env_passthrough`` is rejected
+    rather than dropped: a silently ignored ``OTEL_RESOURCE_ATTRIBUTES`` looks
+    identical to a working one from the client's side.
+
+    :param values: The request's raw mapping, if any. ``None`` or empty means
+        the client asked for nothing.
+    :param declared: The spec's declared passthrough names, or ``None`` when
+        the spec declares no ``os_env.sandbox`` block at all.
+    :returns: The validated mapping, or ``None`` when nothing was requested.
+    :raises OmnigentError: With :data:`ErrorCode.INVALID_INPUT` when a name is
+        undeclared or is not a POSIX environment variable name.
+    """
+    if not values:
+        return None
+    allowed = set(declared or ())
+    for name, value in values.items():
+        if not ENV_VAR_NAME_RE.match(name):
+            raise OmnigentError(
+                "env_passthrough_values keys must be POSIX environment variable "
+                f"names (letters/digits/underscore, not starting with a digit): {name!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if name not in allowed:
+            raise OmnigentError(
+                f"env_passthrough_values name {name!r} is not declared in the agent's "
+                "os_env.sandbox.env_passthrough; add it to the spec to allow it",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not isinstance(value, str):
+            raise OmnigentError(
+                f"env_passthrough_values[{name!r}] must be a string",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    return dict(values)
 
 
 async def validate_session_agent(

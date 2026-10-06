@@ -18,13 +18,16 @@ _SESSION_OVERRIDE_KEYS = (
     "cost_control_mode_override",
     "subagent_routing_override",
     "harness_override",
+    # A JSON object of declared env-var name -> per-session value, not a
+    # scalar like its neighbours; an empty object encodes as unset.
+    "env_passthrough_values",
     # Stored as the string ``"on"`` when the owner shares workspace files
     # with view-level collaborators; absent (SQL NULL blob key) otherwise.
     "share_workspace_files",
 )
 
 
-def encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
+def encode_session_overrides(overrides: dict[str, Any]) -> str | None:
     """Pack the set per-session overrides into a compact JSON blob.
 
     Omits keys whose value is ``None`` and returns ``None`` when nothing is
@@ -33,23 +36,27 @@ def encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
     considered; any other keys in *overrides* are ignored.
 
     :param overrides: Mapping of override key to value (missing / ``None``
-        values mean "unset").
+        values mean "unset"). An empty collection also means "unset", so a
+        caller clearing ``env_passthrough_values`` drops the key rather than
+        storing an empty object.
     :returns: Compact JSON object string, or ``None`` when no override is set.
     """
     data = {
-        key: overrides[key] for key in _SESSION_OVERRIDE_KEYS if overrides.get(key) is not None
+        key: overrides[key]
+        for key in _SESSION_OVERRIDE_KEYS
+        if overrides.get(key) is not None and overrides[key] != {}
     }
     encoded = json.dumps(data, separators=(",", ":")) if data else None
     if encoded is not None and len(encoded) > SESSION_OVERRIDES_MAX_LENGTH:
         raise OmnigentError(
             f"Session overrides exceed the {SESSION_OVERRIDES_MAX_LENGTH}-character limit. "
-            "Use shorter harness or model identifiers.",
+            "Use shorter harness or model identifiers, or fewer env passthrough values.",
             code=ErrorCode.INVALID_INPUT,
         )
     return encoded
 
 
-def decode_session_overrides(raw: str | None) -> dict[str, str | None]:
+def decode_session_overrides(raw: str | None) -> dict[str, Any]:
     """Unpack the ``session_overrides`` blob to a full override dict.
 
     Every one of the :data:`_SESSION_OVERRIDE_KEYS` is present in the

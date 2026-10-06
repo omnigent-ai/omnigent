@@ -1264,7 +1264,7 @@ def _parse_mask_paths(raw: object) -> list[str] | None:
 # certainly a typo or attack surface, and (b) the env var name will
 # be passed straight to ``os.execve``, which interprets ``=`` as the
 # name/value separator.
-_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _parse_env_passthrough(raw: object) -> list[str] | None:
@@ -1308,7 +1308,7 @@ def _parse_env_passthrough(raw: object) -> list[str] | None:
                 f"got {type(entry).__name__}: {entry!r}",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if not _ENV_VAR_NAME_RE.match(entry):
+        if not ENV_VAR_NAME_RE.match(entry):
             raise OmnigentError(
                 "os_env.sandbox.env_passthrough entries must be POSIX "
                 "environment variable names "
@@ -1460,7 +1460,7 @@ class _CredentialSourceModel(BaseModel):  # type: ignore[explicit-any]
             raise ValueError(
                 "source must set exactly one of 'env', 'file', 'command', or 'unix_socket'"
             )
-        if self.env is not None and not _ENV_VAR_NAME_RE.match(self.env):
+        if self.env is not None and not ENV_VAR_NAME_RE.match(self.env):
             raise ValueError("source 'env' must be a POSIX environment variable name")
         if self.file is not None and not self.file.strip():
             raise ValueError("source 'file' must be a non-empty path")
@@ -1556,7 +1556,7 @@ class _CredentialProxyItemModel(BaseModel):  # type: ignore[explicit-any]
         :returns: ``value`` unchanged when valid.
         :raises ValueError: If ``env`` is present but malformed.
         """
-        if value is not None and not _ENV_VAR_NAME_RE.match(value):
+        if value is not None and not ENV_VAR_NAME_RE.match(value):
             raise ValueError("env must be a POSIX environment variable name")
         return value
 

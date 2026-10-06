@@ -160,6 +160,19 @@ class Conversation:
         allowlisted ``args.harness`` (gated by the sub-agent spec's
         ``executor.config.allowed_harnesses``); that value is set on the
         child's own row, not inherited.
+    :param env_passthrough_values: Per-session values for environment
+        variables the agent spec declares in
+        ``os_env.sandbox.env_passthrough``, e.g.
+        ``{"OTEL_RESOURCE_ATTRIBUTES": "myapp.run.id=42"}``. Lets a
+        dispatching client attribute one run's harness process without
+        putting the value on the runner daemon, where it would be shared
+        by every session. Set at session creation via
+        ``POST /v1/sessions`` and immutable thereafter. Persisted rather
+        than applied once because the spawn env is rebuilt on every
+        harness respawn (crash, idle reap, model switch), long after the
+        create request is gone. Only declared names are accepted; the
+        create route rejects anything else so a client cannot reach
+        ``PATH`` or a credential variable. ``None`` means unset.
     :param share_workspace_files: Whether the owner opted into letting
         people with *view* (read-only) access browse the session's
         workspace files — the Files/Changes/GitHub-diff surfaces and the
@@ -253,6 +266,7 @@ class Conversation:
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
+    env_passthrough_values: dict[str, str] | None = None
     share_workspace_files: bool = False
     sub_agent_name: str | None = None
     task_summary: str | None = None
