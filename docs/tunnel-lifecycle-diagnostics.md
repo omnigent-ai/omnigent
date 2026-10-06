@@ -49,13 +49,28 @@ both ends.
   server upgrade is complete.
 - `runner_ping_timeout`: `runner_id`, `connection_id`, `connection_age_s`,
   `silent_s`.
+- `runner_stream_connected` and `runner_stream_ready` carry `runner_id` and
+  `telemetry_schema = runner_stream_recovery.v1`. `connected` means the runner
+  accepted the HTTP stream; `ready` means the first `session.heartbeat` arrived.
+  The marker lets rollout queries exclude older rows without adding
+  heartbeat-volume events.
 - `runner_stream_transport_lost`: one row per outage when the relay first
-  observes the loss, with `intentional_stop` and `grace_s`. An unintentional
-  loss is then held for `grace_s`; an intentional stop goes straight to the
-  give-up row.
+  observes the loss, with `outage_id`, the loss-time `runner_id` and `turn_id`
+  (when known), `stream_ready`, `intentional_stop`, `grace_s`, and the same
+  `telemetry_schema`. An unintentional loss is then held for `grace_s`; an
+  intentional stop goes straight to the give-up row.
+- `runner_stream_recovered`: at most one row per `outage_id`, emitted only
+  when a retry receives its first `session.heartbeat`. It carries the same
+  `outage_id`, loss-time `runner_id`/`turn_id`, `recovery_attempt`,
+  `outage_s`, `recovery_evidence = stream_heartbeat`, and the schema marker.
+  Initial relay readiness is not recovery. A cancellation or relay rebind
+  before a heartbeat emits no recovery row. A long attempt that resets the
+  grace window without readiness starts a new outage ID and does not recover
+  the previous one.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
   (`intentional_stop`, `server_shutdown`, `live_elsewhere`, `idle_no_failure` or
-  `failed_mid_turn`), `grace_s`, `outage_s`, `retries`. `outage_s` is the
+  `failed_mid_turn`), the matching `outage_id`, loss-time `runner_id`/`turn_id`,
+  `grace_s`, `outage_s`, `retries`, and the schema marker. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected
   stretch and is not cumulative disconnected time.
@@ -127,6 +142,11 @@ Join the runner's and server's rows for one socket on
 False` after earlier rows for the same `runner_id` is a new process; `pid`
 confirms it. A repeating `connection_age_s` across drops points at an
 intermediary timeout rather than either endpoint.
+
+Join relay loss, recovery, and give-up rows on the exact
+`session_id + attributes['outage_id'] + attributes['runner_id']` tuple. Do not
+infer a tunnel `connection_id` for relay rows; it is intentionally absent from
+this contract unless a separate event supplies the known value.
 
 ## Credential recovery
 
