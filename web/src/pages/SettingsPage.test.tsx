@@ -1198,6 +1198,37 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
   });
 
+  it("shows why archive cleanup kept a worktree", () => {
+    mocks.conversations = [
+      conv("conv_archived", {
+        archived: true,
+        title: "Old chat",
+        labels: {
+          "omnigent.worktree_kept": JSON.stringify({
+            dirty_files: 2,
+            unpushed_commits: 1,
+            merged: false,
+            default_ref: "origin/main",
+          }),
+        },
+      }),
+    ];
+    renderPage("/settings/archived");
+
+    expect(screen.getByTestId("worktree-kept-note").textContent).toBe(
+      "Worktree kept — 2 uncommitted changes, 1 unpushed commit, " +
+        "branch not merged into origin/main.",
+    );
+  });
+
+  it("shows no worktree note when archive cleanup left no label", () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+
+    expect(screen.getByTestId("archived-row")).toBeInTheDocument();
+    expect(screen.queryByTestId("worktree-kept-note")).toBeNull();
+  });
+
   it("deletes an archived session after confirming, with no row-click navigation", () => {
     mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
     renderPage("/settings/archived");

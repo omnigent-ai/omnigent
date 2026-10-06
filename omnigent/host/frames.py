@@ -138,6 +138,8 @@ class HostFrameKind(str, Enum):
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
     LIST_WORKTREES = "host.list_worktrees"
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
+    INSPECT_WORKTREE = "host.inspect_worktree"
+    INSPECT_WORKTREE_RESULT = "host.inspect_worktree_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
     INSTALL_HARNESS = "host.install_harness"
@@ -736,6 +738,24 @@ class HostCreateDirResultFrame:
 
 
 @dataclass
+class HostInspectWorktreeFrame:
+    request_id: str
+    worktree_path: str
+    branch: str
+
+
+@dataclass
+class HostInspectWorktreeResultFrame:
+    request_id: str
+    status: str
+    dirty_files: int | None = None
+    unpushed_commits: int | None = None
+    merged: bool | None = None
+    default_ref: str | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostInstallHarnessFrame:
     """Server → host: install a harness CLI on the host.
 
@@ -1273,6 +1293,8 @@ HostFrame = (
     | HostRemoveWorktreeResultFrame
     | HostListWorktreesFrame
     | HostListWorktreesResultFrame
+    | HostInspectWorktreeFrame
+    | HostInspectWorktreeResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
     | HostInstallHarnessFrame
@@ -1548,6 +1570,28 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "worktrees": frame.worktrees,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostInspectWorktreeFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INSPECT_WORKTREE.value,
+                "request_id": frame.request_id,
+                "worktree_path": frame.worktree_path,
+                "branch": frame.branch,
+            }
+        )
+    if isinstance(frame, HostInspectWorktreeResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INSPECT_WORKTREE_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "dirty_files": frame.dirty_files,
+                "unpushed_commits": frame.unpushed_commits,
+                "merged": frame.merged,
+                "default_ref": frame.default_ref,
                 "error": frame.error,
             }
         )
@@ -2120,6 +2164,10 @@ def _decode_known_host_frame(
             return _decode_list_worktrees(msg)
         case HostFrameKind.LIST_WORKTREES_RESULT:
             return _decode_list_worktrees_result(msg)
+        case HostFrameKind.INSPECT_WORKTREE:
+            return _decode_inspect_worktree(msg)
+        case HostFrameKind.INSPECT_WORKTREE_RESULT:
+            return _decode_inspect_worktree_result(msg)
         case HostFrameKind.CREATE_DIR:
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
@@ -2557,6 +2605,44 @@ def _decode_list_worktrees_result(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         worktrees=raw,
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_inspect_worktree(msg: _JsonObject) -> HostInspectWorktreeFrame:
+    return HostInspectWorktreeFrame(
+        request_id=_required_str(msg, "request_id"),
+        worktree_path=_required_str(msg, "worktree_path"),
+        branch=_required_str(msg, "branch"),
+    )
+
+
+def _optional_nullable_int(msg: _JsonObject, field: str) -> int | None:
+    value = msg.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"frame field must be an int or null: {field!r}")
+    return value
+
+
+def _optional_nullable_bool(msg: _JsonObject, field: str) -> bool | None:
+    value = msg.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"frame field must be a bool or null: {field!r}")
+    return value
+
+
+def _decode_inspect_worktree_result(msg: _JsonObject) -> HostInspectWorktreeResultFrame:
+    return HostInspectWorktreeResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        dirty_files=_optional_nullable_int(msg, "dirty_files"),
+        unpushed_commits=_optional_nullable_int(msg, "unpushed_commits"),
+        merged=_optional_nullable_bool(msg, "merged"),
+        default_ref=_optional_nullable_str(msg, "default_ref"),
         error=_optional_nullable_str(msg, "error"),
     )
 

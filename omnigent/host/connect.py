@@ -81,6 +81,8 @@ from omnigent.host.frames import (
     HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
+    HostInspectWorktreeFrame,
+    HostInspectWorktreeResultFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -122,6 +124,7 @@ from omnigent.host.frames import (
 from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
+    inspect_worktree,
     list_worktrees,
     remove_worktree,
 )
@@ -3776,6 +3779,32 @@ class HostProcess:
             status="ok",
         )
 
+    async def _handle_inspect_worktree(
+        self,
+        frame: HostInspectWorktreeFrame,
+    ) -> HostInspectWorktreeResultFrame:
+        try:
+            with self._host_subprocess_op():
+                inspection = await asyncio.to_thread(
+                    inspect_worktree,
+                    worktree_path=frame.worktree_path,
+                    branch=frame.branch,
+                )
+        except WorktreeError as exc:
+            return HostInspectWorktreeResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=exc.message,
+            )
+        return HostInspectWorktreeResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            dirty_files=inspection.dirty_files,
+            unpushed_commits=inspection.unpushed_commits,
+            merged=inspection.merged,
+            default_ref=inspection.default_ref,
+        )
+
     async def _handle_list_worktrees(
         self,
         frame: HostListWorktreesFrame,
@@ -4854,6 +4883,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostInspectWorktreeFrame):
+            await ws.send(encode_host_frame(await self._handle_inspect_worktree(frame)))
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.

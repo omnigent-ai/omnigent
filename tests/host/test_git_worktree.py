@@ -20,6 +20,7 @@ from omnigent.host.git_worktree import (
     CreatedWorktree,
     WorktreeError,
     create_worktree,
+    inspect_worktree,
     list_worktrees,
     remove_worktree,
     validate_branch_name,
@@ -156,6 +157,60 @@ def test_create_worktree_places_sibling_of_repo_root(git_repo: Path) -> None:
     # The branch is actually checked out in the worktree (not just the dir made).
     assert _current_branch(Path(created.worktree_path)) == "feature/login"
     assert isinstance(created, CreatedWorktree)
+
+
+def _add_origin(git_repo: Path, tmp_path: Path) -> None:
+    bare = (tmp_path / "origin.git").resolve()
+    _git(tmp_path, "init", "-q", "--bare", str(bare))
+    _git(git_repo, "remote", "add", "origin", str(bare))
+    _git(git_repo, "push", "-q", "origin", "main")
+    _git(git_repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+
+
+def test_inspect_worktree_detects_unpushed_work(git_repo: Path, tmp_path: Path) -> None:
+    _add_origin(git_repo, tmp_path)
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/safety")
+    worktree = Path(created.worktree_path)
+    (worktree / "README.md").write_text("modified")
+    (worktree / "new.txt").write_text("untracked")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-q", "-m", "unpublished work")
+
+    result = inspect_worktree(worktree_path=created.worktree_path, branch="feature/safety")
+
+    assert result.dirty_files == 0
+    assert result.unpushed_commits == 1
+    assert result.merged is False
+    assert result.default_ref == "origin/main"
+
+
+def test_inspect_worktree_detects_uncommitted_changes(git_repo: Path, tmp_path: Path) -> None:
+    _add_origin(git_repo, tmp_path)
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/dirty")
+    worktree = Path(created.worktree_path)
+    (worktree / "README.md").write_text("modified")
+    (worktree / "new.txt").write_text("untracked")
+
+    result = inspect_worktree(worktree_path=created.worktree_path, branch="feature/dirty")
+
+    assert result.dirty_files == 2
+    assert result.unpushed_commits == 0
+    assert result.merged is True
+
+
+def test_inspect_worktree_reports_pushed_unmerged_branch(git_repo: Path, tmp_path: Path) -> None:
+    _add_origin(git_repo, tmp_path)
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/open")
+    worktree = Path(created.worktree_path)
+    (worktree / "change.txt").write_text("work")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-q", "-m", "open work")
+    _git(git_repo, "push", "-q", "origin", "feature/open")
+
+    result = inspect_worktree(worktree_path=created.worktree_path, branch="feature/open")
+
+    assert result.unpushed_commits == 0
+    assert result.merged is False
 
 
 @pytest.mark.parametrize("linked", [False, True])
