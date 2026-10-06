@@ -14,10 +14,13 @@ import {
   TabletIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import type { Comment } from "@/hooks/useComments";
 import { cn } from "@/lib/utils";
-import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { HTML_PREVIEW_SANDBOX, type ActiveSelection } from "./codeViewerHelpers";
 import { useDesignBranding, useFullscreen } from "./designViewer";
+import { appendCommentBridge, wireframeScreenIdForSourceOffset } from "./htmlCommentBridge";
 import { TruncatedBanner } from "./TruncatedBanner";
+import { useHtmlCommentBridge } from "./useHtmlCommentBridge";
 import {
   WIREFRAME_DEVICES,
   WIREFRAME_MSG_SOURCE,
@@ -27,6 +30,9 @@ import {
 } from "./wireframeDoc";
 
 const DEVICE_ICONS = { desktop: MonitorIcon, tablet: TabletIcon, phone: SmartphoneIcon };
+
+const EMPTY_COMMENTS: Comment[] = [];
+const noopSetActiveSelection = (_sel: ActiveSelection | null) => {};
 
 /** Fit the device into the container, never above its real size; 0 before layout. */
 export function fitScale(width: number, height: number, device: WireframeDevice): number {
@@ -40,6 +46,9 @@ export interface WireframeViewerProps {
   conversationId?: string;
   /** Switches the file viewer to the existing source view. */
   onRequestSourceMode?: () => void;
+  comments?: Comment[];
+  activeSelection?: ActiveSelection | null;
+  onSetActiveSelection?: (sel: ActiveSelection | null) => void;
 }
 
 export function WireframeViewer({
@@ -47,17 +56,19 @@ export function WireframeViewer({
   truncated = false,
   conversationId,
   onRequestSourceMode,
+  comments = EMPTY_COMMENTS,
+  activeSelection = null,
+  onSetActiveSelection = noopSetActiveSelection,
 }: WireframeViewerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
-  const iframeRef = useRef<HTMLIFrameElement>(null);
   const screens = useMemo(() => listWireframeScreens(content), [content]);
   const branding = useDesignBranding(conversationId, content, false);
   const brandingReady = branding !== null;
   const doc = branding?.content ?? content;
   const kitStyle = branding?.kitStyle ?? "";
   const systemStyle = branding?.systemStyle ?? "";
-  const srcDoc = useMemo(
+  const preparedDoc = useMemo(
     () => (brandingReady ? prepareWireframeDoc(doc, kitStyle, systemStyle) : ""),
     [doc, brandingReady, kitStyle, systemStyle],
   );
@@ -65,15 +76,38 @@ export function WireframeViewer({
   const [picked, setPicked] = useState<string | null>(null);
   const current = screens.some((s) => s.id === picked) ? picked : (screens[0]?.id ?? null);
   const [scale, setScale] = useState(0);
+  const { nonce, iframeRef, addCommentPortal } = useHtmlCommentBridge({
+    conversationId: conversationId ?? "",
+    content,
+    docKey: preparedDoc,
+    comments,
+    activeSelection,
+    onSetActiveSelection,
+    scale,
+  });
+  const srcDoc = useMemo(
+    () => (preparedDoc ? appendCommentBridge(preparedDoc, nonce) : ""),
+    [preparedDoc, nonce],
+  );
   const { isFullscreen, supported: fullscreenSupported, toggle } = useFullscreen(rootRef);
 
-  const post = useCallback((msg: Record<string, unknown>) => {
-    iframeRef.current?.contentWindow?.postMessage({ source: WIREFRAME_MSG_SOURCE, ...msg }, "*");
-  }, []);
+  const post = useCallback(
+    (msg: Record<string, unknown>) => {
+      iframeRef.current?.contentWindow?.postMessage({ source: WIREFRAME_MSG_SOURCE, ...msg }, "*");
+    },
+    [iframeRef],
+  );
 
   useEffect(() => {
     if (current) post({ type: "goto", id: current });
   }, [current, post]);
+
+  // Activate a comment on another screen by jumping to the section that holds it.
+  useEffect(() => {
+    if (!activeSelection) return;
+    const id = wireframeScreenIdForSourceOffset(content, activeSelection.start_index);
+    if (id && id !== current) setPicked(id);
+  }, [activeSelection, content, current]);
 
   // Link clicks inside the frame report the new screen; trust only our iframe.
   useEffect(() => {
@@ -85,7 +119,7 @@ export function WireframeViewer({
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [screens]);
+  }, [screens, iframeRef]);
 
   useEffect(() => {
     const el = stageRef.current;
@@ -217,6 +251,7 @@ export function WireframeViewer({
           )}
         </div>
       </div>
+      {addCommentPortal}
     </div>
   );
 }

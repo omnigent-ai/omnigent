@@ -796,6 +796,50 @@ describe("CodeViewer slide deck", () => {
     fireEvent.click(button);
     expect(triggerBrowserDownload).toHaveBeenCalledWith(expect.any(Blob), "talk.html");
   });
+
+  it("passes comment props through to SlidesViewer", async () => {
+    const onSet = vi.fn();
+    const comments = [
+      {
+        id: "c1",
+        conversation_id: "conv_1",
+        path: "decks/talk.slides.html",
+        start_index: 0,
+        end_index: 3,
+        body: "note",
+        status: "draft" as const,
+        created_at: 0,
+        updated_at: 0,
+        anchor_content: "One",
+        created_by: null,
+      },
+    ];
+    render(
+      <CodeViewer
+        conversationId="conv_1"
+        path="decks/talk.slides.html"
+        fileQuery={makeFileQuery("<section>One</section><section>Two</section>")}
+        comments={comments}
+        activeSelection={{
+          start_index: 0,
+          end_index: 3,
+          anchor_content: "One",
+          comment_id: "c1",
+        }}
+        onSetActiveSelection={onSet}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="preview"
+      />,
+    );
+    // Bridge is only injected when comment props reach the viewer.
+    await waitFor(() =>
+      expect(screen.getByTitle("Slide deck").getAttribute("srcdoc")).toContain("omni-html-comment"),
+    );
+    expect(screen.getByText("1 / 2")).toBeInTheDocument();
+  });
 });
 
 describe("CodeViewer wireframe", () => {
@@ -812,6 +856,28 @@ describe("CodeViewer wireframe", () => {
     );
     expect(screen.queryByTitle("Slide deck")).not.toBeInTheDocument();
     expect(screen.queryByTitle("HTML preview")).not.toBeInTheDocument();
+  });
+
+  it("passes comment props through to WireframeViewer", async () => {
+    const onSet = vi.fn();
+    render(
+      <CodeViewer
+        conversationId="conv_1"
+        path="wireframes/app.wireframe.html"
+        fileQuery={makeFileQuery('<section data-screen="home">Home</section>')}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={onSet}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="preview"
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByTitle("Wireframe").getAttribute("srcdoc")).toContain("omni-html-comment"),
+    );
   });
 });
 

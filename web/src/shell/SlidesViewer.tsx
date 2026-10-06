@@ -28,18 +28,25 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import type { BrandWarning } from "@/lib/brandRules";
 import { cn } from "@/lib/utils";
+import type { Comment } from "@/hooks/useComments";
 import {
   HTML_PREVIEW_SANDBOX,
   SLIDES_EDITABLE_SELECTOR,
   SLIDES_MSG_SOURCE,
+  type ActiveSelection,
   countSlideSections,
   prepareSlidesDoc,
   prepareSlidesExport,
 } from "./codeViewerHelpers";
 import { useBrandWarnings, useDesignBranding, useFullscreen } from "./designViewer";
+import { appendCommentBridge, slideIndexForSourceOffset } from "./htmlCommentBridge";
 import { TruncatedBanner } from "./TruncatedBanner";
+import { useHtmlCommentBridge } from "./useHtmlCommentBridge";
 
 export { DESIGN_KIT_TIMEOUT_MS, DESIGN_SYSTEM_TIMEOUT_MS } from "./designViewer";
+
+const EMPTY_COMMENTS: Comment[] = [];
+const noopSetActiveSelection = (_sel: ActiveSelection | null) => {};
 
 // Fixed 16:9 stage; the iframe renders at this size and is scaled to fit.
 const STAGE_W = 1280;
@@ -120,6 +127,9 @@ export interface SlidesViewerProps {
   conversationId?: string;
   /** Switches the file viewer to the existing source view. */
   onRequestSourceMode?: () => void;
+  comments?: Comment[];
+  activeSelection?: ActiveSelection | null;
+  onSetActiveSelection?: (sel: ActiveSelection | null) => void;
 }
 
 export function SlidesViewer({
@@ -128,10 +138,12 @@ export function SlidesViewer({
   path: deckPath,
   conversationId,
   onRequestSourceMode,
+  comments = EMPTY_COMMENTS,
+  activeSelection = null,
+  onSetActiveSelection = noopSetActiveSelection,
 }: SlidesViewerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
-  const iframeRef = useRef<HTMLIFrameElement>(null);
   const sourceTotal = useMemo(() => countSlideSections(content), [content]);
   const branding = useDesignBranding(conversationId, content);
   const brandWarnings = useBrandWarnings(conversationId, content, branding?.systemPath ?? null);
@@ -139,15 +151,29 @@ export function SlidesViewer({
   const deckContent = branding?.content ?? content;
   const kitStyle = branding?.kitStyle ?? "";
   const systemStyle = branding?.systemStyle ?? "";
-  const srcDoc = useMemo(
+  const preparedDoc = useMemo(
     () => (brandingReady ? prepareSlidesDoc(deckContent, kitStyle, systemStyle) : ""),
     [deckContent, brandingReady, kitStyle, systemStyle],
+  );
+  const [scale, setScale] = useState(0);
+  const { nonce, iframeRef, addCommentPortal } = useHtmlCommentBridge({
+    conversationId: conversationId ?? "",
+    content,
+    docKey: preparedDoc,
+    comments,
+    activeSelection,
+    onSetActiveSelection,
+    scale,
+  });
+  // Bridge is preview-only; Download HTML keeps prepareSlidesExport without it.
+  const srcDoc = useMemo(
+    () => (preparedDoc ? appendCommentBridge(preparedDoc, nonce) : ""),
+    [preparedDoc, nonce],
   );
   // The iframe's runtime count wins once it reports for the current document.
   const [runtime, setRuntime] = useState<{ srcDoc: string; total: number } | null>(null);
   const total = Math.min(runtime?.srcDoc === srcDoc ? runtime.total : sourceTotal, MAX_SLIDE_COUNT);
   const [index, setIndex] = useState(0);
-  const [scale, setScale] = useState(0);
   const {
     isFullscreen,
     supported: fullscreenSupported,
@@ -165,11 +191,21 @@ export function SlidesViewer({
     [total],
   );
 
-  const post = useCallback((msg: Record<string, unknown>) => {
-    iframeRef.current?.contentWindow?.postMessage({ source: SLIDES_MSG_SOURCE, ...msg }, "*");
-  }, []);
+  const post = useCallback(
+    (msg: Record<string, unknown>) => {
+      iframeRef.current?.contentWindow?.postMessage({ source: SLIDES_MSG_SOURCE, ...msg }, "*");
+    },
+    [iframeRef],
+  );
 
   useEffect(() => post({ type: "goto", index: current }), [current, post]);
+
+  // Activate a comment on another slide by jumping to the section that holds it.
+  useEffect(() => {
+    if (!activeSelection) return;
+    const slide = slideIndexForSourceOffset(content, activeSelection.start_index);
+    if (slide !== null && slide !== current) setIndex(slide);
+  }, [activeSelection, content, current]);
 
   // Count reports and forwarded keys arrive as messages; trust only our iframe.
   useEffect(() => {
@@ -184,7 +220,7 @@ export function SlidesViewer({
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [step, srcDoc]);
+  }, [step, srcDoc, iframeRef]);
 
   // Scale the stage to fit the container, letterboxed (desktop rail and mobile).
   useEffect(() => {
@@ -379,6 +415,7 @@ export function SlidesViewer({
           </div>
         </div>
       )}
+      {addCommentPortal}
     </div>
   );
 }

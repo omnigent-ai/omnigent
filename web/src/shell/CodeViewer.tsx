@@ -883,6 +883,9 @@ export function CodeViewer({
             truncated={truncated}
             conversationId={conversationId}
             onRequestSourceMode={onRequestSourceMode}
+            comments={previewComments}
+            activeSelection={activeSelection}
+            onSetActiveSelection={onSetActiveSelection}
           />
         </Suspense>
       );
@@ -902,6 +905,9 @@ export function CodeViewer({
             path={path}
             conversationId={conversationId}
             onRequestSourceMode={onRequestSourceMode}
+            comments={previewComments}
+            activeSelection={activeSelection}
+            onSetActiveSelection={onSetActiveSelection}
           />
         </Suspense>
       );

@@ -23,6 +23,7 @@ import {
   prepareSlidesExport,
   type KitFile,
 } from "./codeViewerHelpers";
+import { appendCommentBridge, BRIDGE_SOURCE } from "./htmlCommentBridge";
 import { DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer } from "@/lib/designSystem";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { fetchWorkspaceDirectory } from "@/hooks/useWorkspaceChangedFiles";
@@ -37,6 +38,8 @@ import {
   slidesExportFilename,
 } from "./SlidesViewer";
 
+const BRIDGE_NONCE = "test-bridge-nonce";
+
 vi.mock("@/hooks/useFileContent", () => ({
   fetchFileContent: vi.fn(),
   triggerBrowserDownload: vi.fn(),
@@ -46,6 +49,12 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (orig) => ({
   ...(await orig<object>()),
   fetchWorkspaceDirectory: vi.fn(),
 }));
+vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
+vi.mock("@/lib/randomUUID", () => ({ randomUUID: () => BRIDGE_NONCE }));
+
+/** Preview srcdoc: design injection plus the comment bridge (export must omit the bridge). */
+const previewDoc = (html: string, kitStyle = "", systemStyle = "") =>
+  appendCommentBridge(prepareSlidesDoc(html, kitStyle, systemStyle), BRIDGE_NONCE);
 
 const DECK = `<!DOCTYPE html>
 <html><head><title>Deck</title></head><body>
@@ -804,7 +813,7 @@ describe("SlidesViewer design kit", () => {
       "Design kit not applied: kit.json is not valid JSON",
     );
     expect(downloadButton()).toBeDisabled();
-    expect(srcdoc()).toBe(prepareSlidesDoc(DECK));
+    expect(srcdoc()).toBe(previewDoc(DECK));
     expect(screen.getByText("1 / 3")).toBeInTheDocument();
     expect(screen.queryByTitle(/Design kit:/)).not.toBeInTheDocument();
   });
@@ -812,7 +821,7 @@ describe("SlidesViewer design kit", () => {
   it("is unchanged when the workspace has no kit", async () => {
     serve({});
     render(<SlidesViewer content={DECK} conversationId="conv_1" />);
-    await vi.waitFor(() => expect(srcdoc()).toBe(prepareSlidesDoc(DECK)));
+    await vi.waitFor(() => expect(srcdoc()).toBe(previewDoc(DECK)));
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     expect(screen.queryByTitle(/Design kit:/)).not.toBeInTheDocument();
   });
@@ -825,7 +834,7 @@ describe("SlidesViewer design kit", () => {
       expect(srcdoc()).toBe("");
       expect(downloadButton()).toBeDisabled();
       act(() => vi.advanceTimersByTime(DESIGN_KIT_TIMEOUT_MS + 1));
-      expect(srcdoc()).toBe(prepareSlidesDoc(DECK));
+      expect(srcdoc()).toBe(previewDoc(DECK));
       expect(downloadButton()).toBeDisabled();
       expect(screen.getByRole("status")).toHaveTextContent(
         "Design kit not applied: design kit timed out",
@@ -855,7 +864,7 @@ describe("SlidesViewer design kit", () => {
 
     rerender(<SlidesViewer content={DECK} />);
     expect(screen.queryByTitle(/Design kit:/)).not.toBeInTheDocument();
-    expect(srcdoc()).toBe(prepareSlidesDoc(DECK));
+    expect(srcdoc()).toBe(previewDoc(DECK));
   });
 
   it("keeps the kit on a content refresh of the same session", async () => {
@@ -873,7 +882,7 @@ describe("SlidesViewer design kit", () => {
     serve({});
     const { rerender } = render(<SlidesViewer content={DECK} conversationId="conv_1" />);
     const loading = deckFrame();
-    await vi.waitFor(() => expect(srcdoc()).toBe(prepareSlidesDoc(DECK)));
+    await vi.waitFor(() => expect(srcdoc()).toBe(previewDoc(DECK)));
     const first = deckFrame();
     expect(first).not.toBe(loading);
 
@@ -1011,7 +1020,7 @@ describe("SlidesViewer design system", () => {
     serveSystem("skill");
     render(<SlidesViewer content={DS_DECK} conversationId="conv_1" />);
     expect(await screen.findByTitle("Design system: Fixture Brand")).toBeInTheDocument();
-    expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
+    expect(srcdoc()).toBe(previewDoc(DS_DECK));
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     expect(getSessionSlim).not.toHaveBeenCalled();
   });
@@ -1050,7 +1059,7 @@ describe("SlidesViewer design system", () => {
       "Design system not applied: 500 Server Error",
     );
     expect(downloadButton()).toBeDisabled();
-    expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
+    expect(srcdoc()).toBe(previewDoc(DS_DECK));
   });
 
   it("tells a viewer who is not the owner", async () => {
@@ -1061,7 +1070,7 @@ describe("SlidesViewer design system", () => {
     );
     expect(fetchFileContent).toHaveBeenCalledTimes(1);
     expect(downloadButton()).toBeDisabled();
-    expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
+    expect(srcdoc()).toBe(previewDoc(DS_DECK));
   });
 
   it("brands an imported system for a collaborator through workspace reads", async () => {
@@ -1100,7 +1109,7 @@ describe("SlidesViewer design system", () => {
       await act(() => vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS + 1));
       expect(srcdoc()).toBe("");
       await act(() => vi.advanceTimersByTimeAsync(DESIGN_SYSTEM_TIMEOUT_MS));
-      expect(srcdoc()).toBe(prepareSlidesDoc(DS_DECK));
+      expect(srcdoc()).toBe(previewDoc(DS_DECK));
       expect(screen.getByRole("status")).toHaveTextContent(
         "Design system not applied: design system timed out",
       );
@@ -1161,5 +1170,47 @@ describe("SlidesViewer design system", () => {
     const reads = vi.mocked(fetchFileContent).mock.calls.map(([, p]) => p);
     expect(reads.filter((p) => p === `${FOLDER}/assets/extra.svg`)).toHaveLength(2);
     expect(reads.filter((p) => p === `${FOLDER}/assets/logo.svg`)).toHaveLength(1);
+  });
+});
+
+describe("SlidesViewer comments", () => {
+  const srcdoc = () => deckFrame().getAttribute("srcdoc") ?? "";
+
+  it("injects the comment bridge into the preview srcDoc only", async () => {
+    render(<SlidesViewer content={DECK} />);
+    expect(srcdoc()).toContain(BRIDGE_SOURCE);
+    expect(srcdoc()).toContain("omni:selection");
+    const exported = prepareSlidesExport(DECK);
+    expect(exported).not.toContain(BRIDGE_SOURCE);
+    expect(exported).not.toContain("::highlight(omni-comment)");
+  });
+
+  it("Download HTML omits the comment bridge and highlight CSS", async () => {
+    render(<SlidesViewer content={DECK} path="decks/talk.slides.html" />);
+    const { html } = await download();
+    expect(html).toBe(prepareSlidesExport(DECK));
+    expect(html).not.toContain(BRIDGE_SOURCE);
+    expect(html).not.toContain("::highlight(omni-comment)");
+  });
+
+  it("navigates to the slide that contains an activated comment", () => {
+    const token = "Two";
+    const at = DECK.indexOf(`<h1>${token}</h1>`);
+    const { rerender } = render(<SlidesViewer content={DECK} />);
+    expect(screen.getByText("1 / 3")).toBeInTheDocument();
+    const post = spyOnFrame();
+    rerender(
+      <SlidesViewer
+        content={DECK}
+        activeSelection={{
+          start_index: at,
+          end_index: at + token.length,
+          anchor_content: token,
+          comment_id: "c1",
+        }}
+      />,
+    );
+    expect(screen.getByText("2 / 3")).toBeInTheDocument();
+    expect(post).toHaveBeenCalledWith({ source: SLIDES_MSG_SOURCE, type: "goto", index: 1 }, "*");
   });
 });

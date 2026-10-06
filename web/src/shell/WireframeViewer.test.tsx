@@ -17,8 +17,12 @@ import {
   prepareWireframeDoc,
 } from "./wireframeDoc";
 
+const BRIDGE_NONCE = "test-bridge-nonce";
+
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
 vi.mock("@/lib/sessionsApi", () => ({ getSessionSlim: vi.fn() }));
+vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
+vi.mock("@/lib/randomUUID", () => ({ randomUUID: () => BRIDGE_NONCE }));
 
 afterEach(() => {
   cleanup();
@@ -335,5 +339,39 @@ describe("WireframeViewer", () => {
       );
       expect(srcdoc()).toContain('<section data-screen="home"');
     });
+  });
+});
+
+describe("WireframeViewer comments", () => {
+  const frame = () => screen.getByTitle("Wireframe") as HTMLIFrameElement;
+  const srcdoc = () => frame().getAttribute("srcdoc") ?? "";
+
+  it("injects the comment bridge into the preview srcDoc", () => {
+    render(<WireframeViewer content={body(SCREENS)} />);
+    expect(srcdoc()).toContain("omni-html-comment");
+    expect(srcdoc()).toContain(BRIDGE_NONCE);
+    // prepareWireframeDoc alone (export-equivalent injection) has no bridge.
+    expect(prepareWireframeDoc(body(SCREENS))).not.toContain("omni-html-comment");
+  });
+
+  it("navigates to the screen that contains an activated comment", () => {
+    const content = body(SCREENS);
+    const token = "Back";
+    const at = content.indexOf(token);
+    const { rerender } = render(<WireframeViewer content={content} />);
+    const picker = screen.getByRole("combobox", { name: "Screen" }) as HTMLSelectElement;
+    expect(picker.value).toBe("home");
+    rerender(
+      <WireframeViewer
+        content={content}
+        activeSelection={{
+          start_index: at,
+          end_index: at + token.length,
+          anchor_content: token,
+          comment_id: "c1",
+        }}
+      />,
+    );
+    expect(picker.value).toBe("sign-in");
   });
 });
