@@ -89,6 +89,11 @@ function makePdfQuery(
 
 const noopRef = { current: null };
 
+const MINIMAL_NB = JSON.stringify({
+  nbformat: 4,
+  cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
+});
+
 function renderViewer(
   content: string,
   panelOpen = true,
@@ -694,13 +699,8 @@ describe("CodeViewer HTML preview sandbox", () => {
 });
 
 describe("CodeViewer rendered previews skip Shiki highlighting", () => {
-  // These previews render through their own surfaces (iframe / MarkdownPreview /
-  // NotebookPreview) and never consume Shiki tokens, so tokenizing the whole file
-  // is wasted work that can freeze the renderer on a large file.
-  const NB = JSON.stringify({
-    nbformat: 4,
-    cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook\n"] }],
-  });
+  // Rendered previews use their own surfaces and never consume Shiki tokens, so
+  // tokenizing the whole file is wasted work that can freeze a large file.
 
   it("does not tokenize the file when rendering the HTML preview", () => {
     vi.mocked(highlightCode).mockClear();
@@ -747,7 +747,7 @@ describe("CodeViewer rendered previews skip Shiki highlighting", () => {
   // this a rendered preview; toggling it must start and stop highlighting even
   // though the language never changes.
   it("toggles highlighting when notebook eligibility changes with the language unchanged", () => {
-    const fileQuery = makeFileQuery(NB);
+    const fileQuery = makeFileQuery(MINIMAL_NB);
     const build = (path: string) => (
       <CodeViewer
         conversationId="conv_1"
@@ -1011,17 +1011,10 @@ describe("CodeViewer 3D model routing", () => {
 });
 
 describe("CodeViewer .ipynb routing", () => {
-  const MINIMAL_NB = JSON.stringify({
-    nbformat: 4,
-    cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
-  });
-
-  it("renders the notebook preview in preview mode without tokenizing the file", () => {
-    vi.mocked(highlightCode).mockClear();
+  it("renders the notebook preview in preview mode", () => {
     renderViewer(MINIMAL_NB, true, "analysis.ipynb", { viewMode: "preview" });
     expect(screen.getByRole("heading", { name: "Notebook Title" })).toBeDefined();
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
-    expect(highlightCode).not.toHaveBeenCalled();
   });
 
   it("keeps raw-JSON Monaco as the source-view escape hatch", () => {
