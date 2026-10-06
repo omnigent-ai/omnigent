@@ -130,10 +130,11 @@ def claude_agents_skill_args(
     ctx = skill_source_context_from_env(
         roots=roots, harness="claude-native", skills_filter=skills_filter
     )
+    skills = _claude_code_skills(ctx, ".agents")
+    if not skills:
+        return []
     native_names = {skill.name for skill in _claude_code_skills(replace(ctx, is_native=True))}
-    skills = [
-        skill for skill in _claude_code_skills(ctx, ".agents") if skill.name not in native_names
-    ]
+    skills = [skill for skill in skills if skill.name not in native_names]
     if not skills:
         return []
     target = overlay / ".claude" / "skills"

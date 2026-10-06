@@ -133,6 +133,23 @@ def test_claude_native_skill_args_bundle_without_skills_dir(tmp_path: Path) -> N
     assert "--plugin-dir" not in claude_native_skill_args(tmp_path / "no_skills")
 
 
+def test_claude_agents_skill_args_without_portable_skills_skips_native_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    native = tmp_path / ".claude" / "skills" / "native" / "SKILL.md"
+    native.parent.mkdir(parents=True)
+    native.write_text("---\nname: native\ndescription: Native skill\n---\nBody.\n")
+
+    def unexpected_read(*args: object, **kwargs: object) -> str:
+        raise AssertionError("A launch without portable skills must not reread native skills")
+
+    monkeypatch.setattr(Path, "read_text", unexpected_read)
+
+    assert claude_agents_skill_args(tmp_path / "bridge", (tmp_path,), "all") == []
+
+
 @pytest.mark.parametrize(
     "skills_filter,expected",
     [("all", {"portable", "hidden"}), ("none", set()), (["portable"], {"portable"})],
