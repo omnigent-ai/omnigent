@@ -1025,11 +1025,15 @@ async def test_runner_retry_row_retains_application_heartbeat_observations(
 
 
 async def test_runner_close_freezes_pending_response_send(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Cancelling dispatch tasks during disconnect cannot hide an outstanding send."""
     import websockets
 
+    from omnigent.runner.transports.ws_tunnel import diagnostics as diagnostics_module
+
+    monkeypatch.setattr(diagnostics_module, "_SAMPLE_INTERVAL_S", 0.005)
+    monkeypatch.setattr(diagnostics_module, "_SLOW_OPERATION_S", 0.01)
     send_entered = asyncio.Event()
     error = ConnectionClosedError(Close(1011, "keepalive ping timeout"), None, None)
 
@@ -1047,6 +1051,11 @@ async def test_runner_close_freezes_pending_response_send(
                         RequestFrame(id="req-1", method="GET", path="/", headers={})
                     )
                 await send_entered.wait()
+            while not any(
+                getattr(record, "event_name", None) == "runner_tunnel_health"
+                for record in caplog.records
+            ):
+                await asyncio.sleep(0.001)
             raise error
 
     @contextlib.asynccontextmanager
@@ -1068,6 +1077,7 @@ async def test_runner_close_freezes_pending_response_send(
                 server_url="http://127.0.0.1:8000",
                 runner_id="runner-diag",
                 runner_version="0.1.0",
+                connection_id="conn-blocked-response",
                 diagnostics=diagnostics,
             ),
             timeout=2,
@@ -1077,6 +1087,13 @@ async def test_runner_close_freezes_pending_response_send(
     assert snapshot["sends_in_flight"] == 1
     assert snapshot["oldest_tracked_send_age_s"] >= 0
     assert snapshot["last_received_frame_age_s"] >= 0
+    health = next(
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_tunnel_health"
+    )
+    assert health["connection_id"] == "conn-blocked-response"
+    assert health["tunnel_side"] == "runner"
     assert asyncio.all_tasks() == tasks_before
 
 

@@ -22,6 +22,7 @@ from omnigent.runner.transports.ws_tunnel.registry import (
     TunnelRegistry,
     WSChannelState,
 )
+from tests.budgets import budget
 
 
 class _NoopWS:
@@ -378,6 +379,30 @@ async def test_send_diagnostics_follow_owner_loop_and_connection_generation() ->
     assert second.diagnostics.snapshot()["app_pings_queued"] == 0
     assert second.diagnostics.snapshot()["last_app_ping_queued_age_s"] is None
     assert first.diagnostics.snapshot()["app_pings_queued"] == 0
+
+
+@pytest.mark.parametrize("operation", ["timestamp", "enqueued"])
+async def test_send_text_propagates_owner_loop_callback_error(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    registry = TunnelRegistry()
+    session = registry.register("r1", _NoopWS(), _hello())
+    owner_thread = threading.get_ident()
+    error = RuntimeError("queue timing failed")
+
+    def fail_on_owner_loop(*_args: object) -> float:
+        if threading.get_ident() == owner_thread:
+            raise error
+        return 100.0
+
+    monkeypatch.setattr(session.diagnostics, operation, fail_on_owner_loop)
+
+    async def send_from_other_loop() -> None:
+        await asyncio.wait_for(registry.send_text(session, "payload"), timeout=budget(1))
+
+    with pytest.raises(RuntimeError) as raised:
+        await asyncio.to_thread(lambda: asyncio.run(send_from_other_loop()))
+    assert raised.value is error
 
 
 @pytest.mark.asyncio

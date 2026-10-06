@@ -170,7 +170,8 @@ connection. A sampler runs every five seconds; a pending send is visible even
 if it never completes. Ordinary heartbeats add no log rows.
 
 Unexpected sampler failures are logged with their traceback. Loop-lag sampling
-then stops; send and queue timing observations continue.
+then stops and subsequent snapshots set `sampler_failed = true`; send and queue
+timing observations continue. A new connection starts with `sampler_failed = false`.
 
 Join on `connection_id` and compare `tunnel_side = server` with `runner`:
 

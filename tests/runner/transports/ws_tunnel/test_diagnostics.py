@@ -106,6 +106,7 @@ async def test_monitor_failure_is_logged_without_interrupting_sends(
         pass
 
     diagnostics = TunnelDiagnostics(clock=clock)
+    assert diagnostics.snapshot()["sampler_failed"] is False
     async with diagnostics.monitoring(lambda: None):
         now += 8
         assert diagnostics.snapshot()["loop_lag_max_s"] == 3.0
@@ -120,7 +121,10 @@ async def test_monitor_failure_is_logged_without_interrupting_sends(
         snapshot = diagnostics.snapshot()
         assert snapshot["last_send_outcome"] == "completed"
         assert snapshot["loop_lag_max_s"] is None
+        assert snapshot["sampler_failed"] is True
     assert diagnostics.snapshot()["sends_in_flight"] == 0
+    assert diagnostics.snapshot()["sampler_failed"] is True
+    assert TunnelDiagnostics(clock=clock).snapshot()["sampler_failed"] is False
 
 
 async def test_loop_lag_sample_age_is_preserved_across_snapshots() -> None:

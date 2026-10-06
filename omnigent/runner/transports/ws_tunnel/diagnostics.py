@@ -39,6 +39,7 @@ class TunnelDiagnosticAttrs(TunnelKeepaliveSettings, total=False):
     """Scalar log attributes, with no lifecycle identity or payload fields."""
 
     loop_sample_interval_s: float
+    sampler_failed: bool
     diagnostics_age_s: float
     sends_in_flight: int
     oldest_tracked_send_age_s: float | None
@@ -143,6 +144,7 @@ class TunnelDiagnostics:
         self._pings: dict[int, float] = {}
         self._ping_samples_dropped = 0
         self._loop_due_at: float | None = None
+        self._sampler_failed = False
         self._report: Callable[[], None] | None = None
         self._next_report_at = 0.0
         self._frozen: TunnelDiagnosticAttrs | None = None
@@ -183,6 +185,7 @@ class TunnelDiagnostics:
         except Exception:
             # A dead sampler must not look like an ever-growing scheduling delay.
             self._loop_due_at = None
+            self._sampler_failed = True
             with contextlib.suppress(Exception):
                 _logger.exception("Tunnel diagnostics monitor failed")
 
@@ -291,6 +294,7 @@ class TunnelDiagnostics:
             **self.settings,
             "diagnostics_age_s": 0.0,
             "loop_sample_interval_s": _SAMPLE_INTERVAL_S,
+            "sampler_failed": self._sampler_failed,
             "sends_in_flight": self._send_count,
             "oldest_tracked_send_age_s": _age(now, min(self._active_sends.values(), default=None)),
             "send_samples_dropped": self._send_samples_dropped,

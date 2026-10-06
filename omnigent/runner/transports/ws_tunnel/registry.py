@@ -746,11 +746,10 @@ class TunnelRegistry:
 
         def _enqueue() -> None:
             """Run on ``session.loop`` and enqueue the outbound frame."""
-            error: ConnectionError | None = None
-            with self._lock:
-                if self._sessions.get(session.runner_id) is not session:
-                    error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
-                else:
+            try:
+                with self._lock:
+                    if self._sessions.get(session.runner_id) is not session:
+                        raise ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
                     frame = OutboundFrame(
                         data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
                     )
@@ -758,7 +757,7 @@ class TunnelRegistry:
                     session.diagnostics.enqueued(
                         frame, session.outbound_queue.qsize(), requested_at
                     )
-            if error is not None:
+            except Exception as error:  # noqa: BLE001 — forward failures across loops.
                 if not ack.done():
                     ack.set_exception(error)
             else:

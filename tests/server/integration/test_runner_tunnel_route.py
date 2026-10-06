@@ -2235,8 +2235,11 @@ async def test_ping_timeout_retains_blocked_send_and_queued_heartbeats(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The timeout still fires when the sender is stuck, and cleanup preserves proof."""
+    from omnigent.runner.transports.ws_tunnel import diagnostics as diagnostics_module
     from omnigent.server.routes import runner_tunnel
 
+    monkeypatch.setattr(diagnostics_module, "_SAMPLE_INTERVAL_S", 0.005)
+    monkeypatch.setattr(diagnostics_module, "_SLOW_OPERATION_S", 0.01)
     monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 0.05)
     monkeypatch.setattr(runner_tunnel, "PING_MISS_THRESHOLD", 3)
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
@@ -2269,6 +2272,13 @@ async def test_ping_timeout_retains_blocked_send_and_queued_heartbeats(
         if getattr(r, "event_name", None) == "runner_ping_timeout"
     )
     closed = _tunnel_end_events(caplog)[0]
+    health = next(
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_tunnel_health"
+    )
+    assert health["connection_id"] == "conn-blocked-send"
+    assert health["tunnel_side"] == "server"
     for row in (timeout, closed):
         assert row["connection_id"] == "conn-blocked-send"
         assert row["sends_in_flight"] == 1
