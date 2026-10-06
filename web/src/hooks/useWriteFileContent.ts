@@ -27,6 +27,17 @@ export async function writeFileContent(
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
 }
 
+/** Delete a workspace file; an already-missing file counts as deleted. */
+export async function deleteFileContent(conversationId: string, path: string): Promise<void> {
+  const base = browseLocationBase(path);
+  const url =
+    `/v1/sessions/${encodeURIComponent(conversationId)}` +
+    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${browseLocationSegment(path)}` +
+    (base ? `?base=${base}` : "");
+  const res = await authenticatedFetch(url, { method: "DELETE" });
+  if (!res.ok && res.status !== 404) throw new Error(`${res.status} ${res.statusText}`);
+}
+
 /**
  * Write the content of a workspace file for the given conversation.
  * Invalidates the file-content query on success so the viewer refreshes.

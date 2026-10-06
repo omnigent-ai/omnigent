@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
-import { useWriteFileContent } from "./useWriteFileContent";
+import { deleteFileContent, useWriteFileContent } from "./useWriteFileContent";
 
 const fetchMock = vi.fn();
 
@@ -133,5 +133,22 @@ describe("useWriteFileContent", () => {
 
     expect(thrown).not.toBeNull();
     expect(thrown!.message).toMatch("403");
+  });
+});
+
+describe("deleteFileContent", () => {
+  it("DELETEs the file and treats a missing file as deleted", async () => {
+    fetchMock.mockResolvedValueOnce(okResponse()).mockResolvedValueOnce(errorResponse(404));
+    await deleteFileContent("sess_1", ".omnigent/design-system.json");
+    await deleteFileContent("sess_1", ".omnigent/design-system.json");
+    expect(fetchMock.mock.calls[0][0]).toContain(
+      "/v1/sessions/sess_1/resources/environments/default/filesystem/.omnigent/design-system.json",
+    );
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: "DELETE" });
+  });
+
+  it("throws on other errors", async () => {
+    fetchMock.mockResolvedValue(errorResponse(403));
+    await expect(deleteFileContent("sess_1", "a.json")).rejects.toThrow("403");
   });
 });

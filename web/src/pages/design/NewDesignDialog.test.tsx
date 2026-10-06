@@ -10,7 +10,7 @@ import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { fetchFileContent } from "@/hooks/useFileContent";
-import { writeFileContent } from "@/hooks/useWriteFileContent";
+import { deleteFileContent, writeFileContent } from "@/hooks/useWriteFileContent";
 import {
   readRecentDesignSystems,
   rememberDesignSystem,
@@ -23,7 +23,10 @@ import { testAgent } from "@/test/agentFixtures";
 import { NewDesignDialog } from "./NewDesignDialog";
 
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
-vi.mock("@/hooks/useWriteFileContent", () => ({ writeFileContent: vi.fn() }));
+vi.mock("@/hooks/useWriteFileContent", () => ({
+  writeFileContent: vi.fn(),
+  deleteFileContent: vi.fn(),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
@@ -68,6 +71,7 @@ const DESK: Host = { host_id: "host_2", name: "desk", owner: "me", status: "offl
 const createMock = vi.mocked(createSession);
 const postMock = vi.mocked(postEvent);
 const writeMock = vi.mocked(writeFileContent);
+const deleteMock = vi.mocked(deleteFileContent);
 const filesystemMock = vi.mocked(useHostFilesystem);
 let listings: Record<string, string[] | "missing">;
 
@@ -432,5 +436,30 @@ describe("NewDesignDialog design system", () => {
     await waitFor(() => expect(onCreated).toHaveBeenCalled());
     expect(writeMock).not.toHaveBeenCalled();
     expect(sentText()).not.toContain("Follow the design system");
+  });
+
+  it.each([
+    ["None", false],
+    ["Folder kit", true],
+  ])("clears an earlier pointer before sending for %s", async (label, kit) => {
+    if (kit) listings["/work/site/.omnigent/design-kit"] = ["kit.json"];
+    rememberDesignSystem("host_1", ACME);
+    const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+    openSystems();
+    fireEvent.click(screen.getByRole("option", { name: label }));
+    create();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(deleteMock).toHaveBeenCalledWith("conv_new", ".omnigent/design-system.json");
+    expect(deleteMock.mock.invocationCallOrder[0]).toBeLessThan(
+      postMock.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("does not clear the pointer when a system is chosen", async () => {
+    rememberDesignSystem("host_1", ACME);
+    const { onCreated } = renderDialog({ initialPrompt: "Pitch" });
+    create();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(deleteMock).not.toHaveBeenCalled();
   });
 });

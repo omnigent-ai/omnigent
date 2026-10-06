@@ -27,7 +27,7 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { fetchFileContent } from "@/hooks/useFileContent";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHosts } from "@/hooks/useHosts";
-import { writeFileContent } from "@/hooks/useWriteFileContent";
+import { deleteFileContent, writeFileContent } from "@/hooks/useWriteFileContent";
 import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
 import { DECK_SUFFIX, deckName } from "@/lib/designDecks";
 import {
@@ -249,6 +249,9 @@ export function NewDesignDialog({
       const ref = system && { ...system, name: await resolveSystemName(sessionId, system) };
       if (ref) {
         await writeFileContent(sessionId, DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer(ref));
+      } else {
+        // A pointer left from an earlier design would override the folder kit.
+        await deleteFileContent(sessionId, DESIGN_SYSTEM_POINTER);
       }
       await postEvent(sessionId, {
         type: "message",
