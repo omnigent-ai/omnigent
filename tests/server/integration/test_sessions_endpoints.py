@@ -10094,10 +10094,12 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
 @pytest.mark.parametrize(
     "case", ["request", "request_idle", "cache", "idle", "missing", "invalid", "failure"]
 )
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
 async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     case: str,
+    event_type: str,
 ) -> None:
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions.common import (
@@ -10120,6 +10122,22 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     )
     assert child_response.status_code == 202, child_response.text
     child_id = child_response.json()["child_session_id"]
+    item_response = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex",
+                    "content": [{"type": "output_text", "text": "Keep this side-chat answer."}],
+                },
+            },
+        },
+    )
+    assert item_response.status_code == 202, item_response.text
+    transcript = (await client.get(f"/v1/sessions/{child_id}/items")).json()
     try:
         _session_status_cache[child_id] = "idle" if case in ("idle", "request_idle") else "running"
         if case == "cache":
@@ -10142,7 +10160,7 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
                 data["response_id"] = "unrelated_response"
             with patch.object(routes_events, "_publish_interrupted") as publish_interrupted:
                 response = await client.post(
-                    f"/v1/sessions/{child_id}/events", json={"type": "interrupt", "data": data}
+                    f"/v1/sessions/{child_id}/events", json={"type": event_type, "data": data}
                 )
             publish_interrupted.assert_not_called()
 
@@ -10167,6 +10185,17 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
             assert response.json() == {"queued": False}
         assert parent["id"] not in _interrupt_fenced_sessions
         assert child_id not in _interrupt_fenced_sessions
+        child = (await client.get(f"/v1/sessions/{child_id}")).json()
+        closed = event_type == "stop_session" and expected_status == 202
+        assert (child["labels"].get("omnigent.closed") == "true") is closed
+        assert (await client.get(f"/v1/sessions/{child_id}/items")).json() == transcript
+        if closed:
+            with patch.object(routes_events, "_get_runner_client") as get_runner:
+                repeated = await client.post(
+                    f"/v1/sessions/{child_id}/events", json={"type": "stop_session", "data": {}}
+                )
+            assert repeated.status_code == 202, repeated.text
+            get_runner.assert_not_called()
     finally:
         _interrupt_fenced_sessions.discard(child_id)
         _session_active_response_cache.pop(child_id, None)

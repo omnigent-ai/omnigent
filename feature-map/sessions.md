@@ -19,8 +19,11 @@ the header menu), and each place is a separate entry point.
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged.
-- `stop`: Stop session ends a host-launched parent and the sub-agents on its
-  runner without reporting their expected disconnect as a task failure.
+- `stop`: Stop session on a hosted parent ends its runner, including side chats
+  and sub-agents sharing that runner. Conversation histories are kept.
+- `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
+  closing one stops only that chat. A stopped generic hosted parent can start a
+  new side chat on a fresh runner while its host remains online.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
@@ -86,9 +89,17 @@ and send a follow-up after its parent runner is replaced.
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
-**Stop session:** open the native parent's sidebar menu and choose Stop session
-while a sub-agent is working. This ends the runner; the current-turn interrupt
-control is a separate action that leaves the session connected.
+**Stop session:** open the parent's sidebar row menu or right-click the row and
+choose Stop session while a side chat or sub-agent is working. On mobile, open
+the sidebar drawer and long-press the row. The current-turn interrupt control is
+a separate action that leaves the session connected.
+
+**Side-chat lifecycle:** use **Workspace → + → Side chat**, type `/side` in the
+parent composer, or choose **Start a new side chat** from the composer's add
+tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
+side chats open in a drawer. A generic hosted parent can start a new side chat
+after stopping. Close a side chat with its tab's close button; the parent and
+sibling chats keep running.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -195,6 +206,20 @@ plain `uv run pytest`, which starts a private server for the test.
   real runner crash that must still report a failure. Requires both native
   CLIs and tmux; Claude's machine-managed credentials require an isolated
   container for the local model endpoint.
+- **`stop`, `side-chat-lifecycle`, hosted side chats (own environment):**
+  `tests/e2e_ui/sessions/test_stop_side_chats.py::test_stop_session_stops_hosted_side_chats`
+  drives both desktop sidebar menus and the mobile long-press menu with a real
+  host. Side chats share their parent's runner. Closing one leaves its parent
+  and sibling working; stopping the parent stops that shared runner and keeps
+  all histories. An unrelated session stays online, and a new side chat launches
+  a fresh runner while its parent remains stopped.
+  Only model replies are scripted.
+- **`side-chat-lifecycle`, creation entry points:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py` covers `/side`, the Workspace
+  menu, the composer add tray, selected text's Ask in side chat action, and the
+  mobile side-chat drawer. Its stale-branch scenarios simulate an offline parent
+  runner to exercise host-launch fallback; the hosted lifecycle test above
+  proves live-parent reuse with actual runner processes.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`
@@ -234,6 +259,10 @@ plain `uv run pytest`, which starts a private server for the test.
 
 ## Gotchas
 
+- Existing side chats on separate runners must still be closed individually.
+  Hostless CLI Stop keeps its existing per-conversation behavior.
+- A side chat launched after its parent stopped owns a fresh runner. Stopping
+  the parent's old runner does not stop that new chat; close the chat itself.
 - Browser storage sharing is limited to one desktop window and app run;
   restarting the app clears it. Closing an individual tab does not.
 - Archive and unarchive exist on the row, in bulk selection, and in the header

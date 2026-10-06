@@ -121,7 +121,7 @@ PINNED_LABEL_KEY = "omnigent.pinned"
 # Marks a top-level fork created as a side chat. A side chat surfaces only as a
 # Workspace-rail tab, so a conversation carrying this label is hidden from the
 # left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
-# otherwise behaves like any other session (its own runner, transcript).
+# keeps its own transcript and may share its parent's runner.
 SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the

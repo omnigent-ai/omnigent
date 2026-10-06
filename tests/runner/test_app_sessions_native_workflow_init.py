@@ -2502,6 +2502,47 @@ async def test_delete_session_with_active_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_then_release_side_chat_preserves_other_runner_sessions() -> None:
+    """Closing one shared-runner chat leaves the parent and sibling turns alive."""
+    app, pm, _hc = _build_lifecycle_app()
+    parent_id, side_id, sibling_id = (uuid.uuid4().hex for _ in range(3))
+    tasks: dict[str, asyncio.Task[bool]] = {}
+    async with _runner_client(app) as client:
+        try:
+            for session_id in (parent_id, side_id, sibling_id):
+                created = await client.post(
+                    "/v1/sessions",
+                    json={
+                        "session_id": session_id,
+                        "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                    },
+                )
+                assert created.status_code == 201, created.text
+                pm._sessions.add(session_id)
+                tasks[session_id] = asyncio.create_task(asyncio.Event().wait())
+                app.state.active_turns[session_id] = tasks[session_id]
+            await asyncio.sleep(0)
+
+            stopped = await client.post(
+                f"/v1/sessions/{side_id}/events", json={"type": "stop_session"}
+            )
+            assert stopped.status_code == 204, stopped.text
+            released = await client.delete(f"/v1/sessions/{side_id}")
+            assert released.status_code == 200, released.text
+            assert tasks[side_id].cancelled()
+            assert pm.released == [side_id]
+            assert not pm.has_session(side_id)
+            for session_id in (parent_id, sibling_id):
+                assert not tasks[session_id].done()
+                assert pm.has_session(session_id)
+                assert session_id not in pm.cancelled
+                assert app.state.active_turns[session_id] is tasks[session_id]
+        finally:
+            for session_id in (parent_id, side_id, sibling_id):
+                await client.delete(f"/v1/sessions/{session_id}")
+
+
+@pytest.mark.asyncio
 async def test_session_stream_receives_events() -> None:
     """``GET /v1/sessions/{id}/stream`` yields events published by proxy_stream."""
     app, _pm, _hc = _build_lifecycle_app()

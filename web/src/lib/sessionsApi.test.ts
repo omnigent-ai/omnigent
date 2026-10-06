@@ -558,10 +558,12 @@ describe("createSideChat", () => {
   };
 
   it.each(["worktree-from-another-machine", "main", null])(
-    "uses the current workspace without requiring saved branch %s",
+    "launches after parent stop without requiring saved branch %s",
     async (gitBranch) => {
       fetchMock
-        .mockResolvedValueOnce(mockJsonResponse({ ...source, git_branch: gitBranch }))
+        .mockResolvedValueOnce(
+          mockJsonResponse({ ...source, runner_online: false, git_branch: gitBranch }),
+        )
         .mockResolvedValueOnce(mockJsonResponse(fork))
         .mockResolvedValueOnce(mockJsonResponse({ runner_id: "runner_side" }));
 
@@ -580,8 +582,8 @@ describe("createSideChat", () => {
     },
   );
 
-  it.each([{ host_id: null, workspace: null }, { host_online: false }])(
-    "uses the parent's online runner when its host cannot launch (%j)",
+  it.each([{}, { host_id: null, workspace: null }, { host_online: false }])(
+    "reuses the parent's online runner regardless of host availability (%j)",
     async (placement) => {
       fetchMock
         .mockResolvedValueOnce(mockJsonResponse({ ...source, ...placement }))
@@ -621,22 +623,25 @@ describe("createSideChat", () => {
       )
       .mockResolvedValueOnce(mockJsonResponse({ recovered: true, recovery: "runner_relaunched" }))
       .mockResolvedValueOnce(
-        mockJsonResponse({ ...source, host_id: "host_awake", workspace: "/resumed/workspace" }),
+        mockJsonResponse({
+          ...source,
+          host_id: "host_awake",
+          workspace: "/resumed/workspace",
+          runner_id: "runner_awake",
+        }),
       )
       .mockResolvedValueOnce(mockJsonResponse(fork))
-      .mockResolvedValueOnce(mockJsonResponse({ runner_id: "runner_side" }));
+      .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: "runner_awake" }));
 
     await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
 
     const [retryUrl, retryInit] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(retryUrl).toBe(`/v1/sessions/${source.id}/events`);
     expect(JSON.parse(retryInit.body as string)).toMatchObject({ type: "retry_session" });
-    const [launchUrl, launchInit] = fetchMock.mock.calls[4] as [string, RequestInit];
-    expect(launchUrl).toBe("/v1/hosts/host_awake/runners");
-    expect(JSON.parse(launchInit.body as string)).toEqual({
-      session_id: fork.id,
-      workspace: "/resumed/workspace",
-    });
+    const [bindUrl, bindInit] = fetchMock.mock.calls[4] as [string, RequestInit];
+    expect(bindUrl).toBe(`/v1/sessions/${fork.id}`);
+    expect(bindInit.method).toBe("PATCH");
+    expect(JSON.parse(bindInit.body as string)).toEqual({ runner_id: "runner_awake" });
   });
 
   it("does not create an orphan fork when neither the host nor runner is available", async () => {

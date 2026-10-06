@@ -91,14 +91,32 @@ def test_slash_menu_lists_side_command(page: Page, seeded_session: tuple[str, st
     expect(page.get_by_test_id("slash-menu-item-side")).to_be_visible()
 
 
-def test_composer_add_tray_offers_a_side_chat(page: Page, seeded_session: tuple[str, str]) -> None:
-    """The composer ``+`` tray has a "Start a new side chat" item."""
+def test_composer_add_tray_offers_a_side_chat(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    runner_id: str,
+    mock_llm_server_url: str,
+) -> None:
+    """The composer ``+`` tray starts a working chat on the parent's runner."""
     base_url, session_id = seeded_session
+    question = f"tray-side-{session_id}: answer in the side chat"
+    reply = "The add tray started a side chat."
+    configure_mock_llm(mock_llm_server_url, [{"text": reply}], match=question)
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder("Send a message…")).to_be_visible()
 
     page.get_by_test_id("composer-attach").click()
-    expect(page.get_by_role("menuitem", name="Start a new side chat")).to_be_visible()
+    page.get_by_role("menuitem", name="Start a new side chat").click()
+    page.get_by_test_id("side-chat-input").fill(question)
+    page.get_by_test_id("side-chat-send").click()
+    expect(page.locator(".side-chat-backdrop").get_by_text(reply, exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    assert len(side_chat_forks) == 1
+    response = httpx.get(f"{base_url}/v1/sessions/{side_chat_forks[0]}", timeout=10.0)
+    response.raise_for_status()
+    assert response.json()["runner_id"] == runner_id
 
 
 def test_rail_new_tab_menu_offers_a_side_chat(page: Page, seeded_session: tuple[str, str]) -> None:
@@ -122,7 +140,7 @@ def test_side_chat_sends_with_stale_branch_metadata(
     mock_llm_server_url: str,
     entrypoint: str,
 ) -> None:
-    """A working parent can fork and chat even if its saved branch no longer exists."""
+    """A stopped parent can launch a chat even if its saved branch no longer exists."""
     base_url, session_id = seeded_session
     host_id = "side-chat-test-host"
     workspace = "/workspace/existing-checkout"
@@ -135,6 +153,7 @@ def test_side_chat_sends_with_stale_branch_metadata(
         snapshot.update(
             host_id=host_id,
             host_online=True,
+            runner_online=False,
             workspace=workspace,
             git_branch=stale_branch,
         )
