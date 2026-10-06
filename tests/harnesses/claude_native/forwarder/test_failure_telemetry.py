@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 
-from omnigent.harnesses.claude_native import bridge, forwarder
+from omnigent.harnesses.claude_native import bridge, client_version, forwarder
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.native.failure_telemetry import FailureContext
 
@@ -126,6 +127,105 @@ async def test_hook_telemetry_failure_does_not_block_status(
     ]
     assert "Claude hook failure telemetry failed: TypeError" in caplog.text
     assert "synthetic-private-telemetry-data" not in caplog.text
+
+
+_VERSION_REFUSAL = (
+    'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":'
+    '"Claude Code 2.1.217 does not support this model; version 2.1.280 or newer is '
+    'required"}}'
+)
+
+
+async def _forward_stop_failure(bridge_dir: Path, message: str) -> list[dict[str, Any]]:
+    """Forward one parent ``StopFailure`` carrying *message*; return the posted bodies."""
+    bridge.record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "native-session",
+            "error": "invalid_request",
+            "last_assistant_message": message,
+        },
+    )
+    requests: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_synthetic",
+            bridge_dir=bridge_dir,
+            state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id="resp_synthetic",
+        )
+    return requests
+
+
+@pytest.mark.parametrize("model_source", ["status-line", "launch-model"])
+@pytest.mark.asyncio
+async def test_stop_failure_teaches_the_release_a_model_needs(
+    tmp_path: Path, model_source: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    if model_source == "status-line":
+        (bridge_dir / bridge._CONTEXT_FILE).write_text(
+            json.dumps({"model": "system.ai.claude-sonnet-5-6[1m]"})
+        )
+        (bridge_dir / bridge._CONFIG_FILE).write_text(
+            json.dumps({"launch_model": "system.ai.claude-haiku-4-5"})
+        )
+    else:
+        (bridge_dir / bridge._CONFIG_FILE).write_text(
+            json.dumps({"launch_model": "system.ai.claude-sonnet-5-6[1m]"})
+        )
+
+    requests = await _forward_stop_failure(bridge_dir, _VERSION_REFUSAL)
+
+    assert client_version.learned_min_client_versions() == {"sonnet-5-6": "2.1.280"}
+    # Learning never gets in the way of the failed edge itself.
+    assert [request["data"]["status"] for request in requests] == ["failed"]
+
+
+@pytest.mark.asyncio
+async def test_stop_failure_without_a_refusal_or_a_model_teaches_nothing(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / bridge._CONFIG_FILE).write_text(json.dumps({"launch_model": "claude-opus-5-6"}))
+    await _forward_stop_failure(bridge_dir, "API Error: 529 overloaded")
+    assert client_version.learned_min_client_versions() == {}
+
+    other = tmp_path / "other"
+    other.mkdir()
+    requests = await _forward_stop_failure(other, _VERSION_REFUSAL)
+    assert client_version.learned_min_client_versions() == {}
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_unwritable_floor_file_does_not_block_the_failed_edge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / bridge._CONFIG_FILE).write_text(json.dumps({"launch_model": "claude-opus-5-6"}))
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(forwarder, "record_min_client_version", boom)
+    requests = await _forward_stop_failure(bridge_dir, _VERSION_REFUSAL)
+    assert len(requests) == 1
 
 
 @pytest.mark.parametrize("marker_location", ["entry", "message"])

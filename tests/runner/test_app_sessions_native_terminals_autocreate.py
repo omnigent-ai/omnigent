@@ -4834,3 +4834,188 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
 
     await fake_client.aclose()
+
+
+def _gated_catalog_rows() -> list[dict[str, Any]]:
+    """A managed picker whose Default (Sonnet 5.5) needs Claude Code 2.1.280 or newer."""
+    return [
+        {
+            "id": "sonnet[1m]",
+            "model": "system.ai.claude-sonnet-5-5[1m]",
+            "displayName": "Sonnet 5.5 (1M context)",
+            "isDefault": True,
+        },
+        {
+            "id": "opus[1m]",
+            "model": "system.ai.claude-opus-5-5[1m]",
+            "displayName": "Opus 5.5 (1M context)",
+        },
+        {"id": "haiku", "model": "system.ai.claude-haiku-4-5", "displayName": "Haiku 4.5"},
+        {
+            "id": "opus-4-8[1m]",
+            "model": "system.ai.claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8 (1M context)",
+        },
+    ]
+
+
+async def _launch_against_gated_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    cli_version: str | None,
+    model_override: str | None = None,
+    stale: bool = False,
+) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Launch a claude-native terminal against :func:`_gated_catalog_rows`.
+
+    :param cli_version: The installed Claude Code release the launch sees.
+    :param model_override: The session's persisted model pick, or ``None`` for Default.
+    :param stale: Whether the stored catalog is past its freshness TTL.
+    :returns: The launched argv, the events posted to the session, and the
+        model-pick resets.
+    """
+    import os
+    import time
+
+    from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+    from omnigent.models import model_catalog_store
+    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.client_version.installed_cli_version",
+        lambda: cli_version,
+    )
+
+    async def _probe(config: object) -> list[dict[str, Any]]:
+        return _gated_catalog_rows()
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_model_catalog", _probe)
+    fingerprint = claude_catalog_fingerprint(None)
+    model_catalog_store.write_catalog("claude-native", fingerprint, _gated_catalog_rows())
+    if stale:
+        path = model_catalog_store.catalog_path("claude-native", fingerprint)
+        old = time.time() - (model_catalog_store.CATALOG_STALE_AFTER_S + 60)
+        os.utime(path, (old, old))
+
+    posted: list[dict[str, Any]] = []
+    resets: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            posted.append(json.loads(request.content))
+        if request.method == "PATCH" and "model_override" in json.loads(request.content):
+            resets.append(json.loads(request.content))
+        body: dict[str, Any] = {"labels": {}}
+        if model_override is not None:
+            body["model_override"] = model_override
+        return httpx.Response(200, json=body)
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    captured: dict[str, Any] = {}
+    await _auto_create_claude_terminal(
+        "4d5e6f708192a3b4c5d6e7f8091a2b3c",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    task = model_catalog_store._inflight.get(("claude-native", fingerprint))
+    if task is not None:
+        await task
+    await fake_client.aclose()
+    return list(captured["spec"].args), posted, resets
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale", [False, True], ids=["fresh-catalog", "stale-catalog"])
+async def test_auto_create_claude_terminal_default_launch_skips_a_model_the_client_cannot_run(
+    stale: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A Default launch on a Claude Code too old for the catalog Default runs another model.
+
+    Pinning the Default (Sonnet 5.5, needing 2.1.280) on Claude Code 2.1.217 fails the
+    first turn with a 400, so the launch takes the newest model that client can run,
+    tells the session once, and logs a structured event. A stale catalog is no excuse
+    to launch bare: the CLI's own default is that same refused model.
+    """
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        args, posted, resets = await _launch_against_gated_catalog(
+            monkeypatch, tmp_path, cli_version="2.1.217", stale=stale
+        )
+
+    assert args[args.index("--model") + 1] == "system.ai.claude-opus-4-8[1m]"
+    assert resets == []
+    assert len(posted) == 1
+    event = posted[0]
+    assert event["type"] == "external_conversation_item"
+    assert event["data"]["item_type"] == "error"
+    item = event["data"]["item_data"]
+    assert item["code"] == "claude_native_default_model_demoted"
+    assert item["level"] == "info"
+    assert item["message"] == (
+        "Claude Code 2.1.217 can't run Sonnet 5.5 (1M context) (needs 2.1.280 or newer), "
+        "so this session uses Opus 4.8 (1M context). Run `claude update` to use it."
+    )
+    demotions = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_native_default_model_demoted"
+    ]
+    assert len(demotions) == 1
+    assert demotions[0].attributes == {
+        "cli_version": "2.1.217",
+        "wanted_model": "system.ai.claude-sonnet-5-5[1m]",
+        "min_version": "2.1.280",
+        "chosen_model": "system.ai.claude-opus-4-8[1m]",
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_explicit_pick_of_a_gated_model_launches_as_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model the user picked is never swapped out, whatever the installed release."""
+    pick = "system.ai.claude-opus-5-5[1m]"
+    args, posted, resets = await _launch_against_gated_catalog(
+        monkeypatch, tmp_path, cli_version="2.1.217", model_override=pick
+    )
+
+    assert args[args.index("--model") + 1] == pick
+    assert posted == []
+    assert resets == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cli_version", ["2.1.280", "2.1.291", None])
+async def test_auto_create_claude_terminal_default_launch_keeps_a_model_the_client_can_run(
+    cli_version: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new-enough or unreadable Claude Code release leaves the catalog Default alone."""
+    args, posted, resets = await _launch_against_gated_catalog(
+        monkeypatch, tmp_path, cli_version=cli_version
+    )
+
+    assert args[args.index("--model") + 1] == "system.ai.claude-sonnet-5-5[1m]"
+    assert posted == []
+    assert resets == []
