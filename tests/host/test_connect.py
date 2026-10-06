@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -20,6 +21,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
 from websockets.http11 import Response
 
+from omnigent import debug_logging
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
@@ -6829,6 +6831,117 @@ class _CollectingWs:
 async def _drain_frame_tasks(host: HostProcess) -> None:
     """Await every in-flight frame task (handler failures are contained)."""
     await asyncio.gather(*list(host._frame_tasks))
+
+
+@contextlib.contextmanager
+def _captured_host_debug_rows() -> Iterator[list[dict[str, object]]]:
+    """Capture serialized host debug rows through the real async handler."""
+    rows: list[dict[str, object]] = []
+    logger = logging.getLogger("omnigent.host.connect")
+    previous_level = logger.level
+    sink = debug_logging.DebugLogHandler("host", lambda batch: rows.extend(batch))
+    sink.setLevel(logging.ERROR)
+    logger.setLevel(logging.ERROR)
+    logger.addHandler(sink)
+    try:
+        yield rows
+    finally:
+        logger.removeHandler(sink)
+        sink.close()
+        logger.setLevel(previous_level)
+
+
+async def test_frame_handler_failure_serializes_decoded_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure rows retain only IDs present in each decoded host frame."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+
+    async def _fail(_ws: object, frame: object) -> None:
+        # Keep the tasks concurrent so ContextVar scopes cannot bleed across
+        # sessions while one detached handler is waiting.
+        await asyncio.sleep(0.001)
+        raise RuntimeError(type(frame).__name__)
+
+    monkeypatch.setattr(host, "_dispatch_host_frame", _fail)
+    frames = [
+        HostSkillsFrame(
+            request_id="req_a",
+            harness="claude-native",
+            path="/unused",
+            session_id="session-a",
+        ),
+        HostSkillsFrame(
+            request_id="req_b",
+            harness="claude-native",
+            path="/unused",
+            session_id="session-b",
+        ),
+        HostStopRunnerFrame(request_id="req_runner", runner_id="runner-a"),
+        HostModelOptionsFrame(request_id="req_identity_poor", harness="claude-native"),
+    ]
+
+    with _captured_host_debug_rows() as rows:
+        for frame in frames:
+            host._start_frame_task(ws, encode_host_frame(frame))  # type: ignore[arg-type]
+        await _drain_frame_tasks(host)
+
+    assert ws.sent == []
+    by_request = {
+        row["attributes"]["request_id"]: row
+        for row in rows
+        if isinstance(row.get("attributes"), dict)
+    }
+    assert set(by_request) == {"req_a", "req_b", "req_runner", "req_identity_poor"}
+
+    for request_id, session_id in (("req_a", "session-a"), ("req_b", "session-b")):
+        row = by_request[request_id]
+        attrs = row["attributes"]
+        assert row["event_name"] == "host_frame_handler_failed"
+        assert row["session_id"] == session_id
+        assert attrs["host_id"] == "host_test_connect"
+        assert attrs["frame_kind"] == "host.skills"
+        assert attrs["error_type"] == "RuntimeError"
+        assert int(attrs["elapsed_ms"]) >= 0
+        assert "runner_id" not in attrs
+
+    runner_row = by_request["req_runner"]
+    assert runner_row["session_id"] is None
+    assert runner_row["attributes"]["runner_id"] == "runner-a"
+    assert runner_row["attributes"]["frame_kind"] == "host.stop_runner"
+
+    identity_poor_row = by_request["req_identity_poor"]
+    assert identity_poor_row["session_id"] is None
+    assert identity_poor_row["attributes"]["host_id"] == "host_test_connect"
+    assert identity_poor_row["attributes"]["frame_kind"] == "host.model_options"
+    assert "runner_id" not in identity_poor_row["attributes"]
+
+
+async def test_frame_handler_failure_metadata_is_best_effort_for_malformed_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed frame cannot prevent a safe structured failure row."""
+    host = _make_host_process()
+
+    async def _fail(_ws: object, _raw: str) -> None:
+        raise RuntimeError("synthetic malformed-frame failure")
+
+    monkeypatch.setattr(host, "_handle_raw_message", _fail)
+    with _captured_host_debug_rows() as rows:
+        await host._run_frame_handler(None, "{not-json")  # type: ignore[arg-type]
+
+    assert len(rows) == 1
+    row = rows[0]
+    attrs = row["attributes"]
+    assert row["event_name"] == "host_frame_handler_failed"
+    assert row["session_id"] is None
+    assert attrs["host_id"] == "host_test_connect"
+    assert attrs["error_type"] == "RuntimeError"
+    assert isinstance(attrs["elapsed_ms"], str)
+    assert "frame_kind" not in attrs
+    assert "request_id" not in attrs
+    assert "runner_id" not in attrs
 
 
 async def test_slow_frame_does_not_head_of_line_block(

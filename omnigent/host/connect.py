@@ -69,6 +69,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
@@ -1077,6 +1078,43 @@ class _RunnerHandle:
     session_id: str | None = None
     connect_marker: Path | None = None
     stop_requested: bool = False
+
+
+@dataclass(frozen=True)
+class _HostFrameFailureContext:
+    """Safe metadata retained when a host-frame task fails."""
+
+    frame_kind: str | None = None
+    request_id: str | None = None
+    session_id: str | None = None
+    runner_id: str | None = None
+
+
+def _host_frame_failure_context(raw: str) -> _HostFrameFailureContext:
+    """Decode only correlation metadata for a failure diagnostic.
+
+    This failure-only pass returns no metadata for malformed or partially
+    decoded frames, rather than trusting fields from an invalid payload.
+    """
+    try:
+        frame: HostFrame = decode_host_frame(raw)
+        payload = json.loads(raw)
+        frame_kind = payload.get("kind") if isinstance(payload, dict) else None
+        if not isinstance(frame_kind, str):
+            frame_kind = type(frame).__name__
+    except Exception:  # noqa: BLE001 — failure logging must never fail again
+        return _HostFrameFailureContext()
+
+    def _text_field(name: str) -> str | None:
+        value = getattr(frame, name, None)
+        return value if isinstance(value, str) and value else None
+
+    return _HostFrameFailureContext(
+        frame_kind=frame_kind,
+        request_id=_text_field("request_id"),
+        session_id=_text_field("session_id"),
+        runner_id=_text_field("runner_id"),
+    )
 
 
 class HostRetryableConnectionError(Exception):
@@ -4657,14 +4695,30 @@ class HostProcess:
         :param raw: The raw text frame received off the socket.
         :returns: None.
         """
+        started_at = time.monotonic()
         try:
             await self._handle_raw_message(ws, raw)
         except ConnectionClosed:
             # The tunnel died while this frame was in flight; the reconnect
             # loop owns recovery.
             _logger.debug("dropped frame result: tunnel closed mid-handling")
-        except Exception:
-            _logger.exception("host frame handler failed")
+        except Exception as exc:
+            failure_context = _host_frame_failure_context(raw)
+            with runner_log_scope(failure_context.session_id, failure_context.runner_id):
+                # Rebind the frame's IDs after the dispatch scope has unwound.
+                _logger.exception(
+                    "host frame handler failed",
+                    extra=debug_event(
+                        "host_frame_handler_failed",
+                        session_id=failure_context.session_id,
+                        host_id=getattr(getattr(self, "_identity", None), "host_id", None),
+                        request_id=failure_context.request_id,
+                        frame_kind=failure_context.frame_kind,
+                        runner_id=failure_context.runner_id,
+                        error_type=type(exc).__name__,
+                        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                    ),
+                )
 
     async def _handle_raw_message(
         self, ws: websockets.asyncio.client.ClientConnection, raw: str
