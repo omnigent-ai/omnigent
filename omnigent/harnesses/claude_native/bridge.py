@@ -813,6 +813,10 @@ class ClaudeTranscriptItem:
         must correlate it by text without draining unrelated pending input.
     :param failure_context: Explicit API-error evidence for diagnostic logging;
         kept outside model-visible conversation content.
+    :param command_message: For a ``slash_command`` item, the name the person
+        typed when it differs from the recorded ``name`` (a plugin skill is
+        recorded as ``plugin:skill`` but typed ``skill``); lets the server match
+        the command to the message the web composer queued.
     """
 
     source_id: str
@@ -824,6 +828,7 @@ class ClaudeTranscriptItem:
     subagent_return_id: str | None = None
     agent_message_candidate: bool = False
     failure_context: FailureContext | None = None
+    command_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -7945,6 +7950,7 @@ def _attachment_transcript_items_from_entry(
 # hid Skills; we keep the broad scaffolding filter and just
 # selectively re-surface the Skill case.
 _COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
+_COMMAND_MESSAGE_RE = re.compile(r"<command-message>(.*?)</command-message>", re.DOTALL)
 _COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
 _COMMAND_STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL)
 _BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
@@ -8256,11 +8262,14 @@ class _SlashCommandPayload:
         ``"dev-productivity:simplify"``.
     :param arguments: Verbatim ``<command-args>`` text; empty when none.
     :param output: Verbatim ``<local-command-stdout>`` text, or ``None``.
+    :param message: The ``<command-message>`` name, which is what the person
+        typed (``"simplify"``), or ``None`` when the record has none.
     """
 
     name: str
     arguments: str
     output: str | None
+    message: str | None = None
 
 
 def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
@@ -8290,7 +8299,46 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     arguments = args_match.group(1).strip() if args_match else ""
     stdout_match = _COMMAND_STDOUT_RE.search(content)
     output = stdout_match.group(1) if stdout_match else None
-    return _SlashCommandPayload(name=name, arguments=arguments, output=output)
+    message_match = _COMMAND_MESSAGE_RE.search(content)
+    message = message_match.group(1).strip().lstrip("/") if message_match else ""
+    return _SlashCommandPayload(
+        name=name, arguments=arguments, output=output, message=message or None
+    )
+
+
+def _slash_command_item(
+    payload: _SlashCommandPayload,
+    *,
+    agent_name: str,
+    source_key: str,
+    response_id: str,
+) -> ClaudeTranscriptItem:
+    """
+    Build the ``slash_command`` item for a parsed command record.
+
+    :param payload: The parsed command, e.g. the record for ``/model sonnet``.
+    :param agent_name: Agent/model name the web UI attributes the invocation to.
+    :param source_key: Base transcript record key used to construct the source id.
+    :param response_id: Response id the item is grouped under.
+    :returns: The item; ``command_message`` is set only when the person typed a
+        name other than the recorded one.
+    """
+    kind = "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill"
+    data: _JsonObject = {
+        "agent": agent_name,
+        "kind": kind,
+        "name": payload.name,
+        "arguments": payload.arguments,
+    }
+    if payload.output is not None:
+        data["output"] = payload.output
+    return ClaudeTranscriptItem(
+        source_id=_source_id(source_key, 0, "slash_command"),
+        item_type="slash_command",
+        data=data,
+        response_id=response_id,
+        command_message=payload.message if payload.message != payload.name else None,
+    )
 
 
 def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> bool:
@@ -8359,9 +8407,11 @@ def _local_command_transcript_items_from_entry(
     Newer Claude Code builds can record shell-mode ``!cmd`` activity
     as top-level transcript records with ``subtype="local_command"``
     and a string ``content`` field instead of wrapping the same markup
-    inside ``message.role=user``. Only ``<bash-*>`` records are
-    conversation-visible here; slash-command local records are still
-    handled by hook/fork detection and otherwise ignored.
+    inside ``message.role=user``. The same shape carries a built-in
+    command's echo (``<command-name>/model</command-name>``), surfaced
+    like a user-record command so it settles the web message that typed
+    it; its stdout record (``<local-command-stdout>``) stays hidden
+    unless it is a ``/compact`` refusal.
 
     :param entry: Decoded Claude transcript record.
     :param line_number: One-based transcript line number.
@@ -8399,6 +8449,19 @@ def _local_command_transcript_items_from_entry(
                 },
                 response_id=current_response_id or _response_id_from_source(source_key),
                 is_compact_noop=True,
+            )
+        ]
+    if "<command-name>" in content:
+        payload = _parse_slash_command_record(content)
+        if payload is None or payload.name in _CLAUDE_CLI_DROPPED_COMMANDS:
+            return current_response_id, []
+        # A command run mid-turn must not split the turn it interrupted.
+        return current_response_id, [
+            _slash_command_item(
+                payload,
+                agent_name=agent_name,
+                source_key=source_key,
+                response_id=current_response_id or _response_id_from_source(source_key),
             )
         ]
     fallback_response_id = _response_id_from_source(source_key)
@@ -8587,20 +8650,11 @@ def _user_transcript_items_from_entry(
             # in the original bug.
             if payload is None or payload.name in _CLAUDE_CLI_DROPPED_COMMANDS:
                 return current_response_id, []
-            kind = "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill"
-            data: _JsonObject = {
-                "agent": agent_name,
-                "kind": kind,
-                "name": payload.name,
-                "arguments": payload.arguments,
-            }
-            if payload.output is not None:
-                data["output"] = payload.output
             items.append(
-                ClaudeTranscriptItem(
-                    source_id=_source_id(source_key, 0, "slash_command"),
-                    item_type="slash_command",
-                    data=data,
+                _slash_command_item(
+                    payload,
+                    agent_name=agent_name,
+                    source_key=source_key,
                     response_id=fallback_response_id,
                 )
             )

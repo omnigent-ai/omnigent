@@ -2917,6 +2917,192 @@ def test_read_transcript_items_since_surfaces_top_level_local_command(
     assert items[0].response_id.startswith("resp_claude_")
 
 
+def _local_command_record(uuid: str, content: str) -> str:
+    """One top-level ``system/local_command`` transcript line, shaped as Claude writes it."""
+    return json.dumps(
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "uuid": uuid,
+            "content": content,
+            "level": "info",
+            "isMeta": False,
+        }
+    )
+
+
+def _read_items(tmp_path: Path, lines: list[str]) -> list[Any]:
+    """Parse transcript *lines* through both readers, which must agree."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+    by_offset = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert by_offset.items == items
+    return items
+
+
+_MODEL_ECHO = (
+    "<command-name>/model</command-name>\n"
+    "            <command-message>model</command-message>\n"
+    "            <command-args>sonnet</command-args>"
+)
+
+
+def test_read_transcript_items_since_surfaces_a_local_command_echo(tmp_path: Path) -> None:
+    """
+    A built-in command's ``system/local_command`` echo is a ``slash_command`` item.
+
+    Newer Claude Code builds record ``/model`` like this instead of as a
+    ``role=user`` record. Dropping it left the web message that typed the
+    command queued forever, to be reported as "not delivered" at the next
+    message. Its stdout record stays hidden, as before.
+    """
+    items = _read_items(
+        tmp_path,
+        [
+            _local_command_record("model-echo", _MODEL_ECHO),
+            _local_command_record(
+                "model-stdout", "<local-command-stdout>Set model to sonnet</local-command-stdout>"
+            ),
+        ],
+    )
+
+    assert [item.item_type for item in items] == ["slash_command"]
+    assert items[0].data == {
+        "agent": "claude-native-ui",
+        "kind": "command",
+        "name": "model",
+        "arguments": "sonnet",
+    }
+    # The person typed the recorded name, so there is nothing extra to transport.
+    assert items[0].command_message is None
+
+
+@pytest.mark.parametrize(
+    ("echo", "expected_name", "expected_kind"),
+    [
+        pytest.param(
+            "<command-name>/rename</command-name>\n<command-message>rename</command-message>\n"
+            "<command-args>my title</command-args>",
+            "rename",
+            "skill",
+            id="unlisted-name-is-shown-like-a-skill",
+        ),
+        pytest.param(
+            "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n"
+            "<command-args>high</command-args>",
+            "effort",
+            "command",
+            id="surfaced-builtin",
+        ),
+    ],
+)
+def test_local_command_echo_kind_follows_the_user_record_rules(
+    tmp_path: Path, echo: str, expected_name: str, expected_kind: str
+) -> None:
+    """A local echo is classified exactly like the same command's ``role=user`` record."""
+    (item,) = _read_items(tmp_path, [_local_command_record("echo", echo)])
+
+    assert (item.data["name"], item.data["kind"]) == (expected_name, expected_kind)
+
+
+def test_local_command_echo_of_a_hidden_builtin_is_dropped(tmp_path: Path) -> None:
+    """``/help`` and friends stay out of the chat whichever record shape carries them."""
+    items = _read_items(
+        tmp_path,
+        [
+            _local_command_record(
+                "help-echo",
+                "<command-name>/help</command-name>\n<command-message>help</command-message>\n"
+                "<command-args></command-args>",
+            )
+        ],
+    )
+
+    assert items == []
+
+
+def test_local_command_echo_mid_turn_does_not_split_the_turn(tmp_path: Path) -> None:
+    """A command run while Claude is answering joins that turn and leaves its id alone."""
+    items = _read_items(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": "before",
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": "One"}]},
+                }
+            ),
+            _local_command_record("model-echo", _MODEL_ECHO),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": "after",
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": "Two"}]},
+                }
+            ),
+        ],
+    )
+
+    assert [item.item_type for item in items] == ["message", "slash_command", "message"]
+    assert len({item.response_id for item in items}) == 1
+
+
+def test_local_command_compact_echo_and_refusal_render_one_bubble(tmp_path: Path) -> None:
+    """The ``/compact`` echo in the new shape is still folded into its refusal."""
+    items = _read_items(
+        tmp_path,
+        [
+            _local_command_record(
+                "compact-echo",
+                "<command-name>/compact</command-name>\n"
+                "<command-message>compact</command-message>\n<command-args></command-args>",
+            ),
+            _local_command_record(
+                "compact-stdout",
+                "<local-command-stdout>Not enough messages to compact.</local-command-stdout>",
+            ),
+        ],
+    )
+
+    assert [item.item_type for item in items] == ["slash_command"]
+    assert items[0].is_compact_noop is True
+    assert items[0].data["output"] == "Not enough messages to compact."
+
+
+def test_plugin_skill_keeps_the_name_the_person_typed(tmp_path: Path) -> None:
+    """A plugin skill is recorded as ``plugin:skill``; the typed name travels beside it."""
+    (item,) = _read_items(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "slash-skill",
+                    "message": {
+                        "role": "user",
+                        "content": (
+                            "<command-name>/dev-productivity:simplify</command-name>\n"
+                            "            <command-message>simplify</command-message>\n"
+                            "            <command-args>the diff</command-args>"
+                        ),
+                    },
+                }
+            )
+        ],
+    )
+
+    assert item.data["name"] == "dev-productivity:simplify"
+    assert item.command_message == "simplify"
+    # The persisted item data is unchanged: the typed name is transport only.
+    assert "command_message" not in item.data
+
+
 def test_read_transcript_items_since_surfaces_combined_shell_record(
     tmp_path: Path,
 ) -> None:

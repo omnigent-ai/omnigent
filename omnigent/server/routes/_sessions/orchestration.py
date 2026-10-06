@@ -2732,6 +2732,50 @@ def _shell_command_input(item: NewConversationItem) -> str | None:
     return None
 
 
+def _slash_command_spellings(data: SlashCommandData, typed_name: object) -> list[str]:
+    """
+    List the queue texts a mirrored slash command may have been typed as.
+
+    Claude records a plugin skill under its qualified name (``plugin:skill``)
+    while the person typed the bare one, and keeps that in ``<command-message>``.
+
+    :param data: The mirrored command, e.g. name ``"dev-productivity:simplify"``
+        with arguments ``"the diff"``.
+    :param typed_name: The transported ``<command-message>`` name, or anything
+        else when the forwarder sent none.
+    :returns: The recorded spelling first, then each name behind a qualifier and
+        the typed name, e.g. ``["/dev-productivity:simplify the diff",
+        "/simplify the diff"]``.
+    """
+    names = [data.name]
+    unqualified = data.name
+    while ":" in unqualified:
+        unqualified = unqualified.split(":", 1)[1]
+        names.append(unqualified)
+    if isinstance(typed_name, str):
+        names.append(typed_name.strip().lstrip("/"))
+    return list(dict.fromkeys(f"/{name} {data.arguments}".strip() for name in names if name))
+
+
+def _match_queued_slash_command(
+    session_id: str, data: SlashCommandData, typed_name: object
+) -> pending_inputs.MatchedDrain:
+    """
+    Hold the queued entry a mirrored slash command came from, if any spelling matches.
+
+    :param session_id: Session/conversation identifier.
+    :param data: The mirrored command.
+    :param typed_name: The transported ``<command-message>`` name, if any.
+    :returns: The first spelling's match, or an empty result when none matches.
+    """
+    matched = pending_inputs.MatchedDrain(matched=None, skipped=[])
+    for command_line in _slash_command_spellings(data, typed_name):
+        matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+        if matched.matched is not None:
+            break
+    return matched
+
+
 def _drains_pending_inputs(item: NewConversationItem) -> bool:
     """
     Whether a mirrored item settles a queued web message.
@@ -2973,12 +3017,19 @@ async def _persist_external_conversation_item_unlocked(
         # A command typed in the web composer was queued as plain text but comes
         # back as a slash_command item. Drain its own entry so it is not later
         # mistaken for a lost message; older entries stay in place.
-        command_line = f"/{item.data.name} {item.data.arguments}".strip()
-        matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+        matched = _match_queued_slash_command(
+            session_id, item.data, body.data.get("command_message")
+        )
         drained = matched.matched
+        held_older = [*matched.skipped, *matched.uncertain, *matched.accepted]
+        if drained is None:
+            # Recorded under a name none of the spellings cover: the oldest queued
+            # command is the best guess, and any other entry may be its owner.
+            drained = pending_inputs.resolve_oldest(session_id, hold=True, slash_command=True)
+            if drained is not None:
+                pending_inputs.mark_uncertain(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
-        held_older = [*matched.skipped, *matched.uncertain, *matched.accepted]
     elif shell_command is not None:
         # Drain only the matching shell entry; restore older entries.
         matched = pending_inputs.resolve_matching_text(

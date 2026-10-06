@@ -57,6 +57,37 @@ async def test_handback_provenance_is_transported_outside_message_content(candid
     assert forwarder._external_conversation_item_event(item) == captured[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed", ["simplify", None])
+async def test_typed_command_name_is_transported_outside_item_data(typed: str | None) -> None:
+    """The name the person typed rides beside the slash item, never inside its data."""
+    captured: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(202)
+
+    item = ClaudeTranscriptItem(
+        source_id="native-skill",
+        item_type="slash_command",
+        data={
+            "agent": "claude-native-ui",
+            "kind": "skill",
+            "name": "dev-productivity:simplify",
+            "arguments": "",
+        },
+        response_id="skill-turn",
+        command_message=typed,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await forwarder._post_external_conversation_item(client, session_id="parent", item=item)
+    assert captured[0]["data"].get("command_message") == typed
+    assert "command_message" not in captured[0]["data"]["item_data"]
+    assert forwarder._external_conversation_item_event(item) == captured[0]
+
+
 class _CountingAuth(httpx.Auth):
     """
     Test httpx Auth that mints a unique bearer per request.

@@ -5266,6 +5266,322 @@ async def test_claude_native_mirrored_slash_command_drains_its_queued_entry() ->
         pending_inputs.reset_for_tests()
 
 
+def _slash_mirror(
+    name: str, arguments: str, source_id: str, command_message: str | None = None
+) -> SessionEventInput:
+    """A ``slash_command`` item the transcript mirrored back, with the typed name if sent."""
+    event = _mirror_event(
+        "slash_command",
+        {"agent": "claude-native-ui", "kind": "skill", "name": name, "arguments": arguments},
+        source_id,
+    )
+    if command_message is not None:
+        event.data["command_message"] = command_message
+    return event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("queued", "name", "arguments", "command_message"),
+    [
+        pytest.param(
+            "/simplify the diff",
+            "dev-productivity:simplify",
+            "the diff",
+            None,
+            id="bare-name-behind-a-plugin-qualifier",
+        ),
+        pytest.param(
+            "/dev-productivity:simplify the diff",
+            "dev-productivity:simplify",
+            "the diff",
+            "simplify",
+            id="qualified-name-as-recorded",
+        ),
+        pytest.param(
+            "/do now",
+            "my-plugin:do-thing",
+            "now",
+            "do",
+            id="typed-name-from-command-message",
+        ),
+        pytest.param(
+            "/simplify",
+            "team:tools:simplify",
+            "",
+            None,
+            id="nested-qualifiers",
+        ),
+    ],
+)
+async def test_claude_native_slash_command_recorded_under_another_spelling_drains_its_entry(
+    queued: str, name: str, arguments: str, command_message: str | None
+) -> None:
+    """A command typed as ``/simplify`` is recorded as ``plugin:simplify`` and still drains.
+
+    Matching only the recorded spelling left the entry queued, so the next
+    ordinary message skipped it and persisted a false "not delivered" error for a
+    command Claude ran. The entry is found by its spelling, not by position: an
+    older queued command and an older plain message are left in place.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    older_command = pending_inputs.record(sid, [{"type": "input_text", "text": "/other-command"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": queued}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _slash_mirror(name, arguments, "claude:skill:0", command_message),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            older,
+            older_command,
+        ]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_unmatched_slash_command_drains_the_oldest_queued_command() -> None:
+    """A command recorded under a name no spelling covers takes the oldest queued command.
+
+    The person's command was mirrored, but not as anything typed. Leaving every
+    entry queued would later brand it undelivered, so the oldest queued command
+    is drained by position; a plain message in front of it is not a candidate,
+    and whatever stays queued can no longer be declared undelivered, since any
+    of it may have been the command.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    plain = pending_inputs.record(sid, [{"type": "input_text", "text": "plain on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "/alias-typed"}])
+    other_command = pending_inputs.record(sid, [{"type": "input_text", "text": "/other"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "final"}])
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                _slash_mirror("some-real-name", "", "claude:alias:0"),
+                store,  # type: ignore[arg-type]
+            )
+            assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)][:2] == [
+                plain,
+                other_command,
+            ]
+
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                _user_mirror("final", "claude:final:0"),
+                store,  # type: ignore[arg-type]
+            )
+
+        # The entries left behind are drained without an error: uncertain, not lost.
+        assert [item.type for item in store.appended_items] == ["slash_command", "message"]
+        assert pending_inputs.snapshot_for(sid) == []
+        assert not [row for row in rows if row["event_name"] == "native_pending_input_skipped"]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_slash_command_nobody_typed_leaves_the_queue_alone() -> None:
+    """A command run from the model picker or the terminal takes no web message's place.
+
+    With only plain messages queued, nothing can have produced the mirror, so the
+    oldest message keeps its entry and still matches its own mirror by text.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    plain = pending_inputs.record(sid, [{"type": "input_text", "text": "hello"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _slash_mirror("model", "opus", "claude:picker-model:0"),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [plain]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_slash_command_hands_back_the_uncertain_entries_it_jumps_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older entry a positional drain made uncertain stays in play after a command.
+
+    Like a shell command, a slash command drains only its own entry. The older
+    uncertain one it jumps over must be handed back; left held, no later mirror
+    could match it and its message would persist without a receipt.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    first = pending_inputs.record(sid, [{"type": "input_text", "text": "reformatted by the TUI"}])
+    second = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "/model sonnet"}])
+    positional = pending_inputs.resolve_oldest(sid, hold=True)
+    assert positional is not None and positional.pending_id == first
+    pending_inputs.mark_uncertain(sid)
+    pending_inputs.release(sid, positional)
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _slash_mirror("model", "sonnet", "claude:model:0"),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [second]
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _user_mirror("still on its way", "claude:still-on-its-way:0"),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command", "message"]
+        assert _consumed_receipts(published) == [second]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("queued", "record"),
+    [
+        pytest.param(
+            "/model sonnet",
+            {
+                "type": "system",
+                "subtype": "local_command",
+                "uuid": "command-record",
+                "isMeta": False,
+                "content": (
+                    "<command-name>/model</command-name>\n"
+                    "            <command-message>model</command-message>\n"
+                    "            <command-args>sonnet</command-args>"
+                ),
+            },
+            id="local-command-echo",
+        ),
+        pytest.param(
+            "/simplify",
+            {
+                "type": "user",
+                "uuid": "command-record",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<command-name>/dev-productivity:simplify</command-name>\n"
+                        "            <command-message>simplify</command-message>\n"
+                        "            <command-args></command-args>"
+                    ),
+                },
+            },
+            id="plugin-skill",
+        ),
+    ],
+)
+async def test_claude_native_message_after_a_transcript_command_reports_no_lost_input(
+    tmp_path: Path, queued: str, record: dict[str, Any]
+) -> None:
+    """A command the person typed in the web composer leaves no false error behind it.
+
+    Runs the real transcript record through the bridge parser, the forwarder's
+    event body and the server's persist path, then mirrors an ordinary message:
+    the command's entry must already be settled, so nothing is skipped.
+    """
+    import json
+
+    from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+    from omnigent.harnesses.claude_native.forwarder import _external_conversation_item_event
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="claude-native-ui"
+    )
+    assert len(items) == 1
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(sid, [{"type": "input_text", "text": queued}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "thanks"}])
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                SessionEventInput.model_validate(_external_conversation_item_event(items[0])),
+                store,  # type: ignore[arg-type]
+            )
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                _user_mirror("thanks", "claude:thanks:0"),
+                store,  # type: ignore[arg-type]
+            )
+
+        assert [item.type for item in store.appended_items] == ["slash_command", "message"]
+        assert pending_inputs.snapshot_for(sid) == []
+        assert not [row for row in rows if row["event_name"] == "native_pending_input_skipped"]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 def _mirror_event(item_type: str, item_data: dict[str, Any], source_id: str) -> SessionEventInput:
     """Build the ``external_conversation_item`` event a transcript forwarder posts."""
     return SessionEventInput(

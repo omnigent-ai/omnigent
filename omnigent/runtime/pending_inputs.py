@@ -441,7 +441,9 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         return _drained_input(entry) if entry is not None else None
 
 
-def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
+def resolve_oldest(
+    conversation_id: str, *, hold: bool = False, slash_command: bool = False
+) -> DrainedInput | None:
     """
     Drain the oldest pending entry (FIFO) and return it.
 
@@ -464,6 +466,9 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
     :param hold: Keep the entry in place, marked held, instead of removing it;
         the caller settles it with :func:`release` once the persist landed or
         :func:`restore` if it did not. Entries already held are skipped.
+    :param slash_command: Consider only entries typed as a slash command (text
+        starting with ``/``), for a mirrored command whose spelling matched no
+        entry: a plain message can never have produced it.
     :returns: The drained :class:`DrainedInput`, or ``None`` when no
         entry was pending.
     """
@@ -472,8 +477,15 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
         entries = _pending.get(conversation_id)
         if entries is None:
             return None
-        # Insertion order = FIFO; the first unheld key is the oldest entry.
-        oldest_id = next((pid for pid, entry in entries.items() if not entry.held), None)
+        # Insertion order = FIFO; the first eligible key is the oldest entry.
+        oldest_id = next(
+            (
+                pid
+                for pid, entry in entries.items()
+                if not entry.held and (not slash_command or _is_slash_command_entry(entry))
+            ),
+            None,
+        )
         if oldest_id is None:
             return None
         entry = entries[oldest_id]
@@ -801,6 +813,11 @@ def _content_text(content: list[dict[str, Any]]) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "\n".join(parts)
+
+
+def _is_slash_command_entry(entry: _Entry) -> bool:
+    """Whether a queued message was typed as a slash command."""
+    return _collapse_whitespace(_content_text(entry.content)).startswith("/")
 
 
 def _first_match(texts: list[str], needle: str) -> int | None:

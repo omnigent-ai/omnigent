@@ -915,3 +915,30 @@ def test_restore_of_a_gone_entry_keeps_the_accepted_flag() -> None:
 
     restored = pending_inputs.resolve_oldest("conv_a")
     assert restored is not None and restored.accepted is True
+
+
+def test_resolve_oldest_slash_command_skips_messages_that_were_not_commands() -> None:
+    """A mirrored command can only belong to an entry typed as one, however old the others."""
+    plain = pending_inputs.record("conv_a", [_text_block("hello")])
+    command = pending_inputs.record("conv_a", [_text_block("  /simplify   the diff")])
+    later = pending_inputs.record("conv_a", [_text_block("/model opus")])
+
+    drained = pending_inputs.resolve_oldest("conv_a", hold=True, slash_command=True)
+
+    assert drained is not None and drained.pending_id == command
+    pending_inputs.release("conv_a", drained)
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [
+        plain,
+        later,
+    ]
+
+
+def test_resolve_oldest_slash_command_drains_nothing_without_a_queued_command() -> None:
+    """A command run from the picker or typed in the TUI must not take a plain message."""
+    plain = pending_inputs.record("conv_a", [_text_block("hello")])
+
+    assert pending_inputs.resolve_oldest("conv_a", slash_command=True) is None
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [plain]
+    # Without the option the oldest entry is still the oldest entry.
+    drained = pending_inputs.resolve_oldest("conv_a")
+    assert drained is not None and drained.pending_id == plain
