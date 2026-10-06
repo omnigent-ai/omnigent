@@ -84,6 +84,13 @@ _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 # text beyond this moves to an attachment file, with headroom to spare.
 _MAX_INLINE_TEXT_CHARS = 900_000
 
+# Error code for input Codex will not take, from either Omnigent's own checks
+# or Codex's rejection.
+_INPUT_TOO_LARGE_CODE = "input_too_large"
+
+# Error code for a request Codex refused with a JSON-RPC error response.
+_TURN_REJECTED_CODE = "codex_turn_rejected"
+
 
 async def _wait_for_bridge_state(
     bridge_dir: Path,
@@ -495,10 +502,16 @@ class CodexNativeExecutor(Executor):
         goal_objective = goal_objective_from_content(latest_user_content)
         if goal_objective is not None:
             # Reject over-long objectives here so the app-server's raw
-            # JSON-RPC -32600 error never reaches the user.
+            # JSON-RPC -32600 error never reaches the user. Nothing was sent,
+            # so the queued message settles instead of lingering.
             length_error = goal_objective_length_error(goal_objective)
             if length_error is not None:
-                yield ExecutorError(message=length_error)
+                yield ExecutorError(
+                    message=length_error,
+                    code=_INPUT_TOO_LARGE_CODE,
+                    title="Goal is too long for Codex",
+                    undelivered=True,
+                )
                 return
         input_items: list[dict[str, object]] = (
             [{"type": "text", "text": goal_objective}]
@@ -646,6 +659,12 @@ class CodexNativeExecutor(Executor):
                             ),
                         )
                         error_msg = f"Codex native executor error: {exc}"
+                        if isinstance(exc, CodexAppServerResponseError):
+                            # A JSON-RPC error response means Codex refused the request, so
+                            # the turn never started; a timeout or dropped connection can't.
+                            startup_failure = _rejected_request_failure(exc)
+                            error_msg = startup_failure.message
+                            undelivered = True
                         # Name the servers a still-unsettled MCP startup is
                         # blocked on — the most common cause of an injection
                         # failure this early in the session's life.
@@ -662,11 +681,44 @@ class CodexNativeExecutor(Executor):
                 title=startup_failure.title if startup_failure is not None else None,
                 remediation=startup_failure.remediation if startup_failure is not None else None,
                 # A failure once the app-server was asked to start the turn is
-                # ambiguous: Codex may have accepted the message.
+                # ambiguous (Codex may have accepted the message) unless it refused it.
                 undelivered=undelivered,
             )
         else:
             yield TurnComplete(response=None)
+
+
+def _rejected_request_failure(error: CodexAppServerResponseError) -> CodexStartupFailure:
+    """
+    Describe a request Codex refused with a JSON-RPC error response.
+
+    :param error: The structured error Codex answered with. For oversized input
+        its data names the limit, e.g. ``{"input_error_code": "input_too_large",
+        "max_chars": 1048576, "actual_chars": 1309439}``.
+    :returns: A coded failure. ``input_too_large`` states the limit when Codex
+        reports it; any other refusal keeps Codex's error text.
+    """
+    data = error.error.get("data") if isinstance(error.error, dict) else None
+    if isinstance(data, dict) and data.get("input_error_code") == _INPUT_TOO_LARGE_CODE:
+        max_chars = data.get("max_chars")
+        actual_chars = data.get("actual_chars")
+        detail = (
+            f"This message has {actual_chars:,} characters of text; Codex accepts at most "
+            f"{max_chars:,} per message, so it was not sent."
+            if isinstance(max_chars, int) and isinstance(actual_chars, int)
+            else "This message is longer than Codex accepts, so it was not sent."
+        )
+        return CodexStartupFailure(
+            message=detail,
+            code=_INPUT_TOO_LARGE_CODE,
+            title="Message too long for Codex",
+            remediation="Shorten the message, or send it in smaller parts.",
+        )
+    return CodexStartupFailure(
+        message=f"Codex native executor error: {error}",
+        code=_TURN_REJECTED_CODE,
+        title="Codex rejected this message",
+    )
 
 
 def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:

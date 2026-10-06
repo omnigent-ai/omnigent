@@ -288,6 +288,50 @@ def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
     assert "Codex native executor error" not in message
     # The doomed objective never reaches the app-server.
     assert _FakeCodexNativeClient.requests == []
+    # A coded input error, and the message never reached Codex, so the sender's
+    # queued copy settles instead of lingering as a "not delivered" error.
+    assert events[0].code == "input_too_large"
+    assert events[0].title == "Goal is too long for Codex"
+    assert events[0].undelivered is True
+
+
+async def test_overlong_goal_reaches_the_turn_error_as_an_undelivered_input_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Through the harness adapter, an over-long ``/goal`` fails with a coded detail.
+
+    Uncoded, the adapter wraps the error in a bare ``RuntimeError`` and drops the
+    undelivered flag the server settles the queued message on.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: CodexNativeExecutor(bridge_dir=tmp_path))
+    ctx = TurnContext(
+        response_id="resp_goal", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(InnerExecutorError) as raised:
+        await adapter.run_turn(
+            CreateResponseRequest(model="test-agent", input="/goal " + "x" * 14_563), ctx
+        )
+    await adapter.on_shutdown()
+
+    detail = adapter._build_error_detail(raised.value)
+    assert detail.code == "input_too_large"
+    assert detail.undelivered is True
+    assert "14563 characters" in detail.message
+    assert "4000" in detail.message
+    assert _FakeCodexNativeClient.requests == []
 
 
 def test_goal_command_at_the_exact_codex_cap_is_sent(
@@ -1258,6 +1302,8 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     events = _collect_turn_events(executor, "do not duplicate")
 
     assert [type(event) for event in events] == [ExecutorError]
+    # Only an explicit JSON-RPC refusal proves the steer was not applied.
+    assert events[0].undelivered is isinstance(error, CodexAppServerResponseError)
     assert [method for method, _params in _FailingSteerClient.requests] == ["turn/steer"]
     state = read_bridge_state(tmp_path)
     assert state is not None
@@ -2083,6 +2129,222 @@ def test_run_turn_error_after_submit_is_not_marked_undelivered(
     assert failure.code is None
     assert failure.message.startswith("Codex native executor error:")
     assert [method for method, _params in _ResetAfterSubmitClient.requests] == ["turn/start"]
+
+
+# What Codex 0.145 answers when a turn's text exceeds its 1,048,576 character limit.
+_INPUT_TOO_LARGE_ERROR = {
+    "code": -32602,
+    "data": {
+        "input_error_code": "input_too_large",
+        "max_chars": 1048576,
+        "actual_chars": 1309439,
+    },
+    "message": "Input exceeds the maximum length of 1048576 characters.",
+}
+
+
+def _install_failing_client(
+    monkeypatch: pytest.MonkeyPatch, *, method: str, error: Exception
+) -> type[_FakeCodexNativeClient]:
+    """
+    Patch in a fake app-server client that fails one JSON-RPC method.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param method: JSON-RPC method to fail, e.g. ``"turn/start"``.
+    :param error: Exception that method raises.
+    :returns: The client class, so a test can read the requests it recorded.
+    """
+
+    class _FailingClient(_FakeCodexNativeClient):
+        """Raise ``error`` for ``method``; behave as the base fake otherwise."""
+
+        async def request(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
+            """
+            Record the request, then fail it when it is the targeted method.
+
+            :param name: JSON-RPC method, e.g. ``"turn/start"``.
+            :param params: JSON-RPC params.
+            :returns: Codex-shaped response payload for other methods.
+            """
+            if name == method:
+                type(self).requests.append((name, params))
+                raise error
+            return await super().request(name, params)
+
+    _FailingClient.requests = []
+    _FailingClient.created = []
+    _FailingClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _FailingClient
+    )
+    return _FailingClient
+
+
+def test_rejected_turn_start_is_reported_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A JSON-RPC error on ``turn/start`` proves Codex never started the turn.
+
+    The message is flagged undelivered, with a code so the harness adapter keeps
+    the flag, and the server settles the sender's queued copy once instead of
+    leaving it to resurface as a false "not recorded" error at the next message.
+    """
+    client = _install_failing_client(
+        monkeypatch,
+        method="turn/start",
+        error=CodexAppServerResponseError(
+            {"code": -32600, "message": "thread not found: thread_123"}
+        ),
+    )
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.code == "codex_turn_rejected"
+    assert failure.title == "Codex rejected this message"
+    assert failure.message.startswith("Codex native executor error:")
+    assert "thread not found" in failure.message
+    assert [method for method, _params in client.requests] == ["turn/start"]
+
+
+def test_input_too_large_rejection_is_a_clear_coded_undelivered_input_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex's own size rejection reads as a limit, not as the raw JSON-RPC payload."""
+    _install_failing_client(
+        monkeypatch,
+        method="turn/start",
+        error=CodexAppServerResponseError(_INPUT_TOO_LARGE_ERROR),
+    )
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, ExecutorError)
+    assert failure.code == "input_too_large"
+    assert failure.undelivered is True
+    assert failure.title == "Message too long for Codex"
+    assert "1,309,439" in failure.message
+    assert "1,048,576" in failure.message
+    assert "-32602" not in failure.message
+    assert failure.remediation is not None
+
+
+def test_input_too_large_rejection_without_numbers_still_reads_clearly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A rejection that names no limit still gets the coded, undelivered input error."""
+    _install_failing_client(
+        monkeypatch,
+        method="turn/start",
+        error=CodexAppServerResponseError(
+            {"code": -32602, "data": {"input_error_code": "input_too_large"}, "message": "too big"}
+        ),
+    )
+    _start_state(tmp_path)
+
+    failure = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")[0]
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.code == "input_too_large"
+    assert failure.undelivered is True
+    assert "longer than Codex accepts" in failure.message
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(TimeoutError("turn/start timed out"), id="timeout"),
+        pytest.param(
+            ConnectionError("Codex app-server disconnected before responding to turn/start"),
+            id="disconnected",
+        ),
+        pytest.param(ConnectionClosedError(None, None), id="websocket-closed"),
+    ],
+)
+def test_ambiguous_turn_start_failures_are_not_marked_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    """
+    A timeout or dropped connection leaves it unknown whether Codex started the turn.
+
+    Settling the message as undelivered would show it as failed and let the
+    sender re-send it while Codex may already be working on it.
+    """
+    client = _install_failing_client(monkeypatch, method="turn/start", error=error)
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is False
+    assert failure.code is None
+    assert failure.message.startswith("Codex native executor error:")
+    assert [method for method, _params in client.requests] == ["turn/start"]
+
+
+def test_rejected_goal_request_is_reported_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex refusing ``thread/goal/set`` delivers nothing, and no turn is started."""
+    client = _install_failing_client(
+        monkeypatch,
+        method="thread/goal/set",
+        error=CodexAppServerResponseError({"code": -32600, "message": "goals are disabled"}),
+    )
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "/goal Finish it")
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.code == "codex_turn_rejected"
+    assert [method for method, _params in client.requests] == ["thread/goal/set"]
+
+
+async def test_rejected_turn_start_reaches_the_turn_error_as_an_undelivered_coded_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Through the harness adapter, a refused ``turn/start`` keeps its undelivered flag.
+
+    The adapter drops the flag from an uncoded error, so the code is what lets
+    the server settle the sender's queued message on the failed response.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    _install_failing_client(
+        monkeypatch,
+        method="turn/start",
+        error=CodexAppServerResponseError(_INPUT_TOO_LARGE_ERROR),
+    )
+    _start_state(tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: CodexNativeExecutor(bridge_dir=tmp_path))
+    ctx = TurnContext(
+        response_id="resp_rejected", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(InnerExecutorError) as raised:
+        await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+    await adapter.on_shutdown()
+
+    detail = adapter._build_error_detail(raised.value)
+    assert detail.code == "input_too_large"
+    assert detail.undelivered is True
+    assert "1,048,576" in detail.message
 
 
 def test_run_turn_leaves_non_connection_connect_failures_unclassified(
