@@ -21,7 +21,7 @@ Enumeration is deterministic per provider kind:
   ``"openai-compatible"``).
 - ``subscription`` → live CLI discovery for Cursor; curated static aliases for
   CLIs without a listing API (source ``"static"``, ``verified: false``).
-- ``cli-config`` → native Claude's shared probe catalog (source ``"cli"``)
+- ``cli-config`` → native Claude/Codex shared probe catalogs (source ``"cli"``)
   when available, otherwise an empty static listing. Credentials are
   resolved by the CLI at launch.
 - anything unresolvable → source ``"none"`` with an explanatory note,
@@ -251,6 +251,7 @@ class ResolvedModelProvider:
     :param cli: ``"claude"`` / ``"codex"`` / ``"cursor-agent"`` for
         ``kind="subscription"``; ``"claude"`` / ``"codex"`` for
         ``kind="cli-config"``.
+    :param model_provider: Codex config.toml provider id for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
     """
@@ -262,6 +263,7 @@ class ResolvedModelProvider:
     api_key: str | None = None
     auth_command: str | None = None
     cli: str | None = None
+    model_provider: str | None = None
     detail: str = ""
 
 
@@ -1046,6 +1048,7 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
         return ResolvedModelProvider(
             kind=CLI_CONFIG_KIND,
             cli=entry.cli,
+            model_provider=entry.model_provider,
             detail=(
                 f"provider {entry.name!r} (codex config.toml model provider "
                 f"{entry.model_provider!r})"
@@ -1454,21 +1457,37 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
 def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
     """Read a CLI-owned catalog, or report that it has not been probed yet.
 
-    Managed Claude gateways share the native launch catalog. Other CLI
-    configurations expose no listing before launch; credentials remain
-    the CLI's responsibility.
+    Claude managed gateways and Codex config.toml providers share their
+    native launch catalogs. Credentials remain the CLI's responsibility.
 
     :param provider: A ``kind="cli-config"`` provider descriptor.
     :returns: A probe-backed listing when cached, else an empty static listing.
     """
+    from omnigent.models import model_catalog_store
+
+    probe: tuple[str, str, str] | None = None
     if provider.cli == "claude":
         from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
-        from omnigent.models import model_catalog_store
 
-        fingerprint = claude_catalog_fingerprint(None)
-        rows = model_catalog_store.read_catalog("claude-native", fingerprint)
+        probe = ("claude-native", claude_catalog_fingerprint(None), "Claude Code")
+    elif provider.cli == "codex" and provider.model_provider:
+        from omnigent.harnesses.codex_native.app_server import (
+            NativeCodexLaunch,
+            codex_catalog_fingerprint,
+        )
+
+        # Pin the worker's selected provider rather than resolving the ambient default.
+        launch = NativeCodexLaunch(
+            config_overrides=[f"model_provider={json.dumps(provider.model_provider)}"],
+            model=None,
+            profile=None,
+        )
+        probe = ("codex-native", codex_catalog_fingerprint(launch), "Codex")
+    if probe is not None:
+        harness, fingerprint, label = probe
+        rows = model_catalog_store.read_catalog(harness, fingerprint)
         if rows is not None:
-            stale = model_catalog_store.catalog_is_stale("claude-native", fingerprint)
+            stale = model_catalog_store.catalog_is_stale(harness, fingerprint)
             model_ids = dict.fromkeys(str(row.get("model") or row["id"]) for row in rows)
             return ModelListing(
                 source="cli",
@@ -1478,9 +1497,9 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
                     for model_id in model_ids
                 ),
                 note=(
-                    "cached Claude Code model probe; catalog needs refreshing"
+                    f"cached {label} model probe; catalog needs refreshing"
                     if stale
-                    else "models advertised by the Claude Code model probe"
+                    else f"models advertised by the {label} model probe"
                 ),
             )
     return ModelListing(

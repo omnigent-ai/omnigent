@@ -1177,6 +1177,75 @@ def test_subscription_listing_is_static_and_unverified(
     assert "static_fallback" not in payload
 
 
+@pytest.mark.parametrize("cache_state", ["fresh", "stale", "empty", "missing"])
+@pytest.mark.parametrize("explicit", [False, True], ids=["default-provider", "spec-provider"])
+def test_codex_cli_config_uses_native_catalog(
+    cache_state: str, explicit: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Discovery uses the selected worker's cached wire IDs, not another provider's."""
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.models import model_catalog_store
+
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  ambient:\n    kind: cli-config\n    cli: codex\n"
+        f"    model_provider: Ambient\n    default: {str(explicit).lower()}\n"
+        "  codex-gateway:\n    kind: cli-config\n    cli: codex\n"
+        f"    model_provider: Databricks\n    default: {str(not explicit).lower()}\n",
+    )
+    source = tmp_path / "codex-source"
+    source.mkdir()
+    (source / "config.toml").write_text('model_provider = "Ambient"\n')
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+    monkeypatch.setattr(app_server, "_find_codex_cli", lambda: "/test-bin/codex")
+    monkeypatch.setattr(model_catalog_store, "_data_dir", lambda: tmp_path / "data")
+    spec = _worker_spec(
+        "codex-native", **({"auth": ProviderAuth(name="codex-gateway")} if explicit else {})
+    )
+    launch = app_server.resolve_native_codex_launch(model=None, spec=spec)
+    fingerprint = app_server.codex_catalog_fingerprint(launch)
+    model_id = "system.ai.gpt-5-6-sol"
+    if explicit:
+        ambient = app_server.resolve_native_codex_launch(model=None)
+        model_catalog_store.write_catalog(
+            "codex-native",
+            app_server.codex_catalog_fingerprint(ambient),
+            [{"id": "system.ai.gpt-other-provider", "isDefault": True}],
+        )
+    if cache_state != "missing":
+        rows = (
+            []
+            if cache_state == "empty"
+            else [
+                {"id": "gpt-5.6-sol", "model": model_id, "isDefault": True},
+                {"id": model_id, "model": model_id},
+                {"id": "gpt-5.6-terra"},
+            ]
+        )
+        model_catalog_store.write_catalog("codex-native", fingerprint, rows)
+        if cache_state == "stale":
+            old = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+            os.utime(model_catalog_store.catalog_path("codex-native", fingerprint), (old, old))
+
+    row = catalog_for_spec(spec)["self"]
+
+    assert row["source"] == ("static" if cache_state == "missing" else "cli")
+    assert row["verified"] is (cache_state in {"fresh", "empty"})
+    assert row["models"] == (
+        []
+        if cache_state in {"empty", "missing"}
+        else [
+            {"id": model_id, "family": "openai"},
+            {"id": "gpt-5.6-terra", "family": "openai"},
+        ]
+    )
+    if cache_state == "stale":
+        assert "refresh" in str(row["note"])
+    assert "no usable model provider" not in str(row["note"])
+
+
 def test_cli_config_listing_is_static_and_unverified(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
