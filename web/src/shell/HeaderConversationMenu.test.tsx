@@ -26,11 +26,13 @@ const mocks = vi.hoisted(() => ({
   moveToProject: vi.fn(),
   archive: vi.fn(),
   deleteConversation: vi.fn(),
+  restart: vi.fn(),
   markUnread: vi.fn(),
   fork: vi.fn(),
   exportTranscript: vi.fn(),
   triggerDownload: vi.fn(),
   toastError: vi.fn(),
+  toastSuccess: vi.fn(),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -50,6 +52,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
       mutate: mocks.deleteConversation,
       isPending: false,
     }),
+    useRestartConversation: () => ({ mutate: mocks.restart, isPending: false }),
   };
 });
 
@@ -70,7 +73,12 @@ vi.mock("@/hooks/useFileContent", async (importOriginal) => {
 
 // `toast` is callable too: archiving shows the Undo pill via `toast(...)`.
 vi.mock("sonner", () => ({
-  toast: Object.assign(vi.fn(), { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() }),
+  toast: Object.assign(vi.fn(), {
+    error: mocks.toastError,
+    success: mocks.toastSuccess,
+    custom: vi.fn(),
+    dismiss: vi.fn(),
+  }),
 }));
 
 const CONVERSATION: Conversation = {
@@ -155,6 +163,7 @@ describe("HeaderConversationMenu", () => {
       "Export",
       "Rename",
       "Mark as unread",
+      "Restart session…",
       "Add to project",
       "Archive",
       "Delete",
@@ -278,6 +287,32 @@ describe("HeaderConversationMenu", () => {
     // Just the flag flip: unarchiving keeps the user on the session, so no
     // redirect home and no Undo toast.
     expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: false });
+  });
+
+  it("restarts the session only after the confirm dialog", () => {
+    renderMenu();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Restart session…" }));
+    expect(screen.getByRole("heading", { name: "Restart session?" })).toBeInTheDocument();
+    expect(mocks.restart).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("heading", { name: "Restart session?" })).toBeNull();
+    expect(mocks.restart).not.toHaveBeenCalled();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Restart session…" }));
+    fireEvent.click(screen.getByTestId("header-restart-confirm"));
+    expect(mocks.restart).toHaveBeenCalledWith(
+      "conv-1",
+      expect.objectContaining({ onSuccess: expect.any(Function), onError: expect.any(Function) }),
+    );
+    const callbacks = mocks.restart.mock.calls[0]?.[1] as { onSuccess: () => void };
+    callbacks.onSuccess();
+    expect(mocks.toastSuccess).toHaveBeenCalledWith(
+      "Session restarted — running the latest agent version.",
+    );
   });
 
   it("labels project actions for filed and unfiled sessions", () => {
@@ -492,6 +527,7 @@ describe("HeaderConversationMenu", () => {
       "Export",
       "Rename",
       "Mark as unread",
+      "Restart session…",
       "Add to project",
       "Archive",
       "Delete",
@@ -514,6 +550,7 @@ describe("HeaderConversationMenu", () => {
       "Export",
       "Rename",
       "Mark as unread",
+      "Restart session…",
       "Add to project",
       "Files",
       "Archive",

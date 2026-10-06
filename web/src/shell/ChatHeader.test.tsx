@@ -876,6 +876,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Export",
       "Rename",
       "Mark as unread",
+      "Restart session…",
       "Add to project",
       "Files",
       "Changes",
