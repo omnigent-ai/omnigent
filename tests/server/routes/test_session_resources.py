@@ -31,6 +31,7 @@ from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from tests.debug_log_helpers import capture_debug_rows
 
 
 class _ConversationStore:
@@ -5263,6 +5264,514 @@ async def test_claude_native_mirrored_slash_command_drains_its_queued_entry() ->
 
         assert [item.type for item in store.appended_items] == ["slash_command"]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+def _mirror_event(item_type: str, item_data: dict[str, Any], source_id: str) -> SessionEventInput:
+    """Build the ``external_conversation_item`` event a transcript forwarder posts."""
+    return SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": item_type,
+            "item_data": item_data,
+            "response_id": f"resp_{source_id}",
+            "source_id": source_id,
+        },
+    )
+
+
+def _user_mirror(text: str, source_id: str) -> SessionEventInput:
+    """A user message the transcript mirrored back."""
+    content = [{"type": "input_text", "text": text}]
+    return _mirror_event("message", {"role": "user", "content": content}, source_id)
+
+
+def _shell_mirror(kind: str, source_id: str, **fields: Any) -> SessionEventInput:
+    """One half (``"input"`` or ``"output"``) of a mirrored ``!cmd`` shell command."""
+    return _mirror_event("terminal_command", {"kind": kind, **fields}, source_id)
+
+
+def _consumed_receipts(published: list[tuple[str, dict[str, Any]]]) -> list[str | None]:
+    """The ``cleared_pending_id`` of every ``session.input.consumed`` event, in order."""
+    return [
+        event["data"]["cleared_pending_id"]
+        for _conversation_id, event in published
+        if event.get("type") == "session.input.consumed"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirrored_shell_command_drains_its_queued_entry() -> None:
+    """A web ``!cmd`` mirrored as terminal_command input clears its own queued entry.
+
+    Claude Code runs the message as a shell command and records it as
+    terminal-command items, never as a user message, so without this the entry
+    outlives the command and the next ordinary message would skip it, persisting
+    a false "not delivered" error for a command that ran. Older entries stay.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    command = pending_inputs.record(sid, [{"type": "input_text", "text": "!ls -la"}])
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                _shell_mirror("input", "claude:ls:0", input="ls -la"),
+                store,  # type: ignore[arg-type]
+            )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+        drained = [row for row in rows if row["event_name"] == "native_pending_input_drained"]
+        assert len(drained) == 1
+        assert drained[0]["level"] == "INFO"
+        assert drained[0]["session_id"] == sid
+        assert drained[0]["attributes"]["pending_id"] == command
+        assert not [row for row in rows if row["event_name"] == "native_pending_input_skipped"]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_message_after_a_shell_command_reports_no_lost_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The next message after a web ``!cmd`` persists cleanly, with no error item.
+
+    The user sends ``!echo hi`` from the web composer, Claude runs it, and the
+    forwarder mirrors the command and its output. The following ordinary
+    message used to skip the still-queued ``!echo hi`` entry and persist it as
+    undelivered next to an error, although the command had run and shown.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(sid, [{"type": "input_text", "text": "!echo hi"}])
+
+    try:
+        with capture_debug_rows("server") as rows:
+            for event in (
+                _shell_mirror("input", "claude:echo:0", input="echo hi"),
+                _shell_mirror("output", "claude:echo:1", stdout="hi", stderr=""),
+            ):
+                await _persist_external_conversation_item(
+                    sid,
+                    conv,
+                    event,
+                    store,  # type: ignore[arg-type]
+                )
+            assert pending_inputs.snapshot_for(sid) == []
+            following = pending_inputs.record(sid, [{"type": "input_text", "text": "thanks"}])
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                _user_mirror("thanks", "claude:thanks:0"),
+                store,  # type: ignore[arg-type]
+            )
+
+        assert [item.type for item in store.appended_items] == [
+            "terminal_command",
+            "terminal_command",
+            "message",
+        ]
+        assert store.appended_items[-1].data.content == [{"type": "input_text", "text": "thanks"}]
+        # Only the ordinary message produced a receipt, and nothing was skipped.
+        assert _consumed_receipts(published) == [following]
+        assert pending_inputs.snapshot_for(sid) == []
+        assert not [row for row in rows if row["event_name"] == "native_pending_input_skipped"]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_shell_command_output_drains_nothing() -> None:
+    """Only the input half of a shell command settles its queued entry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    command = pending_inputs.record(sid, [{"type": "input_text", "text": "!ls"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _shell_mirror("output", "claude:ls:1", stdout="a.txt", stderr=""),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [command]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_shell_command_typed_in_the_terminal_leaves_the_queue_alone() -> None:
+    """A command run in the TUI, with no web entry of its own, consumes nothing queued."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    queued = pending_inputs.record(sid, [{"type": "input_text", "text": "plain message"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _shell_mirror("input", "claude:pwd:0", input="pwd"),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [queued]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_shell_command_hands_back_the_uncertain_entries_it_jumps_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older entry a positional drain made uncertain stays in play after a shell command.
+
+    A shell command drains only its own entry. An older entry queued when an
+    unmatched mirror drained by position is uncertain: neither declared lost nor
+    consumed, so the persist must hand it back. Left held, no later mirror could
+    match it: its own message would persist without a receipt and its bubble
+    would stay queued until the TTL.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    first = pending_inputs.record(sid, [{"type": "input_text", "text": "reformatted by the TUI"}])
+    second = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "!ls"}])
+    # A mirror that matched nothing drained the oldest entry by position, which
+    # leaves everything queued behind it uncertain.
+    positional = pending_inputs.resolve_oldest(sid, hold=True)
+    assert positional is not None and positional.pending_id == first
+    pending_inputs.mark_uncertain(sid)
+    pending_inputs.release(sid, positional)
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _shell_mirror("input", "claude:ls:0", input="ls"),
+            store,  # type: ignore[arg-type]
+        )
+
+        # Not persisted as undelivered, and still queued.
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [second]
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _user_mirror("still on its way", "claude:still-on-its-way:0"),
+            store,  # type: ignore[arg-type]
+        )
+
+        # Its own mirror matches it and names it in the receipt.
+        assert [item.type for item in store.appended_items] == ["terminal_command", "message"]
+        assert _consumed_receipts(published) == [second]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_failed_shell_command_append_restores_its_entry() -> None:
+    """A shell-command mirror whose append fails puts its queued entry back, in order."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _FailOnceStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    command = pending_inputs.record(sid, [{"type": "input_text", "text": "!ls"}])
+    event = _shell_mirror("input", "claude:ls:0", input="ls")
+
+    try:
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                event,
+                store,  # type: ignore[arg-type]
+            )
+        assert store.appended_items == []
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            older,
+            command,
+        ]
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            event,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_retried_shell_command_mirror_leaves_the_queue_alone() -> None:
+    """A forwarder retry of a persisted shell input must not drain a newer identical entry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(sid, [{"type": "input_text", "text": "!ls"}])
+    event = _shell_mirror("input", "claude:ls:0", input="ls")
+
+    try:
+        first_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            event,
+            store,  # type: ignore[arg-type]
+        )
+        assert pending_inputs.snapshot_for(sid) == []
+        # The person runs the same command again before the retry arrives.
+        again = pending_inputs.record(sid, [{"type": "input_text", "text": "!ls"}])
+
+        retried_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            event,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert retried_id == first_id
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [again]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_lost_shell_message_is_still_reported_as_not_recorded() -> None:
+    """A ``!`` message whose command never ran keeps the error, and the skip is logged.
+
+    Only a mirrored shell command settles its entry. One the TUI never ran is
+    genuinely lost, so the next message still persists it with
+    ``native_prompt_not_recorded`` and a ``native_pending_input_skipped`` warning
+    that says what kind of message was lost and how long it had been queued.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    lost = pending_inputs.record(sid, [{"type": "input_text", "text": "!never ran"}])
+    matched = pending_inputs.record(sid, [{"type": "input_text", "text": "still here?"}])
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                _user_mirror("still here?", "claude:still-here:0"),
+                store,  # type: ignore[arg-type]
+            )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        lost_error = store.appended_items[1].data
+        assert lost_error.code == "native_prompt_not_recorded"
+        assert lost_error.level is None
+        skipped = [row for row in rows if row["event_name"] == "native_pending_input_skipped"]
+        assert len(skipped) == 1
+        assert skipped[0]["level"] == "WARNING"
+        assert skipped[0]["session_id"] == sid
+        attributes = skipped[0]["attributes"]
+        assert attributes["pending_id"] == lost
+        assert attributes["matched_pending_id"] == matched
+        assert attributes["queue_depth"] == "2"
+        assert attributes["interrupted"] == "False"
+        assert attributes["first_char_class"] == "bang"
+        assert attributes["harness"] == "claude-native"
+        assert float(attributes["age_s"]) >= 0.0
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_interrupted_entry_is_reported_as_stopped_not_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt the person stopped right after sending gets a notice, not an error.
+
+    Stop interrupts the turn before the TUI records the prompt, so no mirror of
+    it ever arrives. The next message skips it as before, but the pair now ends
+    in an info-level ``native_prompt_interrupted`` notice instead of "not
+    delivered". A prompt sent after the Stop is still a plain lost message.
+    """
+    import uuid
+
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    stopped = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "stopped prompt"}], created_by="a@example.com"
+    )
+    assert pending_inputs.mark_interrupted(sid)[0] == 1
+    lost_after = pending_inputs.record(sid, [{"type": "input_text", "text": "sent after"}])
+    matched = pending_inputs.record(sid, [{"type": "input_text", "text": "next"}])
+
+    try:
+        with capture_debug_rows("server") as rows:
+            item_id = await _persist_external_conversation_item(
+                sid,
+                conv,
+                _user_mirror("next", "claude:next:0"),
+                store,  # type: ignore[arg-type]
+            )
+
+        assert [item.type for item in store.appended_items] == [
+            "message",
+            "error",
+            "message",
+            "error",
+            "message",
+        ]
+        stopped_user, notice, lost_user, lost_error, matched_user = store.appended_items
+        assert stopped_user.data.content == [{"type": "input_text", "text": "stopped prompt"}]
+        assert stopped_user.created_by == "a@example.com"
+        assert notice.data.code == "native_prompt_interrupted"
+        assert notice.data.level == "info"
+        assert notice.data.message == "Stopped before Claude recorded this message."
+        # Same turn as the message it follows, so the pair renders together.
+        assert notice.response_id == stopped_user.response_id
+        # The prompt sent after the Stop keeps the error.
+        assert lost_user.data.content == [{"type": "input_text", "text": "sent after"}]
+        assert lost_error.data.code == "native_prompt_not_recorded"
+        assert matched_user.data.content == [{"type": "input_text", "text": "next"}]
+        assert item_id == matched_user.id
+        assert pending_inputs.snapshot_for(sid) == []
+        # Clients settle both skipped bubbles, in queue order, before the match.
+        assert _consumed_receipts(published) == [stopped, lost_after, matched]
+        # The notice is published live like the error it replaces.
+        live_notice = next(
+            event["item"]
+            for _conversation_id, event in published
+            if event.get("type") == "response.output_item.done"
+            and event["item"].get("code") == "native_prompt_interrupted"
+        )
+        assert live_notice["level"] == "info"
+        # Stable ids keep the whole batch idempotent, exactly as for the error.
+        for kind, expected in (("user", stopped_user), ("error", notice)):
+            stable_id = uuid.uuid5(
+                uuid.NAMESPACE_URL, f"omnigent-skipped-native-{kind}:{sid}:{stopped}"
+            ).hex
+            assert store.persisted_by_stable_id[stable_id] is expected
+        by_pending = {
+            row["attributes"]["pending_id"]: row["attributes"]
+            for row in rows
+            if row["event_name"] == "native_pending_input_skipped"
+        }
+        assert by_pending[stopped]["interrupted"] == "True"
+        assert by_pending[lost_after]["interrupted"] == "False"
+        assert by_pending[stopped]["first_char_class"] == "other"
+        assert by_pending[stopped]["matched_pending_id"] == matched
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_interrupted_entry_is_reported_as_stopped_not_lost() -> None:
+    """The stop notice names the harness for Kiro too, instead of Kiro's error."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(sid, [{"type": "input_text", "text": "stopped prompt"}])
+    pending_inputs.mark_interrupted(sid)
+    pending_inputs.record(sid, [{"type": "input_text", "text": "next"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _user_mirror("next", "kiro:next:0"),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        notice = store.appended_items[1].data
+        assert notice.code == "native_prompt_interrupted"
+        assert notice.level == "info"
+        assert notice.message == "Stopped before Kiro recorded this message."
     finally:
         pending_inputs.reset_for_tests()
 

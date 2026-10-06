@@ -56,6 +56,13 @@ receipt may really have belonged to one of them, so a later match that
 jumps over them drains them quietly instead of recording them as
 undelivered.
 
+Two more kinds of message never come back as a plain user message. One queued
+before a user interrupt was requested is marked interrupted once the interrupt
+is delivered (:func:`mark_interrupted`): the stopped TUI may never record it, so
+a match that jumps over it reports it as stopped instead of lost. One starting
+with ``!`` runs as a shell command and is mirrored as terminal-command items, so
+it drains through :func:`resolve_matching_text` with ``shell_command=True``.
+
 The one imperfect case is interleaving a web-composer message with a
 message typed directly in the TUI: the TUI message (which has no pending
 entry and matches none) drains the oldest web entry, so that web bubble
@@ -144,6 +151,18 @@ def _now() -> float:
     return time.monotonic()
 
 
+def now() -> float:
+    """
+    Return the current reading of the clock that stamps queued entries.
+
+    Take it before an action that should cover only the messages already
+    queued, and pass it to :func:`mark_interrupted` as the cutoff.
+
+    :returns: Monotonic seconds, e.g. ``1042.7``.
+    """
+    return _now()
+
+
 @dataclass
 class DrainedInput:
     """
@@ -165,6 +184,11 @@ class DrainedInput:
         so ``session.input.consumed`` carries the correct author on
         all clients (including collaborators who never saw the
         optimistic bubble).
+    :param age_s: Seconds the entry had been queued when it was drained,
+        e.g. ``12.5``; diagnostics only.
+    :param interrupted: ``True`` when a user interrupt requested after the entry
+        was queued was delivered (see :func:`mark_interrupted`): if it is
+        skipped, the caller reports it as stopped rather than lost.
     """
 
     pending_id: str
@@ -172,6 +196,8 @@ class DrainedInput:
     created_by: str | None = None
     stable_id: str | None = None
     background_titles_enabled: bool = True
+    age_s: float = 0.0
+    interrupted: bool = False
 
 
 @dataclass
@@ -187,11 +213,14 @@ class MatchedDrain:
         when an unmatched mirror drained by position (see
         :func:`mark_uncertain`). That mirror may have been theirs, so they are
         drained without being declared undelivered.
+    :param queue_depth: Unheld entries queued when the match was made,
+        counting the matched and skipped ones; diagnostics only.
     """
 
     matched: DrainedInput | None
     skipped: list[DrainedInput]
     uncertain: list[DrainedInput] = field(default_factory=list)
+    queue_depth: int = 0
 
 
 @dataclass
@@ -221,6 +250,9 @@ class _Entry:
     :param uncertain: ``True`` once an unmatched mirror drained by position
         while this entry was queued. That mirror may have been this entry's
         own, so a later match that jumps over it must not call it undelivered.
+    :param interrupted: ``True`` once a user interrupt requested after this
+        entry was queued was delivered. The stopped TUI may never record it, so
+        a later match that jumps over it reports it as stopped rather than lost.
     """
 
     pending_id: str
@@ -233,6 +265,7 @@ class _Entry:
     created_at: float = field(default_factory=lambda: _now())
     held: bool = False
     uncertain: bool = False
+    interrupted: bool = False
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -456,6 +489,44 @@ def mark_uncertain(conversation_id: str) -> None:
                 entry.uncertain = True
 
 
+def mark_interrupted(conversation_id: str, cutoff: float | None = None) -> tuple[int, float]:
+    """
+    Flag the queued entries as handed over before a delivered user interrupt.
+
+    Called once the runner acknowledged a Stop. A prompt the TUI was given
+    moments earlier can be discarded with the interrupted turn and never reach
+    its transcript, so a later match that jumps over such an entry reports it as
+    stopped (``interrupted`` on the drained entry) instead of lost. An entry the
+    TUI did record still drains by its own text match. Entries held by a persist
+    in progress are flagged too, since that persist may hand them back to the
+    queue.
+
+    The acknowledgement can take seconds, and a message sent meanwhile is not
+    one the Stop discarded, so the caller passes the :func:`now` reading it took
+    when the Stop was requested and only entries recorded at or before it are
+    flagged.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param cutoff: A :func:`now` reading; entries recorded after it are left
+        alone. ``None`` flags everything queued.
+    :returns: ``(count, oldest_age_s)`` of the flagged entries, e.g.
+        ``(2, 7.5)``; ``(0, 0.0)`` when none was flagged.
+    """
+    with _lock:
+        current = _now()
+        _evict_stale_locked(conversation_id, current)
+        flagged = [
+            entry
+            for entry in _pending.get(conversation_id, {}).values()
+            if cutoff is None or entry.created_at <= cutoff
+        ]
+        if not flagged:
+            return 0, 0.0
+        for entry in flagged:
+            entry.interrupted = True
+        return len(flagged), max(0.0, current - min(entry.created_at for entry in flagged))
+
+
 def restore(conversation_id: str, drained: DrainedInput) -> None:
     """
     Put a drained entry back into the pending queue.
@@ -480,6 +551,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         created_by=drained.created_by,
         stable_id=drained.stable_id,
         background_titles_enabled=drained.background_titles_enabled,
+        interrupted=drained.interrupted,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -510,7 +582,9 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
             _pending.pop(conversation_id, None)
 
 
-def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False) -> MatchedDrain:
+def resolve_matching_text(
+    conversation_id: str, text: str, *, hold: bool = False, shell_command: bool = False
+) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.
 
@@ -527,6 +601,10 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
     :param hold: Keep the matched and skipped entries in place, marked held,
         instead of removing them; the caller settles each with
         :func:`release` or :func:`restore`. Entries already held are skipped.
+    :param shell_command: ``text`` is a shell command the transcript recorded
+        without its leading ``!`` (Claude Code's shell mode), e.g. ``"ls -la"``.
+        Matches the entry ``"!ls -la"`` or ``"! ls -la"``; entries not starting
+        with ``!`` never match.
     :returns: Matched entry plus the older entries it jumped over — at most
         :data:`_MAX_ENTRIES_PER_CONVERSATION` of them, oldest first, split
         into ``skipped`` (known lost) and ``uncertain`` (queued when a
@@ -545,6 +623,8 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
             return MatchedDrain(matched=None, skipped=[])
         ordered = [(pid, entry) for pid, entry in entries.items() if not entry.held]
         texts = [_collapse_whitespace(_content_text(entry.content)) for _pid, entry in ordered]
+        if shell_command:
+            texts = [_shell_command_of(queued) for queued in texts]
         # Two passes. An exact (whitespace-collapsed) match first, so two
         # messages that differ only in a marker-like phrase the person typed
         # at the front stay distinct. Then, for entries carrying attachments:
@@ -552,7 +632,7 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
         # of the text, so drop exactly that many from the mirror and compare
         # with the entry's own text — typed marker-like text still counts.
         match_index = _first_match(texts, exact_needle)
-        if match_index is None:
+        if match_index is None and not shell_command:
             for index, (_pid, entry) in enumerate(ordered):
                 attachments = _attachment_count(entry.content)
                 if attachments == 0 or not texts[index]:
@@ -588,6 +668,7 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
             uncertain=[
                 _drained_input(entry) for _pending_id, entry in skipped_entries if entry.uncertain
             ],
+            queue_depth=len(ordered),
         )
 
 
@@ -654,6 +735,8 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         created_by=entry.created_by,
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
+        age_s=max(0.0, _now() - entry.created_at),
+        interrupted=entry.interrupted,
     )
 
 
@@ -695,6 +778,17 @@ def _first_match(texts: list[str], needle: str) -> int | None:
 def _collapse_whitespace(text: str) -> str:
     """Collapse whitespace runs so paste and mirror spacing differences cancel out."""
     return " ".join(text.split())
+
+
+def _shell_command_of(text: str) -> str:
+    """
+    The command a queued message runs in Claude Code's shell mode.
+
+    :param text: Whitespace-collapsed queued text, e.g. ``"! ls -la"``.
+    :returns: The command behind the leading ``!``, e.g. ``"ls -la"``; empty
+        when the text does not start with ``!``, so it never matches.
+    """
+    return text[1:].lstrip() if text.startswith("!") else ""
 
 
 def _attachment_count(content: list[dict[str, Any]]) -> int:

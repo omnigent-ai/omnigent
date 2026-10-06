@@ -58,6 +58,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runtime import (
     inflight_text,
+    pending_inputs,
     session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
@@ -173,6 +174,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_codex_native_subagent,
     _is_devin_native_subagent,
     _launch_runner_on_host,
+    _mark_pending_inputs_interrupted,
     _parse_background_tasks,
     _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
@@ -325,10 +327,10 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
     Whether a batch entry can skip :func:`_post_event_impl` and be appended
     with its neighbors, which is the shape the claude-native forwarder posts.
 
-    For an external item that is not a user message (pending-input drain) or a
-    slash command (title seeding), the per-entry path only authorizes, persists
-    and broadcasts. Entries carrying ``created_by`` or ``tools`` also stay
-    per-entry so their validation is not duplicated here.
+    For an external item that is not a user message or a shell command's input
+    (pending-input drain) or a slash command (title seeding), the per-entry path
+    only authorizes, persists and broadcasts. Entries carrying ``created_by`` or
+    ``tools`` also stay per-entry so their validation is not duplicated here.
     """
     if (
         event.type != _EXTERNAL_CONVERSATION_ITEM_TYPE
@@ -341,7 +343,12 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
     is_user_message = (
         item_type == "message" and isinstance(item_data, dict) and item_data.get("role") == "user"
     )
-    return item_type != "slash_command" and not is_user_message
+    is_shell_input = (
+        item_type == "terminal_command"
+        and isinstance(item_data, dict)
+        and item_data.get("kind") == "input"
+    )
+    return item_type != "slash_command" and not is_user_message and not is_shell_input
 
 
 def _event_body_too_large() -> HTTPException:
@@ -1346,6 +1353,8 @@ def register_events_routes(
             return wake_conv, _client
 
         if body.type == _INTERRUPT_TYPE:
+            # Messages recorded after this instant were sent after the Stop.
+            interrupt_requested_at = pending_inputs.now()
             target_session_id = session_id
             interrupt_payload: dict[str, Any] = {"type": "interrupt"}
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
@@ -1414,6 +1423,11 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
+            elif not codex_child:
+                # A prompt handed to the TUI just before the Stop may never be
+                # recorded; mark what was queued when the Stop was requested so
+                # a later skip reads as stopped.
+                _mark_pending_inputs_interrupted(session_id, interrupt_requested_at)
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)

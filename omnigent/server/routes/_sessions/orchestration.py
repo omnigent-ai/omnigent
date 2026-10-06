@@ -41,6 +41,7 @@ from omnigent.entities import (
     NewConversationItem,
     ResourceEventData,
     SlashCommandData,
+    TerminalCommandData,
 )
 from omnigent.entities.conversation import (
     FunctionCallData,
@@ -2717,19 +2718,43 @@ def _native_mirror_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _shell_command_input(item: NewConversationItem) -> str | None:
+    """
+    The command a mirrored shell-mode input item ran.
+
+    A web message starting with ``!`` runs as a shell command in Claude Code,
+    which records it as a ``terminal_command`` input item (the command without
+    its ``!``) and an output item, never as a user message.
+
+    :param item: The parsed external item.
+    :returns: The command text, e.g. ``"ls -la"``; ``None`` for any other item,
+        including the output half of a shell command.
+    """
+    if (
+        item.type == "terminal_command"
+        and isinstance(item.data, TerminalCommandData)
+        and item.data.kind == "input"
+    ):
+        return item.data.input or None
+    return None
+
+
 def _drains_pending_inputs(item: NewConversationItem) -> bool:
     """
     Whether a mirrored item settles a queued web message.
 
-    True for a web-composer user message echoed back by the transcript and for
-    a slash command (typed in the web composer as plain text, mirrored as a
-    ``slash_command`` item). Assistant and tool items never touch the queue.
+    True for a web-composer user message echoed back by the transcript, for a
+    slash command (typed in the web composer as plain text, mirrored as a
+    ``slash_command`` item), and for the input half of a ``!`` shell command.
+    Assistant and tool items never touch the queue.
 
     :param item: The parsed external item.
     :returns: ``True`` when persisting *item* drains a pending-input entry.
     """
     if item.type == "slash_command":
         return isinstance(item.data, SlashCommandData)
+    if item.type == "terminal_command":
+        return _shell_command_input(item) is not None
     return (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -2879,11 +2904,13 @@ async def _persist_external_conversation_item_unlocked(
     # their slot until the append settles, so a failed append restores the
     # queue exactly and a refill meanwhile cannot evict them. Older entries a
     # text match jumped over: a user message with a retry-safe identity
-    # surfaces them as undelivered; a source-less mirror or a slash command
-    # only holds them and puts them back afterwards.
+    # surfaces them as undelivered; a source-less mirror, a slash command or a
+    # shell command only holds them and puts them back afterwards.
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
+    queue_depth = 0
+    shell_command = _shell_command_input(item)
     if (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -2900,6 +2927,7 @@ async def _persist_external_conversation_item_unlocked(
         agent_message_candidate = body.data.get("agent_message_candidate") is True
         matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
         drained = matched.matched
+        queue_depth = matched.queue_depth
         if agent_message_candidate:
             # Ambiguous markup can be direct terminal input. Only its exact
             # pending match is evidence of a web submission; preserve others.
@@ -2955,15 +2983,25 @@ async def _persist_external_conversation_item_unlocked(
         if drained is not None:
             cleared_pending_id = drained.pending_id
         held_older = matched.skipped
+    elif shell_command is not None:
+        # Drain only the matching shell entry; restore older entries.
+        matched = pending_inputs.resolve_matching_text(
+            session_id, shell_command, hold=True, shell_command=True
+        )
+        drained = matched.matched
+        if drained is not None:
+            cleared_pending_id = drained.pending_id
+        held_older = [*matched.skipped, *matched.uncertain]
     # Build the batch: skipped entries first (their positions must precede
     # the matched item to match broadcast order), then the anchor. Each
-    # skipped entry gets a pair of items (user message + error) with stable
-    # IDs derived from pending_id, so the whole batch is idempotent under the
-    # append lock. A drain reports at most ``pending_inputs.
-    # _MAX_ENTRIES_PER_CONVERSATION`` skipped entries, so one append writes at
-    # most ``2 * cap + 1`` rows whatever state a rolled-back drain left the
-    # queue in. A concurrent retry that slipped past the probe above comes
-    # back deduplicated and its queue entries are unheld.
+    # skipped entry gets a pair of items (user message + error, or a stop
+    # notice for an interrupted one) with stable IDs derived from pending_id,
+    # so the whole batch is idempotent under the append lock. A drain reports
+    # at most ``pending_inputs._MAX_ENTRIES_PER_CONVERSATION`` skipped
+    # entries, so one append writes at most ``2 * cap + 1`` rows whatever
+    # state a rolled-back drain left the queue in. A concurrent retry that
+    # slipped past the probe above comes back deduplicated and its queue
+    # entries are unheld.
     try:
         skipped_new_items = _build_skipped_native_items(session_id, conv, skipped_pending)
         batch = [*skipped_new_items, item, *claude_subagent_completion_markers(item)]
@@ -2994,10 +3032,23 @@ async def _persist_external_conversation_item_unlocked(
         return persisted.id
     # Landed: the drained entries are settled (uncertain ones leave without a
     # record — their mirror may already have been attributed by position);
-    # older messages a slash command jumped over are still on their way and
-    # go back into play.
+    # older messages a slash or shell command jumped over are still on their
+    # way and go back into play.
     _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
     _restore_drained_inputs(session_id, held_older, None)
+    if shell_command is not None and drained is not None:
+        _logger.info(
+            "Shell command settled pending web message %s for session=%s",
+            drained.pending_id,
+            session_id,
+            extra=debug_event(
+                "native_pending_input_drained",
+                session_id=session_id,
+                pending_id=drained.pending_id,
+                item_type="terminal_command",
+                age_s=round(drained.age_s, 1),
+            ),
+        )
     # Not a duplicate: publish side effects for each skipped pair. Items are
     # [user0, error0, user1, error1, ...]; 2 per skipped entry. The consumed
     # event names each skipped entry so clients settle those bubbles in order
@@ -3010,6 +3061,13 @@ async def _persist_external_conversation_item_unlocked(
                 session_id, persisted_user, cleared_pending_id=skipped.pending_id
             )
             _publish_external_conversation_item(session_id, persisted_error)
+            _log_skipped_native_input(
+                session_id,
+                conv,
+                skipped,
+                matched_pending_id=cleared_pending_id,
+                queue_depth=queue_depth,
+            )
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule(expected_seed_title=conv.title)
@@ -3236,19 +3294,23 @@ def _build_skipped_native_items(
 
     Each skipped entry produces ``[user_message, error_item]``: the message the
     person sent, followed by an error saying the harness never recorded it, so
-    the transcript keeps the lost message instead of silently dropping it.
+    the transcript keeps the lost message instead of silently dropping it. An
+    entry a user interrupt was delivered over gets an info notice instead:
+    stopping a turn can discard a prompt handed to the TUI moments earlier,
+    which is not a delivery failure.
     Stable IDs derived from ``pending_id`` make each pair idempotent under the
     batch append so no pre-flight has_item probe is needed — if the anchor item
     is already persisted (a forwarder retry), these items are too, and append
     returns the whole batch deduplicated.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param conv: Conversation row, used to name the harness in the error.
+    :param conv: Conversation row, used to name the harness in the notice.
     :param skipped_entries: Older queue entries skipped by a text-matched drain.
     :returns: The item pairs in queue order, empty when nothing was skipped.
     """
     if not skipped_entries:
         return []
+    native_agent = _native_coding_agent_for_session(conv)
     if _is_kiro_native_session(conv):
         harness_key = "kiro"
         code = "kiro_native_prompt_not_recorded"
@@ -3257,7 +3319,6 @@ def _build_skipped_native_items(
             "transcript. The native terminal may have shown the underlying error."
         )
     else:
-        native_agent = _native_coding_agent_for_session(conv)
         display_name = native_agent.display_name if native_agent is not None else "The agent"
         harness_key = "native"
         code = "native_prompt_not_recorded"
@@ -3266,6 +3327,14 @@ def _build_skipped_native_items(
             "accepting a later one, so it was not delivered. The native terminal may "
             "have shown the underlying error."
         )
+    agent_label = native_agent.display_name if native_agent is not None else "the agent"
+    failure = ErrorData(source="execution", code=code, message=message)
+    stopped = ErrorData(
+        source="execution",
+        code="native_prompt_interrupted",
+        message=f"Stopped before {agent_label} recorded this message.",
+        level="info",
+    )
     items: list[NewConversationItem] = []
     for skipped in skipped_entries:
         turn_id = generate_task_id()
@@ -3285,7 +3354,7 @@ def _build_skipped_native_items(
             NewConversationItem(
                 type="error",
                 response_id=turn_id,
-                data=ErrorData(source="execution", code=code, message=message),
+                data=stopped if skipped.interrupted else failure,
                 stable_id=uuid.uuid5(
                     uuid.NAMESPACE_URL,
                     f"omnigent-skipped-{harness_key}-error:{session_id}:{skipped.pending_id}",
@@ -3293,6 +3362,61 @@ def _build_skipped_native_items(
             )
         )
     return items
+
+
+def _first_char_class(content: list[dict[str, Any]]) -> str:
+    """
+    Classify a queued web message by its first character, for diagnostics.
+
+    :param content: The queued message's content blocks.
+    :returns: ``"bang"`` for a leading ``!`` (shell mode), ``"slash"`` for a
+        leading ``/`` (command), else ``"other"``. The text itself is never logged.
+    """
+    text = (_message_text(content) or "").lstrip()
+    if text.startswith("!"):
+        return "bang"
+    if text.startswith("/"):
+        return "slash"
+    return "other"
+
+
+def _log_skipped_native_input(
+    session_id: str,
+    conv: Conversation,
+    skipped: pending_inputs.DrainedInput,
+    *,
+    matched_pending_id: str | None,
+    queue_depth: int,
+) -> None:
+    """
+    Log a queued web message a later mirror jumped over and the transcript lacks.
+
+    Lets a false "not delivered" error be told from a real loss after the fact:
+    the age, queue position, kind of message and whether a Stop was delivered.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param conv: Conversation row, used to name the harness.
+    :param skipped: The queue entry that was skipped.
+    :param matched_pending_id: The entry the mirror matched instead, if any.
+    :param queue_depth: Entries queued when the mirror matched.
+    """
+    native_agent = _native_coding_agent_for_session(conv)
+    _logger.warning(
+        "Pending web message %s for session=%s was skipped by a later mirror",
+        skipped.pending_id,
+        session_id,
+        extra=debug_event(
+            "native_pending_input_skipped",
+            session_id=session_id,
+            pending_id=skipped.pending_id,
+            age_s=round(skipped.age_s, 1),
+            queue_depth=queue_depth,
+            matched_pending_id=matched_pending_id,
+            interrupted=skipped.interrupted,
+            first_char_class=_first_char_class(skipped.content),
+            harness=native_agent.harness if native_agent is not None else "",
+        ),
+    )
 
 
 async def _enrich_terminal_status_with_subagent_output(

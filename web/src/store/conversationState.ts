@@ -15,6 +15,7 @@ import type { ConversationState } from "./chatStore";
 const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   blocks: true,
   pendingUserMessages: true,
+  settledShellPendingIds: true,
   activeResponse: true,
   interruptedResponseIds: true,
   status: true,
@@ -82,6 +83,7 @@ export function createInitialConversationState(): ConversationState {
   return {
     blocks: [],
     pendingUserMessages: [],
+    settledShellPendingIds: [],
     activeResponse: null,
     interruptedResponseIds: [],
     status: "idle",

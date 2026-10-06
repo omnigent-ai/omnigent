@@ -536,6 +536,12 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /**
+   * The server's pending-input id from the accepted POST. The bubble keeps
+   * `tempId` as its React key, so this is its only link to the entry a
+   * receipt names. Snapshot-replayed entries carry that id as `tempId`.
+   */
+  pendingId?: string;
 }
 
 /**
@@ -626,6 +632,12 @@ export interface ConversationState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
+  /**
+   * Server ids of `!cmd` bubbles already cleared by their mirrored shell input,
+   * newest last and bounded. A server without shell settlement still names them
+   * in a later skip receipt, which must not take the next message's bubble.
+   */
+  settledShellPendingIds: string[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -1844,6 +1856,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
+  settledShellPendingIds: [],
   btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
@@ -2494,7 +2507,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // consumed event pops it.
         setterFor(sessionId)((s) => ({
           pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId ? { ...p, posted: true } : p,
+            p.tempId === tempId
+              ? {
+                  ...p,
+                  posted: true,
+                  ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
+                }
+              : p,
           ),
         }));
       }
@@ -2504,7 +2523,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // a bubble remount (a visible flink). The eventual
       // `session.input.consumed` clears this bubble by FIFO order (its
       // `clearedPendingId` matches only snapshot-hydrated bubbles, which
-      // already carry the server id); see the consumed handler.
+      // already carry the server id); see the consumed handler. The id rides
+      // along as `pendingId` for the `terminal_command` case.
       // Refresh the sidebar without waiting for the 4 s `useConversations`
       // poll — picks up server-side title auto-gen and any runner_id /
       // status transitions that happen during the turn.
@@ -6827,6 +6847,28 @@ function messageContentText(content: MessageContentBlock[]): string {
 }
 
 /**
+ * Whether a queued bubble is the `!cmd` web message whose shell command the
+ * transcript just mirrored.
+ *
+ * Mirrors the server's shell-mode match on its pending-input queue: the
+ * bubble's text starts with `!` and, behind that `!` and the spaces after it,
+ * equals the mirrored command with whitespace collapsed. An unsent draft was
+ * never posted and an empty command matches nothing.
+ *
+ * @param bubble - A queued optimistic bubble.
+ * @param command - The mirrored command, without its leading `!`.
+ */
+function isShellCommandBubble(bubble: PendingUserMessage, command: string): boolean {
+  const wanted = command.replace(/\s+/g, " ").trim();
+  if (bubble.initialDraft || wanted === "") return false;
+  const text = messageContentText(bubble.content);
+  return text.startsWith("!") && text.slice(1).trimStart() === wanted;
+}
+
+/** Most settled `!cmd` ids kept per conversation; the server's queue caps what it can skip. */
+const MAX_SETTLED_SHELL_IDS = 64;
+
+/**
  * Normalized texts of the committed user-message blocks in `blocks`,
  * dropping empties (image-only messages). The dedup baseline for the
  * the snapshot replay in `bindStream`.
@@ -7485,6 +7527,16 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           eventContent !== null &&
           isClaudeAgentMessageContent(eventContent) &&
           (!pendingHead || contentKeyOf(pendingHead.content) !== contentKeyOf(eventContent));
+        // An older server's skip receipt names a `!cmd` bubble its shell input already
+        // cleared: it owns no bubble, and the FIFO head belongs to a later message.
+        const named = event.clearedPendingId;
+        const settledShell =
+          !!named &&
+          s.settledShellPendingIds.includes(named) &&
+          !s.pendingUserMessages.some((p) => p.tempId === named);
+        const forgetSettled: Partial<ConversationState> = settledShell
+          ? { settledShellPendingIds: s.settledShellPendingIds.filter((id) => id !== named) }
+          : {};
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
           // item beat this event through the stream, or a snapshot merge
@@ -7502,6 +7554,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
             };
           }
+          if (settledShell) return forgetSettled;
           // FIFO-head fallback — same marker guard as the promote path below. A
           // mirrored system marker (the vendor CLI's own `[Request interrupted
           // by user]` record) is synthesized by the CLI, owns no pending entry,
@@ -7553,6 +7606,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    drains it and names it via `clearedPendingId`, so it lands on
         //    branch 1 and never reaches this fallback.
         const head =
+          settledShell ||
           unmatchedEnvelope ||
           (eventContent !== null && isSystemUserContent(eventContent)) ||
           s.pendingUserMessages[0]?.initialDraft
@@ -7580,8 +7634,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
 
         // 3. Nothing pending (or a marker that owns no bubble) — render the
         //    event payload fresh.
-        if (eventContent === null) return {};
+        if (eventContent === null) return forgetSettled;
         return {
+          ...forgetSettled,
           blocks: [
             ...s.blocks,
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
@@ -7606,6 +7661,28 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return { pendingUserMessages: rest };
       });
       return;
+    case "terminal_command": {
+      // Shell inputs have no consumed receipt; remove the oldest matching sent bubble.
+      // Remember its server id: an older server still names it in a later skip receipt.
+      const command = event.kind === "input" ? event.input : null;
+      if (command === null) return;
+      applyToConversation((s) => {
+        const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
+        if (at < 0) return {};
+        const popped = s.pendingUserMessages[at]!;
+        return {
+          pendingUserMessages: [
+            ...s.pendingUserMessages.slice(0, at),
+            ...s.pendingUserMessages.slice(at + 1),
+          ],
+          settledShellPendingIds: [
+            ...s.settledShellPendingIds,
+            popped.pendingId ?? popped.tempId,
+          ].slice(-MAX_SETTLED_SHELL_IDS),
+        };
+      });
+      return;
+    }
     case "session_interrupted":
       // Explicit user-cancel signal. Distinguishes "interrupted by
       // user action" from the generic `response.incomplete` that
