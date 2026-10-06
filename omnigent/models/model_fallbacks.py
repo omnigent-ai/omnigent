@@ -64,6 +64,30 @@ _CODEX_LAUNCH_DEFAULT = StaticModelFallback(
 CODEX_DEFAULT_MODEL = _CODEX_LAUNCH_DEFAULT.model_ids[0]
 
 
+#: Claude models the API refuses to a Claude Code older than the release they
+#: are filed under. A Default launch skips such a model on an older client
+#: (``omnigent.harnesses.claude_native.client_version``); floors a failed turn
+#: teaches a host are kept on that host, beside these.
+_CLAUDE_CLIENT_FLOORS: dict[str, StaticModelFallback] = {
+    "2.1.280": StaticModelFallback(
+        model_ids=("claude-opus-5-5", "claude-sonnet-5-5"),
+        owner="Claude native launch (omnigent.harnesses.claude_native.client_version)",
+        provenance="the API's own refusal: this model needs Claude Code 2.1.280 or newer",
+        discovery_gap=(
+            "neither a model listing nor the Claude Code picker reports the minimum "
+            "client release a model needs"
+        ),
+    ),
+}
+
+#: Minimum Claude Code release per gated model id.
+CLAUDE_MODEL_MIN_CLIENT_VERSIONS: dict[str, str] = {
+    model_id: release
+    for release, fallback in _CLAUDE_CLIENT_FLOORS.items()
+    for model_id in fallback.model_ids
+}
+
+
 # ── Smart Routing ───────────────────────────────────────────────────────────
 #
 # The router's static tables. A live per-session catalog wins wherever one is

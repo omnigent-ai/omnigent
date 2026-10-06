@@ -94,10 +94,7 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     validate_claude_hook_interpreter_compatibility,
 )
-from omnigent.harnesses.claude_native.client_version import (
-    DefaultDemotion,
-    demote_default_for_installed_client,
-)
+from omnigent.harnesses.claude_native.client_version import FlooredRows, floor_catalog_default
 from omnigent.harnesses.claude_native.forwarder import (
     reset_transcript_forward_state,
     supervise_forwarder,
@@ -219,6 +216,7 @@ _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
+_CLAUDE_CODE_RELEASE_RE = re.compile(r"\d+\.\d+\.\d+", re.ASCII)
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
 #: revalidation retries them later). Startup dominates each run and
@@ -870,13 +868,14 @@ def _parse_claude_current_model(stdout: str) -> dict[str, str]:
     """
     Extract the resolved model from a stream-json ``/model`` probe run.
 
-    Two harness-owned facts, taken verbatim: the ``init`` event's exact
-    model id, and the printed ``Current model:`` label with only markdown
-    backticks and the trailing ``(effort: …)`` / ``(default)`` suffixes
-    stripped — so labels like ``Opus 4.8 (1M context)`` survive untouched.
+    Harness-owned facts, taken verbatim: the ``init`` event's exact model id
+    and Claude Code release, and the printed ``Current model:`` label with
+    only markdown backticks and the trailing ``(effort: …)`` / ``(default)``
+    suffixes stripped — so labels like ``Opus 4.8 (1M context)`` survive
+    untouched.
 
     :param stdout: The run's ``--output-format stream-json`` stdout.
-    :returns: Whichever of ``{"model": …, "label": …}`` parsed.
+    :returns: Whichever of ``{"model": …, "label": …, "cli_version": …}`` parsed.
     """
     resolved: dict[str, str] = {}
     for line in stdout.splitlines():
@@ -890,6 +889,9 @@ def _parse_claude_current_model(stdout: str) -> dict[str, str]:
             model = event.get("model")
             if isinstance(model, str) and model:
                 resolved["model"] = model
+            version = event.get("claude_code_version")
+            if isinstance(version, str) and _CLAUDE_CODE_RELEASE_RE.fullmatch(version):
+                resolved["cli_version"] = version
         if event.get("type") == "result":
             for text_line in str(event.get("result", "")).splitlines():
                 _, marker, tail = text_line.partition("Current model:")
@@ -1097,6 +1099,8 @@ class ClaudeModelProbe:
         ``None``.
     :param disabled_models: Disabled picker values and their resolved model ids.
     :param empty_picker: Structured discovery reported no enabled choices.
+    :param cli_version: The Claude Code release the enumeration run reported
+        (its init event's ``claude_code_version``), or ``None`` when unreadable.
     """
 
     alias_rows: list[dict[str, object]]
@@ -1104,6 +1108,7 @@ class ClaudeModelProbe:
     default_label: str | None = None
     disabled_models: frozenset[str] = frozenset()
     empty_picker: bool = False
+    cli_version: str | None = None
 
 
 def _parse_claude_picker_models(stdout: str) -> list[dict[str, Any]] | None:
@@ -1285,6 +1290,7 @@ async def probe_claude_model_options(
         default_label=default_resolution.get("label"),
         disabled_models=disabled_models,
         empty_picker=empty_picker,
+        cli_version=default_resolution.get("cli_version"),
     )
 
 
@@ -1310,7 +1316,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
     return fingerprint_of(
         "claude-native",
-        "control-picker-v3",
+        "control-picker-v4",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1338,14 +1344,21 @@ async def claude_model_catalog(
     its row, or appended as its own row when the catalog lacks it (a
     ``settings.json`` pin, say) and the endpoint can serve it.
 
+    The rows carry the Claude Code release the enumeration run reported
+    (:class:`~omnigent.models.model_catalog_store.CatalogRows`), which the
+    store keeps beside them: that release is what the Default is read against.
+
     :param claude_config: The resolved launch config, or ``None``.
     :returns: Catalog rows, or ``None`` when the probe failed.
     """
+    from omnigent.models.model_catalog_store import CatalogRows
+
     probe = await probe_claude_model_options(claude_config)
     if probe is None:
         return None
+    facts = {"cli_version": probe.cli_version} if probe.cli_version else {}
     if probe.empty_picker:
-        return []
+        return CatalogRows([], meta=facts)
     rows = list(probe.alias_rows)
     declared_models = set(claude_config.routable_models) if claude_config is not None else set()
     _non_canonical = (
@@ -1403,7 +1416,7 @@ async def claude_model_catalog(
                     "isDefault": True,
                 }
             )
-    return out
+    return CatalogRows(out, meta=facts)
 
 
 def stored_claude_catalog_rows(
@@ -1452,51 +1465,44 @@ def stored_claude_picker_values(
     return picker_command_values(rows or ())
 
 
-async def _default_demotion(rows: list[dict[str, Any]]) -> DefaultDemotion | None:
-    """The version-floor demotion of *rows*' Default; advisory, so a failure is only logged."""
-    try:
-        return await demote_default_for_installed_client(rows)
-    except Exception:  # noqa: BLE001 — the floor must never cost a launch its catalog
-        _logger.warning("Claude Code model floor check failed", exc_info=True)
-        return None
-
-
-async def _with_runnable_default(
+def _with_runnable_default(
     rows: list[dict[str, Any]] | None,
     claude_config: ClaudeNativeUcodeConfig | None,
+    fingerprint: str,
 ) -> list[dict[str, Any]] | None:
     """
-    *rows* with the Default moved onto a model the installed Claude Code can call.
+    *rows* read against the Claude Code release the catalog was probed on.
 
-    A config that pins its own launch model is left alone: that pin is the
-    provider's explicit choice, not the CLI's own default.
+    The Default moves onto a model that release can call. A config that pins
+    its own launch model keeps its Default: that pin is the provider's
+    explicit choice, not the CLI's own. The result carries the release and the
+    demotion, if any, so a launch neither recomputes nor rereads them.
 
     :param rows: Catalog rows as stored, or ``None``.
     :param claude_config: The resolved launch config, or ``None``.
-    :returns: *rows*, with ``isDefault`` moved when the client is too old for it.
+    :param fingerprint: The catalog's fingerprint, under which its release
+        and any learned floors are filed.
+    :returns: *rows*, with ``isDefault`` moved when the release is too old for it.
     """
-    if not rows or (claude_config is not None and claude_config.model):
+    if not rows:
         return rows
-    demotion = await _default_demotion(rows)
-    return demotion.rows if demotion is not None else rows
+    from omnigent.models import model_catalog_store
 
-
-async def claude_default_model_demotion(
-    claude_config: ClaudeNativeUcodeConfig | None,
-) -> DefaultDemotion | None:
-    """
-    What the installed Claude Code's version floor changed about the Default.
-
-    Reads the stored catalog without probing, so it describes the rows
-    :func:`claude_launch_catalog` just served.
-
-    :param claude_config: The resolved launch config, or ``None``.
-    :returns: The demotion, or ``None`` when the Default was left alone.
-    """
+    reported = model_catalog_store.read_catalog_meta("claude-native", fingerprint).get(
+        "cli_version"
+    )
+    installed = (
+        reported
+        if isinstance(reported, str) and _CLAUDE_CODE_RELEASE_RE.fullmatch(reported)
+        else None
+    )
     if claude_config is not None and claude_config.model:
-        return None
-    rows = stored_claude_catalog_rows(claude_config)
-    return await _default_demotion(rows) if rows else None
+        return FlooredRows(rows, cli_version=installed, scope=fingerprint)
+    try:
+        return floor_catalog_default(rows, installed=installed, scope=fingerprint)
+    except Exception:  # noqa: BLE001 — the floor must never cost a launch its catalog
+        _logger.warning("Claude Code model floor check failed", exc_info=True)
+        return FlooredRows(rows, cli_version=installed, scope=fingerprint)
 
 
 async def claude_launch_catalog(
@@ -1508,8 +1514,9 @@ async def claude_launch_catalog(
     The store read is what keeps launches fast once the host's boot probe
     (or a previous launch) has run; a cold miss pays one probe and persists
     the answer for every later consumer. The Default is read against the
-    installed Claude Code release (:mod:`.client_version`), so no consumer
-    is told to launch a model that client refuses.
+    Claude Code release the catalog was probed on (:mod:`.client_version`), so
+    no consumer is told to launch a model that client refuses; the returned
+    rows carry that release and any demotion as attributes.
 
     :param claude_config: The resolved launch config, or ``None``.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
@@ -1520,7 +1527,7 @@ async def claude_launch_catalog(
     rows = await model_catalog_store.ensure_catalog(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
     )
-    return await _with_runnable_default(rows, claude_config)
+    return _with_runnable_default(rows, claude_config, fingerprint)
 
 
 async def claude_reprobed_launch_catalog(
@@ -1542,7 +1549,7 @@ async def claude_reprobed_launch_catalog(
     rows = await model_catalog_store.reprobe_catalog(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
     )
-    return await _with_runnable_default(rows, claude_config)
+    return _with_runnable_default(rows, claude_config, fingerprint)
 
 
 def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None) -> bool:

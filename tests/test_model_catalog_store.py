@@ -49,6 +49,38 @@ def test_rows_without_ids_are_dropped_on_read() -> None:
     assert store.read_catalog("claude-native", "abc123") == _ROWS
 
 
+def test_catalog_rows_persist_their_meta_beside_the_rows() -> None:
+    rows = store.CatalogRows(_ROWS, meta={"cli_version": "2.1.217"})
+    assert rows == _ROWS
+    store.write_catalog("claude-native", "abc123", rows)
+    assert store.read_catalog("claude-native", "abc123") == _ROWS
+    assert store.read_catalog_meta("claude-native", "abc123") == {"cli_version": "2.1.217"}
+
+
+def test_plain_rows_store_no_meta() -> None:
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    assert store.read_catalog_meta("claude-native", "abc123") == {}
+    store.write_catalog("claude-native", "abc124", store.CatalogRows(_ROWS))
+    assert store.read_catalog_meta("claude-native", "abc124") == {}
+
+
+@pytest.mark.parametrize("content", [None, "{not json", "[]", '{"models": [], "meta": "x"}'])
+def test_meta_of_a_missing_or_damaged_catalog_is_empty(content: str | None) -> None:
+    path = store.catalog_path("claude-native", "abc123")
+    if content is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    assert store.read_catalog_meta("claude-native", "abc123") == {}
+
+
+async def test_a_probe_that_reports_meta_has_it_stored_with_its_rows() -> None:
+    async def _resolve() -> list[dict[str, object]]:
+        return store.CatalogRows(_ROWS, meta={"cli_version": "2.1.217"})
+
+    assert await store.ensure_catalog("claude-native", "abc123", _resolve) == _ROWS
+    assert store.read_catalog_meta("claude-native", "abc123") == {"cli_version": "2.1.217"}
+
+
 def test_default_row_and_membership_helpers() -> None:
     assert store.default_row(_ROWS) == _ROWS[1]
     assert store.default_row([_ROWS[0]]) is None

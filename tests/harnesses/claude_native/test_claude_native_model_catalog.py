@@ -22,6 +22,7 @@ def _stub_picker(
     legacy_failure: bool = False,
     help_text: str = "Usage: /model <name>. Available: opus, fable, best, fable[1m], default, "
     "or a full model ID.",
+    cli_version: str | None = None,
 ) -> list[tuple[str, ...]]:
     launches: list[tuple[str, ...]] = []
     events = [
@@ -33,7 +34,12 @@ def _stub_picker(
                 "response": {"models": models},
             },
         },
-        {"type": "system", "subtype": "init", "model": default},
+        {
+            "type": "system",
+            "subtype": "init",
+            "model": default,
+            **({"claude_code_version": cli_version} if cli_version else {}),
+        },
         {
             "type": "result",
             "result": f"Current model: `Opus 5`\n{help_text}",
@@ -104,6 +110,42 @@ def _stub_picker(
         SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
     )
     return launches
+
+
+@pytest.mark.parametrize("structured", [True, False], ids=["picker", "legacy"])
+async def test_probe_reports_the_release_that_ran_the_enumeration(
+    monkeypatch: pytest.MonkeyPatch, structured: bool
+) -> None:
+    """The catalog is built on one Claude Code release; the probe says which."""
+    models = [
+        {"value": "opus", "resolvedModel": "system.ai.claude-opus-4-8", "displayName": "Opus"}
+    ]
+    _stub_picker(
+        monkeypatch,
+        models if structured else None,
+        default="system.ai.claude-opus-4-8",
+        control_failure=None if structured else "unsupported",
+        cli_version="2.1.217",
+    )
+
+    probe = await claude_native.probe_claude_model_options(None)
+
+    assert probe is not None
+    assert probe.cli_version == "2.1.217"
+
+
+async def test_probe_without_a_reported_release_leaves_it_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models = [
+        {"value": "opus", "resolvedModel": "system.ai.claude-opus-4-8", "displayName": "Opus"}
+    ]
+    _stub_picker(monkeypatch, models, default="system.ai.claude-opus-4-8")
+
+    probe = await claude_native.probe_claude_model_options(None)
+
+    assert probe is not None
+    assert probe.cli_version is None
 
 
 @pytest.mark.parametrize("control_failure", [None, "after_picker"])
