@@ -76,7 +76,12 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server import (
+    managed_host_keepalive,
+    runner_drop_state,
+    session_live_state,
+    shutdown_state,
+)
 from omnigent.server.auth import AuthProvider, SharingMode, auth_mode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -2501,6 +2506,11 @@ def create_app(
             return host_registry.get(host_id) is not None
         return host_store.is_online(host_id)
 
+    # A host already registered here is online without a store round trip.
+    runner_drop_state.configure_host_probe(
+        lambda host_id: host_registry.get(host_id) is not None or _host_is_online(host_id)
+    )
+
     def _bulk_hosts_online(host_ids: list[str]) -> set[str]:
         """
         Return the subset of ``host_ids`` that are currently online.
@@ -3305,7 +3315,8 @@ def create_app(
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
 
     # Pending per-runner grace timers: a disconnect schedules the
-    # failed-marking after RUNNER_DISCONNECT_GRACE_S instead of doing it
+    # failed-marking after RUNNER_DISCONNECT_GRACE_S (RUNNER_SILENT_DROP_GRACE_S
+    # for a silent drop whose host is also offline) instead of doing it
     # immediately, so transient tunnel drops (ingress recycles,
     # sleep-wake reconnects) that re-register within the grace never
     # flap their sessions to failed.
@@ -3316,6 +3327,83 @@ def create_app(
         pending = _disconnect_grace_tasks.pop(runner_id, None)
         if pending is not None and not pending.done():
             pending.cancel()
+
+    async def _await_disconnect_grace(runner_id: str) -> bool:
+        """Wait out a dropped runner's grace; return whether it re-registered here.
+
+        A vanished runner gets the liveness lease (:data:`RUNNER_DISCONNECT_GRACE_S`).
+        A runner whose tunnel went silent while its host is also offline (a laptop
+        asleep or off the network) usually returns on wake, so once the lease runs
+        out its wait extends to :data:`RUNNER_SILENT_DROP_GRACE_S`, measured from
+        the drop and ended early when the host returns without it
+        (:func:`omnigent.server.runner_drop_state.hold_for_silent_drop`).
+
+        :param runner_id: The disconnected runner's id.
+        :returns: ``True`` when the runner re-registered on this replica in time.
+        """
+        from omnigent.server.routes.sessions import (
+            RUNNER_DISCONNECT_GRACE_S,
+            RUNNER_SILENT_DROP_GRACE_S,
+            RUNNER_SILENT_DROP_RECHECK_S,
+        )
+
+        drop = runner_drop_state.get(runner_id)
+        since = drop.dropped_at if drop is not None else time.monotonic()
+
+        async def runner_back(timeout_s: float) -> bool:
+            return (
+                await tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s) is not None
+            )
+
+        async def bound_host_ids() -> list[str]:
+            bound = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
+            return sorted({conv.host_id for conv in bound if conv.host_id is not None})
+
+        def log_end(
+            outcome: runner_drop_state.GraceOutcome, *, extended: bool, host_online: bool | None
+        ) -> None:
+            runner_drop_state.log_grace_end(
+                path="timer",
+                runner_id=runner_id,
+                session_id=None,
+                drop=drop,
+                outcome=outcome,
+                grace_s=RUNNER_SILENT_DROP_GRACE_S if extended else RUNNER_DISCONNECT_GRACE_S,
+                waited_s=time.monotonic() - since,
+                extended=extended,
+                host_online=host_online,
+            )
+
+        extending = False
+        try:
+            # Event-driven: `register` resolves the wait the instant the runner
+            # reconnects here. A non-positive grace collapses to an immediate
+            # registry check, matching the sleep(0) behavior tests pin.
+            back = await runner_back(RUNNER_DISCONNECT_GRACE_S)
+            held = None
+            if not back and not shutdown_state.server_shutting_down():
+                extending = drop is not None and drop.kind == "silent"
+                held = await runner_drop_state.hold_for_silent_drop(
+                    drop,
+                    grace_s=RUNNER_SILENT_DROP_GRACE_S,
+                    recheck_s=RUNNER_SILENT_DROP_RECHECK_S,
+                    wait_for_runner=runner_back,
+                    bound_host_ids=bound_host_ids,
+                )
+        except asyncio.CancelledError:
+            # A newer disconnect, a crash report, or app shutdown took over the long wait.
+            # The normal window is replaced by every disconnect (the tunnel route can report
+            # one drop twice), so only an extended wait is worth a row.
+            if extending:
+                log_end("superseded", extended=True, host_online=None)
+            raise
+        if held is None:
+            log_end("reconnected" if back else "expired", extended=False, host_online=None)
+            return back
+        log_end(held.outcome, extended=held.extended, host_online=held.host_online)
+        return held.outcome == "reconnected"
 
     async def _mark_disconnected_runner_failed(
         runner_id: str, reference_stamp: int | None
@@ -3331,6 +3419,11 @@ def create_app(
         lease expires hands its bound sessions to
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
+
+        A tunnel that went silent while its host is also offline earns a
+        longer wait (:func:`_await_disconnect_grace`): a laptop asleep past
+        the lease is still expected back, unlike a runner that closed its
+        socket.
 
         This is the transport-drop path only. A runner that actually
         crashed is reported by its daemon on the host tunnel and handled by
@@ -3354,28 +3447,22 @@ def create_app(
             against.
         """
         from omnigent.server.routes.sessions import (
-            RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
             _relinquish_session_live_state,
             _runner_live_on_another_replica_from_conversations,
         )
         from omnigent.server.schemas import ErrorDetail
 
-        # Event-driven: `register` resolves the wait the instant the runner
-        # reconnects here. A non-positive grace collapses to an immediate
-        # registry check, matching the sleep(0) behavior tests pin.
-        reconnected = await tunnel_registry.wait_for_runner(
-            runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
-        )
+        reconnected = await _await_disconnect_grace(runner_id)
         if shutdown_state.server_shutting_down():
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",
                 runner_id,
             )
             return
-        if reconnected is not None:
+        if reconnected:
             _logger.info(
-                "Runner %s reconnected within the liveness lease; skipping offline-marking",
+                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
                 runner_id,
             )
             return

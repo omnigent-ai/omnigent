@@ -36,8 +36,10 @@ import asyncio
 import contextlib
 import io
 import json
+import logging
 import tarfile
 import threading
+import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +76,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.server import runner_drop_state
 from omnigent.server.app import create_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -1903,6 +1906,347 @@ async def test_server_initiated_close_never_fails_the_turn(
     finally:
         shutdown_state.reset_for_tests()
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+_SILENT_HOST_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+_NORMAL_GRACE_S = 0.15
+
+
+@dataclass
+class _DroppableRunner:
+    """A mid-turn, host-bound session served by a runner tunnel the test can drop."""
+
+    ap_app: FastAPI
+    session_id: str
+    runner_id: str
+    communicator: ApplicationCommunicator
+    host_online: threading.Event
+
+
+async def _connect_mid_turn_runner(
+    stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    *,
+    runner_id: str,
+    silent_grace_s: float,
+) -> _DroppableRunner:
+    """Connect a runner whose host-bound session is mid-turn, with short grace windows.
+
+    The host reads offline until the test sets ``host_online``.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", _NORMAL_GRACE_S
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.RUNNER_SILENT_DROP_GRACE_S", silent_grace_s
+    )
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_SILENT_DROP_RECHECK_S", 0.05)
+    host_online = threading.Event()
+    monkeypatch.setattr(
+        runner_drop_state, "_host_online_probe", lambda _host_id: host_online.is_set()
+    )
+    _stub_connect_hook_for_pumpless_ws(stack.ap_app, monkeypatch)
+
+    create_resp = await stack.ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip")},
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    store.set_host_id(session_id, _SILENT_HOST_ID, workspace="/tmp/silent-drop")
+    communicator = await _connect_runner_tunnel(stack.ap_app, runner_id)
+    await _send_hello_and_wait(
+        communicator, stack.ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+    )
+    sessions_module._session_status_cache[session_id] = "running"
+    return _DroppableRunner(stack.ap_app, session_id, runner_id, communicator, host_online)
+
+
+async def _drop_runner(case: _DroppableRunner, *, silently: bool) -> float:
+    """End the runner's tunnel; a silent one went quiet past the keepalive window first.
+
+    :returns: The monotonic time the server recorded the drop.
+    """
+    if silently:
+        session = case.ap_app.state.tunnel_registry.get(case.runner_id)
+        assert session is not None
+        session.last_frame_at -= 120.0
+    await case.communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+    await case.communicator.wait(timeout=budget(2.0))
+    drop = runner_drop_state.get(case.runner_id)
+    assert drop is not None, "the tunnel end was not recorded"
+    assert drop.kind == ("silent" if silently else "sudden")
+    return drop.dropped_at
+
+
+async def _wait_for_cache_status(session_id: str, status: str, *, timeout_s: float = 5.0) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+
+    async def _reached() -> None:
+        while sessions_module._session_status_cache.get(session_id) != status:
+            await asyncio.sleep(0.02)
+
+    await asyncio.wait_for(_reached(), timeout=budget(timeout_s))
+
+
+def _event_rows(caplog: pytest.LogCaptureFixture, event_name: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event_name", None) == event_name]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_silent_drop_with_the_host_offline_holds_the_turn_for_the_silent_grace(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A laptop that went quiet keeps its turn past the normal grace, not past the silent one."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    silent_grace_s = 1.2
+    case = await _connect_mid_turn_runner(
+        tunnel_three_layer_stack,
+        monkeypatch,
+        caplog,
+        runner_id="runner-silent-expires",
+        silent_grace_s=silent_grace_s,
+    )
+    try:
+        dropped_at = await _drop_runner(case, silently=True)
+        # Four normal graces later nothing has failed and the timer is still waiting.
+        await asyncio.sleep(_NORMAL_GRACE_S * 4)
+        assert sessions_module._session_status_cache.get(case.session_id) == "running"
+        assert any(
+            task.get_name() == f"runner-disconnect-grace-{case.runner_id}"
+            for task in asyncio.all_tasks()
+            if not task.done()
+        )
+
+        # Nothing came back, so the silent grace ends the way the normal one always did.
+        await _wait_for_cache_status(case.session_id, "failed")
+        assert time.monotonic() - dropped_at >= silent_grace_s
+
+        async def _persisted_error() -> dict[str, str]:
+            # The labels land just after the status edge.
+            store = get_conversation_store()
+            while True:
+                conv = store.get_conversation(case.session_id)
+                assert conv is not None
+                error = sessions_module._last_task_error_from_labels(conv.labels)
+                if error is not None:
+                    return error
+                await asyncio.sleep(0.02)
+
+        error = await asyncio.wait_for(_persisted_error(), budget(5.0))
+        assert error["code"] == "runner_disconnected"
+
+        (grace,) = _event_rows(caplog, "runner_disconnect_grace")
+        assert grace.attributes["path"] == "timer"
+        assert grace.attributes["outcome"] == "expired"
+        assert grace.attributes["extended"] is True
+        assert grace.attributes["drop_kind"] == "silent"
+        assert grace.attributes["host_online"] is False
+        assert grace.attributes["grace_s"] == silent_grace_s
+        assert grace.attributes["waited_s"] >= silent_grace_s
+        (failed,) = _event_rows(caplog, "session_turn_failed")
+        assert failed.attributes["code"] == "runner_disconnected"
+        assert failed.attributes["drop_kind"] == "silent"
+    finally:
+        sessions_module._session_status_cache.pop(case.session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_silent_drop_then_a_reconnect_within_the_silent_grace_never_fails_the_turn(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner that wakes after the normal grace, inside the silent one, keeps its turn."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    silent_grace_s = 1.0
+    case = await _connect_mid_turn_runner(
+        tunnel_three_layer_stack,
+        monkeypatch,
+        caplog,
+        runner_id="runner-silent-wakes",
+        silent_grace_s=silent_grace_s,
+    )
+    reconnected: ApplicationCommunicator | None = None
+    try:
+        dropped_at = await _drop_runner(case, silently=True)
+        await asyncio.sleep(_NORMAL_GRACE_S * 3)
+        assert sessions_module._session_status_cache.get(case.session_id) == "running"
+
+        reconnected = await _connect_runner_tunnel(case.ap_app, case.runner_id)
+        await _send_hello_and_wait(
+            reconnected, case.ap_app, case.runner_id, harnesses=[_TEST_HARNESS_NAME]
+        )
+        assert runner_drop_state.get(case.runner_id) is None, "a reconnect clears the drop"
+
+        # Well past the moment the silent grace would have ended.
+        await asyncio.sleep(max(0.0, dropped_at + silent_grace_s - time.monotonic()) + 0.5)
+        assert sessions_module._session_status_cache.get(case.session_id) == "running"
+        (grace,) = _event_rows(caplog, "runner_disconnect_grace")
+        assert grace.attributes["outcome"] == "reconnected"
+        assert grace.attributes["extended"] is True
+        assert grace.attributes["drop_kind"] == "silent"
+        assert not _event_rows(caplog, "session_turn_failed")
+    finally:
+        if reconnected is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnected.send_input({"type": "websocket.disconnect", "code": 1000})
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnected.wait(timeout=budget(2.0))
+        sessions_module._session_status_cache.pop(case.session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_silent_drop_with_the_host_back_but_no_runner_fails_shortly_after_the_host(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A host that woke without its runner means the runner is gone: stop waiting."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    # Far longer than the test can wait, so only the host's return can end the wait.
+    case = await _connect_mid_turn_runner(
+        tunnel_three_layer_stack,
+        monkeypatch,
+        caplog,
+        runner_id="runner-silent-host-back",
+        silent_grace_s=60.0,
+    )
+    try:
+        await _drop_runner(case, silently=True)
+        await asyncio.sleep(_NORMAL_GRACE_S * 4)
+        assert sessions_module._session_status_cache.get(case.session_id) == "running"
+
+        case.host_online.set()
+        await _wait_for_cache_status(case.session_id, "failed")
+
+        (grace,) = _event_rows(caplog, "runner_disconnect_grace")
+        assert grace.attributes["outcome"] == "host_back_runner_missing"
+        assert grace.attributes["extended"] is True
+        assert grace.attributes["host_online"] is True
+        assert grace.attributes["waited_s"] < 30.0
+        (failed,) = _event_rows(caplog, "session_turn_failed")
+        assert failed.attributes["drop_kind"] == "silent"
+    finally:
+        sessions_module._session_status_cache.pop(case.session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_sudden_drop_keeps_the_normal_grace_even_with_the_host_offline(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner that closed its socket while talking is not a sleeping laptop."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    case = await _connect_mid_turn_runner(
+        tunnel_three_layer_stack,
+        monkeypatch,
+        caplog,
+        runner_id="runner-sudden",
+        silent_grace_s=60.0,
+    )
+    try:
+        await _drop_runner(case, silently=False)
+        # Fails on the normal grace, nowhere near the 60 s silent one.
+        await _wait_for_cache_status(case.session_id, "failed")
+
+        (grace,) = _event_rows(caplog, "runner_disconnect_grace")
+        assert grace.attributes["outcome"] == "expired"
+        assert grace.attributes["extended"] is False
+        assert grace.attributes["drop_kind"] == "sudden"
+        assert grace.attributes["grace_s"] == _NORMAL_GRACE_S
+        assert "host_online" not in grace.attributes or grace.attributes["host_online"] is None
+        (failed,) = _event_rows(caplog, "session_turn_failed")
+        assert failed.attributes["drop_kind"] == "sudden"
+    finally:
+        sessions_module._session_status_cache.pop(case.session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_silent_drop_with_the_host_still_online_fails_on_the_normal_grace(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only the runner's path went quiet while its host stayed up: nothing to wait for."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    case = await _connect_mid_turn_runner(
+        tunnel_three_layer_stack,
+        monkeypatch,
+        caplog,
+        runner_id="runner-silent-host-up",
+        silent_grace_s=60.0,
+    )
+    case.host_online.set()
+    try:
+        await _drop_runner(case, silently=True)
+        await _wait_for_cache_status(case.session_id, "failed")
+
+        (grace,) = _event_rows(caplog, "runner_disconnect_grace")
+        assert grace.attributes["outcome"] == "expired"
+        assert grace.attributes["extended"] is False
+        assert grace.attributes["drop_kind"] == "silent"
+        assert grace.attributes["host_online"] is True
+    finally:
+        sessions_module._session_status_cache.pop(case.session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_a_superseded_extended_wait_fails_nothing_and_says_so(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A newer disconnect (or a crash report) cancels the long wait; it must not fail the turn."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    case = await _connect_mid_turn_runner(
+        tunnel_three_layer_stack,
+        monkeypatch,
+        caplog,
+        runner_id="runner-silent-superseded",
+        silent_grace_s=60.0,
+    )
+    try:
+        await _drop_runner(case, silently=True)
+        await asyncio.sleep(_NORMAL_GRACE_S * 4)
+        (timer,) = (
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{case.runner_id}" and not task.done()
+        )
+        timer.cancel()
+        await asyncio.gather(timer, return_exceptions=True)
+
+        (grace,) = _event_rows(caplog, "runner_disconnect_grace")
+        assert grace.attributes["outcome"] == "superseded"
+        assert grace.attributes["extended"] is True
+        assert sessions_module._session_status_cache.get(case.session_id) == "running"
+    finally:
+        sessions_module._session_status_cache.pop(case.session_id, None)
 
 
 # TODO: factor ``FakeProcessManager`` and ``_build_harness_agent_bundle``

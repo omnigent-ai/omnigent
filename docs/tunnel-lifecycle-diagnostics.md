@@ -43,6 +43,16 @@ both ends.
   ping helper can end before the sender, so `ended_by` alone does not identify
   the close cause.
 
+  `drop_kind` classifies the end: `silent` when the keepalive declared the
+  runner dead (close code 4003) or the runner had sent no frame for at least
+  85 s (5 s under the keepalive window) when the socket ended, typically a
+  laptop that slept or lost its network; `sudden` for everything else, such as
+  a TCP close or reset while the runner was talking. A server-initiated close
+  (1012) is never `silent`. It is absent on rows for a connection that never
+  registered. The classification is kept in memory per runner until it
+  reconnects (`omnigent.server.runner_drop_state`) and is recorded before the
+  disconnect callbacks run.
+
   During a rollout, queries should accept both `closed` (older servers) and
   `disconnected`, and allow missing close details on older `closed` rows.
   Update queries that select only `closed` to use `disconnected` after the
@@ -50,15 +60,35 @@ both ends.
 - `runner_ping_timeout`: `runner_id`, `connection_id`, `connection_age_s`,
   `silent_s`.
 - `runner_stream_transport_lost`: one row per outage when the relay first
-  observes the loss, with `intentional_stop` and `grace_s`. An unintentional
-  loss is then held for `grace_s`; an intentional stop goes straight to the
-  give-up row.
+  observes the loss, with `intentional_stop`, `grace_s` and `drop_kind` (when
+  the tunnel's end was already recorded). An unintentional loss is then held
+  for `grace_s`; an intentional stop goes straight to the give-up row.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
   (`intentional_stop`, `server_shutdown`, `live_elsewhere`, `idle_no_failure` or
-  `failed_mid_turn`), `grace_s`, `outage_s`, `retries`. `outage_s` is the
-  time since the current grace window opened; a reconnect that dropped again
-  within the window does not reset it, so it includes that brief connected
-  stretch and is not cumulative disconnected time.
+  `failed_mid_turn`), `grace_s`, `outage_s`, `retries`, `drop_kind`. `outage_s`
+  is the time since the current grace window opened; a reconnect that dropped
+  again within the window does not reset it, so it includes that brief
+  connected stretch and is not cumulative disconnected time. `grace_s` is the
+  normal grace even when a silent drop was held longer; see
+  `runner_disconnect_grace`.
+- `runner_disconnect_grace`: one row when a disconnect grace ends, from the
+  per-runner timer (`path = timer`) and from a session's relay
+  (`path = relay`, with `session_id`). A `sudden` drop keeps the normal grace
+  (`RUNNER_DISCONNECT_GRACE_S`, 90 s). A `silent` drop whose host is also
+  offline (or cannot be resolved) is held up to `RUNNER_SILENT_DROP_GRACE_S`
+  (15 min) from the drop, because a sleeping laptop usually reconnects on wake.
+  The host is rechecked every `RUNNER_SILENT_DROP_RECHECK_S` (30 s); a host
+  that is back without its runner ends the wait one recheck later. Fields:
+  `drop_kind`, `host_online` (`True` or `False` once the host was checked,
+  absent otherwise), `grace_s` (the grace that applied: 900 once `extended`),
+  `extended`, `waited_s` (from the drop to the end of the grace) and `outcome`:
+  `reconnected` (the runner re-registered), `host_back_runner_missing` (the
+  host returned without it), `expired` (the grace ran out) or `superseded` (a
+  newer disconnect, a crash report or a relay rebind cancelled an extended
+  wait). After a relay's extended wait the stream is retried once more before
+  the usual give-up, so an `expired` or `host_back_runner_missing` row is
+  followed by `runner_stream_disconnected` and `session_turn_failed`. The
+  relay emits no row for a reconnect inside the normal grace; the timer does.
 - `runner_disconnect_decision`: a warning explaining the status check in the
   relay (`origin = runner_disconnected_mid_turn`) or offline sweep
   (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
@@ -94,6 +124,11 @@ both ends.
   `parent_session_id`, `runner_id`, `host_id`, and `conversation_updated_at`.
   The latter measures content activity, not the time of a status transition.
   A relay cache hit does not load conversation metadata solely for logging.
+- `session_turn_failed`: the ERROR row for every server-side failed turn.
+  For a `runner_disconnected` failure (`origin = runner_disconnected_mid_turn`
+  or `runner_offline_sweep`) it carries `drop_kind` when this replica recorded
+  how the tunnel ended, so dashboards can bucket disconnect failures into
+  silent and sudden drops.
 - `runner_session_init_started`: `resume_interrupted_turn`,
   `suppress_recovery_turn`, `recovery_id`. Neither flag set is the tunnel
   reconnect hook; resume set is a sub-agent restore; suppress set is a
@@ -160,6 +195,8 @@ uv run --no-sync pytest -q tests/runner/transports/ws_tunnel/test_serve.py \
   tests/server/integration/test_runner_tunnel_route.py \
   tests/server/routes/test_sessions_runner_relay.py \
   tests/server/integration/test_sessions_tunnel_three_layer.py \
+  tests/server/routes/test_runner_relay_silent_drop.py \
+  tests/server/test_runner_drop_state.py \
   tests/server/routes/test_subagent_status.py \
   tests/server/test_runner_session_init.py \
   tests/runner/test_suppress_recovery_turn.py \
@@ -171,6 +208,15 @@ runner's socket, hold a reconnect past `RUNNER_DISCONNECT_GRACE_S`, kill the
 runner process, and crash a harness mid-turn. One query on the session over
 the events above, ordered by `client_time`, must tell the four apart and show
 whether the original turn survived.
+
+For silent-drop handling, freeze the host's processes and block its links
+(a laptop lid close, as the resilience lab's S4 does) during a running turn,
+then thaw them a few minutes later. `runner_tunnel` should show
+`drop_kind = silent`, no `session_turn_failed` should appear past 90 s, and
+`runner_disconnect_grace` should end `reconnected` with `extended = True`.
+With the host left offline for the whole 15 minutes the turn fails with
+`outcome = expired`; a runner killed instead of frozen closes its socket
+(`drop_kind = sudden`) and fails on the 90 s grace.
 
 For idle-child handling, let a Claude subsession become idle, then stop its
 host without using the session's Stop action. After the disconnect grace,

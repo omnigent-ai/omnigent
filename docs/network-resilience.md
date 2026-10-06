@@ -20,6 +20,12 @@ instead of Codex's automatic reviewer.
 | The harness loses its model | A visible retrying state, then success or a retryable error | A silent stall, or a terminal error without Retry |
 | The user acts during an outage | The action applied exactly once when reachable, or refused at once with the input kept | Silently dropped or applied twice |
 
+A host that goes quiet without closing its sockets (sleep, a blackholed link)
+while its runner is also away is held past the 90 s grace, up to
+`RUNNER_SILENT_DROP_GRACE_S` (15 min) from the drop, since it usually returns
+on wake. The wait ends early when the host comes back without its runner. A
+runner that closes or resets its socket keeps the 90 s grace.
+
 The committed transcript, session status, approvals and the effect of each
 user action must end up the same as in an uninterrupted run. Live preview text
 during an outage is best-effort.

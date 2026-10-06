@@ -602,6 +602,8 @@ from omnigent.server.routes._sessions.helpers import (
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
+    RUNNER_SILENT_DROP_GRACE_S as RUNNER_SILENT_DROP_GRACE_S,
+    RUNNER_SILENT_DROP_RECHECK_S as RUNNER_SILENT_DROP_RECHECK_S,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
     _stop_host_runner_intentionally as _stop_host_runner_intentionally,

@@ -4811,6 +4811,7 @@ def _publish_status(
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
     failure_context: object = None,
+    failure_attributes: Mapping[str, str] | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4845,6 +4846,9 @@ def _publish_status(
         undifferentiated signature. Ignored for non-failed edges.
     :param failure_context: Untrusted optional native evidence, normalized at
         the failure-log boundary. Malformed values cannot reject the status edge.
+    :param failure_attributes: Extra attributes for the failure log row, e.g.
+        ``{"drop_kind": "silent"}`` for a runner disconnect. Must not reuse the
+        row's own keys (``origin``, ``code``, ``previous_status``, ``response_id``).
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -4919,6 +4923,7 @@ def _publish_status(
                 code=failure_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
+                **(failure_attributes or {}),
                 **failure_log_attributes(failure_context),
             ),
         )

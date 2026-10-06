@@ -42,6 +42,7 @@ def _publish_failed(
     origin: str | None = None,
     response_id: str | None = None,
     previous: str | None = "running",
+    failure_attributes: dict[str, str] | None = None,
 ) -> logging.LogRecord:
     """Publish one failed edge and return the ERROR record it logged."""
     if previous is not None:
@@ -53,6 +54,7 @@ def _publish_failed(
             error,
             response_id=response_id,
             failure_origin=origin,
+            failure_attributes=failure_attributes,
         )
     records = [r for r in caplog.records if "session turn failed" in r.getMessage()]
     assert len(records) == 1, [r.getMessage() for r in caplog.records]
@@ -87,6 +89,40 @@ def test_failed_edge_names_its_origin_code_and_previous_status(
     assert attributes["response_id"] == "resp_abc123"
     assert record.event_name == "session_turn_failed"
     assert record.session_id == "conv_attr1"
+
+
+def test_runner_disconnect_failure_carries_how_the_tunnel_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Dashboards bucket disconnect failures by silent vs sudden drop from this one row."""
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(
+            source="execution",
+            code="runner_disconnected",
+            message="Runner disconnected unexpectedly.",
+        ),
+        origin="runner_disconnected_mid_turn",
+        failure_attributes={"drop_kind": "silent"},
+    )
+    assert record.attributes["drop_kind"] == "silent"
+    assert record.attributes["origin"] == "runner_disconnected_mid_turn"
+    assert _attributes(record, source="server")["drop_kind"] == "silent"
+
+
+def test_failure_without_a_recorded_drop_carries_no_drop_kind(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(
+            source="execution",
+            code="runner_disconnected",
+            message="Runner disconnected unexpectedly.",
+        ),
+        origin="runner_offline_sweep",
+    )
+    assert "drop_kind" not in record.attributes
 
 
 def test_detail_less_failure_still_reports_origin(

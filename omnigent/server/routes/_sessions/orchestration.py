@@ -84,7 +84,7 @@ from omnigent.runner.mcp_execution_registry import (
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
@@ -112,7 +112,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import runner_drop_state, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -3764,7 +3764,17 @@ async def _mark_runner_sessions_offline_once(
         ):
             continue
         turn_id = _session_active_response_cache.get(conv.id)
-        _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
+        _publish_status(
+            conv.id,
+            "failed",
+            error,
+            failure_origin="runner_offline_sweep",
+            failure_attributes=_drop_failure_attributes(
+                runner_drop_state.get(conv.runner_id)
+                if error.code == "runner_disconnected"
+                else None
+            ),
+        )
         await record_subagent_activity(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
@@ -7377,6 +7387,11 @@ async def _dispatch_session_event_to_runner_impl(
 # timer, and the liveness-driven sidebar agree on when a dropped runner is
 # gone; a crash is reported separately by the daemon and never waits this out.
 RUNNER_DISCONNECT_GRACE_S: float = float(RUNNER_LIVENESS_TTL_S)
+# A runner whose tunnel went silent while its host is also offline is usually a laptop asleep
+# or off the network, which reconnects on wake. Hold its turn this long, measured from the drop.
+RUNNER_SILENT_DROP_GRACE_S: float = 900.0
+# How often that extended wait rechecks the host; a host back without its runner ends the wait.
+RUNNER_SILENT_DROP_RECHECK_S: float = 30.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but
@@ -7594,6 +7609,83 @@ async def _relay_runner_live_elsewhere(
     )
 
 
+def _drop_failure_attributes(
+    drop: runner_drop_state.RunnerDrop | None,
+) -> dict[str, str] | None:
+    """Return the failure-log attributes naming how the runner's tunnel dropped."""
+    return {"drop_kind": drop.kind} if drop is not None else None
+
+
+async def _relay_host_id(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> str | None:
+    """
+    Resolve the host serving this relay's runner, for the silent-drop host check.
+
+    A sub-agent shares its parent's runner but carries no host binding of its
+    own, so the nearest host-bound ancestor answers. The host retained when the
+    relay adopted its binding is preferred; an unreadable binding reads as no host.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store used to read the binding and its ancestors.
+    :returns: The host id, or ``None`` when it cannot be resolved.
+    """
+    handle = _runner_relay_tasks.get(session_id)
+    snapshot = handle.status_snapshot if handle is not None else None
+    if snapshot is not None and snapshot.host_id is not None:
+        return snapshot.host_id
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            return None
+        return await asyncio.to_thread(routing_host_id, conv, conversation_store)
+    except Exception:  # noqa: BLE001 - an unresolved host is treated as offline
+        _logger.warning(
+            "Relay: host lookup failed for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return None
+
+
+async def _hold_relay_for_silent_drop(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+    conversation_store: ConversationStore,
+    drop: runner_drop_state.RunnerDrop | None,
+) -> runner_drop_state.SilentGraceEnd | None:
+    """
+    Hold a relay open past its grace for a silently dropped runner's host to wake.
+
+    See :func:`omnigent.server.runner_drop_state.hold_for_silent_drop`. The relay
+    waits on the runner's tunnel transport, so a client without one (in-process
+    tests) has no event-driven view of reconnects and earns no extra grace.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_client: HTTP client pointed at the runner.
+    :param conversation_store: Store used to resolve the session's host.
+    :param drop: How the runner's tunnel last ended, if it was noted.
+    :returns: How the grace ended, or ``None`` when the drop earns no extra grace.
+    """
+    wait = getattr(getattr(runner_client, "_transport", None), "wait_for_runner", None)
+    if wait is None:
+        return None
+
+    async def bound_host_ids() -> list[str]:
+        host_id = await _relay_host_id(session_id, conversation_store)
+        return [] if host_id is None else [host_id]
+
+    return await runner_drop_state.hold_for_silent_drop(
+        drop,
+        grace_s=RUNNER_SILENT_DROP_GRACE_S,
+        recheck_s=RUNNER_SILENT_DROP_RECHECK_S,
+        wait_for_runner=wait,
+        bound_host_ids=bound_host_ids,
+    )
+
+
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -7609,6 +7701,12 @@ async def _relay_runner_stream(
     re-register the runner within :data:`RUNNER_DISCONNECT_GRACE_S`, so a
     lost stream retries inside that window instead of failing the
     session. An intentional Stop exits quietly at once.
+
+    A runner whose tunnel went silent while its host is also offline (a laptop
+    asleep or off the network) usually returns on wake, so it is given
+    :data:`RUNNER_SILENT_DROP_GRACE_S` from the drop instead
+    (:func:`_hold_relay_for_silent_drop`), ended early if its host returns without it.
+    The stream is then retried once more before the usual give-up.
 
     Past the grace the runner is genuinely gone — unless this server is the
     one shutting down (:func:`omnigent.server.shutdown_state.server_shutting_down`):
@@ -7633,6 +7731,8 @@ async def _relay_runner_stream(
     deadline: float | None = None
     outage_started = 0.0
     retries = 0
+    outage_drop: runner_drop_state.RunnerDrop | None = None
+    silent_grace_spent = False
     while True:
         started = loop.time()
         try:
@@ -7652,6 +7752,8 @@ async def _relay_runner_stream(
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
                 outage_started = now
                 retries = 0
+                silent_grace_spent = False
+                outage_drop = runner_drop_state.get(runner_id)
                 _logger.info(
                     "Relay: runner transport lost for session=%s (intentional=%s, grace=%.1fs)",
                     session_id,
@@ -7663,8 +7765,12 @@ async def _relay_runner_stream(
                         intentional_stop=lost.intentional,
                         cached_session_status=_session_status_cache.get(session_id),
                         grace_s=RUNNER_DISCONNECT_GRACE_S,
+                        drop_kind=outage_drop.kind if outage_drop is not None else None,
                     ),
                 )
+            else:
+                # The drop may be noted after the relay's first loss; pick it up now.
+                outage_drop = runner_drop_state.get(runner_id) or outage_drop
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
                 retries += 1
                 _logger.info(
@@ -7685,6 +7791,60 @@ async def _relay_runner_stream(
                 if wait is None or await wait(deadline - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
+            held: runner_drop_state.SilentGraceEnd | None = None
+            if (
+                not lost.intentional
+                and not silent_grace_spent
+                and runner_id is not None
+                and not shutdown_state.server_shutting_down()
+            ):
+                try:
+                    held = await _hold_relay_for_silent_drop(
+                        session_id, runner_client, conversation_store, outage_drop
+                    )
+                except asyncio.CancelledError:
+                    runner_drop_state.log_grace_end(
+                        path="relay",
+                        runner_id=runner_id,
+                        session_id=session_id,
+                        drop=outage_drop,
+                        outcome="superseded",
+                        grace_s=RUNNER_SILENT_DROP_GRACE_S,
+                        waited_s=loop.time() - outage_started,
+                        extended=True,
+                        host_online=None,
+                    )
+                    raise
+                if held is not None and held.extended:
+                    silent_grace_spent = True
+                    runner_drop_state.log_grace_end(
+                        path="relay",
+                        runner_id=runner_id,
+                        session_id=session_id,
+                        drop=outage_drop,
+                        outcome=held.outcome,
+                        grace_s=RUNNER_SILENT_DROP_GRACE_S,
+                        waited_s=loop.time() - outage_started,
+                        extended=True,
+                        host_online=held.host_online,
+                    )
+                    if held.outcome == "reconnected":
+                        # The runner is back: give its stream the normal window to come up.
+                        deadline = loop.time() + RUNNER_DISCONNECT_GRACE_S
+                    # Try the stream once more; a failure then runs the usual give-up.
+                    continue
+            if not lost.intentional and not silent_grace_spent:
+                runner_drop_state.log_grace_end(
+                    path="relay",
+                    runner_id=runner_id,
+                    session_id=session_id,
+                    drop=outage_drop,
+                    outcome="expired",
+                    grace_s=RUNNER_DISCONNECT_GRACE_S,
+                    waited_s=now - outage_started,
+                    extended=False,
+                    host_online=held.host_online if held is not None else None,
+                )
             if lost.intentional:
                 decision = "intentional_stop"
             elif shutdown_state.server_shutting_down():
@@ -7713,6 +7873,7 @@ async def _relay_runner_stream(
                     grace_s=RUNNER_DISCONNECT_GRACE_S,
                     outage_s=round(now - outage_started, 3),
                     retries=retries,
+                    drop_kind=outage_drop.kind if outage_drop is not None else None,
                 ),
             )
             if decision == "intentional_stop":
@@ -7772,6 +7933,7 @@ async def _relay_runner_stream(
                     "failed",
                     disconnect_error,
                     failure_origin="runner_disconnected_mid_turn",
+                    failure_attributes=_drop_failure_attributes(outage_drop),
                 )
                 await record_subagent_activity(
                     session_id, "returned", conversation_store, turn_id=turn_id, status="failed"

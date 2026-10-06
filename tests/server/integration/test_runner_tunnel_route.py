@@ -34,6 +34,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+from omnigent.server import runner_drop_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from tests.budgets import budget
@@ -2180,6 +2181,111 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     assert ends[0]["reason"] == (
         "tunnel retired by server; reconnect" if retire_during_timeout else "ping timeout"
     )
+    # The keepalive declared the runner dead: a silent drop. A server retirement that
+    # pre-empted the timeout close is not one.
+    expected_kind = "sudden" if retire_during_timeout else "silent"
+    assert ends[0]["drop_kind"] == expected_kind
+    recorded = runner_drop_state.get(_RUNNER_ID)
+    assert recorded is not None and recorded.kind == expected_kind
+
+
+@pytest.mark.parametrize(
+    ("code", "frame_age_s", "expected"),
+    [
+        # Quiet past the keepalive window, then the socket ended however it did.
+        (1006, 120.0, "silent"),
+        (1011, 90.0, "silent"),
+        # The runner was talking when the socket closed or reset.
+        (1006, 1.0, "sudden"),
+        (1000, 0.5, "sudden"),
+        (1001, 20.0, "sudden"),
+        # A server-initiated close (restart) is never silent, however quiet the runner was.
+        (1012, 120.0, "sudden"),
+    ],
+)
+async def test_tunnel_end_is_classified_and_recorded_before_the_disconnect_callback(
+    caplog: pytest.LogCaptureFixture, code: int, frame_age_s: float, expected: str
+) -> None:
+    """The end row names the drop kind, and the record exists when the callback runs."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    seen_at_callback: list[tuple[str | None, bool]] = []
+    registry = TunnelRegistry()
+
+    async def on_disconnect(runner_id: str) -> None:
+        drop = runner_drop_state.get(runner_id)
+        seen_at_callback.append((drop.kind if drop else None, registry.get(runner_id) is None))
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(registry, on_runner_disconnect=on_disconnect), prefix="/v1"
+    )
+    communicator = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, registry, connection_id="conn-classified")
+        current = registry.get(_RUNNER_ID)
+        assert current is not None
+        current.last_frame_at -= frame_age_s
+        await communicator.send_input({"type": "websocket.disconnect", "code": code, "reason": ""})
+        await asyncio.wait_for(communicator.future, timeout=budget(1.0))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+        shutdown_state.reset_for_tests()
+
+    ends = _tunnel_end_events(caplog)
+    assert len(ends) == 1
+    assert ends[0]["code"] == code
+    assert ends[0]["drop_kind"] == expected
+    assert ends[0]["last_frame_age_s"] >= frame_age_s
+    recorded = runner_drop_state.get(_RUNNER_ID)
+    assert recorded is not None and recorded.kind == expected
+    # Every invocation of the callback (the helper-task disconnect path invokes it
+    # twice) saw the record, and the tunnel was already deregistered.
+    assert seen_at_callback and all(seen == (expected, True) for seen in seen_at_callback)
+
+
+async def test_a_runner_that_reconnects_clears_its_drop_record() -> None:
+    route_app = _tunnel_route_app()
+    first = await _connect_route(route_app.app, _TUNNEL_PATH)
+    second: ApplicationCommunicator | None = None
+    try:
+        await _send_hello(first, route_app.registry)
+        current = route_app.registry.get(_RUNNER_ID)
+        assert current is not None
+        current.last_frame_at -= 120.0
+        await first.send_input({"type": "websocket.disconnect", "code": 1006, "reason": ""})
+        await asyncio.wait_for(first.future, timeout=budget(1.0))
+        dropped = runner_drop_state.get(_RUNNER_ID)
+        assert dropped is not None and dropped.kind == "silent"
+
+        second = await _connect_route(route_app.app, _TUNNEL_PATH)
+        await _send_hello(second, route_app.registry)
+        assert runner_drop_state.get(_RUNNER_ID) is None
+    finally:
+        first.stop(exceptions=False)
+        if second is not None:
+            await second.send_input({"type": "websocket.disconnect", "code": 1000})
+            second.stop(exceptions=False)
+        await asyncio.gather(
+            first.future, *([second.future] if second else []), return_exceptions=True
+        )
+
+
+async def test_a_replaced_tunnel_notes_no_drop_for_a_runner_that_is_back() -> None:
+    route_app = _tunnel_route_app()
+    first = await _connect_route(route_app.app, _TUNNEL_PATH)
+    second = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(first, route_app.registry, connection_id="conn-old")
+        await _send_hello(second, route_app.registry, connection_id="conn-new")
+        await asyncio.wait_for(first.future, timeout=budget(1.0))
+        # The old generation's teardown ran after the new one registered.
+        assert runner_drop_state.get(_RUNNER_ID) is None
+    finally:
+        await second.send_input({"type": "websocket.disconnect", "code": 1000})
+        first.stop(exceptions=False)
+        second.stop(exceptions=False)
+        await asyncio.gather(first.future, second.future, return_exceptions=True)
 
 
 async def test_keepalive_loop_fires_faster_than_the_ping_interval(

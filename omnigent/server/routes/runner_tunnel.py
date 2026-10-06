@@ -44,16 +44,26 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server import (
+    managed_host_keepalive,
+    runner_drop_state,
+    session_live_state,
+    shutdown_state,
+)
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.util.tunnel_limits import TUNNEL_KEEPALIVE_PING_TIMEOUT_S
 
 _logger = logging.getLogger(__name__)
 
 SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
+PING_TIMEOUT_CLOSE_CODE = 4003
+# A tunnel that ends after this long without a frame went quiet (sleep, blackhole) rather
+# than closing on its own; a small margin under the keepalive window absorbs ping jitter.
+SILENT_DROP_FRAME_AGE_S = TUNNEL_KEEPALIVE_PING_TIMEOUT_S - 5.0
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
 _RUNNER_RECOVERY_SLOW_SEC = 30.0
 
@@ -74,6 +84,9 @@ class _TunnelConnectionAttrs(TypedDict):
         the runner's own rows for this socket.
     :param connection_age_s: Seconds since the tunnel registered.
     :param last_frame_age_s: Seconds since the runner's last frame.
+    :param drop_kind: How the end was classified (``silent`` or ``sudden``, see
+        :func:`classify_tunnel_end`), or ``None`` while the connection is live or
+        when it never registered.
     """
 
     runner_id: str
@@ -81,6 +94,47 @@ class _TunnelConnectionAttrs(TypedDict):
     connection_id: str | None
     connection_age_s: float | None
     last_frame_age_s: float | None
+    drop_kind: str | None
+
+
+def classify_tunnel_end(
+    *, code: int | None, last_frame_age_s: float | None
+) -> runner_drop_state.DropKind:
+    """Classify how a runner tunnel ended.
+
+    A tunnel the keepalive declared dead, or one that ends after going quiet for
+    nearly the keepalive window, dropped silently: the host slept or lost its
+    network and its runner is likely to return. Any other end (TCP close or reset,
+    runner exit) is sudden. A server-initiated close (1012) is never silent.
+
+    :param code: Close code that ended the tunnel, e.g. ``1006``; ``None`` if unknown.
+    :param last_frame_age_s: Seconds since the runner's last frame at the end.
+    :returns: ``"silent"`` or ``"sudden"``.
+    """
+    if code in shutdown_state.SERVER_INITIATED_CLOSE_CODES:
+        return "sudden"
+    if code == PING_TIMEOUT_CLOSE_CODE:
+        return "silent"
+    if last_frame_age_s is not None and last_frame_age_s >= SILENT_DROP_FRAME_AGE_S:
+        return "silent"
+    return "sudden"
+
+
+def _tunnel_end_code(done: set[asyncio.Task[None]], session: RunnerSession) -> int | None:
+    """Return the close code that ended a tunnel.
+
+    :param done: Helper tasks that had finished when the end was observed.
+    :param session: The connection that ended.
+    :returns: The peer's code when a helper reported its disconnect, otherwise
+        the first server-requested close code (``None`` when there is none).
+    """
+    for task in done:
+        if task.cancelled():
+            continue
+        error = task.exception()
+        if isinstance(error, WebSocketDisconnect):
+            return getattr(error, "code", None)
+    return session.close_code
 
 
 def _is_loopback_websocket_client(ws: WebSocket) -> bool:
@@ -477,6 +531,7 @@ def create_runner_tunnel_router(
         session: RunnerSession | None = None
         ended_by: str | None = None
         owned: list[asyncio.Task[None]] = []
+        drop_kind: runner_drop_state.DropKind | None = None
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
             now = time.time()
@@ -490,7 +545,16 @@ def create_runner_tunnel_router(
                 "last_frame_age_s": (
                     round(now - session.last_frame_at, 3) if session is not None else None
                 ),
+                "drop_kind": drop_kind,
             }
+
+        def _classify_end(code: int | None) -> None:
+            # Once per connection, at the first observation of its end.
+            nonlocal drop_kind
+            if drop_kind is None and session is not None:
+                drop_kind = classify_tunnel_end(
+                    code=code, last_frame_age_s=time.time() - session.last_frame_at
+                )
 
         try:
             # 3. Receive hello frame.
@@ -518,6 +582,7 @@ def create_runner_tunnel_router(
             #    rejected) before ``accept()`` above, so runner-binding
             #    checks can enforce ownership.
             session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
+            runner_drop_state.clear(runner_id)
             _logger.info(
                 "Runner %s connected (version=%s, harnesses=%s)",
                 runner_id,
@@ -578,6 +643,7 @@ def create_runner_tunnel_router(
             # Every helper that had finished, by role: a server-declared
             # ping timeout may or may not already carry the peer's close.
             ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
+            _classify_end(_tunnel_end_code(done, session))
             for task in done:
                 task_name = task.get_name()
                 if task.cancelled():
@@ -659,6 +725,12 @@ def create_runner_tunnel_router(
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
+                _classify_end(session.close_code)
+                # Record the end before the disconnect callback reads it; a newer tunnel
+                # for this runner means the runner is back, so its teardown notes nothing.
+                current = registry.get(runner_id)
+                if drop_kind is not None and (current is None or current is session):
+                    runner_drop_state.note(runner_id, drop_kind)
                 registry.deregister(runner_id, session)
                 if on_runner_disconnect is not None:
                     try:
@@ -973,9 +1045,9 @@ async def _ping_loop(
                     error_phase=ErrorPhase.UNKNOWN.value,
                 ),
             )
-            registry.record_close(session, code=4003, reason="ping timeout")
+            registry.record_close(session, code=PING_TIMEOUT_CLOSE_CODE, reason="ping timeout")
             try:
-                await ws.close(code=4003, reason="ping timeout")
+                await ws.close(code=PING_TIMEOUT_CLOSE_CODE, reason="ping timeout")
             except RuntimeError:
                 _logger.debug("Runner %s websocket already closed during ping timeout", runner_id)
             return

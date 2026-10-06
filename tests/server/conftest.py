@@ -37,7 +37,7 @@ from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import init as init_runtime
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server import _elicitation_registry, presence
+from omnigent.server import _elicitation_registry, presence, runner_drop_state
 from omnigent.server.app import create_app
 from omnigent.server.routes import sessions as sessions_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -429,6 +429,20 @@ def _reset_elicitation_state() -> Iterator[None]:
     # Presence is likewise module-global (keyed by conversation/user)
     # with pending leave-grace timers that would fire into later tests.
     presence.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _reset_runner_drop_state() -> Iterator[None]:
+    """
+    Clear the module-global runner drop records around every test.
+
+    The records are keyed by ``runner_id`` and shared by the whole worker, so a
+    silent drop noted by one test would extend the grace of a later test that
+    reuses the id.
+    """
+    runner_drop_state.reset_for_tests()
+    yield
+    runner_drop_state.reset_for_tests()
 
 
 # Originals of the sessions-module globals that many tests monkeypatch.
