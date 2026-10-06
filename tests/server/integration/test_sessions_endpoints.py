@@ -10147,6 +10147,70 @@ async def test_interrupt_not_delivered_leaves_queued_native_messages_unmarked(
         pending_inputs.reset_for_tests()
 
 
+async def test_interrupt_does_not_flag_messages_sent_while_the_stop_is_acknowledged(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only what was queued when the Stop was requested counts as stopped.
+
+    The runner can take seconds to acknowledge a Stop. A message the person
+    sends in that window reaches the TUI after the interrupt, so if the TUI
+    never records it that is a genuine loss and keeps the "not delivered" error.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    sent_during: list[str] = []
+    session_ids: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Acknowledge the Stop, after the person sent another message."""
+        if request.content and json.loads(request.content).get("type") == "interrupt":
+            sent_during.append(
+                pending_inputs.record(
+                    session_ids[0],
+                    [{"type": "input_text", "text": "sent during the acknowledgement"}],
+                )
+            )
+        return httpx.Response(202)
+
+    pending_inputs.reset_for_tests()
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler), base_url="http://runner"
+        ) as runner:
+            _route_to_runner(monkeypatch, runner)
+            agent = await create_test_agent(client)
+            session = await _create_session(
+                client,
+                agent["id"],
+                labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            )
+            session_ids.append(session["id"])
+            stopped = pending_inputs.record(
+                session["id"], [{"type": "input_text", "text": "stopped prompt"}]
+            )
+
+            stop = await client.post(
+                f"/v1/sessions/{session['id']}/events", json={"type": "interrupt", "data": {}}
+            )
+
+            assert stop.status_code == 202, stop.text
+            assert len(sent_during) == 1
+            drained = pending_inputs.resolve_matching_text(
+                session["id"], "sent during the acknowledgement"
+            )
+            assert drained.matched is not None and drained.matched.pending_id == sent_during[0]
+            assert drained.matched.interrupted is False
+            assert [(entry.pending_id, entry.interrupted) for entry in drained.skipped] == [
+                (stopped, True)
+            ]
+    finally:
+        pending_inputs.reset_for_tests()
+        for session_id in session_ids:
+            _interrupt_fenced_sessions.discard(session_id)
+
+
 @dataclass
 class _ForwardedEffort:
     """

@@ -5379,7 +5379,7 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
     session_stream.publish(session_id, payload)
 
 
-def _mark_pending_inputs_interrupted(session_id: str) -> None:
+def _mark_pending_inputs_interrupted(session_id: str, cutoff: float) -> None:
     """
     Flag the web messages queued for a native session when a Stop is delivered.
 
@@ -5391,8 +5391,11 @@ def _mark_pending_inputs_interrupted(session_id: str) -> None:
 
     :param session_id: The interrupted session, e.g. ``"conv_abc123"``. A
         session with no queued messages (every non-native one) is a no-op.
+    :param cutoff: The :func:`omnigent.runtime.pending_inputs.now` reading taken
+        when the Stop was requested; a message sent while the runner was still
+        acknowledging it is not flagged.
     """
-    pending_count, oldest_age_s = pending_inputs.mark_interrupted(session_id)
+    pending_count, oldest_age_s = pending_inputs.mark_interrupted(session_id, cutoff)
     if pending_count:
         _logger.info(
             "Interrupt delivered with %d pending web message(s) on session %s",

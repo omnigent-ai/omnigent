@@ -58,6 +58,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runtime import (
     inflight_text,
+    pending_inputs,
     session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
@@ -1337,6 +1338,8 @@ def register_events_routes(
             return wake_conv, _client
 
         if body.type == _INTERRUPT_TYPE:
+            # Messages recorded after this instant were sent after the Stop.
+            interrupt_requested_at = pending_inputs.now()
             target_session_id = session_id
             interrupt_payload: dict[str, Any] = {"type": "interrupt"}
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
@@ -1407,8 +1410,9 @@ def register_events_routes(
                 _interrupt_fenced_sessions.discard(session_id)
             elif not codex_child:
                 # A prompt handed to the TUI just before the Stop may never be
-                # recorded; mark what is queued so a later skip reads as stopped.
-                _mark_pending_inputs_interrupted(session_id)
+                # recorded; mark what was queued when the Stop was requested so
+                # a later skip reads as stopped.
+                _mark_pending_inputs_interrupted(session_id, interrupt_requested_at)
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)

@@ -56,12 +56,12 @@ receipt may really have belonged to one of them, so a later match that
 jumps over them drains them quietly instead of recording them as
 undelivered.
 
-Two more kinds of message never come back as a plain user message. One still
-queued when a user interrupt is delivered is marked interrupted
-(:func:`mark_interrupted`): the stopped TUI may never record it, so a match that
-jumps over it reports it as stopped instead of lost. One starting with ``!``
-runs as a shell command and is mirrored as terminal-command items, so it drains
-through :func:`resolve_matching_text` with ``shell_command=True``.
+Two more kinds of message never come back as a plain user message. One queued
+before a user interrupt was requested is marked interrupted once the interrupt
+is delivered (:func:`mark_interrupted`): the stopped TUI may never record it, so
+a match that jumps over it reports it as stopped instead of lost. One starting
+with ``!`` runs as a shell command and is mirrored as terminal-command items, so
+it drains through :func:`resolve_matching_text` with ``shell_command=True``.
 
 The one imperfect case is interleaving a web-composer message with a
 message typed directly in the TUI: the TUI message (which has no pending
@@ -151,6 +151,18 @@ def _now() -> float:
     return time.monotonic()
 
 
+def now() -> float:
+    """
+    Return the current reading of the clock that stamps queued entries.
+
+    Take it before an action that should cover only the messages already
+    queued, and pass it to :func:`mark_interrupted` as the cutoff.
+
+    :returns: Monotonic seconds, e.g. ``1042.7``.
+    """
+    return _now()
+
+
 @dataclass
 class DrainedInput:
     """
@@ -174,9 +186,9 @@ class DrainedInput:
         optimistic bubble).
     :param age_s: Seconds the entry had been queued when it was drained,
         e.g. ``12.5``; diagnostics only.
-    :param interrupted: ``True`` when a user interrupt was delivered while the
-        entry was queued (see :func:`mark_interrupted`): if it is skipped, the
-        caller reports it as stopped rather than lost.
+    :param interrupted: ``True`` when a user interrupt requested after the entry
+        was queued was delivered (see :func:`mark_interrupted`): if it is
+        skipped, the caller reports it as stopped rather than lost.
     """
 
     pending_id: str
@@ -238,9 +250,9 @@ class _Entry:
     :param uncertain: ``True`` once an unmatched mirror drained by position
         while this entry was queued. That mirror may have been this entry's
         own, so a later match that jumps over it must not call it undelivered.
-    :param interrupted: ``True`` once a user interrupt was delivered while this
-        entry was queued. The stopped TUI may never record it, so a later match
-        that jumps over it reports it as stopped rather than lost.
+    :param interrupted: ``True`` once a user interrupt requested after this
+        entry was queued was delivered. The stopped TUI may never record it, so
+        a later match that jumps over it reports it as stopped rather than lost.
     """
 
     pending_id: str
@@ -477,31 +489,42 @@ def mark_uncertain(conversation_id: str) -> None:
                 entry.uncertain = True
 
 
-def mark_interrupted(conversation_id: str) -> tuple[int, float]:
+def mark_interrupted(conversation_id: str, cutoff: float | None = None) -> tuple[int, float]:
     """
-    Flag every queued entry as handed over before a delivered user interrupt.
+    Flag the queued entries as handed over before a delivered user interrupt.
 
     Called once the runner acknowledged a Stop. A prompt the TUI was given
     moments earlier can be discarded with the interrupted turn and never reach
     its transcript, so a later match that jumps over such an entry reports it as
     stopped (``interrupted`` on the drained entry) instead of lost. An entry the
-    TUI did record still drains by its own text match; one recorded after this
-    call is unaffected. Entries held by a persist in progress are flagged too,
-    since that persist may hand them back to the queue.
+    TUI did record still drains by its own text match. Entries held by a persist
+    in progress are flagged too, since that persist may hand them back to the
+    queue.
+
+    The acknowledgement can take seconds, and a message sent meanwhile is not
+    one the Stop discarded, so the caller passes the :func:`now` reading it took
+    when the Stop was requested and only entries recorded at or before it are
+    flagged.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param cutoff: A :func:`now` reading; entries recorded after it are left
+        alone. ``None`` flags everything queued.
     :returns: ``(count, oldest_age_s)`` of the flagged entries, e.g.
-        ``(2, 7.5)``; ``(0, 0.0)`` when nothing was queued.
+        ``(2, 7.5)``; ``(0, 0.0)`` when none was flagged.
     """
     with _lock:
-        now = _now()
-        _evict_stale_locked(conversation_id, now)
-        entries = _pending.get(conversation_id)
-        if not entries:
+        current = _now()
+        _evict_stale_locked(conversation_id, current)
+        flagged = [
+            entry
+            for entry in _pending.get(conversation_id, {}).values()
+            if cutoff is None or entry.created_at <= cutoff
+        ]
+        if not flagged:
             return 0, 0.0
-        for entry in entries.values():
+        for entry in flagged:
             entry.interrupted = True
-        return len(entries), max(0.0, now - min(entry.created_at for entry in entries.values()))
+        return len(flagged), max(0.0, current - min(entry.created_at for entry in flagged))
 
 
 def restore(conversation_id: str, drained: DrainedInput) -> None:

@@ -766,3 +766,45 @@ def test_drained_input_reports_how_long_the_entry_was_queued(
 
     assert drained.matched is not None and drained.matched.age_s == 17.5
     assert drained.skipped[0].age_s == 30.0
+
+
+def test_mark_interrupted_leaves_entries_recorded_after_the_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message sent while the Stop was still being acknowledged is not one it discarded."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    before = pending_inputs.record("conv_a", [_text_block("before the stop")])
+    clock["t"] = 1010.0
+    cutoff = pending_inputs.now()
+    at_cutoff = pending_inputs.record("conv_a", [_text_block("at the stop")])
+    clock["t"] = 1012.0
+    during = pending_inputs.record("conv_a", [_text_block("during the acknowledgement")])
+    clock["t"] = 1013.0
+
+    # Entries recorded at or before the cutoff are flagged; the oldest is 13 s old.
+    assert pending_inputs.mark_interrupted("conv_a", cutoff) == (2, 13.0)
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "during the acknowledgement")
+    assert drained.matched is not None and drained.matched.pending_id == during
+    assert drained.matched.interrupted is False
+    assert [(entry.pending_id, entry.interrupted) for entry in drained.skipped] == [
+        (before, True),
+        (at_cutoff, True),
+    ]
+
+
+def test_mark_interrupted_reports_nothing_when_every_entry_is_newer_than_the_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With nothing queued at the cutoff there is nothing to flag or report."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    cutoff = pending_inputs.now()
+    clock["t"] = 1001.0
+    pending_inputs.record("conv_a", [_text_block("sent after")])
+
+    assert pending_inputs.mark_interrupted("conv_a", cutoff) == (0, 0.0)
+
+    drained = pending_inputs.resolve_oldest("conv_a")
+    assert drained is not None and drained.interrupted is False
