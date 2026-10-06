@@ -181,6 +181,7 @@ def callback_client(
         prefix="/auth",
     )
     app.state.pending_id_token = pending_id_token
+    app.state.perm_store = perm_store
 
     with TestClient(app) as client:
         yield client, keys
@@ -271,6 +272,32 @@ def test_callback_verified_email_mints_session(
     # sub is the normalized (lowercased) verified email — proves the
     # decoded claim flowed all the way into the minted session.
     assert decoded["sub"] == "alice@example.com"
+
+
+def test_callback_records_last_login(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A successful sign-in stamps ``last_login_at`` on the user row.
+
+    The Members page and ``/auth/users`` read this column. Only the
+    password and invite routes wrote it, so every OIDC user showed
+    "Never".
+    """
+    client, keys = callback_client
+    perm_store = client.app.state.perm_store
+    # The account does not exist until the first sign-in creates it.
+    assert perm_store.get_user("alice@example.com") is None
+    before = int(time.time())
+
+    resp = _do_callback(
+        client, keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+    )
+
+    assert resp.status_code == 302, resp.text
+    account = perm_store.get_user("alice@example.com")
+    assert account is not None
+    assert account.last_login_at is not None
+    assert before <= account.last_login_at <= int(time.time())
 
 
 @pytest.mark.parametrize(

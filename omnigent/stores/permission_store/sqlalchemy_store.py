@@ -449,6 +449,22 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
         run_write_transaction(self._session_immediate, "ensure_user", write)
 
+    def mark_logged_in(self, user_id: str, when_epoch_seconds: int) -> None:
+        """Stamp ``last_login_at`` on an existing user. See base class for contract."""
+
+        def write(session: Session) -> None:
+            require_active_account(session, user_id)
+            session.execute(
+                update(SqlUser)
+                .where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == user_id,
+                )
+                .values(last_login_at=when_epoch_seconds)
+            )
+
+        run_write_transaction(self._session_immediate, "mark_user_logged_in", write)
+
     def get_user(self, user_id: str) -> Account | None:
         """Read the target identity without creating it. See base class."""
         with self._session("read_target_account") as session:
