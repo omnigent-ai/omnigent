@@ -51,6 +51,28 @@ switch for all terminal text retention or existing logging. See
 [Native harness diagnostics](harness-diagnostics.md) for the capture bounds,
 startup-failure fields, and app-server logging controls.
 
+## Start failure reasons
+
+`terminal_start_failed` and `native_terminal_start_failed` rows carry
+`attributes['reason']` when the failure matches a known cause, and omit it
+otherwise. The runner's error payload has the same `reason`, and the session
+error message names it, e.g.
+`Native Codex terminal failed to start (RuntimeError: codex_install_incomplete)`.
+Tokens come from a fixed set; no exception text is ever included.
+
+| `reason` | Cause |
+| --- | --- |
+| `codex_install_incomplete` | Codex's npm install lacks its platform package |
+| `codex_config_rejected` | Codex refused the host's `config.toml` (legacy `profile`, unknown model provider or profile, parse error) |
+| `tmux_missing`, `tmux_unsupported` | tmux is absent, or older than managed terminals support |
+| `cli_not_found` | The harness CLI is not installed or not on the host's `PATH` |
+| `app_server_start_timeout` | The Codex app-server did not accept connections in time |
+| `app_server_exited_early` | The Codex app-server exited before it was ready, for a reason not listed above |
+
+The first four rows are host environment problems with a fix the user can make,
+and the session message says what it is. The last two describe a symptom, so
+read the runner log for the cause.
+
 ## Verification
 
 ```sh

@@ -29,6 +29,7 @@ from omnigent.runner.native.orchestration import (
     _native_terminal_start_error_response,
     _publish_native_terminal_start_error,
 )
+from omnigent.runner.native.start_failure import classify_start_failure
 from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
 _ERROR_ID_RE = re.compile(r" Error ID: (err_[0-9a-f]{32})\.$")
@@ -62,6 +63,7 @@ def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
     match = _ERROR_ID_RE.search(message)
     assert match is not None, message
     assert payload["error_id"] == match.group(1)
+    assert "reason" not in payload
 
 
 def test_other_causes_keep_generic_startup_failure_code() -> None:
@@ -129,6 +131,7 @@ def test_generic_cause_names_errno_without_free_form_text() -> None:
         "see the runner log for details:"
     ) in payload["message"]
     assert "No space left on device" not in payload["message"]
+    assert "reason" not in payload
 
 
 def test_cause_includes_errno_name_for_os_errors() -> None:
@@ -184,6 +187,124 @@ def test_cause_names_omnigent_error_code_and_cause_type() -> None:
     assert orchestration._native_terminal_start_failure_cause(exc) == (
         f"OmnigentError code {ErrorCode.INTERNAL_ERROR} (cause ReadTimeout)"
     )
+
+
+@pytest.mark.parametrize(
+    ("exc", "reason", "leaked"),
+    [
+        pytest.param(
+            RuntimeError(
+                "Codex app-server exited early: Error: Missing optional dependency "
+                "@openai/codex-linux-x64. Reinstall Codex: npm install -g @openai/codex@latest"
+                " | at Object.<anonymous> (/home/alice/.nvm/lib/codex.js:79:11)"
+            ),
+            "codex_install_incomplete",
+            ("Missing optional dependency", "/home/alice"),
+            id="codex-install",
+        ),
+        pytest.param(
+            RuntimeError(
+                "Codex app-server exited early: Error: Model provider `Acme` not found; "
+                "key=sk-abcdef0123456789"
+            ),
+            "codex_config_rejected",
+            ("Acme", "sk-abcdef0123456789"),
+            id="codex-config",
+        ),
+        pytest.param(
+            RuntimeError("tmux is not installed or not on PATH"),
+            "tmux_missing",
+            ("not installed",),
+            id="tmux",
+        ),
+        pytest.param(
+            ImportError("Native Codex requires the 'codex' CLI on PATH. Set OMNIGENT_CODEX_PATH."),
+            "cli_not_found",
+            ("requires the 'codex' CLI", "OMNIGENT_CODEX_PATH"),
+            id="cli",
+        ),
+    ],
+)
+def test_recognized_cause_adds_reason_token_and_remedy(
+    pinned_runner_log: Path, exc: BaseException, reason: str, leaked: tuple[str, ...]
+) -> None:
+    """A known cause is named by a fixed token and fix, with none of the raw text."""
+    payload = _native_terminal_start_error_payload(exc, "Codex", session_id="conv_1")
+
+    cause = classify_start_failure(exc)
+    assert cause is not None and cause.remedy is not None
+    error_id = payload["error_id"]
+    assert payload == {
+        "code": "native_terminal_start_failed",
+        "error_id": error_id,
+        "message": (
+            f"Native Codex terminal failed to start ({type(exc).__name__}: {reason}). "
+            f"{cause.remedy} See the runner log for details: {pinned_runner_log} "
+            f"Error ID: {error_id}."
+        ),
+        "reason": reason,
+    }
+    for text in leaked:
+        assert text not in payload["message"]
+
+
+def test_recognized_cause_without_a_remedy_keeps_the_log_pointer_form(
+    pinned_runner_log: Path,
+) -> None:
+    exc = RuntimeError(
+        "Timed out after 60s waiting for the Codex app-server at ws://127.0.0.1:50000: None; "
+        "stderr=starting"
+    )
+
+    payload = _native_terminal_start_error_payload(exc, "Codex", session_id="conv_1")
+
+    assert payload["reason"] == "app_server_start_timeout"
+    assert payload["message"] == (
+        "Native Codex terminal failed to start (RuntimeError: app_server_start_timeout); "
+        f"see the runner log for details: {pinned_runner_log} "
+        f"Error ID: {payload['error_id']}."
+    )
+
+
+def test_reason_follows_the_structured_cause_facts() -> None:
+    """The token is appended to, not substituted for, the errno/code/cause facts."""
+    exc = FileNotFoundError(2, "No such file or directory")
+    exc.__cause__ = RuntimeError("tmux is not installed or not on PATH")
+
+    payload = _native_terminal_start_error_payload(exc, "Codex", session_id="conv_1")
+
+    assert "(FileNotFoundError errno 2 ENOENT: tmux_missing)" in payload["message"]
+    assert payload["reason"] == "tmux_missing"
+
+
+@pytest.mark.parametrize(
+    ("exc", "reason"),
+    [
+        pytest.param(RuntimeError("tmux is not installed or not on PATH"), "tmux_missing"),
+        pytest.param(RuntimeError("private launch configuration detail"), None, id="unknown"),
+        pytest.param(
+            OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
+            None,
+            id="missing-agent",
+        ),
+    ],
+)
+def test_start_failure_log_row_carries_the_reason(
+    caplog: pytest.LogCaptureFixture, exc: Exception, reason: str | None
+) -> None:
+    """The structured row keeps ``reason`` beside the exception type, absent when unknown."""
+    with caplog.at_level(logging.WARNING, logger=orchestration._logger.name):
+        _native_terminal_start_error_payload(exc, "Codex", session_id="conv_1")
+
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "native_terminal_start_failed"
+    ]
+    attrs = record_to_row(record, source="runner")["attributes"]
+    assert isinstance(attrs, dict)
+    assert attrs["exception_type"] == type(exc).__name__
+    assert attrs.get("reason") == reason
 
 
 def test_codex_early_exit_with_unknown_status_does_not_invent_one(

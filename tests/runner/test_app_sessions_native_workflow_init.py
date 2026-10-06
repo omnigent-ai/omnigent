@@ -538,6 +538,37 @@ async def test_launch_native_terminal_publishes_start_error_on_failure(
     )
     # pending True/False bracket the attempt, and a start-error event is published.
     assert any("error" in name.lower() or "error" in event for name, event in events)
+    assert failure.attributes["reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_launch_native_terminal_failure_row_names_a_recognized_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A known cause is a fixed ``reason`` on the startup failure row and the published error."""
+    from omnigent.runner.native import _launch_native_terminal
+
+    async def _boom(ctx: NativeLaunchContext) -> object:
+        raise RuntimeError("tmux is not installed or not on PATH")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", _boom)
+    events: list[tuple[str, dict[str, Any]]] = []
+    await _launch_native_terminal(
+        "pi-native",
+        _launch_ctx(publish_event=lambda name, event: events.append((name, event))),
+        ensure_locks={},
+    )
+
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_start_failed"
+    )
+    assert failure.attributes["reason"] == "tmux_missing"
+    [status] = [event for _, event in events if event.get("type") == "session.status"]
+    assert status["error"]["reason"] == "tmux_missing"
+    assert "(RuntimeError: tmux_missing)" in status["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -731,14 +762,32 @@ async def test_ensure_native_terminal_creates_when_absent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exc", "cause", "reason"),
+    [
+        pytest.param(
+            ImportError("Native goose requires the 'goose' CLI on PATH."),
+            "ImportError: cli_not_found",
+            "cli_not_found",
+            id="recognized",
+        ),
+        pytest.param(
+            RuntimeError("goose blew up at /private/path"), "RuntimeError", None, id="unrecognized"
+        ),
+    ],
+)
 async def test_ensure_native_terminal_builder_error_returns_500(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc: Exception,
+    cause: str,
+    reason: str | None,
 ) -> None:
     """A builder failure becomes a structured 500 JSON, not a live-published error."""
     from omnigent.runner.native import _ensure_native_terminal
 
     async def _boom(ctx: NativeLaunchContext) -> object:
-        raise ImportError("Native goose requires the 'goose' CLI on PATH.")
+        raise exc
 
     monkeypatch.setattr("omnigent.runner.native._launch_goose", _boom)
     resp = await _ensure_native_terminal(
@@ -746,14 +795,22 @@ async def test_ensure_native_terminal_builder_error_returns_500(
     )
 
     assert resp is not None and resp.status_code == 500
-    body = json.loads(bytes(resp.body))
-    # The raw ImportError text must not leak; a fixed client-safe message is used
+    error = json.loads(bytes(resp.body))["error"]
+    # The raw exception text must not leak; a fixed client-safe message is used
     # (the display name "Goose" identifies the runtime, not the raw cause).
-    assert "requires the 'goose' CLI" not in body["error"]["message"]
-    assert "Goose" in body["error"]["message"]
-    # The structured, non-sensitive cause (exception type only, here) still
-    # names the failure kind without the free-form message.
-    assert "(ImportError)" in body["error"]["message"]
+    assert "requires the 'goose' CLI" not in error["message"]
+    assert "/private/path" not in error["message"]
+    assert "Goose" in error["message"]
+    # Only structured, non-sensitive facts (exception type, recognized reason)
+    # name the failure kind.
+    assert f"terminal failed to start ({cause})" in error["message"]
+    assert error.get("reason") == reason
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_start_failed"
+    )
+    assert failure.attributes["reason"] == reason
 
 
 @pytest.mark.asyncio

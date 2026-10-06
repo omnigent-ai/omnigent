@@ -119,6 +119,10 @@ _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024
 _MODEL_DISCOVERY_STDERR_LINE_CHARS = 500
 _STDERR_CHUNK_LIMIT = 65536
+# A readiness failure quotes the last stderr lines, plus the first ``Error:``
+# line (capped) when a stack trace pushed it out of that tail.
+_READY_STDERR_TAIL_LINES = 5
+_READY_STDERR_ERROR_LINE_CHARS = 500
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
@@ -2256,7 +2260,7 @@ class CodexNativeAppServer:
         last_error: Exception | None = None
         while asyncio.get_running_loop().time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:
-                detail = " | ".join((self.recent_stderr or [])[-5:])
+                detail = _ready_failure_stderr_detail(self.recent_stderr)
                 raise RuntimeError(f"Codex app-server exited early: {detail}")
             client: CodexAppServerClient | None = None
             try:
@@ -2283,7 +2287,7 @@ class CodexNativeAppServer:
                     with contextlib.suppress(Exception):
                         await client.close()
                 await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
-        detail = " | ".join((self.recent_stderr or [])[-5:])
+        detail = _ready_failure_stderr_detail(self.recent_stderr)
         target = self.listen_url or f"unix://{self.socket_path}"
         raise RuntimeError(
             f"Timed out after {_APP_SERVER_READY_TIMEOUT_SECONDS:g}s waiting for the "
@@ -2353,6 +2357,31 @@ class CodexNativeAppServer:
                 record_line()
             if diagnostics is not None:
                 diagnostics.finish()
+
+
+def _ready_failure_stderr_detail(stderr_lines: Sequence[str] | None) -> str:
+    """
+    Quote recent app-server stderr for a readiness failure.
+
+    Keeps the last few lines and, when a stack trace or later output pushed it
+    out of that tail, the first ``Error:`` line, capped in length. That line
+    usually names the cause, e.g. a missing platform package.
+
+    :param stderr_lines: Recent stderr lines, oldest first, e.g.
+        ``["Error: Missing optional dependency ...", "    at ..."]``.
+    :returns: The quoted lines joined with ``" | "``; empty when there are none.
+    """
+    lines = list(stderr_lines or [])
+    tail_start = max(0, len(lines) - _READY_STDERR_TAIL_LINES)
+    quoted = lines[tail_start:]
+    first_error = next(
+        (line for line in lines[:tail_start] if line.lstrip().startswith("Error:")), None
+    )
+    if first_error is not None:
+        if len(first_error) > _READY_STDERR_ERROR_LINE_CHARS:
+            first_error = f"{first_error[:_READY_STDERR_ERROR_LINE_CHARS]}...[truncated]"
+        quoted.insert(0, first_error)
+    return " | ".join(quoted)
 
 
 def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) -> str:

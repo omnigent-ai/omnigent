@@ -13,11 +13,36 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
 )
+from omnigent.runner.native.start_failure import classify_start_failure
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _FakeStartupClient,
     _test_app_server,
 )
+
+_INSTALL_ERROR_LINE = (
+    "Error: Missing optional dependency @openai/codex-linux-x64. "
+    "Reinstall Codex: npm install -g @openai/codex@latest"
+)
+# Node's uncaught-exception output for a broken npm install: the ``Error:`` line
+# sits above a stack long enough that the last five lines no longer show it.
+_NODE_INSTALL_STDERR = [
+    "/usr/lib/node_modules/@openai/codex/bin/codex.js:79",
+    "    throw new Error(",
+    "          ^",
+    "",
+    _INSTALL_ERROR_LINE,
+    "    at Object.<anonymous> (/usr/lib/node_modules/@openai/codex/bin/codex.js:79:11)",
+    "    at Module._compile (node:internal/modules/cjs/loader:1554:14)",
+    "    at Object..js (node:internal/modules/cjs/loader:1706:10)",
+    "    at Module.load (node:internal/modules/cjs/loader:1289:32)",
+    "    at Function._load (node:internal/modules/cjs/loader:1108:12)",
+    "    at TracingChannel.traceSync (node:diagnostics_channel:322:14)",
+    "    at wrapModuleLoad (node:internal/modules/cjs/loader:220:24)",
+    "    at node:internal/main/run_main_module:36:49",
+    "",
+    "Node.js v22.14.0",
+]
 
 
 async def test_start_reuses_initialized_readiness_client_for_hook_trust(
@@ -317,6 +342,172 @@ async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
     assert (str(server.socket_path) in message) is (listen_url is None)
     assert len(clients) == 3
     assert all(client.close_calls == 1 for client in clients)
+    cause = classify_start_failure(excinfo.value)
+    assert cause is not None
+    assert cause.reason == "app_server_start_timeout"
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        pytest.param(None, "", id="no-buffer"),
+        pytest.param([], "", id="empty"),
+        pytest.param(["a", "b"], "a | b", id="short"),
+        pytest.param(
+            [f"line {i}" for i in range(8)],
+            "line 3 | line 4 | line 5 | line 6 | line 7",
+            id="only-the-last-five",
+        ),
+        pytest.param(
+            ["old", "Error: cause", "x", "y", "z", "w"],
+            "Error: cause | x | y | z | w",
+            id="error-line-in-the-tail-is-not-repeated",
+        ),
+        pytest.param(
+            ["Error: cause", "1", "2", "3", "4", "5"],
+            "Error: cause | 1 | 2 | 3 | 4 | 5",
+            id="error-line-before-the-tail-is-kept",
+        ),
+        pytest.param(
+            ["ok", "Error: first", "Error: second", "1", "2", "3", "4", "5"],
+            "Error: first | 1 | 2 | 3 | 4 | 5",
+            id="only-the-first-error-line",
+        ),
+        pytest.param(
+            ["  Error: indented", "1", "2", "3", "4", "5"],
+            "  Error: indented | 1 | 2 | 3 | 4 | 5",
+            id="indented-error-line",
+        ),
+        pytest.param(
+            ["TypeError: not it", "no Error: prefix", "1", "2", "3", "4", "5"],
+            "1 | 2 | 3 | 4 | 5",
+            id="other-lines-are-not-error-lines",
+        ),
+    ],
+)
+def test_ready_failure_stderr_detail_selection(stderr: list[str] | None, expected: str) -> None:
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    assert codex_native_app_server._ready_failure_stderr_detail(stderr) == expected
+
+
+def test_ready_failure_stderr_detail_caps_the_kept_error_line() -> None:
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    cap = codex_native_app_server._READY_STDERR_ERROR_LINE_CHARS
+    detail = codex_native_app_server._ready_failure_stderr_detail(
+        ["Error: " + "x" * 10_000, "1", "2", "3", "4", "5"]
+    )
+
+    kept, _, tail = detail.partition(" | 1 | ")
+    assert kept == ("Error: " + "x" * 10_000)[:cap] + "...[truncated]"
+    assert tail == "2 | 3 | 4 | 5"
+
+
+async def test_wait_until_ready_early_exit_keeps_the_error_line_a_stack_trace_pushed_out(
+    tmp_path: Path,
+) -> None:
+    """A broken Codex install still names its missing package when the child exits."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.proc = Mock(returncode=1)
+    server.recent_stderr = list(_NODE_INSTALL_STDERR)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await server._wait_until_ready()
+
+    assert str(excinfo.value) == (
+        f"Codex app-server exited early: {_INSTALL_ERROR_LINE} | "
+        + " | ".join(_NODE_INSTALL_STDERR[-5:])
+    )
+    cause = classify_start_failure(excinfo.value)
+    assert cause is not None
+    assert cause.reason == "codex_install_incomplete"
+
+
+async def test_captured_node_stderr_reaches_the_readiness_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stderr read from the child's pipe keeps the lines the readiness error quotes."""
+    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    stderr = asyncio.StreamReader()
+    stderr.feed_data(("\n".join(_NODE_INSTALL_STDERR) + "\n").encode())
+    stderr.feed_eof()
+    server.proc = Mock(returncode=1, stderr=stderr)
+    server.recent_stderr = []
+    await server._stderr_loop()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await server._wait_until_ready()
+
+    assert str(excinfo.value).startswith(
+        f"Codex app-server exited early: {_INSTALL_ERROR_LINE} | "
+    )
+    cause = classify_start_failure(excinfo.value)
+    assert cause is not None
+    assert cause.reason == "codex_install_incomplete"
+
+
+async def test_wait_until_ready_timeout_keeps_the_error_line_a_stack_trace_pushed_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same cause survives when the app-server is still running at the deadline."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", 0.0)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.proc = Mock(returncode=None)
+    server.recent_stderr = list(_NODE_INSTALL_STDERR)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await server._wait_until_ready()
+
+    assert str(excinfo.value).endswith(
+        f"; stderr={_INSTALL_ERROR_LINE} | " + " | ".join(_NODE_INSTALL_STDERR[-5:])
+    )
+    cause = classify_start_failure(excinfo.value)
+    assert cause is not None
+    assert cause.reason == "codex_install_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("stderr", "reason"),
+    [
+        pytest.param(
+            ['Error: legacy `profile = "ucode"` config is no longer supported'],
+            "codex_config_rejected",
+            id="legacy-profile",
+        ),
+        pytest.param(
+            ["warning: slow disk", "Error: Model provider `Databricks` not found"],
+            "codex_config_rejected",
+            id="model-provider",
+        ),
+        pytest.param(["starting"], "app_server_exited_early", id="unrecognized"),
+        pytest.param([], "app_server_exited_early", id="silent"),
+    ],
+)
+async def test_wait_until_ready_early_exit_is_recognized_from_stderr(
+    tmp_path: Path, stderr: list[str], reason: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.proc = Mock(returncode=1)
+    server.recent_stderr = stderr
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await server._wait_until_ready()
+
+    cause = classify_start_failure(excinfo.value)
+    assert cause is not None
+    assert cause.reason == reason
 
 
 async def test_standalone_hook_trust_closes_client_when_connect_fails(

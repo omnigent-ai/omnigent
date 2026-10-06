@@ -17,7 +17,7 @@ parameterization produces additional collected cases.
 | [test_policy_hooks.py](test_policy_hooks.py) | Policy hooks | 21 |
 | [test_router_hooks.py](test_router_hooks.py) | Router hooks | 10 |
 | [test_session_profiles.py](test_session_profiles.py) | Session profiles | 6 |
-| [test_startup.py](test_startup.py) | Startup | 8 |
+| [test_startup.py](test_startup.py) | Startup | 14 |
 
 Explicit fixtures stay in the test module that consumes them.
 Helpers shared by multiple modules live in `_support.py`; helpers used by one

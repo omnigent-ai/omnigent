@@ -64,6 +64,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.native.native_dispatch import resolve_hook
 from omnigent.process_logging import process_log_reference
+from omnigent.runner.native.start_failure import classify_start_failure
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -7565,6 +7566,19 @@ def _native_terminal_start_failure_cause(exc: BaseException) -> str:
     return class_name
 
 
+def _native_terminal_start_failure_reason(exc: BaseException) -> str | None:
+    """
+    Name the recognized cause of a native terminal start failure for a log row.
+
+    :param exc: Exception raised by the native terminal creation path, e.g.
+        ``RuntimeError("tmux is not installed or not on PATH")``.
+    :returns: A fixed reason token, e.g. ``"tmux_missing"``, or ``None`` when
+        no known cause matches.
+    """
+    failure = classify_start_failure(exc)
+    return failure.reason if failure is not None else None
+
+
 def _native_terminal_start_error_payload(
     exc: BaseException, runtime_name: str, *, session_id: str
 ) -> dict[str, str]:
@@ -7578,9 +7592,13 @@ def _native_terminal_start_error_payload(
     :returns: ``{"code": ..., "message": ...}`` payload for SSE and
         JSON error responses. Known actionable configuration errors surface
         their safe message directly; other causes point to the runner log.
+        A cause recognized by :func:`classify_start_failure` adds a fixed
+        ``"reason"`` token (e.g. ``"codex_install_incomplete"``) and, where
+        there is a clear fix, a short remedy sentence.
     """
     error_id = f"err_{uuid.uuid4().hex}"
     missing_agent = isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING
+    failure = None if missing_agent else classify_start_failure(exc)
     extra = debug_event(
         "native_terminal_start_failed",
         session_id=session_id,
@@ -7592,6 +7610,7 @@ def _native_terminal_start_error_payload(
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
+        reason=failure.reason if failure is not None else None,
         # The warning below carries no exc_info for a missing agent, so the
         # sink cannot derive its category.
         error_category=exc.category.value
@@ -7656,15 +7675,26 @@ def _native_terminal_start_error_payload(
     else:
         log_reference = process_log_reference("runner")
         cause = _native_terminal_start_failure_cause(exc)
-        message = (
-            f"Native {runtime_name} terminal failed to start ({cause}); "
-            f"see the runner log for details: {log_reference}"
-        )
-    return {
+        if failure is not None:
+            cause = f"{cause}: {failure.reason}"
+        if failure is not None and failure.remedy:
+            message = (
+                f"Native {runtime_name} terminal failed to start ({cause}). {failure.remedy} "
+                f"See the runner log for details: {log_reference}"
+            )
+        else:
+            message = (
+                f"Native {runtime_name} terminal failed to start ({cause}); "
+                f"see the runner log for details: {log_reference}"
+            )
+    payload = {
         "code": _NATIVE_TERMINAL_START_FAILED_CODE,
         "error_id": error_id,
         "message": f"{message} Error ID: {error_id}.",
     }
+    if failure is not None:
+        payload["reason"] = failure.reason
+    return payload
 
 
 def _publish_native_terminal_start_error(
@@ -9713,6 +9743,7 @@ async def _launch_native_terminal(
                     session_id=ctx.session_id,
                     harness=harness_name,
                     stage="terminal_start",
+                    reason=_native_terminal_start_failure_reason(exc),
                     error_impact=ErrorImpact.BLOCKING.value,
                     error_phase=ErrorPhase.HARNESS_STARTUP.value,
                 ),
@@ -9873,6 +9904,7 @@ async def _ensure_native_terminal(
                         session_id=ctx.session_id,
                         terminal_name=terminal_name,
                         stage="terminal_start",
+                        reason=_native_terminal_start_failure_reason(exc),
                         error_impact=ErrorImpact.BLOCKING.value,
                     ),
                 )
