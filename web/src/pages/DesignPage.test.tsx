@@ -192,7 +192,11 @@ describe("DesignPage list", () => {
   it("shows a search error with a retry that searches again", async () => {
     stubSessions([row("a", 1)]);
     searchMock.mockRejectedValueOnce(new Error("500 Server Error"));
-    searchMock.mockResolvedValueOnce({ status: "ok", paths: ["fixed.slides.html"], truncated: false });
+    searchMock.mockResolvedValueOnce({
+      status: "ok",
+      paths: ["fixed.slides.html"],
+      truncated: false,
+    });
 
     renderPage();
 
@@ -258,9 +262,9 @@ describe("DesignPage list", () => {
 
     renderPage();
 
-    expect(
-      await within(group("a")).findByText(/Search stopped early/),
-    ).toHaveTextContent("more decks may exist");
+    expect(await within(group("a")).findByText(/Search stopped early/)).toHaveTextContent(
+      "more decks may exist",
+    );
     expect(within(group("a")).getByText("d")).toBeInTheDocument();
   });
 });
@@ -268,7 +272,11 @@ describe("DesignPage list", () => {
 describe("DesignPage selection", () => {
   beforeEach(() => {
     stubSessions([row("a", 1, { title: "Pitch session" })]);
-    searchMock.mockResolvedValue({ status: "ok", paths: ["decks/pitch.slides.html"], truncated: false });
+    searchMock.mockResolvedValue({
+      status: "ok",
+      paths: ["decks/pitch.slides.html"],
+      truncated: false,
+    });
   });
 
   it("shows a hint until a deck is selected", async () => {
