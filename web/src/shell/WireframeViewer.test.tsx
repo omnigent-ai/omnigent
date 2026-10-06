@@ -111,8 +111,8 @@ describe("prepareWireframeDoc", () => {
     expect(at('<base target="_blank">')).toBeGreaterThan(0);
     expect(at("data-omnigent-design-system")).toBeLessThan(at("h1{color:red}"));
     expect(at("data-omnigent-kit")).toBeGreaterThan(at("h1{color:red}"));
-    expect(at("data-omnigent-kit")).toBeLessThan(at("<script>"));
-    expect(at("<script>")).toBeLessThan(at("</body>"));
+    expect(at("data-omnigent-kit")).toBeLessThan(doc.lastIndexOf("<script>"));
+    expect(doc.lastIndexOf("<script>")).toBeLessThan(at("</body>"));
     expect(doc).toContain(WIREFRAME_MSG_SOURCE);
   });
 
