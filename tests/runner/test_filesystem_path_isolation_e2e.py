@@ -201,14 +201,20 @@ async def test_symlink_read_escape_blocked_via_http(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("params", [None, {"scope": "reach"}], ids=["unmarked", "scope-reach"])
 async def test_symlink_write_escape_blocked_via_http(
     client: httpx.AsyncClient,
     planted: Path,
+    params: dict[str, str] | None,
 ) -> None:
-    """Writing through an in-workspace symlink must not mutate the out-of-root file."""
+    """Writing through an in-workspace symlink must not mutate the out-of-root file.
+
+    Only reads take ``scope=reach``, so the mark changes nothing here.
+    """
     outside = planted / "outside_secret.txt"
     resp = await client.put(
         f"{_BASE}/filesystem/escape.txt",
+        params=params,
         json={"content": "OVERWRITTEN-BY-ATTACKER", "encoding": "utf-8"},
     )
     assert resp.status_code != 200, resp.text
@@ -250,22 +256,6 @@ async def test_reach_scope_follows_a_symlinked_directory_out_of_the_workspace(
     )
     assert download.status_code == 200, download.text
     assert download.content == _SECRET.encode()
-
-
-@pytest.mark.asyncio
-async def test_reach_scope_does_not_unlock_writes_through_a_symlink(
-    client: httpx.AsyncClient,
-    planted: Path,
-) -> None:
-    """Only reads take the scope: a write through the outward link is still refused."""
-    outside = planted / "outside_secret.txt"
-    resp = await client.put(
-        f"{_BASE}/filesystem/escape.txt",
-        params={"scope": "reach"},
-        json={"content": "OVERWRITTEN-BY-ATTACKER", "encoding": "utf-8"},
-    )
-    assert resp.status_code != 200, resp.text
-    assert outside.read_text() == _SECRET
 
 
 @pytest.mark.asyncio

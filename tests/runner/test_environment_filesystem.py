@@ -2482,3 +2482,36 @@ def test_outward_symlink_under_a_confined_policy_needs_a_grant(tmp_path: Path) -
         _confined_fs(ws, read_roots=[outside], follow_outward_links=False)._resolve("linked")
 
     assert _confined_fs(ws, read_roots=[outside])._resolve("linked") == outside
+
+
+@pytest.mark.asyncio
+async def test_default_read_still_follows_a_symlink_into_a_read_grant(tmp_path: Path) -> None:
+    """Callers that never ask for outward links (the file-diff route, the write
+    baseline capture) read through a workspace symlink into a declared read grant
+    via the helper, as they always did; a link to an ungranted directory still
+    fails there instead of being resolved up front."""
+    granted = (tmp_path / "granted").resolve()
+    granted.mkdir()
+    (granted / "note.txt").write_text("granted content\n")
+    ungranted = (tmp_path / "ungranted").resolve()
+    ungranted.mkdir()
+    (ungranted / "note.txt").write_text("secret\n")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "linked").symlink_to(granted, target_is_directory=True)
+    (ws / "escape").symlink_to(ungranted, target_is_directory=True)
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(type="none", read_paths=[str(granted)]),
+        )
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+    try:
+        assert (await fs.read("linked/note.txt")).data == b"granted content\n"
+        with pytest.raises(FilesystemPathNotFound):
+            await fs.read("escape/note.txt")
+    finally:
+        os_env.close()

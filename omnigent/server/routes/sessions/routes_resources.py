@@ -53,6 +53,7 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -770,18 +771,44 @@ def register_resources_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
-        # ``level is None`` means permissions are disabled (single-user); admins
-        # resolve to owner. Edit collaborators keep the workspace unconditionally;
-        # a view-only grant reaches it only once the owner shares its files.
-        if access.level is None or access.level >= LEVEL_OWNER:
-            return conv, True
-        if access.level >= LEVEL_EDIT or conv.share_workspace_files:
-            return conv, False
+        # ``level is None`` means permissions are disabled (single-user) or, on a
+        # child session, access inherited from the parent chain with no direct
+        # grant. Edit collaborators keep the workspace unconditionally; a
+        # view-only grant reaches it only once the owner shares its files.
+        if access.level is None or access.level >= LEVEL_EDIT or conv.share_workspace_files:
+            return conv, await _owns_session(user_id, conv, access.level)
         raise OmnigentError(
             f"{user_id!r} needs edit access to browse the workspace of session "
             f"{session_id!r}, or the owner must enable file sharing",
             code=ErrorCode.FORBIDDEN,
         )
+
+    async def _owns_session(user_id: str | None, conv: Conversation, level: int | None) -> bool:
+        """Whether the caller clears the owner bar :func:`_browse_level` sets.
+
+        The same decision ``_validate_session(..., LEVEL_OWNER)`` makes, without
+        raising: permissions disabled, an admin or direct owner grant, or — on a
+        child session — ownership resolved through the parent chain, which is
+        the only case that costs a further lookup.
+
+        :param user_id: The authenticated user.
+        :param conv: The conversation already authorized for reading.
+        :param level: The caller's direct level from that authorization, or
+            ``None`` when permissions are disabled or no direct grant exists.
+        :returns: ``True`` for an effective owner.
+        """
+        if permission_store is None:
+            return True
+        if conv.parent_conversation_id is not None:
+            return await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                conv.parent_conversation_id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+            )
+        return level is not None and level >= LEVEL_OWNER
 
     def _resolve_browse_path(request: Request, client_path: str) -> tuple[bool, str]:
         """Resolve a filesystem request path against its declared base.

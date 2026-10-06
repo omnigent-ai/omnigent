@@ -50,6 +50,7 @@ from omnigent.errors import OmnigentError
 from omnigent.runtime import _globals, set_runner_client, set_runner_router
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
@@ -71,12 +72,19 @@ class _StubConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self._conversations.get(conversation_id)
 
-    def add(self, conversation_id: str, *, share_workspace_files: bool = False) -> None:
+    def add(
+        self,
+        conversation_id: str,
+        *,
+        share_workspace_files: bool = False,
+        parent: str | None = None,
+    ) -> None:
         self._conversations[conversation_id] = Conversation(
             id=conversation_id,
             created_at=0,
             updated_at=0,
-            root_conversation_id=conversation_id,
+            root_conversation_id=parent or conversation_id,
+            parent_conversation_id=parent,
             agent_id="ag_test",
             share_workspace_files=share_workspace_files,
         )
@@ -274,9 +282,13 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     # A second session whose owner opted into sharing workspace files with
     # view-level collaborators — same grant shape, share flag on.
     conv_store.add("conv_open", share_workspace_files=True)
+    # A sub-agent of conv_share: nobody holds a direct grant on it, so every
+    # caller's access is inherited through the parent.
+    conv_store.add("conv_child", parent="conv_share")
     perm_store = _StubPermissionStore()
     perm_store.add_grant("owner@example.com", "conv_share", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_share", LEVEL_READ)
+    perm_store.add_grant("manager@example.com", "conv_share", LEVEL_MANAGE)
     perm_store.add_grant("real-owner@example.com", "conv_share", LEVEL_OWNER)
     perm_store.add_grant("owner@example.com", "conv_open", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_open", LEVEL_READ)
@@ -458,8 +470,24 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
         ("owner@example.com", _FS_RELATIVE, False),
         ("viewer@example.com", _FS_RELATIVE.replace("conv_share", "conv_open"), False),
         ("real-owner@example.com", _FS_ABSOLUTE, False),
+        ("real-owner@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), True),
+        ("admin@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), True),
+        ("manager@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
+        ("owner@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
+        ("viewer@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
     ],
-    ids=["owner", "admin", "edit-collaborator", "shared-viewer", "owner-absolute"],
+    ids=[
+        "owner",
+        "admin",
+        "edit-collaborator",
+        "shared-viewer",
+        "owner-absolute",
+        "child-inherited-owner",
+        "child-admin",
+        "child-inherited-manager",
+        "child-inherited-editor",
+        "child-inherited-viewer",
+    ],
 )
 async def test_filesystem_marks_reach_scope_for_the_owner_only(
     client: httpx.AsyncClient,
@@ -470,9 +498,11 @@ async def test_filesystem_marks_reach_scope_for_the_owner_only(
 ) -> None:
     """A workspace symlink may lead outside the workspace. The runner follows
     it only when the request carries ``scope=reach``, which is added for the
-    owner alone -- the bar an absolute path already needs -- so a shared
-    session cannot reach past the workspace through a link. An absolute path
-    needs no mark; it is authorized as itself."""
+    effective owner alone -- the bar an absolute path already needs -- so a
+    shared session cannot reach past the workspace through a link. On a child
+    session that decision follows the parent chain, exactly as the absolute
+    gate does: inherited manage/edit/read access is not ownership. An absolute
+    path needs no mark; it is authorized as itself."""
     resp = await client.get(url, headers={"X-Forwarded-Email": caller})
 
     assert resp.status_code == 200, resp.text

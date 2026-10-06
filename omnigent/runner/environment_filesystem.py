@@ -1100,21 +1100,26 @@ print(json.dumps({'r': results, 't': truncated}))
         validated = "" if absolute else _validate_path(path)
         if not absolute and not validated:
             raise InvalidPath("Cannot read the environment root")
-        resolved = self._resolve(path)
-        if not self._within_grants(resolved):
-            # Only reachable when the environment is unconfined —
-            # ``_resolve`` rejects out-of-grant paths otherwise — so there
-            # is no sandbox to route around. Runs the same implementation
-            # the helper would, minus the file-tool cwd guard, which is an
-            # agent-tool policy rather than a browsing boundary.
-            direct = await _run_impl_direct(_read_impl, resolved, 1, limit, byte_cap)
-            return self._file_content(path, direct, byte_cap)
+        # A workspace path keeps its relative form: the helper runs with cwd at
+        # the root and enforces the environment's reach itself, so a symlink
+        # into a declared grant reads as it always has.
+        target = validated
+        if absolute or self._follow_outward_links:
+            resolved = self._resolve(path)
+            if not self._within_grants(resolved):
+                # Only reachable when the environment is unconfined —
+                # ``_resolve`` rejects out-of-grant paths otherwise — so there
+                # is no sandbox to route around. Runs the same implementation
+                # the helper would, minus the file-tool cwd guard, which is an
+                # agent-tool policy rather than a browsing boundary.
+                direct = await _run_impl_direct(_read_impl, resolved, 1, limit, byte_cap)
+                return self._file_content(path, direct, byte_cap)
+            if absolute:
+                target = str(resolved)
 
-        # The helper runs with cwd at the root, so a workspace path keeps its
-        # relative form.
         result = await _run_os_env_async(
             self._os_env.read,
-            str(resolved) if absolute else validated,
+            target,
             limit=limit,
             # Bound text and binary reads before content crosses the helper IPC.
             max_bytes=byte_cap,
