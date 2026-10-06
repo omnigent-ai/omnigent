@@ -9,7 +9,7 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from types import SimpleNamespace
+from types import ModuleType
 from typing import Any
 
 import httpx
@@ -30,6 +30,23 @@ from tests.server.integration.test_runner_tunnel_route import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+class _AsyncioProxy:
+    def __init__(self, to_thread: Callable[..., Awaitable[Any]]) -> None:
+        self.to_thread = to_thread
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(asyncio, name)
+
+
+def _patch_to_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    module: ModuleType,
+    to_thread: Callable[..., Awaitable[Any]],
+) -> None:
+    """Intercept one module's offloads without changing global asyncio behavior."""
+    monkeypatch.setattr(module, "asyncio", _AsyncioProxy(to_thread))
 
 
 def _create_session(app: FastAPI, agent_id: str, **kwargs: Any) -> Conversation:
@@ -196,11 +213,7 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
                     monkeypatch.setattr(registry, "get", lambda _: newer)
         return result
 
-    monkeypatch.setattr(
-        server_app,
-        "asyncio",
-        SimpleNamespace(**(vars(asyncio) | {"to_thread": read_then_replace})),
-    )
+    _patch_to_thread(monkeypatch, server_app, read_then_replace)
 
     async def heartbeat() -> None:
         while not stop.is_set():
@@ -350,11 +363,7 @@ async def test_reconnect_skips_root_rebound_before_initialization(
             await asyncio.to_thread(rebind_subtree)
         return result
 
-    monkeypatch.setattr(
-        server_app,
-        "asyncio",
-        SimpleNamespace(**(vars(asyncio) | {"to_thread": rebind_after_listing})),
-    )
+    _patch_to_thread(monkeypatch, server_app, rebind_after_listing)
 
     async def respond(request: httpx.Request) -> httpx.Response:
         requested.append(json.loads(request.content)["session_id"])
@@ -425,11 +434,7 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
         helpers,
         orchestration,
     ):
-        monkeypatch.setattr(
-            module,
-            "asyncio",
-            SimpleNamespace(**(vars(asyncio) | {"to_thread": tracked_store_call})),
-        )
+        _patch_to_thread(monkeypatch, module, tracked_store_call)
 
     async def respond(request: httpx.Request) -> httpx.Response:
         sid = json.loads(request.content)["session_id"]
@@ -485,12 +490,14 @@ async def test_hosted_child_recovers_independently_while_parent_is_stalled(
 
 
 @pytest.mark.parametrize("superseded", [False, True])
-async def test_root_transport_failure_is_quiet_only_after_tunnel_replacement(
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, RuntimeError])
+async def test_root_recovery_failure_is_quiet_only_after_tunnel_replacement(
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     superseded: bool,
+    error_type: type[Exception],
 ) -> None:
     agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     root = _create_session(app, agent.id)
@@ -499,7 +506,7 @@ async def test_root_transport_failure_is_quiet_only_after_tunnel_replacement(
     async def respond(_: httpx.Request) -> httpx.Response:
         if superseded:
             monkeypatch.setattr(app.state.tunnel_registry, "get", lambda _: None)
-        raise httpx.ConnectError("runner tunnel closed during initialization")
+        raise error_type("runner recovery failed during initialization")
 
     async with _recover(app, monkeypatch, respond) as (_, finished):
         await asyncio.wait_for(finished.wait(), budget(5))

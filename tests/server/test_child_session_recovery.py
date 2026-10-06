@@ -374,6 +374,43 @@ async def test_concurrent_recovery_does_not_allocate_a_second_continuation(
 
 
 @pytest.mark.asyncio
+async def test_scheduled_restoration_is_shared_only_within_one_generation(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import child_session_recovery as recovery
+
+    store, parent, _, _, _, _ = recovery_tree
+    connection = SimpleNamespace(generation=1)
+    initializer = RunnerSessionInitializer(Mock(get=lambda _: connection), server_version="test")
+    pending: dict[object, asyncio.Task[None]] = {}
+    started: asyncio.Queue[int] = asyncio.Queue()
+    release = asyncio.Event()
+    completed: list[int] = []
+
+    async def restore(*_: Any, generation: int) -> None:
+        started.put_nowait(generation)
+        await release.wait()
+        completed.append(generation)
+
+    monkeypatch.setattr(recovery, "_restoration_tasks", pending)
+    monkeypatch.setattr(recovery, "restore_active_children", restore)
+    async with httpx.AsyncClient() as client:
+        try:
+            recovery.schedule_child_restoration(parent, client, store, initializer)
+            assert await asyncio.wait_for(started.get(), 5) == 1
+            recovery.schedule_child_restoration(parent, client, store, initializer)
+            connection.generation = 2
+            recovery.schedule_child_restoration(parent, client, store, initializer)
+            assert await asyncio.wait_for(started.get(), 5) == 2
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*pending.values()), 5)
+
+    assert sorted(completed) == [1, 2]
+    assert not pending
+
+
+@pytest.mark.asyncio
 async def test_message_handshake_does_not_wait_for_child_initialization(
     recovery_tree: Any,
 ) -> None:

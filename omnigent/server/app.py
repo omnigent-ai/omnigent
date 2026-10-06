@@ -3682,15 +3682,13 @@ def create_app(
                             generation=connection.generation,
                             store_slots=store_slots,
                         )
-                except (ConnectionError, httpx.HTTPError):
+                except Exception:
                     if tunnel_registry.get(runner_id) is connection:
                         _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
                     else:
                         _logger.info(
                             "Stopped recovering session %s: runner tunnel changed", conv.id
                         )
-                except Exception:
-                    _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
 
         # A hung initialization delays only its own tree. All tasks are joined and
         # cancelled with this connection; no detached recovery or shared deadline.

@@ -1059,6 +1059,7 @@ async def _reconnect_fires_connect_hook(
     *,
     wait_for_recover: str,
     runner_client: httpx.AsyncClient | None = None,
+    expect_recovered: bool = True,
 ) -> AsyncIterator[list[str]]:
     """Drive a real tunnel disconnect/reconnect so ``_on_runner_connect`` fires.
 
@@ -1175,6 +1176,7 @@ async def _reconnect_fires_connect_hook(
                 f"within 5s. recovered_calls={recovered_calls}"
             ) from None
 
+        assert (wait_for_recover in recovered_calls) is expect_recovered, recovered_calls
         yield recovered_calls
     finally:
         runner_tunnel._run_connect_hook = real_hook
@@ -2203,7 +2205,10 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
 
     monkeypatch.setattr(initializer, "initialize", record_init)
     async with _reconnect_fires_connect_hook(
-        ap_app, fake_pm, wait_for_recover=parent_id
+        ap_app,
+        fake_pm,
+        wait_for_recover=parent_id,
+        expect_recovered=fail_first != "parent",
     ) as recovered:
         if fail_first:
             assert failed_once
