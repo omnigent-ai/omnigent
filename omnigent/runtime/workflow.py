@@ -45,6 +45,7 @@ from omnigent.inner.model_egress import (
 from omnigent.llms import Client as LLMClient
 from omnigent.models.model_catalog import resolve_catalog_model
 from omnigent.models.model_resolver import ModelResolutionError
+from omnigent.onboarding.ambient import claude_managed_gateway
 from omnigent.onboarding.databricks_config import (
     get_workspace_url_for_profile,
 )
@@ -1127,7 +1128,10 @@ def _resolve_provider_for_build(
        builders thread the key themselves).
     4. The per-family global default (``providers: … default: true``), then an
        ambient-detected default.
-    5. (``for_launch`` only) the first credential that can serve the family even
+    5. For claude-sdk, a configured Claude CLI subscription backed by managed
+       credentials. The CLI owns its auth and default model, even when the
+       subscription detection was deduplicated against a saved entry.
+    6. (``for_launch`` only) the first credential that can serve the family even
        though it is not marked default — so a launch credentials the head (e.g.
        Debby's codex head with only a never-defaulted Databricks workspace)
        rather than failing with "Invalid API key". Off for the readout / cost
@@ -1218,6 +1222,12 @@ def _resolve_provider_for_build(
     ambient_default = default_provider_for_harness(effective, harness)
     if ambient_default is not None:
         return ambient_default
+    # A saved CLI subscription suppresses its ambient detection. Keep managed
+    # Claude auth/model ahead of unrelated, unselected saved API keys.
+    if harness_type == "claude-sdk" and claude_managed_gateway()[1]:
+        for entry in load_providers(effective).values():
+            if entry.kind == SUBSCRIPTION_KIND and entry.cli == "claude":
+                return entry
     # Launch-only last resort: no default anywhere, but a credential that serves
     # this family is configured (e.g. a Databricks workspace the user added but
     # never set as the default). The runner is the one chokepoint every head
