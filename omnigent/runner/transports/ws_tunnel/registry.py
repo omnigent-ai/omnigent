@@ -740,6 +740,8 @@ class TunnelRegistry:
             route-loop outbound queue.
         :raises ConnectionError: If ``session`` is no longer the
             registry's current generation for its runner id.
+        :raises Exception: Preparation or queue failures before frame acceptance
+            are forwarded from the owner loop.
         """
         requested_at = session.diagnostics.timestamp()
         ack: concurrent.futures.Future[None] = concurrent.futures.Future()
@@ -754,11 +756,18 @@ class TunnelRegistry:
                         data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
                     )
                     session.outbound_queue.put_nowait(frame)
-                    # Recording failures cannot undo an accepted frame.
+                    # Recording or logging failures cannot undo an accepted frame.
                     with contextlib.suppress(Exception):
-                        session.diagnostics.enqueued(
-                            frame, session.outbound_queue.qsize(), requested_at
-                        )
+                        try:
+                            session.diagnostics.enqueued(
+                                frame, session.outbound_queue.qsize(), requested_at
+                            )
+                        except Exception:  # noqa: BLE001 — recording failures are best-effort.
+                            _logger.debug(
+                                "Runner %s outbound queue diagnostics failed",
+                                session.runner_id,
+                                exc_info=True,
+                            )
             except Exception as error:  # noqa: BLE001 — forward failures across loops.
                 if not ack.done():
                     ack.set_exception(error)

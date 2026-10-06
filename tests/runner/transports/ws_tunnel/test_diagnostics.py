@@ -106,8 +106,9 @@ async def test_monitor_failure_is_logged_without_interrupting_sends(
         pass
 
     diagnostics = TunnelDiagnostics(clock=clock)
+    diagnostics.settings["tunnel_side"] = "server"
     assert diagnostics.snapshot()["sampler_failed"] is False
-    async with diagnostics.monitoring(lambda: None):
+    async with diagnostics.monitoring(lambda: None, connection_id="conn-sampler-failure"):
         now += 8
         assert diagnostics.snapshot()["loop_lag_max_s"] == 3.0
         fail_clock = True
@@ -116,6 +117,10 @@ async def test_monitor_failure_is_logged_without_interrupting_sends(
         assert len(records) == 1
         assert records[0].exc_info is not None
         assert records[0].exc_info[1] is error
+        assert records[0].attributes == {
+            "connection_id": "conn-sampler-failure",
+            "tunnel_side": "server",
+        }
         await diagnostics.send(send, "still connected")
         now += 100
         snapshot = diagnostics.snapshot()

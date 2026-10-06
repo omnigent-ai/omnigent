@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import threading
 
 import pytest
@@ -358,7 +359,11 @@ async def test_send_diagnostics_follow_owner_loop_and_connection_generation() ->
         clock=lambda: owner_now if threading.get_ident() == owner_thread else 100.0
     )
     await asyncio.to_thread(
-        lambda: asyncio.run(registry.send_text(first, "heartbeat", app_ping_ts=123))
+        lambda: asyncio.run(
+            asyncio.wait_for(
+                registry.send_text(first, "heartbeat", app_ping_ts=123), timeout=budget(1)
+            )
+        )
     )
     queued = first.outbound_queue.get_nowait()
     assert queued is not None
@@ -407,13 +412,19 @@ async def test_send_text_propagates_owner_loop_timestamp_error(
 
 @pytest.mark.parametrize("cross_loop", [False, True], ids=["same-loop", "cross-loop"])
 async def test_send_text_accepts_queued_frame_when_diagnostics_fail(
-    monkeypatch: pytest.MonkeyPatch, cross_loop: bool
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, cross_loop: bool
 ) -> None:
     registry = TunnelRegistry()
     session = registry.register("r1", _NoopWS(), _hello())
+    await registry.send_text(session, "earlier frame")
+    first = session.outbound_queue.get_nowait()
+    assert first is not None
+    session.diagnostics.dequeued(first)
+    error = RuntimeError("queue diagnostics failed")
+    caplog.set_level(logging.DEBUG, logger="omnigent.runner.transports.ws_tunnel.registry")
 
     def fail_recording(*_args: object) -> None:
-        raise RuntimeError("queue diagnostics failed")
+        raise error
 
     monkeypatch.setattr(session.diagnostics, "enqueued", fail_recording)
 
@@ -432,6 +443,13 @@ async def test_send_text_accepts_queued_frame_when_diagnostics_fail(
     assert frame.data == "heartbeat"
     assert frame.app_ping_ts == 123
     assert session.outbound_queue.empty()
+    session.diagnostics.dequeued(frame)
+    snapshot = session.diagnostics.snapshot()
+    assert snapshot["outbound_queue_depth"] == 0
+    assert snapshot["app_pings_queued"] == 0
+    recorded = next(r for r in caplog.records if "outbound queue diagnostics failed" in r.message)
+    assert recorded.exc_info is not None
+    assert recorded.exc_info[1] is error
 
 
 @pytest.mark.asyncio

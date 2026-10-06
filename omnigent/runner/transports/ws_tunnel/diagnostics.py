@@ -133,7 +133,7 @@ class TunnelDiagnostics:
         self._ping_rtt = _Timing()
         self._observed_at: dict[str, float] = {}
         self._active_sends: dict[object, float] = {}
-        self._send_count = 0
+        self._sends_in_flight = 0
         self._send_samples_dropped = 0
         self._send_errors = 0
         self._send_cancellations = 0
@@ -155,11 +155,13 @@ class TunnelDiagnostics:
         return self._clock()
 
     @contextlib.asynccontextmanager
-    async def monitoring(self, report: Callable[[], None]) -> AsyncIterator[None]:
+    async def monitoring(
+        self, report: Callable[[], None], *, connection_id: str | None = None
+    ) -> AsyncIterator[None]:
         """Sample scheduling delays and report slow operations at most once/minute."""
         self._report = report
         self._loop_due_at = self._clock() + _SAMPLE_INTERVAL_S
-        task = asyncio.create_task(self._monitor(), name="tunnel-diagnostics")
+        task = asyncio.create_task(self._monitor(connection_id), name="tunnel-diagnostics")
         try:
             yield
         finally:
@@ -171,12 +173,12 @@ class TunnelDiagnostics:
                 self._report = None
                 await asyncio.gather(task, return_exceptions=True)
 
-    async def _monitor(self) -> None:
+    async def _monitor(self, connection_id: str | None) -> None:
         try:
-            while self._loop_due_at is not None:
-                await asyncio.sleep(max(0.0, self._loop_due_at - self._clock()))
+            while (due_at := self._loop_due_at) is not None:
+                await asyncio.sleep(max(0.0, due_at - self._clock()))
                 now = self._clock()
-                lag = max(0.0, now - self._loop_due_at)
+                lag = max(0.0, now - due_at)
                 self._loop_lag.observe(lag, now)
                 self._loop_due_at = now + _SAMPLE_INTERVAL_S
                 oldest_send = min(self._active_sends.values(), default=now)
@@ -187,7 +189,15 @@ class TunnelDiagnostics:
             self._loop_due_at = None
             self._sampler_failed = True
             with contextlib.suppress(Exception):
-                _logger.exception("Tunnel diagnostics monitor failed")
+                _logger.exception(
+                    "Tunnel diagnostics monitor failed",
+                    extra={
+                        "attributes": {
+                            "connection_id": connection_id,
+                            "tunnel_side": self.settings.get("tunnel_side"),
+                        }
+                    },
+                )
 
     def _maybe_report(self, now: float) -> None:
         if self._report is not None and self._frozen is None and now >= self._next_report_at:
@@ -225,10 +235,10 @@ class TunnelDiagnostics:
         now = self._clock()
         # Count data frames only; retirement also enqueues a None sentinel.
         if self._queue_depth is not None:
-            self._queue_depth -= 1
+            self._queue_depth = max(0, self._queue_depth - 1)
         self._queue_wait.observe(now - frame.queued_at, now)
         if frame.app_ping_ts is not None:
-            self._queued_pings -= 1
+            self._queued_pings = max(0, self._queued_pings - 1)
         if now - frame.queued_at >= _SLOW_OPERATION_S:
             self._maybe_report(now)
 
@@ -242,7 +252,7 @@ class TunnelDiagnostics:
         """Observe send completion, exceptions and cancellation without altering them."""
         started = self._clock()
         token = object()
-        self._send_count += 1
+        self._sends_in_flight += 1
         if len(self._active_sends) < _MAX_TRACKED_SENDS:
             self._active_sends[token] = started
         else:
@@ -272,7 +282,7 @@ class TunnelDiagnostics:
             now = self._clock()
             self._send_duration.observe(now - started, now)
             self._last_send_outcome = outcome
-            self._send_count -= 1
+            self._sends_in_flight -= 1
             self._active_sends.pop(token, None)
             if now - started >= _SLOW_OPERATION_S:
                 self._maybe_report(now)
@@ -295,7 +305,7 @@ class TunnelDiagnostics:
             "diagnostics_age_s": 0.0,
             "loop_sample_interval_s": _SAMPLE_INTERVAL_S,
             "sampler_failed": self._sampler_failed,
-            "sends_in_flight": self._send_count,
+            "sends_in_flight": self._sends_in_flight,
             "oldest_tracked_send_age_s": _age(now, min(self._active_sends.values(), default=None)),
             "send_samples_dropped": self._send_samples_dropped,
             "send_errors": self._send_errors,

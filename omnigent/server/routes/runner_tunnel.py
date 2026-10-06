@@ -551,7 +551,9 @@ def create_runner_tunnel_router(
                 ),
             )
 
-            async with session.diagnostics.monitoring(_report_diagnostics):
+            async with session.diagnostics.monitoring(
+                _report_diagnostics, connection_id=frame.connection_id
+            ):
                 # 6. Start tunnel helper tasks. The sender task is the
                 # only code path that writes to the Starlette WebSocket;
                 # request-side callers enqueue frames through the registry.

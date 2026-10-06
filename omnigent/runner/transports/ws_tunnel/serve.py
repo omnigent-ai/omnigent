@@ -970,7 +970,7 @@ async def _serve_tunnel_once(
             ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
             ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
         ) as ws,
-        diagnostics.monitoring(_report_diagnostics),
+        diagnostics.monitoring(_report_diagnostics, connection_id=connection_id),
     ):
         diagnostics.settings.update(
             protocol_ping_interval_s=getattr(ws, "ping_interval", None),
