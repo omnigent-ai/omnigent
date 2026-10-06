@@ -165,6 +165,7 @@ describe("buildDesignGroups", () => {
       {
         status: "ok",
         paths: ["z.slides.html", ".worktrees/x/z.slides.html", "a/b.slides.html", "notes.md"],
+        truncated: false,
       },
     ];
 
@@ -173,6 +174,7 @@ describe("buildDesignGroups", () => {
     ]);
 
     expect(group.status).toBe("ready");
+    expect(group.truncated).toBe(false);
     expect(group.kit).toEqual({ status: "ok", name: "Acme" });
     expect(group.decks).toEqual([
       { sessionId: "a", path: "a/b.slides.html", name: "b", sessionTitle: "Pitch work" },
@@ -180,11 +182,23 @@ describe("buildDesignGroups", () => {
     ]);
   });
 
+  it("keeps a truncated search with no decks so the cap is visible", () => {
+    const [group] = buildDesignGroups(
+      workspaces.slice(0, 1),
+      [{ status: "ok", paths: ["notes.md"], truncated: true }],
+      [],
+    );
+
+    expect(group.status).toBe("ready");
+    expect(group.decks).toEqual([]);
+    expect(group.truncated).toBe(true);
+  });
+
   it("keeps loading, unavailable, and error groups and drops empty finished ones", () => {
     const groups = buildDesignGroups(
       workspaces,
       [
-        { status: "ok", paths: ["notes.md"] },
+        { status: "ok", paths: ["notes.md"], truncated: false },
         { status: "loading" },
         { status: "unavailable" },
         { status: "error", message: "500 Internal Server Error" },
@@ -204,7 +218,7 @@ describe("buildDesignGroups", () => {
   it("marks the kit as loading until its read settles", () => {
     const [group] = buildDesignGroups(
       workspaces.slice(0, 1),
-      [{ status: "ok", paths: ["d.slides.html"] }],
+      [{ status: "ok", paths: ["d.slides.html"], truncated: false }],
       [],
     );
     expect(group.kit).toEqual({ status: "loading" });

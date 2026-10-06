@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import type * as workspaceFiles from "@/hooks/useWorkspaceChangedFiles";
 import { requestWorkspaceFileSearch } from "@/hooks/useWorkspaceChangedFiles";
-import { fetchDeckSearch, fetchKitIndicator } from "./designDeckApi";
+import { WORKSPACE_FILE_SEARCH_LIMIT, fetchDeckSearch, fetchKitIndicator } from "./designDeckApi";
 
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importActual) => ({
@@ -42,11 +42,42 @@ describe("fetchDeckSearch", () => {
     expect(await fetchDeckSearch("conv_a")).toEqual({
       status: "ok",
       paths: ["decks/q3.slides.html"],
+      truncated: false,
     });
     expect(searchMock).toHaveBeenCalledWith("conv_a", {
       query: ".slides.html",
       include: "**/*.slides.html",
     });
+  });
+
+  it("surfaces the server truncated flag", async () => {
+    searchMock.mockResolvedValue(
+      response(200, {
+        object: "list",
+        data: [entry("decks/q3.slides.html")],
+        has_more: false,
+        truncated: true,
+      }),
+    );
+
+    expect(await fetchDeckSearch("conv_a")).toEqual({
+      status: "ok",
+      paths: ["decks/q3.slides.html"],
+      truncated: true,
+    });
+  });
+
+  it("treats a full page of results as truncated when the server omits the flag", async () => {
+    const data = Array.from({ length: WORKSPACE_FILE_SEARCH_LIMIT }, (_, i) =>
+      entry(`decks/d${i}.slides.html`),
+    );
+    searchMock.mockResolvedValue(
+      response(200, { object: "list", data, has_more: false }),
+    );
+
+    const result = await fetchDeckSearch("conv_a");
+    expect(result).toMatchObject({ status: "ok", truncated: true });
+    expect(result.status === "ok" && result.paths).toHaveLength(WORKSPACE_FILE_SEARCH_LIMIT);
   });
 
   it.each([404, 503])("reads a %s as an unavailable workspace", async (status) => {

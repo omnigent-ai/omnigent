@@ -298,16 +298,23 @@ function GroupBody({
     );
   }
   return (
-    <ul className="flex flex-col">
-      {group.decks.map((deck) => (
-        <li key={deck.path}>
-          <DeckRow
-            deck={deck}
-            selected={selection?.sessionId === deck.sessionId && selection.path === deck.path}
-          />
-        </li>
-      ))}
-    </ul>
+    <div className="flex flex-col">
+      <ul className="flex flex-col">
+        {group.decks.map((deck) => (
+          <li key={deck.path}>
+            <DeckRow
+              deck={deck}
+              selected={selection?.sessionId === deck.sessionId && selection.path === deck.path}
+            />
+          </li>
+        ))}
+      </ul>
+      {group.truncated && (
+        <p className="px-4 py-2 text-sm text-muted-foreground">
+          Search stopped early - more decks may exist in this workspace.
+        </p>
+      )}
+    </div>
   );
 }
 

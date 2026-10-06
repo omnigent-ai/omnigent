@@ -14,7 +14,12 @@ import {
   type KitIndicator,
 } from "./designDecks";
 
-export type DeckSearchResult = { status: "ok"; paths: string[] } | { status: "unavailable" };
+/** Matches the `/search` `limit` query param; a full page means the scan may have stopped early. */
+export const WORKSPACE_FILE_SEARCH_LIMIT = 500;
+
+export type DeckSearchResult =
+  | { status: "ok"; paths: string[]; truncated: boolean }
+  | { status: "unavailable" };
 
 /**
  * Every `*.slides.html` path in a session's workspace. A 404 (no file
@@ -28,8 +33,14 @@ export async function fetchDeckSearch(sessionId: string): Promise<DeckSearchResu
   });
   if (res.status === 404 || res.status === 503) return { status: "unavailable" };
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const { files } = await readWorkspaceFileSearch(res);
-  return { status: "ok", paths: files.filter((f) => f.type === "file").map((f) => f.path) };
+  const { files, truncated } = await readWorkspaceFileSearch(res);
+  const paths = files.filter((f) => f.type === "file").map((f) => f.path);
+  // Prefer the server flag; fall back to a full page when older servers omit it.
+  return {
+    status: "ok",
+    paths,
+    truncated: truncated || files.length >= WORKSPACE_FILE_SEARCH_LIMIT,
+  };
 }
 
 /** The kit indicator for a workspace, reading `kit.json` only (no assets). */

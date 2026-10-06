@@ -39,7 +39,7 @@ export type KitIndicatorState = KitIndicator | { status: "loading" };
 
 export type DeckSearchState =
   | { status: "loading" }
-  | { status: "ok"; paths: string[] }
+  | { status: "ok"; paths: string[]; truncated: boolean }
   | { status: "unavailable" }
   | { status: "error"; message: string };
 
@@ -48,6 +48,8 @@ export interface DesignGroup {
   status: "loading" | "ready" | "unavailable" | "error";
   decks: DesignDeck[];
   kit: KitIndicatorState;
+  /** True when the workspace search may have missed decks past the result cap. */
+  truncated: boolean;
   error?: string;
 }
 
@@ -135,6 +137,7 @@ export function buildDesignGroups(
         status: search.status,
         decks: [],
         kit,
+        truncated: false,
         ...(search.status === "error" ? { error: search.message } : {}),
       });
       return;
@@ -149,7 +152,16 @@ export function buildDesignGroups(
         name: deckName(path),
         sessionTitle,
       }));
-    if (decks.length > 0) groups.push({ workspace, status: "ready", decks, kit });
+    // Keep a truncated empty group so the user sees the search hit its cap.
+    if (decks.length > 0 || search.truncated) {
+      groups.push({
+        workspace,
+        status: "ready",
+        decks,
+        kit,
+        truncated: search.truncated,
+      });
+    }
   });
   return groups;
 }

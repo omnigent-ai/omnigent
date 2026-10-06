@@ -124,7 +124,7 @@ describe("DesignPage list", () => {
     stubSessions([row("a", 2), row("b", 1)]);
     searchMock.mockImplementation((id) =>
       id === "a"
-        ? Promise.resolve({ status: "ok", paths: ["decks/q3.slides.html"] })
+        ? Promise.resolve({ status: "ok", paths: ["decks/q3.slides.html"], truncated: false })
         : new Promise(() => {}),
     );
 
@@ -145,6 +145,7 @@ describe("DesignPage list", () => {
     searchMock.mockResolvedValue({
       status: "ok",
       paths: ["decks/q3.slides.html", ".worktrees/x/decks/q3.slides.html"],
+      truncated: false,
     });
 
     renderPage();
@@ -160,7 +161,7 @@ describe("DesignPage list", () => {
 
   it("shows the empty state once nothing has decks", async () => {
     stubSessions([row("a", 1)]);
-    searchMock.mockResolvedValue({ status: "ok", paths: [] });
+    searchMock.mockResolvedValue({ status: "ok", paths: [], truncated: false });
 
     renderPage();
 
@@ -191,7 +192,7 @@ describe("DesignPage list", () => {
   it("shows a search error with a retry that searches again", async () => {
     stubSessions([row("a", 1)]);
     searchMock.mockRejectedValueOnce(new Error("500 Server Error"));
-    searchMock.mockResolvedValueOnce({ status: "ok", paths: ["fixed.slides.html"] });
+    searchMock.mockResolvedValueOnce({ status: "ok", paths: ["fixed.slides.html"], truncated: false });
 
     renderPage();
 
@@ -206,7 +207,7 @@ describe("DesignPage list", () => {
     [{ status: "invalid", reason: "kit.json is not valid JSON" } as const, "Kit invalid"],
   ])("shows the kit indicator %j", async (kit, label) => {
     stubSessions([row("a", 1)]);
-    searchMock.mockResolvedValue({ status: "ok", paths: ["d.slides.html"] });
+    searchMock.mockResolvedValue({ status: "ok", paths: ["d.slides.html"], truncated: false });
     kitMock.mockResolvedValue(kit);
 
     renderPage();
@@ -217,7 +218,7 @@ describe("DesignPage list", () => {
 
   it("links No kit to the sample kit instructions", async () => {
     stubSessions([row("a", 1)]);
-    searchMock.mockResolvedValue({ status: "ok", paths: ["d.slides.html"] });
+    searchMock.mockResolvedValue({ status: "ok", paths: ["d.slides.html"], truncated: false });
 
     renderPage();
 
@@ -227,7 +228,7 @@ describe("DesignPage list", () => {
 
   it("does not read the kit for a workspace without decks", async () => {
     stubSessions([row("a", 1)]);
-    searchMock.mockResolvedValue({ status: "ok", paths: [] });
+    searchMock.mockResolvedValue({ status: "ok", paths: [], truncated: false });
 
     renderPage();
 
@@ -237,7 +238,7 @@ describe("DesignPage list", () => {
 
   it("refreshes the session list and every search", async () => {
     stubSessions([row("a", 1)]);
-    searchMock.mockResolvedValue({ status: "ok", paths: ["d.slides.html"] });
+    searchMock.mockResolvedValue({ status: "ok", paths: ["d.slides.html"], truncated: false });
 
     renderPage();
     await within(group("a")).findByText("d");
@@ -246,12 +247,28 @@ describe("DesignPage list", () => {
     expect(refreshMock).toHaveBeenCalled();
     await waitFor(() => expect(searchMock).toHaveBeenCalledTimes(2));
   });
+
+  it("tells the user when a workspace search hit its result cap", async () => {
+    stubSessions([row("a", 1)]);
+    searchMock.mockResolvedValue({
+      status: "ok",
+      paths: ["d.slides.html"],
+      truncated: true,
+    });
+
+    renderPage();
+
+    expect(
+      await within(group("a")).findByText(/Search stopped early/),
+    ).toHaveTextContent("more decks may exist");
+    expect(within(group("a")).getByText("d")).toBeInTheDocument();
+  });
 });
 
 describe("DesignPage selection", () => {
   beforeEach(() => {
     stubSessions([row("a", 1, { title: "Pitch session" })]);
-    searchMock.mockResolvedValue({ status: "ok", paths: ["decks/pitch.slides.html"] });
+    searchMock.mockResolvedValue({ status: "ok", paths: ["decks/pitch.slides.html"], truncated: false });
   });
 
   it("shows a hint until a deck is selected", async () => {
@@ -302,7 +319,7 @@ describe("DesignPage on a phone", () => {
   beforeEach(() => {
     mobileRef.current = true;
     stubSessions([row("a", 1)]);
-    searchMock.mockResolvedValue({ status: "ok", paths: ["pitch.slides.html"] });
+    searchMock.mockResolvedValue({ status: "ok", paths: ["pitch.slides.html"], truncated: false });
   });
 
   it("shows only the list until a deck is chosen, then only the viewer", async () => {
