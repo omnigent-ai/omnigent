@@ -67,7 +67,7 @@ def test_unseen_reply_surfaces_in_inbox_until_read(
     expect(row).to_be_visible(timeout=_TURN_TIMEOUT_MS)
     expect(row).to_have_attribute("data-kind", "done")
     expect(row).to_contain_text(_FIRST_REPLY, timeout=15_000)
-    expect(page.get_by_text("1 unread")).to_be_visible()
+    expect(page.get_by_title("1 unread")).to_be_visible()
 
     # It raised no approval, so "Awaiting response" leaves it out.
     page.get_by_role("tab", name="Awaiting response").click()

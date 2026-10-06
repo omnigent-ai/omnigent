@@ -415,8 +415,8 @@ describe("InboxPage approval items", () => {
 
 describe("InboxPage comments and errors", () => {
   it("renders unseen file comments with author, path, and body", async () => {
-    // WHY: the comment side of the inbox renders each unseen comment with its
-    // author pill, file path, and body, and counts it in the header summary.
+    // WHY: an unseen comment collapses to one row naming its author; expanding
+    // it shows the file path, body, and the deep link that marks it seen.
     vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(
       commentInboxStub({
         items: [
@@ -437,11 +437,21 @@ describe("InboxPage comments and errors", () => {
     );
     renderPage();
 
-    expect(await screen.findByTestId("inbox-comment")).toBeInTheDocument();
-    expect(screen.getByText("alice")).toBeInTheDocument();
-    expect(screen.getByText("src/app.ts")).toBeInTheDocument();
-    expect(screen.getByText("Please reconsider this line.")).toBeInTheDocument();
-    expect(screen.getByText(/1 comment/)).toBeInTheDocument();
+    const item = await screen.findByTestId("inbox-comment");
+    expect(item).toHaveAttribute("data-expanded", "false");
+    // Collapsed: the author's avatar tile plus "author: body" in the preview.
+    expect(item).toHaveTextContent("alice: Please reconsider this line.");
+    expect(within(item).getByRole("img", { name: "Unread" })).toBeInTheDocument();
+    expect(screen.getByText("1 comment")).toBeInTheDocument();
+
+    fireEvent.click(within(item).getByRole("button", { name: /Comment: My Session/ }));
+    expect(item).toHaveAttribute("data-expanded", "true");
+    expect(within(item).getByText("src/app.ts")).toBeInTheDocument();
+    expect(within(item).getByText("Please reconsider this line.")).toBeInTheDocument();
+    expect(within(item).getByRole("link", { name: /Open file/ })).toHaveAttribute(
+      "href",
+      "/c/sess_1?file=src%2Fapp.ts&comment=cm_1",
+    );
   });
 
   it("shows the load-error banner and retries failed sources on click", async () => {
@@ -597,6 +607,35 @@ describe("InboxPage unread sessions", () => {
     fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
     fireEvent.click(within(item).getByRole("button", { name: /Mark as read/ }));
     await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+  });
+});
+
+describe("InboxPage recency groups", () => {
+  it("interleaves kinds newest first under recency headers", async () => {
+    // WHY: items of every kind share one timeline, so a fresh reply sits
+    // above an older approval — the approval still opens by default.
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const approvalRow = conversation({
+      id: "sess_approval",
+      title: "Approval Session",
+      updated_at: nowSeconds - 3 * 86_400,
+    });
+    const unreadRow = unreadConversation({ updated_at: nowSeconds - 30 });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([approvalRow, unreadRow]),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    await screen.findByTestId("inbox-item");
+    const regions = screen.getAllByRole("region");
+    expect(regions.map((r) => r.getAttribute("aria-label"))).toEqual(["Just now", "This week"]);
+    expect(within(regions[0]).getByTestId("inbox-unread")).toBeInTheDocument();
+    expect(within(regions[1]).getByTestId("inbox-item")).toHaveAttribute("data-expanded", "true");
+    // The header pill totals every kind; its label spells out the breakdown.
+    expect(screen.getByText("1 approval · 1 unread")).toBeInTheDocument();
   });
 });
 
