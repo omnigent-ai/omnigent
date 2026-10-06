@@ -235,16 +235,23 @@ export function ComposerTextInput({
     <ComposerTextarea
       {...input}
       onKeyDown={(event) => {
-        if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
+        // Touch-primary devices keep the on-screen keyboard's Enter a newline, but an
+        // attached hardware keyboard's Cmd/Ctrl+Enter chord still reaches the controller.
+        if (
+          keyboard.preventsKeyboardSubmit &&
+          event.key === "Enter" &&
+          !event.metaKey &&
+          !event.ctrlKey
+        ) {
+          return;
+        }
         const shouldSubmitFromKeyboard = isComposerSendKey(
           { ...event, isComposing: event.nativeEvent.isComposing },
           keyboard.submitWithModEnter,
-          keyboard.preventsKeyboardSubmit,
         );
         const shouldSteerAllFromKeyboard = isComposerSteerAllKey(
           { ...event, isComposing: event.nativeEvent.isComposing },
           keyboard.submitWithModEnter,
-          keyboard.preventsKeyboardSubmit,
         );
         input.onKeyDown?.(event, {
           shouldSubmitFromKeyboard,

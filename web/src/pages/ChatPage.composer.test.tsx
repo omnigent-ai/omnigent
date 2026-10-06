@@ -703,6 +703,30 @@ describe("Composer send shortcut", () => {
     }
   });
 
+  it.each([
+    [false, "metaKey"],
+    [false, "ctrlKey"],
+    [true, "metaKey"],
+    [true, "ctrlKey"],
+  ] as const)(
+    "sends with a hardware keyboard's Mod+Enter on a coarse pointer (alternate send: %s, modifier: %s)",
+    (alternate, modifier) => {
+      // Phones and tablets keep plain Enter a newline, but an attached
+      // keyboard's Cmd/Ctrl+Enter is still a send chord in both modes.
+      localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      const restorePointer = forceDesktopCoarsePointer();
+      const onSend = vi.fn();
+      try {
+        render(<Composer {...composerProps({ onSend })} />);
+        fireEvent.change(textarea(), { target: { value: "hardware chord" } });
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true });
+        expect(onSend).toHaveBeenCalledWith("hardware chord", undefined);
+      } finally {
+        restorePointer();
+      }
+    },
+  );
+
   it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     const onSend = vi.fn();

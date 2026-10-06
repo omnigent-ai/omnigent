@@ -40,9 +40,8 @@ export function writeSubmitWithModEnter(value: boolean): void {
 export function isComposerSendKey(
   event: ComposerSendKeyEvent,
   submitWithModEnter: boolean,
-  isMobile: boolean,
 ): boolean {
-  if (isMobile || event.key !== "Enter" || event.isComposing || event.shiftKey || event.altKey) {
+  if (event.key !== "Enter" || event.isComposing || event.shiftKey || event.altKey) {
     return false;
   }
 
@@ -58,9 +57,8 @@ export function isComposerSendKey(
 export function isComposerSteerAllKey(
   event: ComposerSendKeyEvent,
   submitWithModEnter: boolean,
-  isMobile: boolean,
 ): boolean {
-  if (isMobile || event.key !== "Enter" || event.isComposing || event.altKey) return false;
+  if (event.key !== "Enter" || event.isComposing || event.altKey) return false;
   const hasMod = event.metaKey === true || event.ctrlKey === true;
   if (!hasMod) return false;
   return submitWithModEnter ? event.shiftKey === true : event.shiftKey !== true;

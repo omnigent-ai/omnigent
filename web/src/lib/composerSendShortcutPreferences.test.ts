@@ -46,53 +46,43 @@ describe("composerSendShortcutPreferences", () => {
 
 describe("isComposerSendKey", () => {
   it("keeps Enter and the legacy modifier chord in default mode", () => {
-    expect(isComposerSendKey({ key: "Enter" }, false, false)).toBe(true);
-    expect(isComposerSendKey({ key: "Enter", shiftKey: true }, false, false)).toBe(false);
-    expect(isComposerSendKey({ key: "Enter", metaKey: true }, false, false)).toBe(true);
-    expect(isComposerSendKey({ key: "Enter", ctrlKey: true }, false, false)).toBe(true);
+    expect(isComposerSendKey({ key: "Enter" }, false)).toBe(true);
+    expect(isComposerSendKey({ key: "Enter", shiftKey: true }, false)).toBe(false);
+    expect(isComposerSendKey({ key: "Enter", metaKey: true }, false)).toBe(true);
+    expect(isComposerSendKey({ key: "Enter", ctrlKey: true }, false)).toBe(true);
   });
 
   it("uses Command/Ctrl+Enter only for the alternate shortcut", () => {
-    expect(isComposerSendKey({ key: "Enter" }, true, false)).toBe(false);
-    expect(isComposerSendKey({ key: "Enter", metaKey: true }, true, false)).toBe(true);
-    expect(isComposerSendKey({ key: "Enter", ctrlKey: true }, true, false)).toBe(true);
+    expect(isComposerSendKey({ key: "Enter" }, true)).toBe(false);
+    expect(isComposerSendKey({ key: "Enter", metaKey: true }, true)).toBe(true);
+    expect(isComposerSendKey({ key: "Enter", ctrlKey: true }, true)).toBe(true);
   });
 
-  it("never submits from composition, modified chords, or mobile Enter", () => {
-    expect(isComposerSendKey({ key: "Enter", metaKey: true, isComposing: true }, true, false)).toBe(
-      false,
-    );
-    expect(isComposerSendKey({ key: "Enter", metaKey: true, shiftKey: true }, true, false)).toBe(
-      false,
-    );
-    expect(isComposerSendKey({ key: "Enter", metaKey: true }, true, true)).toBe(false);
+  it("never submits from composition or Shift chords", () => {
+    expect(isComposerSendKey({ key: "Enter", metaKey: true, isComposing: true }, true)).toBe(false);
+    expect(isComposerSendKey({ key: "Enter", metaKey: true, shiftKey: true }, true)).toBe(false);
   });
 });
 
 describe("isComposerSteerAllKey", () => {
   it("is Command/Ctrl+Enter in default mode", () => {
-    expect(isComposerSteerAllKey({ key: "Enter" }, false, false)).toBe(false);
-    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true }, false, false)).toBe(true);
-    expect(isComposerSteerAllKey({ key: "Enter", ctrlKey: true }, false, false)).toBe(true);
-    expect(
-      isComposerSteerAllKey({ key: "Enter", ctrlKey: true, shiftKey: true }, false, false),
-    ).toBe(false);
+    expect(isComposerSteerAllKey({ key: "Enter" }, false)).toBe(false);
+    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true }, false)).toBe(true);
+    expect(isComposerSteerAllKey({ key: "Enter", ctrlKey: true }, false)).toBe(true);
+    expect(isComposerSteerAllKey({ key: "Enter", ctrlKey: true, shiftKey: true }, false)).toBe(
+      false,
+    );
   });
 
   it("moves to Command/Ctrl+Shift+Enter when Mod+Enter already sends", () => {
-    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true }, true, false)).toBe(false);
-    expect(
-      isComposerSteerAllKey({ key: "Enter", metaKey: true, shiftKey: true }, true, false),
-    ).toBe(true);
+    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true }, true)).toBe(false);
+    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true, shiftKey: true }, true)).toBe(true);
   });
 
-  it("never fires from composition, Alt chords, or mobile", () => {
-    expect(
-      isComposerSteerAllKey({ key: "Enter", metaKey: true, isComposing: true }, false, false),
-    ).toBe(false);
-    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true, altKey: true }, false, false)).toBe(
+  it("never fires from composition or Alt chords", () => {
+    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true, isComposing: true }, false)).toBe(
       false,
     );
-    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true }, false, true)).toBe(false);
+    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true, altKey: true }, false)).toBe(false);
   });
 });
