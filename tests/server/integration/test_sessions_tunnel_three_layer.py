@@ -82,6 +82,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from tests.budgets import budget
+from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.helpers import NullServerClient
 from tests.runtime.harnesses._test_scaffold_harnesses import _EchoHarness
 
@@ -247,6 +248,7 @@ async def _send_hello_and_wait(
     runner_id: str,
     *,
     harnesses: list[str],
+    connection_id: str | None = None,
 ) -> None:
     """Send a HelloFrame and wait until the registry lists the runner."""
     hello = HelloFrame(
@@ -254,6 +256,7 @@ async def _send_hello_and_wait(
         frame_protocol_version=1,
         harnesses=list(harnesses),
         envs=["os_sandbox"],
+        connection_id=connection_id,
     )
     await communicator.send_input(
         {"type": "websocket.receive", "text": encode_frame(hello)},
@@ -1629,7 +1632,13 @@ async def test_runner_disconnect_grace_defers_failed_marking(
     )
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
-    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    await _send_hello_and_wait(
+        communicator,
+        ap_app,
+        runner_id,
+        harnesses=[_TEST_HARNESS_NAME],
+        connection_id="grace-first",
+    )
     sessions_module._session_status_cache[session_id] = "running"
 
     reconnect_communicator: ApplicationCommunicator | None = None
@@ -1637,36 +1646,80 @@ async def test_runner_disconnect_grace_defers_failed_marking(
         # (a) Drop the tunnel. The disconnect hook has completed by the
         # time the ASGI app exits, so the grace timer is armed — but the
         # failed flip must not have happened yet.
-        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
-        await communicator.wait(timeout=budget(2.0))
-        assert runner_id in cleared_runners
-        assert sessions_module._session_status_cache.get(session_id) != "failed", (
-            "session failed immediately on disconnect — the grace window "
-            "is not deferring the failed-marking"
-        )
+        with capture_debug_rows("server") as rows:
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+            await communicator.wait(timeout=budget(2.0))
+            assert runner_id in cleared_runners
+            assert sessions_module._session_status_cache.get(session_id) != "failed", (
+                "session failed immediately on disconnect — the grace window "
+                "is not deferring the failed-marking"
+            )
 
-        # (b) Past the grace with the runner still gone, the marking lands.
-        async def _marked_failed() -> None:
-            while sessions_module._session_status_cache.get(session_id) != "failed":
-                await asyncio.sleep(0.02)
+            # (b) Observe the complete reconciliation, including its final log.
+            timer = next(
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"runner-disconnect-grace-{runner_id}"
+            )
+            await asyncio.wait_for(asyncio.shield(timer), timeout=budget(5.0))
+            assert sessions_module._session_status_cache.get(session_id) == "failed"
 
-        await asyncio.wait_for(_marked_failed(), timeout=grace * 10)
+        grace_rows = [row for row in rows if row["event_name"] == "runner_disconnect_grace"]
+        assert [row["attributes"]["phase"] for row in grace_rows] == [
+            "scheduled",
+            "reconciliation_started",
+            "resolved",
+        ]
+        assert grace_rows[0]["attributes"]["path"] == "timer"
+        assert {row["attributes"]["connection_id"] for row in grace_rows} == {"grace-first"}
+        assert len({row["attributes"]["generation"] for row in grace_rows}) == 1
+        assert grace_rows[0]["attributes"]["generation"]
+        assert grace_rows[-1]["attributes"]["outcome"] == "expired"
+        assert grace_rows[-1]["attributes"]["decision"] == "reconciled"
+        assert all(row["session_id"] is None for row in grace_rows)
 
         # (c) Drop again, but reconnect inside the grace: no failed flip.
         communicator2 = await _connect_runner_tunnel(ap_app, runner_id)
         await _send_hello_and_wait(
-            communicator2, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+            communicator2,
+            ap_app,
+            runner_id,
+            harnesses=[_TEST_HARNESS_NAME],
+            connection_id="grace-second",
         )
         sessions_module._session_status_cache[session_id] = "running"
-        await communicator2.send_input({"type": "websocket.disconnect", "code": 1000})
-        await communicator2.wait(timeout=budget(2.0))
-        reconnect_communicator = await _connect_runner_tunnel(ap_app, runner_id)
-        await _send_hello_and_wait(
-            reconnect_communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
-        )
-        await asyncio.sleep(grace * 2)
+        with capture_debug_rows("server") as reconnect_rows:
+            await communicator2.send_input({"type": "websocket.disconnect", "code": 1000})
+            await communicator2.wait(timeout=budget(2.0))
+            reconnect_timer = next(
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"runner-disconnect-grace-{runner_id}"
+            )
+            reconnect_communicator = await _connect_runner_tunnel(ap_app, runner_id)
+            await _send_hello_and_wait(
+                reconnect_communicator,
+                ap_app,
+                runner_id,
+                harnesses=[_TEST_HARNESS_NAME],
+                connection_id="grace-reconnect",
+            )
+            await asyncio.wait_for(asyncio.shield(reconnect_timer), timeout=budget(5.0))
         assert sessions_module._session_status_cache.get(session_id) != "failed", (
             "reconnect inside the grace did not suppress the failed-marking"
+        )
+        resolved = next(
+            row
+            for row in reconnect_rows
+            if row["event_name"] == "runner_disconnect_grace"
+            and row["attributes"]["phase"] == "resolved"
+        )
+        assert resolved["attributes"]["outcome"] == "reconnected"
+        assert resolved["attributes"]["decision"] == "same_replica"
+        assert resolved["attributes"]["connection_id"] == "grace-second"
+        assert resolved["attributes"]["reconnect_connection_id"] == "grace-reconnect"
+        assert (
+            resolved["attributes"]["generation"] != resolved["attributes"]["reconnect_generation"]
         )
     finally:
         if reconnect_communicator is not None:
@@ -1677,6 +1730,81 @@ async def test_runner_disconnect_grace_defers_failed_marking(
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 await reconnect_communicator.wait(timeout=budget(2.0))
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("termination", ["cancel_before_start", "cancel_wait", "wait_error"])
+async def test_runner_disconnect_grace_reports_terminal_observation(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    termination: str,
+) -> None:
+    """Even an unstarted timer gets one terminal row for the dropped connection."""
+    from importlib import import_module
+    from types import SimpleNamespace
+
+    app_module = import_module("omnigent.server.app")
+    ap_app = tunnel_three_layer_stack.ap_app
+    runner_id = "runner-grace-terminal-observation"
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(
+        communicator,
+        ap_app,
+        runner_id,
+        harnesses=[_TEST_HARNESS_NAME],
+        connection_id="grace-terminal-connection",
+    )
+    entered = asyncio.Event()
+    blocked = asyncio.Event()
+    timers: list[asyncio.Task[None]] = []
+
+    async def wait_for_runner(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        if termination == "wait_error":
+            raise ValueError("private diagnostic detail")
+        await blocked.wait()
+
+    def create_task(coro: Any, **kwargs: Any) -> asyncio.Task[None]:
+        task = asyncio.create_task(coro, **kwargs)
+        if kwargs.get("name") == f"runner-disconnect-grace-{runner_id}":
+            timers.append(task)
+            if termination == "cancel_before_start":
+                task.cancel()
+        return task
+
+    scoped_asyncio = SimpleNamespace(**vars(asyncio))
+    scoped_asyncio.create_task = create_task
+    monkeypatch.setattr(app_module, "asyncio", scoped_asyncio)
+    monkeypatch.setattr(ap_app.state.tunnel_registry, "wait_for_runner", wait_for_runner)
+    with capture_debug_rows("server") as rows:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.wait(timeout=budget(2.0))
+        (timer,) = timers
+        if termination == "cancel_before_start":
+            assert not entered.is_set()
+        else:
+            await asyncio.wait_for(entered.wait(), timeout=budget(2.0))
+        if termination == "cancel_wait":
+            timer.cancel()
+        expected_error = ValueError if termination == "wait_error" else asyncio.CancelledError
+        with pytest.raises(expected_error):
+            await timer
+        await asyncio.sleep(0)
+
+    observations = [row for row in rows if row["event_name"] == "runner_disconnect_grace"]
+    expected_phase = "error" if termination == "wait_error" else "cancelled"
+    assert [row["attributes"]["phase"] for row in observations] == ["scheduled", expected_phase]
+    assert {row["attributes"]["connection_id"] for row in observations} == {
+        "grace-terminal-connection"
+    }
+    assert len({row["attributes"]["generation"] for row in observations}) == 1
+    assert observations[-1]["attributes"]["outcome"] == expected_phase
+    assert "private diagnostic detail" not in json.dumps(observations)
+    if termination == "wait_error":
+        assert observations[-1]["attributes"]["error_type"] == "ValueError"
+        assert observations[-1]["attributes"]["decision"] == "wait_for_runner"
 
 
 @pytest.mark.asyncio
@@ -1724,22 +1852,23 @@ async def test_runner_disconnect_rechecks_tunnel_after_session_lookup(
     monkeypatch.setattr(store, "list_conversations_by_runner_id", delayed_lookup)
     reconnect: ApplicationCommunicator | None = None
     try:
-        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
-        await communicator.wait(timeout=budget(2.0))
-        assert await asyncio.to_thread(lookup_started.wait, budget(5.0))
-        grace_task = next(
-            task
-            for task in asyncio.all_tasks()
-            if task.get_name() == f"runner-disconnect-grace-{runner_id}"
-        )
-        if reconnect_during_lookup:
-            reconnect = await _connect_runner_tunnel(ap_app, runner_id)
-            await _send_hello_and_wait(
-                reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+        with capture_debug_rows("server") as rows:
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+            await communicator.wait(timeout=budget(2.0))
+            assert await asyncio.to_thread(lookup_started.wait, budget(5.0))
+            grace_task = next(
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"runner-disconnect-grace-{runner_id}"
             )
-            assert ap_app.state.tunnel_registry.get(runner_id) is not None
-        release_lookup.set()
-        await asyncio.wait_for(asyncio.shield(grace_task), timeout=budget(5.0))
+            if reconnect_during_lookup:
+                reconnect = await _connect_runner_tunnel(ap_app, runner_id)
+                await _send_hello_and_wait(
+                    reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+                )
+                assert ap_app.state.tunnel_registry.get(runner_id) is not None
+            release_lookup.set()
+            await asyncio.wait_for(asyncio.shield(grace_task), timeout=budget(5.0))
         expected = "running" if reconnect_during_lookup else "failed"
         assert sessions_module._session_status_cache[session_id] == expected
         conv = store.get_conversation(session_id)
@@ -1749,6 +1878,15 @@ async def test_runner_disconnect_rechecks_tunnel_after_session_lookup(
             assert error is None
         else:
             assert error is not None and error["code"] == "runner_disconnected"
+        grace_rows = [row for row in rows if row["event_name"] == "runner_disconnect_grace"]
+        if reconnect_during_lookup:
+            resolved = next(row for row in grace_rows if row["attributes"]["phase"] == "resolved")
+            assert resolved["attributes"]["decision"] == "during_db_lookup"
+            assert resolved["attributes"]["outcome"] == "reconnected"
+        else:
+            assert any(
+                row["attributes"]["phase"] == "reconciliation_started" for row in grace_rows
+            )
     finally:
         release_lookup.set()
         if reconnect is not None:
@@ -1810,16 +1948,17 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
     sessions_module._session_status_cache[session_id] = "running"
     sessions_module._session_active_response_cache[session_id] = "response-live-elsewhere"
     try:
-        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
-        await communicator.wait(timeout=budget(2.0))
-        # Let this replica's own disconnect-time liveness write land first,
-        # then stamp the row the way the replica now holding the tunnel does.
-        await asyncio.sleep(0.1)
-        if foreign_write:
-            own = session_live_state.last_liveness_stamp(runner_id)
-            assert own is not None, "the hello did not record this replica's own stamp"
-            store.touch_runner_liveness([runner_id], own + 1)
-        await asyncio.sleep(grace * 3)
+        with capture_debug_rows("server") as rows:
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+            await communicator.wait(timeout=budget(2.0))
+            # Let this replica's own disconnect-time liveness write land first,
+            # then stamp the row the way the replica now holding the tunnel does.
+            await asyncio.sleep(0.1)
+            if foreign_write:
+                own = session_live_state.last_liveness_stamp(runner_id)
+                assert own is not None, "the hello did not record this replica's own stamp"
+                store.touch_runner_liveness([runner_id], own + 1)
+            await asyncio.sleep(grace * 3)
         cached = sessions_module._session_status_cache.get(session_id)
         if foreign_write:
             assert cached is None, (
@@ -1830,6 +1969,16 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
             # Control: with no foreign stamp the same setup must fail the turn,
             # proving the foreign write, not the setup, spares the session.
             assert cached == "failed", f"expected the grace timer to fail the turn, got {cached!r}"
+        grace_rows = [row for row in rows if row["event_name"] == "runner_disconnect_grace"]
+        if foreign_write:
+            foreign = next(row for row in grace_rows if row["attributes"]["phase"] == "resolved")
+            assert foreign["attributes"]["decision"] == "foreign_replica"
+            assert foreign["attributes"]["outcome"] == "live_elsewhere"
+            assert foreign["attributes"]["observed_runner_last_seen_max"]
+        else:
+            assert any(
+                row["attributes"]["phase"] == "reconciliation_started" for row in grace_rows
+            )
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
         sessions_module._session_active_response_cache.pop(session_id, None)
@@ -1888,18 +2037,29 @@ async def test_server_initiated_close_never_fails_the_turn(
     sessions_module._session_status_cache[session_id] = "running"
     touched_runners.clear()
     try:
-        await communicator.send_input({"type": "websocket.disconnect", "code": 1012})
-        await communicator.wait(timeout=budget(2.0))
-        assert shutdown_state.server_shutting_down(), "a 1012 close did not mark server shutdown"
-        assert runner_id not in cleared_runners
-        assert runner_id in touched_runners
+        with capture_debug_rows("server") as rows:
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1012})
+            await communicator.wait(timeout=budget(2.0))
+            assert shutdown_state.server_shutting_down(), (
+                "a 1012 close did not mark server shutdown"
+            )
+            assert runner_id not in cleared_runners
+            assert runner_id in touched_runners
 
-        # Well past the grace: the timer has fired and must have skipped the marking.
-        await asyncio.sleep(grace * 3)
+            # Well past the grace: the timer has fired and must have skipped the marking.
+            await asyncio.sleep(grace * 3)
         assert sessions_module._session_status_cache.get(session_id) == "running"
         conv = store.get_conversation(session_id)
         assert conv is not None
         assert sessions_module._last_task_error_from_labels(conv.labels) is None
+        resolved = next(
+            row
+            for row in rows
+            if row["event_name"] == "runner_disconnect_grace"
+            and row["attributes"]["phase"] == "resolved"
+        )
+        assert resolved["attributes"]["outcome"] == "server_shutdown"
+        assert resolved["attributes"]["decision"] == "server_shutdown"
     finally:
         shutdown_state.reset_for_tests()
         sessions_module._session_status_cache.pop(session_id, None)

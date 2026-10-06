@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from functools import partial
 from importlib import import_module
 from itertools import batched, groupby
@@ -142,6 +143,62 @@ from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 _RECONNECT_BINDING_BATCH_SIZE = 128
+
+
+@dataclass(frozen=True, slots=True)
+class _DisconnectGraceContext:
+    """Immutable identity and timing captured for one dropped tunnel."""
+
+    runner_id: str
+    connection_id: str | None
+    generation: int
+    reference_stamp: int | None
+    started_at: float
+    connection_age_s: float
+    last_frame_age_s: float
+
+
+def _log_disconnect_grace(
+    context: _DisconnectGraceContext,
+    *,
+    phase: str,
+    outcome: str,
+    decision: str,
+    grace_s: float | None = None,
+    affected_count: int | None = None,
+    observed_runner_last_seen_max: int | None = None,
+    reconnect_connection_id: str | None = None,
+    reconnect_generation: int | None = None,
+    error_type: str | None = None,
+) -> None:
+    """Record one bounded timer lifecycle observation without changing state."""
+    _logger.log(
+        logging.WARNING if phase == "error" else logging.INFO,
+        "Runner %s disconnect grace %s: %s",
+        context.runner_id,
+        phase,
+        outcome,
+        extra=debug_event(
+            "runner_disconnect_grace",
+            path="timer",
+            phase=phase,
+            outcome=outcome,
+            decision=decision,
+            runner_id=context.runner_id,
+            connection_id=context.connection_id,
+            generation=context.generation,
+            reference_stamp=context.reference_stamp,
+            waited_s=round(max(0.0, time.monotonic() - context.started_at), 3),
+            grace_s=grace_s,
+            connection_age_s=context.connection_age_s,
+            last_frame_age_s=context.last_frame_age_s,
+            affected_count=affected_count,
+            observed_runner_last_seen_max=observed_runner_last_seen_max,
+            reconnect_connection_id=reconnect_connection_id,
+            reconnect_generation=reconnect_generation,
+            error_type=error_type,
+        ),
+    )
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -3323,41 +3380,11 @@ def create_app(
         if pending is not None and not pending.done():
             pending.cancel()
 
-    async def _mark_disconnected_runner_failed(
-        runner_id: str, reference_stamp: int | None
-    ) -> None:
-        """Reconcile a dropped runner's sessions once the liveness lease expires.
+    async def _mark_disconnected_runner_failed(context: _DisconnectGraceContext) -> None:
+        """Reconcile a dropped runner once its liveness lease expires.
 
-        Waits for the runner to re-register on this replica, event-driven,
-        for the whole liveness lease (:data:`RUNNER_DISCONNECT_GRACE_S`,
-        sized to :data:`RUNNER_LIVENESS_TTL_S`). A reconnect resolves the
-        wait at once and makes this a no-op, so a Wi-Fi roam, VPN stall,
-        ingress recycle, or sleep/resume that comes back within the lease
-        never flaps its sessions to failed. A runner still absent when the
-        lease expires hands its bound sessions to
-        :func:`_mark_runner_sessions_offline`, which fails only the
-        interrupted turns and stamps the disconnect cause.
-
-        This is the transport-drop path only. A runner that actually
-        crashed is reported by its daemon on the host tunnel and handled by
-        :func:`_on_runner_exited`, which fails fast and cancels this timer,
-        so waiting out the lease here costs nothing on real death.
-
-        A server that is itself shutting down skips the marking too: it
-        closed the tunnel, and the runner cannot re-register with a
-        process that stopped listening — the replacement server re-adopts
-        it on reconnect (:mod:`omnigent.server.shutdown_state`).
-
-        A runner confirmed live on another replica (via
-        :func:`_runner_live_on_another_replica_from_conversations`) skips it too: that
-        replica's tunnel is authoritative now, and this one's registry
-        only ever knew about its own connections.
-
-        :param runner_id: The disconnected runner's id.
-        :param reference_stamp: This replica's own last liveness stamp for
-            *runner_id*, captured in :func:`_on_runner_disconnect` before
-            the clear — the reference the cross-replica check compares
-            against.
+        Local reconnection, a fresh foreign liveness stamp, or server shutdown
+        spares the bound sessions. Otherwise reconcile their interrupted turns.
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
@@ -3367,64 +3394,152 @@ def create_app(
         )
         from omnigent.server.schemas import ErrorDetail
 
-        # Event-driven: `register` resolves the wait the instant the runner
-        # reconnects here. A non-positive grace collapses to an immediate
-        # registry check, matching the sleep(0) behavior tests pin.
-        reconnected = await tunnel_registry.wait_for_runner(
-            runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
-        )
-        if shutdown_state.server_shutting_down():
-            _logger.info(
-                "Runner %s dropped because this server is shutting down; skipping offline-marking",
-                runner_id,
+        runner_id = context.runner_id
+        grace_s = RUNNER_DISCONNECT_GRACE_S
+        stage = "wait_for_runner"
+        affected_count: int | None = None
+        observed_stamp: int | None = None
+        try:
+            # Registration resolves the wait immediately. A non-positive grace
+            # checks the current registry without waiting.
+            reconnected = await tunnel_registry.wait_for_runner(runner_id, timeout_s=grace_s)
+            if shutdown_state.server_shutting_down():
+                _log_disconnect_grace(
+                    context,
+                    phase="resolved",
+                    outcome="server_shutdown",
+                    decision="server_shutdown",
+                    grace_s=grace_s,
+                    reconnect_connection_id=(
+                        reconnected.hello.connection_id if reconnected is not None else None
+                    ),
+                    reconnect_generation=(
+                        reconnected.generation if reconnected is not None else None
+                    ),
+                )
+                _logger.info(
+                    "Runner %s dropped because this server is shutting down; "
+                    "skipping offline-marking",
+                    runner_id,
+                )
+                return
+            if reconnected is not None:
+                _log_disconnect_grace(
+                    context,
+                    phase="resolved",
+                    outcome="reconnected",
+                    decision="same_replica",
+                    grace_s=grace_s,
+                    reconnect_connection_id=reconnected.hello.connection_id,
+                    reconnect_generation=reconnected.generation,
+                )
+                _logger.info(
+                    "Runner %s reconnected within the liveness lease; skipping offline-marking",
+                    runner_id,
+                )
+                return
+
+            # Direct by-runner lookup is read-after-write consistent and
+            # bounded to sessions on this runner.
+            stage = "offline_lookup"
+            affected = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
             )
-            return
-        if reconnected is not None:
-            _logger.info(
-                "Runner %s reconnected within the liveness lease; skipping offline-marking",
-                runner_id,
+            affected_count = len(affected)
+            observed_stamp = max(
+                (
+                    conv.runner_last_seen
+                    for conv in affected
+                    if conv.runner_id == runner_id and conv.runner_last_seen is not None
+                ),
+                default=None,
             )
-            return
-        # Direct by-runner lookup: read-after-write consistent (the
-        # listing path may be served from an eventually-consistent
-        # search index in alternate store backends) and
-        # O(sessions-on-this-runner) instead of a 500-row scan.
-        # Archived sessions are included by construction — an archived
-        # session can still be runner-bound, and skipping it here would
-        # leave it stuck "running" forever.
-        affected = await asyncio.to_thread(
-            conversation_store.list_conversations_by_runner_id, runner_id
-        )
-        # The runner may reconnect while the store returns an older snapshot.
-        if tunnel_registry.get(runner_id) is not None:
-            _logger.info(
-                "Runner %s reconnected during offline lookup; skipping offline-marking",
-                runner_id,
+
+            # The runner may reconnect while the store returns an older snapshot.
+            reconnected = tunnel_registry.get(runner_id)
+            if reconnected is not None:
+                _log_disconnect_grace(
+                    context,
+                    phase="resolved",
+                    outcome="reconnected",
+                    decision="during_db_lookup",
+                    grace_s=grace_s,
+                    affected_count=affected_count,
+                    observed_runner_last_seen_max=observed_stamp,
+                    reconnect_connection_id=reconnected.hello.connection_id,
+                    reconnect_generation=reconnected.generation,
+                )
+                _logger.info(
+                    "Runner %s reconnected during offline lookup; skipping offline-marking",
+                    runner_id,
+                )
+                return
+
+            stage = "foreign_replica"
+            if _runner_live_on_another_replica_from_conversations(
+                affected, runner_id, context.reference_stamp
+            ):
+                for conv in affected:
+                    _relinquish_session_live_state(conv.id)
+                _log_disconnect_grace(
+                    context,
+                    phase="resolved",
+                    outcome="live_elsewhere",
+                    decision="foreign_replica",
+                    grace_s=grace_s,
+                    affected_count=affected_count,
+                    observed_runner_last_seen_max=observed_stamp,
+                )
+                _logger.info(
+                    "Runner %s is live on another replica; skipping offline-marking",
+                    runner_id,
+                )
+                return
+
+            stage = "reconciliation"
+            _log_disconnect_grace(
+                context,
+                phase="reconciliation_started",
+                outcome="reconciliation_started",
+                decision="reconciliation_started",
+                grace_s=grace_s,
+                affected_count=affected_count,
+                observed_runner_last_seen_max=observed_stamp,
             )
-            return
-        if _runner_live_on_another_replica_from_conversations(
-            affected, runner_id, reference_stamp
-        ):
-            for conv in affected:
-                _relinquish_session_live_state(conv.id)
-            _logger.info(
-                "Runner %s is live on another replica; skipping offline-marking",
+            _logger.warning(
+                "Runner %s disconnected; reconciling %d bound session(s)",
                 runner_id,
+                affected_count,
             )
-            return
-        _logger.warning(
-            "Runner %s disconnected; reconciling %d bound session(s)",
-            runner_id,
-            len(affected),
-        )
-        await _mark_runner_sessions_offline(
-            affected,
-            ErrorDetail(
-                code="runner_disconnected",
-                message="Runner disconnected unexpectedly.",
-            ),
-            conversation_store,
-        )
+            await _mark_runner_sessions_offline(
+                affected,
+                ErrorDetail(
+                    code="runner_disconnected",
+                    message="Runner disconnected unexpectedly.",
+                ),
+                conversation_store,
+            )
+            _log_disconnect_grace(
+                context,
+                phase="resolved",
+                outcome="expired",
+                decision="reconciled",
+                grace_s=grace_s,
+                affected_count=affected_count,
+                observed_runner_last_seen_max=observed_stamp,
+            )
+        except Exception as exc:
+            _log_disconnect_grace(
+                context,
+                phase="error",
+                outcome="error",
+                decision=stage,
+                grace_s=grace_s,
+                affected_count=affected_count,
+                observed_runner_last_seen_max=observed_stamp,
+                error_type=type(exc).__name__,
+            )
+            raise
 
     async def _on_runner_disconnect(runner_id: str, connection: RunnerSession) -> None:
         """Schedule offline-marking for the turns *this* runner interrupted.
@@ -3450,6 +3565,10 @@ def create_app(
         :param connection: The closed tunnel whose generation scopes
             initialization cleanup.
         """
+        grace_started_at = time.monotonic()
+        connection_id = connection.hello.connection_id
+        connection_age_s = round(max(0.0, time.time() - connection.connected_at), 3)
+        last_frame_age_s = round(max(0.0, time.time() - connection.last_frame_at), 3)
         cancelled = runner_session_initializer.invalidate_runner(
             runner_id, generation=connection.generation
         )
@@ -3491,13 +3610,40 @@ def create_app(
         # Replace any pending timer so a rapid drop-reconnect-drop gives
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
+        from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
+
+        context = _DisconnectGraceContext(
+            runner_id=runner_id,
+            connection_id=connection_id,
+            generation=connection.generation,
+            reference_stamp=reference_stamp,
+            started_at=grace_started_at,
+            connection_age_s=connection_age_s,
+            last_frame_age_s=last_frame_age_s,
+        )
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id, reference_stamp),
+            _mark_disconnected_runner_failed(context),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task
+        _log_disconnect_grace(
+            context,
+            phase="scheduled",
+            outcome="pending",
+            decision="awaiting_reconnect",
+            grace_s=RUNNER_DISCONNECT_GRACE_S,
+        )
 
         def _clear_grace_slot(t: asyncio.Task[None]) -> None:
+            # A task can be cancelled before its coroutine starts.
+            if t.cancelled():
+                _log_disconnect_grace(
+                    context,
+                    phase="cancelled",
+                    outcome="cancelled",
+                    decision="cancelled",
+                    grace_s=RUNNER_DISCONNECT_GRACE_S,
+                )
             if _disconnect_grace_tasks.get(runner_id) is t:
                 _disconnect_grace_tasks.pop(runner_id, None)
 

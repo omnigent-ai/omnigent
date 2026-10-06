@@ -109,6 +109,18 @@ both ends.
   `parent_session_id`, `runner_id`, `host_id`, and `conversation_updated_at`.
   The latter measures content activity, not the time of a status transition.
   A relay cache hit does not load conversation metadata solely for logging.
+- `runner_disconnect_grace`: the per-runner timer lifecycle, with `path = timer`,
+  `phase` (`scheduled`, `resolved`, `reconciliation_started`, `cancelled`, or
+  `error`), `outcome`, and `decision`. It carries the dropped tunnel's
+  `connection_id` and process-local `generation`, the captured
+  `reference_stamp`, `grace_s`, `waited_s`, connection/last-frame ages, and
+  the maximum `runner_last_seen` observed in the already-loaded rows. A local
+  reconnect is identified by `decision = same_replica` and its replacement
+  connection fields; `during_db_lookup` means the recheck won while the
+  session rows were loading; `foreign_replica` means a newer persisted stamp
+  won. `reconciliation_started` means offline reconciliation is about to run,
+  not that every affected session failed. A cancellation is not recovery, and
+  an error row contains only its exception type.
 - `runner_session_init_started`: `resume_interrupted_turn`,
   `suppress_recovery_turn`, `recovery_id`. Neither flag set is the tunnel
   reconnect hook; resume set is a sub-agent restore; suppress set is a
