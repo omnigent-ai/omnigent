@@ -135,3 +135,38 @@ it("replaces the default selection and the removed PR's cached metadata", async 
   expect(client.getQueryData(["github-info", "conv"])).toMatchObject(empty);
   expect(client.getQueryData(["github-info", "conv", url])).toMatchObject(empty);
 });
+
+it("does not restore an unlinked GitLab MR from an older host's stale selection", async () => {
+  const url = "https://gitlab.com/team/project/-/merge_requests/7";
+  const empty = {
+    object: "session.github.info",
+    available: true,
+    provider: "gitlab",
+    tracking_available: true,
+    prs: [],
+    pr: null,
+    selected_pr_url: url,
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(new Response(JSON.stringify(empty), { status: 200 })),
+  );
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { result } = renderHook(() => useUpdateSessionPr("conv"), {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+  await act(async () => {
+    const response = await result.current.mutateAsync({ url, action: "remove" });
+    expect(response.selected_pr_url).toBeUndefined();
+  });
+  expect(client.getQueryData(["github-info", "conv"])).toMatchObject({
+    prs: [],
+    selected_pr_url: undefined,
+  });
+  expect(client.getQueryData(["github-info", "conv", url])).toMatchObject({
+    prs: [],
+    selected_pr_url: undefined,
+  });
+});

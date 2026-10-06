@@ -171,10 +171,99 @@ def _shell_host(segment: ShellSegment, hostname: str | None) -> str | None:
     return instance_authority(host) if host else None
 
 
+def _push_output(text: str) -> list[PullRequestRef]:
+    """Read GitLab's existing-MR banner, never push hints or arbitrary URLs."""
+    if re.search(r"(?m)^(?:error: failed to push some refs|fatal:)", text):
+        return []
+    refs = []
+    for match in re.finditer(
+        r"(?m)^remote:\s*View merge request for [^\n]+:\s*\nremote:[ \t]+(https?://\S+)[ \t]*$",
+        text,
+    ):
+        if re.search(r"/-/merge_requests/[1-9][0-9]*/?$", match[1]) and (
+            ref := reference(match[1])
+        ):
+            refs.append(ref)
+    return refs
+
+
+def _git_push(tokens: Sequence[str]) -> ShellPrOp | None:
+    """Recognize explicit MR push options without resolving aliases or running git."""
+    args = list(tokens[1:])
+    while args and args[0].startswith("-"):
+        flag = args.pop(0)
+        if flag in {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}:
+            if not args:
+                return None
+            args.pop(0)
+        elif flag in {"--no-pager", "--no-optional-locks"} or flag.startswith(
+            ("--git-dir=", "--work-tree=", "--namespace=", "--config-env=", "-C", "-c")
+        ):
+            continue
+        else:
+            return None
+    if not args or args.pop(0) != "push":
+        return None
+    options = []
+    while args:
+        arg = args.pop(0)
+        if arg == "--":
+            break
+        if arg in {"-o", "--push-option"}:
+            if not args:
+                return ShellPrOp(False, False, None, True)
+            options.append(args.pop(0))
+        elif arg.startswith("--push-option="):
+            options.append(arg.split("=", 1)[1])
+        elif arg.startswith("-o"):
+            options.append(arg[2:])
+        elif arg in {
+            "-u",
+            "--set-upstream",
+            "-f",
+            "--force",
+            "--force-with-lease",
+            "--force-if-includes",
+            "--no-verify",
+            "--follow-tags",
+            "--atomic",
+            "--porcelain",
+            "-v",
+            "--verbose",
+            "-q",
+            "--quiet",
+        } or arg.startswith("--force-with-lease="):
+            continue
+        elif arg.startswith("-"):
+            return ShellPrOp(False, False, None, True)
+    mutations = {
+        "merge_request.create",
+        "merge_request.title",
+        "merge_request.description",
+        "merge_request.target",
+        "merge_request.target_project",
+        "merge_request.draft",
+        "merge_request.label",
+        "merge_request.unlabel",
+        "merge_request.assign",
+        "merge_request.unassign",
+        "merge_request.merge_when_pipeline_succeeds",
+        "merge_request.remove_source_branch",
+        "merge_request.squash",
+    }
+    tracks = any(option.split("=", 1)[0] in mutations for option in options)
+    return ShellPrOp(tracks, "merge_request.create" in options, None, False, _push_output)
+
+
 def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
     """Describe MR reads too, so mixed command output cannot masquerade as a write."""
     operations = []
+    pushes = []
     for segment in segments:
+        if PurePath(segment.invocation_tokens[0]).name == "git":
+            if op := _git_push(segment.invocation_tokens):
+                pushes.append(op)
+            continue
         if PurePath(segment.invocation_tokens[0]).name != "glab":
             continue
         tokens = list(segment.invocation_tokens[1:])
@@ -215,6 +304,10 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         ):
             tracks, creates = False, False
         operations.append(ShellPrOp(tracks, creates, target, "--jq" in flags))
+    # Ordinary pushes are not PR operations. With an MR push, a second ordinary
+    # push makes the shared remote output ambiguous.
+    if any(op.tracks for op in pushes):
+        operations.extend(pushes)
     return operations
 
 

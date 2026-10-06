@@ -26,7 +26,9 @@ PATCH = (
 )
 
 
-def stub(page: Page, *, partial: bool = False) -> list[tuple[str, str | None]]:
+def stub(
+    page: Page, *, partial: bool = False, stale_removed_selection: bool = False
+) -> list[tuple[str, str | None]]:
     urls = [URL]
     requested: list[tuple[str, str | None]] = []
 
@@ -39,7 +41,7 @@ def stub(page: Page, *, partial: bool = False) -> list[tuple[str, str | None]]:
             "branch": "feature/widget",
             "base_ref": "main",
             "tracking_available": True,
-            "selected_pr_url": url,
+            "selected_pr_url": url or (URL if stale_removed_selection else None),
             "repo": {"name_with_owner": "team/sub/project"},
             "auth": {
                 "authenticated": True,
@@ -121,6 +123,11 @@ def stub(page: Page, *, partial: bool = False) -> list[tuple[str, str | None]]:
         parsed = urlsplit(route.request.url)
         selected = parse_qs(parsed.query).get("pr_url", [urls[0] if urls else None])[0]
         requested.append((parsed.path.rsplit("/", 1)[-1], selected))
+        if selected and selected not in urls and not parsed.path.endswith("/prs"):
+            route.fulfill(
+                status=502, json={"detail": "Pull request is not tracked by this session"}
+            )
+            return
         if parsed.path.endswith("/prs"):
             body = route.request.post_data_json
             if body["action"] == "remove":
@@ -262,6 +269,42 @@ def test_gitlab_link_select_unlink(
     expect(picker).to_contain_text("!7")
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("!7")
     page.screenshot(path=str(tmp_path / "gitlab-selection.png"), animations="disabled")
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
+@pytest.mark.parametrize("stale_selection", [False, True], ids=["current-host", "older-host"])
+def test_gitlab_unlink_last_mr_clears_selection(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str, stale_selection: bool
+) -> None:
+    base_url, session_id = seeded_session
+    requested = stub(page, stale_removed_selection=stale_selection)
+    mobile = entry == "composer-mobile"
+    page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    if entry == "rail":
+        open_right_rail(page)
+        panel = page.get_by_role("complementary", name="Workspace")
+        panel.get_by_role("tab", name="Pull Requests").click()
+    else:
+        page.get_by_test_id("composer-pr-link").click()
+        panel = (
+            page.get_by_test_id("github-panel-drawer")
+            if mobile
+            else page.get_by_role("complementary", name="Workspace")
+        )
+    expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
+    panel.get_by_role("button", name="Unlink PR", exact=True).click()
+    expect(panel.get_by_role("button", name="Link a PR", exact=True)).to_be_visible()
+    expect(panel.get_by_role("button", name="Unlink PR", exact=True)).to_have_count(0)
+    expect(panel.get_by_role("link", name="Open the PR on GitLab")).to_have_count(0)
+    expect(panel.get_by_text(re.compile("Couldn.t load pull request"))).to_have_count(0)
+    expect(page.get_by_test_id("composer-pr-link")).to_have_count(0)
+    page.screenshot(path=str(tmp_path / f"gitlab-unlinked-{entry}.png"), animations="disabled")
+    removal = next(i for i, (resource, _) in enumerate(requested) if resource == "prs")
+    page.reload()
+    expect(page.get_by_test_id("composer-pr-link")).to_have_count(0)
+    page.wait_for_timeout(1200)
+    assert not any(selected == URL for _, selected in requested[removal + 1 :])
 
 
 def test_gitlab_partial_data_is_visible(

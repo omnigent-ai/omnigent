@@ -38,6 +38,11 @@ responses; they exercise the actual shared UI without contacting GitLab.
 - Associations:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_link_select_unlink`
   attaches a second project, changes selection, and removes it.
+- Last association removal:
+  `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_unlink_last_mr_clears_selection`
+  removes the final MR through the rail and both composer surfaces, refreshes,
+  and verifies no stale selection, error, or fallback link remains. Includes
+  an older host's stale selected URL with an empty association list.
 - Partial responses:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_partial_data_is_visible`
   checks visible summary and diff limitations.
@@ -63,5 +68,10 @@ responses; they exercise the actual shared UI without contacting GitLab.
   `api_host` routing remains owned by glab.
 - Mocked browser responses prove rendering and interaction, not GitLab access.
   The native hook fixture proves transport and persistence, not vendor services.
+- Live tracking proof must launch the native agent itself. Verify its `glab`
+  login, then create MRs in another worktree using both `glab mr create` and
+  `git push -o merge_request.create`. Neither should need branch inference or
+  manual linking. Host-to-runner config forwarding alone does not prove the
+  native child received the CLI config location.
 - Keep evidence outside the tracked tree. Canvas is gated by its feature flag;
   desktop sidepanel proof does not cover the mobile drawer or Canvas link.

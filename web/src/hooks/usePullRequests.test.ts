@@ -42,6 +42,18 @@ describe("pullRequestNotFoundReason", () => {
 });
 
 describe("normalizePullRequestInfo", () => {
+  it("ignores removed selections without changing legacy hosts that omit associations", () => {
+    const url = "https://gitlab.com/team/project/-/merge_requests/7";
+    const raw: PullRequestInfo = {
+      object: "session.github.info",
+      available: true,
+      tracking_available: true,
+      selected_pr_url: url,
+      pr: null,
+    };
+    expect(normalizePullRequestInfo({ ...raw, prs: [] }).selected_pr_url).toBeUndefined();
+    expect(normalizePullRequestInfo(raw).selected_pr_url).toBe(url);
+  });
   const accounts: PullRequestAccount[] = [
     { login: "personal", active: true, state: "success", host: "github.com" },
     { login: "work", active: false, state: "success", host: "github.com" },

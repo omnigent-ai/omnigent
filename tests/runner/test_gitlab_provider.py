@@ -667,6 +667,10 @@ def test_generic_panel_inference_attach_selection_files_and_removal(
     assert expanded["before"] == "old\n" and expanded["after"] == "new\n"
     removed = pr_resource.update_session_pr(root, session, URL, "remove")
     assert removed["pr"] is None and not removed["prs"]
+    assert not removed.get("selected_pr_url")
+    refreshed = pr_resource.pr_info(root, session_id=session)
+    assert refreshed["pr"] is None and not refreshed["prs"]
+    assert not refreshed.get("selected_pr_url")
     attached = pr_resource.update_session_pr(root, session, URL, "attach")
     assert attached["pr"]["number"] == 7 and attached["prs"][0]["relationship"] == "attached"
 

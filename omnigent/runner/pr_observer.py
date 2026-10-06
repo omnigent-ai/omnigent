@@ -229,7 +229,12 @@ def extract_prs(
             return [], False
         segments = _shell_segments(command)
         # Every recognized PR command, reads included; ``commands`` are those that change a PR.
-        ops = [op for facet in facets for op in facet.shell_pr_operations(segments)]
+        provider_ops = [
+            (facet.provider_id, op)
+            for facet in facets
+            for op in facet.shell_pr_operations(segments)
+        ]
+        ops = [op for _, op in provider_ops]
         commands = [op for op in ops if op.tracks]
         if not commands:
             return [], False
@@ -250,14 +255,23 @@ def extract_prs(
             and any(op.target is None for op in commands)
             and (len(commands) > 1 or not commands[0].content_only)
         ):
-            for obj in result_objects(result):
-                if ref := _object_pr(obj, facets):
-                    references.append(ref)
-            # A single operation's known identity makes rendered body links redundant.
-            if len(commands) > 1 or not references:
-                for line in text.splitlines():
-                    if len(line.split()) == 1 and (ref := pr_reference(line.strip())):
+            for provider_id, op in provider_ops:
+                if op.parse_output is not None and op.target is None and not op.content_only:
+                    try:
+                        references.extend(
+                            ref for ref in op.parse_output(text) if ref.provider == provider_id
+                        )
+                    except Exception:  # noqa: BLE001 — one parser must not hide other providers
+                        _log_provider_failure(provider_id, "parse_output")
+            if any(op.parse_output is None and op.target is None for op in commands):
+                for obj in result_objects(result):
+                    if ref := _object_pr(obj, facets):
                         references.append(ref)
+                # A single operation's known identity makes rendered body links redundant.
+                if len(commands) > 1 or not references:
+                    for line in text.splitlines():
+                        if len(line.split()) == 1 and (ref := pr_reference(line.strip())):
+                            references.append(ref)
     else:
         # The first provider that claims the tool answers for it.
         for facet in facets:

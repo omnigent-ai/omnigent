@@ -57,7 +57,7 @@ deprecated and will be removed in 0.19.0. Other providers omit them.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol, TypedDict, runtime_checkable
 
@@ -160,12 +160,15 @@ class ShellPrOp:
         they name none, e.g. on create or for the current branch's PR.
     :ivar content_only: The command prints only PR content (body, title, or
         diff), so URLs in its output do not identify the PR.
+    :ivar parse_output: Optional network-free parser for command-specific output.
+        Replaces generic JSON/bare-URL extraction for this operation.
     """
 
     tracks: bool
     creates: bool
     target: PullRequestRef | None
     content_only: bool
+    parse_output: Callable[[str], Sequence[PullRequestRef]] | None = None
 
 
 @runtime_checkable

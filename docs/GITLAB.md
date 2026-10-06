@@ -73,6 +73,12 @@ before expanding context again.
 
 Successful `glab mr` mutations and `glab api` MR writes are tracked from their
 explicit target or result. Supported GitLab MCP mutation tools are tracked too.
+GitLab push options such as `git push -o merge_request.create` or
+`-o merge_request.title=...` track the MR reported in GitLab's successful push
+output. Dry runs, failed pushes, and ordinary pushes do not create associations.
+These agent operations work from another repository or worktree; branch discovery
+only covers the session workspace. Native agents retain the host's `GLAB_CONFIG_DIR`
+(and GitHub's `GH_CONFIG_DIR`) so their CLI tools use the same login.
 Read commands, comments, failed commands, and URLs quoted inside descriptions
 do not create associations. For MCP fork creation, supply `target_project_id`
 when the tool supports it; ambiguous source-project paths may require linking
@@ -103,7 +109,12 @@ To verify manually:
 2. Open a changed file, then expand context. For a fork MR, check a renamed file
    against the target merge-base and source head in GitLab.
 3. Attach a second MR URL, select it, remove it, and refresh. Confirm it remains
-   removed, then attach it again.
+   removed, then attach it again. Remove the final association too: no removed
+   MR link or load error should remain, including after refresh.
 4. Repeat through the compact composer control and at mobile width. Without
    `glab` authentication, confirm the panel keeps the checkout context and shows
    an actionable sign-in or access hint.
+5. In a real native agent session, create MRs in another worktree using both
+   `glab mr create` and `git push -o merge_request.create`. Confirm they appear
+   automatically as created associations, survive refresh, and stay removed
+   after unlinking. A manual hook invocation does not cover native launch.

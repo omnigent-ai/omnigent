@@ -368,9 +368,11 @@ def _associate_discovered_pr(
                     _logger.warning("Could not cache discovered PR metadata", exc_info=True)
             else:
                 candidate["pr"] = None
+                candidate.pop("selected_pr_url", None)
         except Exception:  # noqa: BLE001 — failed optional inference preserves selected PRs
             _logger.warning("Could not associate discovered pull request", exc_info=True)
             candidate["pr"] = None
+            candidate.pop("selected_pr_url", None)
             candidate.setdefault("warnings", []).append("Could not associate this pull request.")
 
 

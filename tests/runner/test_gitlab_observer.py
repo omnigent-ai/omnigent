@@ -53,6 +53,101 @@ def shell(command: str, stdout: object = URL, **status: object):
     )
 
 
+def push_output(url: str = URL) -> str:
+    return f"remote: \nremote: View merge request for feature:\nremote:   {url}\nremote: \n"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push origin HEAD -o merge_request.create",
+        "git -C /another/worktree push -u origin HEAD --push-option=merge_request.create",
+        "git -c http.sslVerify=false push -u origin HEAD -omerge_request.create",
+        "git --git-dir=/another/.git push --push-option merge_request.create origin HEAD",
+        "zsh -lc 'cd /another/project && git push -o merge_request.create origin HEAD'",
+        "git add . && git commit -m change && git push origin HEAD -o merge_request.create",
+    ],
+)
+@pytest.mark.parametrize("url", [URL, PRIVATE_URL])
+def test_push_options_track_server_reported_mr_across_worktrees(command, url):
+    refs, created = shell(command, push_output(url))
+    assert [ref.url for ref in refs] == [url] and created
+
+
+def test_push_options_track_update_and_preserve_removal(monkeypatch):
+    command = "git push -o merge_request.title=Updated origin HEAD"
+    refs, created = shell(command, push_output())
+    assert [ref.url for ref in refs] == [URL] and not created
+    result = {"output": push_output(), "exit_code": 0}
+    observe_tool_completion(
+        "push-session",
+        tool_name="shell",
+        arguments={"command": command},
+        result=result,
+        call_id="push",
+    )
+    registry = SessionPrRegistry("push-session")
+    assert [entry.url for entry in registry.list()] == [URL]
+    registry.remove(URL)
+    observe_tool_completion(
+        "push-session",
+        tool_name="shell",
+        arguments={"command": command},
+        result=result,
+        call_id="push",
+    )
+    assert registry.list() == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push origin HEAD",
+        "git push --dry-run -o merge_request.create",
+        "git push -n -o merge_request.create",
+        "git push -nu -o merge_request.create",
+        "git push --delete -o merge_request.create origin feature",
+        "git push --help -o merge_request.create",
+        "git push -- -o merge_request.create",
+        "git log -o merge_request.create",
+        "echo git push -o merge_request.create",
+        "git -c alias.publish=push publish -o merge_request.create",
+        "git push -o merge_request.create || true",
+        "git push -o merge_request.create; glab mr view 7",
+        "git push -o merge_request.create; glab mr note 7 -m comment",
+        "git push -o merge_request.create origin HEAD; git push other HEAD",
+    ],
+)
+def test_non_mutating_or_ambiguous_push_does_not_track(command):
+    assert shell(command, push_output())[0] == []
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        URL,
+        f"remote: {URL}",
+        push_output(GH_URL),
+        push_output().replace("View merge request for", "To create a merge request for"),
+        push_output() + "error: failed to push some refs to 'origin'\n",
+        push_output().replace(URL, URL + "/diffs"),
+    ],
+)
+def test_push_tracks_only_successful_gitlab_mr_banner(output):
+    assert shell("git push -o merge_request.create", output)[0] == []
+
+
+def test_failed_or_background_push_does_not_track():
+    command = "git push -o merge_request.create"
+    assert shell(command, push_output(), exit_code=1) == ([], False)
+    assert shell(command, push_output(), exit_code=None, session_id=12) == ([], False)
+
+
+def test_normal_push_before_github_creation_still_tracks():
+    refs, created = shell("git push -u origin HEAD && gh pr create --title T --body B", GH_URL)
+    assert [ref.url for ref in refs] == [GH_URL] and created
+
+
 @pytest.mark.parametrize(
     "command",
     [
