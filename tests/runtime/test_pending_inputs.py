@@ -373,6 +373,51 @@ def test_restore_returns_a_drained_entry_to_the_front() -> None:
     assert redrained is not None and redrained.pending_id == first
 
 
+def test_interrupted_flag_survives_nonheld_resolve_and_restore() -> None:
+    """A removed interrupted entry remains hidden after compensation restores it."""
+    cancelled = pending_inputs.record("conv_restore", [_text_block("cancelled")])
+    pending_inputs.mark_interrupted("conv_restore", [cancelled])
+
+    drained = pending_inputs.resolve("conv_restore", cancelled)
+    assert drained is not None and drained.interrupted is True
+
+    pending_inputs.restore("conv_restore", drained)
+
+    assert pending_inputs.snapshot_for("conv_restore") == []
+    assert pending_inputs.has_pending("conv_restore") is False
+    later = pending_inputs.record("conv_restore", [_text_block("later")])
+    matched = pending_inputs.resolve_matching_text("conv_restore", "later")
+    assert matched.matched is not None and matched.matched.pending_id == later
+    assert matched.skipped == []
+    assert [entry.pending_id for entry in matched.uncertain] == [cancelled]
+
+
+def test_interrupted_flag_survives_ttl_eviction_of_held_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A TTL-evicted held interrupted entry stays hidden when reconstructed."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    cancelled = pending_inputs.record("conv_ttl_restore", [_text_block("cancelled")])
+    pending_inputs.mark_interrupted("conv_ttl_restore", [cancelled])
+    held = pending_inputs.resolve_matching_text("conv_ttl_restore", "cancelled", hold=True)
+    assert held.matched is not None and held.matched.interrupted is True
+
+    clock["t"] += pending_inputs._TTL_S + 0.1
+    assert pending_inputs.snapshot_for("conv_ttl_restore") == []
+
+    pending_inputs.restore("conv_ttl_restore", held.matched)
+
+    assert pending_inputs.snapshot_for("conv_ttl_restore") == []
+    assert pending_inputs.has_pending("conv_ttl_restore") is False
+    later = pending_inputs.record("conv_ttl_restore", [_text_block("later")])
+    matched = pending_inputs.resolve_matching_text("conv_ttl_restore", "later")
+    assert matched.matched is not None and matched.matched.pending_id == later
+    assert matched.skipped == []
+    assert [entry.pending_id for entry in matched.uncertain] == [cancelled]
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("matched", [False, True])
 def test_title_preference_survives_drain_and_restore(enabled: bool, matched: bool) -> None:

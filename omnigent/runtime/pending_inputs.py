@@ -175,6 +175,9 @@ class DrainedInput:
         so ``session.input.consumed`` carries the correct author on
         all clients (including collaborators who never saw the
         optimistic bubble).
+    :param interrupted: Whether the person interrupted the turn while this
+        entry was queued. Preserved when the entry is restored so it remains
+        hidden and settles quietly as an uncertain entry.
     """
 
     pending_id: str
@@ -182,6 +185,7 @@ class DrainedInput:
     created_by: str | None = None
     stable_id: str | None = None
     background_titles_enabled: bool = True
+    interrupted: bool = False
 
 
 @dataclass
@@ -549,6 +553,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         created_by=drained.created_by,
         stable_id=drained.stable_id,
         background_titles_enabled=drained.background_titles_enabled,
+        interrupted=drained.interrupted,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -739,6 +744,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         created_by=entry.created_by,
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
+        interrupted=entry.interrupted,
     )
 
 
@@ -784,7 +790,10 @@ def _prefer_live(candidates: list[int], interrupted: list[bool]) -> int | None:
     A resend of the same text after Stop leaves a cancelled entry and a live
     one that match the same mirror. The agent recorded the resend, so it takes
     the mirror and the cancelled entry is jumped over. A cancelled entry with
-    no live twin still matches: the agent did record it.
+    no live twin still matches: the agent did record it. If another live input
+    intervenes, text alone cannot distinguish the cancelled copy from the
+    resend; preferring the live entry is inherently ambiguous but deliberately
+    optimizes for the common resend case.
 
     :param candidates: Queue indices of the entries that match, oldest first.
     :param interrupted: Per entry, whether the person cancelled it by interrupting.
