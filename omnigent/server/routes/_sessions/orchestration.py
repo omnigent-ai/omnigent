@@ -2977,10 +2977,7 @@ async def _persist_external_conversation_item_unlocked(
             cleared_pending_id = drained.pending_id
         held_older = matched.skipped
     elif shell_command is not None:
-        # A `!cmd` typed in the web composer runs as a shell command and comes
-        # back as terminal_command input, never as a user message. Drain its
-        # own entry so it is not later mistaken for a lost message; older
-        # entries stay in place.
+        # Drain only the matching shell entry; restore older entries.
         matched = pending_inputs.resolve_matching_text(
             session_id, shell_command, hold=True, shell_command=True
         )

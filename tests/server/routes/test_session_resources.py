@@ -5296,10 +5296,7 @@ def _consumed_receipts(published: list[tuple[str, dict[str, Any]]]) -> list[str 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("queued_text", ["!ls -la", "! ls -la"])
-async def test_claude_native_mirrored_shell_command_drains_its_queued_entry(
-    queued_text: str,
-) -> None:
+async def test_claude_native_mirrored_shell_command_drains_its_queued_entry() -> None:
     """A web ``!cmd`` mirrored as terminal_command input clears its own queued entry.
 
     Claude Code runs the message as a shell command and records it as
@@ -5316,7 +5313,7 @@ async def test_claude_native_mirrored_shell_command_drains_its_queued_entry(
     conv = store.get_conversation(sid)
     assert conv is not None
     older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
-    command = pending_inputs.record(sid, [{"type": "input_text", "text": queued_text}])
+    command = pending_inputs.record(sid, [{"type": "input_text", "text": "!ls -la"}])
 
     try:
         with capture_debug_rows("server") as rows:

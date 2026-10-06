@@ -7543,12 +7543,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "terminal_command": {
-      // Claude-native: a `!cmd` typed in the web composer runs as a shell
-      // command, so its input comes back as this item instead of a user
-      // message and no `session.input.consumed` fires. The server drains the
-      // oldest queued entry whose text is that command; pop the matching
-      // bubble the same way. A command typed in the TUI, and the output half,
-      // match no bubble and acknowledge nothing.
+      // Shell inputs have no consumed receipt; remove the oldest matching sent bubble.
       const command = event.kind === "input" ? event.input : null;
       if (command === null) return;
       applyToConversation((s) => {

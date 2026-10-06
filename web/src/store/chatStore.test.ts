@@ -8174,6 +8174,13 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       tempId,
       content: [{ type: "input_text" as const, text }],
     });
+    const receipt = (itemId: string, text: string, clearedPendingId: string): StreamEvent => ({
+      type: "session_input_consumed",
+      itemId,
+      itemType: "message",
+      clearedPendingId,
+      data: { role: "user", content: [{ type: "input_text", text }], user_authored: true },
+    });
 
     it("pops the queued bubble whose command was mirrored", () => {
       // A `!cmd` runs as a shell command, so no `session.input.consumed`
@@ -8285,6 +8292,30 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       handleSessionEvent(shellEvent("input"));
 
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+
+    it("commits each message once when an older server's skip receipt names a popped bubble", () => {
+      // An older server never drains the `!cmd` entry: the next message's mirror
+      // persists it as skipped, with a receipt naming the bubble popped above.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [bubble("pend_1", "!echo hi"), bubble("pend_2", "thanks")],
+      });
+
+      handleSessionEvent(shellEvent("input", "echo hi"));
+      handleSessionEvent(receipt("item_skipped_user", "!echo hi", "pend_1"));
+      handleSessionEvent(receipt("item_thanks", "thanks", "pend_2"));
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks).toMatchObject([
+        {
+          type: "user_message",
+          ctx: { itemId: "item_skipped_user" },
+          content: [{ text: "!echo hi" }],
+        },
+        { type: "user_message", ctx: { itemId: "item_thanks" }, content: [{ text: "thanks" }] },
+      ]);
     });
   });
 
