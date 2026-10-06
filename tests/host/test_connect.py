@@ -7,6 +7,7 @@ import contextlib
 import errno
 import json
 import logging
+import socket
 import subprocess
 import sys
 import threading
@@ -8343,6 +8344,73 @@ async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
     """An unknown write op fails loud rather than silently no-op'ing."""
     with pytest.raises(ValueError, match="unknown fs write op"):
         HostProcess._dispatch_fs_write_op("/ws", "bogus", {})
+
+
+@pytest.mark.parametrize(
+    ("use_proxy", "failure"), [(False, "enter"), (True, "constructor"), (True, "enter")]
+)
+async def test_connect_and_serve_proxy_socket(
+    monkeypatch: pytest.MonkeyPatch, use_proxy: bool, failure: str
+) -> None:
+    """The proxied socket is passed to connect() and closed when either connect step fails."""
+    from omnigent.host import connect as connect_mod
+
+    proxy_url = "http://127.0.0.1:3128"
+    if use_proxy:
+        monkeypatch.setenv("http_proxy", proxy_url)
+    host = HostProcess(
+        HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        "http://server.sandbox.test:8000",
+    )
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    connect = Mock(return_value=AsyncMock())
+    if failure == "constructor":
+        connect.side_effect = ConnectionError("test rejection")
+    else:
+        connect.return_value.__aenter__.side_effect = ConnectionError("test rejection")
+    monkeypatch.setattr(connect_mod.websockets.asyncio.client, "connect", connect)
+
+    with socket.socket() as proxy_sock:
+        dial = AsyncMock(return_value=proxy_sock)
+        monkeypatch.setattr(connect_mod, "open_proxy_connect_socket", dial)
+        with pytest.raises(ConnectionError, match="test rejection"):
+            await host._connect_and_serve()
+
+        tunnel_url = "ws://server.sandbox.test:8000/v1/hosts/host_test_connect/tunnel"
+        assert connect.call_args.args == (tunnel_url,)
+        assert connect.call_args.kwargs["sock"] is (proxy_sock if use_proxy else None)
+        if use_proxy:
+            dial.assert_awaited_once_with(
+                proxy_url, tunnel_url, timeout=connect_mod._INITIAL_CONNECT_OPEN_TIMEOUT_S
+            )
+            assert proxy_sock.fileno() == -1
+        else:
+            dial.assert_not_awaited()
+
+
+async def test_connect_and_serve_builds_ssl_context_before_dialing_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CA-bundle failure surfaces before any proxied socket is opened."""
+    import ssl
+
+    from omnigent.host import connect as connect_mod
+
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:3128")
+    host = HostProcess(
+        HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        "https://server.sandbox.test:8443",
+    )
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    monkeypatch.setattr(
+        connect_mod, "client_ssl_context", Mock(side_effect=ssl.SSLError("bad CA bundle"))
+    )
+    dial = AsyncMock()
+    monkeypatch.setattr(connect_mod, "open_proxy_connect_socket", dial)
+
+    with pytest.raises(ssl.SSLError, match="bad CA bundle"):
+        await host._connect_and_serve()
+    dial.assert_not_awaited()
 
 
 @pytest.mark.parametrize("action", ["attach", "remove"])
