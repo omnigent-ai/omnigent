@@ -1521,6 +1521,14 @@ async def test_startup_gates_before_dispatch(
         ({"arg_count": "4"}, 502),
         ({"arg_count": -3}, 502),
         ({"arg_count": True}, 502),
+        ({"args": "--model opus"}, 502),
+        ({"args": ["--model", 5]}, 502),
+        ({"configured_command": 5}, 502),
+        ({"configured_args": ["--model", 5]}, 502),
+        ({"environment": {"inherit": "true", "variables": {}, "unset": []}}, 502),
+        ({"environment": {"inherit": True, "variables": {"TOKEN": 5}, "unset": []}}, 502),
+        ({"environment": {"inherit": True, "variables": {}, "unset": [5]}}, 502),
+        ("old", 200),
         ({"command": 5}, 502),
         ({"resolved_path": []}, 502),
         ({"command_source": "unknown"}, 502),
@@ -1547,13 +1555,25 @@ async def test_startup_http_through_real_tunnel(startup_app, monkeypatch, reply,
         "resolved_path": None,
         "command_source": "default",
         "arg_count": 2,
+        "args": ["--model", "opus"],
+        "configured_command": "env",
+        "configured_args": ["TOKEN=visible-value", "claude", "--model", "opus"],
+        "environment": {"inherit": True, "variables": {"TOKEN": "visible-value"}, "unset": []},
     }
     if reply == "disconnect":
         await peer.send_input({"type": "websocket.disconnect", "code": 1000})
     elif reply == "replace":
         registry.register(_HOST_ID, conn.ws, conn.hello, owner="owner")
     elif reply != "timeout":
-        payload = {**expected, **reply} if isinstance(reply, dict) else reply
+        if reply == "old":
+            payload = {
+                key: value
+                for key, value in expected.items()
+                if key not in ("configured_command", "configured_args", "environment")
+            }
+            expected.update(configured_command=None, configured_args=None, environment=None)
+        else:
+            payload = {**expected, **reply} if isinstance(reply, dict) else reply
         await peer.send_input(
             {
                 "type": "websocket.receive",

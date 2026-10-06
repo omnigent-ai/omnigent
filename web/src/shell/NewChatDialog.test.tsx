@@ -1073,6 +1073,24 @@ describe("matchSkillInvocation", () => {
     });
   });
 
+  it("matches a skill whose name contains spaces and splits off its args", () => {
+    const name = "Simplified Technical English (ASD-STE100)";
+    const skills = [...SKILLS, { name }];
+    expect(matchSkillInvocation(`/${name}`, skills)).toEqual({ name, args: "" });
+    expect(matchSkillInvocation(`/${name} rewrite this`, skills)).toEqual({
+      name,
+      args: "rewrite this",
+    });
+  });
+
+  it("matches a skill whose first word is not command-shaped", () => {
+    const name = "Node.js Best Practices";
+    expect(matchSkillInvocation(`/${name} here`, [...SKILLS, { name }])).toEqual({
+      name,
+      args: "here",
+    });
+  });
+
   it("tolerates surrounding whitespace (the sanitized prompt is trimmed)", () => {
     expect(matchSkillInvocation("  /review-pr 123  ", SKILLS)).toEqual({
       name: "review-pr",

@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { BridgeSetupApp } from "./server-selector-v2";
 
@@ -39,7 +39,10 @@ it("tags a connect with a request ID, shows only its phases, and cancels it", as
     },
   });
   render(<BridgeSetupApp />);
-  fireEvent.click(await screen.findByRole("button", { name: /open omnigent/i }));
+  const openButton = await screen.findByRole("button", { name: /open omnigent/i });
+  await waitFor(() => expect(openButton).toBeEnabled());
+  fireEvent.click(openButton);
+  await waitFor(() => expect(setServerUrl).toHaveBeenCalledTimes(1));
   const requestId = setServerUrl.mock.calls[0][1]?.requestId;
   expect(requestId).toEqual(expect.any(String));
 

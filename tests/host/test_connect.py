@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -308,7 +308,14 @@ async def test_host_answers_launch_settings(monkeypatch, fails):
     from omnigent.host.harness_startup import HarnessStartup
 
     expected = HarnessStartup(
-        command="claude", resolved_path=None, command_source="default", arg_count=2
+        command="claude",
+        resolved_path=None,
+        command_source="default",
+        arg_count=2,
+        args=["--model", "opus"],
+        configured_command="env",
+        configured_args=["TOKEN=visible-value", "claude", "--model", "opus"],
+        environment={"inherit": True, "variables": {"TOKEN": "visible-value"}, "unset": []},
     )
 
     def describe(harness):
@@ -326,7 +333,8 @@ async def test_host_answers_launch_settings(monkeypatch, fails):
     assert decode_host_frame(ws.sent[-1]) == HostHarnessStartupResultFrame(
         "startup", None if fails else expected
     )
-    assert "SECRET" not in ws.sent[-1]
+    if fails:
+        assert "SECRET" not in ws.sent[-1]
 
 
 async def test_host_answers_mcp_inventory_over_the_tunnel(
@@ -6032,6 +6040,65 @@ def test_run_host_process_exits_nonzero_on_fatal(
     assert "HTTP 403" in err
 
 
+def _host_exit_reasons(caplog: pytest.LogCaptureFixture) -> list[object]:
+    return [
+        r.attributes["reason"]  # type: ignore[attr-defined]
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "host_exiting"
+    ]
+
+
+def test_run_host_process_logs_fatal_exit_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fatal tunnel failure is logged, not only printed, so the sink sees it."""
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+    _patch_connect(monkeypatch, _ConnectSpy([_invalid_status(403)]))
+
+    with pytest.raises(SystemExit):
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert _host_exit_reasons(caplog) == ["fatal_connect"]
+    assert any(getattr(r, "event_name", None) == "host_started" for r in caplog.records)
+
+
+def test_run_host_process_logs_clean_exit_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    run_host_process(
+        server_url="https://app.example.databricks.com",
+        config_path=tmp_path / "config.yaml",
+    )
+
+    assert _host_exit_reasons(caplog) == ["clean"]
+
+
+def test_run_host_process_logs_crash_during_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A setup crash is reported even when the caller catches it before excepthook."""
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+
+    def _boom(*_args: object) -> None:
+        raise RuntimeError("setup exploded")
+
+    monkeypatch.setattr("omnigent.git_credential_github.configure_host_git", _boom)
+
+    with pytest.raises(RuntimeError, match="setup exploded"):
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert _host_exit_reasons(caplog) == ["uncaught"]
+
+
 async def test_run_host_process_invalid_host_id_exits_actionably(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -8528,3 +8595,33 @@ async def test_host_mcp_tools_failure_is_private(monkeypatch, caplog, error, sta
     )
     assert result.status == status
     assert "synthetic-private-config" not in encode_host_frame(result) + caplog.text
+
+
+@pytest.mark.parametrize(
+    ("serve", "expected"),
+    [
+        (lambda: True, "lifecycle_lost"),
+        (lambda: (_ for _ in ()).throw(SystemExit(None)), "clean"),
+        (lambda: (_ for _ in ()).throw(SystemExit(0)), "clean"),
+        (lambda: (_ for _ in ()).throw(SystemExit(3)), "exit"),
+        (lambda: (_ for _ in ()).throw(KeyboardInterrupt()), "interrupted"),
+    ],
+    ids=["lifecycle-lost", "system-exit-none", "system-exit-0", "system-exit-3", "ctrl-c"],
+)
+def test_run_host_process_classifies_how_the_host_ended(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    serve: Callable[[], bool],
+    expected: str,
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+    monkeypatch.setattr("omnigent.host.connect._serve_host_until_exit", lambda *_a, **_k: serve())
+
+    with contextlib.suppress(SystemExit, KeyboardInterrupt):
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert _host_exit_reasons(caplog) == [expected]

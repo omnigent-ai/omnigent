@@ -17,29 +17,33 @@ describe("injectCommentBridge", () => {
   const NONCE = "test-nonce-123";
   const LOADER_URL = "https://app.example/assets/html-comment-bridge.js";
 
+  // The prepared head carries its own <script> (same-page anchors), so the
+  // bridge script is located by its nonce.
   it("injects the bridge script before </body> when present", () => {
     const html = "<html><head></head><body><p>hi</p></body></html>";
     const out = injectCommentBridge(html, NONCE, LOADER_URL);
-    const scriptAt = out.indexOf("<script ");
+    const scriptAt = out.indexOf(`data-omni-nonce="${NONCE}"`);
     const bodyCloseAt = out.indexOf("</body>");
     expect(scriptAt).toBeGreaterThan(-1);
     expect(scriptAt).toBeLessThan(bodyCloseAt);
-    expect(out).toContain(NONCE);
   });
 
   it("falls back to before </html> when there is no body", () => {
     const html = "<html><head></head><p>hi</p></html>";
     const out = injectCommentBridge(html, NONCE, LOADER_URL);
-    expect(out.indexOf("<script ")).toBeLessThan(out.indexOf("</html>"));
+    const scriptAt = out.indexOf(`data-omni-nonce="${NONCE}"`);
+    expect(scriptAt).toBeGreaterThan(-1);
+    expect(scriptAt).toBeLessThan(out.indexOf("</html>"));
   });
 
   it("appends to a bare fragment with no body/html", () => {
     const out = injectCommentBridge("<p>just a fragment</p>", NONCE, LOADER_URL);
-    // prepareHtmlPreviewDoc prepends <base> for a bare fragment; the bridge is
-    // then appended at the end since there's no </body>/</html> to inject before.
+    // prepareHtmlPreviewDoc prepends its head markup for a bare fragment; the
+    // bridge is then appended at the end since there's no </body>/</html> to
+    // inject before.
     expect(out).toContain("<p>just a fragment</p>");
     const fragAt = out.indexOf("<p>just a fragment</p>");
-    expect(out.indexOf("<script ")).toBeGreaterThan(fragAt);
+    expect(out.indexOf(`data-omni-nonce="${NONCE}"`)).toBeGreaterThan(fragAt);
   });
 
   it("preserves the prepared <base target=_blank> link behavior", () => {

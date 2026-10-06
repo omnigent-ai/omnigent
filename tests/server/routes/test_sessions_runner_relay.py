@@ -1920,7 +1920,7 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
         ("sub_agent", "idle", "error", None, "idle_no_failure", "relay_snapshot"),
         ("sub_agent", "running", "error", None, "failed_mid_turn", "relay_snapshot"),
         ("sub_agent", "waiting", "missing", None, "failed_mid_turn", "relay_snapshot"),
-        ("sub_agent", None, "missing", None, "failed_mid_turn", "unknown"),
+        ("sub_agent", None, "missing", None, "unknown_no_failure", "unknown"),
         ("sub_agent", "idle", "running", None, "failed_mid_turn", "persisted"),
         ("sub_agent", "idle", "waiting", None, "failed_mid_turn", "persisted"),
         ("sub_agent", "running", "idle", None, "idle_no_failure", "persisted"),
@@ -1930,12 +1930,16 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
         # edge, and its parent's runtime owns the turn: only the cache fails it.
         ("mirror", "running", "error", None, "subagent_unobserved", "relay_snapshot"),
         ("mirror", "waiting", "missing", None, "subagent_unobserved", "relay_snapshot"),
-        ("mirror", None, "missing", None, "failed_mid_turn", "unknown"),
+        ("mirror", None, "missing", None, "unknown_no_failure", "unknown"),
         ("mirror", "idle", "running", None, "subagent_unobserved", "persisted"),
         ("mirror", "idle", "idle", "running", "failed_mid_turn", "cache"),
         # A top-level session's saved mid-turn status still reports the drop.
         ("default", "running", "error", None, "failed_mid_turn", "relay_snapshot"),
         ("default", "idle", "running", None, "failed_mid_turn", "persisted"),
+        ("default", None, "error", None, "unknown_no_failure", "unknown"),
+        ("default", None, "missing", None, "unknown_no_failure", "unknown"),
+        ("default", None, "error", "running", "failed_mid_turn", "cache"),
+        ("default", None, "error", "waiting", "failed_mid_turn", "cache"),
     ],
 )
 async def test_relay_disconnect_status_after_adoption(
@@ -2044,9 +2048,9 @@ async def test_relay_disconnect_status_after_adoption(
 @pytest.mark.parametrize(
     ("scenario", "expect_failed"),
     [
-        ("wrong_session", True),
-        ("wrong_runner", True),
-        ("rebind", True),
+        ("wrong_session", False),
+        ("wrong_runner", False),
+        ("rebind", False),
         ("caller_mutation", False),
         ("healthy_reuse", False),
     ],
@@ -2119,6 +2123,11 @@ async def test_relay_adoption_snapshot_lifetime(
                     conversation=snapshot,
                 )
                 assert reused is handle
+        if scenario in {"wrong_session", "wrong_runner", "rebind"}:
+            assert handle.status_snapshot is None
+        else:
+            assert handle.status_snapshot is not None
+            assert handle.status_snapshot.live_status == "idle"
         monkeypatch.setattr(store, "get_conversation", missing_disconnect_lookup)
         gate.set()
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
@@ -2250,19 +2259,15 @@ async def test_disconnect_uses_status_arriving_during_lookup(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing_row", [False, True])
-async def test_relay_reports_the_drop_when_live_status_is_unknown(
+async def test_relay_preserves_existing_error_when_live_status_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
     missing_row: bool,
 ) -> None:
     """
-    An unreadable or missing row still reports the drop.
+    An unreadable or missing row cannot establish an interrupted turn.
 
-    The cold-cache fallback reads the row from inside the disconnect
-    handler. A store error there must not escape: an exception thrown out of
-    that handler ends the relay task before either branch publishes,
-    truncating the client's stream with no error event — exactly what the
-    ``failed`` status exists to prevent. An indeterminate answer therefore
-    reports the drop, as the ungated relay always did.
+    The relay exits cleanly without publishing a fabricated failure, clearing
+    a genuine earlier error, or inventing an idle status.
     """
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
@@ -2282,6 +2287,8 @@ async def test_relay_reports_the_drop_when_live_status_is_unknown(
 
     monkeypatch.setattr(store, "get_conversation", unavailable_conversation)
     session_id = "abcdef0123456789abcdef0123456789"
+    original_labels = {"omnigent.last_task_error_code": "required_terminal_exited"}
+    store.labels[session_id] = dict(original_labels)
 
     try:
         assert sessions_module._session_status_cache.get(session_id) is None
@@ -2297,12 +2304,10 @@ async def test_relay_reports_the_drop_when_live_status_is_unknown(
         gate.set()
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
-        # The relay survived the store error and still reported the cause.
+        # The relay survives the read failure without changing session state.
         assert handle.task.exception() is None
-        assert sessions_module._session_status_cache.get(session_id) == "failed"
-        persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
-        assert persisted is not None
-        assert persisted["code"] == "runner_disconnected"
+        assert session_id not in sessions_module._session_status_cache
+        assert store.labels[session_id] == original_labels
     finally:
         gate.set()
         handle = sessions_module._runner_relay_tasks.get(session_id)

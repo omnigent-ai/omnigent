@@ -25,6 +25,9 @@ const mocks = vi.hoisted(() => ({
   bulkArchiveMutate: vi.fn(),
   bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
+  harnessSettingsEnabled: false,
+  importSessionsPanel: vi.fn(() => null),
+  reviewImportsPanel: vi.fn(() => null),
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -55,7 +58,14 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    features: { harness_settings_ui: mocks.harnessSettingsEnabled },
   }),
+}));
+vi.mock("@/shell/ImportSessionsPanel", () => ({
+  ImportSessionsPanel: mocks.importSessionsPanel,
+}));
+vi.mock("@/components/onboarding/HostImportReview", () => ({
+  ReviewImportsPanel: mocks.reviewImportsPanel,
 }));
 vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
@@ -224,6 +234,9 @@ beforeEach(() => {
   mocks.conversationQuery.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
+  mocks.harnessSettingsEnabled = false;
+  mocks.importSessionsPanel.mockClear();
+  mocks.reviewImportsPanel.mockClear();
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
@@ -247,6 +260,26 @@ afterEach(() => {
     if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
   }
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+});
+
+describe("Import sessions", () => {
+  it.each([true, false])(
+    "shows Harness imports only with Harnesses settings disabled (enabled=%s)",
+    (enabled) => {
+      mocks.harnessSettingsEnabled = enabled;
+      renderPage("/settings/import");
+
+      expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
+      expect(mocks.importSessionsPanel).toHaveBeenCalled();
+      if (enabled) {
+        expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+        expect(mocks.reviewImportsPanel).not.toHaveBeenCalled();
+      } else {
+        expect(screen.getByRole("heading", { name: "Harness imports" })).toBeTruthy();
+        expect(mocks.reviewImportsPanel).toHaveBeenCalled();
+      }
+    },
+  );
 });
 
 const DEFAULT_UPDATE_CONFIG: UpdateConfig = {

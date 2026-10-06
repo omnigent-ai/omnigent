@@ -120,7 +120,7 @@ import {
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
 import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
-import { isSlashCommandText, SlashCommandMenu } from "@/components/SlashCommandMenu";
+import { matchSlashCommandInvocation, SlashCommandMenu } from "@/components/SlashCommandMenu";
 import {
   beginLocalConversation,
   hasPendingLocalMessage,
@@ -1189,12 +1189,12 @@ function SandboxRepoBranchSelect({
 /**
  * Match a first message against the available bundled and host skills.
  *
- * Uses the in-session composer's shared command-shape guard
- * (:func:`isSlashCommandText`): the first token must read as ``/name``
- * (file paths like ``/etc/hosts`` never match), while the args after it
- * may carry anything — including paths and URLs, e.g.
- * ``"/review-pr https://github.com/..."``. The command name must
- * exactly match an available skill. Unknown commands are sent as plain text.
+ * The message must be ``/`` plus an available skill's full name (which may
+ * contain spaces or punctuation), followed by nothing or by whitespace and
+ * args that may carry anything, including paths and URLs, e.g.
+ * ``"/review-pr https://github.com/..."``. File paths like ``/etc/hosts``
+ * never match because no skill has that name; unknown commands are sent as
+ * plain text.
  *
  * @param text The sanitized first message, e.g. ``"/review-pr 123"``.
  * @param skills The chosen agent's bundled skills and the selected host's catalog.
@@ -1205,12 +1205,11 @@ export function matchSkillInvocation(
   text: string,
   skills: readonly { name: string }[],
 ): { name: string; args: string } | null {
-  const trimmed = text.trim();
-  if (!isSlashCommandText(trimmed)) return null;
-  const command = trimmed.split(/\s+/)[0]!;
-  const name = command.slice(1);
-  if (!skills.some((s) => s.name === name)) return null;
-  return { name, args: trimmed.slice(command.length).trim() };
+  const match = matchSlashCommandInvocation(
+    text,
+    skills.map((s) => `/${s.name}`),
+  );
+  return match && { name: match.command.slice(1), args: match.args };
 }
 
 /**

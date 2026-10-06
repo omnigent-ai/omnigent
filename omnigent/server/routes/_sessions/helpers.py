@@ -2572,6 +2572,62 @@ def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
         ) from exc
 
 
+class _LiveSettingsChange:
+    """Orders one session's live effort/model changes and records writes made meanwhile."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self._position = 0
+        # Setting → (position, value) of the latest write by another request.
+        self._writes: dict[str, tuple[int, str | None]] = {}
+
+    def note_write(self, key: str, value: str | None) -> None:
+        """Record another request's write, or a terminal report, of *key*."""
+        self._position += 1
+        self._writes[key] = (self._position, value)
+
+    def position(self) -> int:
+        """Return the position that later writes are ordered after."""
+        return self._position
+
+    def restore_target(
+        self, key: str, previous: str | None, *, began: int, saved: int
+    ) -> tuple[bool, str | None]:
+        """Return whether a refused change may restore *key*, and the value to restore.
+
+        A write after the change was saved is a newer selection, so it stays. One
+        between the change's start and its save is what the change replaced.
+        """
+        position, value = self._writes.get(key, (0, None))
+        if position > saved:
+            return False, None
+        return True, value if position > began else previous
+
+
+# Live forwards run on the replica that holds the session's runner, so this
+# process-local registry orders them; weak values drop sessions with no change.
+# custom-lint: disable-next=workspace-scoped-cache -- session ids are globally unique
+_live_settings_changes: weakref.WeakValueDictionary[str, _LiveSettingsChange] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _live_settings_change(session_id: str) -> _LiveSettingsChange:
+    """Return the live settings change for *session_id*, starting one if none is active."""
+    change = _live_settings_changes.get(session_id)
+    if change is None:
+        change = _live_settings_changes[session_id] = _LiveSettingsChange()
+    return change
+
+
+def _note_settings_write(session_id: str, values: Mapping[str, str | None]) -> None:
+    """Record settings another request wrote while a live change may be active."""
+    change = _live_settings_changes.get(session_id)
+    if change is not None:
+        for key, value in values.items():
+            change.note_write(key, value)
+
+
 async def _persist_external_reasoning_effort_change(
     session_id: str,
     conv: Conversation,
@@ -2595,6 +2651,8 @@ async def _persist_external_reasoning_effort_change(
     """
     effort = _validate_external_reasoning_effort(body)
     if conv.reasoning_effort == effort:
+        # The terminal still reports what it runs when the saved value matches.
+        _note_settings_write(session_id, {"reasoning_effort": effort})
         return
     await asyncio.to_thread(
         conversation_store.update_conversation,
@@ -2602,6 +2660,7 @@ async def _persist_external_reasoning_effort_change(
         reasoning_effort=effort,
         _unset_reasoning_effort=effort is None,
     )
+    _note_settings_write(session_id, {"reasoning_effort": effort})
     event = SessionReasoningEffortEvent(
         type="session.reasoning_effort",
         conversation_id=session_id,
@@ -6774,13 +6833,13 @@ async def _forward_session_change_to_runner_impl(
 
     Used for control inputs the runner dispatches by harness in its
     ``/v1/sessions/{id}/events`` handler — claude-native injects the
-    corresponding slash command into the tmux pane; other harnesses
-    return 204 no-op. Two kinds of caller use this:
+    corresponding slash command into the tmux pane; Codex-native applies
+    settings through its app-server. Two kinds of caller use this:
 
     * PATCH-driven harness notifications (``effort_change``,
-      ``model_change``) — claude-native injects the slash command,
-      other harnesses re-read the persisted value at the next turn
-      boundary, so they ignore the return value.
+      ``model_change``) — native callers inspect refusals and can restore
+      the previous selection; in-process harnesses re-read the persisted
+      value at the next turn boundary.
     * Explicit ``compact`` — the caller inspects the returned status
       to decide whether the runner handled the control (claude-native,
       200) or the Omnigent server must run its own in-process compaction

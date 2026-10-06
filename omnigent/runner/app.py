@@ -302,6 +302,29 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 _server_version: str | None = None
 
 
+def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
+    """Mark a refused Codex settings response as not kept by this runner."""
+    try:
+        content = json.loads(bytes(response.body))
+    except ValueError:
+        content = None
+    if not isinstance(content, dict):
+        content = {}
+    return JSONResponse(
+        status_code=response.status_code, content={**content, "rollback_on_refusal": True}
+    )
+
+
+def _invalid_effort_response(effort: object) -> JSONResponse | None:
+    """Return the 400 for a non-string, non-null session-event effort, else ``None``."""
+    if effort is None or isinstance(effort, str):
+        return None
+    return JSONResponse(
+        status_code=400,
+        content={"error": "invalid_input", "detail": "Body 'effort' must be a string or null"},
+    )
+
+
 def _version_supports_waiting_status(server_version: str) -> bool:
     """
     Whether *server_version* can serialize ``session.status: "waiting"``.
@@ -6541,26 +6564,31 @@ def create_runner_app(
         if body_type == "effort_change":
             harness = _session_harness_name(conversation_id)
             effort = body.get("effort") if isinstance(body, dict) else None
-            if effort is not None and not isinstance(effort, str):
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_input",
-                        "detail": "Body 'effort' must be a string or null",
-                    },
+            if (invalid := _invalid_effort_response(effort)) is not None:
+                return invalid
+            if harness == "codex-native":
+                # The native handler remembers the applied effort only after
+                # Codex confirms it; a refused reset must retain the old value.
+                server_rolls_back = body.get("rollback_on_refusal") is True
+                response = await _handle_codex_native_settings_update(
+                    conversation_id,
+                    {"effort": effort},
+                    # An older server keeps a refused selection for the next turn.
+                    legacy_server=not server_rolls_back,
                 )
+                if server_rolls_back and not (
+                    200 <= response.status_code < 300 or response.status_code == 504
+                ):
+                    # Confirm the refusal was not kept, so the server may roll it back.
+                    return _acknowledge_settings_rollback(response)
+                return response
             # In-process harnesses apply the effort on their next turn, from the
             # forwarded turn body (see ``_turn_reasoning``).
             if effort:
                 _session_reasoning_effort[conversation_id] = effort
             else:
                 _session_reasoning_effort.pop(conversation_id, None)
-            if harness in ("claude-native", "codex-native", "pi-native", "devin-native"):
-                if harness == "codex-native":
-                    return await _handle_codex_native_settings_update(
-                        conversation_id,
-                        {"effort": effort},
-                    )
+            if harness in ("claude-native", "pi-native", "devin-native"):
                 if harness == "pi-native":
                     return await _handle_pi_native_effort_change(
                         conversation_id,
@@ -6600,10 +6628,20 @@ def create_runner_app(
                 if harness == "codex-native":
                     if model is None or not model.strip():
                         return Response(status_code=204)
-                    return await _handle_codex_native_settings_update(
+                    settings: _JsonObject = {"model": model.strip()}
+                    if "effort" in body:
+                        effort = body["effort"]
+                        if (invalid := _invalid_effort_response(effort)) is not None:
+                            return invalid
+                        settings["effort"] = effort
+                    response = await _handle_codex_native_settings_update(
                         conversation_id,
-                        {"model": model.strip()},
+                        settings,
+                        legacy_server=body.get("rollback_on_refusal") is not True,
                     )
+                    if "effort" in settings and 200 <= response.status_code < 300:
+                        return JSONResponse({"codex_settings_applied": True})
+                    return response
                 if harness == "cursor-native":
                     return await _handle_cursor_native_model_change(
                         conversation_id,

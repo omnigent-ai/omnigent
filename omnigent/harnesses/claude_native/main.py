@@ -453,16 +453,15 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
 
 
 def _ambient_env_is_non_anthropic_gateway() -> bool:
-    """Whether the ambient process env routes through a non-Anthropic gateway.
+    """Whether managed settings or the process env route through a gateway.
 
     Used as the ``claude_config is None`` counterpart to
     :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
     set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
     fingerprint must treat the env as a non-canonical endpoint.
     """
-    from urllib.parse import urlparse
-
-    base_url = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    managed_base_url, _ = managed_claude_gateway_signal()
+    base_url = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
     if not base_url:
         return False
     host = (urlparse(base_url).hostname or "").lower()
@@ -510,6 +509,8 @@ def claude_catalog_serves_model(
 
     if catalog_contains(rows, model):
         return True
+    if claude_config is None and _ambient_env_is_non_anthropic_gateway():
+        return False
     if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
         return False
     if not model.lower().startswith("claude-"):
@@ -1303,7 +1304,10 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
     command, _ = resolve_claude_launch("claude", [])
-    ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
+    ambient_gateway = None
+    if claude_config is None:
+        managed_base_url, _ = managed_claude_gateway_signal()
+        ambient_gateway = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV)
     return fingerprint_of(
         "claude-native",
         "control-picker-v3",
