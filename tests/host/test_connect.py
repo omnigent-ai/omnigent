@@ -4114,6 +4114,40 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
 
 
 @pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
+def test_forge_config_paths_survive_daemon_and_runner_hops(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, server_url: str | None
+) -> None:
+    from omnigent.cli import _build_host_daemon_env
+
+    selectors = {
+        "GLAB_CONFIG_DIR": str(tmp_path / "glab"),
+        "GH_CONFIG_DIR": str(tmp_path / "gh"),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "XDG_CONFIG_DIRS": str(tmp_path / "system-config"),
+    }
+    for name, value in selectors.items():
+        monkeypatch.setenv(name, value)
+    for name in ("GITLAB_TOKEN", "GLAB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.setenv(name, "must-not-forward")
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:8000",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace=str(tmp_path),
+        parent_pid=42,
+    )
+    for env in (daemon_env, runner_env):
+        for name, value in selectors.items():
+            assert env[name] == value
+        for name in ("GITLAB_TOKEN", "GLAB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            assert name not in env
+
+
+@pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
 @pytest.mark.parametrize("setting", [None, "1", "0"])
 async def test_harness_stderr_opt_in_survives_daemon_and_runner_hops(
     monkeypatch: pytest.MonkeyPatch,

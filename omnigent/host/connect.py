@@ -538,6 +538,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Discovery and invocation must read the same harness config directories.
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
+        # Forge CLI config selectors must agree across CLI, daemon, and runner.
+        # Forward paths only; bearer-token environment variables remain excluded.
+        "GLAB_CONFIG_DIR",
+        "GH_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CONFIG_DIRS",
         # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
         # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
         # Without it a runner falls back to the ~/.databrickscfg [__settings__]
