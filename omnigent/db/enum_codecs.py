@@ -21,6 +21,8 @@ existing int-coded ``session_permissions.level``.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
 
 # ── Code tables (name → stable int code) ───────────────
@@ -74,6 +76,9 @@ SESSION_LIVE_STATUS: dict[str, int] = {
     "waiting": 3,
     "failed": 4,
 }
+
+# The same vocabulary as a type, for response schemas and status resolvers.
+SessionLiveStatus = Literal["idle", "running", "waiting", "failed"]
 
 ACCOUNT_TOKEN_KIND: dict[str, int] = {
     "invite": 1,

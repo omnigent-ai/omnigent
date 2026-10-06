@@ -10,6 +10,8 @@ type codes stay in lock-step with the app's item-type registry.
 
 from __future__ import annotations
 
+from typing import get_args
+
 import pytest
 
 from omnigent.db import enum_codecs as ec
@@ -70,6 +72,11 @@ def test_unknown_code_raises(table, encode, decode) -> None:
     """Decoding an unknown code fails loud rather than returning None."""
     with pytest.raises(ValueError):
         decode(9999)
+
+
+def test_session_live_status_type_matches_table() -> None:
+    """The ``SessionLiveStatus`` type and the codec table name the same values."""
+    assert set(get_args(ec.SessionLiveStatus)) == set(ec.SESSION_LIVE_STATUS)
 
 
 def test_item_type_codes_cover_data_classes() -> None:

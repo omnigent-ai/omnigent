@@ -22,6 +22,11 @@ import pytest
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
+from omnigent.runtime.session_status import (
+    LAST_TASK_ERROR_CODE_LABEL_KEY,
+    LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
+    session_status_cache,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -1116,6 +1121,53 @@ def test_session_list_skips_label_closed_child_with_original_title(
     raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
     payload = json.loads(raw)
     assert payload["sub_agents"] == []
+
+
+def test_session_list_reports_child_live_status(
+    session_fixture: _Fixture,
+) -> None:
+    """Report the child's status, or None before any status was recorded."""
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+    payload = json.loads(raw)
+    assert payload["sub_agents"] == [
+        {
+            "agent": "researcher",
+            "title": "auth",
+            "conversation_id": session_fixture.child_conv_id,
+            "status": None,
+        }
+    ]
+
+    session_fixture.conv_store.set_session_live_status(session_fixture.child_conv_id, "idle")
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+    payload = json.loads(raw)
+    assert payload["sub_agents"][0]["status"] == "idle"
+
+    session_fixture.conv_store.set_session_live_status(session_fixture.child_conv_id, "failed")
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+    payload = json.loads(raw)
+    assert payload["sub_agents"][0]["status"] == "failed"
+
+
+def test_session_list_uses_cached_status_and_durable_error(session_fixture: _Fixture) -> None:
+    child_id = session_fixture.child_conv_id
+    session_fixture.conv_store.set_session_live_status(child_id, "idle")
+    session_status_cache[child_id] = "running"
+    try:
+        result = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
+        assert result["sub_agents"][0]["status"] == "running"
+
+        session_fixture.conv_store.set_labels(
+            child_id,
+            {
+                LAST_TASK_ERROR_CODE_LABEL_KEY: "runner_disconnected",
+                LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "Runner disconnected unexpectedly.",
+            },
+        )
+        result = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
+        assert result["sub_agents"][0]["status"] == "failed"
+    finally:
+        session_status_cache.pop(child_id, None)
 
 
 def test_session_list_schema_exposes_bounded_pagination() -> None:
