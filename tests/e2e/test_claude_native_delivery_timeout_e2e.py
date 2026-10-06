@@ -245,6 +245,9 @@ async def test_run_turn_completes_despite_stalled_submit(
     assert len(events) == 1, events
     assert not isinstance(events[0], ExecutorError), events[0]
     assert isinstance(events[0], TurnComplete), events[0]
+    # The draft visibly left a rendered input box, which is the proof the server
+    # needs to stop calling the message lost should its mirror never arrive.
+    assert events[0].input_accepted is True, events[0]
     assert _TUI_STALL_S - 2.0 <= elapsed <= _DELIVERY_BOUND_S, elapsed
 
     assert not any(
