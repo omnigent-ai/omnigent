@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 import threading
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -3193,18 +3193,38 @@ async def test_relay_still_fails_mid_turn_session_without_handoff_evidence(
 # ── Relays that never attached to their runner's stream ─────────────────────
 
 
-class _RetiredTunnelRunnerClient:
-    """Fake runner client whose tunnel is retired as the relay opens its stream.
+def _tunnel_closed() -> Exception:
+    return ConnectionError("tunnel closed before request completed")
 
-    Every ``stream`` open raises the ``ConnectionError`` ``WSTunnelTransport``
-    emits for a retired tunnel, except the open numbered ``ready_on_call``,
-    which serves the ready heartbeat and then drops like a stream that attached
-    and was lost later.
+
+def _tunnel_replaced() -> Exception:
+    return ConnectionError("runner 'runner_x' tunnel was replaced")
+
+
+def _runner_offline() -> Exception:
+    return httpx.ConnectError("runner 'runner_x' is offline")
+
+
+def _stream_rejected() -> Exception:
+    request = httpx.Request("GET", "http://runner/v1/sessions/x/stream")
+    return httpx.HTTPStatusError(
+        "503", request=request, response=httpx.Response(503, request=request)
+    )
+
+
+class _FailingStreamRunnerClient:
+    """Fake runner client whose stream opens fail, by default like a retired tunnel.
+
+    Open number N raises ``failures[N - 1]()`` (the last entry repeats), except
+    the open numbered ``ready_on_call``, which serves the ready heartbeat and
+    then drops like a stream that attached and was lost later.
 
     :param ready_on_call: Attempt number (from 1) that attaches before
         dropping; ``None`` never attaches.
     :param on_open: Called with the attempt number just before each open, so a
         test can act between the relay's first loss and its give-up.
+    :param failures: Factories for the exception each failing open raises;
+        the default is the ``ConnectionError`` of a closed tunnel.
     """
 
     def __init__(
@@ -3212,10 +3232,12 @@ class _RetiredTunnelRunnerClient:
         *,
         ready_on_call: int | None = None,
         on_open: Callable[[int], None] | None = None,
+        failures: Sequence[Callable[[], Exception]] = (_tunnel_closed,),
     ) -> None:
         self.calls = 0
         self._ready_on_call = ready_on_call
         self._on_open = on_open
+        self._failures = failures
 
     def stream(self, method: str, path: str, *, timeout: Any) -> Any:
         del method, path, timeout
@@ -3226,7 +3248,7 @@ class _RetiredTunnelRunnerClient:
             gate = asyncio.Event()
             gate.set()
             return _ScriptedThenDropStreamResponse([], gate)
-        raise ConnectionError("tunnel closed before request completed")
+        raise self._failures[min(self.calls, len(self._failures)) - 1]()
 
 
 @pytest.fixture()
@@ -3325,7 +3347,7 @@ async def test_never_attached_relay_yields_to_the_replica_now_holding_the_runner
 
         assert session_id not in sessions_module._session_status_cache
         handle = await _run_relay_to_give_up(
-            session_id, runner_id, _RetiredTunnelRunnerClient(on_open=replica_b_connects), store
+            session_id, runner_id, _FailingStreamRunnerClient(on_open=replica_b_connects), store
         )
     finally:
         session_live_state.configure(None)
@@ -3422,7 +3444,7 @@ async def test_never_attached_relay_fails_nothing_without_handoff_evidence(
         monkeypatch.setattr(store, "get_conversation", status_unavailable)
     assert session_id not in sessions_module._session_status_cache
 
-    await _run_relay_to_give_up(session_id, runner_id, _RetiredTunnelRunnerClient(), store)
+    await _run_relay_to_give_up(session_id, runner_id, _FailingStreamRunnerClient(), store)
 
     row = _disconnect_row(caplog).attributes
     assert row["decision"] == "never_attached"
@@ -3483,7 +3505,7 @@ async def test_attached_relay_still_fails_the_turn_when_every_retry_fails(
 
         monkeypatch.setattr(store, "get_runner_liveness", liveness_unavailable)
 
-    client = _RetiredTunnelRunnerClient(ready_on_call=ready_on_call)
+    client = _FailingStreamRunnerClient(ready_on_call=ready_on_call)
     await _run_relay_to_give_up(session_id, runner_id, client, store)
 
     row = _disconnect_row(caplog).attributes
@@ -3539,7 +3561,7 @@ async def test_relay_reference_stamp_is_taken_when_the_stream_first_drops(
 
     # Attached, so the outcome is decided by the stamps rather than by the rule
     # for relays that never attached.
-    client = _RetiredTunnelRunnerClient(ready_on_call=1, on_open=fresh_stamp_lands)
+    client = _FailingStreamRunnerClient(ready_on_call=1, on_open=fresh_stamp_lands)
     handle = await _run_relay_to_give_up(session_id, runner_id, client, store)
 
     row = _disconnect_row(caplog).attributes
@@ -3554,6 +3576,142 @@ async def test_relay_reference_stamp_is_taken_when_the_stream_first_drops(
         assert row["reference_stamp"] == now
         assert row["live_elsewhere_fresh"] is False
         assert sessions_module._session_status_cache.get(session_id) == "failed"
+
+
+class _LiveTunnelTransport(httpx.MockTransport):
+    """Mock transport for a tunnel that is up: the runner is registered and answers."""
+
+    async def wait_for_runner(self, timeout_s: float) -> bool:
+        del timeout_s
+        return True
+
+
+class _StreamFaultBody(httpx.AsyncByteStream):
+    """Response body the tunnel aborts with the runner's own stream error."""
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b": connected, no runner heartbeat\n\n"
+        raise httpx.RemoteProtocolError("runner stream error: harness crashed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["http_503", "http_404", "stream_fault", "empty_stream"])
+async def test_never_ready_relay_still_fails_when_a_live_tunnel_answers_with_an_error(
+    short_relay_grace: list[str],
+    caplog: pytest.LogCaptureFixture,
+    answer: str,
+) -> None:
+    """
+    A never-ready relay keeps today's failure when the tunnel is up and the runner answers.
+
+    Only a tunnel going away hands the session to the runner's disconnect
+    timer. A stream endpoint that answers with an error over a live tunnel
+    leaves no timer to end the turn, so the relay must still fail a mid-turn
+    session instead of leaving it "running" forever.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        del request
+        if answer == "stream_fault":
+            return httpx.Response(200, stream=_StreamFaultBody())
+        if answer == "empty_stream":
+            return httpx.Response(200, content=b": connected, no runner heartbeat\n\n")
+        return httpx.Response(int(answer.removeprefix("http_")))
+
+    runner_id = "runner_live_tunnel_rejects_stream"
+    session_id = "1b2c3d4e5f60718293a4b5c6d7e8f901"
+    short_relay_grace.append(session_id)
+    store = _RecordingLabelStore(live_status="running")
+
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=_LiveTunnelTransport(handle)
+    ) as client:
+        await _run_relay_to_give_up(session_id, runner_id, client, store)
+
+    row = _disconnect_row(caplog).attributes
+    assert row["decision"] == "failed_mid_turn"
+    assert row["ever_ready"] is False
+    assert sessions_module._session_status_cache.get(session_id) == "failed"
+    persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+    assert persisted is not None and persisted["code"] == "runner_disconnected"
+    assert [r.attributes["origin"] for r in _failed_turn_records(caplog)] == [
+        "runner_disconnected_mid_turn"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(_tunnel_closed, id="closed"),
+        pytest.param(_tunnel_replaced, id="replaced"),
+        pytest.param(_runner_offline, id="offline"),
+    ],
+)
+async def test_never_ready_relay_leaves_every_way_of_losing_the_tunnel_to_the_timer(
+    short_relay_grace: list[str],
+    caplog: pytest.LogCaptureFixture,
+    failure: Callable[[], Exception],
+) -> None:
+    """A tunnel closed, retired, replaced or gone offline is a transport loss."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    runner_id = "runner_tunnel_lost"
+    session_id = "2c3d4e5f60718293a4b5c6d7e8f90112"
+    short_relay_grace.append(session_id)
+    store = _RecordingLabelStore(live_status="running")
+
+    await _run_relay_to_give_up(
+        session_id, runner_id, _FailingStreamRunnerClient(failures=[failure]), store
+    )
+
+    assert _disconnect_row(caplog).attributes["decision"] == "never_attached"
+    assert not _failed_turn_records(caplog)
+    assert sessions_module._session_status_cache.get(session_id) is None
+    assert session_id not in store.labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failures", "decision"),
+    [
+        pytest.param(
+            [_tunnel_closed, _stream_rejected], "failed_mid_turn", id="tunnel-then-errors"
+        ),
+        pytest.param(
+            [_stream_rejected, _tunnel_closed], "never_attached", id="errors-then-tunnel"
+        ),
+    ],
+)
+async def test_the_last_loss_decides_whether_the_disconnect_timer_covers_the_relay(
+    short_relay_grace: list[str],
+    caplog: pytest.LogCaptureFixture,
+    failures: list[Callable[[], Exception]],
+    decision: str,
+) -> None:
+    """
+    The cause at give-up decides, not an earlier attempt's.
+
+    The runner may re-register on this replica and answer with errors until the
+    deadline (no timer covers that), or answer with errors and lose its tunnel
+    at the end (the timer it starts then covers the session).
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    runner_id = "runner_mixed_losses"
+    session_id = "3d4e5f60718293a4b5c6d7e8f9011223"
+    short_relay_grace.append(session_id)
+    store = _RecordingLabelStore(live_status="running")
+
+    await _run_relay_to_give_up(
+        session_id, runner_id, _FailingStreamRunnerClient(failures=failures), store
+    )
+
+    assert _disconnect_row(caplog).attributes["decision"] == decision
+    failed = decision == "failed_mid_turn"
+    assert (sessions_module._session_status_cache.get(session_id) == "failed") is failed
+    assert bool(_failed_turn_records(caplog)) is failed
 
 
 @pytest.mark.asyncio

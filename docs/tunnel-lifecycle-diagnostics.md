@@ -81,14 +81,19 @@ both ends.
   carried none of the turn and has no evidence it was interrupted: a rollout
   can move a runner between replicas within seconds, leaving the first
   replica's relay to time out on a tunnel that was retired before its stream
-  came up, while the turn runs on the replica now holding the runner. Unless a
-  fresh stamp from another replica shows the runner live there
+  came up, while the turn runs on the replica now holding the runner. When the
+  final loss was the tunnel going away (`exception_cause_type` is
+  `ConnectionError` or `ConnectError`: closed, retired, replaced, or the runner
+  offline) and no fresh stamp from another replica shows the runner live there
   (`live_elsewhere`), such a relay gives up as `never_attached`: it publishes
   no status and leaves the outcome to the replica's per-runner disconnect
   timer, which still fails a mid-turn session (`origin = runner_offline_sweep`)
   when the runner is really gone. An unreadable or stale liveness read does not
-  change that. A relay that attached once decides from the evidence and the
-  session status as before.
+  change that. If the final loss was the stream endpoint answering over a live
+  tunnel (`HTTPStatusError`, a `RemoteProtocolError` stream fault, or no cause
+  when the body just ended), no disconnect timer is coming, so the relay
+  decides from the session status as before. A relay that attached once also
+  decides from the evidence and the session status.
 
   Except for `intentional_stop` and `server_shutdown`, which skip the check,
   the row reports what the cross-replica check saw: `liveness_lookup` (`found`,
@@ -239,8 +244,10 @@ still fail.
 
 For a relay that never attached, the window is too short to hit by hand, so
 the tests above build it deterministically. During a rollout, select
-`runner_stream_disconnected` rows with `ever_ready = False`: none should be
+`runner_stream_disconnected` rows with `ever_ready = False` and an
+`exception_cause_type` of `ConnectionError` or `ConnectError`: none should be
 `failed_mid_turn` or `idle_no_failure`, and their sessions should have no
 `session_turn_failed` with `origin = runner_disconnected_mid_turn`. A session
 whose runner is really gone fails only through the disconnect timer
-(`origin = runner_offline_sweep`).
+(`origin = runner_offline_sweep`). Rows with another cause, such as
+`HTTPStatusError`, still fail a mid-turn session themselves.

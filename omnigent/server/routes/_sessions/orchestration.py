@@ -7435,6 +7435,17 @@ class _RelayTransportLost(Exception):
         self.intentional = intentional
         self.stream_ready = stream_ready
 
+    @property
+    def tunnel_gone(self) -> bool:
+        """Whether the runner's tunnel went away, not its endpoint answering badly.
+
+        The tunnel transport reports a closed, retired or replaced tunnel as a
+        ``ConnectionError`` and an absent runner as ``httpx.ConnectError``. An
+        HTTP status, a stream fault or a body that just ended came over a live
+        tunnel, so no disconnect timer will settle that session.
+        """
+        return isinstance(self.__cause__, ConnectionError | httpx.ConnectError)
+
 
 def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
@@ -7671,11 +7682,13 @@ async def _relay_runner_stream(
     other sessions. An idle session had no work to interrupt, so it stays
     idle and the disconnect surfaces through liveness instead.
 
-    A relay that never received the runner's ready heartbeat (its tunnel was
-    retired before the stream came up, as when a rollout moves the runner
-    between replicas) saw none of the turn, so it fails nothing
-    (``never_attached``). The replica's per-runner disconnect timer, which
-    sees the runner itself, fails the mid-turn session if the runner is gone.
+    A relay that never received the runner's ready heartbeat because the
+    tunnel went away (retired before the stream came up, as when a rollout
+    moves the runner between replicas) saw none of the turn, so it fails
+    nothing (``never_attached``). The replica's per-runner disconnect timer,
+    which sees the runner itself, fails the mid-turn session if the runner is
+    gone. If a live tunnel's stream endpoint answered with an error instead,
+    no timer is coming and the relay decides from the session status.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -7807,9 +7820,9 @@ async def _relay_runner_stream(
                 liveness = await _relay_runner_liveness(session_id, conversation_store)
                 if liveness.live_elsewhere:
                     decision = "live_elsewhere"
-                elif not ever_ready:
-                    # Never subscribed to the runner, so it has no view of the turn;
-                    # the disconnect timer settles a runner that is really gone.
+                elif not ever_ready and lost.tunnel_gone:
+                    # Never subscribed and the tunnel is gone: the disconnect timer
+                    # settles a runner that is really gone; a live tunnel has none.
                     decision = "never_attached"
                 elif await _runner_disconnect_requires_failure(
                     session_id, conversation_store, origin="runner_disconnected_mid_turn"
