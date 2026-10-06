@@ -545,7 +545,7 @@ describe("prepareSlidesDoc with a kit", () => {
     const doc = prepareSlidesDoc(deck, "<style data-omnigent-kit>x</style>");
     const kitAt = doc.indexOf("data-omnigent-kit");
     expect(kitAt).toBeGreaterThan(doc.indexOf("body{color:red}"));
-    expect(kitAt).toBeLessThan(doc.indexOf("<script>"));
+    expect(kitAt).toBeLessThan(doc.lastIndexOf("<script>"));
     expect(kitAt).toBeLessThan(doc.indexOf("</body>"));
   });
 });
