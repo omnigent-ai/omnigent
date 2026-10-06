@@ -2401,6 +2401,7 @@ function ComposerImpl(
   // `delivered` when the send turns out to have reached the server, so the
   // retraction effect below can empty the composer.
   const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
+  const pendingFailedSendRestore = useRef<{ stableId: string; draft: typeof draft } | null>(null);
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
   );
@@ -2960,6 +2961,9 @@ function ComposerImpl(
       useChatStore.setState({ pendingRetryStableId: null });
       return;
     }
+    pendingFailedSendRestore.current = failedSendDraft.stableId
+      ? { stableId: failedSendDraft.stableId, draft }
+      : null;
     replaceText(failedSendDraft.text, failedSendDraft.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
@@ -2982,7 +2986,7 @@ function ComposerImpl(
       });
     }
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
+  }, [failedSendDraft, conversationId, settledConversationId, replaceText, draft]);
 
   // Retract a restored failed-send draft once its send proves delivered (its
   // committed item arrived over the stream or a reconnect snapshot). Edits win:
@@ -2991,6 +2995,11 @@ function ComposerImpl(
     if (restoredSendDraft === null || !restoredSendDraft.delivered) return;
     if (restoredSendDraft.conversationId !== conversationId) return;
     if (settledConversationId !== conversationId) return;
+    // Delivery can interrupt the queued text restore with a store render.
+    // Wait for the local draft update before deciding whether the user edited it.
+    const pending = pendingFailedSendRestore.current;
+    if (pending?.stableId === restoredSendDraft.stableId && pending.draft === draft) return;
+    pendingFailedSendRestore.current = null;
     useChatStore.setState({ restoredSendDraft: null });
     const expected = serializeReplyDraft(
       restoreReplyDraft(restoredSendDraft.text, restoredSendDraft.replyDraft),
@@ -3003,7 +3012,7 @@ function ComposerImpl(
     attachmentsRef.current.replaceFiles([]);
     dirtyRef.current = false;
     if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
-  }, [restoredSendDraft, conversationId, settledConversationId, replaceText]);
+  }, [restoredSendDraft, conversationId, settledConversationId, replaceText, draft]);
 
   /**
    * Execute a slash command by name + optional argument string.
