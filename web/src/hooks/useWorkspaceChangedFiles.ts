@@ -515,6 +515,9 @@ export function relativizeToWorkspace(
 
 // ── Recursive file search ──────────────────────────────────────────────────────
 
+/** Matches the `/search` `limit` query param (server max and default). */
+export const WORKSPACE_FILE_SEARCH_LIMIT = 500;
+
 export interface WorkspaceFileSearchResult {
   files: WorkspaceFile[];
   /**
@@ -523,6 +526,8 @@ export interface WorkspaceFileSearchResult {
    * definitive "no match".
    */
   truncated: boolean;
+  /** True when the page filled the limit (`has_more`: len(entries) >= limit). */
+  hasMore: boolean;
 }
 
 export interface WorkspaceFileSearchRequest {
@@ -537,7 +542,7 @@ export function requestWorkspaceFileSearch(
   conversationId: string,
   { query, include = "", exclude = "", location = "" }: WorkspaceFileSearchRequest,
 ): Promise<Response> {
-  const params = new URLSearchParams({ limit: "500" });
+  const params = new URLSearchParams({ limit: String(WORKSPACE_FILE_SEARCH_LIMIT) });
   if (query) params.set("q", query);
   if (include) params.set("include", include);
   if (exclude) params.set("exclude", exclude);
@@ -555,7 +560,11 @@ export async function readWorkspaceFileSearch(
   location = "",
 ): Promise<WorkspaceFileSearchResult> {
   const json = (await res.json()) as FilesystemListResponse;
-  return { files: mapFilesystemEntries(json, location), truncated: !!json.truncated };
+  return {
+    files: mapFilesystemEntries(json, location),
+    truncated: !!json.truncated,
+    hasMore: !!json.has_more,
+  };
 }
 
 async function fetchWorkspaceFileSearch(
@@ -574,8 +583,8 @@ async function fetchWorkspaceFileSearch(
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
-  if (res.status === 404) return { files: [], truncated: false };
-  if (await isRunnerUnavailable503(res)) return { files: [], truncated: false };
+  if (res.status === 404) return { files: [], truncated: false, hasMore: false };
+  if (await isRunnerUnavailable503(res)) return { files: [], truncated: false, hasMore: false };
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return readWorkspaceFileSearch(res, location);
 }

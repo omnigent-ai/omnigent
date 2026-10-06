@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchFileContent } from "@/hooks/useFileContent";
-import type * as workspaceFiles from "@/hooks/useWorkspaceChangedFiles";
-import { requestWorkspaceFileSearch } from "@/hooks/useWorkspaceChangedFiles";
-import { WORKSPACE_FILE_SEARCH_LIMIT, fetchDeckSearch, fetchKitIndicator } from "./designDeckApi";
+import * as workspaceFiles from "@/hooks/useWorkspaceChangedFiles";
+import { fetchDeckSearch, fetchKitIndicator } from "./designDeckApi";
+
+const { WORKSPACE_FILE_SEARCH_LIMIT, requestWorkspaceFileSearch } = workspaceFiles;
 
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importActual) => ({
@@ -67,12 +68,12 @@ describe("fetchDeckSearch", () => {
     });
   });
 
-  it("treats a full page of results as truncated when the server omits the flag", async () => {
+  it("treats a full page of results as truncated via has_more", async () => {
     const data = Array.from({ length: WORKSPACE_FILE_SEARCH_LIMIT }, (_, i) =>
       entry(`decks/d${i}.slides.html`),
     );
     searchMock.mockResolvedValue(
-      response(200, { object: "list", data, has_more: false }),
+      response(200, { object: "list", data, has_more: true }),
     );
 
     const result = await fetchDeckSearch("conv_a");

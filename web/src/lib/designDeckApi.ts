@@ -3,6 +3,7 @@
 
 import { fetchFileContent } from "@/hooks/useFileContent";
 import {
+  WORKSPACE_FILE_SEARCH_LIMIT,
   readWorkspaceFileSearch,
   requestWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
@@ -13,9 +14,6 @@ import {
   kitIndicator,
   type KitIndicator,
 } from "./designDecks";
-
-/** Matches the `/search` `limit` query param; a full page means the scan may have stopped early. */
-export const WORKSPACE_FILE_SEARCH_LIMIT = 500;
 
 export type DeckSearchResult =
   | { status: "ok"; paths: string[]; truncated: boolean }
@@ -33,13 +31,14 @@ export async function fetchDeckSearch(sessionId: string): Promise<DeckSearchResu
   });
   if (res.status === 404 || res.status === 503) return { status: "unavailable" };
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const { files, truncated } = await readWorkspaceFileSearch(res);
+  const { files, truncated, hasMore } = await readWorkspaceFileSearch(res);
   const paths = files.filter((f) => f.type === "file").map((f) => f.path);
-  // Prefer the server flag; fall back to a full page when older servers omit it.
+  // Scan budget (`truncated`) or a full page of results (the server's `has_more`).
+  // Count is only a stand-in when `has_more` is missing from the body.
   return {
     status: "ok",
     paths,
-    truncated: truncated || files.length >= WORKSPACE_FILE_SEARCH_LIMIT,
+    truncated: truncated || hasMore || files.length >= WORKSPACE_FILE_SEARCH_LIMIT,
   };
 }
 
