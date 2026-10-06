@@ -38,9 +38,8 @@ import time
 # the only peer that sends it.
 SERVER_INITIATED_CLOSE_CODES: frozenset[int] = frozenset({1012})
 
-# How long a mark counts as "still shutting down". Longer than the 90s
-# runner-disconnect grace plus the reads that follow it, because that is when
-# the relay and the per-runner timer decide whether to fail a turn.
+# Outlast the runner-disconnect grace, with scheduling slack, so shutdown
+# suppression is still active when reconciliation runs.
 SHUTDOWN_WINDOW_S: float = 150.0
 
 _marked_at: float | None = None
