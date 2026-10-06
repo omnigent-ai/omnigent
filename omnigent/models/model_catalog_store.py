@@ -24,7 +24,7 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +80,25 @@ def binary_identity(command: str | None) -> tuple[str, int, int] | None:
 CATALOG_STALE_AFTER_S = 3600.0
 
 
+class CatalogRows(list[dict[str, Any]]):
+    """
+    Probe rows plus the harness-reported facts that belong with them.
+
+    Equal to the plain row list everywhere; :func:`write_catalog` stores
+    ``meta`` beside the rows, where :func:`read_catalog_meta` finds it.
+
+    :param rows: The verbatim harness rows.
+    :param meta: Facts the same probe run reported, e.g.
+        ``{"cli_version": "2.1.217"}``.
+    """
+
+    def __init__(
+        self, rows: Iterable[dict[str, Any]] = (), *, meta: Mapping[str, Any] | None = None
+    ) -> None:
+        super().__init__(rows)
+        self.meta: dict[str, Any] = dict(meta or {})
+
+
 def _data_dir() -> Path:
     """Return the omnigent data dir (must stay in lock-step with
     ``omnigent.host.local_server._local_data_dir`` /
@@ -121,6 +140,21 @@ def read_catalog(harness: str, fingerprint: str) -> list[dict[str, Any]] | None:
     return [row for row in rows if isinstance(row, dict) and row.get("id")]
 
 
+def read_catalog_meta(harness: str, fingerprint: str) -> dict[str, Any]:
+    """Read the facts stored beside one catalog's rows.
+
+    :param harness: Canonical harness name.
+    :param fingerprint: The launch-config fingerprint.
+    :returns: The probe run's reported facts, or ``{}`` on a miss / damaged file.
+    """
+    try:
+        payload = json.loads(catalog_path(harness, fingerprint).read_text())
+    except (OSError, ValueError):
+        return {}
+    meta = payload.get("meta") if isinstance(payload, dict) else None
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
 def catalog_age_s(harness: str, fingerprint: str) -> float | None:
     """Age of the stored catalog in seconds, or ``None`` on a miss."""
     path = catalog_path(harness, fingerprint)
@@ -149,15 +183,19 @@ def write_catalog(harness: str, fingerprint: str, rows: list[dict[str, Any]]) ->
 
     :param harness: Canonical harness name.
     :param fingerprint: The launch-config fingerprint.
-    :param rows: Verbatim harness rows to persist.
+    :param rows: Verbatim harness rows to persist; a :class:`CatalogRows`
+        also persists its ``meta``.
     """
     path = catalog_path(harness, fingerprint)
-    payload = {
+    payload: dict[str, Any] = {
         "harness": harness,
         "fingerprint": fingerprint,
         "written_at": time.time(),
         "models": rows,
     }
+    meta = getattr(rows, "meta", None)
+    if isinstance(meta, dict) and meta:
+        payload["meta"] = meta
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         handle, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -319,6 +357,7 @@ def catalog_contains(rows: list[dict[str, Any]], token: str) -> bool:
 
 __all__ = [
     "CATALOG_STALE_AFTER_S",
+    "CatalogRows",
     "binary_identity",
     "catalog_age_s",
     "catalog_contains",
@@ -328,6 +367,7 @@ __all__ = [
     "ensure_catalog",
     "fingerprint_of",
     "read_catalog",
+    "read_catalog_meta",
     "reprobe_catalog",
     "shutdown_catalog_probes",
     "write_catalog",

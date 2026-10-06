@@ -4859,22 +4859,38 @@ def _gated_catalog_rows() -> list[dict[str, Any]]:
     ]
 
 
-async def _launch_against_gated_catalog(
+_GATED_SESSION = "4d5e6f708192a3b4c5d6e7f8091a2b3c"
+
+
+@dataclass
+class _GatedLaunch:
+    """What one launch against the gated catalog ran and told the server."""
+
+    command: str
+    args: list[str]
+    posted: list[dict[str, Any]]
+    resets: list[dict[str, Any]]
+
+    @property
+    def model(self) -> str:
+        """The ``--model`` the terminal was launched with."""
+        return self.args[self.args.index("--model") + 1]
+
+
+def _seed_gated_catalog(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     *,
     cli_version: str | None,
-    model_override: str | None = None,
     stale: bool = False,
-) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> str:
     """
-    Launch a claude-native terminal against :func:`_gated_catalog_rows`.
+    Store :func:`_gated_catalog_rows` as a probe on *cli_version* would, and wire the launch.
 
-    :param cli_version: The installed Claude Code release the launch sees.
-    :param model_override: The session's persisted model pick, or ``None`` for Default.
+    :param cli_version: The release the stored catalog was probed on, or ``None``
+        for a catalog that reports none.
     :param stale: Whether the stored catalog is past its freshness TTL.
-    :returns: The launched argv, the events posted to the session, and the
-        model-pick resets.
+    :returns: The catalog's fingerprint.
     """
     import os
     import time
@@ -4892,28 +4908,43 @@ async def _launch_against_gated_catalog(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.client_version.installed_cli_version",
-        lambda: cli_version,
-    )
+
+    def _probe_rows() -> model_catalog_store.CatalogRows:
+        meta = {"cli_version": cli_version} if cli_version else {}
+        return model_catalog_store.CatalogRows(_gated_catalog_rows(), meta=meta)
 
     async def _probe(config: object) -> list[dict[str, Any]]:
-        return _gated_catalog_rows()
+        return _probe_rows()
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_model_catalog", _probe)
     fingerprint = claude_catalog_fingerprint(None)
-    model_catalog_store.write_catalog("claude-native", fingerprint, _gated_catalog_rows())
+    model_catalog_store.write_catalog("claude-native", fingerprint, _probe_rows())
     if stale:
         path = model_catalog_store.catalog_path("claude-native", fingerprint)
         old = time.time() - (model_catalog_store.CATALOG_STALE_AFTER_S + 60)
         os.utime(path, (old, old))
+    return fingerprint
 
-    posted: list[dict[str, Any]] = []
-    resets: list[dict[str, Any]] = []
 
-    def _handle_request(request: httpx.Request) -> httpx.Response:
+def _gated_client(
+    posted: list[dict[str, Any]],
+    resets: list[dict[str, Any]],
+    *,
+    model_override: str | None = None,
+    on_event: Any = None,
+) -> httpx.AsyncClient:
+    """
+    A server double: records the events and model resets a launch sends.
+
+    :param on_event: Optional coroutine function awaited, and whose response is
+        returned, for each ``/events`` post.
+    """
+
+    async def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path.endswith("/events"):
             posted.append(json.loads(request.content))
+            if on_event is not None:
+                return await on_event()
         if request.method == "PATCH" and "model_override" in json.loads(request.content):
             resets.append(json.loads(request.content))
         body: dict[str, Any] = {"labels": {}}
@@ -4921,26 +4952,63 @@ async def _launch_against_gated_catalog(
             body["model_override"] = model_override
         return httpx.Response(200, json=body)
 
-    fake_client = httpx.AsyncClient(
+    return httpx.AsyncClient(
         base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
     )
+
+
+async def _launch_gated(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str = _GATED_SESSION,
+    agent_spec: AgentSpec | None = None,
+) -> Any:
+    """Launch the claude-native terminal for *session_id* and return its terminal spec."""
 
     async def _resolve() -> None:
         return None
 
     captured: dict[str, Any] = {}
     await _auto_create_claude_terminal(
-        "4d5e6f708192a3b4c5d6e7f8091a2b3c",
+        session_id,
         _RecordingClaudeRegistry(captured),
         lambda _sid, _evt: None,
-        server_client=fake_client,
+        server_client=client,
         resolve_launch_config=_resolve,
+        agent_spec=agent_spec,
     )
-    task = model_catalog_store._inflight.get(("claude-native", fingerprint))
-    if task is not None:
-        await task
-    await fake_client.aclose()
-    return list(captured["spec"].args), posted, resets
+    return captured["spec"]
+
+
+async def _settle_background_work(fingerprint: str) -> None:
+    """Wait for the catalog refresh and the background notices a launch scheduled."""
+    from omnigent.models import model_catalog_store
+    from omnigent.runner.native import orchestration
+
+    refresh = model_catalog_store._inflight.get(("claude-native", fingerprint))
+    pending = {*orchestration._DEMOTION_NOTICE_TASKS, *([refresh] if refresh else [])}
+    if pending:
+        await asyncio.gather(*pending)
+
+
+async def _launch_against_gated_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    cli_version: str | None,
+    model_override: str | None = None,
+    stale: bool = False,
+    agent_spec: AgentSpec | None = None,
+) -> _GatedLaunch:
+    """Launch a claude-native terminal against :func:`_gated_catalog_rows`."""
+    fingerprint = _seed_gated_catalog(monkeypatch, tmp_path, cli_version=cli_version, stale=stale)
+    posted: list[dict[str, Any]] = []
+    resets: list[dict[str, Any]] = []
+    client = _gated_client(posted, resets, model_override=model_override)
+    spec = await _launch_gated(client, agent_spec=agent_spec)
+    await _settle_background_work(fingerprint)
+    await client.aclose()
+    return _GatedLaunch(spec.command, list(spec.args), posted, resets)
 
 
 @pytest.mark.asyncio
@@ -4960,22 +5028,26 @@ async def test_auto_create_claude_terminal_default_launch_skips_a_model_the_clie
     to launch bare: the CLI's own default is that same refused model.
     """
     with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
-        args, posted, resets = await _launch_against_gated_catalog(
+        launch = await _launch_against_gated_catalog(
             monkeypatch, tmp_path, cli_version="2.1.217", stale=stale
         )
 
-    assert args[args.index("--model") + 1] == "system.ai.claude-opus-4-8[1m]"
-    assert resets == []
-    assert len(posted) == 1
-    event = posted[0]
+    assert launch.model == "system.ai.claude-opus-4-8[1m]"
+    assert launch.resets == []
+    assert len(launch.posted) == 1
+    event = launch.posted[0]
     assert event["type"] == "external_conversation_item"
     assert event["data"]["item_type"] == "error"
+    assert event["data"]["source_id"] == (
+        f"claude-native-default-demoted:{_GATED_SESSION}:2.1.217:system.ai.claude-opus-4-8[1m]"
+    )
     item = event["data"]["item_data"]
     assert item["code"] == "claude_native_default_model_demoted"
     assert item["level"] == "info"
     assert item["message"] == (
-        "Claude Code 2.1.217 can't run Sonnet 5.5 (1M context) (needs 2.1.280 or newer), "
-        "so this session uses Opus 4.8 (1M context). Run `claude update` to use it."
+        "Claude Code 2.1.217 can't run Sonnet 5.5 (1M context); it needs 2.1.280 or newer. "
+        "This session uses Opus 4.8 (1M context) instead. Update Claude Code on the host "
+        "(for example `claude update`) to use it."
     )
     demotions = [
         record
@@ -4992,18 +5064,57 @@ async def test_auto_create_claude_terminal_default_launch_skips_a_model_the_clie
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_records_what_a_refusal_is_learned_against(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launch leaves the catalog's fingerprint and release in the bridge for the forwarder."""
+    from omnigent.harnesses.claude_native.bridge import (
+        bridge_dir_for_bridge_id,
+        read_launch_catalog_facts,
+    )
+
+    fingerprint = _seed_gated_catalog(monkeypatch, tmp_path, cli_version="2.1.280")
+    client = _gated_client([], [])
+    await _launch_gated(client)
+    await client.aclose()
+
+    assert read_launch_catalog_facts(bridge_dir_for_bridge_id(_GATED_SESSION)) == (
+        fingerprint,
+        "2.1.280",
+    )
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_explicit_pick_of_a_gated_model_launches_as_asked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A model the user picked is never swapped out, whatever the installed release."""
     pick = "system.ai.claude-opus-5-5[1m]"
-    args, posted, resets = await _launch_against_gated_catalog(
+    launch = await _launch_against_gated_catalog(
         monkeypatch, tmp_path, cli_version="2.1.217", model_override=pick
     )
 
-    assert args[args.index("--model") + 1] == pick
-    assert posted == []
-    assert resets == []
+    assert launch.model == pick
+    assert launch.posted == []
+    assert launch.resets == []
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_spec_pinned_gated_model_launches_as_declared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agent spec's model pin is as explicit as a user's pick."""
+    pin = "system.ai.claude-sonnet-5-5[1m]"
+    launch = await _launch_against_gated_catalog(
+        monkeypatch,
+        tmp_path,
+        cli_version="2.1.217",
+        agent_spec=AgentSpec(spec_version=1, name="pinned", executor=ExecutorSpec(model=pin)),
+    )
+
+    assert launch.model == pin
+    assert launch.posted == []
+    assert launch.resets == []
 
 
 @pytest.mark.asyncio
@@ -5011,11 +5122,135 @@ async def test_auto_create_claude_terminal_explicit_pick_of_a_gated_model_launch
 async def test_auto_create_claude_terminal_default_launch_keeps_a_model_the_client_can_run(
     cli_version: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A new-enough or unreadable Claude Code release leaves the catalog Default alone."""
-    args, posted, resets = await _launch_against_gated_catalog(
-        monkeypatch, tmp_path, cli_version=cli_version
-    )
+    """A new-enough or unreported Claude Code release leaves the catalog Default alone."""
+    launch = await _launch_against_gated_catalog(monkeypatch, tmp_path, cli_version=cli_version)
 
-    assert args[args.index("--model") + 1] == "system.ai.claude-sonnet-5-5[1m]"
-    assert posted == []
-    assert resets == []
+    assert launch.model == "system.ai.claude-sonnet-5-5[1m]"
+    assert launch.posted == []
+    assert launch.resets == []
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_opt_out_launches_the_catalog_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CLAUDE_DEFAULT_MODEL_FLOOR", "0")
+    launch = await _launch_against_gated_catalog(monkeypatch, tmp_path, cli_version="2.1.217")
+
+    assert launch.model == "system.ai.claude-sonnet-5-5[1m]"
+    assert launch.posted == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.posix_only
+@pytest.mark.parametrize("via", ["OMNIGENT_CLAUDE_PATH", "config command"])
+async def test_auto_create_claude_terminal_never_runs_the_configured_claude_to_ask_its_version(
+    via: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The release comes from the catalog probe, not from a ``--version`` run.
+
+    The terminal runs the configured command (an env override or
+    ``harness.claude-native.command``); asking that binary for its version would
+    cost a slow, side-effecting process on the launch path.
+    """
+    import stat
+
+    runs = tmp_path / "runs"
+    script = tmp_path / "claude-wrapper"
+    script.write_text(f'#!/bin/sh\necho "$@" >> "{runs}"\necho "9.9.9 (Claude Code)"\n')
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+    if via == "OMNIGENT_CLAUDE_PATH":
+        monkeypatch.setenv("OMNIGENT_CLAUDE_PATH", str(script))
+    else:
+        (config_home / "config.yaml").write_text(
+            f"harness:\n  claude-native:\n    command: {script}\n    args: []\n"
+        )
+
+    launch = await _launch_against_gated_catalog(monkeypatch, tmp_path, cli_version="2.1.217")
+
+    assert launch.command == str(script), "the launch did not use the configured claude"
+    assert launch.model == "system.ai.claude-opus-4-8[1m]"
+    assert len(launch.posted) == 1
+    assert not runs.exists(), "the configured claude was run to read its version"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["server-error", "connection-error"])
+async def test_auto_create_claude_terminal_lost_notice_leaves_the_launch_intact(
+    failure: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A notice that cannot be posted is only logged: the demoted launch still happens."""
+    fingerprint = _seed_gated_catalog(monkeypatch, tmp_path, cli_version="2.1.217")
+    posted: list[dict[str, Any]] = []
+
+    async def _fail() -> httpx.Response:
+        if failure == "connection-error":
+            raise httpx.ConnectError("server is down")
+        return httpx.Response(500, json={"error": "boom"})
+
+    client = _gated_client(posted, [], on_event=_fail)
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        spec = await _launch_gated(client)
+        await _settle_background_work(fingerprint)
+    await client.aclose()
+
+    assert spec.args[spec.args.index("--model") + 1] == "system.ai.claude-opus-4-8[1m]"
+    assert len(posted) == 1
+    assert "failed to surface the default-model notice" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_does_not_wait_for_the_notice_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The notice goes out in the background: a slow server cannot stall the launch."""
+    fingerprint = _seed_gated_catalog(monkeypatch, tmp_path, cli_version="2.1.217")
+    release = asyncio.Event()
+    posted: list[dict[str, Any]] = []
+
+    async def _slow() -> httpx.Response:
+        await release.wait()
+        return httpx.Response(200, json={})
+
+    client = _gated_client(posted, [], on_event=_slow)
+    spec = await asyncio.wait_for(_launch_gated(client), timeout=5)
+
+    assert spec.args[spec.args.index("--model") + 1] == "system.ai.claude-opus-4-8[1m]"
+    release.set()
+    await _settle_background_work(fingerprint)
+    assert len(posted) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_relaunch_posts_the_same_notice_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A relaunch of the session re-posts the notice under one idempotency key.
+
+    The server derives the item id from the key, so the repeat is a no-op there;
+    another session (or another replacement model) gets its own key.
+    """
+    fingerprint = _seed_gated_catalog(monkeypatch, tmp_path, cli_version="2.1.217")
+    posted: list[dict[str, Any]] = []
+    client = _gated_client(posted, [])
+    await _launch_gated(client)
+    await _settle_background_work(fingerprint)
+    await _launch_gated(client)
+    await _settle_background_work(fingerprint)
+    await _launch_gated(client, session_id="5e6f708192a3b4c5d6e7f8091a2b3c4d")
+    await _settle_background_work(fingerprint)
+    await client.aclose()
+
+    keys = [event["data"]["source_id"] for event in posted]
+    assert len(keys) == 3
+    assert keys[0] == keys[1] != keys[2]

@@ -37,6 +37,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_claude_status_model,
     read_hook_events_from_offset,
     read_hook_events_since_with_position,
+    read_launch_catalog_facts,
     read_launch_model,
     read_message_deltas_from_offset,
     read_pane_signals,
@@ -49,10 +50,7 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
-from omnigent.harnesses.claude_native.client_version import (
-    record_min_client_version,
-    unsupported_model_min_version,
-)
+from omnigent.harnesses.claude_native.client_version import client_refusal, learn_from_refusal
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
@@ -3456,20 +3454,26 @@ async def _learn_min_client_version(bridge_dir: Path, record: ClaudeHookRecord) 
     """
     Remember a model the installed Claude Code was refused, so the next launch skips it.
 
-    A ``StopFailure`` whose text says the client is too old for the model names
-    the release it needs; the pane's model at that moment (the launch model
-    when no status snapshot exists yet) is the one refused.
+    Only the structured too-old-client refusal counts, and only when it quotes
+    the release the launch catalog was probed on (:func:`learn_from_refusal`);
+    the model is the pane's at that moment, the launch model before any
+    status snapshot exists. Assistant prose never qualifies.
 
     :param bridge_dir: Native Claude bridge directory.
     :param record: ``StopFailure`` hook record.
     """
-    min_version = unsupported_model_min_version(record.failure_message)
-    if min_version is None:
+    if client_refusal(record.failure_context) is None:
         return
     try:
+        scope, installed = read_launch_catalog_facts(bridge_dir)
         model = read_claude_status_model(bridge_dir) or read_launch_model(bridge_dir)
-        if model is not None:
-            await asyncio.to_thread(record_min_client_version, model, min_version)
+        await asyncio.to_thread(
+            learn_from_refusal,
+            record.failure_context,
+            installed=installed,
+            model=model,
+            scope=scope,
+        )
     except Exception as exc:  # noqa: BLE001 - learning must not prevent status delivery
         _logger.debug("Claude model floor learning failed: %s", type(exc).__name__)
 

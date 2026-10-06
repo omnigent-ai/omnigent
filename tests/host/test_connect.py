@@ -3777,6 +3777,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
+        "OMNIGENT_CLAUDE_DEFAULT_MODEL_FLOOR": "0",
         "KUBECONFIG": "/home/alice/.kube/config",
         "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "BROWSER": "www-browser",
@@ -3830,6 +3831,9 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     # must reach the runner without also forcing
     # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
     assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
+    # The native-Claude Default-model floor opt-out is read by the runner, so a
+    # bare ``OMNIGENT_CLAUDE_DEFAULT_MODEL_FLOOR=0`` on the host must reach it.
+    assert env["OMNIGENT_CLAUDE_DEFAULT_MODEL_FLOOR"] == "0"
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
     assert env["KUBECONFIG"] == "/home/alice/.kube/config"

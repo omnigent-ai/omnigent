@@ -1919,6 +1919,24 @@ def read_launch_model(bridge_dir: Path) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def read_launch_catalog_facts(bridge_dir: Path) -> tuple[str | None, str | None]:
+    """
+    Read the catalog facts recorded at launch.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: ``(catalog_scope, cli_version)`` from :func:`record_model_vocabulary`;
+        each is ``None`` when the launch did not read a catalog.
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    if not isinstance(config, dict):
+        return None, None
+    scope, version = config.get("catalog_scope"), config.get("cli_version")
+    return (
+        scope if isinstance(scope, str) and scope else None,
+        version if isinstance(version, str) and version else None,
+    )
+
+
 def read_model_env(bridge_dir: Path) -> dict[str, str]:
     """
     Read the launch env keys defining this session's model vocabulary.
@@ -1964,6 +1982,8 @@ def record_model_vocabulary(
     launch_env: Mapping[str, str] | None,
     launch_model: str | None,
     picker_values: Sequence[str] | None = None,
+    catalog_scope: str | None = None,
+    cli_version: str | None = None,
 ) -> None:
     """
     Persist the launch's model vocabulary after the bridge dir exists.
@@ -1982,6 +2002,10 @@ def record_model_vocabulary(
         ``None``.
     :param picker_values: The ``/model`` spellings this session's picker
         offers, or ``None`` when the catalog is unknown. An empty list clears it.
+    :param catalog_scope: The fingerprint of the catalog the launch read, under
+        which a refused model's floor is learned, or ``None`` when unknown.
+    :param cli_version: The Claude Code release that catalog was probed on, or
+        ``None`` when unknown.
     :returns: None.
     """
     # Read-modify-write under the bridge dir's cross-process lock so a
@@ -2010,6 +2034,10 @@ def record_model_vocabulary(
         if launch_model and config.get("launch_model") != launch_model:
             config["launch_model"] = launch_model
             changed = True
+        for key, value in (("catalog_scope", catalog_scope), ("cli_version", cli_version)):
+            if value and config.get(key) != value:
+                config[key] = value
+                changed = True
         if changed:
             _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
