@@ -725,6 +725,35 @@ describe("CodeViewer rendered previews skip Shiki highlighting", () => {
     renderViewer(NB, true, "analysis.ipynb", { viewMode: "preview" });
     expect(highlightCode).not.toHaveBeenCalled();
   });
+
+  it("tokenizes markdown only on entering source view, not across preview transitions", () => {
+    const fileQuery = makeFileQuery("# heading");
+    const build = (viewMode: "preview" | "source") => (
+      <CodeViewer
+        conversationId="conv_1"
+        path="notes.md"
+        fileQuery={fileQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode={viewMode}
+      />
+    );
+    vi.mocked(highlightCode).mockClear();
+    const { rerender } = render(build("preview"));
+    expect(highlightCode).not.toHaveBeenCalled();
+
+    rerender(build("source"));
+    expect(highlightCode).toHaveBeenCalled();
+
+    vi.mocked(highlightCode).mockClear();
+    rerender(build("preview"));
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
 });
 
 describe("CodeViewer image rendering", () => {

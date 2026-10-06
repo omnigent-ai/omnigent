@@ -514,8 +514,10 @@ export function CodeViewer({
   const showMonaco = lang !== "markdown" && viewMode !== "preview";
   // HTML, markdown, and notebook previews render through their own surfaces and
   // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
-  const isRenderedPreview =
-    viewMode === "preview" && (lang === "html" || lang === "markdown" || isNotebookPath(path));
+  const isHtmlPreview = viewMode === "preview" && lang === "html";
+  const isMarkdownOrNotebookPreview =
+    viewMode === "preview" && (lang === "markdown" || isNotebookPath(path));
+  const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview;
   // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
   // rendered previews, which never render these lines.
   const rawLines = useMemo(
@@ -554,7 +556,12 @@ export function CodeViewer({
   useEffect(() => {
     if (showMonaco) return; // Monaco does its own highlighting.
     if (viewMode === "editor" && lang === "markdown") return;
-    if (isRenderedPreview) return; // Preview surfaces never read the Shiki tokens.
+    if (isRenderedPreview) {
+      // Drop stale tokens so a later switch to source view can't briefly render
+      // the previous file's highlighted text.
+      setTokenLines(null);
+      return;
+    }
     let cancelled = false;
     setTokenLines(null);
     if (!content) return;
@@ -848,7 +855,7 @@ export function CodeViewer({
   // HTML preview gets its own comment-enabled viewer (selection capture +
   // highlights relayed over a bridge into the still-sandboxed iframe), so it
   // owns the truncated banner internally.
-  if (viewMode === "preview" && lang === "html") {
+  if (isHtmlPreview) {
     return (
       <HtmlCommentViewer
         conversationId={conversationId}
@@ -861,7 +868,7 @@ export function CodeViewer({
     );
   }
 
-  if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
+  if (isMarkdownOrNotebookPreview) {
     const isNotebook = isNotebookPath(path);
     return (
       <PreviewWithSearch
