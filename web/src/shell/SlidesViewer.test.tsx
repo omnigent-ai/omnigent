@@ -216,7 +216,7 @@ describe("prepareSlidesExport", () => {
     expect(doc.indexOf(DS)).toBeLessThan(doc.indexOf("<title>"));
     expect(doc.indexOf(KIT)).toBeGreaterThan(doc.indexOf("<h1>Three</h1>"));
     expect(doc.indexOf(KIT)).toBeLessThan(doc.indexOf("</body>"));
-    expect(doc.match(/<script>/g)).toHaveLength(1);
+    expect(doc.replace(HTML_PREVIEW_HEAD, "").match(/<script>/g)).toHaveLength(1);
     expect(doc).not.toContain(SLIDES_MSG_SOURCE);
     expect(doc).not.toContain("postMessage");
   });
@@ -234,7 +234,7 @@ describe("exported deck", () => {
   // Loads the export into the test document with its script inert, as with JS off.
   function load(inner: string) {
     const parsed = new DOMParser().parseFromString(prepareSlidesExport(body(inner)), "text/html");
-    const script = parsed.querySelector("script")!;
+    const script = [...parsed.querySelectorAll("script")].at(-1)!;
     script.remove();
     document.head.replaceChildren(...parsed.head.childNodes);
     document.body.replaceChildren(...parsed.body.childNodes);
