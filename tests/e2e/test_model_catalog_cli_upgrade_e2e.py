@@ -198,6 +198,24 @@ def _write_fake_codex(path: Path, *, marker: str, legacy: bool = False) -> None:
     path.chmod(0o755)
 
 
+def _write_codex_wrapper(path: Path, *, trace: Path) -> None:
+    """Write a generic configured launcher that forwards to an argv-selected CLI."""
+    path.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+target, *args = sys.argv[1:]
+with Path({str(trace)!r}).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(args) + "\\n")
+os.execv(target, [target, *args])
+"""
+    )
+    path.chmod(0o755)
+
+
 def _free_port() -> int:
     """Return an ephemeral loopback TCP port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -495,6 +513,82 @@ def test_codex_cli_upgrade_refreshes_model_catalog(tmp_path: Path, legacy: bool)
             after = rig.model_display_names("codex-native", timeout=5.0)
 
     _assert_upgrade_refreshed(before, after, "codex-native")
+
+
+@pytest.mark.timeout(400)
+@pytest.mark.parametrize("legacy", [False, True], ids=["modern", "legacy"])
+def test_configured_codex_wrapper_prefix_drives_and_refreshes_host_catalog(
+    tmp_path: Path, legacy: bool
+) -> None:
+    """The host probes through any configured launcher and tracks its wrapped CLI."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    backend = bin_dir / "managed-codex-backend"
+    wrapper = bin_dir / "managed-codex"
+    trace = tmp_path / "wrapper-argv.jsonl"
+    _write_fake_codex(backend, marker="OLD", legacy=legacy)
+    _write_codex_wrapper(wrapper, trace=trace)
+
+    rig_root = tmp_path / "rig"
+    config_home = rig_root / "config-home"
+    config_home.mkdir(parents=True)
+    (config_home / "config.yaml").write_text(
+        "harness:\n"
+        "  codex-native:\n"
+        f"    command: {json.dumps(str(wrapper))}\n"
+        f"    args: [{json.dumps(str(backend))}]\n"
+    )
+
+    with _booted_rig(rig_root, bin_dir, {}) as rig:
+        rig.start_host()
+        before = rig.model_display_names("codex-native", timeout=_CATALOG_TIMEOUT_S)
+
+        # The configured launcher is stable while the company-managed CLI it
+        # forwards to updates in place.
+        _write_fake_codex(backend, marker="NEW", legacy=legacy)
+        rig.start_host()
+        after = rig.model_display_names("codex-native", timeout=_REFRESH_TIMEOUT_S)
+        deadline = time.monotonic() + _REFRESH_TIMEOUT_S
+        while after and not any("NEW" in name for name in after) and time.monotonic() < deadline:
+            time.sleep(2.0)
+            after = rig.model_display_names("codex-native", timeout=5.0)
+
+    _assert_upgrade_refreshed(before, after, "configured codex-native")
+    invocations = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert any(args and args[0] == "app-server" for args in invocations)
+
+
+@pytest.mark.timeout(400)
+@pytest.mark.parametrize("legacy", [False, True], ids=["modern", "legacy"])
+def test_command_only_codex_wrapper_drives_and_refreshes_host_catalog(
+    tmp_path: Path, legacy: bool
+) -> None:
+    """A configured command needs no prefix args to own catalog discovery."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    wrapper = bin_dir / "managed-codex"
+    _write_fake_codex(wrapper, marker="OLD", legacy=legacy)
+
+    rig_root = tmp_path / "rig"
+    config_home = rig_root / "config-home"
+    config_home.mkdir(parents=True)
+    (config_home / "config.yaml").write_text(
+        f"harness:\n  codex-native:\n    command: {json.dumps(str(wrapper))}\n"
+    )
+
+    with _booted_rig(rig_root, bin_dir, {}) as rig:
+        rig.start_host()
+        before = rig.model_display_names("codex-native", timeout=_CATALOG_TIMEOUT_S)
+
+        _write_fake_codex(wrapper, marker="NEW", legacy=legacy)
+        rig.start_host()
+        after = rig.model_display_names("codex-native", timeout=_REFRESH_TIMEOUT_S)
+        deadline = time.monotonic() + _REFRESH_TIMEOUT_S
+        while after and not any("NEW" in name for name in after) and time.monotonic() < deadline:
+            time.sleep(2.0)
+            after = rig.model_display_names("codex-native", timeout=5.0)
+
+    _assert_upgrade_refreshed(before, after, "command-only codex-native")
 
 
 @pytest.mark.timeout(180)

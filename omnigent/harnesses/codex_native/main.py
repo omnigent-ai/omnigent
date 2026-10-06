@@ -60,6 +60,8 @@ from omnigent.harnesses.codex_native.app_server import (
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS,
+    CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     CodexNativeBridgeState,
     bridge_dir_for_bridge_id,
     clear_bridge_state,
@@ -72,6 +74,10 @@ from omnigent.harnesses.codex_native.bridge import (
 from omnigent.harnesses.codex_native.forwarder import (
     _replay_dead_letters_before_resume,
     supervise_forwarder,
+)
+from omnigent.harnesses.codex_native.invocation import (
+    CodexInvocation,
+    resolve_codex_invocation,
 )
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
 from omnigent.host.daemon_launch import (
@@ -1061,7 +1067,10 @@ async def _ensure_codex_terminal_on_runner(
     resp = await client.post(
         f"/v1/sessions/{url_component(session_id)}/resources/terminals",
         json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
-        timeout=60.0,
+        timeout=(
+            CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+            + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS
+        ),
     )
     if resp.status_code >= 400:
         raise click.ClickException(
@@ -1236,6 +1245,7 @@ async def _prepare_codex_terminal(
         socket_path = socket_path_for_bridge_dir(bridge_dir)
         codex_home = codex_home_for_bridge_dir(bridge_dir)
         clear_bridge_state(bridge_dir)
+        codex_invocation = resolve_codex_invocation(explicit=command)
         # Route across all offerings: a configured provider (configure
         # harness), the Databricks ucode profile, or Codex's own login —
         # so `omnigent codex` honors the provider selection like the
@@ -1251,6 +1261,7 @@ async def _prepare_codex_terminal(
                 workspace=Path.cwd().resolve(),
                 model_provider=codex_session_meta_model_provider(_codex_launch),
                 codex_path=command,
+                codex_invocation=codex_invocation,
                 terminal_launch_args=codex_args,
             )
         # Listen on a loopback WebSocket, mirroring the host-spawned
@@ -1270,6 +1281,7 @@ async def _prepare_codex_terminal(
             model=_codex_launch.model,
             profile=_codex_launch.profile,
             codex_path=command,
+            codex_invocation=codex_invocation,
             extra_config_overrides=_codex_launch.config_overrides,
             bridge_dir=bridge_dir,
             ap_server_url=base_url,
@@ -1930,6 +1942,7 @@ async def _ensure_local_codex_resume_rollout(
     workspace: Path,
     model_provider: str,
     codex_path: str | None,
+    codex_invocation: CodexInvocation | None = None,
     terminal_launch_args: Sequence[str] | None = None,
 ) -> Path:
     """
@@ -2007,7 +2020,8 @@ async def _ensure_local_codex_resume_rollout(
     if codex_path is not None:
         from omnigent.inner.codex_executor import _codex_cli_version
 
-        version_tuple = await _codex_cli_version(codex_path)
+        version_target = codex_invocation if codex_invocation is not None else codex_path
+        version_tuple = await _codex_cli_version(version_target)
         if version_tuple is not None:
             cli_version = ".".join(str(part) for part in version_tuple)
     records = _codex_rollout_records_from_session_items(

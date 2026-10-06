@@ -45,6 +45,10 @@ from omnigent.harness_plugins import (
     PI_NATIVE_CODING_AGENT,
     harness_capabilities,
 )
+from omnigent.harnesses.codex_native.bridge import (
+    CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS,
+    CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
+)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
@@ -893,6 +897,21 @@ _managed_launch_tasks: set[asyncio.Task[None]] = set()
 
 
 _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
+
+
+def runner_session_init_timeout(harness: str | None) -> float:
+    """Return the bounded runner-init budget for one harness family.
+
+    The server cannot see a runner host's local command wrapper. Codex-native
+    therefore reserves its maximum configured-wrapper budget; direct launches
+    still fail earlier at their own 60-second app-server readiness boundary.
+    """
+    if harness == "codex-native":
+        return (
+            CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+            + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS
+        )
+    return _RUNNER_SESSION_INIT_TIMEOUT_S
 
 
 _STOP_RUNNER_RESULT_TIMEOUT_S = 10.0

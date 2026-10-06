@@ -16,7 +16,7 @@ import sys
 import tempfile
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
 
@@ -35,7 +35,14 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
+from omnigent.harnesses.codex_native.bridge import (
+    CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS,
+    write_policy_hook_config,
+)
+from omnigent.harnesses.codex_native.invocation import (
+    CodexInvocation,
+    resolve_codex_invocation,
+)
 from omnigent.harnesses.codex_native.launch_args import (
     _merge_tables,
     _write_private_config,
@@ -159,6 +166,32 @@ _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 # Codex rejects permission flags on remote resume starting with this release.
 _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
+
+
+def _codex_startup_timeout_seconds(invocation: CodexInvocation, fallback: float) -> float:
+    """Use the configured-wrapper allowance only when app-server is wrapped."""
+    if invocation.app_server_configured:
+        return CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+    return fallback
+
+
+def _resolve_native_codex_invocation(
+    *,
+    codex_path: str | None = None,
+    codex_invocation: CodexInvocation | None = None,
+) -> CodexInvocation:
+    """Resolve config prefixes while retaining the legacy PATH lookup."""
+    if codex_invocation is not None:
+        return codex_invocation
+    if codex_path is not None:
+        return CodexInvocation(codex_path)
+    invocation = resolve_codex_invocation()
+    if invocation.executable == "codex" and not invocation.argv_prefix:
+        return replace(
+            invocation,
+            executable=_find_codex_cli() or invocation.executable,
+        )
+    return invocation
 
 
 @dataclass(frozen=True)
@@ -1163,7 +1196,45 @@ _model_discovery_cache: TTLCache[str, tuple[_JsonObject, ...]] = TTLCache(
 )
 
 
-async def discover_codex_model_options(*, codex_path: str | None = None) -> list[_JsonObject]:
+def _argv_prefix_digest(argv_prefix: Sequence[str]) -> str:
+    """Digest a configured prefix without retaining its argument values."""
+    digest = hashlib.sha256()
+    for argument in argv_prefix:
+        encoded = argument.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _codex_invocation_identity(invocation: CodexInvocation) -> tuple[object, ...]:
+    """Capture privacy-safe executable and prefix metadata for an invocation."""
+    from omnigent.models.model_catalog_store import binary_identity
+
+    prefix_identities = tuple(
+        (position, binary_identity(part))
+        for position, part in enumerate(invocation.argv_prefix)
+        if "=" not in part and not part.startswith("-")
+    )
+    return (
+        invocation.executable,
+        binary_identity(invocation.executable),
+        _argv_prefix_digest(invocation.argv_prefix),
+        prefix_identities,
+    )
+
+
+def _model_discovery_cache_key(
+    invocation: CodexInvocation,
+) -> str:
+    """Key short-lived discovery by the selected invocation."""
+    return repr(("codex_invocation", _codex_invocation_identity(invocation)))
+
+
+async def discover_codex_model_options(
+    *,
+    codex_path: str | None = None,
+    codex_invocation: CodexInvocation | None = None,
+) -> list[_JsonObject]:
     """Query the installed Codex CLI's credential-free compatibility catalog.
 
     Starts a short-lived app-server with an empty private ``CODEX_HOME`` and
@@ -1177,10 +1248,15 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
     :raises RuntimeError: When the discovery app-server exits before connecting.
     :raises TimeoutError: When the discovery app-server does not become ready.
     """
-    resolved_codex = codex_path or _find_codex_cli()
+    invocation = _resolve_native_codex_invocation(
+        codex_path=codex_path,
+        codex_invocation=codex_invocation,
+    )
+    resolved_codex = invocation.executable
     if not resolved_codex:
         raise ImportError("Native Codex model discovery requires the 'codex' CLI on PATH.")
-    cached = _model_discovery_cache.get(resolved_codex)
+    cache_key = _model_discovery_cache_key(invocation)
+    cached = _model_discovery_cache.get(cache_key)
     if cached is not None:
         return [dict(option) for option in cached]
 
@@ -1198,15 +1274,25 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
             }:
                 env.pop(name)
         env["CODEX_HOME"] = str(codex_home)
-        discovery = await _start_codex_model_discovery_process(
-            codex_path=resolved_codex,
-            listen_url=listen_url,
-            env=env,
-            cwd=root,
-        )
+        discovery_kwargs: dict[str, object] = {
+            "codex_path": resolved_codex,
+            "listen_url": listen_url,
+            "env": env,
+            "cwd": root,
+        }
+        if invocation.argv_prefix:
+            discovery_kwargs["invocation"] = invocation
+        discovery = await _start_codex_model_discovery_process(**discovery_kwargs)  # type: ignore[arg-type]
         client: CodexAppServerClient | None = None
         try:
-            await _wait_for_discovery_listener(discovery, port)
+            if invocation.app_server_configured:
+                await _wait_for_discovery_listener(
+                    discovery,
+                    port,
+                    timeout=_codex_startup_timeout_seconds(invocation, _CONNECT_TIMEOUT_SECONDS),
+                )
+            else:
+                await _wait_for_discovery_listener(discovery, port)
             client = CodexAppServerClient(
                 ws_url=listen_url,
                 client_name="omnigent-codex-model-discovery",
@@ -1219,7 +1305,7 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
                     await client.close()
             await _stop_codex_model_discovery_process(discovery)
 
-    _model_discovery_cache[resolved_codex] = tuple(dict(option) for option in options)
+    _model_discovery_cache[cache_key] = tuple(dict(option) for option in options)
     return options
 
 
@@ -1230,14 +1316,15 @@ async def _start_codex_model_discovery_process(
     env: dict[str, str],
     cwd: Path,
     config_overrides: Sequence[str] = (),
+    invocation: CodexInvocation | None = None,
 ) -> _CodexModelDiscoveryProcess:
     """Start the isolated Codex process used only for model discovery."""
     override_args: list[str] = []
     for override in config_overrides:
         override_args.extend(("-c", override))
+    process_invocation = invocation or CodexInvocation(codex_path)
     process = await asyncio.create_subprocess_exec(
-        codex_path,
-        "app-server",
+        *process_invocation.argv("app-server"),
         "--listen",
         listen_url,
         *override_args,
@@ -1302,10 +1389,12 @@ def _allocate_loopback_port() -> int:
 async def _wait_for_discovery_listener(
     discovery: _CodexModelDiscoveryProcess,
     port: int,
+    *,
+    timeout: float = _CONNECT_TIMEOUT_SECONDS,
 ) -> None:
     """Wait until a discovery app-server accepts loopback connections."""
     process = discovery.process
-    deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
+    deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         if process.returncode is not None:
             message = f"Codex model discovery exited early ({process.returncode})"
@@ -1322,7 +1411,9 @@ async def _wait_for_discovery_listener(
         await writer.wait_closed()
         del reader
         return
-    raise TimeoutError("Timed out waiting for Codex model discovery app-server")
+    raise TimeoutError(
+        f"Timed out after {timeout:g}s waiting for Codex model discovery app-server"
+    )
 
 
 def _codex_config_identity(source_home: Path) -> tuple[object, ...]:
@@ -1360,6 +1451,22 @@ def _codex_picker_config(source_home: Path) -> dict[str, str]:
             path if path.is_absolute() else (source_home / path).resolve()
         )
     return picker
+
+
+def _restore_codex_picker_config(target_home: Path, source_home: Path) -> None:
+    """Keep picker keys when a private home uses minimal config materialization."""
+    picker_config = _codex_picker_config(source_home)
+    if not picker_config:
+        return
+    config_path = target_home / "config.toml"
+    try:
+        document = (
+            tomlkit.parse(config_path.read_text()) if config_path.exists() else tomlkit.document()
+        )
+    except (OSError, ValueError):
+        return
+    document.update(picker_config)
+    _write_private_config(config_path, tomlkit.dumps(document))
 
 
 def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
@@ -1403,15 +1510,7 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
         minimal_config=True,
         supported_efforts=CODEX_NATIVE_EFFORTS,
     )
-    # A custom catalog replaces Codex's built-in choices, including visibility.
-    picker_config = _codex_picker_config(source_home)
-    if picker_config:
-        config_path = home / "config.toml"
-        document = (
-            tomlkit.parse(config_path.read_text()) if config_path.exists() else tomlkit.document()
-        )
-        document.update(picker_config)
-        config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    _restore_codex_picker_config(home, source_home)
     return home
 
 
@@ -1475,7 +1574,10 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
 
 
 async def probe_codex_model_options(
-    *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    *,
+    codex_path: str | None = None,
+    launch: NativeCodexLaunch | None = None,
+    codex_invocation: CodexInvocation | None = None,
 ) -> list[_JsonObject]:
     """
     Ask a session-configured Codex app-server for its own model list.
@@ -1496,19 +1598,32 @@ async def probe_codex_model_options(
     """
     if launch is None:
         launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
-    resolved_codex = codex_path or _find_codex_cli()
+    invocation = _resolve_native_codex_invocation(
+        codex_path=codex_path,
+        codex_invocation=codex_invocation,
+    )
+    resolved_codex = invocation.executable
     if not resolved_codex:
         raise ImportError("Native Codex model probing requires the 'codex' CLI on PATH.")
     config_overrides = list(launch.config_overrides)
     pinned_model = launch.model
     env = _clean_codex_env()
     if launch.profile is not None:
-        databricks = await asyncio.to_thread(
-            _databricks_launch_materialization,
-            model=launch.model,
-            profile=launch.profile,
-            codex_path=resolved_codex,
-        )
+        if invocation.argv_prefix:
+            databricks = await asyncio.to_thread(
+                _databricks_launch_materialization,
+                model=launch.model,
+                profile=launch.profile,
+                codex_path=resolved_codex,
+                codex_invocation=invocation,
+            )
+        else:
+            databricks = await asyncio.to_thread(
+                _databricks_launch_materialization,
+                model=launch.model,
+                profile=launch.profile,
+                codex_path=resolved_codex,
+            )
         config_overrides.extend(databricks.config_overrides)
         env["DATABRICKS_HOST"] = databricks.host
         pinned_model = databricks.model
@@ -1516,16 +1631,26 @@ async def probe_codex_model_options(
     env["CODEX_HOME"] = str(codex_home)
     port = _allocate_loopback_port()
     listen_url = f"ws://127.0.0.1:{port}"
-    discovery = await _start_codex_model_discovery_process(
-        codex_path=resolved_codex,
-        listen_url=listen_url,
-        env=env,
-        cwd=codex_home,
-        config_overrides=config_overrides,
-    )
+    discovery_kwargs: dict[str, object] = {
+        "codex_path": resolved_codex,
+        "listen_url": listen_url,
+        "env": env,
+        "cwd": codex_home,
+        "config_overrides": config_overrides,
+    }
+    if invocation.argv_prefix:
+        discovery_kwargs["invocation"] = invocation
+    discovery = await _start_codex_model_discovery_process(**discovery_kwargs)  # type: ignore[arg-type]
     client: CodexAppServerClient | None = None
     try:
-        await _wait_for_discovery_listener(discovery, port)
+        if invocation.app_server_configured:
+            await _wait_for_discovery_listener(
+                discovery,
+                port,
+                timeout=_codex_startup_timeout_seconds(invocation, _CONNECT_TIMEOUT_SECONDS),
+            )
+        else:
+            await _wait_for_discovery_listener(discovery, port)
         client = CodexAppServerClient(
             ws_url=listen_url,
             client_name="omnigent-codex-model-probe",
@@ -1564,7 +1689,12 @@ async def _read_codex_probe_default(client: CodexAppServerClient) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
-def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | None = None) -> str:
+def codex_catalog_fingerprint(
+    launch: NativeCodexLaunch,
+    *,
+    codex_path: str | None = None,
+    codex_invocation: CodexInvocation | None = None,
+) -> str:
     """The launch fingerprint keying codex's shared model catalog.
 
     One formula for every consumer (host boot probe, runner launch, live
@@ -1586,24 +1716,40 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
 
     profile_host = _read_databrickscfg_host(launch.profile) if launch.profile is not None else None
-    return fingerprint_of(
+    invocation = _resolve_native_codex_invocation(
+        codex_path=codex_path,
+        codex_invocation=codex_invocation,
+    )
+    fingerprint_parts: list[object] = [
         "codex-native",
         "isolated-picker-v4",
         _codex_config_identity(_codex_home_config_source_from_env()),
         (launch.profile, (profile_host or "").rstrip("/")) if launch.profile is not None else None,
         launch.model,
         tuple(launch.config_overrides),
-        binary_identity(codex_path or _find_codex_cli()),
+        binary_identity(invocation.executable),
+    ]
+    if invocation.argv_prefix:
+        fingerprint_parts.append(("codex_invocation", _codex_invocation_identity(invocation)))
+    return fingerprint_of(
+        *fingerprint_parts,
     )
 
 
 def fresh_codex_launch_catalog(
-    *, codex_path: str | None = None, launch: NativeCodexLaunch
+    *,
+    codex_path: str | None = None,
+    launch: NativeCodexLaunch,
+    codex_invocation: CodexInvocation | None = None,
 ) -> list[_JsonObject] | None:
     """Return a fresh persisted catalog for one launch shape, without probing."""
     from omnigent.models import model_catalog_store
 
-    fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
+    fingerprint = codex_catalog_fingerprint(
+        launch,
+        codex_path=codex_path,
+        codex_invocation=codex_invocation,
+    )
     rows = model_catalog_store.read_catalog("codex-native", fingerprint)
     if rows is None or model_catalog_store.catalog_is_stale("codex-native", fingerprint):
         return None
@@ -1611,7 +1757,11 @@ def fresh_codex_launch_catalog(
 
 
 async def _codex_launch_catalog(
-    *, codex_path: str | None, launch: NativeCodexLaunch | None, reprobe: bool
+    *,
+    codex_path: str | None,
+    launch: NativeCodexLaunch | None,
+    reprobe: bool,
+    codex_invocation: CodexInvocation | None = None,
 ) -> list[_JsonObject] | None:
     """Read or refresh one launch shape without resolving a different probe shape."""
     from omnigent.models import model_catalog_store
@@ -1622,14 +1772,40 @@ async def _codex_launch_catalog(
     except Exception:  # noqa: BLE001 — a broken provider config means no catalog
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
         return None
-    fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
+    effective_invocation = _resolve_native_codex_invocation(
+        codex_path=codex_path,
+        codex_invocation=codex_invocation,
+    )
+    fingerprint = codex_catalog_fingerprint(
+        launch,
+        codex_path=codex_path,
+        codex_invocation=effective_invocation,
+    )
 
     async def _probe(*, allow_empty: bool) -> list[_JsonObject] | None:
         try:
-            rows = await asyncio.wait_for(
-                probe_codex_model_options(codex_path=codex_path, launch=launch),
-                timeout=_MODEL_CATALOG_PROBE_TIMEOUT_SECONDS,
-            )
+            probe_kwargs: dict[str, object] = {
+                "codex_path": codex_path,
+                "launch": launch,
+            }
+            probe_kwargs["codex_invocation"] = effective_invocation
+            try:
+                rows = await asyncio.wait_for(
+                    probe_codex_model_options(**probe_kwargs),  # type: ignore[arg-type]
+                    timeout=_codex_startup_timeout_seconds(
+                        effective_invocation, _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS
+                    ),
+                )
+            except TypeError as exc:
+                if "codex_invocation" not in str(exc):
+                    raise
+                probe_kwargs.pop("codex_invocation", None)
+                rows = await asyncio.wait_for(
+                    probe_codex_model_options(**probe_kwargs),  # type: ignore[arg-type]
+                    timeout=_codex_startup_timeout_seconds(
+                        effective_invocation, _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS
+                    ),
+                )
         except Exception:  # noqa: BLE001 — probe failure means "no catalog", never a crash
             # Best-effort probe re-run on every catalog fetch; log once so a
             # persistently failing probe doesn't flood the logs.
@@ -1655,7 +1831,10 @@ async def _codex_launch_catalog(
 
 
 async def codex_launch_catalog(
-    *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    *,
+    codex_path: str | None = None,
+    launch: NativeCodexLaunch | None = None,
+    codex_invocation: CodexInvocation | None = None,
 ) -> list[_JsonObject] | None:
     """
     The shared codex catalog for a launch shape: store, then probe.
@@ -1670,11 +1849,19 @@ async def codex_launch_catalog(
         omitted, resolve the host's default shape.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
     """
-    return await _codex_launch_catalog(codex_path=codex_path, launch=launch, reprobe=False)
+    return await _codex_launch_catalog(
+        codex_path=codex_path,
+        launch=launch,
+        reprobe=False,
+        codex_invocation=codex_invocation,
+    )
 
 
 async def codex_reprobed_launch_catalog(
-    *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    *,
+    codex_path: str | None = None,
+    launch: NativeCodexLaunch | None = None,
+    codex_invocation: CodexInvocation | None = None,
 ) -> list[_JsonObject] | None:
     """
     Await a fresh catalog for one launch shape, joining an in-flight probe.
@@ -1687,11 +1874,19 @@ async def codex_reprobed_launch_catalog(
         omitted, resolve the host's default shape.
     :returns: Fresh probe rows, or ``None`` when the probe failed.
     """
-    return await _codex_launch_catalog(codex_path=codex_path, launch=launch, reprobe=True)
+    return await _codex_launch_catalog(
+        codex_path=codex_path,
+        launch=launch,
+        reprobe=True,
+        codex_invocation=codex_invocation,
+    )
 
 
 async def codex_launch_catalog_is_stale(
-    *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    *,
+    codex_path: str | None = None,
+    launch: NativeCodexLaunch | None = None,
+    codex_invocation: CodexInvocation | None = None,
 ) -> bool:
     """
     Whether a launch shape's stored catalog is past the TTL.
@@ -1711,7 +1906,12 @@ async def codex_launch_catalog_is_stale(
     except Exception:  # noqa: BLE001 — a broken provider config means no catalog
         return False
     return model_catalog_store.catalog_is_stale(
-        "codex-native", codex_catalog_fingerprint(launch, codex_path=codex_path)
+        "codex-native",
+        codex_catalog_fingerprint(
+            launch,
+            codex_path=codex_path,
+            codex_invocation=codex_invocation,
+        ),
     )
 
 
@@ -1720,9 +1920,10 @@ def _build_native_codex_app_server_argv(
     tagged_argv0: str,
     listen_url: str,
     config_overrides: Sequence[str],
+    invocation_prefix: Sequence[str] = (),
 ) -> list[str]:
     """Build argv for the native Codex app-server subprocess."""
-    argv = [tagged_argv0, "app-server", "--listen", listen_url]
+    argv = [tagged_argv0, *invocation_prefix, "app-server", "--listen", listen_url]
     for override in config_overrides:
         argv.extend(["-c", override])
     return argv
@@ -1805,6 +2006,7 @@ class CodexNativeAppServer:
     config_overrides: list[str]
     cwd: Path
     bridge_dir: Path
+    codex_invocation: CodexInvocation | None = None
     developer_instructions: str | None = None
     ap_server_url: str | None = None
     ap_auth_headers: dict[str, str] | None = None
@@ -1829,6 +2031,10 @@ class CodexNativeAppServer:
     session_id: str | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.codex_invocation is None:
+            self.codex_invocation = CodexInvocation(self.codex_path)
 
     async def start(self) -> None:
         """
@@ -1857,7 +2063,13 @@ class CodexNativeAppServer:
         # (``None``) is treated as supported so a flaky probe never
         # silently disables enforcement — a genuine trust failure is then
         # caught below.
-        codex_version = await _codex_cli_version(self.codex_path)
+        assert self.codex_invocation is not None
+        version_target: str | CodexInvocation = (
+            self.codex_invocation
+            if self.codex_invocation.app_server_configured
+            else self.codex_path
+        )
+        codex_version = await _codex_cli_version(version_target)
         self.codex_cli_version = codex_version
         policy_hooks_supported = (
             codex_version is None or codex_version >= _MIN_POLICY_HOOK_CODEX_VERSION
@@ -1894,12 +2106,21 @@ class CodexNativeAppServer:
             # therefore be absent even from a fresh snapshot. A present row
             # with malformed migration metadata is also unsafe to trust.
             if catalog_entry is None or _codex_model_upgrade_metadata_is_malformed(catalog_entry):
-                catalog = await asyncio.to_thread(
-                    read_codex_model_catalog,
-                    self.codex_path,
-                    config_source,
-                    timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
-                )
+                if self.codex_invocation.app_server_configured:
+                    catalog = await asyncio.to_thread(
+                        read_codex_model_catalog,
+                        self.codex_path,
+                        config_source,
+                        timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
+                        codex_invocation=self.codex_invocation,
+                    )
+                else:
+                    catalog = await asyncio.to_thread(
+                        read_codex_model_catalog,
+                        self.codex_path,
+                        config_source,
+                        timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
+                    )
             model_migration_target = _codex_model_upgrade_target(catalog, self.pinned_model)
         # Off the loop: this copies/symlinks a home AND (on a Smart Routing
         # session) shells out to ``codex debug models`` with a 10s timeout. Run
@@ -1913,7 +2134,12 @@ class CodexNativeAppServer:
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
             minimal_config=minimal_config,
+            codex_invocation=(
+                self.codex_invocation if self.codex_invocation.app_server_configured else None
+            ),
         )
+        if minimal_config:
+            _restore_codex_picker_config(self.codex_home, config_source)
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
             config_source,
@@ -1996,6 +2222,7 @@ class CodexNativeAppServer:
             tagged_argv0=tagged_argv0,
             listen_url=resolved_listen,
             config_overrides=self.config_overrides,
+            invocation_prefix=self.codex_invocation.argv_prefix,
         )
         proc_env = codex_app_server_diagnostic_env(
             {**self.env, "CODEX_HOME": str(self.codex_home)}
@@ -2009,7 +2236,7 @@ class CodexNativeAppServer:
                 stderr=asyncio.subprocess.PIPE,
                 env=proc_env,
                 cwd=str(self.cwd),
-                executable=self.codex_path,
+                executable=self.codex_invocation.executable,
                 **_proc.spawn_kwargs(),
             )
         except BaseException:
@@ -2252,7 +2479,11 @@ class CodexNativeAppServer:
         :raises RuntimeError: If the app-server exits or never
             becomes ready within ``_APP_SERVER_READY_TIMEOUT_SECONDS``.
         """
-        deadline = asyncio.get_running_loop().time() + _APP_SERVER_READY_TIMEOUT_SECONDS
+        timeout = _codex_startup_timeout_seconds(
+            self.codex_invocation or CodexInvocation(self.codex_path),
+            _APP_SERVER_READY_TIMEOUT_SECONDS,
+        )
+        deadline = asyncio.get_running_loop().time() + timeout
         last_error: Exception | None = None
         while asyncio.get_running_loop().time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:
@@ -2286,7 +2517,7 @@ class CodexNativeAppServer:
         detail = " | ".join((self.recent_stderr or [])[-5:])
         target = self.listen_url or f"unix://{self.socket_path}"
         raise RuntimeError(
-            f"Timed out after {_APP_SERVER_READY_TIMEOUT_SECONDS:g}s waiting for the "
+            f"Timed out after {timeout:g}s waiting for the "
             f"Codex app-server at {target}: {last_error}; stderr={detail}"
         )
 
@@ -2905,7 +3136,11 @@ class _DatabricksLaunchMaterialization:
 
 
 def _databricks_launch_materialization(
-    *, model: str | None, profile: str, codex_path: str | None = None
+    *,
+    model: str | None,
+    profile: str,
+    codex_path: str | None = None,
+    codex_invocation: CodexInvocation | None = None,
 ) -> _DatabricksLaunchMaterialization:
     """
     Resolve the Databricks-profile routing pieces of a Codex launch.
@@ -2929,7 +3164,13 @@ def _databricks_launch_materialization(
             "with a host visible to the runner process."
         )
     host = host.rstrip("/")
-    resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
+    resolved_model = _resolve_databricks_codex_model(
+        host,
+        profile,
+        model,
+        codex_path=codex_path,
+        codex_invocation=codex_invocation,
+    )
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
             model=resolved_model,
@@ -2943,7 +3184,12 @@ def _databricks_launch_materialization(
 
 # DATABRICKS-PATCH(codex-live-model-discovery)
 def _resolve_databricks_codex_model(
-    host: str, profile: str, requested: str | None, *, codex_path: str | None = None
+    host: str,
+    profile: str,
+    requested: str | None,
+    *,
+    codex_path: str | None = None,
+    codex_invocation: CodexInvocation | None = None,
 ) -> str:
     """Resolve the codex launch model against what the workspace serves.
 
@@ -2980,7 +3226,9 @@ def _resolve_databricks_codex_model(
         profile_host = _read_databrickscfg_host(profile)
         if profile_host and profile_host.rstrip("/") == host.rstrip("/"):
             fingerprint = codex_catalog_fingerprint(
-                NativeCodexLaunch([], None, profile), codex_path=codex_path
+                NativeCodexLaunch([], None, profile),
+                codex_path=codex_path,
+                codex_invocation=codex_invocation,
             )
             rows = model_catalog_store.read_catalog("codex-native", fingerprint)
             if rows and not model_catalog_store.catalog_is_stale("codex-native", fingerprint):
@@ -3043,6 +3291,7 @@ def build_codex_native_server(
     ap_auth_headers: dict[str, str] | None = None,
     python_executable: str | None = None,
     codex_path: str | None = None,
+    codex_invocation: CodexInvocation | None = None,
     extra_config_overrides: list[str] | None = None,
     developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
@@ -3114,7 +3363,11 @@ def build_codex_native_server(
     :raises OSError: If Databricks routing was requested but no
         credentials can be resolved.
     """
-    resolved_codex = codex_path or _find_codex_cli()
+    codex_invocation = _resolve_native_codex_invocation(
+        codex_path=codex_path,
+        codex_invocation=codex_invocation,
+    )
+    resolved_codex = codex_invocation.executable
     if not resolved_codex:
         raise ImportError(
             "Native Codex requires the 'codex' CLI on PATH. If codex is "
@@ -3125,9 +3378,19 @@ def build_codex_native_server(
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
-        databricks = _databricks_launch_materialization(
-            model=model, profile=profile, codex_path=resolved_codex
-        )
+        if codex_invocation.argv_prefix:
+            databricks = _databricks_launch_materialization(
+                model=model,
+                profile=profile,
+                codex_path=resolved_codex,
+                codex_invocation=codex_invocation,
+            )
+        else:
+            databricks = _databricks_launch_materialization(
+                model=model,
+                profile=profile,
+                codex_path=resolved_codex,
+            )
         config_overrides.extend(databricks.config_overrides)
         env["DATABRICKS_HOST"] = databricks.host
         # A launch that names no model still routes through the profile's
@@ -3161,6 +3424,7 @@ def build_codex_native_server(
         config_overrides.append(f"model={json.dumps(pinned_model)}")
     return CodexNativeAppServer(
         codex_path=resolved_codex,
+        codex_invocation=codex_invocation,
         socket_path=socket_path,
         codex_home=codex_home,
         env=env,
@@ -3596,9 +3860,9 @@ def _resolve_subscription_launch(
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     # Pin codex's built-in ``openai`` provider: the bridged config.toml may
-    # set a custom default ``model_provider`` (e.g. isaac's Databricks AI
-    # Gateway), which would silently hijack a Subscription selection. A
-    # no-op when the user's config sets no custom default.
+    # set a custom default ``model_provider`` (e.g. an enterprise gateway),
+    # which would silently hijack a Subscription selection. A no-op when the
+    # user's config sets no custom default.
     subscription_overrides = ['model_provider="openai"']
     if _codex_login_usable():
         log_info_once(

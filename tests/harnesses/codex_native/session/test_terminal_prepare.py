@@ -527,6 +527,49 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
 
 
 @pytest.mark.asyncio
+async def test_ensure_codex_terminal_uses_configured_command_startup_timeout() -> None:
+    """The terminal ensure request allows the configured Codex wrapper budget."""
+    from omnigent.harnesses.codex_native.bridge import (
+        CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS,
+        CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
+    )
+
+    class _Client:
+        def __init__(self) -> None:
+            self.path: str | None = None
+            self.body: dict[str, object] | None = None
+            self.timeout: float | None = None
+
+        async def post(
+            self,
+            path: str,
+            *,
+            json: dict[str, object],
+            timeout: float,
+        ) -> httpx.Response:
+            self.path = path
+            self.body = json
+            self.timeout = timeout
+            return httpx.Response(200, json={})
+
+    client = _Client()
+    await codex_native._ensure_codex_terminal_on_runner(  # type: ignore[arg-type]
+        client, "conv_codex"
+    )
+
+    assert client.path == "/v1/sessions/conv_codex/resources/terminals"
+    assert client.body == {
+        "terminal": "codex",
+        "session_key": "main",
+        "ensure_native_terminal": True,
+    }
+    assert client.timeout == (
+        CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+        + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS
+    )
+
+
+@pytest.mark.asyncio
 async def test_prepare_codex_terminal_via_daemon_overlaps_create_and_host_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

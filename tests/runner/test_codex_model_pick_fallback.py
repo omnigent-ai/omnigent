@@ -19,6 +19,7 @@ import pytest
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native import app_server as codex_app
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native.invocation import CodexInvocation
 from omnigent.models import model_catalog_store
 from omnigent.runner.app import ResolvedSpec
 from omnigent.runner.native import orchestration as runner_native
@@ -32,6 +33,7 @@ _CODEX_PATH = "/missing-test-bin/codex"
 _SESSION_ID = "c91a9d508b344ad59c65628ed80b5230"
 _PROVIDER_DEFAULT = "gpt-5.6-terra"
 _RETIRED_PICK = "gpt-5.4-retired"
+_CODEX_INVOCATION = CodexInvocation(_CODEX_PATH)
 
 
 @dataclass
@@ -149,6 +151,7 @@ async def codex_launch_harness(
 
     app_server = SimpleNamespace(
         codex_path=_CODEX_PATH,
+        codex_invocation=_CODEX_INVOCATION,
         codex_cli_version=(0, 145, 0),
         codex_home=tmp_path / "unused-home",
         env={"OPENAI_API_KEY": "test-key"},
@@ -231,6 +234,7 @@ async def test_equivalent_gateway_pick_launches_without_reset(
 
     assert harness.builds[0]["model"] == pick
     assert harness.builds[0]["session_id"] == _SESSION_ID
+    assert harness.builds[0]["codex_invocation"] == _CODEX_INVOCATION
     assert harness.resets == []
     harness.probe.assert_not_awaited()
 
@@ -280,7 +284,11 @@ async def test_stale_miss_awaits_reprobe_before_deciding_fallback(
     release_probe = asyncio.Event()
 
     async def reprobe(**kwargs: Any) -> list[dict[str, Any]]:
-        assert kwargs == {"codex_path": _CODEX_PATH, "launch": harness.catalog_shape()}
+        assert kwargs == {
+            "codex_path": _CODEX_PATH,
+            "launch": harness.catalog_shape(),
+            "codex_invocation": _CODEX_INVOCATION,
+        }
         probe_started.set()
         await release_probe.wait()
         if refresh == "error":
@@ -343,7 +351,11 @@ async def test_no_catalog_keeps_explicit_pick(
 
     assert harness.builds[0]["model"] == harness.snapshot["model_override"]
     assert harness.resets == []
-    harness.probe.assert_awaited_once_with(codex_path=_CODEX_PATH, launch=harness.catalog_shape())
+    harness.probe.assert_awaited_once_with(
+        codex_path=_CODEX_PATH,
+        launch=harness.catalog_shape(),
+        codex_invocation=_CODEX_INVOCATION,
+    )
 
 
 @pytest.mark.asyncio
@@ -405,7 +417,9 @@ async def test_spec_catalog_is_not_replaced_by_ambient_provider_catalog(
         if task is not None:
             await task
         harness.probe.assert_awaited_once_with(
-            codex_path=_CODEX_PATH, launch=harness.catalog_shape()
+            codex_path=_CODEX_PATH,
+            launch=harness.catalog_shape(),
+            codex_invocation=_CODEX_INVOCATION,
         )
     else:
         harness.probe.assert_not_awaited()

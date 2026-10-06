@@ -333,6 +333,7 @@ class _FakeRunnerClient:
         self._text_responses = text_responses or {}
         self.calls: list[tuple[str, str]] = []
         self.post_json_calls: list[tuple[str, Any]] = []
+        self.post_timeouts: list[float | None] = []
         # Query params passed to each GET, in call order. ``None`` when
         # the caller sent no params — lets tests assert that a proxy
         # forwarded (or deliberately dropped) the incoming query string.
@@ -409,10 +410,10 @@ class _FakeRunnerClient:
 
         :param url: Request URL path.
         :param json: JSON body passed to the fake client.
-        :param timeout: Request timeout (ignored).
+        :param timeout: Request timeout recorded with the forwarded POST.
         :returns: The canned response.
         """
-        del timeout
+        self.post_timeouts.append(timeout)
         self.post_json_calls.append((url, json))
         return self._make_response("POST", url)
 
@@ -1462,6 +1463,7 @@ async def test_create_terminal_proxies_to_runner(
     assert fake_runner.calls == [
         ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
+    assert fake_runner.post_timeouts == [10.0]
 
 
 @pytest.mark.asyncio
@@ -1603,6 +1605,36 @@ async def test_create_terminal_native_bootstrap_exempt_from_gate(
     assert fake_runner.calls == [
         ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
+    assert fake_runner.post_timeouts == [10.0]
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_codex_native_bootstrap_uses_wrapper_startup_timeout(
+    client: httpx.AsyncClient,
+) -> None:
+    """A valid Codex bootstrap proxy gets the configured wrapper budget."""
+    from omnigent.server.routes._sessions.common import runner_session_init_timeout
+
+    terminal_resource = {
+        "id": "terminal_codex_main",
+        "object": "session.resource",
+        "type": "terminal",
+        "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+        "name": "codex:main",
+        "environment": DEFAULT_ENVIRONMENT_ID,
+        "metadata": {"terminal_name": "codex", "session_key": "main", "running": True},
+    }
+    fake_runner = _FakeRunnerClient(payload=terminal_resource)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+        json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == "terminal_codex_main"
+    assert fake_runner.post_timeouts == [runner_session_init_timeout("codex-native")]
 
 
 @pytest.mark.asyncio
@@ -6455,6 +6487,29 @@ async def test_ensure_native_terminal_ready_retries_over_the_runners_new_tunnel(
     finally:
         await client.aclose()
         await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_codex_message_terminal_ensure_uses_wrapper_startup_timeout() -> None:
+    """Message-driven Codex recovery allows the configured wrapper budget."""
+    import dataclasses
+
+    from omnigent.server.routes._sessions.common import runner_session_init_timeout
+    from omnigent.server.routes.sessions import _ensure_native_terminal_ready
+
+    store = _ConversationStore()
+    source = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert source is not None
+    conv = dataclasses.replace(
+        source,
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+    )
+    client = _FakeRunnerClient(payload={})
+
+    outcome = await _ensure_native_terminal_ready(client, conv.id, conv)  # type: ignore[arg-type]
+
+    assert outcome.error is None
+    assert client.post_timeouts == [runner_session_init_timeout("codex-native")]
 
 
 @pytest.mark.asyncio
