@@ -361,9 +361,7 @@ def test_databricks_rate_limit_is_retryable_live_and_after_reload(
                 "content": [
                     {
                         "type": "input_text",
-                        "text": (
-                            "Please continue from where you left off before the rate limit error."
-                        ),
+                        "text": "Please continue from where you left off.",
                     }
                 ],
             },

@@ -42,8 +42,8 @@ the message. Same discipline as repro-agent:
     {"symptom": "catalog default", "outcome": "nothing_to_fix", "test_transition": "already_fixed in #3448; skipped"}
   ],
   "tests": {
-    "e2e": "tests/e2e_ui/model_catalog/test_1234.py",
-    "added": ["tests/web/model/test_picker_label.py"]
+    "e2e": "",
+    "added": ["tests/web/model/test_picker_label.py::test_display_label"]
   },
   "recordings": [
     {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
@@ -54,7 +54,7 @@ the message. Same discipline as repro-agent:
      "caption": "open the model picker → select the catalog → picker now shows friendly names"}
   ],
   "recording_unavailable_reason": "",
-  "test_audit": "repro e2e was behavioral (failed on raw IDs); no rewrite needed",
+  "test_audit": "Reused the display-label regression; the same assertions fail on base and pass on head. Browser reproduction evidence is staged in .omnigent/repro-evidence/; workflow upload is pending at <workflow run URL>, artifact resolve-bundle-<run-id>, path repro-evidence/. No additional browser boundary was found.",
   "impact_assessment": {
     "base_sha": "<full target-branch tip SHA>",
     "head_sha": "<full candidate HEAD SHA>",
@@ -79,7 +79,15 @@ the message. Same discipline as repro-agent:
   "reviewed_pr_url": "",
   "pushed_branch": "",
   "ci_status": "green (all required checks pass)",
-  "polly_review": "clean: no blocking/security findings after 1 round (fixed a null-deref Polly flagged, re-triggered via workflow_dispatch)",
+  "polly_review": "clean on <full candidate HEAD SHA>: fixed null-deref; fresh review has no findings",
+  "ocr_review": "clean on <full candidate HEAD SHA>: no findings",
+  "review_cycle": {
+    "head_sha": "<full candidate HEAD SHA>",
+    "fingerprint": "<fingerprint from the final review snapshot>",
+    "dispositions": [
+      {"key": "comment:<id>", "status": "addressed", "reason": "Finding 1: null-deref fixed in <commit>; <test> passes. Finding 2: suggested fallback already exists at <path:line> and is covered by <test>, so not needed."}
+    ]
+  },
   "ui_preview": "labeled ui-preview on every PR; preview at https://…; posted connect instructions",
   "validation_surface": "server",
   "validation_prompt": "Reproduce and validate a bug fix. Steps: open the model picker in the catalog view… Before this fix, raw catalog IDs were shown. Confirm the fix by checking that friendly labels appear. Report whether each step now behaves correctly.",
@@ -92,6 +100,10 @@ the message. Same discipline as repro-agent:
 ```
 
 Field meanings:
+
+For modes that drive an open PR, `fixed` also requires the Step 4.3 live gate
+to pass. Interim and workflow-owned implementation handoffs do not certify PR
+readiness; name pending publication/review steps in `remaining_work`.
 
 - `bug_url` — the bug link, carried through from the recovered handoff.
 - `mode` — `reviewed_existing_pr` (Step 2A: a candidate PR existed, you reviewed
@@ -113,7 +125,10 @@ Field meanings:
   `already_fixed`/`not_reproduced`, or the 2B.1 audit showed `main` has since
   fixed it — name the fixing commit and recommend closing the ticket), or
   `needs_more_info` (couldn't recover a reliable reproduction, evidence is unsafe,
-  intended behavior is ambiguous, or setup/environment blocks verification).
+  required inputs/authorization are missing, or setup/environment blocks verification).
+  When intended behavior is ambiguous, follow `resolve-investigate`: a supported
+  proposal with an unresolved design choice is `partially_fixed`, with the choice
+  in `remaining_work`. Do not describe it as a proven fix.
 - `problem_summary` / `solution_summary` — the two user-facing paragraphs shown
   prominently in the Linear update under **What's the problem?** and **How is it
   fixed?** Write plain, natural English for someone who uses the product but has
@@ -127,6 +142,12 @@ Field meanings:
   publication/review fallbacks, so concrete symbols and filenames are welcome.
   In review mode, describe the reviewed PR's approach and leave `files_changed`
   empty (you changed nothing).
+  Distinguish the observed symptom from the supported cause; include sources for
+  historical intent, competing explanations checked, and any proposed policy
+  change. Identify the real configuration path exercised and any substituted
+  components. If the test assumes the suspected cause, retain it as a hypothesis
+  and carry the missing proof into the outcome and `remaining_work`, following
+  `resolve-investigate`. State missing evidence plainly; never include credentials.
 - `review_body` — the PR-facing review text from Step 2A. Fill it in for
   `reviewed_existing_pr`, including workflow-owned publication; use `""` in
   other modes. State the verdict and reason first, then separate the proof and
@@ -137,8 +158,20 @@ Field meanings:
   `\n` within the JSON string.
 - `facets` — per-facet, mirroring the recovered breakdown: each with its own
   `outcome` and a `test_transition` (the fail→pass proof, or why it was skipped).
-- `tests` — `e2e` is the (possibly rewritten) repro test path; `added` is the list
-  of targeted tests you wrote (empty in review mode).
+- `tests` — selected permanent regression coverage. `e2e` is the retained e2e
+  path, or `""` when none is needed. `added` keeps its legacy name but lists the
+  other selected checks, including reused unchanged tests or extensions to an
+  existing module. Each entry must be a bare repository-relative path or test
+  node ID that resolves on the committed candidate. Do not append labels such
+  as `(reused unchanged)`, shell commands, or result summaries; put those in
+  `test_audit`. Before handing off, check the file portion of every reference
+  against the committed tree and use the same node IDs as the executed checks.
+  Do not list artifact-only reproduction paths here. In comment-only review,
+  keep the existing review procedure and do not commit temporary test source.
+  Use `test_audit` for brief selection reasoning: reused/retained tests, why any
+  new permanent e2e is necessary, and gaps. For reproduction-only evidence, give
+  the run URL/artifact/path or verified persistent local path from 2B.4, plus
+  its retention status; identify pending uploads and unresolved retention.
 - `recordings` — your after-fix clips (`kind: "after"`) and any recovered
   before-clips, using `{surface, kind, path, format, capture_mode, caption}`.
   Follow the recording rules in Step 2B.5 on both author and review runs; in
@@ -179,7 +212,8 @@ Field meanings:
   touched env-derived defaults: which added/edited tests you re-ran with ambient
   vars set and that they still passed. Empty string when not applicable (no such
   test in the diff).
-- `pr_url` — the ready-for-review PR you **opened** (author mode). Empty in review
+- `pr_url` — the PR you **opened** (author mode), including a draft proposal
+  identified as such in `fix_summary`. Empty in review
   mode, when `skip_push` was set, or if you stopped before opening one.
 - `reviewed_pr_url` — the existing PR you **reviewed** (review mode), or the fork
   PR you **took over** into your own (fork takeover — `pr_url` is then yours).
@@ -192,14 +226,21 @@ Field meanings:
   and whether each was diff-caused vs pre-existing/flaky/infra. If a fork PR needed
   a fix and you took over into your own PR, this reflects **your** PR's checks.
   Empty when `skip_push` was set or you stopped before there was a PR to land.
-- `polly_review` — the result of the Step 4.3 automated-review loop: `clean` (every
-  finding on the newest **real review comment** addressed — blocking, security, **and**
-  non-blocking) with how many review rounds it took, what you fixed, and which
-  non-blocking notes you fixed vs. justified skipping; or the unresolved findings if
-  you hit the round cap. If a real review never ran — the dispatch failed or no
-  `<!-- polly-review-bot -->` comment ever landed (a phantom green check does not
-  count) — say so here explicitly; that state also blocks an approving review (see
-  the review-verdict step). Empty when no PR was opened.
+- `polly_review` / `ocr_review` — each reviewer's current-head result, rounds,
+  run/comment links, fixes, and individually justified invalid/not-needed findings
+  (including non-blocking notes). Missing, stale, skipped, failed, or undispatched
+  reviews are explicitly incomplete and block readiness/approval. Empty when the
+  publication mode skips Step 4; that does not mean the PR is ready to merge.
+- `review_cycle` — the Step 4.3 snapshot receipt: `head_sha`, `fingerprint`, and
+  `dispositions`. Include one record per feedback `key` from the snapshot, with
+  `status` (`addressed`, `invalid`, or `not_needed`) and a nonempty `reason`
+  explaining every finding in that document with commit/test/code evidence.
+  Mixed dispositions in one summary belong individually in its `reason`; use
+  `addressed` for the document when all its findings are settled. Revalidate
+  after new feedback or a push. The live checker verifies coverage and freshness,
+  not whether the reasoning is correct. Use `{}` when Step 4 has not run (interim,
+  local-only, or workflow-owned author publication); preserve partial receipts
+  and name missing reviews/findings in `remaining_work` if the loop is blocked.
 - `ui_preview` — the result of Step 4.1 (run on every PR, not just frontend fixes):
   the **preview URL** (verbatim, so the ticket write-back can surface it and a
   reviewer can `omnigent claude -p '<prompt>' --server <url>`), or why it failed to
@@ -224,12 +265,14 @@ Field meanings:
 
 Directly published author runs and review runs end the same way: the PR you're
 landing (one you opened, or an existing in-repo PR you reviewed and kept) has a
-preview, green CI, a clean automated review, a live-validation command, and the
-maintainer tagged (Step 4) — or you've hit the round cap and left an honest
-summary. The difference is only how a fix lands (push directly, or — for an
-unpushable fork PR that needs changes — take over into your own PR carrying the
-contributor's commits), and that the direct author path opens a PR while the
+preview, green CI, settled current-head Polly and OCR reviews, a live-validation
+command, and the maintainer tagged (Step 4) — or a concrete blocker or actual
+execution deadline has left an explicitly incomplete, resumable handoff. The difference is only how
+a fix lands (push directly, or — for an unpushable fork PR that needs changes —
+take over into your own PR carrying the contributor's commits), and that the direct author path opens a PR while the
 review path adopts an existing one. Workflow-owned author publication ends after
 the validated body, deferred validation prompt, and final handoff are prepared;
-the publisher owns the post-publication loop. `skip_push` and `needs_more_info`
+the publisher owns the post-publication loop. A direct draft proposal instead
+ends with the incomplete handoff in `resolve-publish`; it makes no readiness or
+independent-review claim. `skip_push` and `needs_more_info`
 runs end earlier, with no PR to land. In every mode, **you do not merge.**

@@ -511,7 +511,7 @@ def test_agent_parser_rejects_unshared_harness(tmp_path, harness, legacy):
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(config))
 
     def load():
-        return _parse_agent_def(config) if legacy else parse(tmp_path)
+        return _parse_agent_def(config, allow_dynamic_tools=True) if legacy else parse(tmp_path)
 
     if harness == "openai-agents":
         assert load().os_env is not None

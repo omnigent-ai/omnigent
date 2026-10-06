@@ -1,3 +1,4 @@
+import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
@@ -100,38 +101,16 @@ function setHosts(hosts: Host[]): void {
 // SDK targets plus same-family native (claude-native) and hide the
 // cross-family native target (codex-native).
 const AVAILABLE_AGENTS: AvailableAgent[] = [
-  {
-    id: "ag_claude_sdk",
-    name: "claude",
-    display_name: "Claude",
-    description: null,
-    harness: "claude-sdk",
-    skills: [],
-  },
-  {
-    id: "ag_claude_native",
-    name: "claude-native-ui",
+  testAgent("ag_claude_sdk", "claude", { display_name: "Claude", harness: "claude-sdk" }),
+  testAgent("ag_claude_native", "claude-native-ui", {
     display_name: "Claude Code",
-    description: null,
     harness: "claude-native",
-    skills: [],
-  },
-  {
-    id: "ag_codex_native",
-    name: "codex-native-ui",
+  }),
+  testAgent("ag_codex_native", "codex-native-ui", {
     display_name: "Codex",
-    description: null,
     harness: "codex-native",
-    skills: [],
-  },
-  {
-    id: "ag_openai",
-    name: "gpt",
-    display_name: "GPT",
-    description: null,
-    harness: "openai-agents",
-    skills: [],
-  },
+  }),
+  testAgent("ag_openai", "gpt", { display_name: "GPT", harness: "openai-agents" }),
 ];
 
 function setAgents(available: AvailableAgent[], sourceHarness: string | null): void {
@@ -447,14 +426,10 @@ describe("ForkSessionDialog", () => {
     // source"). Source here is databricks_coding_agent (openai-agents).
     const agents = [
       ...AVAILABLE_AGENTS,
-      {
-        id: "ag_dbx",
-        name: "databricks_coding_agent",
+      testAgent("ag_dbx", "databricks_coding_agent", {
         display_name: "databricks_coding_agent",
-        description: null,
         harness: "openai-agents",
-        skills: [],
-      },
+      }),
     ];
     setAgents(agents, "openai-agents");
     useSessionAgentMock.mockReturnValue({
@@ -531,22 +506,14 @@ describe("ForkSessionDialog", () => {
     // where the fork-only preamble target (opencode) is hidden.
     setAgents(
       [
-        {
-          id: "ag_opencode",
-          name: "opencode-native-ui",
+        testAgent("ag_opencode", "opencode-native-ui", {
           display_name: "OpenCode",
-          description: null,
           harness: "opencode-native",
-          skills: [],
-        },
-        {
-          id: "ag_hermes",
-          name: "hermes-native-ui",
+        }),
+        testAgent("ag_hermes", "hermes-native-ui", {
           display_name: "Hermes",
-          description: null,
           harness: "hermes-native",
-          skills: [],
-        },
+        }),
       ],
       "claude-sdk",
     );
@@ -561,15 +528,11 @@ describe("ForkSessionDialog", () => {
     // Custom agents discovered from session scans start with harness=null and
     // a sessionId. Without eager prefetch, forkTargetCarriesHistory(null)
     // returns false and they never appear in the fork picker.
-    const customAgent: AvailableAgent = {
-      id: "ag_custom",
-      name: "my-agent",
+    const customAgent: AvailableAgent = testAgent("ag_custom", "my-agent", {
       display_name: "My Agent",
-      description: null,
       harness: null,
-      skills: [],
       sessionId: "conv_custom",
-    };
+    });
     setAgents([...AVAILABLE_AGENTS, customAgent], "claude-sdk");
 
     renderDialog();

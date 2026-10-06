@@ -524,7 +524,7 @@ def test_claude_command_resume_binds_session_and_passes_unknown_args(
 
     The wrapper's defensive strip (``_strip_resume_from_claude_args``)
     runs INSIDE ``run_claude_native`` and is tested separately at
-    ``tests/test_claude_native.py::test_strip_resume_from_claude_args_*``.
+    ``tests/harnesses/claude_native/test_claude_native.py::test_strip_resume_from_claude_args_*``.
     This test mocks ``run_claude_native`` so it covers the Click
     parsing seam: ``--resume`` is consumed by Click, the post-``--``
     tokens land in ``claude_args`` raw, and the wrapper takes it from
@@ -3221,6 +3221,234 @@ def test_bundle_no_env_vars_preserves_files(
     # Config content should be preserved exactly.
     assert parsed["name"] == "plain-agent"
     assert parsed["llm"]["model"] == "openai/gpt-4o"
+
+
+# ── MCP url/headers/env through the upload path ────────────
+
+
+def _write_upload_agent(
+    agent_dir: Path,
+    tools: dict[str, Any] | None = None,
+) -> None:
+    """
+    Write a minimal agent ``config.yaml`` the server accepts on upload.
+
+    :param agent_dir: The agent image directory.
+    :param tools: Optional ``tools:`` block, e.g. inline MCP servers
+        ``{"search": {"type": "mcp", "url": "${SEARCH_URL}"}}``.
+    """
+    config: dict[str, Any] = {
+        "spec_version": 1,
+        "name": "mcp-upload-agent",
+        "prompt": "hi",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    }
+    if tools is not None:
+        config["tools"] = tools
+    _write_config(agent_dir, config)
+
+
+def _upload_and_parse(agent_dir: Path) -> dict[str, Any]:
+    """
+    Bundle *agent_dir* as ``omnigent run`` does, then parse it the way
+    the server parses an uploaded session bundle.
+
+    :param agent_dir: The agent image directory.
+    :returns: ``{server_name: MCPServerConfig}`` from the server-side spec.
+    """
+    from omnigent.server.bundles import validate_agent_bundle
+
+    spec = validate_agent_bundle(_bundle(agent_dir), enforce_handler_allowlist=False)
+    return {server.name: server for server in spec.mcp_servers}
+
+
+def test_bundle_upload_resolves_directory_mcp_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``tools/mcp/*.yaml`` server's ``url: ${VAR}`` reaches the server
+    resolved, since the server re-parses uploads without expansion.
+    """
+    monkeypatch.setenv("UPLOAD_MCP_URL", "https://mcp.example.invalid")
+    monkeypatch.setenv("UPLOAD_MCP_TOKEN", "tok-dir")
+    _write_upload_agent(tmp_path)
+    _write_mcp_config(
+        tmp_path,
+        "pipeshub",
+        {
+            "name": "pipeshub",
+            "transport": "http",
+            "url": "${UPLOAD_MCP_URL}/mcp",
+            "headers": {"Authorization": "Bearer ${UPLOAD_MCP_TOKEN}"},
+        },
+    )
+
+    servers = _upload_and_parse(tmp_path)
+
+    assert servers["pipeshub"].url == "https://mcp.example.invalid/mcp"
+    assert servers["pipeshub"].headers == {"Authorization": "Bearer tok-dir"}
+
+
+def test_bundle_upload_resolves_inline_mcp_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Inline ``tools:`` MCP servers in config.yaml have ``url``,
+    ``headers`` and ``env`` resolved before upload.
+    """
+    monkeypatch.setenv("INLINE_MCP_URL", "https://inline.example.invalid/mcp")
+    monkeypatch.setenv("INLINE_MCP_TOKEN", "tok-inline")
+    monkeypatch.setenv("INLINE_STDIO_SECRET", "stdio-inline")
+    _write_upload_agent(
+        tmp_path,
+        tools={
+            "search": {
+                "type": "mcp",
+                "url": "${INLINE_MCP_URL}",
+                "headers": {"Authorization": "Bearer ${INLINE_MCP_TOKEN}"},
+            },
+            "local": {
+                "type": "mcp",
+                "command": "my-mcp-server",
+                "env": {"API_TOKEN": "${INLINE_STDIO_SECRET}"},
+            },
+        },
+    )
+
+    servers = _upload_and_parse(tmp_path)
+
+    assert servers["search"].url == "https://inline.example.invalid/mcp"
+    assert servers["search"].headers == {"Authorization": "Bearer tok-inline"}
+    assert servers["local"].env == {"API_TOKEN": "stdio-inline"}
+    # The shipped config.yaml itself carries the resolved values, since the
+    # runtime tool loader reads them from the raw YAML.
+    shipped = _extract_yaml_from_bundle(_bundle(tmp_path), "config.yaml")
+    assert shipped["tools"]["search"]["url"] == "https://inline.example.invalid/mcp"
+    assert shipped["tools"]["local"]["env"] == {"API_TOKEN": "stdio-inline"}
+
+
+@pytest.mark.parametrize("layout", ["directory", "inline"])
+def test_bundle_upload_missing_mcp_url_var_fails_like_parser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    """
+    A missing variable in an MCP ``url`` fails the upload with the same
+    error the parser raises, instead of shipping a literal ``${VAR}``.
+    """
+    from omnigent.spec.parser import parse
+
+    monkeypatch.delenv("MISSING_UPLOAD_MCP_URL", raising=False)
+    server = {"type": "mcp", "url": "${MISSING_UPLOAD_MCP_URL}/mcp"}
+    if layout == "inline":
+        _write_upload_agent(tmp_path, tools={"search": server})
+    else:
+        _write_upload_agent(tmp_path)
+        _write_mcp_config(
+            tmp_path,
+            "search",
+            {"name": "search", "transport": "http", "url": server["url"]},
+        )
+
+    with pytest.raises(OmnigentError) as parser_error:
+        parse(tmp_path, expand_env=True)
+    with pytest.raises(OmnigentError) as upload_error:
+        _bundle(tmp_path)
+
+    assert "Unresolved environment variable '${MISSING_UPLOAD_MCP_URL}'" in str(upload_error.value)
+    assert str(upload_error.value) == str(parser_error.value)
+
+
+def test_bundle_upload_keeps_literal_mcp_url(tmp_path: Path) -> None:
+    """
+    An MCP ``url`` without ``${}`` passes through unchanged, and a
+    directory MCP file with nothing to expand ships byte-for-byte.
+    """
+    _write_upload_agent(
+        tmp_path,
+        tools={"search": {"type": "mcp", "url": "https://inline.example.invalid/mcp"}},
+    )
+    _write_mcp_config(
+        tmp_path,
+        "plain",
+        {"name": "plain", "transport": "http", "url": "http://localhost:9000/mcp"},
+    )
+
+    servers = _upload_and_parse(tmp_path)
+
+    assert servers["search"].url == "https://inline.example.invalid/mcp"
+    assert servers["plain"].url == "http://localhost:9000/mcp"
+    assert "tools/mcp/plain.yaml" not in _resolve_bundle_env_vars(tmp_path)
+
+
+def _bundle_member_text(bundle_bytes: bytes, arcname: str) -> str:
+    """
+    Return one bundle member's raw text, without parsing it.
+
+    :param bundle_bytes: The gzipped tarball bytes.
+    :param arcname: The archive member name, e.g. ``"tools/mcp/github.yaml"``.
+    :returns: The member's contents decoded as UTF-8.
+    """
+    with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:gz") as tf:
+        extracted = tf.extractfile(tf.getmember(arcname))
+        assert extracted is not None, f"Expected {arcname!r} to be a regular file in the bundle"
+        return extracted.read().decode("utf-8")
+
+
+def test_bundle_upload_rewrites_mcp_file_only_when_a_value_expands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    MCP files whose headers and env are all literal ship byte-for-byte
+    (comments and formatting kept); a ``${VAR}`` header is resolved.
+    """
+    monkeypatch.setenv("SIDECAR_MCP_TOKEN", "tok-sidecar")
+    _write_upload_agent(
+        tmp_path,
+        tools={
+            "inline": {
+                "type": "mcp",
+                "url": "https://inline.example.invalid/mcp",
+                "headers": {"Authorization": "Bearer literal-inline"},
+            },
+        },
+    )
+    mcp_dir = tmp_path / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True, exist_ok=True)
+    literal_text = (
+        "# Hand-written sidecar; keep this comment.\n"
+        "name: literal\n"
+        "transport: http\n"
+        "url: http://localhost:9000/mcp\n"
+        "headers:\n"
+        "  Authorization: Bearer literal-token  # not a secret\n"
+        "env:\n"
+        "  LOG_LEVEL: debug\n"
+    )
+    (mcp_dir / "literal.yaml").write_text(literal_text, encoding="utf-8")
+    (mcp_dir / "templated.yaml").write_text(
+        "# Token comes from the uploader's environment.\n"
+        "name: templated\n"
+        "transport: http\n"
+        "url: http://localhost:9001/mcp\n"
+        "headers:\n"
+        "  Authorization: Bearer ${SIDECAR_MCP_TOKEN}\n",
+        encoding="utf-8",
+    )
+
+    resolved = _resolve_bundle_env_vars(tmp_path)
+    bundle_bytes = _bundle(tmp_path)
+
+    assert "config.yaml" not in resolved
+    assert "tools/mcp/literal.yaml" not in resolved
+    assert _bundle_member_text(bundle_bytes, "tools/mcp/literal.yaml") == literal_text
+    assert "tools/mcp/templated.yaml" in resolved
+    templated = _extract_yaml_from_bundle(bundle_bytes, "tools/mcp/templated.yaml")
+    assert templated["headers"] == {"Authorization": "Bearer tok-sidecar"}
 
 
 def test_bundle_materializes_standalone_omnigent_yaml(tmp_path: Path) -> None:

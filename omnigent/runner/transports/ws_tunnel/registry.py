@@ -38,6 +38,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
+from itertools import count
 from typing import Protocol
 
 import httpx
@@ -54,6 +55,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 
 _logger = logging.getLogger(__name__)
+_connection_generations = count(1)
 
 
 class WebSocketLike(Protocol):
@@ -94,9 +96,13 @@ class RunnerSession:
         disabled (single-user mode). Used to enforce runner
         ownership: only the owner (or an admin) may bind sessions
         to this runner.
+    :param generation: Process-unique connection generation for initialization readiness.
     :param in_flight: Per-req_id reassembly state. Each entry holds
         a head Future + body queue + end Event so the transport can
         await heads, iterate body chunks, and detect end.
+    :param close_code: First server-requested close code, recorded under
+        the registry lock before helpers can observe retirement.
+    :param close_reason: Reason accompanying ``close_code``.
     """
 
     runner_id: str
@@ -107,11 +113,14 @@ class RunnerSession:
     connected_at: float
     last_frame_at: float
     owner: str | None
+    generation: int = field(default_factory=lambda: next(_connection_generations))
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
     # by whichever side terminated the attach.
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
+    close_code: int | None = None
+    close_reason: str | None = None
 
 
 @dataclass
@@ -283,6 +292,7 @@ class TunnelRegistry:
         with self._lock:
             old = self._sessions.pop(runner_id, None)
             if old is not None:
+                self.record_close(old, code=4000, reason="tunnel replaced")
                 self._abort_session_inflight(
                     old,
                     ConnectionError(
@@ -326,6 +336,7 @@ class TunnelRegistry:
             if current is None or (session is not None and current is not session):
                 return None
             removed = self._sessions.pop(runner_id)
+            self.record_close(removed, code=1001, reason="tunnel retired by server; reconnect")
             in_flight_count = len(removed.in_flight)
             if in_flight_count:
                 _logger.warning(
@@ -344,8 +355,29 @@ class TunnelRegistry:
                 removed,
                 ConnectionError("tunnel closed before request completed"),
             )
-        _retire_session_writer(removed, code=4003, reason="tunnel closed")
+        # 1001 ("going away"), not 4003: it lands in the runner's existing
+        # tunnel-recycle path (serve.py's ``_TUNNEL_RECYCLE_CLOSE_CODES``) for a
+        # prompt, spread reconnect instead of an escalating backoff. Avoid 1012
+        # too — the server's own shutdown_state treats an observed 1012 as
+        # "this server is shutting down".
+        _retire_session_writer(removed, code=1001, reason="tunnel retired by server; reconnect")
         return removed
+
+    def record_close(self, session: RunnerSession, *, code: int, reason: str) -> None:
+        """Retain the first server-requested close for one connection.
+
+        Retirement callers hold the registry lock across removal and this
+        update so stale-session helpers cannot finish before it is visible.
+
+        :param session: Connection being closed, including a retired generation.
+        :param code: Requested WebSocket close code.
+        :param reason: Requested WebSocket close reason.
+        :returns: None.
+        """
+        with self._lock:
+            if session.close_code is None:
+                session.close_code = code
+                session.close_reason = reason
 
     @staticmethod
     def _abort_session_inflight(session: RunnerSession, error: BaseException) -> None:
@@ -525,10 +557,13 @@ class TunnelRegistry:
 
     # ── Per-request lifecycle ────────────────────────────
 
-    def open_request(self, runner_id: str, req_id: str) -> RequestState:
+    def open_request(
+        self, runner_id: str, req_id: str, *, generation: int | None = None
+    ) -> RequestState:
         """Allocate reassembly state for a new outgoing request.
 
         :raises KeyError: If the runner isn't online.
+        :raises ConnectionError: If the requested connection has been replaced.
         :raises ValueError: If a request with this ``req_id`` is
             already in flight on this runner. req_ids must be unique
             per session.
@@ -538,6 +573,8 @@ class TunnelRegistry:
             session = self._sessions.get(runner_id)
             if session is None:
                 raise KeyError(runner_id)
+            if generation is not None and session.generation != generation:
+                raise ConnectionError("runner tunnel changed before request was sent")
             if req_id in session.in_flight:
                 raise ValueError(f"req_id {req_id!r} already in flight on runner {runner_id!r}")
             state = RequestState(
@@ -894,6 +931,17 @@ def _end_response_body(state: RequestState) -> None:
     :param state: Request state whose body iterator should stop.
     :returns: None.
     """
+    if not state.head_future.done():
+        # A response cannot complete before its head. Wake the head waiter so
+        # a malformed or truncated runner response cannot hold the request.
+        _abort_request_state(
+            state,
+            httpx.RemoteProtocolError(
+                "runner sent response.end before response.head",
+                request=None,  # type: ignore[arg-type]
+            ),
+        )
+        return
     state.end_event.set()
     # Push a sentinel so any pending body_queue.get() unblocks.
     state.body_queue.put_nowait(None)

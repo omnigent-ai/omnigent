@@ -14,6 +14,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import {
@@ -83,86 +84,62 @@ vi.mock("@/hooks/useHosts", () => ({
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
 // is the data source under test, so it's a controllable mock.
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  // Pins are server-authoritative now. Derive the pinned set from the seeded
-  // ref intersected with the loaded conversations, so tests that seed via
-  // `seedPins` exercise the Pinned section without a separate fixture.
-  usePinnedConversations: () => {
-    const idSet = new Set(pinnedIdsRef.current);
-    return {
-      data: {
-        conversations: conversationsRef.current.filter((c) => idSet.has(c.id)),
-        filterHonored: true,
-      },
-      isSuccess: true,
-    };
-  },
-  // Reflect the toggle into the seeded ref so a test that clicks quick-pin then
-  // re-renders sees the updated Pinned set.
-  useTogglePinnedConversation: () => ({
-    mutate: ({ id, pinned }: { id: string; pinned: boolean }) => {
-      const ids = pinnedIdsRef.current;
-      pinnedIdsRef.current = pinned
-        ? [id, ...ids.filter((x) => x !== id)]
-        : ids.filter((x) => x !== id);
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    usePinnedConversations: () => {
+      const idSet = new Set(pinnedIdsRef.current);
+      return {
+        data: {
+          conversations: conversationsRef.current.filter((c) => idSet.has(c.id)),
+          filterHonored: true,
+        },
+        isSuccess: true,
+      };
     },
-  }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  // Project feature: the sidebar reads the project list to build project
-  // sections, and rows fire useMoveToProject from the kebab menu. Both must
-  // be stubbed or the Sidebar throws on render.
-  // Tests push project NAMES into projectsMock; expose them as first-class
-  // {id, name} folders (synthetic id per name) to match useProjects' shape.
-  useProjects: () => ({
-    data: projectRowsRef.current ?? projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
-  }),
-  // Each project folder fetches its own sessions (server-side ?project=). Derive
-  // them from the global-list fixture by label so existing tests keep seeding
-  // project sessions there. Single page, no pagination, in this mock.
-  useProjectSessions: (project: string, enabled: boolean) => {
-    const override = projectSessionsMock.current[project];
-    const rows = !enabled
-      ? []
-      : (override ??
-        conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
-        ));
-    return {
-      data: enabled
-        ? {
-            pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
-            pageParams: [undefined],
-          }
-        : undefined,
-      isLoading: false,
-      isError: false,
-      error: null,
-      fetchNextPage: vi.fn(),
-      hasNextPage: false,
-      isFetchingNextPage: false,
-    };
-  },
-  useMoveToProject: () => ({ mutate: moveToProjectSpy }),
-  useDeleteProject: () => ({ mutate: deleteProjectSpy, isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: renameProjectSpy, isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: createProjectSpy, isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: fetchProjectSessionIdsMock,
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+    useTogglePinnedConversation: () => ({
+      mutate: ({ id, pinned }: { id: string; pinned: boolean }) => {
+        const ids = pinnedIdsRef.current;
+        pinnedIdsRef.current = pinned
+          ? [id, ...ids.filter((x) => x !== id)]
+          : ids.filter((x) => x !== id);
+      },
+    }),
+    useProjects: () => ({
+      data:
+        projectRowsRef.current ?? projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
+    }),
+    useProjectSessions: (project: string, enabled: boolean) => {
+      const override = projectSessionsMock.current[project];
+      const rows = !enabled
+        ? []
+        : (override ??
+          conversationsRef.current.filter(
+            (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
+          ));
+      return {
+        data: enabled
+          ? {
+              pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
+              pageParams: [undefined],
+            }
+          : undefined,
+        isLoading: false,
+        isError: false,
+        error: null,
+        fetchNextPage: vi.fn(),
+        hasNextPage: false,
+        isFetchingNextPage: false,
+      };
+    },
+    useMoveToProject: () => ({ mutate: moveToProjectSpy }),
+    useDeleteProject: () => ({ mutate: deleteProjectSpy, isPending: false, isError: false }),
+    useRenameProject: () => ({ mutate: renameProjectSpy, isPending: false, isError: false }),
+    useCreateProject: () => ({ mutate: createProjectSpy, isPending: false, isError: false }),
+    fetchProjectSessionIds: fetchProjectSessionIdsMock,
+  };
+});
 // Header / dialog children that pull their own context — stub to keep the
 // test scoped to the conversation list + funnel.
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
@@ -1093,6 +1070,15 @@ describe("Sidebar session list", () => {
     const sessionsSection = screen.getByText("Sessions").closest("section");
     expect(sessionsSection).not.toBeNull();
 
+    const newSession = within(sessionsSection!).getByRole("link", {
+      name: "New session",
+    });
+    expect(newSession).toHaveAttribute("data-testid", "sessions-new-session");
+    expect(newSession).toHaveAttribute("href", "/");
+    expect(newSession).toHaveAttribute("data-size", "icon-xs");
+    expect(newSession).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    expect(newSession).not.toHaveTextContent("New session");
+
     const selectSessions = within(sessionsSection!).getByRole("button", {
       name: "Select sessions",
     });
@@ -1100,7 +1086,11 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
-    expect(selectSessions.parentElement).toHaveClass(
+    expect(
+      newSession.compareDocumentPosition(selectSessions) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(selectSessions.parentElement).toHaveClass("flex", "gap-0.5");
+    expect(selectSessions.parentElement?.parentElement).toHaveClass(
       "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
@@ -1121,6 +1111,7 @@ describe("Sidebar session list", () => {
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
     expect(within(sessionsSection!).queryByRole("button", { name: "Select sessions" })).toBeNull();
+    expect(within(sessionsSection!).queryByRole("link", { name: "New session" })).toBeNull();
   });
 
   it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
@@ -1146,6 +1137,28 @@ describe("Sidebar session list", () => {
     );
     expect(scheduled.compareDocumentPosition(inbox) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("reveals the new-session shortcut within the row on hover or keyboard focus", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const newSession = screen.getByTestId("new-chat-button");
+    const shortcut = newSession.querySelector<HTMLElement>('[data-slot="shortcut-keys"]');
+
+    expect(newSession).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+N`);
+    expect(
+      Array.from(newSession.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+    ).toEqual([MOD_KEY, ALT_KEY, "N"]);
+    expect(shortcut).toHaveClass(
+      "absolute",
+      "top-1/2",
+      "right-2",
+      "-translate-y-1/2",
+      "opacity-0",
+      "group-focus-visible/new-session:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100",
     );
   });
 

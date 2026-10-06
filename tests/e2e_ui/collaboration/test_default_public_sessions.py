@@ -11,13 +11,13 @@ lands in the runner's ``~/.omnigent``.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 
 import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
@@ -60,10 +60,10 @@ def _permissions(base_url: str, session_id: str) -> dict[str, int]:
 
 
 def _create_session(base_url: str) -> str:
-    resp = httpx.post(
+    resp = post_session_bundle(
+        httpx.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
+        _build_hello_world_bundle(),
         headers=_ADMIN_HEADERS,
         timeout=30,
     )

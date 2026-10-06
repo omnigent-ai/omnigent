@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+
 import pytest
 
 from omnigent.errors import (
@@ -263,6 +265,22 @@ def test_classify_exception_arbitrary_is_unknown() -> None:
         ErrorCategory.UNKNOWN,
         ErrorImpact.UNKNOWN,
     )
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        errno.ENOSPC,
+        pytest.param(
+            getattr(errno, "EDQUOT", None),
+            marks=pytest.mark.skipif(not hasattr(errno, "EDQUOT"), reason="POSIX-only errno"),
+        ),
+    ],
+)
+def test_classify_exception_disk_full_is_blocking_host(code: int) -> None:
+    """A full disk or quota is the host machine's fault, e.g. a runner log or bridge dir."""
+    exc = OSError(code, "No space left on device", "/home/x/.omnigent/logs/r.log")
+    assert classify_exception(exc) == (ErrorCategory.HOST, ErrorImpact.BLOCKING)
 
 
 def _make_rpc_error(status_name: str | None) -> Exception:

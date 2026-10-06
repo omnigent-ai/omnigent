@@ -25,7 +25,7 @@ import {
   listRunners,
   openSessionStream,
   postEvent,
-  retryRateLimitedTurn,
+  continueFailedTurn,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -1494,16 +1494,22 @@ describe("openSessionStream", () => {
 });
 
 describe("interrupt", () => {
-  it("posts {type: 'interrupt', data: {}} to the events endpoint", async () => {
-    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
+  it.each([undefined, "codex_turn_side_1"])(
+    "posts an interrupt with the optional observed response id %s",
+    async (responseId) => {
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
 
-    const out = await interrupt("conv_abc");
+      const out = await interrupt("conv_abc", responseId);
 
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/v1/sessions/conv_abc/events");
-    expect(JSON.parse(init.body as string)).toEqual({ type: "interrupt", data: {} });
-    expect(out.queued).toBe(false);
-  });
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("/v1/sessions/conv_abc/events");
+      expect(JSON.parse(init.body as string)).toEqual({
+        type: "interrupt",
+        data: responseId ? { response_id: responseId } : {},
+      });
+      expect(out.queued).toBe(false);
+    },
+  );
 });
 
 describe("stopSession", () => {
@@ -1522,14 +1528,14 @@ describe("stopSession", () => {
   });
 });
 
-describe("retryRateLimitedTurn", () => {
+describe("continueFailedTurn", () => {
   it.each([
     { queued: true, item_id: "ci_retry" },
     { queued: true, pending_id: "pending_retry" },
   ])("submits a continuation for an accepted retry: %o", async (response) => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse(response));
 
-    await retryRateLimitedTurn("conv_retry");
+    await continueFailedTurn("conv_retry");
 
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -1542,7 +1548,7 @@ describe("retryRateLimitedTurn", () => {
         content: [
           {
             type: "input_text",
-            text: "Please continue from where you left off before the rate limit error.",
+            text: "Please continue from where you left off.",
           },
         ],
       },
@@ -1558,8 +1564,8 @@ describe("retryRateLimitedTurn", () => {
         }),
     );
 
-    const first = retryRateLimitedTurn("conv_retry");
-    const second = retryRateLimitedTurn("conv_retry");
+    const first = continueFailedTurn("conv_retry");
+    const second = continueFailedTurn("conv_retry");
 
     expect(second).toBe(first);
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -1567,7 +1573,7 @@ describe("retryRateLimitedTurn", () => {
     await Promise.all([first, second]);
 
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
-    await retryRateLimitedTurn("conv_retry");
+    await continueFailedTurn("conv_retry");
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -1580,8 +1586,8 @@ describe("retryRateLimitedTurn", () => {
         }),
     );
 
-    const first = retryRateLimitedTurn("conv_retry");
-    const second = retryRateLimitedTurn("conv_retry");
+    const first = continueFailedTurn("conv_retry");
+    const second = continueFailedTurn("conv_retry");
     const outcomes = Promise.allSettled([first, second]);
     finishRetry?.(mockJsonResponse({ queued: false, denied: true }));
 
@@ -1592,7 +1598,7 @@ describe("retryRateLimitedTurn", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
 
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
-    await retryRateLimitedTurn("conv_retry");
+    await continueFailedTurn("conv_retry");
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -1606,8 +1612,8 @@ describe("retryRateLimitedTurn", () => {
     );
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
 
-    const first = retryRateLimitedTurn("conv_first");
-    await retryRateLimitedTurn("conv_second");
+    const first = continueFailedTurn("conv_first");
+    await continueFailedTurn("conv_second");
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
@@ -1621,7 +1627,7 @@ describe("retryRateLimitedTurn", () => {
   it("rejects policy denials so the error card remains actionable", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, denied: true }));
 
-    await expect(retryRateLimitedTurn("conv_retry")).rejects.toThrow(
+    await expect(continueFailedTurn("conv_retry")).rejects.toThrow(
       "The retry was blocked by a policy",
     );
   });
@@ -1629,7 +1635,7 @@ describe("retryRateLimitedTurn", () => {
   it("rejects a response that did not queue a continuation", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
 
-    await expect(retryRateLimitedTurn("conv_retry")).rejects.toThrow("The retry was not accepted");
+    await expect(continueFailedTurn("conv_retry")).rejects.toThrow("The retry was not accepted");
   });
 
   it("propagates the server's dispatch error", async () => {
@@ -1640,7 +1646,7 @@ describe("retryRateLimitedTurn", () => {
       ),
     );
 
-    await expect(retryRateLimitedTurn("conv_retry")).rejects.toMatchObject({
+    await expect(continueFailedTurn("conv_retry")).rejects.toMatchObject({
       code: "runner_unavailable",
       message: "The host is offline",
       status: 503,
