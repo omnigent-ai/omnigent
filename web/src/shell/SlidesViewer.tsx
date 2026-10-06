@@ -26,6 +26,8 @@ import { TruncatedBanner } from "./TruncatedBanner";
 // Fixed 16:9 stage; the iframe renders at this size and is scaled to fit.
 const STAGE_W = 1280;
 const STAGE_H = 720;
+/** Upper bound for iframe-reported slide counts; anything above is clamped. */
+export const MAX_SLIDE_COUNT = 1000;
 
 const PREV_KEYS = new Set(["ArrowLeft", "PageUp"]);
 const NEXT_KEYS = new Set(["ArrowRight", "PageDown"]);
@@ -90,7 +92,10 @@ export function SlidesViewer({
       const win = iframeRef.current?.contentWindow;
       if (!win || e.source !== win || e.data?.source !== SLIDES_MSG_SOURCE) return;
       const { type, key, total: n } = e.data;
-      if (type === "count" && Number.isInteger(n) && n >= 0) setRuntime({ srcDoc, total: n });
+      // Only finite non-negative integers; clamp so a hostile deck cannot claim billions.
+      if (type === "count" && Number.isInteger(n) && Number.isFinite(n) && n >= 0) {
+        setRuntime({ srcDoc, total: Math.min(n, MAX_SLIDE_COUNT) });
+      }
       else if (type === "key" && PREV_KEYS.has(key)) step(-1);
       else if (type === "key" && NEXT_KEYS.has(key)) step(1);
     };

@@ -11,7 +11,7 @@ import {
   isSlidesFile,
   prepareSlidesDoc,
 } from "./codeViewerHelpers";
-import { SlidesViewer, isIgnoredNavKey } from "./SlidesViewer";
+import { MAX_SLIDE_COUNT, SlidesViewer, isIgnoredNavKey } from "./SlidesViewer";
 
 const DECK = `<!DOCTYPE html>
 <html><head><title>Deck</title></head><body>
@@ -249,6 +249,16 @@ describe("SlidesViewer", () => {
     expect(screen.getByText("1 / 3")).toBeInTheDocument();
     fromFrame({ type: "count", total: 5 });
     expect(screen.getByText("1 / 5")).toBeInTheDocument();
+  });
+
+  it("caps a huge runtime count and ignores non-integer or negative totals", () => {
+    render(<SlidesViewer content={DECK} />);
+    fromFrame({ type: "count", total: 1_000_000_000 });
+    expect(screen.getByText(`1 / ${MAX_SLIDE_COUNT}`)).toBeInTheDocument();
+    fromFrame({ type: "count", total: 1.5 });
+    fromFrame({ type: "count", total: -1 });
+    fromFrame({ type: "count", total: Number.POSITIVE_INFINITY });
+    expect(screen.getByText(`1 / ${MAX_SLIDE_COUNT}`)).toBeInTheDocument();
   });
 
   it("clamps when the deck shrinks so the next keypress still moves", () => {
