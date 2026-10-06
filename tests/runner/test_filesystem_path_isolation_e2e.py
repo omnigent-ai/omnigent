@@ -226,12 +226,17 @@ async def test_symlink_write_escape_blocked_via_http(
 async def test_read_through_symlinked_directory_blocked(
     client: httpx.AsyncClient,
 ) -> None:
-    """A read into a symlinked out-of-root directory is blocked."""
+    """A read into, or a listing of, a symlinked out-of-root directory is blocked
+    unless the request carries ``scope=reach``."""
     # ``vendor`` -> out-of-root ``personal/``; ``vendor/id_rsa`` has no ``..`` so
     # string validation passes and only the resolved-path guard can refuse it.
     resp = await client.get(f"{_BASE}/filesystem/vendor/id_rsa")
     assert resp.status_code != 200, resp.text
     assert _SECRET not in resp.text
+
+    listed = await client.get(f"{_BASE}/filesystem/vendor")
+    assert listed.status_code == 400, listed.text
+    assert listed.json()["error"]["code"] == "invalid_path"
 
 
 @pytest.mark.asyncio
