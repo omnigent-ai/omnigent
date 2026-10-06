@@ -183,6 +183,9 @@ export function InboxPage() {
       retry: 1,
     })),
   });
+  const previewBySession = new Map(
+    unreadItems.map(({ row }, i) => [row.id, previewQueries[i]?.data ?? undefined]),
+  );
 
   const visibleApprovals = showApprovals ? items : [];
   const visibleComments = showUnread ? commentInbox.items : [];
@@ -488,20 +491,24 @@ export function InboxPage() {
             </div>
           );
         })}
-        {visibleUnread.map((item, index) => {
+        {visibleUnread.map((item) => {
           const sessionId = item.row.id;
           const expanded = expandedUnread[sessionId] ?? false;
           return (
             <UnreadInboxRow
               key={sessionId}
               item={item}
-              preview={previewQueries[index]?.data ?? undefined}
+              preview={previewBySession.get(sessionId)}
               expanded={expanded}
               onToggle={() => {
                 trackClick("inbox.unread.toggle_expanded", "button");
                 setExpandedUnread((prev) => ({ ...prev, [sessionId]: !expanded }));
               }}
-              onMarkRead={() => markConversationRead(sessionId, item.row.updated_at)}
+              onMarkRead={() => {
+                // Drop the toggle so a later reply re-surfaces the row collapsed.
+                setExpandedUnread(({ [sessionId]: _cleared, ...rest }) => rest);
+                markConversationRead(sessionId, item.row.updated_at);
+              }}
             />
           );
         })}

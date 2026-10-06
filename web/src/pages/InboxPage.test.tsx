@@ -547,6 +547,36 @@ describe("InboxPage unread sessions", () => {
     expect(isExplicitlyUnread("sess_flagged")).toBe(false);
   });
 
+  it("re-surfaces a row collapsed after it was expanded and marked read", async () => {
+    // WHY: the expand toggle is dropped on read, so a later reply on the same
+    // session lands collapsed like any new unread row.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={queryClient}>
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+          </MemoryRouter>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree());
+
+    const item = await screen.findByTestId("inbox-unread");
+    fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
+    fireEvent.click(within(item).getByRole("button", { name: /Mark as read/ }));
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+
+    // A new reply lands after the read baseline (which is anchored at "now").
+    const replied = { ...row, updated_at: Math.floor(Date.now() / 1000) + 60 };
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([replied]));
+    rerender(tree());
+
+    expect(await screen.findByTestId("inbox-unread")).toHaveAttribute("data-expanded", "false");
+  });
+
   it("keeps the row usable when its preview fetch fails", async () => {
     // WHY: a missing preview isn't a load failure — the row still renders
     // without one, raises no error banner, and can be marked read.
