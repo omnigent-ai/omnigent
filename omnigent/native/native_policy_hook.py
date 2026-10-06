@@ -20,6 +20,7 @@ model sees it).
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import secrets
@@ -28,6 +29,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from typing import NotRequired, TypedDict
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -581,6 +583,30 @@ def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str
     return fail_closed_hook_output(hook_event, detail)
 
 
+def is_loopback_url(url: str) -> bool:
+    """
+    Report whether *url* addresses this machine's loopback interface.
+
+    Mirrors :func:`omnigent_client._http.is_loopback_url`; duplicated here
+    because importing the SDK package loads the server schemas and roughly
+    triples this hook's startup on every tool call.
+
+    :param url: Absolute URL to classify, e.g. ``"http://127.0.0.1:28700"``.
+    :returns: ``True`` for ``localhost``, any ``.localhost`` name,
+        ``127.0.0.0/8``, or ``::1``; ``False`` otherwise, including a URL
+        with no host.
+    """
+    host = urlsplit(url).hostname
+    if host is None:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def post_evaluate_with_retry(
     url: str,
     headers: dict[str, str],
@@ -656,7 +682,12 @@ def post_evaluate_with_retry(
         attempt_started = time.monotonic()
         held_poll_severed = False
         try:
-            with httpx.Client(headers=headers, timeout=timeout) as client:
+            # Loopback callbacks cannot traverse an environment-configured proxy.
+            with httpx.Client(
+                headers=headers,
+                timeout=timeout,
+                trust_env=not is_loopback_url(url),
+            ) as client:
                 resp = client.post(url, json=request_body)
                 if (
                     reauth is not None
