@@ -71,7 +71,7 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "emoji-mart": "^5.6.0",
-    "katex": "^0.16.47",
+    "katex": "catalog:",
     "lucide-react": "^1.57.0",
     "monaco-editor": "^0.55.1",
     "nanoid": "^6.0.2",
