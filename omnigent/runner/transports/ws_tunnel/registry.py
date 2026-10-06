@@ -922,6 +922,17 @@ def _end_response_body(state: RequestState) -> None:
     :param state: Request state whose body iterator should stop.
     :returns: None.
     """
+    if not state.head_future.done():
+        # A response cannot complete before its head. Wake the head waiter so
+        # a malformed or truncated runner response cannot hold the request.
+        _abort_request_state(
+            state,
+            httpx.RemoteProtocolError(
+                "runner sent response.end before response.head",
+                request=None,  # type: ignore[arg-type]
+            ),
+        )
+        return
     state.end_event.set()
     # Push a sentinel so any pending body_queue.get() unblocks.
     state.body_queue.put_nowait(None)

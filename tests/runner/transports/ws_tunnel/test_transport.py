@@ -153,6 +153,29 @@ async def test_handle_async_request_with_body() -> None:
     assert response.status_code == 201
 
 
+@pytest.mark.asyncio
+async def test_response_end_before_head_aborts_request_and_releases_slot() -> None:
+    """An end frame without a head must not leave the transport waiting forever."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    task = asyncio.create_task(transport.handle_async_request(_make_request("GET", "/bad")))
+    for _ in range(100):
+        if session.in_flight:
+            break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("request did not open before the bounded test window")
+
+    req_id = next(iter(session.in_flight))
+    assert reg.route_response_frame("r1", ResponseEndFrame(id=req_id)) is True
+
+    with pytest.raises(httpx.RemoteProtocolError, match=r"before response\.head"):
+        await asyncio.wait_for(task, timeout=0.2)
+    assert req_id not in session.in_flight
+
+
 # ── _TunneledByteStream: abort propagation ─────────────
 
 
