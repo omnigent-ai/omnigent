@@ -8178,6 +8178,120 @@ async def test_relay_fences_cancelled_turn_and_resumes_on_next_turn(
     assert "REAL REPLY" in published_deltas
 
 
+async def _relay_setup_failure_then_mirror_next(
+    monkeypatch: pytest.MonkeyPatch, *, runner_names_the_message: bool
+) -> tuple[_ConversationStore, list[dict[str, Any]], str, str]:
+    """Replay a runner-side setup failure, then mirror the person's next message.
+
+    :param monkeypatch: Pytest monkeypatch capturing the live stream.
+    :param runner_names_the_message: ``True`` for a runner that publishes the
+        undelivered ``response.failed`` ahead of the failed status; ``False`` for
+        an older one that publishes the status alone.
+    :returns: The store, the live events, and the pending ids of the failed
+        message and the next one.
+    """
+    from omnigent.runner.app import _undelivered_failed_payload
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    failed_id = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "set up the worktree"}],
+        created_by="alice@example.com",
+        stable_id=_ACCEPTED_STABLE_ID,
+    )
+    next_id = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "then run the tests"}],
+        created_by="alice@example.com",
+        stable_id="b2" * 16,
+    )
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    error = {"message": "turn setup failed: [Errno 28] No space left on device"}
+    frames = [
+        _sse_frame(
+            {
+                "type": "session.status",
+                "status": "failed",
+                "error": {"code": "runner_error", **error},
+            }
+        ),
+        "data: [DONE]\n\n",
+    ]
+    if runner_names_the_message:
+        frames.insert(0, _sse_frame(_undelivered_failed_payload(error, _ACCEPTED_STABLE_ID)))
+    await _relay_runner_stream(sid, _ScriptedStreamingRunnerClient(frames), store)  # type: ignore[arg-type]
+    await _persist_external_conversation_item(
+        sid,
+        conv,
+        _user_mirror("then run the tests", "claude:next:0"),
+        store,  # type: ignore[arg-type]
+    )
+    return store, published, failed_id, next_id
+
+
+@pytest.mark.asyncio
+async def test_relay_settles_a_message_whose_turn_failed_during_runner_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A setup failure commits the queued message once, and the next message is clean.
+
+    The runner failed the turn before sending anything to the harness. Its failure
+    now names the message, so the relay commits it as the person's own message and
+    settles its bubble. Previously it stayed queued, and the following message's
+    mirror persisted it a second time next to ``native_prompt_not_recorded``.
+    """
+    from omnigent.runtime import pending_inputs
+
+    try:
+        store, published, failed_id, next_id = await _relay_setup_failure_then_mirror_next(
+            monkeypatch, runner_names_the_message=True
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "message"]
+        settled, mirrored = store.appended_items
+        assert settled.data.content == [{"type": "input_text", "text": "set up the worktree"}]
+        assert settled.created_by == "alice@example.com"
+        assert mirrored.data.content == [{"type": "input_text", "text": "then run the tests"}]
+        assert _consumed_receipts([("s", e) for e in published]) == [failed_id, next_id]
+        assert pending_inputs.snapshot_for("64a784c3aa907d1774f44313546947c6") == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relay_leaves_the_message_of_an_older_runners_setup_failure_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that reports the failure by status alone behaves exactly as it always did."""
+    from omnigent.runtime import pending_inputs
+
+    try:
+        store, _published, _failed_id, _next_id = await _relay_setup_failure_then_mirror_next(
+            monkeypatch, runner_names_the_message=False
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[1].data.code == "native_prompt_not_recorded"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 @pytest.mark.asyncio
 async def test_relay_settles_queued_native_message_on_failed_turn(
     monkeypatch: pytest.MonkeyPatch,

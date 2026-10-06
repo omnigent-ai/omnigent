@@ -598,6 +598,18 @@ class TurnDispatch:
 
 
 @dataclasses.dataclass
+class _TurnHandoff:
+    """
+    Whether a turn's message has been handed to its harness.
+
+    :param started: ``True`` once the runner is about to send the message, after
+        which a failure can no longer be called undelivered.
+    """
+
+    started: bool = False
+
+
+@dataclasses.dataclass
 class InstructionComposition:
     """Runner-local, never-serialized view of this turn's instruction state.
 
@@ -719,6 +731,31 @@ def _response_failed_payload(
         "response": {"status": "failed", "error": failure_error},
         "error": failure_error,
     }
+
+
+def _undelivered_failed_payload(
+    error: Mapping[str, object],
+    stable_id: object,
+    source: str = "execution",
+) -> _JsonObject:
+    """
+    Build a ``response.failed`` for a turn that failed before its message reached the harness.
+
+    The server settles the queued web message named by ``input_stable_id`` only when
+    the error also says it was undelivered, so a turn without a stable id gets the
+    plain failure.
+
+    :param error: Error payload, e.g. ``{"message": "turn setup failed: ..."}``.
+    :param stable_id: The web message's stable id from the forwarded message, if any.
+    :param source: Where the fault originated, as for :func:`_response_failed_payload`.
+    :returns: The failure envelope, flagged undelivered and naming the message when
+        *stable_id* is a non-empty string.
+    """
+    if not isinstance(stable_id, str) or not stable_id:
+        return _response_failed_payload(error, source=source)
+    payload = _response_failed_payload({**error, "undelivered": True}, source=source)
+    payload["input_stable_id"] = stable_id
+    return payload
 
 
 def _response_failed_event(
@@ -4696,6 +4733,25 @@ def create_runner_app(
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
+    def _publish_undelivered_failure(
+        conv_id: str, msg_body: _JsonObject, error: Mapping[str, object]
+    ) -> None:
+        """
+        Tell the server a turn failed before its web message reached the harness.
+
+        The harness never had the message, so its queued copy is the only record of
+        it; without this it is reported lost at the next message. A message with no
+        stable id (an older server) has nothing to name, so only the status edge
+        reports the failure.
+
+        :param conv_id: Session/conversation id.
+        :param msg_body: The turn's dispatched message body.
+        :param error: The failure, e.g. ``{"message": "turn setup failed: ..."}``.
+        """
+        stable_id = msg_body.get("stable_id")
+        if isinstance(stable_id, str) and stable_id:
+            _publish_event(conv_id, _undelivered_failed_payload(error, stable_id))
+
     async def _run_turn_bg(
         msg_body: _JsonObject,
         conv: str,
@@ -4710,11 +4766,12 @@ def create_runner_app(
         # can't suppress this turn's legitimate terminal publish.
         _desynced_sessions.discard(conv)
         _desync_terminalized.pop(conv, None)
+        handoff = _TurnHandoff()
         # Locate any uncoded exception logged below in the turn phase (this task's
         # context carries it for its lifetime). Coded errors keep their own phase.
         with phase_scope(ErrorPhase.TURN):
             try:
-                await _run_turn_bg_setup_and_stream(msg_body, conv)
+                await _run_turn_bg_setup_and_stream(msg_body, conv, handoff)
             except _ContextWindowOverflow:
                 # Re-raise so the streaming-phase handler (which publishes the
                 # error event) is never shadowed by the generic except below.
@@ -4737,7 +4794,10 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": conv},
                 )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                setup_error = {"message": f"turn setup failed: {exc}"}
+                if not handoff.started:
+                    _publish_undelivered_failure(conv, msg_body, setup_error)
+                _on_proxy_stream_end(conv, error=setup_error)
             finally:
                 # Permanent-wedge floor: guarantee _active_turns is never left stale,
                 # however the body exits — including a BaseException that escapes
@@ -4777,6 +4837,7 @@ def create_runner_app(
     async def _run_turn_bg_setup_and_stream(
         msg_body: _JsonObject,
         conv: str,
+        handoff: _TurnHandoff,
     ) -> None:
         _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
         _prior_agent_id = _session_agent_ids.get(conv)
@@ -5176,6 +5237,7 @@ def create_runner_app(
         finally:
             _session_init_envelopes.pop(conv, None)
         if isinstance(response, StreamingResponse):
+            handoff.started = True
             await _drain_streaming_response(response, conv)
         else:
             error = _harness_error_response_error(response)
@@ -5185,6 +5247,8 @@ def create_runner_app(
                 error["message"],
                 extra={"session_id": conv},
             )
+            # Nothing was sent: the harness could not be reached or resolved.
+            _publish_undelivered_failure(conv, msg_body, error)
             _on_proxy_stream_end(conv, error=error)
 
     async def _drain_streaming_response(
@@ -5598,8 +5662,10 @@ def create_runner_app(
                                 },
                             },
                         )
-                        _fail_status = _response_failed_payload(
-                            {"status": harness_resp.status_code}, source="harness"
+                        _fail_status = _undelivered_failed_payload(
+                            {"status": harness_resp.status_code},
+                            body.get("input_stable_id"),
+                            source="harness",
                         )
                         _publish_event(
                             conv_id,

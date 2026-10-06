@@ -12717,3 +12717,229 @@ async def test_accepted_input_proof_rides_on_the_turns_terminal_event(
     assert stamped == expected
     assert not any(e.get("type") == "input.accepted" for e in published)
 
+
+_UNDELIVERED_STABLE_ID = "9d2c4e6f8a0b1c3d5e7f9a1b2c3d4e5f"
+
+
+class _RefusingHarnessClient(_FakeHarnessClient):
+    """Harness client whose turn endpoint answers with an error status."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__([])
+        self._status_code = status_code
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, object],
+        timeout: float | None,
+    ) -> _FakeHarnessStream:
+        """Return a stream that refuses the turn."""
+        del method, url, json, timeout
+        return _FakeHarnessStream([], status_code=self._status_code)
+
+
+async def _published_turn_events(
+    app: Any, conv: str, *, stable_id: str | None, timeout: float = 5.0
+) -> list[dict[str, Any]]:
+    """Post one web message and return everything the runner published until the turn failed."""
+    body: dict[str, Any] = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_undelivered",
+        "model": "x",
+        "content": [{"role": "user", "content": "hi"}],
+    }
+    if stable_id is not None:
+        body["stable_id"] = stable_id
+    published: list[dict[str, Any]] = []
+    async with _runner_test_client(app) as http:
+        response = await http.post(f"/v1/sessions/{conv}/events", json=body)
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        queue = app.state.session_event_queues.get(conv)
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            while queue is not None and not queue.empty():
+                published.append(queue.get_nowait())
+            if any(
+                e.get("type") == "session.status" and e.get("status") == "failed"
+                for e in published
+            ):
+                break
+            await asyncio.sleep(0.02)
+    return published
+
+
+def _undelivered_app(
+    process_manager: _FakeProcessManager, *, harness: str = "claude-native"
+) -> Any:
+    """A runner app whose spec resolves to *harness*."""
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="undelivered-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        )
+
+    return create_runner_app(
+        process_manager=cast(HarnessProcessManager, process_manager),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+
+def _failed_responses(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The ``response.failed`` events among *events*."""
+    return [e for e in events if e.get("type") == "response.failed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stable_id", [_UNDELIVERED_STABLE_ID, None])
+async def test_setup_failure_names_the_message_the_harness_never_received(
+    monkeypatch: pytest.MonkeyPatch, stable_id: str | None
+) -> None:
+    """A turn that fails while being set up tells the server which message was lost.
+
+    The harness never had the message, so its queued copy is the only record of
+    it. Reporting only a ``failed`` status left that entry queued, and the next
+    message's mirror reported it "not delivered" although the person had already
+    been told the turn failed. The failure now carries the message's stable id and
+    an ``undelivered`` error, ahead of the ``failed`` status. A message with no
+    stable id (an older server) gets the status alone, as before.
+    """
+    monkeypatch.setattr(
+        "omnigent.runner.app._build_spawn_env_from_spec",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+    )
+    app = _undelivered_app(_FakeProcessManager(_FakeHarnessClient([])))
+
+    events = await _published_turn_events(app, "conv_setup_undelivered", stable_id=stable_id)
+
+    failed = _failed_responses(events)
+    status_failed = [
+        e for e in events if e.get("type") == "session.status" and e.get("status") == "failed"
+    ]
+    assert len(status_failed) == 1
+    if stable_id is None:
+        assert failed == []
+        return
+    assert len(failed) == 1
+    assert failed[0]["input_stable_id"] == stable_id
+    error = failed[0]["response"]["error"]
+    assert error["undelivered"] is True
+    assert error["code"] == "runner_error"
+    assert "No space left on device" in error["message"]
+    # The settle comes first, so the message is committed ahead of the failure.
+    assert events.index(failed[0]) < events.index(status_failed[0])
+
+
+@pytest.mark.asyncio
+async def test_failure_after_the_message_was_sent_is_not_called_undelivered() -> None:
+    """Once the message is on its way, an unexpected runner error settles nothing.
+
+    The harness may already have the message, and its own mirror can still
+    arrive; committing it here would show it twice. The failed status is still
+    published.
+    """
+    broken_frame = (
+        "event: response.output_item.done\n"
+        'data: {"type":"response.output_item.done","item":{"type":"function_call"}}\n\n'
+    )
+    app = _undelivered_app(
+        _FakeProcessManager(_FakeHarnessClient([_SSE_RESPONSE_CREATED, broken_frame]))
+    )
+
+    events = await _published_turn_events(
+        app, "conv_after_handoff", stable_id=_UNDELIVERED_STABLE_ID
+    )
+
+    assert any(e.get("type") == "session.status" and e.get("status") == "failed" for e in events)
+    assert [e for e in _failed_responses(events) if "input_stable_id" in e] == []
+    assert not any(
+        e.get("response", {}).get("error", {}).get("undelivered")
+        for e in _failed_responses(events)
+    )
+
+
+@pytest.mark.asyncio
+async def test_unstartable_harness_names_the_message_it_never_delivered() -> None:
+    """A harness that cannot be started fails the turn before anything is sent."""
+    app = _undelivered_app(_SpawnFailingProcessManager())
+
+    events = await _published_turn_events(
+        app, "conv_spawn_undelivered", stable_id=_UNDELIVERED_STABLE_ID
+    )
+
+    (failed,) = _failed_responses(events)
+    assert failed["input_stable_id"] == _UNDELIVERED_STABLE_ID
+    assert failed["response"]["error"]["undelivered"] is True
+    assert "harness_spawn_failed" in failed["response"]["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_harness_refusing_the_turn_names_the_message_it_never_delivered() -> None:
+    """A harness that answers the turn with an error status never ran the message."""
+    app = _undelivered_app(_FakeProcessManager(_RefusingHarnessClient(409)))
+
+    events = await _published_turn_events(
+        app, "conv_refused_undelivered", stable_id=_UNDELIVERED_STABLE_ID
+    )
+
+    (failed,) = _failed_responses(events)
+    assert failed["source"] == "harness"
+    assert failed["input_stable_id"] == _UNDELIVERED_STABLE_ID
+    assert failed["response"]["error"]["undelivered"] is True
+    assert failed["response"]["error"]["status"] == 409
+
+
+def test_undelivered_failed_payload_needs_a_stable_id_to_flag_anything() -> None:
+    """Without a message to name there is nothing to settle, so the failure stays plain."""
+    from omnigent.runner.app import _undelivered_failed_payload
+
+    plain = _undelivered_failed_payload({"message": "boom"}, None)
+    empty = _undelivered_failed_payload({"message": "boom"}, "")
+    named = _undelivered_failed_payload({"message": "boom"}, _UNDELIVERED_STABLE_ID, "harness")
+
+    for payload in (plain, empty):
+        assert "input_stable_id" not in payload
+        assert "undelivered" not in payload["response"]["error"]  # type: ignore[index]
+    assert named["input_stable_id"] == _UNDELIVERED_STABLE_ID
+    assert named["source"] == "harness"
+    assert named["response"]["error"]["undelivered"] is True  # type: ignore[index]
+    # The legacy top-level mirror carries the flag too, like every other field.
+    assert named["error"]["undelivered"] is True  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_startup_pending_failure_keeps_its_undelivered_flag_and_names_the_message() -> None:
+    """A Codex turn refused while its TUI is still starting is reported as undelivered.
+
+    The runner only records why the TUI is not ready; the Codex executor fails the
+    turn from that record, before anything reaches the TUI, and flags the error
+    undelivered. The runner must pass the flag through and add the web message's
+    stable id, or the server cannot tell the queued message was never received.
+    """
+    pending_failure = (
+        "event: response.failed\ndata: "
+        '{"type":"response.failed","response":{"status":"failed","error":'
+        '{"code":"agent_startup_pending","message":"Codex is still starting in this '
+        'session\'s terminal.","undelivered":true}}}\n\n'
+    )
+    app = _undelivered_app(
+        _FakeProcessManager(_FakeHarnessClient([_SSE_RESPONSE_CREATED, pending_failure])),
+        harness="codex-native",
+    )
+
+    events = await _published_turn_events(
+        app, "conv_startup_pending", stable_id=_UNDELIVERED_STABLE_ID
+    )
+
+    (failed,) = _failed_responses(events)
+    assert failed["input_stable_id"] == _UNDELIVERED_STABLE_ID
+    assert failed["response"]["error"]["undelivered"] is True
+    assert failed["response"]["error"]["code"] == "agent_startup_pending"
