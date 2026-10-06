@@ -10,6 +10,7 @@ import threading
 from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
+from typing import TypeVar
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
@@ -50,6 +51,7 @@ from omnigent.inner.native_attachments import (
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 class ClaudeNativeExecutor(Executor):
@@ -127,17 +129,25 @@ class ClaudeNativeExecutor(Executor):
             return False
         return True
 
-    async def _inject_prompt(self, text: str, notices: list[str]) -> None:
-        """Inject user text with one-shot context while holding the injection lock."""
+    async def _inject_prompt(self, text: str, notices: list[str]) -> bool:
+        """
+        Inject user text with one-shot context while holding the injection lock.
+
+        :returns: ``True`` when the terminal was seen to take the text (see
+            :func:`inject_user_message`); ``False`` when that is not known.
+        """
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
         if notices:
             context_path.write_text("\n\n".join(notices), encoding="utf-8")
         try:
-            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+            accepted = await self._inject(
+                partial(inject_user_message, self._bridge_dir, content=text)
+            )
         except BaseException:
             context_path.unlink(missing_ok=True)
             raise
+        return accepted is True
 
     async def run_turn(
         self,
@@ -166,8 +176,9 @@ class ClaudeNativeExecutor(Executor):
             it arrives here (adapter maps ``request.model_override`` →
             ``config.model``) and the switch is applied inline, before the
             message — see the ``/model`` handling below.
-        :yields: :class:`TurnComplete` after the input was injected,
-            or :class:`ExecutorError` on bridge failure.
+        :yields: :class:`TurnComplete` after the input was injected (flagged
+            ``input_accepted`` when the terminal was seen to take it), or
+            :class:`ExecutorError` on bridge failure.
         """
         del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
@@ -221,6 +232,7 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's picker values, aliases, and
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
+        accepted = False
         try:
             with telemetry.span("claude_native.inject"):
                 async with self._inject_lock:
@@ -244,7 +256,7 @@ class ClaudeNativeExecutor(Executor):
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
-                    await self._inject_prompt(text, notices)
+                    accepted = await self._inject_prompt(text, notices)
         except ClaudeTerminalExited as exc:
             # Claude Code exits 0 on /quit or a closed window. The turn still
             # fails, but the person's own teardown is not a defect; a pane that
@@ -296,15 +308,15 @@ class ClaudeNativeExecutor(Executor):
             )
             yield ExecutorError(message=describe_exception(exc))
             return
-        yield TurnComplete(response=None)
+        yield TurnComplete(response=None, input_accepted=accepted)
 
-    async def _inject(self, operation: Callable[[], None]) -> None:
+    async def _inject(self, operation: Callable[[], _T]) -> _T:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
         with cancellable_injection(cancelled):
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
-            await asyncio.shield(worker)
+            return await asyncio.shield(worker)
         except asyncio.CancelledError:
             cancelled.set()
             while not worker.done():

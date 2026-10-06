@@ -2901,6 +2901,7 @@ async def _persist_external_conversation_item_unlocked(
     # shell command only holds them and puts them back afterwards.
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
+    accepted_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
     queue_depth = 0
     shell_command = _shell_command_input(item)
@@ -2924,18 +2925,20 @@ async def _persist_external_conversation_item_unlocked(
         if agent_message_candidate:
             # Ambiguous markup can be direct terminal input. Only its exact
             # pending match is evidence of a web submission; preserve others.
-            held_older = [*matched.skipped, *matched.uncertain]
+            held_older = [*matched.skipped, *matched.uncertain, *matched.accepted]
         elif item.stable_id is not None or _is_kiro_native_session(conv):
             skipped_pending = matched.skipped
             # Jumped-over entries that a positional drain may already have
-            # settled: drained without an undelivered record.
+            # settled, or that the terminal was seen to take: drained without
+            # an undelivered record.
             uncertain_pending = matched.uncertain
+            accepted_pending = matched.accepted
         else:
             # A mirror without a source id cannot be told from a retry of an
             # already-persisted one, and a retry matching a newer identical
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
-            held_older = [*matched.skipped, *matched.uncertain]
+            held_older = [*matched.skipped, *matched.uncertain, *matched.accepted]
         if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
@@ -2975,7 +2978,7 @@ async def _persist_external_conversation_item_unlocked(
         drained = matched.matched
         if drained is not None:
             cleared_pending_id = drained.pending_id
-        held_older = matched.skipped
+        held_older = [*matched.skipped, *matched.uncertain, *matched.accepted]
     elif shell_command is not None:
         # Drain only the matching shell entry; restore older entries.
         matched = pending_inputs.resolve_matching_text(
@@ -2984,7 +2987,7 @@ async def _persist_external_conversation_item_unlocked(
         drained = matched.matched
         if drained is not None:
             cleared_pending_id = drained.pending_id
-        held_older = [*matched.skipped, *matched.uncertain]
+        held_older = [*matched.skipped, *matched.uncertain, *matched.accepted]
     # Build the batch: skipped entries first (their positions must precede
     # the matched item to match broadcast order), then the anchor. Each
     # skipped entry gets a pair of items (user message + error, or a stop
@@ -3010,7 +3013,9 @@ async def _persist_external_conversation_item_unlocked(
         # retry drains the same entries and surfaces the same undelivered
         # messages.
         _restore_drained_inputs(
-            session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
+            session_id,
+            [*skipped_pending, *uncertain_pending, *accepted_pending, *held_older],
+            drained,
         )
         raise
     persisted = persisted_items[len(skipped_new_items)]
@@ -3019,16 +3024,27 @@ async def _persist_external_conversation_item_unlocked(
         # title. Every pending entry consumed above belongs to a LATER user
         # message.
         _restore_drained_inputs(
-            session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
+            session_id,
+            [*skipped_pending, *uncertain_pending, *accepted_pending, *held_older],
+            drained,
         )
         await record_claude_subagent_return(session_id, persisted, conversation_store)
         return persisted.id
-    # Landed: the drained entries are settled (uncertain ones leave without a
-    # record — their mirror may already have been attributed by position);
-    # older messages a slash or shell command jumped over are still on their
-    # way and go back into play.
-    _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
+    # Landed: drained entries are settled (uncertain and accepted ones leave without
+    # a record); older messages a slash or shell command jumped over are still on
+    # their way and go back into play.
+    _release_drained_inputs(
+        session_id, [*skipped_pending, *uncertain_pending, *accepted_pending, drained]
+    )
     _restore_drained_inputs(session_id, held_older, None)
+    for entry in accepted_pending:
+        _log_accepted_native_input(
+            session_id,
+            conv,
+            entry,
+            matched_pending_id=cleared_pending_id,
+            queue_depth=queue_depth,
+        )
     if shell_command is not None and drained is not None:
         _logger.info(
             "Shell command settled pending web message %s for session=%s",
@@ -3406,7 +3422,47 @@ def _log_skipped_native_input(
             queue_depth=queue_depth,
             matched_pending_id=matched_pending_id,
             interrupted=skipped.interrupted,
+            accepted=skipped.accepted,
             first_char_class=_first_char_class(skipped.content),
+            harness=native_agent.harness if native_agent is not None else "",
+        ),
+    )
+
+
+def _log_accepted_native_input(
+    session_id: str,
+    conv: Conversation,
+    accepted: pending_inputs.DrainedInput,
+    *,
+    matched_pending_id: str | None,
+    queue_depth: int,
+) -> None:
+    """
+    Log a queued web message the terminal took but no mirror of it ever arrived.
+
+    A later mirror jumped over it and it was drained without an error, so this
+    row is the only trace of how often the terminal's own evidence overruled a
+    missing mirror.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param conv: Conversation row, used to name the harness.
+    :param accepted: The queue entry that was drained quietly.
+    :param matched_pending_id: The entry the mirror matched instead, if any.
+    :param queue_depth: Entries queued when the mirror matched.
+    """
+    native_agent = _native_coding_agent_for_session(conv)
+    _logger.info(
+        "Pending web message %s for session=%s was taken by the terminal but never mirrored",
+        accepted.pending_id,
+        session_id,
+        extra=debug_event(
+            "native_pending_input_accepted",
+            session_id=session_id,
+            pending_id=accepted.pending_id,
+            age_s=round(accepted.age_s, 1),
+            queue_depth=queue_depth,
+            matched_pending_id=matched_pending_id,
+            first_char_class=_first_char_class(accepted.content),
             harness=native_agent.harness if native_agent is not None else "",
         ),
     )
@@ -8036,6 +8092,13 @@ async def _relay_runner_stream_once(
                         if ready is not None:
                             ready.set()
                         continue
+
+                    # The runner saw the terminal take a web message; an older
+                    # runner sends no such field.
+                    if event.get("delivery") == "accepted":
+                        accepted_stable_id = event.get("input_stable_id")
+                        if isinstance(accepted_stable_id, str) and accepted_stable_id:
+                            pending_inputs.mark_accepted(session_id, accepted_stable_id)
 
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES or (
                         evt_type == "session.status" and event.get("status") == "running"

@@ -103,6 +103,49 @@ async def test_run_turn_injects_user_message_without_streaming_transcript(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("injection_report", "expect_accepted"),
+    [(True, True), (False, False), (None, False)],
+)
+async def test_run_turn_flags_a_message_the_terminal_was_seen_to_take(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    injection_report: bool | None,
+    expect_accepted: bool,
+) -> None:
+    """
+    The turn completes with the bridge's acceptance report, and only a true one counts.
+
+    The runner relays the flag so the server can tell a message the terminal took
+    from one that never arrived; an unknown outcome must never read as accepted.
+    """
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> bool | None:
+        """Report what the bridge saw of the submit."""
+        del bridge_dir_arg, content, timeout_s
+        return injection_report
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello from web"}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert events == [TurnComplete(response=None, input_accepted=expect_accepted)]
+
+
+@pytest.mark.asyncio
 async def test_run_turn_does_not_advertise_active_omnigent_tools(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

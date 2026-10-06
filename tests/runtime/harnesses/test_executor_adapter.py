@@ -2672,6 +2672,40 @@ def test_translate_event_emits_subagent_tool_call() -> None:
     assert json.loads(ev.arguments) == {"file_path": "mathutils.py"}
 
 
+def test_translate_event_relays_an_accepted_input_to_the_runner() -> None:
+    """A ``TurnComplete`` flagged ``input_accepted`` becomes the ``input.accepted`` marker.
+
+    The runner consumes it and passes the proof to the server on the turn's
+    terminal event, so the server stops treating a missing mirror of that
+    message as proof it was lost.
+    """
+    from omnigent.inner.executor import TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import InputAcceptedEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_accepted")
+    adapter._translate_event(
+        TurnComplete(response=None, input_accepted=True),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(ctx.emitted) == 1
+    ev = ctx.emitted[0]
+    assert isinstance(ev, InputAcceptedEvent)
+    assert ev.type == "input.accepted"
+
+
+def test_translate_event_stays_silent_when_the_input_was_not_seen_accepted() -> None:
+    """An ordinary ``TurnComplete`` emits nothing: no proof is not a marker."""
+    from omnigent.inner.executor import TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_plain")
+    adapter._translate_event(TurnComplete(response=None), ctx)  # type: ignore[arg-type]
+    assert ctx.emitted == []
+
+
 def test_interrupt_slice_covers_pi_rpc_session_close_reap_budget() -> None:
     """_INTERRUPT_SLICE_S must be >= _PiRpcSession.close()'s reap wait_for budget.
 

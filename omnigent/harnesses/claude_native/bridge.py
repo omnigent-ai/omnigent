@@ -3998,7 +3998,7 @@ def inject_user_message(
     *,
     content: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
-) -> None:
+) -> bool:
     r"""
     Deliver a user message into the Claude terminal via tmux send-keys.
 
@@ -4051,7 +4051,10 @@ def inject_user_message(
         terminal's process is verifiably alive but still booting (see
         :func:`_wait_for_claude_prompt_ready`), so a slow host connect
         delivers the message late instead of dropping it.
-    :returns: None.
+    :returns: ``True`` when the terminal was seen to take the message: its
+        draft left a visible input box, which is the one positive proof of
+        acceptance there is. ``False`` when the draft was never identifiable
+        (a blind submit), so nothing is known either way.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
         invocation fails, or if the draft never leaves the input box
@@ -4098,9 +4101,11 @@ def inject_user_message(
         rejection_baseline = _count_unknown_command_rejections(
             _capture_pane(socket_path, tmux_target), rejection_needle
         )
-    _paste_and_submit(bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle)
+    accepted = _paste_and_submit(
+        bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle
+    )
     if rejection_needle is None:
-        return
+        return accepted
     if not _unknown_command_rejection_appeared(
         socket_path,
         tmux_target,
@@ -4109,7 +4114,7 @@ def inject_user_message(
     ):
         # No rejection: Claude Code accepted the command (a real skill or
         # custom command) and the turn is underway.
-        return
+        return accepted
     # Claude Code dropped the message. Re-deliver it escaped so the text
     # reaches the model as a regular user message instead of vanishing.
     _logger.info(
@@ -4117,7 +4122,7 @@ def inject_user_message(
         "re-delivering the message escaped as plain text",
         unknown_name,
     )
-    _paste_and_submit(
+    return _paste_and_submit(
         bridge_dir,
         socket_path,
         tmux_target,
@@ -4133,7 +4138,7 @@ def _paste_and_submit(
     *,
     text: str,
     needle: str,
-) -> None:
+) -> bool:
     r"""
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
 
@@ -4149,7 +4154,9 @@ def _paste_and_submit(
     :param text: Exact text to paste (already escaped as needed).
     :param needle: Draft marker from :func:`_submit_needle`; empty skips
         draft-visibility verification (blind submit).
-    :returns: None.
+    :returns: ``True`` when the draft left the input box and the box is on
+        screen without it; ``False`` for a blind submit or a view that cannot
+        prove the box emptied (a dialog or a torn capture).
     :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
         never leaves the input box after repeated submit Enters.
     """
@@ -4238,7 +4245,7 @@ def _paste_and_submit(
         delivery_diagnostics.record_details(verification="unverified")
         # The draft was never observed, so its absence proves nothing —
         # verification would trivially "pass". Submit blind as before.
-        return
+        return False
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -4253,7 +4260,9 @@ def _paste_and_submit(
         what="submitted message",
         bridge_dir=bridge_dir,
     ):
-        return
+        # An emptied box only counts when the box itself is visible: a dialog
+        # or a torn capture shows no draft either.
+        return _composer_without_draft(_capture_pane(socket_path, tmux_target), needle)
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
@@ -5860,6 +5869,20 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
     return bool(needle) and needle in tail
+
+
+def _composer_without_draft(pane: str, needle: str) -> bool:
+    """
+    Return whether Claude's input box is on screen and holds none of our draft.
+
+    Unlike "no draft found", this is positive: an empty or torn capture, or a
+    dialog standing in for the composer, has no input box and so proves nothing.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :param needle: Marker from :func:`_submit_needle`, e.g. ``"fix the bug"``.
+    :returns: ``True`` when the input box is mounted and the draft is not in it.
+    """
+    return _claude_prompt_rendered(pane) and not _draft_in_input_box(pane, needle)
 
 
 def _format_terminal_failure_tail(pane: str) -> str:

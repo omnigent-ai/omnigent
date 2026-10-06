@@ -187,12 +187,16 @@ class TurnComplete(ExecutorEvent):
         ``"cache_read_input_tokens"``, ``"cache_creation_input_tokens"``.
         e.g. ``{"input_tokens": 1523, "output_tokens": 847,
         "total_tokens": 2370}``.
+    :param input_accepted: ``True`` when a native-terminal executor saw the
+        terminal take this turn's message (e.g. Claude Code's input box emptied).
+        ``False`` when that is unknown, which is not evidence of loss.
     """
 
     response: str | None = None
     modified_by_policy: bool = False
     continue_turn: bool = False
     usage: ExecutorUsage | None = None
+    input_accepted: bool = False
 
 
 class ToolCallStatus(str, enum.Enum):

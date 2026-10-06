@@ -808,3 +808,110 @@ def test_mark_interrupted_reports_nothing_when_every_entry_is_newer_than_the_cut
 
     drained = pending_inputs.resolve_oldest("conv_a")
     assert drained is not None and drained.interrupted is False
+
+
+_STABLE_A = "a" * 32
+_STABLE_B = "b" * 32
+
+
+def test_mark_accepted_flags_only_the_entry_queued_under_that_stable_id() -> None:
+    """The runner names a message by its stable id; only that queue entry is flagged."""
+    first = pending_inputs.record("conv_a", [_text_block("first")], stable_id=_STABLE_A)
+    pending_inputs.record("conv_a", [_text_block("second")], stable_id=_STABLE_B)
+
+    assert pending_inputs.mark_accepted("conv_a", _STABLE_A) == first
+
+    drained = pending_inputs.resolve_oldest("conv_a")
+    assert drained is not None and drained.pending_id == first and drained.accepted is True
+    other = pending_inputs.resolve_oldest("conv_a")
+    assert other is not None and other.accepted is False
+
+
+def test_mark_accepted_is_a_noop_without_a_queued_entry() -> None:
+    """An entry already mirrored, another session's, or an unknown id flags nothing."""
+    pending_inputs.record("conv_b", [_text_block("elsewhere")], stable_id=_STABLE_A)
+
+    assert pending_inputs.mark_accepted("conv_a", _STABLE_A) is None
+    pending_inputs.record("conv_a", [_text_block("mirrored")], stable_id=_STABLE_A)
+    pending_inputs.resolve_matching_text("conv_a", "mirrored")
+    assert pending_inputs.mark_accepted("conv_a", _STABLE_A) is None
+    assert pending_inputs.mark_accepted("conv_a", _STABLE_B) is None
+    other = pending_inputs.resolve_oldest("conv_b")
+    assert other is not None and other.accepted is False
+
+
+def test_resolve_matching_text_drains_an_accepted_entry_quietly() -> None:
+    """A jumped-over entry the terminal took is reported as accepted, not skipped."""
+    first = pending_inputs.record("conv_a", [_text_block("taken")], stable_id=_STABLE_A)
+    second = pending_inputs.record("conv_a", [_text_block("recorded")], stable_id=_STABLE_B)
+    pending_inputs.mark_accepted("conv_a", _STABLE_A)
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "recorded")
+
+    assert drained.matched is not None and drained.matched.pending_id == second
+    assert drained.skipped == []
+    assert [entry.pending_id for entry in drained.accepted] == [first]
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_resolve_matching_text_still_skips_an_entry_nothing_vouches_for() -> None:
+    """Without the terminal's evidence a jumped-over entry is still reported lost."""
+    taken = pending_inputs.record("conv_a", [_text_block("taken")], stable_id=_STABLE_A)
+    lost = pending_inputs.record("conv_a", [_text_block("lost")])
+    pending_inputs.record("conv_a", [_text_block("recorded")])
+    pending_inputs.mark_accepted("conv_a", _STABLE_A)
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "recorded")
+
+    assert [entry.pending_id for entry in drained.skipped] == [lost]
+    assert [entry.pending_id for entry in drained.accepted] == [taken]
+
+
+def test_accepted_entries_keep_the_uncertain_and_stopped_handling() -> None:
+    """Evidence never overrides a positional drain or a delivered Stop, which explain more."""
+    uncertain = pending_inputs.record(
+        "conv_a", [_text_block("maybe mirrored")], stable_id=_STABLE_A
+    )
+    pending_inputs.mark_uncertain("conv_a")
+    stopped = pending_inputs.record("conv_a", [_text_block("stopped")], stable_id=_STABLE_B)
+    pending_inputs.mark_interrupted("conv_a")
+    pending_inputs.record("conv_a", [_text_block("recorded")])
+    pending_inputs.mark_accepted("conv_a", _STABLE_A)
+    pending_inputs.mark_accepted("conv_a", _STABLE_B)
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "recorded")
+
+    assert [entry.pending_id for entry in drained.uncertain] == [uncertain]
+    assert drained.accepted == []
+    # The stopped entry stays in the skipped list so the caller words it as stopped.
+    assert [
+        (entry.pending_id, entry.interrupted, entry.accepted) for entry in drained.skipped
+    ] == [(stopped, True, True)]
+
+
+def test_accepted_flag_survives_a_held_drain_and_restore() -> None:
+    """A persist that hands an accepted entry back must not lose the flag."""
+    first = pending_inputs.record("conv_a", [_text_block("!ls")], stable_id=_STABLE_A)
+    second = pending_inputs.record("conv_a", [_text_block("second")])
+    held = pending_inputs.resolve_matching_text("conv_a", "ls", hold=True, shell_command=True)
+    assert held.matched is not None and held.matched.pending_id == first
+    pending_inputs.mark_accepted("conv_a", _STABLE_A)
+    pending_inputs.restore("conv_a", held.matched)
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "second")
+
+    assert [entry.pending_id for entry in drained.accepted] == [first]
+    assert drained.matched is not None and drained.matched.pending_id == second
+
+
+def test_restore_of_a_gone_entry_keeps_the_accepted_flag() -> None:
+    """An entry re-inserted after the queue dropped it is still reported as accepted."""
+    pending_inputs.record("conv_a", [_text_block("first")], stable_id=_STABLE_A)
+    pending_inputs.mark_accepted("conv_a", _STABLE_A)
+    gone = pending_inputs.resolve_oldest("conv_a")
+    assert gone is not None and gone.accepted is True
+
+    pending_inputs.restore("conv_a", gone)
+
+    restored = pending_inputs.resolve_oldest("conv_a")
+    assert restored is not None and restored.accepted is True

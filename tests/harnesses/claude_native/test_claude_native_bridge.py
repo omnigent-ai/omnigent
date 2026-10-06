@@ -4790,6 +4790,148 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
     )
 
 
+def _inject_against_scripted_tui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    content: str,
+    draft_pane: str,
+    submit_panes: list[str],
+) -> bool:
+    """
+    Drive ``inject_user_message`` against a fake TUI and return what it reports.
+
+    :param tmp_path: Test temp dir for the bridge directory.
+    :param monkeypatch: Pytest monkeypatch for subprocess + timeouts.
+    :param content: User text to inject.
+    :param draft_pane: Pane the TUI shows after each paste.
+    :param submit_panes: Pane shown after the Nth submit Enter; the last one
+        repeats for any later Enter.
+    :returns: The injection's acceptance report.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._UNKNOWN_COMMAND_WATCH_TIMEOUT_S", 0.3
+    )
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    tui = {"pane": _composer_pane(), "submits": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Serve the scripted pane for each stage of the delivery.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = draft_pane
+        if cmd[-1] == "Enter":
+            tui["pane"] = submit_panes[min(tui["submits"], len(submit_panes) - 1)]
+            tui["submits"] += 1
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    return inject_user_message(bridge_dir, content=content)
+
+
+def test_inject_user_message_reports_a_submit_it_watched_the_box_take(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The draft was visible, then the box came back empty: the one proof of acceptance."""
+    accepted = _inject_against_scripted_tui(
+        tmp_path,
+        monkeypatch,
+        content="fix the flaky test",
+        draft_pane=_composer_pane("fix the flaky test"),
+        submit_panes=[_composer_pane()],
+    )
+
+    assert accepted is True
+
+
+def test_inject_user_message_does_not_vouch_for_a_blind_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A draft the pane never showed (shell mode, a custom status line) proves nothing."""
+    accepted = _inject_against_scripted_tui(
+        tmp_path,
+        monkeypatch,
+        content="!ls",
+        draft_pane=_composer_pane(),
+        submit_panes=[_composer_pane()],
+    )
+
+    assert accepted is False
+
+
+@pytest.mark.parametrize(
+    "after_submit",
+    [
+        pytest.param("", id="torn-capture"),
+        pytest.param("Do you want to proceed?\n❯ 1. Yes\n  2. No\n", id="dialog-in-place-of-box"),
+    ],
+)
+def test_inject_user_message_does_not_vouch_when_the_box_is_not_on_screen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    after_submit: str,
+) -> None:
+    """An absent draft only counts when the input box itself is visible to be empty."""
+    accepted = _inject_against_scripted_tui(
+        tmp_path,
+        monkeypatch,
+        content="fix the flaky test",
+        draft_pane=_composer_pane("fix the flaky test"),
+        submit_panes=[after_submit],
+    )
+
+    assert accepted is False
+
+
+def test_inject_user_message_reports_the_escaped_redelivery_not_the_rejected_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After an "Unknown command" rejection, only the re-delivered paste can vouch.
+
+    The first submit emptied the box too, but Claude Code discarded it, so the
+    report comes from the escaped second paste alone.
+    """
+    accepted = _inject_against_scripted_tui(
+        tmp_path,
+        monkeypatch,
+        content="/not-a-real-skill hello",
+        draft_pane=_composer_pane("/not-a-real-skill hello"),
+        submit_panes=[_rejection_pane("not-a-real-skill"), _composer_pane()],
+    )
+    unverified = _inject_against_scripted_tui(
+        tmp_path,
+        monkeypatch,
+        content="/not-a-real-skill hello",
+        draft_pane=_composer_pane("/not-a-real-skill hello"),
+        submit_panes=[_rejection_pane("not-a-real-skill"), ""],
+    )
+
+    assert accepted is True
+    assert unverified is False
+
+
 def test_inject_user_message_raises_when_draft_never_submits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
