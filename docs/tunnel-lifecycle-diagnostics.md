@@ -185,7 +185,8 @@ Join on `connection_id` and compare `tunnel_side = server` with `runner`:
 | `app_pings_queued`, `last_app_ping_queued_age_s`, `last_app_ping_sent_age_s`, `last_app_pong_received_age_s` | Server application-heartbeat progress through enqueue, successful send, and pong receipt. |
 | `last_app_ping_received_age_s`, `last_app_pong_sent_age_s` | Runner application-heartbeat receive and successful response-send times. |
 | `app_ping_rtt_s` | Server-local elapsed time from starting the matching ping send to consuming its pong; excludes queue wait, may include send delay. Uses the echoed token only for matching, not as a clock. |
-| `last_received_frame_age_s`, `last_sent_frame_age_s` | Time since any received application frame or successfully completed application-frame send. |
+| `last_received_frame_age_s` | Time since a WebSocket message was received, including messages later dropped as non-text or malformed. |
+| `last_sent_frame_age_s` | Time since an application-frame send completed successfully. |
 
 All durations use local monotonic time. Maxima cover this connection's lifetime;
 their accompanying `_max_age_s` fields distinguish old congestion from delays
