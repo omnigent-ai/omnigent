@@ -6024,7 +6024,9 @@ def _wait_for_claude_prompt_ready(
     :param extend_for_slow_boot: ``False`` makes *timeout_s* a hard cap with no
         slow-boot extension, for a caller that must answer within its own
         deadline (a settings change whose requester gives up after a fixed
-        time). A slow boot then fails the wait instead of outliving the request.
+        time). A slow boot then fails the wait instead of outliving the request,
+        while a dead pane still ends it at the first liveness check, a
+        :data:`_CLAUDE_LIVENESS_POLL_INTERVAL_S` in, rather than at the cap.
     :returns: None.
     :raises ClaudeTerminalExited: If tmux affirms the pane's process has
         exited, carrying the pane's wait-status so a clean quit is
@@ -6048,7 +6050,11 @@ def _wait_for_claude_prompt_ready(
         a box that never appeared — is diagnosable from the error alone.
     """
     started = time.monotonic()
-    next_liveness_probe = started + timeout_s
+    # The extended wait first probes when its base budget lapses. A capped wait has
+    # no extension to decide, so it probes on the regular cadence from the start.
+    next_liveness_probe = started + (
+        timeout_s if extend_for_slow_boot else _CLAUDE_LIVENESS_POLL_INTERVAL_S
+    )
     hard_deadline = started + (
         max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S) if extend_for_slow_boot else timeout_s
     )

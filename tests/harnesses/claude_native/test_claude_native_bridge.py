@@ -11039,17 +11039,26 @@ class _BootingClaudePane:
 
     Captures read :data:`_BOOTING_PANE` until the virtual clock reaches
     ``boot_s``, then a composer holding whatever was typed; every send-keys is
-    logged with the virtual time it happened at.
+    logged with the virtual time it happened at. Liveness probes answer
+    ``state``, a live process until a test says otherwise.
     """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch, *, boot_s: float) -> None:
         self.clock = _VirtualClock()
         self.boot_s = boot_s
+        self.state = claude_native_bridge._ClaudePaneState(True)
         self.sends: list[tuple[float, str]] = []
         self._draft = ""
         monkeypatch.setattr(claude_native_bridge, "_run_tmux", self._run_tmux)
         monkeypatch.setattr(claude_native_bridge, "_capture_pane", self._capture_pane)
+        monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", self._pane_state)
         monkeypatch.setattr(claude_native_bridge, "time", self.clock)
+
+    def _pane_state(
+        self, socket_path: str, tmux_target: str
+    ) -> claude_native_bridge._ClaudePaneState:
+        del socket_path, tmux_target
+        return self.state
 
     def _run_tmux(self, socket_path: str, *args: str) -> None:
         del socket_path
@@ -11182,6 +11191,57 @@ def test_wait_for_input_ready_times_out_at_its_cap(
 
     assert pane.clock.monotonic() <= 2.0 + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
     assert pane.composer_keys() == []
+
+
+def test_wait_for_input_ready_reports_a_dead_pane_within_its_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A terminal that exited fails the capped wait at a liveness check, not at the cap.
+
+    The cap used to be the first probe's due time and the deadline check runs
+    first, so no probe ever ran: a dead pane burned the whole cap and came back
+    as a generic readiness timeout instead of the exit it was.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=1000.0)
+    pane.state = claude_native_bridge._ClaudePaneState(False, exited=True, exit_status="1")
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalExited) as excinfo:
+        claude_native_bridge.wait_for_input_ready(bridge_dir, ready_timeout_s=9.0)
+
+    assert excinfo.value.exit_status == "1"
+    # The reclaim spends its own dismiss window first; the first probe follows a
+    # liveness interval into the readiness wait, far short of the 9s cap.
+    assert pane.clock.monotonic() <= (
+        claude_native_bridge._OCCUPIED_INPUT_DISMISS_TIMEOUT_S
+        + claude_native_bridge._CLAUDE_LIVENESS_POLL_INTERVAL_S
+        + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+    )
+    assert pane.composer_keys() == []
+
+
+@pytest.mark.parametrize("alive", [True, None])
+def test_capped_readiness_probes_liveness_until_its_cap(
+    monkeypatch: pytest.MonkeyPatch, alive: bool | None
+) -> None:
+    """A capped wait probes on the regular cadence and still ends exactly at its cap."""
+    clock = _VirtualClock()
+    probe = Mock(return_value=claude_native_bridge._ClaudePaneState(alive))
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/sock", "main", timeout_s=3.5, extend_for_slow_boot=False
+        )
+
+    assert clock.monotonic() == 3.5
+    # One probe per liveness interval (1s, 2s, 3s), none at the cap itself.
+    assert probe.call_count == 3
 
 
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
