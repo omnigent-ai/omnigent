@@ -29,7 +29,7 @@ export function setSessionHost(sessionId: string, hostId: string | null | undefi
   }
 }
 
-// A sub-agent child runs on its parent's runner, whose tunnel lives on the
+// A sub-agent or side chat runs on its parent's runner, whose tunnel lives on the
 // replica keyed by the PARENT's host — the child row carries no host_id of its
 // own. Recording the parent link lets a child key its traffic by the nearest
 // host-bound ancestor instead of going keyless to the default replica.
@@ -39,16 +39,23 @@ const _sessionParents = new Map<string, string>();
  * Record (or clear) a session's parent so a hostless child resolves its host
  * through the ancestor chain. Called wherever a session object is parsed.
  */
-export function setSessionParent(sessionId: string, parentId: string | null | undefined): void {
-  if (parentId && parentId !== sessionId) {
-    _sessionParents.set(sessionId, parentId);
+export function setSessionParent(
+  sessionId: string,
+  parentId: string | null | undefined,
+  labels?: Record<string, string>,
+): void {
+  // Generic side chats stay top-level but route through their fork source.
+  const routingParent =
+    parentId ?? (labels?.["omnigent.side_chat"] === "1" ? labels["omnigent.fork.source_id"] : null);
+  if (routingParent && routingParent !== sessionId) {
+    _sessionParents.set(sessionId, routingParent);
   } else {
     _sessionParents.delete(sessionId);
   }
 }
 
 /**
- * A session's recorded parent id, or `null` for a top-level session or one
+ * A session's routing parent id, or `null` for an independent session or one
  * whose snapshot hasn't been seen yet.
  */
 export function getSessionParent(sessionId: string): string | null {

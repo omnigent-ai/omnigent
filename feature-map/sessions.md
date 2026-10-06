@@ -220,6 +220,11 @@ plain `uv run pytest`, which starts a private server for the test.
   mobile side-chat drawer. Its stale-branch scenarios simulate an offline parent
   runner to exercise host-launch fallback; the hosted lifecycle test above
   proves live-parent reuse with actual runner processes.
+- **`side-chat-lifecycle`, native Codex:**
+  `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
+  drives a real Codex CLI and app-server with scripted model replies. It checks
+  inherited context in the model request, isolated follow-ups, and a parent
+  that stays usable after closing its side chat.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`

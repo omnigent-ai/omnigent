@@ -317,7 +317,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   // attach) can pin to the replica holding that host's runner tunnel; a
   // sub-agent child inherits its parent's through the recorded parent link.
   setSessionHost(wire.id, wire.host_id);
-  setSessionParent(wire.id, wire.parent_session_id);
+  setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
     agentId: wire.agent_id,

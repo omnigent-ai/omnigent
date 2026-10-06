@@ -19,7 +19,12 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+from omnigent.errors import ErrorCode
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
+from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY, SIDE_CHAT_LABEL_KEY
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
@@ -163,6 +168,58 @@ async def test_runner_status_hides_other_users_runner(
 
 
 # ── Tests: Runner binding requires ownership ─────────
+
+
+@pytest.mark.parametrize("previous_runner", [None, "runner_previous"])
+@pytest.mark.parametrize(
+    ("caller", "requested_runner", "host_online", "expected_code"),
+    [
+        (ALICE, ALICE_RUNNER, True, ErrorCode.WRONG_REPLICA),
+        (ALICE, BOB_RUNNER, True, ErrorCode.INVALID_INPUT),
+        (ALICE, ALICE_RUNNER, False, ErrorCode.INVALID_INPUT),
+        (BOB, ALICE_RUNNER, True, ErrorCode.FORBIDDEN),
+    ],
+)
+async def test_side_chat_binding_on_another_replica_preserves_owner_and_runner_checks(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_runner: str | None,
+    caller: str,
+    requested_runner: str,
+    host_online: bool,
+    expected_code: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = "1dc34d0b40de4dcaa326713fc8badc78"
+    source = store.create_conversation(
+        runner_id=ALICE_RUNNER, host_id=host_id, workspace="/workspace"
+    )
+    side_chat = store.create_conversation(
+        runner_id=previous_runner,
+        labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: source.id},
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user(ALICE)
+    permissions.ensure_user(BOB)
+    permissions.grant(ALICE, source.id, LEVEL_OWNER)
+    permissions.grant(ALICE, side_chat.id, LEVEL_OWNER)
+    permissions.grant(BOB, side_chat.id, LEVEL_EDIT)
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(host_id, "Remote host", ALICE)
+    if not host_online:
+        host_store.set_offline(host_id)
+    monkeypatch.setattr(auth_app.state.runner_router, "_host_store", host_store)
+
+    response = await _patch_runner(auth_client, side_chat.id, requested_runner, caller)
+
+    assert response.json()["error"]["code"] == expected_code, response.text
+    unchanged = store.get_conversation(side_chat.id)
+    assert unchanged is not None
+    assert unchanged.runner_id == previous_runner
+    assert unchanged.host_id is None
+    assert unchanged.labels[FORK_SOURCE_LABEL_KEY] == source.id
 
 
 async def test_bind_own_runner_succeeds(

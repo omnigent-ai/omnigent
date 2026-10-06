@@ -7,6 +7,7 @@ dispatch, streaming, and transcript persistence use the real backend.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Iterator
@@ -15,6 +16,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, open_right_rail
 
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
@@ -222,6 +224,17 @@ def test_side_chat_sends_with_stale_branch_metadata(
     assert followup in child_text
     assert "First side answer." in child_text
     assert "Second side answer." in child_text
+    model_inputs = [
+        json.dumps(request.get("input", []))
+        for request in get_mock_requests(mock_llm_server_url, key="gpt-4o-mini")
+    ]
+    first_input = next(text for text in model_inputs if question in text and followup not in text)
+    followup_input = next(text for text in model_inputs if followup in text)
+    assert parent_question in first_input
+    assert parent_reply in first_input
+    assert parent_reply in followup_input
+    assert question in followup_input
+    assert "First side answer." in followup_input
     expect(page).to_have_url(f"{base_url}/c/{session_id}")
 
 

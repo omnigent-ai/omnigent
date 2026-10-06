@@ -12,7 +12,12 @@
 // gets the user's actual level for any conversation they navigate to.
 
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
-import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import {
+  getSessionHost,
+  getSessionParent,
+  setSessionHost,
+  setSessionParent,
+} from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import type { Session } from "@/lib/types";
@@ -190,7 +195,7 @@ export async function prefetchSessionHostChain(
     // `sessionFromWire` records these on a live fetch; re-record so a cached
     // snapshot seeds the map the same way.
     setSessionHost(session.id, session.hostId);
-    setSessionParent(session.id, session.parentSessionId);
-    id = session.parentSessionId;
+    setSessionParent(session.id, session.parentSessionId, session.labels);
+    id = getSessionParent(session.id);
   }
 }

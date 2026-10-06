@@ -154,6 +154,26 @@ describe("prefetchSessionHostChain", () => {
     expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each([false, true])("resolves nested side chats after reload (cached: %s)", async (cached) => {
+    const { client } = harness();
+    const side = {
+      ...routed(`side_${cached}`, null, null),
+      labels: { "omnigent.side_chat": "1", "omnigent.fork.source_id": `outer_${cached}` },
+    };
+    const outer = {
+      ...routed(`outer_${cached}`, null, null),
+      labels: { "omnigent.side_chat": "1", "omnigent.fork.source_id": `root_${cached}` },
+    };
+    if (cached) client.setQueryData(["session", side.id], side);
+    serve([side, outer, routed(`root_${cached}`, "host_side", null)]);
+
+    await prefetchSessionHostChain(client, side.id);
+
+    expect(getSessionHost(side.id)).toBe("host_side");
+    expect(side.parentSessionId).toBeNull();
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(cached ? 2 : 3);
+  });
+
   it("terminates on a malformed parent cycle", async () => {
     const { client } = harness();
     serve([routed("cycle_a", null, "cycle_b"), routed("cycle_b", null, "cycle_a")]);

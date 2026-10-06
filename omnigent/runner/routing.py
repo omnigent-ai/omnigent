@@ -21,6 +21,7 @@ from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import telemetry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec import AgentSpec
+from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY, SIDE_CHAT_LABEL_KEY
 
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
@@ -77,9 +78,9 @@ def routing_host_id(
     """
     Return the host whose replica serves *conv*'s runner tunnel.
 
-    A host-bound session is served by its own ``host_id``. A sub-agent child
-    copies its parent's ``runner_id`` at creation but carries no host binding
-    of its own. The nearest host-bound ancestor identifies the shared tunnel's
+    A host-bound session is served by its own ``host_id``. Sub-agents and
+    side chats can share another session's runner without owning its host
+    binding. Follow their parent or fork source to identify the shared tunnel's
     replica, so a routing miss is distinguished from a dead runner.
 
     :param conv: Conversation whose runner is being routed.
@@ -88,12 +89,23 @@ def routing_host_id(
     :returns: The routing host id, or ``None`` when no host is bound anywhere
         in the chain or the read budget is exhausted.
     """
-    if conv.host_id is not None or conv.kind != "sub_agent":
+    if conv.host_id is not None:
         return conv.host_id
     reads = 0
     visited = {conv.id}
-    ancestor_id = conv.parent_conversation_id
-    while ancestor_id is not None and ancestor_id not in visited:
+    current = conv
+    root_id = None
+    while True:
+        is_side_chat = current.kind == "default" and current.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+        if current.kind == "sub_agent":
+            ancestor_id = current.parent_conversation_id
+            root_id = current.root_conversation_id
+        elif is_side_chat:
+            ancestor_id = current.labels.get(FORK_SOURCE_LABEL_KEY)
+        else:
+            break
+        if ancestor_id is None or ancestor_id in visited:
+            break
         if max_ancestor_reads is not None and reads >= max_ancestor_reads:
             return None
         reads += 1
@@ -101,12 +113,17 @@ def routing_host_id(
         ancestor = conversation_store.get_conversation(ancestor_id)
         if ancestor is None:
             break
+        if (
+            is_side_chat
+            and current.runner_id is not None
+            and current.runner_id != ancestor.runner_id
+        ):
+            return None
         if ancestor.host_id is not None:
             return ancestor.host_id
-        ancestor_id = ancestor.parent_conversation_id
+        current = ancestor
 
     # Retain the root fallback when an intermediate parent is missing or cyclic.
-    root_id = conv.root_conversation_id
     if root_id is not None and root_id not in visited:
         if max_ancestor_reads is not None and reads >= max_ancestor_reads:
             return None
@@ -362,7 +379,7 @@ class RunnerRouter:
         registry-only check — single-replica setups never misroute.
 
         :param host_id: The session's routing host id (its own ``host_id``, or
-            a sub-agent's host-bound ancestor — see :func:`routing_host_id`),
+            a shared runner's source host — see :func:`routing_host_id`),
             or ``None`` for a hostless local runner, which is always genuinely
             offline when its tunnel drops.
         :returns: The error code string to raise.

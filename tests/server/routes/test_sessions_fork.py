@@ -33,7 +33,11 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
-from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS, SIDE_CHAT_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    _FORK_ONLY_DROPPED_LABEL_KEYS,
+    FORK_SOURCE_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+)
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -600,6 +604,25 @@ def _build_app(
 
 
 # ── Tests ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_side_chat_records_its_source_without_a_persisted_workspace(nested: bool) -> None:
+    source = _make_conversation(
+        labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: "original"} if nested else {}
+    )
+    store = _ConversationStore({source.id: source})
+    client = TestClient(_build_app(store))
+
+    response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": True})
+
+    assert response.status_code == 201, response.text
+    labels = response.json()["labels"]
+    assert labels[SIDE_CHAT_LABEL_KEY] == "1"
+    assert labels[FORK_SOURCE_LABEL_KEY] == source.id
+    assert response.json()["kind"] == "default"
+    assert response.json()["host_id"] is None
+    assert response.json()["parent_session_id"] is None
 
 
 @pytest.mark.asyncio

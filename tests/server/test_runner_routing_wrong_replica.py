@@ -6,6 +6,7 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError, make_tunnel_ws_factory
+from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY, SIDE_CHAT_LABEL_KEY
 
 
 class MockHostRegistry:
@@ -133,7 +134,8 @@ def test_runner_absent_code_no_store_registry_only_returns_wrong_replica():
 
 @pytest.mark.parametrize("surface", ["resources", "existing", "dispatch", "terminal_attach"])
 @pytest.mark.parametrize("ancestry", ["direct", "nested", "nested_hostless_root"])
-def test_colocated_child_on_another_replica_is_not_reported_offline(surface, ancestry):
+@pytest.mark.parametrize("side_chat", [False, True])
+def test_colocated_child_on_another_replica_is_not_reported_offline(surface, ancestry, side_chat):
     parent = Conversation(
         id="parent",
         created_at=1,
@@ -146,10 +148,11 @@ def test_colocated_child_on_another_replica_is_not_reported_offline(surface, anc
         id="child",
         created_at=1,
         updated_at=1,
-        root_conversation_id="parent",
-        parent_conversation_id="parent",
-        kind="sub_agent",
+        root_conversation_id="child" if side_chat else "parent",
+        parent_conversation_id=None if side_chat else "parent",
+        kind="default" if side_chat else "sub_agent",
         runner_id=parent.runner_id,
+        labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: parent.id} if side_chat else {},
     )
     conversations = [parent, child]
     if ancestry != "direct":
@@ -164,16 +167,22 @@ def test_colocated_child_on_another_replica_is_not_reported_offline(surface, anc
             id="intermediate",
             created_at=1,
             updated_at=1,
-            root_conversation_id=root.id,
-            parent_conversation_id=parent.id,
-            kind="sub_agent",
+            root_conversation_id="intermediate" if side_chat else root.id,
+            parent_conversation_id=None if side_chat else parent.id,
+            kind="default" if side_chat else "sub_agent",
             runner_id=parent.runner_id,
+            labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: parent.id}
+            if side_chat
+            else {},
         )
         parent.parent_conversation_id = root.id
         parent.root_conversation_id = root.id
         parent.kind = "sub_agent"
-        child.parent_conversation_id = intermediate.id
-        child.root_conversation_id = root.id
+        if side_chat:
+            child.labels[FORK_SOURCE_LABEL_KEY] = intermediate.id
+        else:
+            child.parent_conversation_id = intermediate.id
+            child.root_conversation_id = root.id
         conversations.extend([root, intermediate])
     registry = MockTunnelRegistry()
     router = RunnerRouter(
@@ -196,6 +205,79 @@ def test_colocated_child_on_another_replica_is_not_reported_offline(surface, anc
                 router.client_for_conversation(conversation_id=child.id, harness="pi-native")
         assert caught.value.code == ErrorCode.WRONG_REPLICA
     assert child.host_id is None
+
+
+@pytest.mark.parametrize("runner_id", [None, "runner_shared", "runner_different"])
+@pytest.mark.parametrize("side_chat", [False, True])
+def test_fork_source_only_routes_side_chats_sharing_the_source_runner(runner_id, side_chat):
+    source = Conversation(
+        id="source",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="source",
+        runner_id="runner_shared",
+        host_id="host_source",
+    )
+    fork = Conversation(
+        id="fork",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="fork",
+        runner_id=runner_id,
+        labels={FORK_SOURCE_LABEL_KEY: source.id, SIDE_CHAT_LABEL_KEY: "1" if side_chat else "0"},
+    )
+
+    host_id = routing_host_id(fork, MockConversationStore(source, fork))
+
+    assert host_id == ("host_source" if side_chat and runner_id != "runner_different" else None)
+    assert fork.host_id is None
+    assert fork.parent_conversation_id is None
+
+
+@pytest.mark.parametrize("max_reads", [0, 1, 2])
+def test_side_chat_routing_respects_read_budget_and_subagent_root_fallback(max_reads):
+    root = Conversation(
+        id="root", created_at=1, updated_at=1, root_conversation_id="root", host_id="host_root"
+    )
+    source = Conversation(
+        id="source",
+        created_at=1,
+        updated_at=1,
+        kind="sub_agent",
+        root_conversation_id=root.id,
+        runner_id="runner_shared",
+    )
+    side_chat = Conversation(
+        id="side",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="side",
+        runner_id=source.runner_id,
+        labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: source.id},
+    )
+
+    assert routing_host_id(
+        side_chat, MockConversationStore(root, source, side_chat), max_ancestor_reads=max_reads
+    ) == ("host_root" if max_reads == 2 else None)
+
+
+def test_side_chat_routing_handles_cyclic_source_links():
+    side_chat = Conversation(
+        id="side",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="side",
+        labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: "source"},
+    )
+    source = Conversation(
+        id="source",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="source",
+        labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: side_chat.id},
+    )
+
+    assert routing_host_id(side_chat, MockConversationStore(side_chat, source)) is None
 
 
 @pytest.mark.parametrize("root_host", [None, "host_root"])

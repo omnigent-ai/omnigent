@@ -75,7 +75,12 @@ def test_stop_session_stops_hosted_side_chats(
             tmp_path,
             server_cwd=_REPO,
             base_env=base_env,
-            server_env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": None},
+            server_env={
+                **env,
+                "OMNIGENT_RUNNER_TUNNEL_TOKEN": None,
+                "OMNIGENT_WEB_UI_DIST": os.environ.get("OMNIGENT_WEB_UI_DIST")
+                or str(_REPO / "omnigent/server/static/web-ui"),
+            },
             poll_interval=0.2,
         ) as stack,
         httpx.Client(
@@ -116,6 +121,17 @@ def test_stop_session_stops_hosted_side_chats(
 
         parent_id = create("Stop with side chats")
         unrelated_id = create("Unrelated session")
+        runner_launches: list[str] = []
+        page.on(
+            "request",
+            lambda request: (
+                runner_launches.append(request.url)
+                if request.method == "POST"
+                and "/v1/hosts/" in request.url
+                and request.url.endswith("/runners")
+                else None
+            ),
+        )
         page.goto(f"{stack.base_url}/c/{parent_id}")
         parent_prompt = f"parent-{parent_id}: remember this conversation"
         reset_mock_llm(mock_llm_server_url)
@@ -146,6 +162,7 @@ def test_stop_session_stops_hosted_side_chats(
         runners = {session_id: snapshot["runner_id"] for session_id, snapshot in snapshots.items()}
         assert runners[parent_id] == runners[closed_id] == runners[child_id], snapshots
         assert runners[unrelated_id] != runners[parent_id], snapshots
+        assert not runner_launches, runner_launches
 
         def online(session_id: str) -> bool:
             return get(f"/v1/runners/{runners[session_id]}/status")["online"]
@@ -171,7 +188,13 @@ def test_stop_session_stops_hosted_side_chats(
 
         page.get_by_role("tab", name="Side chat 1", exact=True).click()
         block_side_chat(f"closing-{parent_id}: keep working until this tab closes")
-        with page.expect_response(f"**/v1/sessions/{closed_id}/events") as closed:
+        with page.expect_response(
+            lambda response: (
+                response.url.endswith(f"/v1/sessions/{closed_id}/events")
+                and response.request.method == "POST"
+                and response.request.post_data_json.get("type") == "stop_session"
+            )
+        ) as closed:
             page.get_by_role("button", name="Close Side chat 1", exact=True).click()
         assert closed.value.ok
         assert closed.value.request.post_data_json["type"] == "stop_session"
@@ -210,7 +233,13 @@ def test_stop_session_stops_hosted_side_chats(
             row.get_by_test_id("conversation-actions").click()
         page.get_by_test_id("stop-conversation").click()
         page.screenshot(path=str(tmp_path / "before-stop.png"))
-        with page.expect_response(f"**/v1/sessions/{parent_id}/events") as stopped:
+        with page.expect_response(
+            lambda response: (
+                response.url.endswith(f"/v1/sessions/{parent_id}/events")
+                and response.request.method == "POST"
+                and response.request.post_data_json.get("type") == "stop_session"
+            )
+        ) as stopped:
             page.get_by_test_id("stop-session-confirm").click()
         assert stopped.value.ok
         assert stopped.value.request.post_data_json["type"] == "stop_session"
@@ -240,15 +269,21 @@ def test_stop_session_stops_hosted_side_chats(
         fresh = get(f"/v1/sessions/{fresh_id}")
         assert fresh["runner_id"] != runners[parent_id]
         assert fresh["host_id"] == host["host_id"]
+        assert len(runner_launches) == 1, runner_launches
         assert get(f"/v1/runners/{fresh['runner_id']}/status")["online"]
         assert not online(parent_id) and not online(child_id)
         assert online(unrelated_id)
         assert _items(stack.base_url, parent_id) == parent_items
         page.screenshot(path=str(tmp_path / "fresh-side-chat.png"))
+        assert stack.server is not None and stack.host is not None
         (tmp_path / "evidence.json").write_text(
             json.dumps(
                 {
                     "entrypoint": entrypoint,
+                    "server_version": get("/api/version"),
+                    "server_process": stack.server.args,
+                    "host_process": stack.host.args,
+                    "runner_launches": runner_launches,
                     "before": snapshots,
                     "runner_online_after_stop": stopped_runners,
                     "fresh": fresh,
