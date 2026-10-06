@@ -46,7 +46,13 @@ from omnigent.debug_logging import (
     debug_event,
     runner_log_scope,
 )
-from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorImpact,
+    ErrorPhase,
+    category_for_code,
+    phase_for_code,
+)
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -63,16 +69,18 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
-    HostImportLocalSessionFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -82,13 +90,21 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostMcpServersFrame,
+    HostMcpServersResultFrame,
+    HostMcpToolsFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPluginsFrame,
+    HostPluginsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillContentFrame,
+    HostSkillContentResultFrame,
     HostSkillsFrame,
     HostSkillsResultFrame,
     HostStatFrame,
@@ -97,8 +113,10 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    ImportSessionChunkingUnsupportedError,
     decode_host_frame,
     encode_host_frame,
+    encode_import_local_session_frames,
     workspace_missing_message,
 )
 from omnigent.host.git_worktree import (
@@ -563,14 +581,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",
         LOG_TTY_FD_ENV_VAR,
-        # Debug-log sink config + creds (OMNI-4198). The runner uploads its OWN
-        # process logs to the debug-logs table, so it needs these — including the
-        # service-principal secret. That is the one deliberate exception to the
-        # "no secrets" rule: it is the app's SP creds for log upload (not a user
-        # secret), and the runner is a trusted child. Without them the runner's
-        # sink never arms and runner logs never reach the table.
+        # Debug-log sink config. A secret-provider command is preferred because
+        # the uploader invokes it asynchronously and keeps its output in memory.
+        # The static secret remains supported for existing integrations.
         "OMNIGENT_DEBUG_LOG_CLIENT_ID",
         "OMNIGENT_DEBUG_LOG_CLIENT_SECRET",
+        "OMNIGENT_DEBUG_LOG_CLIENT_SECRET_COMMAND",
         "OMNIGENT_DEBUG_LOG_WORKSPACE_URL",
         "OMNIGENT_DEBUG_LOG_ENDPOINT",
         # Secret-store backend selector. The CLI's `configure harnesses` stores
@@ -641,6 +657,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ssh-agent auth, so git-over-SSH and SSH-cert-authenticated tooling
         # fail with "dial unix: missing address".
         "SSH_AUTH_SOCK",
+        # The user's URL-opener command (e.g. a remote-dev helper that forwards
+        # URLs and OAuth callbacks to the laptop). A command name, not a secret.
+        # Without it, CLI logins in the agent fall back to a local browser.
+        "BROWSER",
         # gcloud Application Default Credentials selectors, same class as
         # KUBECONFIG above: AGY_ADC_AUTH is the boolean the Antigravity CLI
         # (agy) reads to pick ADC auth, GOOGLE_APPLICATION_CREDENTIALS is a
@@ -1060,6 +1080,43 @@ class _RunnerHandle:
     stop_requested: bool = False
 
 
+@dataclass(frozen=True)
+class _HostFrameFailureContext:
+    """Safe metadata retained when a host-frame task fails."""
+
+    frame_kind: str | None = None
+    request_id: str | None = None
+    session_id: str | None = None
+    runner_id: str | None = None
+
+
+def _host_frame_failure_context(raw: str) -> _HostFrameFailureContext:
+    """Decode only correlation metadata for a failure diagnostic.
+
+    This failure-only pass returns no metadata for malformed or partially
+    decoded frames, rather than trusting fields from an invalid payload.
+    """
+    try:
+        frame: HostFrame = decode_host_frame(raw)
+        payload = json.loads(raw)
+        frame_kind = payload.get("kind") if isinstance(payload, dict) else None
+        if not isinstance(frame_kind, str):
+            frame_kind = type(frame).__name__
+    except Exception:  # noqa: BLE001 — failure logging must never fail again
+        return _HostFrameFailureContext()
+
+    def _text_field(name: str) -> str | None:
+        value = getattr(frame, name, None)
+        return value if isinstance(value, str) and value else None
+
+    return _HostFrameFailureContext(
+        frame_kind=frame_kind,
+        request_id=_text_field("request_id"),
+        session_id=_text_field("session_id"),
+        runner_id=_text_field("runner_id"),
+    )
+
+
 class HostRetryableConnectionError(Exception):
     """Server-reported channel failure that should use reconnect backoff."""
 
@@ -1111,6 +1168,12 @@ class HostProcess:
         from omnigent.host.skills import HostSkillDiscovery
 
         self._skill_discovery = HostSkillDiscovery(self._fetch_skill_bundle)
+        from omnigent.host.mcp_inventory import HostMcpInventory
+
+        self._mcp_inventory = HostMcpInventory()
+        from omnigent.host.mcp_tools import HostMcpTools
+
+        self._mcp_tools = HostMcpTools()
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -1640,12 +1703,15 @@ class HostProcess:
         error: str,
         *,
         error_code: str | None = None,
+        error_category: ErrorCategory = ErrorCategory.HOST,
     ) -> HostLaunchRunnerResultFrame:
         """Report and return a failed runner launch.
 
         :param frame: Launch request that failed.
         :param error: Human-readable failure reason.
         :param error_code: Optional machine-readable failure category.
+        :param error_category: Fault attribution for an uncoded failure; a coded
+            preflight refusal uses its code's mapping instead.
         :returns: Failed result frame for the server.
         """
         session_id = frame.session_id or "<unknown>"
@@ -1667,6 +1733,13 @@ class HostProcess:
                 host_request_id=frame.request_id,
                 stage="runner_launch",
                 error_code=error_code or "runner_spawn_failed",
+                error_category=(
+                    category_for_code(error_code) if error_code else error_category
+                ).value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=(
+                    phase_for_code(error_code) if error_code else ErrorPhase.RUNNER_LAUNCH
+                ).value,
             ),
         )
         print(
@@ -1910,7 +1983,7 @@ class HostProcess:
             self._trigger_maintenance("runner_launch_failed")
             # The returned result retains the diagnostic tail, while
             # _launch_failed limits the host lifecycle line to its first line.
-            return self._launch_failed(frame, error)
+            return self._launch_failed(frame, error, error_category=ErrorCategory.RUNNER)
 
         # One live runner per session: the session's previous runner —
         # whose binding the server has already rotated away — is
@@ -2618,13 +2691,28 @@ class HostProcess:
                             }
                         )
                         continue
-                    await ws.send(
-                        encode_host_frame(
-                            HostImportLocalSessionFrame(
-                                request_id=frame.request_id, total=total, session=session
-                            )
-                        )
+                    # Oversized sessions are sliced into chunk frames; a single
+                    # whole-session frame past the tunnel's message cap would
+                    # drop the host connection and kill the rest of the batch.
+                    for text in encode_import_local_session_frames(
+                        frame.request_id,
+                        total,
+                        session,
+                        allow_chunks=frame.allow_session_chunks,
+                    ):
+                        await ws.send(text)
+                except ImportSessionChunkingUnsupportedError:
+                    failures.append(
+                        {
+                            "external_session_id": session_id,
+                            "source": source,
+                            "reason": (
+                                "This session is too large for the connected server. "
+                                "Upgrade the server and retry."
+                            ),
+                        }
                     )
+                    continue
                 except ConnectionClosed:
                     # Dead tunnel: abort the batch (recovery is owned upstream),
                     # never a per-session skip — nothing more can be sent.
@@ -3145,6 +3233,73 @@ class HostProcess:
                 error="skill discovery failed; see the host log",
             )
 
+    def _handle_harness_startup(
+        self, frame: HostHarnessStartupFrame
+    ) -> HostHarnessStartupResultFrame:
+        """Read launch metadata locally, keeping config values off the tunnel."""
+        from omnigent.host.harness_startup import describe_harness_startup
+
+        try:
+            return HostHarnessStartupResultFrame(
+                frame.request_id, describe_harness_startup(frame.harness)
+            )
+        except Exception:
+            _logger.exception("Harness launch settings failed")
+            return HostHarnessStartupResultFrame(frame.request_id)
+
+    def _handle_mcp_servers(self, frame: HostMcpServersFrame) -> HostMcpServersResultFrame:
+        """List user-level MCP servers in a worker thread."""
+        try:
+            servers = self._mcp_inventory.discover()
+        except Exception:
+            _logger.exception("MCP inventory failed")
+            return HostMcpServersResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="MCP inventory failed; see the host log",
+            )
+        return HostMcpServersResultFrame(
+            request_id=frame.request_id, status="ok", mcp_servers=servers
+        )
+
+    def _handle_plugins(self, frame: HostPluginsFrame) -> HostPluginsResultFrame:
+        """Read installed plugin metadata off the event loop."""
+        from omnigent.host.plugins import discover_plugins
+
+        try:
+            plugins = discover_plugins()
+        except Exception:  # noqa: BLE001 — do not log host file contents
+            return HostPluginsResultFrame(
+                request_id=frame.request_id, status="failed", error="plugin inventory failed"
+            )
+        return HostPluginsResultFrame(request_id=frame.request_id, status="ok", plugins=plugins)
+
+    def _handle_skill_content(self, frame: HostSkillContentFrame) -> HostSkillContentResultFrame:
+        from omnigent.host.skill_content import read_skill_content
+
+        try:
+            skill = read_skill_content(frame.harness, frame.name, source_id=frame.source_id)
+        except Exception:  # noqa: BLE001 — file contents must never enter exception logs
+            return HostSkillContentResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="skill content lookup failed",
+            )
+        return HostSkillContentResultFrame(request_id=frame.request_id, status="ok", skill=skill)
+
+    async def _handle_mcp_tools(self, frame: HostMcpToolsFrame) -> HostMcpToolsResultFrame:
+        try:
+            result = await self._mcp_tools.probe(
+                frame.harness, frame.server, frame.plugin, frame.source_id
+            )
+        except BlockingIOError:
+            return HostMcpToolsResultFrame(request_id=frame.request_id, status="busy")
+        except Exception:  # noqa: BLE001 — transport failures must not expose private config
+            return HostMcpToolsResultFrame(
+                request_id=frame.request_id, status="failed", error="MCP tools lookup failed"
+            )
+        return HostMcpToolsResultFrame(request_id=frame.request_id, status="ok", **result)
+
     def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
@@ -3273,7 +3428,10 @@ class HostProcess:
                 error="the codex model probe failed — see the host log",
             )
 
-        if harness == "pi-native":
+        if harness in ("pi-native", "pi"):
+            # ``pi`` is a canonical harness id (the gateway-wrapped headless
+            # Pi), not an alias of ``pi-native``; both share one configured
+            # inventory.
             try:
                 from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
@@ -3568,6 +3726,7 @@ class HostProcess:
             status="ok",
             worktree_path=created.worktree_path,
             branch=created.branch,
+            workspace=created.workspace,
         )
 
     async def _handle_remove_worktree(
@@ -3629,6 +3788,7 @@ class HostProcess:
                 worktrees = await asyncio.to_thread(
                     list_worktrees,
                     repo_path=frame.repo_path,
+                    for_cleanup=frame.for_cleanup,
                 )
         except WorktreeError as exc:
             return HostListWorktreesResultFrame(
@@ -4535,14 +4695,30 @@ class HostProcess:
         :param raw: The raw text frame received off the socket.
         :returns: None.
         """
+        started_at = time.monotonic()
         try:
             await self._handle_raw_message(ws, raw)
         except ConnectionClosed:
             # The tunnel died while this frame was in flight; the reconnect
             # loop owns recovery.
             _logger.debug("dropped frame result: tunnel closed mid-handling")
-        except Exception:
-            _logger.exception("host frame handler failed")
+        except Exception as exc:
+            failure_context = _host_frame_failure_context(raw)
+            with runner_log_scope(failure_context.session_id, failure_context.runner_id):
+                # Rebind the frame's IDs after the dispatch scope has unwound.
+                _logger.exception(
+                    "host frame handler failed",
+                    extra=debug_event(
+                        "host_frame_handler_failed",
+                        session_id=failure_context.session_id,
+                        host_id=getattr(getattr(self, "_identity", None), "host_id", None),
+                        request_id=failure_context.request_id,
+                        frame_kind=failure_context.frame_kind,
+                        runner_id=failure_context.runner_id,
+                        error_type=type(exc).__name__,
+                        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                    ),
+                )
 
     async def _handle_raw_message(
         self, ws: websockets.asyncio.client.ClientConnection, raw: str
@@ -4673,6 +4849,21 @@ class HostProcess:
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
             await ws.send(encode_host_frame(skills_result))
+        elif isinstance(frame, HostPluginsFrame):
+            plugins_result = await asyncio.to_thread(self._handle_plugins, frame)
+            await ws.send(encode_host_frame(plugins_result))
+        elif isinstance(frame, HostSkillContentFrame):
+            content_result = await asyncio.to_thread(self._handle_skill_content, frame)
+            await ws.send(encode_host_frame(content_result))
+        elif isinstance(frame, HostMcpToolsFrame):
+            tools_result = await self._handle_mcp_tools(frame)
+            await ws.send(encode_host_frame(tools_result))
+        elif isinstance(frame, HostHarnessStartupFrame):
+            startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
+            await ws.send(encode_host_frame(startup_result))
+        elif isinstance(frame, HostMcpServersFrame):
+            mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
+            await ws.send(encode_host_frame(mcp_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall

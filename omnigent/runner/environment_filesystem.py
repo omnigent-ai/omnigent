@@ -35,7 +35,6 @@ from omnigent.entities.pagination import PagedList
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.inner.os_env import (
-    _DEFAULT_READ_LIMIT,
     _edit_impl,
     _read_impl,
     _write_impl,
@@ -1060,7 +1059,7 @@ print(json.dumps({'r': results, 't': truncated}))
         path: str,
         *,
         max_bytes: int | None = None,
-        limit: int | None = _DEFAULT_READ_LIMIT,
+        limit: int | None = None,
     ) -> FileContent:
         """Read file content via the sandboxed helper.
 
@@ -1069,14 +1068,11 @@ print(json.dumps({'r': results, 't': truncated}))
         :param path: Relative file path.
         :param max_bytes: Maximum bytes to read. Defaults to
             ``_MAX_READ_BYTES`` (10 MiB).
-        :param limit: Maximum number of lines to return.  Defaults to
-            ``_DEFAULT_READ_LIMIT`` (2 000 lines) — appropriate for agent
-            tool calls.  Pass ``None`` for no line cap (e.g. the diff
-            endpoint needs the full file to render a correct before/after
-            view).
+        :param limit: Optional line cap within the byte-limited prefix.
+            Defaults to all lines within the byte cap for file previews
+            and diffs.
         :returns: The file content.
         :raises FilesystemPathNotFound: If the file does not exist.
-        :raises FileTooLarge: If the file exceeds the size limit.
         """
         byte_cap = max_bytes or _MAX_READ_BYTES
 
@@ -1101,10 +1097,8 @@ print(json.dumps({'r': results, 't': truncated}))
             self._os_env.read,
             target,
             limit=limit,
-            # Inline binary content up to the byte cap so it can be served to
-            # the viewer / download. (The agent read path omits this and gets a
-            # descriptor only — see ``_read_impl``.)
-            max_binary_bytes=byte_cap,
+            # Bound text and binary reads before content crosses the helper IPC.
+            max_bytes=byte_cap,
         )
         return self._file_content(path, result, byte_cap)
 
@@ -1160,7 +1154,7 @@ print(json.dumps({'r': results, 't': truncated}))
             data=data,
             bytes=len(data),
             encoding="utf-8",
-            truncated=byte_truncated or line_truncated,
+            truncated=bool(result.get("truncated")) or byte_truncated or line_truncated,
         )
 
     async def write(

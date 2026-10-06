@@ -61,11 +61,24 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    category_for_code,
+    restart_on_stale_cursor,
+)
 from omnigent.harness_plugins import (
+    ANTIGRAVITY_NATIVE_CODING_AGENT,
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+    DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -88,7 +101,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state
+from omnigent.server import presence, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -179,6 +192,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY,
     _LAST_TASK_ERROR_CAUSE_LABEL_KEY,
     _LAST_TASK_ERROR_CODE_LABEL_KEY,
+    _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY,
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
     _LAST_TASK_ERROR_TITLE_LABEL_KEY,
@@ -275,6 +289,7 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     ToolOutputDeltaEvent,
 )
+from omnigent.server.session_metadata_logging import harness_attributes
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -2969,6 +2984,12 @@ def _publish_external_conversation_item(
             # Hidden context on a non-user message has no live rendering
             # path that filters on the flag, so keep it off the stream.
             return
+    if (
+        item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "assistant"
+    ):
+        inflight_text.retire_native_previews(session_id)
     event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())
     payload = event.model_dump()
     if message_id is not None:
@@ -3428,6 +3449,9 @@ async def _persist_external_acp_subagent_start(
     :func:`_resolve_harness_impl` to the parent's (e.g. ``devin``) and the UI
     labels it from the harness catalog.
 
+    The shared ACP event does not identify a concrete harness, so creation
+    telemetry leaves it unresolved for both new and adopted children.
+
     Idempotent: a redelivery with the same ``subagent_id`` returns the existing
     child id, with a title-collision recovery path matching the native helpers.
 
@@ -3501,10 +3525,14 @@ async def _persist_external_acp_subagent_start(
         if adopted is None:
             raise
         await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
-        _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
+        await _publish_session_created(
+            parent_id, adopted.id, parent_conv.agent_id, conversation_store, harness=None
+        )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(
+        parent_id, child.id, parent_conv.agent_id, conversation_store, harness=None
+    )
     return child.id
 
 
@@ -3548,10 +3576,13 @@ def _find_subagent_child_by_title(
         after = page.last_id
 
 
-def _publish_session_created(
+async def _publish_session_created(
     parent_id: str,
     child_session_id: str,
     agent_id: str | None,
+    conversation_store: ConversationStore,
+    *,
+    harness: str | None,
 ) -> None:
     """
     Emit ``session.created`` on the parent's stream for a child session.
@@ -3566,6 +3597,8 @@ def _publish_session_created(
     :param agent_id: Agent id stamped on the child (the parent's
         agent), e.g. ``"ag_abc123"``. ``None`` only for legacy parents
         without one.
+    :param conversation_store: Store for the durable parent-chat activity link.
+    :param harness: The harness identified by the child event, or ``None`` when unknown.
     """
     event = SessionCreatedEvent(
         type="session.created",
@@ -3575,6 +3608,28 @@ def _publish_session_created(
         parent_session_id=parent_id,
     )
     session_stream.publish(parent_id, event.model_dump())
+    # Native-harness sub-agents are minted outside the general create path's
+    # ``session_created`` logger, so emit the join key here. Log the child
+    # explicitly without rebinding the parent relay's request scope.
+    # ``creation_kind="child"`` matches the general path's classification (these
+    # always have a parent) so both signals agree across every creation path.
+    _logger.info(
+        "Sub-agent session created",
+        extra=debug_event(
+            "session_created",
+            session_id=child_session_id,
+            agent_id=agent_id,
+            session_kind="sub_agent",
+            parent_session_id=parent_id,
+            creation_kind="child",
+            **harness_attributes(harness, source="subagent_event"),
+        ),
+    )
+    from omnigent.server.subagent_activity import record_subagent_activity
+
+    await record_subagent_activity(
+        child_session_id, "delegated", conversation_store, parent_id=parent_id
+    )
 
 
 async def _persist_external_subagent_start(
@@ -3669,6 +3724,11 @@ async def _persist_external_subagent_start(
         subagent_id,
     )
     if existing is not None:
+        from omnigent.server.subagent_activity import record_subagent_activity
+
+        await record_subagent_activity(
+            existing.id, "delegated", conversation_store, parent_id=parent_id
+        )
         return existing.id
 
     # Title format mirrors omnigent-spawned children
@@ -3727,10 +3787,22 @@ async def _persist_external_subagent_start(
         # Subagents rail) have never heard about the child — emit it now.
         # In the concurrent-race case the winner also published; a
         # duplicate event is a harmless extra cache invalidation.
-        _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
+        await _publish_session_created(
+            parent_id,
+            adopted.id,
+            parent_conv.agent_id,
+            conversation_store,
+            harness=CLAUDE_NATIVE_CODING_AGENT.harness,
+        )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(
+        parent_id,
+        child.id,
+        parent_conv.agent_id,
+        conversation_store,
+        harness=CLAUDE_NATIVE_CODING_AGENT.harness,
+    )
     return child.id
 
 
@@ -3826,10 +3898,22 @@ async def _create_and_publish_antigravity_child(
         # An orphaned row's creator died before publishing, so live clients have
         # never heard about this child; a duplicate publish in the race case is a
         # harmless extra cache invalidation.
-        _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+        await _publish_session_created(
+            parent_id,
+            existing.id,
+            parent_conv.agent_id,
+            conversation_store,
+            harness=ANTIGRAVITY_NATIVE_CODING_AGENT.harness,
+        )
         return existing.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(
+        parent_id,
+        child.id,
+        parent_conv.agent_id,
+        conversation_store,
+        harness=ANTIGRAVITY_NATIVE_CODING_AGENT.harness,
+    )
     return child.id
 
 
@@ -4107,11 +4191,23 @@ async def _create_and_publish_codex_child(
             # this child — emit it now. In the concurrent-race case the
             # winner also published; the duplicate is a harmless extra
             # cache invalidation.
-            _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+            await _publish_session_created(
+                parent_id,
+                existing.id,
+                parent_conv.agent_id,
+                conversation_store,
+                harness=CODEX_NATIVE_CODING_AGENT.harness,
+            )
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(
+        parent_id,
+        child.id,
+        parent_conv.agent_id,
+        conversation_store,
+        harness=CODEX_NATIVE_CODING_AGENT.harness,
+    )
     return child.id
 
 
@@ -4207,11 +4303,23 @@ async def _create_and_publish_devin_child(
             )
         if existing is not None:
             await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
-            _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+            await _publish_session_created(
+                parent_id,
+                existing.id,
+                parent_conv.agent_id,
+                conversation_store,
+                harness=DEVIN_NATIVE_CODING_AGENT.harness,
+            )
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(
+        parent_id,
+        child.id,
+        parent_conv.agent_id,
+        conversation_store,
+        harness=DEVIN_NATIVE_CODING_AGENT.harness,
+    )
     return child.id
 
 
@@ -4702,6 +4810,7 @@ def _publish_status(
     persist_live_status: bool = True,
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
+    failure_context: object = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4734,6 +4843,8 @@ def _publish_status(
         server-side failure logs one ERROR from here, so without it the
         dozen unrelated causes that reach this function are one
         undifferentiated signature. Ignored for non-failed edges.
+    :param failure_context: Untrusted optional native evidence, normalized at
+        the failure-log boundary. Malformed values cannot reject the status edge.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -4808,6 +4919,7 @@ def _publish_status(
                 code=failure_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
+                **failure_log_attributes(failure_context),
             ),
         )
         session_live_state.persist_scheduled_run_completion(
@@ -4940,6 +5052,7 @@ async def _persist_session_status_error_labels(
     conversation_store: ConversationStore,
     *,
     agent_name: str | None = None,
+    item_id: str | None = None,
 ) -> None:
     """
     Persist or clear the reload-visible failure detail for a session status.
@@ -4955,6 +5068,8 @@ async def _persist_session_status_error_labels(
         ``None`` to clear stale error labels on subsequent activity.
     :param conversation_store: Store used to upsert labels.
     :param agent_name: Agent responsible for this failure, captured before a rebind.
+    :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
+        a client whose POST answer was lost can match the refusal to its own send.
     """
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
@@ -4968,6 +5083,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_TITLE_LABEL_KEY: _truncate_label(error.title or ""),
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: _truncate_label(error.cause or ""),
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(error.remediation or ""),
+            _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: _truncate_label(item_id or ""),
         }
         if error is not None
         else {
@@ -4977,6 +5093,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_TITLE_LABEL_KEY: "",
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: "",
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: "",
+            _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: "",
         }
     )
     try:
@@ -4999,8 +5116,9 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
     become public ``last_task_error`` data for snapshots and child summaries.
 
     :param labels: Conversation labels, usually after closed-status projection.
-    :returns: ``{"code": "...", "message": "..."}``, or ``None`` when either
-        value is absent/cleared.
+    :returns: ``{"code": "...", "message": "..."}`` plus any recorded structured
+        field (``agent_name``, ``title``, ``cause``, ``remediation``, ``item_id``),
+        or ``None`` when either required value is absent/cleared.
     """
     raw_error_code = labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY)
     raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
@@ -5014,6 +5132,7 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
             ("title", _LAST_TASK_ERROR_TITLE_LABEL_KEY),
             ("cause", _LAST_TASK_ERROR_CAUSE_LABEL_KEY),
             ("remediation", _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY),
+            ("item_id", _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY),
         ):
             value = labels.get(label)
             if value:
@@ -5778,11 +5897,15 @@ async def _launch_runner_on_host_locked(
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
-    await asyncio.to_thread(
+    bound_conv = await asyncio.to_thread(
         conversation_store.replace_runner_id,
         conv.id,
         new_runner_id,
     )
+    if bound_conv.runner_last_seen is not None:
+        # The new token has not reached the host, so this stamp can only
+        # belong to the previous runner. Clear it before launching.
+        await asyncio.to_thread(conversation_store.clear_runner_liveness, new_runner_id)
     _logger.info(
         "Session bound to runner",
         extra=debug_event(
@@ -5866,20 +5989,36 @@ async def _launch_runner_on_host_locked(
             # No result yet — fall through to the caller's connect wait, which
             # preserves the prior fire-and-forget timing for a slow-but-fine host.
             host_conn.pending_launches.pop(request_id, None)
+            # A slow host, not a refusal: the launch may still land.
             _logger.warning(
                 "Host launch acknowledgement timed out",
                 extra=debug_event(
-                    "runner_launch_failed", stage="runner_launch", error_code="host_launch_timeout"
+                    "runner_launch_failed",
+                    stage="runner_launch",
+                    error_code="host_launch_timeout",
+                    error_category=ErrorCategory.HOST.value,
+                    error_impact=ErrorImpact.TRANSIENT.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         if result.get("status") == "failed":
+            refusal_code = result.get("error_code")
+            # Unmapped codes (spawn failures) are attributed on the host's own row.
+            refusal_category: str | None = None
+            if isinstance(refusal_code, str):
+                mapped = category_for_code(refusal_code)
+                if mapped is not ErrorCategory.UNKNOWN:
+                    refusal_category = mapped.value
             _logger.error(
                 "Host refused runner launch",
                 extra=debug_event(
                     "runner_launch_failed",
                     stage="runner_launch",
-                    error_code=result.get("error_code"),
+                    error_code=refusal_code,
+                    error_category=refusal_category,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
             return _HostLaunchAttempt(
@@ -6246,86 +6385,6 @@ async def _proxy_get_session_resources_to_runner(
             status_code=502,
             detail="runner session-resources endpoint unavailable",
         ) from exc
-
-
-async def _reset_runner_resources_after_switch(*args: Any, **kwargs: Any) -> None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return await _facade._reset_runner_resources_after_switch(*args, **kwargs)
-
-
-async def _reset_runner_resources_after_switch_impl(session_id: str) -> None:
-    """Best-effort reset of the session's runner-side state after a switch.
-
-    Run as a fire-and-forget background task by the switch-agent route. Calls
-    the runner's dedicated ``POST /v1/sessions/{id}/reset-state`` endpoint,
-    which closes the cached primary OSEnv + terminals AND drops the
-    spec-derived session caches. Two reasons:
-
-    1. **Sandbox correctness.** The primary OSEnv (which backs the web-UI
-       filesystem / shell endpoints) is materialized once per session from the
-       *original* agent's spec and cached. Closing it AND invalidating the
-       spec/snapshot caches forces the next access to re-resolve and
-       re-materialize from the NEW agent's spec, so those endpoints run
-       under the switched-to agent's ``os_env``/sandbox — not the old one.
-       (Agent ``sys_os_*`` tool calls already re-derive os_env per call, and
-       native terminals re-evaluate the sandbox gate on respawn; this closes
-       the remaining stale path.)
-    2. **Terminal rebuild.** A lingering native terminal would otherwise shadow
-       the switch-back transcript rebuild (auto-create skips while one exists).
-
-    A dedicated endpoint (rather than ``DELETE /resources``) keeps the
-    session-deletion contract untouched — deletion never needs the
-    switch-specific cache reset.
-
-    A switch only runs while the session is idle, so closing the env + terminal
-    here is safe — unlike doing it inside the next turn's dispatch, which wedges
-    that turn. cwd is re-derived from the runner's bound workspace, so the
-    working directory / git worktree is preserved (only the sandbox changes;
-    a ``fork``/``start_in_scratch`` agent gets a fresh scratch copy). The
-    claude-native auto-create gate remains the switch-back safety net if this
-    call is lost (runner offline, races).
-
-    :param session_id: Session/conversation id just switched, e.g.
-        ``"conv_abc123"``.
-    :returns: None.
-    """
-    try:
-        runner_client = await _get_runner_client_for_resource_access(session_id)
-        if runner_client is None:
-            return
-        reset_resp = await runner_client.post(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/reset-state",
-            timeout=15.0,
-        )
-        # httpx only raises on transport errors — a 4xx/5xx reset response
-        # still returns. A non-2xx means the runner did NOT close the old
-        # env, so it must take the failure path below (suppressing the
-        # invalidation publish); HTTPStatusError is an httpx.HTTPError.
-        reset_resp.raise_for_status()
-    except (httpx.HTTPError, HTTPException, OmnigentError, RuntimeError):
-        # Best-effort: a runner hiccup must not break the (already-committed)
-        # switch. OmnigentError covers the session-not-runner-bound / runner-
-        # offline case raised by _get_runner_client_for_resource_access. The
-        # auto-create gate rebuilds on switch-back regardless. No
-        # changed-files event on this path either: the runner's env cache is
-        # still the OLD agent's, so a triggered refetch would re-serve it —
-        # and a lost runner rebuilds from the new spec on relaunch anyway.
-        _logger.warning(
-            "post-switch runner-resource reset failed for session=%s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-        return
-    # The old agent's cached OSEnv is now closed, so a refetch triggered by
-    # this event re-materializes filesystem state from the NEW agent's spec.
-    # This is what flips the web Files tab when the switch crosses an
-    # os_env boundary (none→some shows it, some→none hides it) — the
-    # session.agent_changed event fires before the reset and so cannot
-    # carry a trustworthy availability signal.
-    _publish_changed_files_invalidated(session_id)
 
 
 def _native_coding_agent_for_session(conv: Conversation) -> NativeCodingAgent | None:
@@ -6871,6 +6930,14 @@ async def _stop_session_via_runner_impl(
     return True
 
 
+@dataclass
+class _HostRunnerStopAttempt:
+    """Track frame handoff and explicit rejection across caller cancellation."""
+
+    dispatched: bool = False
+    rejected: bool = False
+
+
 async def _stop_session_host_runner(
     session_id: str,
     host_id: str,
@@ -6878,6 +6945,7 @@ async def _stop_session_host_runner(
     host_registry: Any,
     *,
     expect_already_stopped: bool = False,
+    attempt: _HostRunnerStopAttempt | None = None,
 ) -> bool:
     """
     Terminate the host-launched runner backing a host-spawned session.
@@ -6919,11 +6987,11 @@ async def _stop_session_host_runner(
         instead of warning, for callers that race another reaper for the same
         runner (the relaunch belt: see
         :func:`_spawn_superseded_runner_stop`). Delivery failures still warn.
-    :returns: ``True`` when the stop was delivered and acknowledged (the
-        runner is exiting, so a tunnel drop is expected); ``False`` on any
-        best-effort early-out (no host registry, host offline/replaced,
-        ack timeout, or host-reported failure) where the runner may keep
-        running and no tunnel drop will follow.
+    :param attempt: Optional caller-owned progress record that survives cancellation.
+    :returns: ``True`` after a successful acknowledgement; ``False`` for an
+        unavailable host, rejected send, timeout, or host-reported failure.
+        A dispatched stop can still finish after a timeout or cancellation;
+        ``attempt`` distinguishes that uncertainty from definitive rejection.
     """
     if host_registry is None:
         return False
@@ -6948,33 +7016,38 @@ async def _stop_session_host_runner(
         HostStopRunnerFrame(request_id=request_id, runner_id=runner_id),
     )
     try:
-        host_registry.send_text(conn, stop_frame)
-    except ConnectionError:
+        try:
+            host_registry.send_text(conn, stop_frame)
+        except ConnectionError:
+            _logger.warning(
+                "Cannot stop runner %s for session %s: host %s connection was replaced",
+                runner_id,
+                session_id,
+                host_id,
+                extra={"session_id": session_id},
+            )
+            return False
+        if attempt is not None:
+            attempt.dispatched = True
+        try:
+            result = await asyncio.wait_for(
+                future,
+                timeout=_STOP_RUNNER_RESULT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            _logger.warning(
+                "Host %s did not acknowledge stop of runner %s for session %s",
+                host_id,
+                runner_id,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            return False
+    finally:
         conn.pending_stops.pop(request_id, None)
-        _logger.warning(
-            "Cannot stop runner %s for session %s: host %s connection was replaced",
-            runner_id,
-            session_id,
-            host_id,
-            extra={"session_id": session_id},
-        )
-        return False
-    try:
-        result = await asyncio.wait_for(
-            future,
-            timeout=_STOP_RUNNER_RESULT_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        conn.pending_stops.pop(request_id, None)
-        _logger.warning(
-            "Host %s did not acknowledge stop of runner %s for session %s",
-            host_id,
-            runner_id,
-            session_id,
-            extra={"session_id": session_id},
-        )
-        return False
     if result.get("status") == "failed":
+        if attempt is not None:
+            attempt.rejected = True
         # An unknown runner means someone already reaped it. Expected for the
         # relaunch belt, which the host's own supersession normally beats, so
         # a warning there would report a successful reap as a failure.
@@ -6994,6 +7067,8 @@ def _build_new_item(
     body: SessionEventInput,
     response_id: str,
     created_by: str | None = None,
+    *,
+    adopt_stable_id: bool = False,
 ) -> NewConversationItem:
     """
     Construct a :class:`NewConversationItem` from a POSTed event.
@@ -7018,6 +7093,10 @@ def _build_new_item(
     :param created_by: Authenticated identity of the actor posting
         the event, recorded for per-message attribution. ``None`` in
         single-user mode.
+    :param adopt_stable_id: Persist a web user message under the
+        client-minted ``stable_id`` it carries (see
+        :func:`_web_send_stable_id`). Off by default so seeded and
+        replayed items keep store-assigned ids.
     :returns: A :class:`NewConversationItem` ready for delivery
         or persistence.
     :raises OmnigentError: When ``body.data`` does not satisfy the
@@ -7030,12 +7109,67 @@ def _build_new_item(
             f"invalid data for {body.type!r} item: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    if isinstance(data, MessageData) and data.role == "user" and not data.is_meta:
+        data = data.model_copy(update={"user_authored": True})
     return NewConversationItem(
         type=body.type,
         response_id=response_id,
         data=data,
         created_by=created_by,
+        stable_id=_web_send_stable_id(body) if adopt_stable_id else None,
     )
+
+
+def _web_send_stable_id(body: SessionEventInput) -> str | None:
+    """
+    Return the client-minted stable id of a web user-message send, if usable.
+
+    Persisting the send under its 32-hex ``stable_id`` makes the append idempotent
+    on retry and lets the client recognize its own send coming back after a lost
+    acknowledgement. Same shape gate as the native pending-input path.
+
+    :param body: Validated event input.
+    :returns: The stable id for a user message carrying a well-formed one, else ``None``.
+    """
+    raw_stable_id = body.data.get("stable_id")
+    if (
+        body.type == "message"
+        and body.data.get("role") == "user"
+        and isinstance(raw_stable_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+    ):
+        return raw_stable_id
+    return None
+
+
+def _stable_id_reuse_is_exact_retry(
+    persisted: ConversationItem, item: NewConversationItem
+) -> bool:
+    """
+    Tell whether a send deduplicated by its stable id is a retry of that item.
+
+    The store answers a repeated ``stable_id`` with the persisted item instead of
+    inserting, which is right for the retry of a send whose acknowledgement was
+    lost. A different body from the same author is not an error: web bundles
+    from before the server adopted client ids resend an edited restored draft
+    under the original id, and must keep working while such tabs stay open. The
+    caller persists that body under a store-assigned id. Another author reusing
+    a visible id is refused so a prompt can never run under someone else's item.
+
+    :param persisted: The item the store returned, flagged ``deduplicated``.
+    :param item: The item built from the request being persisted.
+    :returns: ``True`` for a byte-identical retry, ``False`` for another body
+        from the same author.
+    :raises OmnigentError: ``CONFLICT`` when the author differs.
+    """
+    if persisted.created_by != item.created_by:
+        raise OmnigentError(
+            f"stable_id {item.stable_id!r} already names another author's item in this session",
+            code=ErrorCode.CONFLICT,
+        )
+    persisted_payload = persisted.data.model_dump(mode="json", by_alias=True)
+    request_payload = item.data.model_dump(mode="json", by_alias=True)
+    return persisted.type == item.type and persisted_payload == request_payload
 
 
 def _parse_skill_slash_command(body: SessionEventInput) -> tuple[str, str]:
@@ -7876,6 +8010,18 @@ async def _relay_persist_error_once(
             session_id,
             [item],
         )
+        _logger.info(
+            "Relay: error item persisted for session=%s code=%s",
+            session_id,
+            item.data.code,
+            extra=debug_event(
+                "error_item_persisted",
+                session_id=session_id,
+                code=item.data.code,
+                level=item.data.level,
+                source=item.data.source,
+            ),
+        )
         return "persisted"
     except Exception:  # noqa: BLE001
         _logger.exception(
@@ -7918,17 +8064,17 @@ async def _relay_response_policy_deny_reason(
     conversation_store: ConversationStore,
     session_id: str,
     text: str,
+    *,
+    turn_final: bool,
 ) -> str | None:
     """
     Evaluate *text* against the session's OUTPUT (RESPONSE) phase policies.
 
     Runner-relayed (scaffold) harnesses never POST the assistant message
     back through ``POST /v1/sessions/{id}/events``, so the
-    ``Phase.RESPONSE`` evaluator there is unreachable for them. The relay's
-    terminal text flush is their single persist point, so this evaluates the
-    same output policies over the final assistant text right before it
-    becomes durable — making a spec's ``response``-phase policy enforceable
-    in the runner topology.
+    ``Phase.RESPONSE`` evaluator there is unreachable for them. The relay
+    evaluates these policies at each nonempty text flush, including
+    tool-call boundaries, before the segment becomes durable.
 
     Fails OPEN (returns ``None``) on any evaluation error, matching the LLM
     phases' advisory default: a policy-engine hiccup must not destroy the
@@ -7937,6 +8083,9 @@ async def _relay_response_policy_deny_reason(
     :param conversation_store: Store for the conversation/labels lookup.
     :param session_id: Session/conversation identifier.
     :param text: The joined assistant text segment about to persist.
+    :param turn_final: Whether ``text`` ends a successfully completed turn.
+        Forwarded as ``event["context"]["turn_final"]`` so completion
+        policies can skip intermediate and unsuccessful-turn segments.
     :returns: The deny reason when an output policy DENYs, else ``None``.
     """
     from omnigent.runtime._globals import _agent_store
@@ -7975,6 +8124,7 @@ async def _relay_response_policy_deny_reason(
             _agent_store,
             None,
             actor=_build_actor(turn_actor),
+            turn_final=turn_final,
         )
     except Exception:  # noqa: BLE001 — fail open: output phases are advisory on error
         _logger.exception(
@@ -7998,6 +8148,7 @@ async def _flush_relay_text(
     *,
     deny_reason: str | None = None,
     evaluate_response_phase: bool = False,
+    turn_final: bool = False,
 ) -> None:
     """
     Persist buffered assistant text as a message item and clear the buffer.
@@ -8055,9 +8206,13 @@ async def _flush_relay_text(
     :param model_id: Assistant agent label for the message.
     :param deny_reason: When set, an output policy already denied this
         turn's assistant text; persist the deny sentinel instead of it.
-    :param evaluate_response_phase: When ``True`` (terminal flush), gate
+    :param evaluate_response_phase: When ``True``, gate
         the text through the spec's RESPONSE-phase policies before
         persisting.
+    :param turn_final: Whether this segment ends a successfully completed
+        turn. Completion policies can use it to skip intermediate and
+        unsuccessful-turn segments. Content policies should check every
+        segment. Empty segments never invoke policies.
     """
     if not text_acc:
         return
@@ -8073,7 +8228,7 @@ async def _flush_relay_text(
         return
     if deny_reason is None and evaluate_response_phase:
         deny_reason = await _relay_response_policy_deny_reason(
-            conversation_store, session_id, text
+            conversation_store, session_id, text, turn_final=turn_final
         )
     if deny_reason is not None:
         # Substitute the sentinel for the denied content — same Option-B
@@ -8228,7 +8383,7 @@ def _agent_carries_native_fork_history_impl(agent: Agent) -> bool:
     claude-native / codex-native / pi-native each record a resumable native
     session file that the runner rebuilds from the copied Omnigent items on
     fork/resume, so a fork bound to one of them carries prior history into the
-    native CLI. Used by both fork and switch-agent. cursor-native is a native
+    native CLI. Used by fork. cursor-native is a native
     CLI but has no resumable session file to rebuild; it carries fork history a
     different way (a text preamble, fork-only — see
     :func:`_agent_carries_cursor_fork_history`), so stamping
@@ -8257,8 +8412,7 @@ def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
     Cursor's conversation is server-backed and opencode has no history-import
     API, so neither can seed a local store for a rebuilt resume; instead the
     runner replays prior turns as a text preamble on the fork (cursor: the
-    first message; opencode: a ``noReply`` context message). Fork-only —
-    switch-agent does not call this, so switching into one still launches fresh.
+    first message; opencode: a ``noReply`` context message).
     Returns ``False`` when the bundle can't be loaded.
 
     :param agent: The agent whose harness to classify.
@@ -8440,8 +8594,8 @@ def _build_policy_engine_from_spec_impl(
         conversation_store=conversation_store,
         conversation=conversation,
         # The spec was resolved from this row's agent binding; the builder
-        # confirms it against its own fresh read and fails closed if a
-        # switch-agent landed in between.
+        # confirms it against its own fresh read and fails closed if the
+        # binding changed in between.
         expected_agent_id=conversation.agent_id if conversation is not None else None,
         default_policies=caps.default_policies,
         policy_store=get_policy_store(),
@@ -8887,6 +9041,7 @@ async def _evaluate_output_policy(
     _runner_router: RunnerRouter | None,
     *,
     actor: dict[str, str] | None = None,
+    turn_final: bool | None = None,
 ) -> dict[str, Any] | None:
     """
     Evaluate an assistant message against OUTPUT phase policies.
@@ -8908,6 +9063,9 @@ async def _evaluate_output_policy(
     :param actor: Authenticated principal, e.g.
         ``{"run_as": "alice@example.com"}``. ``None`` when
         identity is unknown.
+    :param turn_final: Whether this segment ends a successfully completed
+        turn. The relay passes ``False`` for intermediate or unsuccessful
+        segments. ``None`` when the calling path doesn't distinguish.
     :returns: ``None`` on ALLOW (fall through). Verdict dict
         with ``_denied_body`` on DENY.
     """
@@ -8933,6 +9091,7 @@ async def _evaluate_output_policy(
         content=assistant_text,
         tool_name=None,
         actor=actor,
+        turn_final=turn_final,
     )
     result = await engine.evaluate(ctx)
 
@@ -8973,12 +9132,9 @@ async def _stream_live_events(
     reconcile pre-subscribe state via the snapshot endpoint
     (``GET /v1/sessions/{id}``) and dedupe by item id.
 
-    On normal completion (subscribe ends or the disconnect check
-    breaks the loop) this generator emits a ``[DONE]`` sentinel so
-    well-behaved SSE consumers see a clean stream termination. A
-    subscriber-queue overflow instead ends without ``[DONE]`` so clients
-    treat it as a dropped transport, reconnect, and reconcile from the
-    persisted snapshot.
+    An intentional session close emits ``[DONE]``. Server shutdown and
+    subscriber overflow instead end without it so clients reconnect and
+    reconcile from the persisted snapshot after the server returns.
 
     ``finally`` is cleanup-only (presence deregistration): yielding
     from ``finally`` during client ``aclose`` / ``GeneratorExit``
@@ -9079,9 +9235,10 @@ async def _stream_live_events(
             extra={"session_id": session_id},
         )
     else:
-        # Normal completion only — never yield from ``finally`` (aclose /
-        # GeneratorExit would raise ``async generator ignored GeneratorExit``).
-        yield "data: [DONE]\n\n"
+        # Server restart is a transport drop, not a permanent session close.
+        # Never yield from finally: aclose / GeneratorExit cannot accept a yield.
+        if not shutdown_state.server_shutting_down():
+            yield "data: [DONE]\n\n"
     finally:
         # The non-None checks besides presence_token's are type
         # narrowing only: a minted token implies both were set above.
@@ -9254,8 +9411,8 @@ async def _create_session_worktree(
     Create a git worktree on the host for a new session branch.
 
     Validates the branch name server-side (the host re-validates), then
-    proxies ``host.create_worktree``. The returned worktree path
-    becomes the session ``workspace``. See
+    proxies ``host.create_worktree``. The returned workspace preserves
+    the selected subdirectory in the new worktree. See
     designs/SESSION_GIT_WORKTREE.md.
 
     :param host_id: Target host id, e.g. ``"host_a1b2c3d4..."``.
@@ -9266,8 +9423,8 @@ async def _create_session_worktree(
     :param git: Validated git options (``branch_name``, optional
         ``base_branch``).
     :param request: FastAPI request carrying the host registry.
-    :returns: The created worktree's ``worktree_path`` (to store as
-        ``workspace``) and ``branch`` (to store as ``git_branch``).
+    :returns: The worktree root for rollback, the relocated ``workspace``,
+        and ``branch`` (to store as ``git_branch``).
     :raises OmnigentError: ``invalid_input`` for a bad branch name,
         missing source repo, or a host-reported git failure (duplicate
         branch, bad base ref, not a repo); ``conflict`` when the host is
@@ -9326,17 +9483,18 @@ async def _remove_session_worktree_best_effort(
     worktree_path: str,
     branch: str,
     delete_branch: bool,
-    request: Request,
+    host_registry: Any,
     reason: str,
     conversation_store: ConversationStore | None = None,
     exclude_conversation_id: str | None = None,
     fail_if_unavailable: bool = False,
+    expected_root_fingerprint: str | None = None,
 ) -> None:
     """
     Best-effort removal of a session's git worktree.
 
     Used for create-rollback (orphan cleanup) and opt-in session-delete
-    cleanup. Host-reported git failures are logged so the caller's
+    and session-archive cleanup. Host-reported git failures are logged so the caller's
     primary operation still completes. When ``fail_if_unavailable`` is
     set, an unreachable host raises ``CONFLICT`` instead of skipping —
     the session is left in place so the caller can retry without
@@ -9350,9 +9508,10 @@ async def _remove_session_worktree_best_effort(
         ``"feature/login"``.
     :param delete_branch: When ``True``, also run ``git branch -D``
         after removing the worktree directory.
-    :param request: FastAPI request carrying the host registry.
+    :param host_registry: The ``HostRegistry`` tracking live host
+        tunnels, or ``None`` when host support is not wired.
     :param reason: Short label for log lines, e.g.
-        ``"create-rollback"`` or ``"session-delete"``.
+        ``"create-rollback"``, ``"session-delete"`` or ``"session-archive"``.
     :param conversation_store: Store used to check whether another live
         session shares this directory. ``None`` skips the check — correct
         for create-rollback, whose worktree was made moments ago in the
@@ -9360,6 +9519,8 @@ async def _remove_session_worktree_best_effort(
     :param exclude_conversation_id: The conversation whose delete triggered
         this removal, excluded from that check. Required with
         *conversation_store*.
+    :param expected_root_fingerprint: Recorded root identity; absent legacy sessions
+        may only remove their exact stored workspace.
     :param fail_if_unavailable: When ``True``, raise ``CONFLICT`` if the
         host cannot be reached to run git. Create-rollback leaves this
         ``False`` so a failed create still surfaces its original error.
@@ -9367,8 +9528,12 @@ async def _remove_session_worktree_best_effort(
     from omnigent.server.routes._host_worktree import (
         WorktreeHostUnavailableError,
         WorktreeProxyError,
+        list_worktrees_on_host,
+        recorded_worktree_root,
         remove_worktree_on_host,
+        worktree_root_fingerprint,
     )
+    from omnigent.server.routes._workspace_validation import _is_subpath_of
 
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
@@ -9377,11 +9542,18 @@ async def _remove_session_worktree_best_effort(
     # reachability so an offline host does not 409 a delete that would not
     # have touched the directory anyway.
     if conversation_store is not None and exclude_conversation_id is not None:
+        cleanup_root = recorded_worktree_root(worktree_path, expected_root_fingerprint)
+        if cleanup_root is None:
+            _logger.warning(
+                "Workspace %s no longer matches its recorded cleanup root", worktree_path
+            )
+            return
         shared = await asyncio.to_thread(
             conversation_store.has_other_live_session_in_workspace,
             host_id=host_id,
-            workspace=worktree_path,
+            workspace=cleanup_root,
             exclude_conversation_id=exclude_conversation_id,
+            include_subdirectories=True,
         )
         if shared:
             _logger.info(
@@ -9391,7 +9563,6 @@ async def _remove_session_worktree_best_effort(
             )
             return
 
-    host_registry = getattr(request.app.state, "host_registry", None)
     if host_registry is None:
         if fail_if_unavailable:
             raise OmnigentError(
@@ -9414,6 +9585,31 @@ async def _remove_session_worktree_best_effort(
         )
         return
     try:
+        if conversation_store is not None and exclude_conversation_id is not None:
+            worktrees = await list_worktrees_on_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                repo_path=worktree_path,
+                for_cleanup=True,
+            )
+            # Missing directories can resolve inside an unrelated enclosing repository.
+            expected_root = expected_root_fingerprint or worktree_root_fingerprint(worktree_path)
+            # Keep worktrees that have been repurposed for another branch or detached HEAD.
+            roots = [
+                path
+                for tree in worktrees
+                if isinstance(path := tree.get("path"), str)
+                and _is_subpath_of(worktree_path, path)
+                and worktree_root_fingerprint(path) == expected_root
+                and tree.get("branch") == branch
+                and not tree.get("is_main", True)
+            ]
+            if not roots:
+                _logger.warning(
+                    "No matching linked worktree for %s; skipping cleanup", worktree_path
+                )
+                return
+            worktree_path = max(roots, key=len)
         await remove_worktree_on_host(
             host_registry=host_registry,
             host_conn=host_conn,
@@ -9875,6 +10071,13 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    if WORKTREE_ROOT_LABEL_KEY in labels:
+        raise OmnigentError(
+            f"label {WORKTREE_ROOT_LABEL_KEY!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
@@ -10117,7 +10320,7 @@ async def _authorize_bundled_parent_and_inherit_runner(
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
-) -> str | None:
+) -> tuple[Conversation | None, str | None]:
     """
     Authorize a bundled create's parent link and resolve runner affinity.
 
@@ -10137,8 +10340,8 @@ async def _authorize_bundled_parent_and_inherit_runner(
     :param conversation_store: Store for the parent-conversation read.
     :param runner_router: Router for the runner-ownership check;
         ``None`` skips it.
-    :returns: The inherited runner id, or ``None`` when the parent has
-        no runner binding or ownership disallows inheritance.
+    :returns: The authorized parent and inherited runner id. The runner id
+        is ``None`` when absent or ownership disallows inheritance.
     :raises OmnigentError: 403/404 when the caller may not access the
         parent session.
     """
@@ -10154,13 +10357,13 @@ async def _authorize_bundled_parent_and_inherit_runner(
         parent_session_id,
     )
     if parent_conv is None:
-        return None
+        return None, None
     inherited_runner_id = parent_conv.runner_id
     if inherited_runner_id is not None and user_id is not None and runner_router is not None:
         runner_owner = runner_router.runner_owner(inherited_runner_id)
         if runner_owner is not None and runner_owner != user_id:
-            return None
-    return inherited_runner_id
+            return parent_conv, None
+    return parent_conv, inherited_runner_id
 
 
 async def _notify_runner_of_bundled_child(
@@ -11518,8 +11721,6 @@ __all__ = [
     "_require_filesystem_attachment_harness",
     "_require_host_conn_for_worktree",
     "_require_permission_mode_forward",
-    "_reset_runner_resources_after_switch",
-    "_reset_runner_resources_after_switch_impl",
     "_resolve_harness",
     "_resolve_llm_model",
     "_resolve_skill_meta_text_via_runner",

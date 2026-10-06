@@ -1159,6 +1159,14 @@ def _resolve_provider_for_build(
         # ambient detections, so a spec may name a detected provider too.
         providers = load_providers(effective_config_with_detected(explicit_config))
         entry = providers.get(auth.name)
+        if entry is None and os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
+            # The managed-sandbox overlay replaces the local providers block, so an
+            # explicitly named provider from ~/.omnigent/config.yaml would vanish.
+            # Server bindings already won above; fall back to the local config.
+            from omnigent.onboarding.provider_config import _load_config
+
+            local_providers = load_providers(effective_config_with_detected(_load_config()))
+            entry = local_providers.get(auth.name)
         if entry is None:
             raise OmnigentError(
                 f"executor.auth references provider {auth.name!r}, but no such provider is "
@@ -2173,6 +2181,10 @@ def _build_cursor_spawn_env(
     harness falls back to an inherited ``CURSOR_API_KEY`` — a ``DatabricksAuth``
     profile does not apply to cursor and is ignored.
 
+    Model: ``executor.model`` wins. When unset (common for Polly/Debby brain
+    overrides), ``cursor.model`` then global ``model`` from config are used so
+    the SDK does not fall through to ``auto-smart``.
+
     :param spec: The agent spec.
     :param workdir: The bundle's on-disk path, threaded as
         ``HARNESS_CURSOR_BUNDLE_DIR``.
@@ -2181,6 +2193,20 @@ def _build_cursor_spawn_env(
     """
     env: dict[str, str] = {}
     model = _resolve_spec_model(spec)
+    if model is None:
+        # Brain-picker sessions (Polly/Debby) often leave executor.model unset;
+        # without a fallback the Cursor SDK defaults to auto-smart, which many
+        # API keys reject. Prefer cursor.model, then global model.
+        cfg = load_config()
+        cursor_block = cfg.get("cursor")
+        if isinstance(cursor_block, dict):
+            cursor_model = cursor_block.get("model")
+            if isinstance(cursor_model, str) and cursor_model.strip():
+                model = cursor_model.strip()
+        if model is None:
+            global_model = cfg.get("model")
+            if isinstance(global_model, str) and global_model.strip():
+                model = global_model.strip()
     if model is not None:
         env["HARNESS_CURSOR_MODEL"] = model
     # Session workspace (the selected working folder), not the bundle workdir.
@@ -2354,12 +2380,24 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
     vertex/project/location, independent of the key path. A ``DatabricksAuth`` is
     unsupported — warned and ignored.
 
+    Model: ``executor.model`` wins. When unset, ``antigravity.model`` from
+    config is threaded so brain-picker sessions do not inherit an unintended
+    SDK default.
+
     :param spec: The agent spec.
     :returns: Env-var overrides; may be empty (the wrap then uses the SDK's
         ambient creds and default model).
     """
     env: dict[str, str] = {}
     model = _resolve_spec_model(spec)
+    if model is None:
+        # Brain-picker sessions often omit executor.model; honor antigravity.model
+        # from config so the SDK does not pick an unintended provider default.
+        agy_block = load_config().get("antigravity")
+        if isinstance(agy_block, dict):
+            agy_model = agy_block.get("model")
+            if isinstance(agy_model, str) and agy_model.strip():
+                model = agy_model.strip()
     if model is not None:
         env["HARNESS_ANTIGRAVITY_MODEL"] = model
 

@@ -13,6 +13,7 @@ e2e suite when available.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -141,6 +142,27 @@ def test_executor_factory_reads_env_vars(
     assert os_env_value.type == "caller_process"
     assert os_env_value.sandbox is not None
     assert os_env_value.sandbox.type == "none"
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_executor_factory_passes_runner_selected_skills_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, configured: bool
+) -> None:
+    """Only the runner-selected skill directory crosses the harness boundary."""
+    skills_dir = tmp_path / "session skills"
+    if configured:
+        monkeypatch.setenv("HARNESS_CODEX_SKILLS_DIR", str(skills_dir))
+    else:
+        monkeypatch.delenv("HARNESS_CODEX_SKILLS_DIR", raising=False)
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch("omnigent.inner.codex_harness.CodexExecutor.__init__", _fake_init):
+        codex_harness._build_codex_executor()
+
+    assert captured["skills_dir"] == (skills_dir if configured else None)
 
 
 def test_executor_factory_builds_registered_ucode_signer_authority(

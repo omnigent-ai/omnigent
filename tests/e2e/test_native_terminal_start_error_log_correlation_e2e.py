@@ -36,18 +36,11 @@ from __future__ import annotations
 
 import contextlib
 import http.server
-import io
 import json
 import os
 import re
-import secrets
 import shlex
 import shutil
-import signal
-import socket
-import subprocess
-import sys
-import tarfile
 import threading
 import time
 from dataclasses import dataclass
@@ -56,29 +49,18 @@ from pathlib import Path
 import httpx
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._helpers.server_runner import server_runner
+from tests._helpers.session import bundle_files, post_session_bundle
 
 # CI shells can carry an egress proxy in the environment; every HTTP call in
 # this test targets 127.0.0.1, so bypass proxy autodetection entirely.
 _http = httpx.Client(trust_env=False)
 
-# The runner imports ``omnigent_client`` / ``omnigent_ui_sdk``; in a worktree
-# they resolve from sdks/, in an installed venv from site-packages.
-_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
 
 from omnigent.runner.identity import (  # noqa: E402
     OMNIGENT_INTERNAL_WS_ORIGIN,
-    token_bound_runner_id,
 )
 
-_HEALTH_TIMEOUT_S = 120.0
 _POLL_S = 1.0
 _ENSURE_TIMEOUT_S = 120.0
 # The sink flushes every ~2s on a daemon thread; give delivery slack.
@@ -88,58 +70,6 @@ pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None,
     reason="claude-native terminals run inside tmux; tmux not installed",
 )
-
-
-def _find_free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
-    """Subprocess env with worktree imports, no proxy, and no leaked runner ctx.
-
-    Any ``OMNIGENT*`` / ``RUNNER_SERVER_URL`` inherited from a parent runner is
-    stripped, then re-supplied only via *extra*, so the spawned server/runner
-    boot from a clean omnigent context.
-    """
-    env = {
-        **os.environ,
-        "PYTHONPATH": _PYTHONPATH,
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-    }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env.pop(name, None)
-    for name in list(env):
-        if name.startswith("OMNIGENT") or name == "RUNNER_SERVER_URL":
-            env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _wait_http_ok(url: str, deadline: float) -> None:
-    last = "not polled"
-    while time.monotonic() < deadline:
-        try:
-            if _http.get(url, timeout=2.0).status_code == 200:
-                return
-            last = "non-200"
-        except httpx.HTTPError as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        time.sleep(_POLL_S)
-    raise AssertionError(f"{url} never became healthy: {last}")
 
 
 def _create_session_with_scoped_agent(base_url: str, name: str) -> tuple[str, str]:
@@ -162,18 +92,15 @@ def _create_session_with_scoped_agent(base_url: str, name: str) -> tuple[str, st
             "",
         ]
     )
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes through the omnigent compat translator.
-        info = tarfile.TarInfo(f"{name}.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+    # Non-config.yaml arcname routes through the omnigent compat translator.
+    data = yaml_text.encode()
+    bundle_bytes = bundle_files({f"{name}.yaml": data})
 
-    create = _http.post(
+    create = post_session_bundle(
+        _http.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": (f"{name}.tar.gz", buf.getvalue(), "application/gzip")},
+        bundle_bytes,
+        filename=f"{name}.tar.gz",
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         timeout=30.0,
     )
@@ -265,14 +192,6 @@ def _native_stack(tmp_path: Path, claude_stub_script: str, *, fail_tmux_launch: 
     enabled through the same ``OMNIGENT_DEBUG_LOG_*`` env contract the internal
     config CLI sets — pointed at the local ZeroBus capture endpoint.
     """
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    database_uri = f"sqlite:///{tmp_path / 'chat.db'}"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    runner_home = tmp_path / "home"
-    runner_home.mkdir()
-
     # Stub Claude CLI on PATH so the launch path never blocks on a real
     # (unauthenticated) Claude TUI; the script decides how the launch behaves.
     stub_bin = tmp_path / "bin"
@@ -298,88 +217,27 @@ def _native_stack(tmp_path: Path, claude_stub_script: str, *, fail_tmux_launch: 
         )
         tmux_stub.chmod(0o755)
 
-    binding_token = secrets.token_urlsafe(32)
-    runner_id = token_bound_runner_id(binding_token)
-
-    capture = _ZeroBusCapture()
-    server_log = (tmp_path / "server.log").open("w")
-    runner_log = (tmp_path / "runner.log").open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    runner_proc: subprocess.Popen[bytes] | None = None
-    try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                database_uri,
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env({"OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}),
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
-        )
-        _wait_http_ok(f"{base_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
-
-        # The parent session exists BEFORE the runner spawns for it — the
-        # order the host follows when it launches a runner for a session.
+    with contextlib.closing(_ZeroBusCapture()) as capture, server_runner(tmp_path) as stack:
+        base_url, runner_id = stack.base_url, stack.runner_id
+        # The host creates the parent before starting its runner.
         parent_session_id, _parent_agent_id = _create_session_with_scoped_agent(
             base_url, "parent-primary-fixture"
         )
-
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=_localhost_env(
-                {
-                    "OMNIGENT_RUNNER_ID": runner_id,
-                    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-                    "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                    "RUNNER_SERVER_URL": base_url,
-                    "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
-                    "OMNIGENT_RUNNER_PRIMARY_SESSION_ID": parent_session_id,
-                    # Real sink, local ZeroBus-contract capture endpoint.
-                    "OMNIGENT_DEBUG_LOG_CLIENT_ID": "e2e-client",
-                    "OMNIGENT_DEBUG_LOG_CLIENT_SECRET": "e2e-secret",
-                    "OMNIGENT_DEBUG_LOG_WORKSPACE_URL": capture.base_url,
-                    "OMNIGENT_DEBUG_LOG_ENDPOINT": capture.insert_url,
-                    # Hermetic HOME so provider config / caches resolve off a
-                    # scratch dir, not the real HOME.
-                    "HOME": str(runner_home),
-                    # The stub shadows any real claude on PATH.
-                    "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
-                }
-            ),
-            stdout=runner_log,
-            stderr=subprocess.STDOUT,
+        stack.start_runner(
+            env={
+                "OMNIGENT_RUNNER_PRIMARY_SESSION_ID": parent_session_id,
+                "OMNIGENT_DEBUG_LOG_CLIENT_ID": "e2e-client",
+                "OMNIGENT_DEBUG_LOG_CLIENT_SECRET": "e2e-secret",
+                "OMNIGENT_DEBUG_LOG_WORKSPACE_URL": capture.base_url,
+                "OMNIGENT_DEBUG_LOG_ENDPOINT": capture.insert_url,
+                "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            }
         )
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        online = False
-        while time.monotonic() < deadline:
-            try:
-                status = _http.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2.0)
-                if status.status_code == 200 and status.json().get("online") is True:
-                    online = True
-                    break
-            except httpx.HTTPError:
-                pass
-            time.sleep(_POLL_S)
-        assert online, (
-            f"runner never came online; log:\n{(tmp_path / 'runner.log').read_text()[-3000:]}"
-        )
-
         _http.patch(
             f"{base_url}/v1/sessions/{parent_session_id}",
             json={"runner_id": runner_id},
             timeout=30.0,
         ).raise_for_status()
-
         yield _Stack(
             base_url=base_url,
             runner_id=runner_id,
@@ -387,12 +245,6 @@ def _native_stack(tmp_path: Path, claude_stub_script: str, *, fail_tmux_launch: 
             capture=capture,
             tmp_path=tmp_path,
         )
-    finally:
-        _terminate(runner_proc)
-        _terminate(server_proc)
-        capture.close()
-        server_log.close()
-        runner_log.close()
 
 
 def _bind_session(stack: _Stack, session_id: str) -> None:

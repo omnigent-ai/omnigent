@@ -167,6 +167,10 @@ async def test_startup_failure_is_visible_at_error_and_belongs_to_child(
     assert attributes["app_server_pid"] == 4242
     assert attributes.get("app_server_returncode") is None
     assert attributes["codex_version"] == "0.154.0"
+    assert attributes["error_impact"] == "blocking"
+    assert attributes["error_phase"] == "harness_startup"
+    # A live TUI leaves the category to the exception classifier.
+    assert "error_category" not in attributes
 
     row = record_to_row(record, source="runner")
     assert row["session_id"] == startup.session_id
@@ -371,8 +375,11 @@ async def test_timeout_captures_tui_exit_when_discovery_misses_it(
     assert record.attributes["app_server_state"] == "running"
     if capture == "1":
         assert "unexpected argument '--invalid'" in record.attributes["terminal_last_output"]
+        # The captured usage error attributes the dead TUI, not the timeout.
+        assert record.attributes["error_category"] == "config"
     else:
         assert "terminal_last_output" not in record.attributes
+        assert record.attributes["error_category"] == "runner"
 
 
 async def test_stale_terminal_exit_does_not_stop_replacement_launch(
@@ -787,7 +794,12 @@ async def test_success_starts_forwarder_without_reporting_startup_failure(
     ) -> AsyncIterator[SimpleNamespace]:
         yield SimpleNamespace(patch=AsyncMock(return_value=SimpleNamespace(status_code=200)))
 
-    supervise = AsyncMock()
+    record_at_forwarding: list[str | None] = []
+    supervise = AsyncMock(
+        side_effect=lambda **_: record_at_forwarding.append(
+            read_bridge_startup_error(startup.bridge_dir)
+        )
+    )
     monkeypatch.setattr(
         forwarder, "wait_for_thread_started", AsyncMock(return_value="thread-ready")
     )
@@ -800,7 +812,8 @@ async def test_success_starts_forwarder_without_reporting_startup_failure(
         await _discover(startup)
 
     assert _failure_records(caplog) == []
-    assert read_bridge_startup_error(startup.bridge_dir) is None
+    # No startup failure is on record once forwarding begins.
+    assert record_at_forwarding == [None]
     state = read_bridge_state(startup.bridge_dir)
     assert state is not None
     assert state.session_id == startup.session_id
@@ -809,3 +822,112 @@ async def test_success_starts_forwarder_without_reporting_startup_failure(
     assert supervise.await_args.kwargs["thread_id"] == "thread-ready"
     assert supervise.await_args.kwargs["client"] is startup.event_client
     assert startup.close_order == ["client", "app_server", "subagent", "turn"]
+
+
+@pytest.mark.parametrize(
+    ("registry_present", "has_instance", "launched_socket", "expect_armed", "expect_reason"),
+    [
+        (True, True, "/tmp/t/tmux.sock", True, None),  # match → armed
+        (True, True, None, True, None),  # unknown launched socket must NOT disarm
+        (True, True, "/other/tmux.sock", False, "socket_mismatch"),
+        (True, False, "/tmp/t/tmux.sock", False, "registry_miss"),
+        (False, False, None, False, "no_terminal_registry"),
+    ],
+)
+def test_codex_exit_watch_decision(
+    tmp_path: Path,
+    registry_present: bool,
+    has_instance: bool,
+    launched_socket: str | None,
+    expect_armed: bool,
+    expect_reason: str | None,
+) -> None:
+    """Only a definitive socket mismatch disarms fast-fail; a missing socket keeps it."""
+    instance = _exited_terminal(tmp_path) if has_instance else None
+    if instance is not None:
+        # Align the instance socket with the "match" fixture path.
+        object.__setattr__(instance, "socket_path", Path("/tmp/t/tmux.sock"))
+    armed, reason = orchestration._codex_exit_watch_decision(
+        terminal_registry_present=registry_present,
+        instance=instance,
+        launched_socket=launched_socket,
+    )
+    if expect_armed:
+        assert armed is instance
+    else:
+        assert armed is None
+    assert reason == expect_reason
+
+
+def _live_terminal(tmp_path: Path) -> TerminalInstance:
+    """A running codex TUI instance, as the registry holds one after launch."""
+    return TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path / "terminal",
+        keep_alive_after_exit=True,
+        running=True,
+    )
+
+
+def test_launch_projection_arms_exit_watch(tmp_path: Path) -> None:
+    """The real launch projection + registry lookup arm fast-fail.
+
+    Reproduces the launch-path wiring — the ``terminal_resource_view`` the
+    launch returns, the ``terminal_registry.get`` lookup, and
+    ``_codex_exit_watch_decision`` — using the production projection instead
+    of hand-fed metadata. It establishes that a normally launched TUI is
+    armed, so an early exit reaches the exit race rather than exhausting the
+    thread-start timeout. Because that projection always supplies
+    ``tmux_socket``, the earlier bare ``!=`` guard could only have misfired on
+    a launch path that omitted the key.
+    """
+    from omnigent.entities.session_resources import terminal_resource_view
+    from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
+
+    session_id = "conv_launch"
+    instance = _live_terminal(tmp_path)
+    registry = TerminalRegistry()
+    registry._by_conversation[session_id] = {("codex", "main"): instance}
+
+    terminal_view = terminal_resource_view(
+        session_id,
+        TerminalListEntry(terminal_name="codex", session_key="main", instance=instance),
+    )
+    # The normal launch path always projects the live socket into metadata.
+    assert terminal_view.metadata["tmux_socket"] == str(instance.socket_path)
+
+    armed, reason = orchestration._codex_exit_watch_decision(
+        terminal_registry_present=True,
+        instance=registry.get(session_id, "codex", "main"),
+        launched_socket=terminal_view.metadata.get("tmux_socket"),
+    )
+    assert armed is instance
+    assert reason is None
+
+
+def test_launch_projection_without_socket_still_arms(tmp_path: Path) -> None:
+    """A launch view missing ``tmux_socket`` keeps fast-fail armed.
+
+    Encodes the defensive change directly against the launch wiring: were a
+    launch path to omit the socket from the projected view, the earlier
+    ``str(path) != metadata.get("tmux_socket")`` guard would have discarded a
+    healthy instance (``str(path) != None`` is always true) and disarmed
+    fast-fail. The decision now keeps the instance so an early exit still
+    fails fast.
+    """
+    from omnigent.terminals.registry import TerminalRegistry
+
+    session_id = "conv_launch_nosocket"
+    instance = _live_terminal(tmp_path)
+    registry = TerminalRegistry()
+    registry._by_conversation[session_id] = {("codex", "main"): instance}
+
+    armed, reason = orchestration._codex_exit_watch_decision(
+        terminal_registry_present=True,
+        instance=registry.get(session_id, "codex", "main"),
+        launched_socket=None,  # a launch view that omitted the socket
+    )
+    assert armed is instance
+    assert reason is None

@@ -273,6 +273,10 @@ describe("ErrorBanner", () => {
     ["databricks_sign_in_pending", "The agent is waiting for a Databricks sign-in."],
     ["agent_startup_pending", "The agent is still starting in the session terminal."],
     ["codex_thread_not_started", "Codex stopped before it could start, so this turn never ran."],
+    [
+      "transient_upstream_error",
+      "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+    ],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
     expect(screen.getByText(sentence)).toBeInTheDocument();
@@ -462,6 +466,19 @@ describe("ErrorBanner", () => {
     fireEvent.click(screen.getByRole("button", { name: /Something went wrong/ }));
     expect(screen.getByTestId("error-message-content")).toHaveTextContent("mystery_failure");
     expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
+  });
+
+  it("names an undelivered native web message in the headline", () => {
+    render(
+      <ErrorBanner
+        message="Claude Code never recorded this message in its transcript before accepting a later one, so it was not delivered."
+        source="execution"
+        code="native_prompt_not_recorded"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "Message not delivered. Try sending it again.",
+    );
   });
 
   it("dismisses only the visible banner", () => {
@@ -677,6 +694,26 @@ describe("ErrorBanner", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
+  it("offers turn retry for a transient upstream failure", async () => {
+    const onRetry = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ErrorBanner
+        message="API Error: Server error mid-response. The response above may be incomplete."
+        source="llm"
+        code="transient_upstream_error"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+    );
+    // Turn retry, not a runner resume — the session itself is healthy.
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledTimes(1));
+  });
+
   it.each(["native_turn_error", "codex_turn_error", "codex_reauth_required", "unauthorized"])(
     "does not infer rate-limit retry from the message for code %s",
     (code) => {
@@ -693,9 +730,29 @@ describe("ErrorBanner", () => {
       render(
         <ErrorBanner message="The turn failed." source="execution" code={code} onRetry={vi.fn()} />,
       );
-      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
     },
   );
+
+  it("offers Retry (not Resume session) for a connection_error", async () => {
+    const onRetry = vi.fn(async () => {});
+    render(
+      <ErrorBanner
+        itemId="conn-err-1"
+        message="peer closed connection without sending complete message body (incomplete chunked read)"
+        source="harness"
+        code="connection_error"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    const retryButton = screen.getByRole("button", { name: "Retry" });
+    fireEvent.click(retryButton);
+    await waitFor(() =>
+      expect(onRetry).toHaveBeenCalledWith(expect.objectContaining({ code: "connection_error" })),
+    );
+  });
 
   it("suppresses the runner's unavailable last-output diagnostics tab", () => {
     render(

@@ -44,6 +44,8 @@
 		B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000003 /* RedirectConsentUITests.swift */; };
 		B40000000000000000000005 /* ManagedServersUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000005 /* ManagedServersUITests.swift */; };
 		B2000000000000000000000A /* ConnectionErrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* ConnectionErrorTests.swift */; };
+		B20000000000000000000105 /* KeyboardViewportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000105 /* KeyboardViewportTests.swift */; };
+		B20000000000000000000106 /* ServerSwitcherVisibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000106 /* ServerSwitcherVisibilityTests.swift */; };
 		B10000000000000000000019 /* DatabricksOAuthConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000019 /* DatabricksOAuthConfiguration.swift */; };
 		B1000000000000000000001A /* DatabricksOAuthAttempt.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001A /* DatabricksOAuthAttempt.swift */; };
 		B1000000000000000000001B /* DatabricksOAuthClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001B /* DatabricksOAuthClient.swift */; };
@@ -124,6 +126,8 @@
 		A30000000000000000000001 /* Omnigent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Omnigent.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A30000000000000000000002 /* OmnigentTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A2000000000000000000000A /* ConnectionErrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionErrorTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000105 /* KeyboardViewportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardViewportTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000106 /* ServerSwitcherVisibilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerSwitcherVisibilityTests.swift; sourceTree = "<group>"; };
 		A10000000000000000000019 /* DatabricksOAuthConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksOAuthConfiguration.swift; sourceTree = "<group>"; };
 		A1000000000000000000001A /* DatabricksOAuthAttempt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksOAuthAttempt.swift; sourceTree = "<group>"; };
 		A1000000000000000000001B /* DatabricksOAuthClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksOAuthClient.swift; sourceTree = "<group>"; };
@@ -246,6 +250,8 @@
 				A20000000000000000000006 /* MockHTTPServer.swift */,
 				A20000000000000000000009 /* OidcLoginManagerTests.swift */,
 				A2000000000000000000000A /* ConnectionErrorTests.swift */,
+				A20000000000000000000105 /* KeyboardViewportTests.swift */,
+				A20000000000000000000106 /* ServerSwitcherVisibilityTests.swift */,
 				A20000000000000000000020 /* DatabricksOAuthTests.swift */,
 				A2000000000000000000000B /* DatabricksOAuthClientTests.swift */,
 				A2000000000000000000000C /* DatabricksLoginManagerTests.swift */,
@@ -455,6 +461,8 @@
 				B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */,
 				B20000000000000000000009 /* OidcLoginManagerTests.swift in Sources */,
 				B2000000000000000000000A /* ConnectionErrorTests.swift in Sources */,
+				B20000000000000000000105 /* KeyboardViewportTests.swift in Sources */,
+				B20000000000000000000106 /* ServerSwitcherVisibilityTests.swift in Sources */,
 				B20000000000000000000020 /* DatabricksOAuthTests.swift in Sources */,
 				B2000000000000000000000B /* DatabricksOAuthClientTests.swift in Sources */,
 				B2000000000000000000000C /* DatabricksLoginManagerTests.swift in Sources */,

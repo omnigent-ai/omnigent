@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import logging
 import os
@@ -12,14 +13,18 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
+from websockets.exceptions import WebSocketException
+
 from omnigent.debug_logging import debug_event
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
     client_for_transport,
+    is_stale_active_turn_error,
 )
 from omnigent.harnesses.codex_native.bridge import (
+    CODEX_APP_SERVER_STOPPED,
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
@@ -68,9 +73,6 @@ from omnigent.util.reasoning_effort import (
 
 _logger = logging.getLogger(__name__)
 
-_NO_ACTIVE_TURN_ERROR_CODE = -32600
-_NO_ACTIVE_TURN_ERROR_MESSAGE = "no active turn to steer"
-_ACTIVE_TURN_MISMATCH_MARKERS = ("expected active turn id", "but found")
 _LEGACY_BRIDGE_STATE_WAIT_SECONDS = 60.0
 _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
@@ -128,37 +130,42 @@ def _bridge_state_wait_seconds(bridge_dir: Path) -> float:
     )
 
 
-def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
-    """Return whether Codex explicitly rejected a steer because the turn ended."""
-    return (
-        error.code == _NO_ACTIVE_TURN_ERROR_CODE
-        and error.message is not None
-        and error.message.strip().casefold() == _NO_ACTIVE_TURN_ERROR_MESSAGE
+async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServerClient | None:
+    """
+    Connect to the bridge's app-server, or return ``None`` when it is unreachable.
+
+    Only a failure to connect counts, a socket error or a websocket handshake
+    failure such as an accept-then-close: nothing has been sent, so the turn is
+    provably undelivered. An error once the connection is up is the caller's.
+    Any other exit, a cancel included, closes the half-open client first.
+
+    :param state: Bridge state naming the app-server transport.
+    :returns: A connected client, or ``None`` when the connection was refused or lost.
+    """
+    client = client_for_transport(
+        state.socket_path,
+        client_name="omnigent-codex-native",
     )
-
-
-def _is_active_turn_mismatch(error: CodexAppServerResponseError) -> bool:
-    """Return whether a newer turn replaced the one we recorded.
-
-    The app-server rejects a steer/interrupt with ``expected active turn id `X`
-    but found `Y``` (also code -32600) when a turn started after we read the
-    bridge's ``active_turn_id``. Match on the phrasing, not the ids, since the
-    message quotes them and the backtick formatting varies across builds.
-    """
-    if error.code != _NO_ACTIVE_TURN_ERROR_CODE or error.message is None:
-        return False
-    message = error.message.casefold()
-    return all(marker in message for marker in _ACTIVE_TURN_MISMATCH_MARKERS)
-
-
-def _is_stale_active_turn(error: CodexAppServerResponseError) -> bool:
-    """Return whether our recorded active turn is no longer the thread's active one.
-
-    Covers both -32600 shapes: the turn ended ("no active turn to steer") and a
-    newer turn replaced it ("expected active turn id X but found Y"). Both call
-    for the same recovery — re-read bridge state and retarget the live turn.
-    """
-    return _is_no_active_turn_to_steer(error) or _is_active_turn_mismatch(error)
+    connected = False
+    try:
+        await client.connect()
+        connected = True
+        return client
+    except (OSError, WebSocketException):
+        _logger.exception(
+            "Codex native app-server unreachable: socket=%s",
+            state.socket_path,
+            extra=debug_event(
+                "codex_app_server_unreachable",
+                session_id=state.session_id,
+                thread_id=state.thread_id,
+            ),
+        )
+        return None
+    finally:
+        if not connected:
+            with contextlib.suppress(Exception):
+                await client.close()
 
 
 async def _start_codex_turn(
@@ -272,7 +279,7 @@ async def _inject_codex_turn(
         )
         return
     except CodexAppServerResponseError as error:
-        if not _is_stale_active_turn(error):
+        if not is_stale_active_turn_error(error):
             raise
 
     # Codex authoritatively says A is no longer the active turn (it ended, or a
@@ -437,7 +444,7 @@ class CodexNativeExecutor(Executor):
                     # The recorded turn already ended or was replaced by a
                     # newer one, so there is nothing left to interrupt — not a
                     # failure. The local cancel map was already flipped above.
-                    if not _is_stale_active_turn(error):
+                    if not is_stale_active_turn_error(error):
                         raise
                     # Drop the stale record unless a newer turn/started already
                     # replaced it.
@@ -582,12 +589,12 @@ class CodexNativeExecutor(Executor):
                 elif not _session_is_active(state.session_id, self._request_session_id):
                     error_msg = "Codex native session is no longer active"
                     undelivered = True
+                elif (client := await _connect_to_app_server(state)) is None:
+                    # Nothing reached the app-server, so the sender's copy is the only record.
+                    startup_failure = CODEX_APP_SERVER_STOPPED
+                    error_msg = startup_failure.message
+                    undelivered = True
                 else:
-                    client = client_for_transport(
-                        state.socket_path,
-                        client_name="omnigent-codex-native",
-                    )
-                    await client.connect()
                     try:
                         side_question = side_chat.side_chat_question(input_items)
                         if side_question is not None:

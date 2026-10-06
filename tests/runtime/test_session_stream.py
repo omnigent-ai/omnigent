@@ -133,6 +133,58 @@ async def test_single_subscriber_receives_events_in_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_publish_drops_closed_loop_without_disturbing_healthy_subscriber() -> None:
+    """A closed subscriber loop is removed while healthy peers still receive events."""
+    conversation_id = "conv_closed_loop"
+    stale_loop = asyncio.new_event_loop()
+    stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    stale_subscriber = (stale_queue, stale_loop)
+    stale_loop.close()
+    session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
+
+    task = asyncio.create_task(_collect(conversation_id, expected=1))
+    await asyncio.sleep(0)
+
+    assert session_stream.publish(conversation_id, {"type": "event"}) == 1
+    assert stale_subscriber not in session_stream._subscribers[conversation_id]
+    assert await asyncio.wait_for(task, timeout=2.0) == [{"type": "event"}]
+
+
+@pytest.mark.asyncio
+async def test_close_drops_closed_loop_and_terminates_healthy_subscriber() -> None:
+    """Closing ignores a stale loop and still terminates healthy subscribers."""
+    conversation_id = "conv_close_closed_loop"
+    stale_loop = asyncio.new_event_loop()
+    stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    stale_subscriber = (stale_queue, stale_loop)
+    stale_loop.close()
+    session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
+
+    task = asyncio.create_task(_collect(conversation_id, expected=0))
+    await asyncio.sleep(0)
+
+    session_stream.close(conversation_id)
+
+    assert await asyncio.wait_for(task, timeout=2.0) == []
+    assert conversation_id not in session_stream._subscribers
+
+
+def test_schedule_delivery_does_not_count_already_removed_subscriber() -> None:
+    """A slot removed after a publisher snapshot is no longer deliverable."""
+    conversation_id = "conv_removed_before_schedule"
+    loop = asyncio.new_event_loop()
+    queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    subscriber = (queue, loop)
+    try:
+        assert not session_stream._schedule_delivery(
+            conversation_id, subscriber, {"type": "event"}
+        )
+        assert queue.empty()
+    finally:
+        loop.close()
+
+
+@pytest.mark.asyncio
 async def test_pre_subscribe_events_are_lost() -> None:
     """
     Events published before any subscriber connected are dropped.
@@ -860,6 +912,25 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
         assert leaked.lower() not in flat
 
 
+def test_sse_child_creation_preserves_relationship_without_content() -> None:
+    attrs = session_stream._sse_safe_attributes(
+        {
+            "type": "session.created",
+            "conversation_id": "parent",
+            "parent_session_id": "parent",
+            "child_session_id": "child",
+            "agent_id": "agent",
+            "title": "private task description",
+            "data": {"prompt": "private prompt"},
+        }
+    )
+    assert attrs == {
+        "parent_session_id": "parent",
+        "child_session_id": "child",
+        "agent_id": "agent",
+    }
+
+
 def test_sse_safe_attributes_captures_level_and_code_for_error_items() -> None:
     # Level and code on an error item must be captured so dashboards can
     # exclude info-level notices from error-rate metrics.
@@ -906,6 +977,67 @@ def test_sse_safe_attributes_omits_oversized_code() -> None:
     }
     attrs = session_stream._sse_safe_attributes(event)
     assert "item_code" not in attrs
+
+
+def test_sse_safe_attributes_uses_real_serializer_for_destructive_error() -> None:
+    # A destructive error item (no level) built through the real to_api_dict()
+    # serializer must have item_code and item_source captured, and item_level
+    # must be absent (the dashboard treats missing as "error").
+    from omnigent.entities.conversation import ConversationItem, ErrorData
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    persisted = ConversationItem(
+        id="item_destruct",
+        type="error",
+        status="completed",
+        response_id="resp_test",
+        created_at=1753900000,
+        data=ErrorData(
+            source="execution",
+            code="native_terminal_start_failed",
+            message="terminal failed to start; do not log this",
+        ),
+    )
+    event = OutputItemDoneEvent(type="response.output_item.done", item=persisted.to_api_dict())
+    attrs = session_stream._sse_safe_attributes(event.model_dump())
+    assert attrs["item_type"] == "error"
+    assert attrs["item_code"] == "native_terminal_start_failed"
+    assert attrs["item_source"] == "execution"
+    # No level means the dashboard should count this as a failure.
+    assert "item_level" not in attrs
+    # message text must never reach the debug table
+    assert "message" not in attrs
+    flat = repr(attrs).lower()
+    assert "terminal failed" not in flat
+    assert "do not log" not in flat
+
+
+def test_sse_safe_attributes_uses_real_serializer_for_info_notice() -> None:
+    # An info-level notice built through the real to_api_dict() serializer must
+    # have item_level="info", item_code, and item_source captured.
+    from omnigent.entities.conversation import ConversationItem, ErrorData
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    persisted = ConversationItem(
+        id="item_notice",
+        type="error",
+        status="completed",
+        response_id="resp_test",
+        created_at=1753900000,
+        data=ErrorData(
+            source="execution",
+            code="managed_sandbox_workspace_reset",
+            message="workspace reset notice; do not log this",
+            level="info",
+        ),
+    )
+    event = OutputItemDoneEvent(type="response.output_item.done", item=persisted.to_api_dict())
+    attrs = session_stream._sse_safe_attributes(event.model_dump())
+    assert attrs["item_type"] == "error"
+    assert attrs["item_level"] == "info"
+    assert attrs["item_code"] == "managed_sandbox_workspace_reset"
+    assert attrs["item_source"] == "execution"
+    assert "message" not in attrs
 
 
 @contextlib.contextmanager

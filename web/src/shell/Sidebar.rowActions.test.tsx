@@ -75,71 +75,46 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
-    isPending: false,
-    isError: false,
-    variables: undefined,
-  }),
-  // Reactive server pinned set: subscribes to the hoisted store so a toggle
-  // re-renders, mapping pinned ids onto the loaded conversations.
-  usePinnedConversations: () => {
-    const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
-    const idSet = new Set(ids);
-    return {
-      data: {
-        conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
-        filterHonored: true,
-      },
-      isSuccess: true,
-    };
-  },
-  useTogglePinnedConversation: () => ({
-    mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
-      mocks.pinnedStore.toggle(id, pinned),
-  }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => mocks.rename,
-  useLeaveSession: () => mocks.leave,
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({
-    data: mocks.projects.map((name: string) => ({
-      id: `p_${name}`,
-      name,
-      icon: mocks.projectIcons[name],
-    })),
-  }),
-  // A non-empty `useProjects` renders a project folder, which queries its
-  // sessions — return the collapsed (disabled) shape so the folder is inert
-  // (this suite keeps its test row unfiled; the picker only needs the name).
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  }),
-  useMoveToProject: () => mocks.moveToProject,
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    usePinnedConversations: () => {
+      const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
+      const idSet = new Set(ids);
+      return {
+        data: {
+          conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+          filterHonored: true,
+        },
+        isSuccess: true,
+      };
+    },
+    useTogglePinnedConversation: () => ({
+      mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
+        mocks.pinnedStore.toggle(id, pinned),
+    }),
+    useRenameConversation: () => mocks.rename,
+    useLeaveSession: () => mocks.leave,
+    useProjects: () => ({
+      data: mocks.projects.map((name: string) => ({
+        id: `p_${name}`,
+        name,
+        icon: mocks.projectIcons[name],
+      })),
+    }),
+    useProjectSessions: () => ({
+      data: undefined,
+      isLoading: false,
+      isError: false,
+      error: null,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      isFetchingNextPage: false,
+    }),
+    useMoveToProject: () => mocks.moveToProject,
+  };
+});
 
 // Heavy sibling widgets pull their own hooks/providers; stub them so this
 // test stays scoped to the conversation row.
@@ -332,21 +307,15 @@ describe("quick pin/unpin hover button", () => {
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
-    // The folder-header pencil + kebab share the right-edge column with the
-    // session-row kebab, so they must be the same compact `icon-xs` (size-6)
-    // button — not the larger `icon-sm` (size-7) — or their glyphs sit in
-    // different columns and read as misaligned.
+    // Project and session menu buttons share the same compact right-edge slot.
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
     const projectActions = screen.getByTestId("project-actions");
-    const projectNewSession = screen.getByTestId("project-new-session");
-    for (const button of [projectActions, projectNewSession]) {
-      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
-      expect(button).not.toHaveClass("size-7");
-      expect(button.querySelector("svg")).toHaveClass("size-3.5");
-      expect(button.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
-    }
+    expect(projectActions).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+    expect(projectActions).not.toHaveClass("size-7");
+    expect(projectActions.querySelector("svg")).toHaveClass("size-3.5");
+    expect(projectActions.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
     // Same compact size as the session-row kebab it aligns with.
     expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
   });

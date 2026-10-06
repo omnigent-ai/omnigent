@@ -12,6 +12,21 @@ pytestmark = pytest.mark.posix_only
 _WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/polly-review.yml"
 
 
+def test_review_identity_is_recorded_before_the_model_starts() -> None:
+    steps = yaml.safe_load(_WORKFLOW.read_text())["jobs"]["review"]["steps"]
+    record = next(step for step in steps if step.get("name") == "Record review target")
+    context = next(step for step in steps if step.get("id") == "ctx")
+    reviewer = next(step for step in steps if step.get("id") == "polly")
+    publication = next(step for step in steps if step.get("id") == "publish")
+    assert steps.index(context) < steps.index(record) < steps.index(reviewer)
+    assert record["if"] == "steps.ctx.outcome == 'success'"
+    # Runner-generated env headers survive a model timeout or summary failure.
+    # Use the frozen diff's head, which can differ from the earlier duplicate check.
+    assert record["env"]["PR_NUMBER"] == publication["env"]["PR_NUMBER"]
+    assert record["env"]["HEAD_SHA"] == "${{ steps.ctx.outputs.head_sha }}"
+    assert record["env"]["HEAD_SHA"] == publication["env"]["HEAD_SHA"]
+
+
 @pytest.mark.parametrize(
     ("body", "eligible"),
     [
@@ -51,3 +66,42 @@ def test_comment_command_eligibility(tmp_path: Path, body: str, eligible: bool) 
     assert result.returncode == 0, result.stdout + result.stderr
     assert output.read_text() == f"eligible={str(eligible).lower()}\n"
     assert not (tmp_path / "injected").exists()
+
+
+@pytest.mark.parametrize(
+    ("force", "body", "skipped"),
+    [("false", "", True), ("true", "", False), ("false", "/review force", False)],
+    ids=["duplicate", "manual-force", "comment-force"],
+)
+def test_force_review_bypasses_duplicate_check(
+    tmp_path: Path, force: str, body: str, skipped: bool
+) -> None:
+    workflow = yaml.safe_load(_WORKFLOW.read_text())
+    step = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "dupe")
+    gh = tmp_path / "gh"
+    gh.write_text(
+        '#!/bin/sh\ncase "$*" in\n'
+        "  *pulls*) echo test-sha ;;\n"
+        '  *) echo "https://example.test/comment\t<!-- polly-skipped-sha: test-sha -->" ;;\n'
+        "esac\n"
+    )
+    gh.chmod(0o755)
+    output = tmp_path / "github_output"
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"].replace("/tmp/", f"{tmp_path}/")],
+        cwd=tmp_path,
+        env={
+            "PATH": f"{tmp_path}{os.pathsep}{os.defpath}",
+            "COMMENT_BODY": body,
+            "FORCE_REVIEW": force,
+            "GITHUB_OUTPUT": str(output),
+            "REPO": "test/repo",
+            "PR_NUMBER": "1",
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("duplicate=true" in output.read_text()) is skipped

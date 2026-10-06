@@ -69,6 +69,9 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # running and to hold the key. Shared here because every harness runs
         # git, not just the one whose bug surfaced it.
         "SSH_AUTH_SOCK",
+        # The user's URL-opener command, so an agent's CLI logins open URLs the
+        # way the user configured (e.g. forwarded to a laptop from a remote box).
+        "BROWSER",
         OMNIGENT_SESSION_ENV_VAR,
         # Windows system / profile constants (SYSTEMROOT is mandatory for
         # Winsock init, USERPROFILE for Path.home(), etc.); no-ops on POSIX

@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
+import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
@@ -148,7 +149,7 @@ function AppRoutes({ basename }: AppProps) {
   // after the first admin exists.
   if (info !== "loading" && info.accounts_enabled && info.needs_setup) {
     return (
-      <Suspense fallback={null}>
+      <Suspense fallback={<PageLoading />}>
         <Routes>
           <Route path={basename ? `${prefix}/*` : "*"} element={<SetupPage />} />
         </Routes>
@@ -157,7 +158,7 @@ function AppRoutes({ basename }: AppProps) {
   }
 
   return (
-    <Suspense fallback={null}>
+    <Suspense fallback={<PageLoading />}>
       <Routes>
         {info !== "loading" && info.accounts_enabled && (
           <>

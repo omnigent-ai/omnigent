@@ -737,13 +737,20 @@ export async function renameConversation(id: string, title: string): Promise<Con
  *
  * Exported for direct unit testing. `archived` is sent as the new
  * desired state, so the same helper handles both archive (`true`) and
- * unarchive (`false`).
+ * unarchive (`false`). `deleteWorktree` (archive only) asks the server to
+ * remove the session's worktree directory once its teardown runs.
  */
-export async function archiveConversation(id: string, archived: boolean): Promise<Conversation> {
+export async function archiveConversation(
+  id: string,
+  archived: boolean,
+  deleteWorktree = false,
+): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ archived }),
+    body: JSON.stringify(
+      archived && deleteWorktree ? { archived, delete_worktree: true } : { archived },
+    ),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
@@ -939,8 +946,15 @@ async function paintConversationsArchived(
 export function useArchiveConversation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, archived }: { id: string; archived: boolean }) =>
-      archiveConversation(id, archived),
+    mutationFn: ({
+      id,
+      archived,
+      deleteWorktree = false,
+    }: {
+      id: string;
+      archived: boolean;
+      deleteWorktree?: boolean;
+    }) => archiveConversation(id, archived, deleteWorktree),
     onMutate: ({ id, archived }) => paintConversationsArchived(queryClient, [id], archived),
     onError: (_err, { id, archived }, context) => {
       if (archived && context?.marked !== undefined) {
@@ -1282,8 +1296,19 @@ export function useStopSession() {
 export function useBulkArchiveConversations() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ ids, archived }: { ids: string[]; archived: boolean }) => {
-      const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, archived)));
+    mutationFn: async ({
+      ids,
+      archived,
+      deleteWorktreeIds,
+    }: {
+      ids: string[];
+      archived: boolean;
+      /** Archived sessions whose worktree should also be removed. */
+      deleteWorktreeIds?: ReadonlySet<string>;
+    }) => {
+      const results = await Promise.allSettled(
+        ids.map((id) => archiveConversation(id, archived, deleteWorktreeIds?.has(id) === true)),
+      );
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
         if (results[i].status === "rejected") failed.push(ids[i]);

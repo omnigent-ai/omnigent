@@ -85,6 +85,9 @@ _ZYGOTE_TEST_CHILD_RAISE_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"
 # under a live child and assert the crash-recovery path. Never set in prod.
 _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP"
 
+# Upper bound on draining a forked child's debug-log sink before os._exit.
+_CHILD_TELEMETRY_FLUSH_TIMEOUT_S = 2.0
+
 
 @dataclass(frozen=True)
 class _SourceFileStamp:
@@ -288,6 +291,23 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
     from omnigent.runner._entry import main
 
     main()
+
+
+def _flush_child_telemetry() -> None:
+    """Drain the child's debug-log sink and stdio before ``os._exit``.
+
+    ``os._exit`` skips ``atexit``, where the sink would otherwise send its last
+    batch. Bounded so a slow upload cannot keep a dying child alive.
+    """
+    # BaseException too: this runs in a dying child, where nothing may stop the
+    # caller's os._exit (e.g. a KeyboardInterrupt during the drain join).
+    with contextlib.suppress(BaseException):
+        from omnigent.debug_logging import close_debug_log_sink
+
+        close_debug_log_sink(timeout=_CHILD_TELEMETRY_FLUSH_TIMEOUT_S)
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(BaseException):
+            stream.flush()
 
 
 def _maybe_run_test_seam() -> None:
@@ -675,19 +695,26 @@ class _ZygoteServer:
 
         :param body: Zero-arg callable running the child's real work.
         """
+        exit_code = 0
         try:
             body()
         except SystemExit as exc:
             # Preserve the exec'd entrypoint's exit code (main() raises
             # SystemExit) rather than flattening it to a traceback + code 1.
             code = exc.code
-            os._exit(code if isinstance(code, int) else (0 if code is None else 1))
-        except BaseException:  # noqa: BLE001 — last-resort child guard
-            import traceback
-
-            traceback.print_exc()
-            os._exit(1)
-        os._exit(0)
+            exit_code = code if isinstance(code, int) else (0 if code is None else 1)
+        except BaseException as exc:  # noqa: BLE001 — last-resort child guard
+            # Route through sys.excepthook so the runner's crash hook (installed
+            # by its main()) records the cause; it chains to the default print.
+            with contextlib.suppress(BaseException):
+                sys.excepthook(type(exc), exc, exc.__traceback__)
+            exit_code = 1
+        # The child must never fall back into the zygote's serve loop, even if
+        # the flush is interrupted.
+        try:
+            _flush_child_telemetry()
+        finally:
+            os._exit(exit_code)
 
     def _drop_runner(self, conn: socket.socket) -> None:
         """Forget a runner whose control socket closed (the runner exited).
