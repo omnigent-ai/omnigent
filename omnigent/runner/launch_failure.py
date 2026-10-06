@@ -27,6 +27,7 @@ __all__ = [
     "classify_native_turn_error",
     "classify_terminal_failure",
     "describe_failure_code",
+    "is_budget_exhausted_message",
 ]
 
 
@@ -232,6 +233,17 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
 _TRANSIENT_UPSTREAM_STATUSES = {"500", "502", "503", "504", "529"}
 
 
+def is_budget_exhausted_message(message: str) -> bool:
+    """Return whether *message* reports an exhausted spending budget or usage limit.
+
+    :param message: Native harness error text, e.g.
+        ``'Budget "team" has reached its limit of $100.'``.
+    :returns: ``True`` when it carries an AI-gateway budget marker.
+    """
+    lowered = message.lower()
+    return any(fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS)
+
+
 def classify_native_turn_error(code: str, message: str) -> str:
     """Refine a native turn's generic code when its text identifies the cause.
 
@@ -245,11 +257,11 @@ def classify_native_turn_error(code: str, message: str) -> str:
     :param message: Native harness error text, from its status or transcript.
     :returns: The semantic error code, or the existing code if unrecognized.
     """
-    lowered = message.lower()
-    if any(fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS):
+    if is_budget_exhausted_message(message):
         return "budget_exhausted"
     if code not in {"native_turn_error", "codex_turn_error"}:
         return code
+    lowered = message.lower()
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
     if status in {"401", "403"}:

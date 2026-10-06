@@ -10,6 +10,7 @@ from omnigent.runner.launch_failure import (
     classify_native_turn_error,
     classify_terminal_failure,
     describe_failure_code,
+    is_budget_exhausted_message,
 )
 
 # The tail Claude Code prints when refusing --dangerously-skip-permissions as
@@ -225,6 +226,24 @@ def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> 
 )
 def test_classifies_budget_exhausted(code: str, message: str) -> None:
     assert classify_native_turn_error(code, message) == "budget_exhausted"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ('API Error: 403 Budget "team" has reached its limit of $100.', True),
+        ("API ERROR: 403 RATE LIMIT IS SET TO 0 for user test@example.com", True),
+        ("API Error: 403 Invalid Token", False),
+        ("API Error: 429 rate limit exceeded", False),
+        ("", False),
+    ],
+)
+def test_is_budget_exhausted_message_shares_the_classifier_markers(
+    message: str, expected: bool
+) -> None:
+    assert is_budget_exhausted_message(message) is expected
+    classified = classify_native_turn_error("native_turn_error", message)
+    assert (classified == "budget_exhausted") is expected
 
 
 def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:

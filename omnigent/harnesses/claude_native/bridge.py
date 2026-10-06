@@ -8934,12 +8934,21 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
 # does not do, so pointing at it there would only add noise. The one
 # shape worth catching, "...then /logout and /login.", already matches
 # on its ``/login``.
+#
+# The CLI files every 401/403 under auth, so a gateway refusal that signing
+# in cannot lift (exhausted budget, IP ACL block) also arrives behind
+# "Please run /login · ". Those get neither the guidance nor the lead-in.
 _LOGIN_COMMAND_RE = re.compile(r"(?<![\w/])/login\b")
 
 _LOGIN_GUIDANCE = (
     "`/login` is not available from the Omnigent web chat — run "
     "`omni setup` on the host to sign in again."
 )
+
+_LOGIN_LEAD_IN = "Please run /login · "
+
+# Lowercase IP ACL rejection markers; budget refusals use the runner's markers.
+_IP_ACL_FRAGMENTS = ("is blocked by databricks ip acl", "source ip address")
 
 
 def _is_api_error_entry(entry: _JsonObject) -> bool:
@@ -9005,19 +9014,55 @@ def _assistant_message_item(
     )
 
 
+def _is_non_auth_refusal(text: str) -> bool:
+    """
+    Return whether CLI error text is a gateway refusal that signing in cannot lift.
+
+    The CLI reports an exhausted AI-gateway budget and a workspace IP ACL
+    block as 403s, under the same auth lead-in as an expired login.
+
+    :param text: CLI-authored error text, e.g.
+        ``'Please run /login · API Error: 403 Budget "x" has reached its limit'``.
+    :returns: ``True`` for a budget or IP ACL refusal.
+    """
+    # Imported here so hook subprocesses, which load this module on every
+    # call, do not pay for it.
+    from omnigent.runner.launch_failure import is_budget_exhausted_message
+
+    lowered = text.lower()
+    return is_budget_exhausted_message(text) or any(
+        fragment in lowered for fragment in _IP_ACL_FRAGMENTS
+    )
+
+
+def _without_login_lead_in(text: str) -> str:
+    """
+    Drop the CLI's leading ``Please run /login · `` and keep the rest verbatim.
+
+    :param text: CLI error text, e.g. ``"Please run /login · API Error: 403 ..."``.
+    :returns: The text after the lead-in, or *text* unchanged when it does
+        not start with it.
+    """
+    body = text.lstrip()
+    return body.removeprefix(_LOGIN_LEAD_IN) if body.startswith(_LOGIN_LEAD_IN) else text
+
+
 def _display_text(text: str, *, is_api_error: bool) -> str:
     """
     Rewrite Claude text whose own remedy is a dead end in the web chat.
 
     :param text: Assistant or CLI error text, e.g. ``"Prompt is too long"``.
     :param is_api_error: Whether Claude Code authored the text as its own
-        error; gates the ``/login`` guidance append.
-    :returns: The text to show, e.g. the context-overflow guidance.
+        error; gates the ``/login`` guidance append and the lead-in strip.
+    :returns: The text to show, e.g. the context-overflow guidance. A budget
+        or IP ACL refusal keeps the CLI's text without its ``/login`` lead-in.
     """
     stripped = text.strip()
     if _CONTEXT_OVERFLOW_RE.match(stripped):
         return _CONTEXT_OVERFLOW_REPLACEMENT
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
+        if _is_non_auth_refusal(stripped):
+            return _without_login_lead_in(text)
         return f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
     return text
 

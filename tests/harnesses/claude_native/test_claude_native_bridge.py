@@ -1623,6 +1623,19 @@ def _assistant_transcript_text(
     return str(items[0].data["content"][0]["text"])
 
 
+# Gateway refusals the CLI files under its auth branch (synthetic ids).
+# Signing in cannot lift either, so `omni setup` guidance would mislead.
+_BUDGET_EXHAUSTED_403 = (
+    'API Error: 403 Budget "test-budget" (00000000-0000-0000-0000-000000000001) has '
+    "reached its limit of $1000. To continue, contact an admin to increase the budget "
+    "or use a different budget."
+)
+_IP_ACL_403 = (
+    "API Error: 403 Source IP address: 203.0.113.7 is blocked by Databricks IP ACL "
+    "for workspace: 1234567890123456 [ReqId: 00000000-0000-0000-0000-000000000000]"
+)
+
+
 @pytest.mark.parametrize(
     "raw_text",
     [
@@ -1636,6 +1649,9 @@ def _assistant_transcript_text(
         # the line, and replacing a real turn would delete an answer the
         # user asked for — so it is forwarded as-is.
         "Login expired · Please run /login",
+        # The lead-in strip is gated on the flag just like the guidance.
+        pytest.param(f"Please run /login · {_BUDGET_EXHAUSTED_403}", id="budget-403"),
+        pytest.param(f"Please run /login · {_IP_ACL_403}", id="ip-acl-403"),
     ],
 )
 def test_read_transcript_leaves_unflagged_login_text_untouched(
@@ -1663,6 +1679,10 @@ def test_read_transcript_leaves_unflagged_login_text_untouched(
         "OAuth token revoked · Please run /login",
         "Your organization has disabled API key authentication · Run /login "
         "to sign in with your claude.ai account",
+        # A rejected token carries no budget or IP ACL marker, so signing
+        # in stays the remedy, 403 included.
+        "Please run /login · API Error: 401 Invalid Token",
+        "Please run /login · API Error: 403 Invalid Token",
     ],
 )
 def test_read_transcript_rewrites_flagged_api_error_anywhere(
@@ -1681,6 +1701,56 @@ def test_read_transcript_rewrites_flagged_api_error_anywhere(
     """
     expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
     assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_text", "expected"),
+    [
+        pytest.param(
+            f"Please run /login · {_BUDGET_EXHAUSTED_403}",
+            _BUDGET_EXHAUSTED_403,
+            id="budget-exhausted",
+        ),
+        pytest.param(
+            f"Please run /login · {_IP_ACL_403}",
+            _IP_ACL_403,
+            id="ip-acl-block",
+        ),
+        pytest.param(
+            "Please run /login · API Error: 403 rate limit is set to 0 for user test@example.com",
+            "API Error: 403 rate limit is set to 0 for user test@example.com",
+            id="rate-limit-set-to-zero",
+        ),
+        pytest.param(
+            f"Please run /login · {_IP_ACL_403}\n",
+            f"{_IP_ACL_403}\n",
+            id="rest-of-text-kept-verbatim",
+        ),
+        # Only the CLI's exact lead-in is removed; a variant is left as written.
+        pytest.param(
+            'Please run /login. API Error: 403 Budget "test-budget" has reached its limit of $1.',
+            'Please run /login. API Error: 403 Budget "test-budget" has reached its limit of $1.',
+            id="inexact-lead-in-untouched",
+        ),
+    ],
+)
+def test_read_transcript_flagged_non_auth_403_drops_login_remedy(
+    tmp_path: Path,
+    raw_text: str,
+    expected: str,
+) -> None:
+    """
+    A budget or IP ACL 403 loses the CLI's ``/login`` lead-in and gets no guidance.
+
+    The CLI treats every 401/403 as an auth failure and leads it with
+    "Please run /login · ", but neither refusal is lifted by signing in,
+    so the ``omni setup`` guidance would send the user the wrong way.
+    The rest of the CLI's text, which names the real cause, is untouched.
+    """
+    rendered = _assistant_transcript_text(tmp_path, raw_text, is_api_error=True)
+
+    assert rendered == expected
+    assert _LOGIN_GUIDANCE not in rendered
 
 
 def test_read_transcript_flag_inside_message_also_counts(tmp_path: Path) -> None:
@@ -7940,6 +8010,45 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert login.failure_message is not None
     assert login.failure_message.startswith("Login expired · Please run /login\n\n")
     assert "omni setup" in login.failure_message
+
+
+@pytest.mark.parametrize(
+    ("last_message", "expected"),
+    [
+        pytest.param(
+            f"Please run /login · {_BUDGET_EXHAUSTED_403}",
+            _BUDGET_EXHAUSTED_403,
+            id="budget-exhausted",
+        ),
+        pytest.param(f"Please run /login · {_IP_ACL_403}", _IP_ACL_403, id="ip-acl-block"),
+        pytest.param(
+            "Please run /login · API Error: 401 Invalid Token",
+            f"Please run /login · API Error: 401 Invalid Token\n\n{_LOGIN_GUIDANCE}",
+            id="rejected-token-keeps-guidance",
+        ),
+    ],
+)
+def test_hook_record_stop_failure_message_drops_login_remedy_for_non_auth_403(
+    last_message: str,
+    expected: str,
+) -> None:
+    """
+    The failure card carries the same remedy as the mirrored transcript error.
+
+    ``StopFailure`` reports the CLI's auth category for a budget or IP ACL
+    403 too, so the failure detail must not send that user to re-authenticate.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "authentication_failed",
+                "last_assistant_message": last_message,
+            }
+        )
+    )
+
+    assert record.failure_message == expected
 
 
 # ── stop_hook_seen_since: subagent filtering ─────────────────────────

@@ -128,6 +128,69 @@ async def test_hook_telemetry_failure_does_not_block_status(
     assert "synthetic-private-telemetry-data" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("last_message", "expected_detail"),
+    [
+        pytest.param(
+            'Please run /login · API Error: 403 Budget "test-budget" has reached its limit.',
+            'API Error: 403 Budget "test-budget" has reached its limit.',
+            id="budget-exhausted",
+        ),
+        pytest.param(
+            "Please run /login · API Error: 403 Source IP address: 203.0.113.7 is blocked by "
+            "Databricks IP ACL for workspace: 1234567890123456",
+            "API Error: 403 Source IP address: 203.0.113.7 is blocked by "
+            "Databricks IP ACL for workspace: 1234567890123456",
+            id="ip-acl-block",
+        ),
+        pytest.param(
+            "Please run /login · API Error: 401 Invalid Token",
+            f"Please run /login · API Error: 401 Invalid Token\n\n{bridge._LOGIN_GUIDANCE}",
+            id="rejected-token-keeps-guidance",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_hook_failure_detail_sends_only_real_auth_errors_to_sign_in(
+    tmp_path: Path, last_message: str, expected_detail: str
+) -> None:
+    """The posted failure detail sends only real auth errors to sign in again."""
+    bridge_dir = tmp_path / "bridge"
+    bridge.record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "native-session",
+            "error": "authentication_failed",
+            "last_assistant_message": last_message,
+        },
+    )
+    requests = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_synthetic",
+            bridge_dir=bridge_dir,
+            state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id="resp_synthetic",
+        )
+    (request,) = requests
+    assert request["data"]["status"] == "failed"
+    assert request["data"]["failure_detail"] == expected_detail
+
+
 @pytest.mark.parametrize("marker_location", ["entry", "message"])
 @pytest.mark.parametrize("block_count", [1, 2], ids=["string", "multiple-text-blocks"])
 @pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
