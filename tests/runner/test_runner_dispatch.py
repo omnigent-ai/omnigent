@@ -12619,59 +12619,69 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
     assert failed[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
 
 
-_SSE_INPUT_ACCEPTED = 'event: input.accepted\ndata: {"type":"input.accepted"}\n\n'
+_SSE_COMPLETED_ACCEPTED = (
+    "event: response.completed\ndata: "
+    '{"type":"response.completed","response":{"id":"resp_sf_1","status":"completed"},'
+    '"delivery":"accepted"}\n\n'
+)
+_SSE_FAILED_ACCEPTED = (
+    "event: response.failed\ndata: "
+    '{"type":"response.failed","response":{"status":"failed"},'
+    f'"error":{{"message":"{_STREAM_FAILURE_MESSAGE}","code":"executor_error"}},'
+    '"delivery":"accepted"}\n\n'
+)
 _ACCEPTED_STABLE_ID = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("frames", "stable_id", "terminal", "expected"),
+    ("frames", "stable_id", "terminal", "expected_id"),
     [
         pytest.param(
-            [_SSE_RESPONSE_CREATED, _SSE_INPUT_ACCEPTED, _SSE_RESPONSE_COMPLETED],
+            [_SSE_RESPONSE_CREATED, _SSE_COMPLETED_ACCEPTED],
             _ACCEPTED_STABLE_ID,
             "response.completed",
-            {"input_stable_id": _ACCEPTED_STABLE_ID, "delivery": "accepted"},
+            _ACCEPTED_STABLE_ID,
             id="completed-turn-names-the-message",
         ),
         pytest.param(
-            [_SSE_RESPONSE_CREATED, _SSE_INPUT_ACCEPTED, _SSE_RESPONSE_FAILED],
+            [_SSE_RESPONSE_CREATED, _SSE_FAILED_ACCEPTED],
             _ACCEPTED_STABLE_ID,
             "response.failed",
-            {"input_stable_id": _ACCEPTED_STABLE_ID, "delivery": "accepted"},
+            _ACCEPTED_STABLE_ID,
             id="failure-after-acceptance-keeps-the-proof",
         ),
         pytest.param(
             [_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED],
             _ACCEPTED_STABLE_ID,
             "response.completed",
-            {},
+            None,
             id="no-proof-no-stamp",
         ),
         pytest.param(
-            [_SSE_RESPONSE_CREATED, _SSE_INPUT_ACCEPTED, _SSE_RESPONSE_COMPLETED],
+            [_SSE_RESPONSE_CREATED, _SSE_COMPLETED_ACCEPTED],
             None,
             "response.completed",
-            {},
+            None,
             id="nothing-to-name-without-a-stable-id",
         ),
     ],
 )
-async def test_accepted_input_proof_rides_on_the_turns_terminal_event(
+async def test_accepted_input_proof_names_the_message_on_the_terminal_event(
     frames: list[str],
     stable_id: str | None,
     terminal: str,
-    expected: dict[str, str],
+    expected_id: str | None,
 ) -> None:
     """
-    The harness's acceptance marker reaches the server as a field on the terminal event.
+    A terminal event the harness marked ``delivery: "accepted"`` names the web message.
 
-    The marker itself is runner-internal and never published. The runner adds
-    ``delivery: "accepted"`` and the web message's stable id (the harness does
-    not know it) to the turn's ``response.completed`` or ``response.failed``:
-    fields on a known event are what an older server ignores, where an unknown
-    event type would fail its stream validation. Without the proof, or without
-    a stable id to name, the terminal event is left exactly as it was.
+    The harness does not know the message's stable id, so the runner adds it
+    as ``input_stable_id`` to the turn's ``response.completed`` or
+    ``response.failed``. The proof is a field on a known event, which an older
+    server ignores, never a new event type, which would fail its stream
+    validation. Without the proof, or without a stable id to name, the
+    terminal event gets no ``input_stable_id``.
     """
     conv = "conv_input_accepted"
 
@@ -12713,9 +12723,9 @@ async def test_accepted_input_proof_rides_on_the_turns_terminal_event(
                 break
             await asyncio.sleep(0.02)
     (ended,) = [e for e in published if e.get("type") == terminal]
-    stamped = {key: ended[key] for key in ("input_stable_id", "delivery") if key in ended}
-    assert stamped == expected
-    assert not any(e.get("type") == "input.accepted" for e in published)
+    assert ended.get("input_stable_id") == expected_id
+    # No event type beyond the ones every server already validates.
+    assert not any(str(e.get("type", "")).startswith("input.") for e in published)
 
 
 _UNDELIVERED_STABLE_ID = "9d2c4e6f8a0b1c3d5e7f9a1b2c3d4e5f"

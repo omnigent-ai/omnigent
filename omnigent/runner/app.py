@@ -5695,7 +5695,6 @@ def create_runner_app(
                     _subagent_post_chains: dict[str, _asyncio.Task[object]] = {}
                     _text_acc: list[str] = []
                     _stream_failed_error: _JsonObject | None = None
-                    _input_accepted = False
                     async for chunk in harness_resp.aiter_text():
                         _buffer += chunk
                         while "\n\n" in _buffer:
@@ -5756,11 +5755,6 @@ def create_runner_app(
                                                     "content": _m.get("content", []),
                                                 }
                                             )
-                                    continue
-                                if _evt_type == "input.accepted":
-                                    # The terminal took this turn's message; the proof
-                                    # rides out on the terminal event below.
-                                    _input_accepted = True
                                     continue
                                 if _evt_type == "response.output_text.delta":
                                     delta = event.get("delta")
@@ -6051,14 +6045,12 @@ def create_runner_app(
                                 _input_stable_id = body.get("input_stable_id")
                                 if isinstance(_input_stable_id, str):
                                     event["input_stable_id"] = _input_stable_id
-                            if _input_accepted and event.get("type") in (
-                                "response.completed",
-                                "response.failed",
-                            ):
+                            if event.get("delivery") == "accepted":
+                                # The terminal took this turn's message. The harness
+                                # does not know which one, so name it for the server.
                                 _accepted_id = body.get("input_stable_id")
                                 if isinstance(_accepted_id, str):
                                     event["input_stable_id"] = _accepted_id
-                                    event["delivery"] = "accepted"
                             if not _defer_publish and event.get("type") != "response.created":
                                 _publish_event(conv_id, event)
                             if dispatch is not None and event.get(_RUNNER_DISPATCHED_FIELD):

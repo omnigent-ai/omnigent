@@ -4868,25 +4868,6 @@ class PolicyEvaluationRequestEvent(_SSEEventBase):
     data: dict[str, Any]
 
 
-class InputAcceptedEvent(_SSEEventBase):
-    """
-    Runner-internal marker: a native terminal took the turn's web message.
-
-    Emitted by the executor adapter when a native-terminal executor saw its
-    terminal accept the message (:attr:`~omnigent.inner.executor.TurnComplete.input_accepted`).
-    The runner intercepts it in ``proxy_stream`` and never relays it. It passes
-    the proof on as ``delivery: "accepted"`` plus the web message's
-    ``input_stable_id`` on the turn's terminal event, which the server reads to
-    stop treating a missing mirror of that message as proof it was lost. A
-    field on a known event is what an older server silently ignores; an event
-    type it does not know would fail its stream validation.
-
-    :param type: Always ``"input.accepted"``.
-    """
-
-    type: Literal["input.accepted"]
-
-
 class SubagentStartedEvent(_SSEEventBase):
     """
     Runner-internal marker: the harness agent spawned a sub-agent.
@@ -4962,7 +4943,6 @@ class SubagentToolCallEvent(_SSEEventBase):
 HarnessStreamEvent = (
     ServerStreamEvent
     | InjectionConsumedEvent
-    | InputAcceptedEvent
     | PolicyEvaluationRequestEvent
     | SubagentStartedEvent
     | SubagentCompletedEvent

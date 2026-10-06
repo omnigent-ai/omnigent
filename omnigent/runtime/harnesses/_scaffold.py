@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import json
 import logging
 import os
 import time
@@ -452,6 +453,10 @@ class TurnContext:
         # to populate the usage field on the response.completed SSE.
         # ``None`` when the inner executor does not report usage.
         self.provider_usage: dict[str, Any] | None = None
+        # Set to ``"accepted"`` by a native-terminal executor that saw its terminal
+        # take the turn's message. Rides out as a ``delivery`` field on the terminal
+        # frame, which a consumer that does not know it ignores.
+        self.input_delivery: Literal["accepted"] | None = None
         # Idle-watchdog reset hook. ``_guarded_run_turn`` sets this to
         # push the per-turn idle deadline forward on each real progress
         # event so a long-but-active turn isn't killed mid-turn.
@@ -1423,7 +1428,10 @@ class HarnessApp:
             async with self._lock:
                 if self._active_turn_ctx is ctx:
                     self._active_turn_ctx = None
-            yield _format_sse_event(terminal)
+            yield _format_sse_event(
+                terminal,
+                extras={"delivery": ctx.input_delivery} if ctx.input_delivery else None,
+            )
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
 
@@ -1929,7 +1937,7 @@ class HarnessApp:
         )
 
 
-def _format_sse_event(event: HarnessStreamEvent) -> bytes:
+def _format_sse_event(event: HarnessStreamEvent, extras: dict[str, Any] | None = None) -> bytes:
     """
     Serialize a typed event to an SSE wire frame.
 
@@ -1937,10 +1945,16 @@ def _format_sse_event(event: HarnessStreamEvent) -> bytes:
 
     :param event: Any variant from
         :data:`omnigent.server.schemas.ServerStreamEvent`.
+    :param extras: Fields to add beside the event's own, e.g.
+        ``{"delivery": "accepted"}``. They are not part of the event's schema:
+        every consumer validates with ``extra="ignore"``, so ones that do not
+        know the field drop it.
     :returns: UTF-8-encoded bytes ready to ship over the HTTP
         response.
     """
     payload = event.model_dump_json(exclude_none=True)
+    if extras:
+        payload = json.dumps({**json.loads(payload), **extras})
     return f"event: {event.type}\ndata: {payload}\n\n".encode()
 
 

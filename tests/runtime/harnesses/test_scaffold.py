@@ -308,6 +308,12 @@ def use_echo(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_accepted_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spawn the accepted-input fixture harness for this test."""
+    monkeypatch.setenv("HARNESS_TEST_FIXTURE", "accepted_input")
+
+
+@pytest.fixture
 def use_tool_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     """Spawn the tool-dispatch fixture harness for this test."""
     monkeypatch.setenv("HARNESS_TEST_FIXTURE", "tool_dispatch")
@@ -999,6 +1005,67 @@ async def test_scaffold_response_completed_preserves_cache_tokens(
         "cache_creation_input_tokens must survive scaffold serialization so "
         "the server cost path can price cache writes at the premium rate."
     )
+
+
+async def test_scaffold_terminal_event_carries_the_input_delivery_proof(
+    use_accepted_input: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    A turn whose terminal took the message ends with ``delivery: "accepted"``.
+
+    The proof rides as a field on the terminal event and no other event is
+    added: a frame the server's stream validation does not know would raise
+    there and break every client stream, so every frame must validate and a
+    consumer that does not know the field must drop it.
+    """
+    from omnigent.server.routes._sessions.common import _SERVER_STREAM_EVENT_ADAPTER
+
+    conv_id = "conv_input_delivery"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    body = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [{"type": "input_text", "text": "hi"}],
+    }
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    completed = next(e for e in events if e.event == "response.completed")
+    assert completed.data["delivery"] == "accepted"
+    assert events[-1] is completed, "the proof must ride on the last frame, not follow it"
+    assert not any(e.event.startswith("input.") for e in events)
+    for event in events:
+        validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event.data).model_dump()
+        assert validated["type"] == event.event
+    assert (
+        "delivery" not in _SERVER_STREAM_EVENT_ADAPTER.validate_python(completed.data).model_dump()
+    )
+
+
+async def test_scaffold_terminal_event_has_no_delivery_field_by_default(
+    use_echo: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """A turn nothing vouched for leaves the terminal event exactly as it was."""
+    conv_id = "conv_no_input_delivery"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    body = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [{"type": "input_text", "text": "hi"}],
+    }
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    completed = next(e for e in events if e.event == "response.completed")
+    assert "delivery" not in completed.data
 
 
 # ── Session-keyed surface (POST /events) ──────────────────────

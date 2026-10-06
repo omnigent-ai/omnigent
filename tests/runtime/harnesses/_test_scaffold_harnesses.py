@@ -77,6 +77,21 @@ class _UsageHarness(HarnessApp):
         ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="usage"))
 
 
+class _AcceptedInputHarness(HarnessApp):
+    """
+    Marks the turn's input as taken by a native terminal, then returns.
+
+    Verifies the scaffold carries that proof on the terminal event as a
+    ``delivery`` field, so the only frames the server ever sees are ones its
+    stream validation already knows.
+    """
+
+    async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+        del request
+        ctx.input_delivery = "accepted"
+        ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="accepted"))
+
+
 class _ToolDispatchHarness(HarnessApp):
     """
     Emits a ``function_call`` (action_required), parks on the
@@ -488,6 +503,7 @@ _FIXTURES: dict[str, type[HarnessApp]] = {
     "busy_progress": _BusyProgressHarness,
     "wedged_fast_heartbeat": _WedgedFastHeartbeatHarness,
     "usage": _UsageHarness,
+    "accepted_input": _AcceptedInputHarness,
     "tool_dispatch": _ToolDispatchHarness,
     "elicitation": _ElicitationHarness,
     "cancellable": _CancellableHarness,
