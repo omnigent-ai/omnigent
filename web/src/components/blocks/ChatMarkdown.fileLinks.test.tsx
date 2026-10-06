@@ -174,7 +174,12 @@ describe("markdown links to workspace files", () => {
   it("still linkifies an inline-code path", () => {
     renderMarkdown("see `docs/notes.md` for detail", ["docs/notes.md"]);
 
-    fireEvent.click(screen.getByRole("button", { name: "docs/notes.md" }));
+    // The openable-path chip must keep the same base styling as plain inline
+    // code (rounded background + padding), only adding the link affordance.
+    const chip = screen.getByRole("button", { name: "docs/notes.md" });
+    expect(chip).toHaveClass("rounded", "bg-muted", "px-1.5", "py-0.5");
+
+    fireEvent.click(chip);
     expect(openFile).toHaveBeenCalledWith("docs/notes.md");
   });
 });
