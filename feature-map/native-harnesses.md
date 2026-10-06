@@ -30,9 +30,10 @@ implements them separately, so a fix for one harness does not reach the others.
   CLI disconnect, a runner going offline, and a browser stream reconnect.
 
 - `launch-settings`: Settings → Harnesses → a configured Claude or Codex →
-  Settings (or its card's gear). Shows the selected host's binary, source, and
-  configured argument count, read-only. Argument and environment values stay
-  on the host. Workspace config can override these host defaults. Behind
+  Settings (or its card's gear). One Startup configuration block shows Command,
+  Environment, and Arguments, unmasked and read-only, with the selected host's source.
+  Env wrappers are split into these fields, without a duplicate raw invocation.
+  Session and workspace config can add to or override these host defaults. Behind
   `harness_settings_ui`; other harnesses keep their credential card only.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
@@ -99,8 +100,15 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 **Launch settings (own environment):** enable `harness_settings_ui`, connect a
 host with Claude/Codex configured, and put a command and two args under
 `harness.claude-native` / `harness.codex-native` in its `~/.omnigent/config.yaml`.
-Open each harness through both its gear and card → Settings. Check the binary,
-source, count of two (no values), and credential. Select a second host on the
+Open each harness through both its gear and card → Settings. Check one Startup
+configuration block with Command, Environment, and Arguments, plus source and
+credential. Repeat with `command: /usr/bin/env`
+and args containing environment assignments before the wrapped command. Check
+full override values, empty values, inheritance and `-i`/`-u` behavior. Values
+must appear only once; no Configured invocation panel. Unknown env options must
+keep the raw Command and Arguments and show an interpretation warning.
+These are host defaults, not a running session's full command or environment.
+Select a second host on the
 grid and repeat. An older host shows an update message; an older server hides
 the extra fields. Resolver and raw-tunnel checks:
 `tests/host/test_harness_startup.py`,

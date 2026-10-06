@@ -2626,14 +2626,57 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HarnessEnvironment": {
+        "properties": {
+          "inherit": {
+            "title": "Inherit",
+            "type": "boolean"
+          },
+          "unset": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unset",
+            "type": "array"
+          },
+          "variables": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Variables",
+            "type": "object"
+          }
+        },
+        "required": [
+          "inherit",
+          "variables",
+          "unset"
+        ],
+        "title": "HarnessEnvironment",
+        "type": "object"
+      },
       "HarnessStartup": {
-        "description": "The only launch metadata allowed across the host tunnel and HTTP API.",
+        "description": "Launch metadata returned through the owner-only host API.",
         "properties": {
           "arg_count": {
             "format": "int64",
             "minimum": 0.0,
             "title": "Arg Count",
             "type": "integer"
+          },
+          "args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Args"
           },
           "command": {
             "title": "Command",
@@ -2647,6 +2690,41 @@
             ],
             "title": "Command Source",
             "type": "string"
+          },
+          "configured_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configured Args"
+          },
+          "configured_command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configured Command"
+          },
+          "environment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HarnessEnvironment"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "resolved_path": {
             "anyOf": [
@@ -10636,7 +10714,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/startup": {
       "get": {
-        "description": "Read the binary, source, and argument count; never argument values.",
+        "description": "Read host launch defaults, configured invocation, and env-wrapper settings.",
         "operationId": "get_harness_startup_v1_hosts__host_id__harnesses__harness__startup_get",
         "parameters": [
           {

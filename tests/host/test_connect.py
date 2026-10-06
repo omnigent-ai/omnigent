@@ -308,7 +308,14 @@ async def test_host_answers_launch_settings(monkeypatch, fails):
     from omnigent.host.harness_startup import HarnessStartup
 
     expected = HarnessStartup(
-        command="claude", resolved_path=None, command_source="default", arg_count=2
+        command="claude",
+        resolved_path=None,
+        command_source="default",
+        arg_count=2,
+        args=["--model", "opus"],
+        configured_command="env",
+        configured_args=["TOKEN=visible-value", "claude", "--model", "opus"],
+        environment={"inherit": True, "variables": {"TOKEN": "visible-value"}, "unset": []},
     )
 
     def describe(harness):
@@ -326,7 +333,8 @@ async def test_host_answers_launch_settings(monkeypatch, fails):
     assert decode_host_frame(ws.sent[-1]) == HostHarnessStartupResultFrame(
         "startup", None if fails else expected
     )
-    assert "SECRET" not in ws.sent[-1]
+    if fails:
+        assert "SECRET" not in ws.sent[-1]
 
 
 async def test_host_answers_mcp_inventory_over_the_tunnel(
