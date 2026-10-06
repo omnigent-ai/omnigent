@@ -448,7 +448,7 @@ describe("ServerSelectorV2", () => {
       getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
     });
     expect(screen.getByText(/connecting your remote environment/i)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Connect anyway" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
     await waitFor(() =>
       expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "remote"),
     );
@@ -464,7 +464,7 @@ describe("ServerSelectorV2", () => {
     expect(onInstallCli).not.toHaveBeenCalled();
   });
 
-  it("can retry Arca or connect anyway after Arca startup fails", async () => {
+  it("can retry Arca or Continue anyway after Arca startup fails", async () => {
     const onConnectRunner = vi.fn().mockResolvedValue({ ok: false, error: "Arca failed" });
     const onInstallCli = vi.fn();
     let finishConnect: (result: { error?: string }) => void = () => {};
@@ -486,33 +486,33 @@ describe("ServerSelectorV2", () => {
     });
     expect(await screen.findByText("Arca failed")).toBeInTheDocument();
     expect(onConnect).not.toHaveBeenCalled();
-    const skip = screen.getByRole("button", { name: "Connect anyway" });
+    const skip = screen.getByRole("button", { name: "Continue anyway" });
     expect(skip.nextElementSibling).toBe(screen.getByRole("button", { name: "Retry" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(await screen.findByText("Arca failed")).toBeInTheDocument();
     expect(onConnectRunner).toHaveBeenCalledTimes(2);
-    fireEvent.click(screen.getByRole("button", { name: "Connect anyway" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
     await waitFor(() =>
       expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
     );
-    expect(screen.queryByRole("button", { name: "Connect anyway" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
     expect(screen.queryByText("Arca failed")).not.toBeInTheDocument();
 
     act(() => finishConnect({ error: "Server unavailable" }));
     expect(await screen.findByText("Server unavailable")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Connect anyway" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
     expect(onConnect).toHaveBeenCalledTimes(2);
     expect(onConnectRunner).toHaveBeenCalledTimes(2);
     expect(onInstallCli).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: "Connect anyway" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
   });
 
   it.each(["install", "laptop", "server"])(
-    "does not offer Connect anyway after a %s failure",
+    "does not offer Continue anyway after a %s failure",
     async (failure) => {
       await installFromRunnerStep({
         installed: false,
@@ -522,7 +522,7 @@ describe("ServerSelectorV2", () => {
         getRunnerOptions: vi.fn().mockResolvedValue({ remote: failure === "server" }),
       });
       expect(await screen.findByText("failed")).toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: "Connect anyway" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
     },
   );
 

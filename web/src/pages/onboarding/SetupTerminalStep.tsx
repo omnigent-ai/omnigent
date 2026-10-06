@@ -216,7 +216,7 @@ export function SetupTerminalStep({
           <div className="flex gap-2">
             {onConnectAnyway && (
               <Button variant="outline" onClick={onConnectAnyway}>
-                Connect anyway
+                Continue anyway
               </Button>
             )}
             <Button onClick={() => setAttempt((n) => n + 1)}>
