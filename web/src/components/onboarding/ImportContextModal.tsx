@@ -30,6 +30,9 @@ import {
   type InventoryAssetKind,
 } from "@/hooks/useHarnessInventory";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { Link } from "@/lib/routing";
 
 export type ImportHarness = BrandHarness;
 export type ImportContext = HarnessInventoryContext;
@@ -284,6 +287,7 @@ function ImportContextBody({
   mcpUnsupported = false,
   loadingMessage = "Checking your harnesses…",
 }: Omit<ImportContextModalProps, "open" | "onOpenChange">) {
+  const info = useServerInfo();
   const harnesses = detectedHarnesses(context);
   const notice =
     [
@@ -362,7 +366,14 @@ function ImportContextBody({
         {content}
       </div>
 
-      <div className="flex shrink-0 justify-end px-5 pt-4 pb-5">
+      <div className="flex shrink-0 justify-end gap-2 px-5 pt-4 pb-5">
+        {isFeatureEnabled(info, "harness_settings_ui") && (
+          <DialogClose asChild>
+            <Button variant="outline" asChild componentId="onboarding.import.seeMore">
+              <Link to="/settings/harnesses">See more</Link>
+            </Button>
+          </DialogClose>
+        )}
         <Button onClick={onConfirm} componentId="onboarding.import.confirm">
           Confirm
         </Button>

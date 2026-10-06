@@ -42,6 +42,10 @@ implements them separately, so a fix for one harness does not reach the others.
   with connected/auth/timeout/unreachable/unsupported and mixed-version states.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
+- `harness-settings-navigation`: with `harness_settings_ui` enabled, the import
+  review modal's See more opens Harnesses and dismisses the modal. Settings →
+  Import sessions keeps session imports but hides Harness imports. With the flag
+  off, the modal has no See more and Harness imports remains available.
 
 ## How to get to it (user POV)
 
@@ -59,6 +63,11 @@ list or plugin. Requires `harness_settings_ui`.
 **MCP tools:** Settings → Harnesses → configured harness card (or gear),
 then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
 Probes run only on expansion; requires `harness_settings_ui`.
+
+**Harness settings navigation:** the import review modal shown for a newly
+connected or requested host → See more opens Settings → Harnesses. With the
+flag off, Settings → Import sessions → Harness imports → Review imports reopens
+the review modal instead.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -115,6 +124,14 @@ the extra fields. Resolver and raw-tunnel checks:
 `tests/server/integration/test_host_tunnel_route.py::test_startup_http_through_real_tunnel`.
 
 Cross-harness journeys:
+
+- **`harness-settings-navigation`:** run
+  `web/src/components/onboarding/ImportContextModal.test.tsx` and
+  `web/src/pages/SettingsPage.test.tsx`. In an isolated instance, connect a new
+  host, then click See more beside Confirm. Check that the modal closes and
+  Harnesses opens. Open Import sessions and check that only session imports
+  remain. Repeat with `harness_settings_ui` off: no See more, and Harness
+  imports can still reopen the modal.
 
 - **`needs-auth`:**
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,

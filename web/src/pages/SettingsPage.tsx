@@ -117,6 +117,7 @@ import {
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -2717,6 +2718,7 @@ function selectValueToRetentionDays(value: string): number | null {
 }
 
 function ImportSection() {
+  const info = useServerInfo();
   return (
     <Section
       title="Import sessions"
@@ -2728,15 +2730,17 @@ function ImportSection() {
           <ImportSessionsPanel />
         </div>
       </div>
-      <div className="mt-8 flex flex-col gap-3">
-        <h2 className="text-ui font-medium">Harness imports</h2>
-        <p className="-mt-2 text-ui text-muted-foreground">
-          See the logins, MCP servers, skills, and plugins each machine's harnesses carry over.
-        </p>
-        <div className="rounded-xl border border-border bg-card p-4">
-          <ReviewImportsPanel />
+      {!isFeatureEnabled(info, "harness_settings_ui") && (
+        <div className="mt-8 flex flex-col gap-3">
+          <h2 className="text-ui font-medium">Harness imports</h2>
+          <p className="-mt-2 text-ui text-muted-foreground">
+            See the logins, MCP servers, skills, and plugins each machine's harnesses carry over.
+          </p>
+          <div className="rounded-xl border border-border bg-card p-4">
+            <ReviewImportsPanel />
+          </div>
         </div>
-      </div>
+      )}
     </Section>
   );
 }
