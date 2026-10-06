@@ -152,6 +152,7 @@ function loadNavigationHarness({
   // A createWorkspaceNetwork() to run the real session module against.
   network = null,
   manifest = {},
+  deleteStoredToken,
   notificationsSupported = false,
   oidc = {},
   acceptedSessions = new Set(),
@@ -201,7 +202,8 @@ function loadNavigationHarness({
         expirationDate: details.expirationDate,
       });
     },
-    remove: async (_url, name) => {
+    remove: async (url, name) => {
+      calls.cookiesRemoved = [...(calls.cookiesRemoved ?? []), [url, name]];
       jar.delete(name);
     },
   });
@@ -341,7 +343,26 @@ function loadNavigationHarness({
     WebContentsView: function WebContentsView(opts) {
       return electron.createWebContentsView(opts);
     },
-    Menu: { buildFromTemplate: () => ({}), setApplicationMenu: () => {} },
+    Menu: {
+      buildFromTemplate: (template) => ({
+        template,
+        getMenuItemById: (id) => {
+          const find = (items) => {
+            for (const item of items ?? []) {
+              if (item.id === id) return item;
+              const nested = Array.isArray(item.submenu) ? find(item.submenu) : null;
+              if (nested) return nested;
+            }
+            return null;
+          };
+          return find(template);
+        },
+      }),
+      setApplicationMenu: (menu) => {
+        calls.appMenu = menu;
+      },
+      getApplicationMenu: () => calls.appMenu ?? null,
+    },
     Notification: Object.assign(
       function Notification(options) {
         calls.notifications = [...(calls.notifications ?? []), options];
@@ -422,6 +443,11 @@ function loadNavigationHarness({
       },
     },
     "./databricks-oauth": {
+      deleteStoredToken: (origin) => {
+        deleteStoredToken?.(origin);
+        calls.forgottenTokens = [...(calls.forgottenTokens ?? []), origin];
+      },
+      whenRefreshSettled: async () => {},
       expireStoredAccessToken: () => false,
       removeStoredRefreshToken: () => false,
     },
@@ -529,7 +555,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -945,25 +971,241 @@ describe("Databricks auth mode wiring", () => {
     );
   });
 
-  it("signs in through the browser for a different account, then reuses that sign-in", async (t) => {
+  it("signs a workspace out from the server picker, in every window on it", async (t) => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
     t.after(h.cleanup);
     h.api.registerIpc();
-    const setupEvent = {
-      sender: h.webContents,
-      senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    h.setUrl(workspace);
+    const pageEvent = { sender: h.webContents, senderFrame: { url: workspace } };
+    const picker = await h.ipc.get("omnigent:get-server-picker")(pageEvent);
+    assert.equal(picker.canSignOut, true);
+
+    // A second window on the same workspace is signed out with it.
+    const otherLoads = [];
+    const other = {
+      isDestroyed: () => false,
+      webContents: {
+        on: () => {},
+        removeListener: () => {},
+        stop: () => {},
+        getURL: () => workspace,
+      },
+      loadFile: (...args) => {
+        otherLoads.push(args);
+        return Promise.resolve();
+      },
     };
-    const connect = (opts) => h.ipc.get("omnigent:set-server-url")(setupEvent, workspace, opts);
-    await connect({ requestId: "other", browserSignIn: true });
-    await connect({ requestId: "again" });
-    await assert.rejects(connect({ browserSignIn: "yes" }), /Invalid browserSignIn option/);
-    assert.deepEqual(
-      h.calls.auth.map((call) => [call[2].interactive, call[2].useStoredCredentials]),
-      [
-        [true, false],
-        [true, true],
-      ],
+    h.api.windows.set(other, {
+      origin: new URL(workspace).origin,
+      serverUrl: workspace,
+      ephemeral: false,
+      badgeCount: 0,
+      browserRegistry: { closeAll: () => {} },
+    });
+
+    assert.equal(await h.ipc.get("omnigent:sign-out-of-server")(pageEvent), true);
+    await tick();
+    const origin = new URL(workspace).origin;
+    assert.deepEqual(h.calls.forgottenTokens, [origin]);
+    assert.equal(h.api.windows.get(other).origin, null);
+    assert.match(
+      new URLSearchParams(otherLoads.at(-1)[1].search).get("error"),
+      /^You're signed out of /,
     );
+    assert.ok(h.calls.cookiesRemoved.some(([, name]) => name === "DBAUTH"));
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    const params = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
+    assert.equal(params.get("error"), `You're signed out of ${new URL(workspace).host}.`);
+    assert.equal(params.get("url"), workspace);
+  });
+
+  it("offers Server → Sign Out of Server whatever web app the server runs", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    const item = h.calls.appMenu.getMenuItemById("sign_out_server");
+    assert.equal(item.label, "Sign Out of Server");
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    assert.equal(item.enabled, true);
+    item.click();
+    await tick();
+    assert.deepEqual(h.calls.forgottenTokens, [new URL(workspace).origin]);
+    // Back on the setup page, there's nothing to sign out of.
+    assert.equal(item.enabled, false);
+  });
+
+  it("keeps the menu item disabled for a server whose sign-in isn't the shell's", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: "https://plain.example" });
+    t.after(h.cleanup);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    await h.api.loadServerUrl(h.win, "https://plain.example");
+    assert.equal(h.calls.appMenu.getMenuItemById("sign_out_server").enabled, false);
+  });
+
+  it("waits for a renewal already running before clearing the sign-in", async (t) => {
+    let release;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async (_ses, origin, opts) => {
+        if (opts?.interactive === false) {
+          await new Promise((resolve) => {
+            release = resolve;
+          });
+        }
+        return origin;
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    h.setUrl(workspace);
+    // The cookie disappears, so a background renewal starts and stays pending.
+    h.electron.session.defaultSession.cookies.emit(
+      "changed",
+      {},
+      { name: "DBAUTH", domain: new URL(workspace).hostname, hostOnly: true },
+      "explicit",
+      true,
+    );
+    await tick();
+    assert.equal(typeof release, "function", "no renewal started");
+    const pageEvent = { sender: h.webContents, senderFrame: { url: workspace } };
+    const signingOut = h.ipc.get("omnigent:sign-out-of-server")(pageEvent);
+    await tick();
+    assert.equal(h.calls.forgottenTokens, undefined, "cleared before the renewal settled");
+    release();
+    assert.equal(await signingOut, true);
+    assert.deepEqual(h.calls.forgottenTokens, [new URL(workspace).origin]);
+  });
+
+  it("holds a connection that starts during sign-out until the credentials are gone", async (t) => {
+    const order = [];
+    let release;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      deleteStoredToken: () => order.push("forgot"),
+      ensureSession: async (_ses, origin, opts) => {
+        order.push(`session(interactive=${opts?.interactive})`);
+        if (opts?.interactive === false && !release) {
+          await new Promise((resolve) => {
+            release = resolve;
+          });
+        }
+        return origin;
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    h.setUrl(workspace);
+    h.electron.session.defaultSession.cookies.emit(
+      "changed",
+      {},
+      { name: "DBAUTH", domain: new URL(workspace).hostname, hostOnly: true },
+      "explicit",
+      true,
+    );
+    await tick();
+    const pageEvent = { sender: h.webContents, senderFrame: { url: workspace } };
+    const signingOut = h.ipc.get("omnigent:sign-out-of-server")(pageEvent);
+    await tick();
+    // A reconnect or New Window to the same workspace while sign-out waits.
+    const reconnecting = h.api.loadServerUrl(h.win, workspace).catch(() => {});
+    await tick();
+    release();
+    assert.equal(await signingOut, true);
+    await reconnecting;
+    // The reconnect never read the old credentials: it waited, and sign-out
+    // then sent its window to the connect screen.
+    assert.deepEqual(order, ["session(interactive=true)", "session(interactive=false)", "forgot"]);
+    assert.equal(h.api.windows.get(h.win).origin, null);
+  });
+
+  it("signs out a window that is reconnecting to the workspace too", async (t) => {
+    const offlineError = () => new TypeError("fetch failed");
+    let failing = false;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async (_ses, origin) => {
+        if (failing) throw offlineError();
+        return origin;
+      },
+    });
+    t.after(h.cleanup);
+    h.api.setReconnectDelaysMs([60_000]);
+    // This window goes offline and waits behind the reconnect overlay, unpinned.
+    failing = true;
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    assert.ok(h.overlay.hint, "the window should be reconnecting");
+    // Another window on the same workspace signs out.
+    const other = {
+      isDestroyed: () => false,
+      webContents: {
+        on: () => {},
+        removeListener: () => {},
+        stop: () => {},
+        getURL: () => workspace,
+      },
+      loadFile: () => Promise.resolve(),
+    };
+    h.api.windows.set(other, {
+      origin: new URL(workspace).origin,
+      serverUrl: workspace,
+      ephemeral: false,
+      badgeCount: 0,
+      browserRegistry: { closeAll: () => {} },
+    });
+    failing = false;
+    assert.equal(await h.api.signOutOfServer(other), true);
+    await tick();
+    assert.equal(h.overlay.hint, null, "the reconnect was cancelled");
+    const params = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
+    assert.equal(params.get("error"), `You're signed out of ${new URL(workspace).host}.`);
+  });
+
+  it("clears the cookie and says so when forgetting the token fails", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      deleteStoredToken: () => {
+        throw new Error("disk full");
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    h.setUrl(workspace);
+    const pageEvent = { sender: h.webContents, senderFrame: { url: workspace } };
+    assert.equal(await h.ipc.get("omnigent:sign-out-of-server")(pageEvent), false);
+    await tick();
+    assert.ok(h.calls.cookiesRemoved.some(([, name]) => name === "DBAUTH"));
+    const params = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
+    assert.match(params.get("error"), /^Couldn't finish signing out of /);
+    // The next Connect still goes to the browser, so another account can sign in.
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    assert.equal(h.calls.auth.at(-1)[2].useStoredCredentials, false);
+  });
+
+  it("only lets the connected server page ask to sign out", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.setUrl("https://evil.example/");
+    await assert.rejects(
+      h.ipc.get("omnigent:sign-out-of-server")({
+        sender: h.webContents,
+        senderFrame: { url: "https://evil.example/" },
+      }),
+      /only available to a connected server page/,
+    );
+    assert.equal(h.calls.forgottenTokens, undefined);
   });
 
   it("keeps requiring browser sign-in after a cancelled one", async (t) => {
@@ -3230,6 +3472,63 @@ describe("OIDC system-browser sign-in wiring", () => {
     assert.equal(prevented, true);
     assert.equal(h.calls.oidc.signOut, 1);
     assert.equal(setupQuery(h).get("error"), "You're signed out of omni.example.");
+  });
+
+  it("signs out from the server picker, as the app's own sign-out does", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: { refresh: minted("renewed") },
+      acceptedSessions: new Set(["renewed"]),
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, server);
+    h.setUrl(server);
+    const pageEvent = { sender: h.webContents, senderFrame: { url: server } };
+    assert.equal((await h.ipc.get("omnigent:get-server-picker")(pageEvent)).canSignOut, true);
+    assert.equal(await h.ipc.get("omnigent:sign-out-of-server")(pageEvent), true);
+    await settle();
+    assert.equal(h.calls.oidc.signOut, 1);
+    assert.equal(setupQuery(h).get("error"), "You're signed out of omni.example.");
+  });
+
+  it("enables Sign Out only once the browser sign-in finished", async (t) => {
+    let finishSignIn;
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: {
+        signIn: () =>
+          new Promise((resolve) => {
+            finishSignIn = () => resolve({ token: "browser-session", expiresIn: 3600 });
+          }),
+      },
+      acceptedSessions: new Set(["browser-session"]),
+    });
+    t.after(h.cleanup);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    const item = h.calls.appMenu.getMenuItemById("sign_out_server");
+    const connecting = h.api.loadServerUrl(h.win, server, undefined, { interactive: true });
+    await settle();
+    assert.equal(typeof finishSignIn, "function", "browser sign-in never started");
+    assert.equal(item.enabled, false, "enabled while the browser sign-in is still pending");
+    finishSignIn();
+    await connecting;
+    assert.equal(item.enabled, true);
+  });
+
+  it("offers no Sign out for a server whose sign-in isn't the shell's", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, manifest: { manifestVersion: 1 } });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, server);
+    h.setUrl(server);
+    const pageEvent = { sender: h.webContents, senderFrame: { url: server } };
+    assert.equal((await h.ipc.get("omnigent:get-server-picker")(pageEvent)).canSignOut, false);
+    assert.equal(await h.ipc.get("omnigent:sign-out-of-server")(pageEvent), false);
+    assert.equal(h.api.windows.get(h.win).origin, server);
   });
 
   it("leaves accounts mode and servers without an auth block signing in in the window", async (t) => {

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import logging
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -37,13 +36,16 @@ class _HeartbeatStreamResponse:
         ready heartbeat has been consumed.
     """
 
-    def __init__(self, release: asyncio.Event) -> None:
+    def __init__(self, release: asyncio.Event, *, drop: bool = False) -> None:
         """
         Initialize the fake streaming response.
 
         :param release: Event used to unblock the stream tail.
+        :param drop: Raise a transport error after the gate instead of
+            ending the stream with ``[DONE]``.
         """
         self._release = release
+        self._drop = drop
 
     async def __aenter__(self) -> _HeartbeatStreamResponse:
         """
@@ -75,13 +77,15 @@ class _HeartbeatStreamResponse:
 
     async def aiter_text(self) -> AsyncIterator[str]:
         """
-        Yield a ready heartbeat, then finish after release.
+        Yield a ready heartbeat, then finish or drop after release.
 
         :yields: SSE text chunks in the same data-line shape the runner
             emits over HTTP.
         """
         yield 'data: {"type": "session.heartbeat"}\n\n'
         await self._release.wait()
+        if self._drop:
+            raise ConnectionError("tunnel closed before request completed")
         yield "data: [DONE]\n\n"
 
 
@@ -152,6 +156,10 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
         ready_row = next(row for row in rows if row["event_name"] == "runner_stream_ready")
         assert ready_row["session_id"] == "a7f039e9f1311474878eb7d4699c1013"
         assert ready_row["attributes"]["runner_id"] == "runner_ready"
+        assert ready_row["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
+        connected_row = next(row for row in rows if row["event_name"] == "runner_stream_connected")
+        assert connected_row["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
+        assert not any(row["event_name"] == "runner_stream_recovered" for row in rows)
         assert fake_runner.stream_calls[0][0] == "GET"
         assert (
             fake_runner.stream_calls[0][1]
@@ -2334,10 +2342,132 @@ class _FlakyThenHealthyRunnerClient:
         return _HeartbeatStreamResponse(release)
 
 
+class _RepeatedRecoveryRunnerClient:
+    """Drop before readiness, recover, drop after readiness, then recover again."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.release = asyncio.Event()
+        self.release.set()
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _HeartbeatStreamResponse:
+        del method, path, timeout
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionError("tunnel closed before request completed")
+        return _HeartbeatStreamResponse(self.release, drop=self.calls == 2)
+
+
+class _NeverReadyStreamResponse:
+    """SSE response that never yields the readiness heartbeat."""
+
+    def __init__(self, release: asyncio.Event) -> None:
+        self._release = release
+
+    async def __aenter__(self) -> _NeverReadyStreamResponse:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        await self._release.wait()
+        if False:
+            yield ""
+
+
+class _DropThenNeverReadyRunnerClient:
+    """Drop once, then wait before readiness until the relay is cancelled."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _NeverReadyStreamResponse:
+        del method, path, timeout
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionError("tunnel closed before request completed")
+        self.started.set()
+        return _NeverReadyStreamResponse(self.release)
+
+
+class _DelayedNeverReadyStreamResponse:
+    """SSE response that spends longer than grace before dropping."""
+
+    def __init__(self, delay_s: float) -> None:
+        self._delay_s = delay_s
+
+    async def __aenter__(self) -> _DelayedNeverReadyStreamResponse:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        await asyncio.sleep(self._delay_s)
+        raise ConnectionError("tunnel closed before request completed")
+        if False:
+            yield ""
+
+
+class _LongNoReadyAttemptRunnerClient:
+    """A no-ready attempt exceeds grace before a later ready recovery."""
+
+    def __init__(self, delay_s: float) -> None:
+        self.calls = 0
+        self._delay_s = delay_s
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _HeartbeatStreamResponse | _DelayedNeverReadyStreamResponse:
+        del method, path, timeout
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionError("tunnel closed before request completed")
+        if self.calls == 2:
+            return _DelayedNeverReadyStreamResponse(self._delay_s)
+        release = asyncio.Event()
+        release.set()
+        return _HeartbeatStreamResponse(release)
+
+
 @pytest.mark.asyncio
 async def test_relay_retries_transport_drop_within_grace(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A transport drop inside the grace reconnects without failing the session.
@@ -2354,20 +2484,20 @@ async def test_relay_retries_transport_drop_within_grace(
         0.01,
     )
     sessions_module._runner_relay_tasks.clear()
-    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
     fake_runner = _FlakyThenHealthyRunnerClient()
     store = _RecordingLabelStore()
     session_id = "5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d"
 
     try:
-        handle = await sessions_module._ensure_runner_relay_ready(
-            session_id,
-            "runner_flaky_then_healthy",
-            fake_runner,  # type: ignore[arg-type]
-            conversation_store=store,  # type: ignore[arg-type]
-        )
-        assert handle is not None
-        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        with capture_debug_rows("server") as rows:
+            handle = await sessions_module._ensure_runner_relay_ready(
+                session_id,
+                "runner_flaky_then_healthy",
+                fake_runner,  # type: ignore[arg-type]
+                conversation_store=store,  # type: ignore[arg-type]
+            )
+            assert handle is not None
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         assert fake_runner.calls == 2, "relay did not retry after the drop"
         # The blip resolved silently: no failed status reached the cache
@@ -2378,16 +2508,26 @@ async def test_relay_retries_transport_drop_within_grace(
         # was held for, and no give-up row since the retry rode it out.
         from omnigent.server.routes._sessions.orchestration import RUNNER_DISCONNECT_GRACE_S
 
-        events = [getattr(r, "event_name", None) for r in caplog.records]
+        events = [row["event_name"] for row in rows]
         assert events.count("runner_stream_transport_lost") == 1
+        assert events.count("runner_stream_recovered") == 1
         assert "runner_stream_disconnected" not in events
-        lost = next(
-            r
-            for r in caplog.records
-            if getattr(r, "event_name", None) == "runner_stream_transport_lost"
-        )
-        assert lost.session_id == session_id
-        assert lost.attributes["grace_s"] == RUNNER_DISCONNECT_GRACE_S
+        lost = next(row for row in rows if row["event_name"] == "runner_stream_transport_lost")
+        recovered = next(row for row in rows if row["event_name"] == "runner_stream_recovered")
+        assert lost["session_id"] == session_id
+        assert lost["turn_id"] is None
+        assert lost["attributes"]["runner_id"] == "runner_flaky_then_healthy"
+        assert lost["attributes"]["stream_ready"] == "False"
+        assert lost["attributes"]["grace_s"] == str(RUNNER_DISCONNECT_GRACE_S)
+        assert lost["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
+        assert recovered["session_id"] == session_id
+        assert recovered["turn_id"] is None
+        assert recovered["attributes"]["outage_id"] == lost["attributes"]["outage_id"]
+        assert recovered["attributes"]["runner_id"] == "runner_flaky_then_healthy"
+        assert recovered["attributes"]["recovery_attempt"] == "1"
+        assert recovered["attributes"]["recovery_evidence"] == "stream_heartbeat"
+        assert recovered["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
+        assert float(recovered["attributes"]["outage_s"]) >= 0
     finally:
         handle = sessions_module._runner_relay_tasks.get(session_id)
         if handle is not None and not handle.task.done():
@@ -2396,6 +2536,181 @@ async def test_relay_retries_transport_drop_within_grace(
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_relay_recovery_rows_get_fresh_ids_for_repeated_ready_drop_cycles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each ready-confirmed outage gets one distinct, serializer-visible ID."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S", 0.0
+    )
+    sessions_module._runner_relay_tasks.clear()
+    runner = _RepeatedRecoveryRunnerClient()
+    store = _RecordingLabelStore()
+    session_id = "6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e"
+    sessions_module._session_active_response_cache[session_id] = "turn-loss"
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await asyncio.wait_for(
+                sessions_module._relay_runner_stream(
+                    session_id,
+                    runner,  # type: ignore[arg-type]
+                    store,  # type: ignore[arg-type]
+                    runner_id="runner_repeated_recovery",
+                ),
+                timeout=_TASK_TIMEOUT_S,
+            )
+
+        losses = [row for row in rows if row["event_name"] == "runner_stream_transport_lost"]
+        recoveries = [row for row in rows if row["event_name"] == "runner_stream_recovered"]
+        assert runner.calls == 3
+        assert len(losses) == len(recoveries) == 2
+        loss_ids = {row["attributes"]["outage_id"] for row in losses}
+        recovery_ids = {row["attributes"]["outage_id"] for row in recoveries}
+        assert len(loss_ids) == 2
+        assert recovery_ids == loss_ids
+        assert {row["attributes"]["stream_ready"] for row in losses} == {"False", "True"}
+        assert {row["turn_id"] for row in losses} == {"turn-loss"}
+        assert {row["turn_id"] for row in recoveries} == {"turn-loss"}
+        assert all(
+            row["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
+            for row in losses + recoveries
+        )
+        assert all(float(row["attributes"]["outage_s"]) >= 0 for row in recoveries)
+        assert not any(row["event_name"] == "runner_stream_disconnected" for row in rows)
+    finally:
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_active_response_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_relay_cancellation_before_ready_emits_no_recovery_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled/rebound retry before heartbeat leaves its outage censored."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S", 0.0
+    )
+    sessions_module._runner_relay_tasks.clear()
+    runner = _DropThenNeverReadyRunnerClient()
+    session_id = "7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f"
+    task: asyncio.Task[None] | None = None
+
+    try:
+        with capture_debug_rows("server") as rows:
+            task = asyncio.create_task(
+                sessions_module._relay_runner_stream(
+                    session_id,
+                    runner,  # type: ignore[arg-type]
+                    _RecordingLabelStore(),
+                    runner_id="runner_cancel_before_ready",
+                )
+            )
+            await asyncio.wait_for(runner.started.wait(), timeout=_TASK_TIMEOUT_S)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert any(row["event_name"] == "runner_stream_transport_lost" for row in rows)
+        assert not any(row["event_name"] == "runner_stream_recovered" for row in rows)
+    finally:
+        runner.release.set()
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        sessions_module._runner_relay_tasks.clear()
+
+
+@pytest.mark.asyncio
+async def test_relay_giveup_matches_loss_outage_and_turn_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A give-up row reuses the exact loss ID and loss-time turn identity."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    gate.set()
+    runner = _TunnelCloseRunnerClient(gate)
+    store = _RecordingLabelStore()
+    session_id = "8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f30"
+    sessions_module._session_active_response_cache[session_id] = "turn-giveup"
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await asyncio.wait_for(
+                sessions_module._relay_runner_stream(
+                    session_id,
+                    runner,  # type: ignore[arg-type]
+                    store,  # type: ignore[arg-type]
+                    runner_id="runner_giveup_identity",
+                ),
+                timeout=_TASK_TIMEOUT_S,
+            )
+
+        lost = next(row for row in rows if row["event_name"] == "runner_stream_transport_lost")
+        giveup = next(row for row in rows if row["event_name"] == "runner_stream_disconnected")
+        assert lost["turn_id"] == "turn-giveup"
+        assert giveup["turn_id"] == "turn-giveup"
+        assert giveup["attributes"]["outage_id"] == lost["attributes"]["outage_id"]
+        assert giveup["attributes"]["runner_id"] == "runner_giveup_identity"
+        assert giveup["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
+        assert not any(row["event_name"] == "runner_stream_recovered" for row in rows)
+    finally:
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_active_response_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_relay_long_unready_attempt_starts_a_new_outage_without_false_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A grace reset without heartbeat does not recover the prior outage."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.01
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S", 0.0
+    )
+    sessions_module._runner_relay_tasks.clear()
+    runner = _LongNoReadyAttemptRunnerClient(delay_s=0.05)
+    session_id = "9e0f1a2b3c4d5e6f7a8b9c0d1e2f3041"
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await asyncio.wait_for(
+                sessions_module._relay_runner_stream(
+                    session_id,
+                    runner,  # type: ignore[arg-type]
+                    _RecordingLabelStore(),
+                    runner_id="runner_long_unready",
+                ),
+                timeout=_TASK_TIMEOUT_S,
+            )
+
+        losses = [row for row in rows if row["event_name"] == "runner_stream_transport_lost"]
+        recoveries = [row for row in rows if row["event_name"] == "runner_stream_recovered"]
+        assert runner.calls == 3
+        assert len(losses) == 2
+        assert len(recoveries) == 1
+        assert all(row["attributes"]["stream_ready"] == "False" for row in losses)
+        assert recoveries[0]["attributes"]["outage_id"] == losses[1]["attributes"]["outage_id"]
+        assert recoveries[0]["attributes"]["outage_id"] != losses[0]["attributes"]["outage_id"]
+    finally:
+        sessions_module._runner_relay_tasks.clear()
 
 
 @pytest.mark.asyncio

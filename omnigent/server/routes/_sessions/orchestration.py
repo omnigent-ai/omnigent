@@ -130,7 +130,12 @@ from omnigent.server.background_session_titles import (
     background_session_titles_enabled,
     prepare_background_session_title,
 )
-from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.bundles import (
+    agent_for_user,
+    bundle_location,
+    uploaded_agent_for,
+    validate_agent_bundle,
+)
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
@@ -150,6 +155,7 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
+from omnigent.server.routes._errors import agent_removed as _agent_removed
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._session_create_validation import (
     validate_session_agent,
@@ -287,6 +293,7 @@ from omnigent.server.routes._sessions.helpers import (
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
     _persist_native_policy_notice,
+    _persist_session_for_uploaded_agent,
     _persist_session_status_error_labels,
     _persist_stored_session_bundle,
     _policy_notice_from_ensure_response,
@@ -5085,8 +5092,17 @@ async def _ensure_runner_session_initialized(
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
-        from omnigent.server.runner_session_init import runner_inference_verified
+        from omnigent.server.runner_session_init import (
+            is_session_agent_removed,
+            runner_inference_verified,
+        )
 
+        if is_session_agent_removed(resp):
+            # Forwarded anyway, the message gets the runner's own "this agent no
+            # longer exists" reply; a caller that needs the runner ready gets it now.
+            if require_success or conv.inference_snapshot is not None:
+                raise _agent_removed()
+            return False
         if not runner_inference_verified(conv, resp):
             raise OmnigentError(
                 "The runner did not accept this session's saved inference configuration",
@@ -6165,6 +6181,7 @@ async def _forward_event_to_runner(
     has_mcp_servers: bool = False,
     created_by: str | None = None,
     host_store: HostStore | None = None,
+    agent_revision: str | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -6196,6 +6213,8 @@ async def _forward_event_to_runner(
     :param host_store: Host registrations, read only to learn whether this
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed.
+    :param agent_revision: The agent's current ``bundle_location``; the
+        runner rebuilds the session's spec when it changes.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
@@ -6310,6 +6329,8 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    if agent_revision is not None:
+        runner_body["agent_revision"] = agent_revision
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
     # forwards (sub-agent results, parent-wake carry created_by=None) — they
@@ -7012,6 +7033,7 @@ async def _dispatch_session_event_to_runner_impl(
     host_store: HostStore | None = None,
     host_registry: HostRegistry | None = None,
     background_titles_enabled: bool = True,
+    agent_revision: str | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -7084,6 +7106,8 @@ async def _dispatch_session_event_to_runner_impl(
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed — the same posture
         an older host row gets.
+    :param agent_revision: The agent's current ``bundle_location``, stamped on
+        non-native forwards (see :func:`_forward_event_to_runner`).
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -7369,6 +7393,7 @@ async def _dispatch_session_event_to_runner_impl(
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
         host_store=host_store,
+        agent_revision=agent_revision,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -7379,6 +7404,9 @@ async def _dispatch_session_event_to_runner_impl(
 RUNNER_DISCONNECT_GRACE_S: float = float(RUNNER_LIVENESS_TTL_S)
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
+# Version marker for the bounded relay recovery event contract. Keep this on
+# every connected/ready row so rollout queries can separate old and new shapes.
+_RELAY_TELEMETRY_SCHEMA = "runner_stream_recovery.v1"
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but
 # stalled and re-registers once it can (observed: 24 s). Hold the message that
 # long before failing it instead of discarding it on a drop the runner outlives.
@@ -7631,8 +7659,46 @@ async def _relay_runner_stream(
     """
     loop = asyncio.get_running_loop()
     deadline: float | None = None
-    outage_started = 0.0
+    outage_started: float | None = None
+    outage_id: str | None = None
+    outage_runner_id: str | None = None
+    outage_turn_id: str | None = None
     retries = 0
+
+    def _on_stream_ready() -> None:
+        """Record one ready-confirmed recovery for the active outage."""
+        nonlocal outage_id, outage_started, outage_runner_id, outage_turn_id
+        if outage_id is None or outage_started is None:
+            # The first ready heartbeat is ordinary relay startup, not recovery.
+            return
+        recovered_id = outage_id
+        recovered_started = outage_started
+        recovered_runner_id = outage_runner_id
+        recovered_turn_id = outage_turn_id
+        outage_id = None
+        outage_started = None
+        outage_runner_id = None
+        outage_turn_id = None
+        attributes = {
+            "outage_id": recovered_id,
+            "runner_id": recovered_runner_id,
+            "recovery_attempt": max(1, retries),
+            "outage_s": round(loop.time() - recovered_started, 3),
+            "recovery_evidence": "stream_heartbeat",
+            "telemetry_schema": _RELAY_TELEMETRY_SCHEMA,
+        }
+        _logger.info(
+            "Relay: runner stream recovered for session=%s after %.1fs",
+            session_id,
+            attributes["outage_s"],
+            extra=debug_event(
+                "runner_stream_recovered",
+                session_id=session_id,
+                turn_id=recovered_turn_id,
+                **attributes,
+            ),
+        )
+
     while True:
         started = loop.time()
         try:
@@ -7642,6 +7708,7 @@ async def _relay_runner_stream(
                 conversation_store,
                 ready,
                 runner_id=runner_id,
+                on_stream_ready=_on_stream_ready,
             )
             return
         except _RelayTransportLost as lost:
@@ -7652,6 +7719,9 @@ async def _relay_runner_stream(
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
                 outage_started = now
                 retries = 0
+                outage_id = uuid.uuid4().hex
+                outage_runner_id = runner_id
+                outage_turn_id = _session_active_response_cache.get(session_id)
                 _logger.info(
                     "Relay: runner transport lost for session=%s (intentional=%s, grace=%.1fs)",
                     session_id,
@@ -7660,9 +7730,14 @@ async def _relay_runner_stream(
                     extra=debug_event(
                         "runner_stream_transport_lost",
                         session_id=session_id,
+                        turn_id=outage_turn_id,
+                        outage_id=outage_id,
+                        runner_id=outage_runner_id,
                         intentional_stop=lost.intentional,
+                        stream_ready=lost.stream_ready,
                         cached_session_status=_session_status_cache.get(session_id),
                         grace_s=RUNNER_DISCONNECT_GRACE_S,
+                        telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
                     ),
                 )
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
@@ -7707,12 +7782,18 @@ async def _relay_runner_stream(
                 extra=debug_event(
                     "runner_stream_disconnected",
                     session_id=session_id,
+                    turn_id=outage_turn_id,
+                    outage_id=outage_id,
+                    runner_id=outage_runner_id,
                     intentional_stop=lost.intentional,
                     cached_session_status=_session_status_cache.get(session_id),
                     decision=decision,
                     grace_s=RUNNER_DISCONNECT_GRACE_S,
-                    outage_s=round(now - outage_started, 3),
+                    outage_s=(
+                        round(now - outage_started, 3) if outage_started is not None else None
+                    ),
                     retries=retries,
+                    telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
                 ),
             )
             if decision == "intentional_stop":
@@ -7800,6 +7881,7 @@ async def _relay_runner_stream_once(
     ready: asyncio.Event | None = None,
     *,
     runner_id: str | None = None,
+    on_stream_ready: Callable[[], None] | None = None,
 ) -> None:
     """
     Subscribe to the runner's SSE stream and relay events locally.
@@ -7828,6 +7910,9 @@ async def _relay_runner_stream_once(
         that exercise relay parsing/persistence without asserting on
         startup readiness.
     :param runner_id: The runner this attempt owns, used to match stop intent.
+    :param on_stream_ready: Optional callback after this attempt's first
+        ``session.heartbeat``. The supervisor uses it for one recovery row;
+        it is synchronous and does not create a helper task.
     """
     text_acc: list[str] = []
     current_response_id: str | None = None
@@ -7871,7 +7956,12 @@ async def _relay_runner_stream_once(
             _logger.info(
                 "Relay: connected to runner GET /stream for session=%s",
                 session_id,
-                extra=debug_event("runner_stream_connected", session_id=session_id),
+                extra=debug_event(
+                    "runner_stream_connected",
+                    session_id=session_id,
+                    runner_id=runner_id,
+                    telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
+                ),
             )
             buffer = ""
             async for chunk in resp.aiter_text():
@@ -7907,8 +7997,15 @@ async def _relay_runner_stream_once(
                             _logger.info(
                                 "Relay: runner stream ready for session=%s",
                                 session_id,
-                                extra=debug_event("runner_stream_ready", session_id=session_id),
+                                extra=debug_event(
+                                    "runner_stream_ready",
+                                    session_id=session_id,
+                                    runner_id=runner_id,
+                                    telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
+                                ),
                             )
+                            if on_stream_ready is not None:
+                                on_stream_ready()
                         if ready is not None:
                             ready.set()
                         continue
@@ -9132,6 +9229,7 @@ async def _wake_parent_for_blocked_child(
     *,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    agent_store: AgentStore | None = None,
 ) -> bool:
     """
     Deliver a parent-wake notice when a sub-agent blocks on an approval.
@@ -9154,6 +9252,8 @@ async def _wake_parent_for_blocked_child(
     :param runner_router: Router used to resolve the parent's bound
         runner. ``None`` in in-process setups (the runtime singleton is
         consulted as a fallback).
+    :param agent_store: Resolves the parent agent's current bundle, so a
+        reinstall since the parent's last turn reaches this wake turn too.
     :returns: ``True`` when the notice was dispatched to the parent's runner;
         ``False`` when delivery could not happen (parent gone, no runner bound,
         or the forward raised a transport error).
@@ -9193,6 +9293,11 @@ async def _wake_parent_for_blocked_child(
             "content": [{"type": "input_text", "text": notice}],
         },
     )
+    parent_agent = (
+        await asyncio.to_thread(agent_store.get, parent_conv.agent_id)
+        if agent_store is not None and parent_conv.agent_id
+        else None
+    )
     try:
         # None args: a system notice carries no agent/files/artifacts; the runner
         # recomputes has_mcp_servers from the parent's cached spec.
@@ -9206,6 +9311,7 @@ async def _wake_parent_for_blocked_child(
             file_store=None,
             artifact_store=None,
             runner_router=runner_router,
+            agent_revision=parent_agent.bundle_location if parent_agent is not None else None,
         )
     except (httpx.HTTPError, OmnigentError):
         _logger.warning(
@@ -9221,6 +9327,7 @@ async def _wake_parent_for_blocked_child(
 def configure_subagent_block_notifier(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    agent_store: AgentStore | None = None,
 ) -> Callable[[], None]:
     """
     Install the parent-wake notifier on the elicitation publish path.
@@ -9239,6 +9346,7 @@ def configure_subagent_block_notifier(
         ``parent_conversation_id`` and to persist the wake message.
     :param runner_router: Router used by the wake to reach the parent's
         bound runner. ``None`` in in-process setups.
+    :param agent_store: Lets each wake name the parent agent's current bundle.
     :returns: A callable that uninstalls the observer and cancels any
         in-flight wake futures. Call from the lifespan teardown.
     """
@@ -9264,6 +9372,7 @@ def configure_subagent_block_notifier(
             notice,
             conversation_store=conversation_store,
             runner_router=runner_router,
+            agent_store=agent_store,
         )
 
     notifier = SubagentBlockNotifier(
@@ -9726,7 +9835,7 @@ def _create_resolved_harness(
         return None
     try:
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         # An unloadable spec just means "harness unknown"; the create's own
@@ -9812,7 +9921,7 @@ def _spec_routes_its_own_harness(
         return False
     try:
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         # An unloadable spec just means "no opt-in"; the create's own
@@ -10340,7 +10449,7 @@ async def _create_session_from_existing_agent(
                     agent_cache.load,
                     agent.id,
                     agent.bundle_location,
-                    expand_env=agent.session_id is None,
+                    expand_env=agent.operator_authored,
                 )
             ).spec
         except (KeyError, AttributeError, ValueError, ImportError, OSError):
@@ -10548,7 +10657,7 @@ async def _create_session_from_existing_agent(
                 agent_cache.load,
                 agent.id,
                 agent.bundle_location,
-                expand_env=agent.session_id is None,
+                expand_env=agent.operator_authored,
             )
             own_spec = own_loaded.spec if own_loaded is not None else None
         except (OSError, ValueError, RuntimeError, KeyError, AttributeError, ImportError):
@@ -10620,6 +10729,16 @@ async def _create_session_from_existing_agent(
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
     )
     from omnigent.stores.conversation_store.overrides import encode_session_overrides
+
+    # A new session from another user's agent runs on the caller's own copy, so
+    # that user can never change code running here. A child reusing its parent's
+    # agent stays on it: collaborators act in the owner's session. A failed create
+    # below keeps the copy: it is listed to its owner from the start, so another of
+    # their requests may already be using it.
+    if _parent_for_routing is None or _parent_for_routing.agent_id != agent.id:
+        agent = await asyncio.to_thread(
+            agent_for_user, agent_store, artifact_store, agent, user_id
+        )
 
     try:
         # Include spec-seeded defaults before create; overflow must not leave a session.
@@ -10797,7 +10916,7 @@ async def _create_session_from_existing_agent(
                 _tel_loaded = agent_cache.load(
                     agent.id,
                     agent.bundle_location,
-                    expand_env=agent.session_id is None,
+                    expand_env=agent.operator_authored,
                 )
                 _tel_harness = _spec_harness(_tel_loaded.spec)
             else:
@@ -10876,6 +10995,7 @@ async def _create_session_from_existing_agent(
                     runner_router=runner_router,
                     host_store=getattr(request.app.state, "host_store", None),
                     background_titles_enabled=background_session_titles_enabled(request.headers),
+                    agent_revision=agent.bundle_location,
                 )
                 if pending_background_title is not None:
                     pending_background_title.schedule(expected_seed_title=conv.title)
@@ -10909,17 +11029,14 @@ def _create_session_from_bundle(
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
     created_by: str | None = None,
+    agent_store: AgentStore | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
 
-    Each upload creates a session-scoped agent row, even when a
-    template agent with the same spec name already exists. Agent
-    names are user-authored labels, not global content identities:
-    reusing a template by name would make a fresh ``omnigent run
-    <yaml>`` session execute whatever bundle that template currently
-    points at, silently discarding the uploaded bundle and coupling
-    unrelated users who chose the same name.
+    Top-level uploads reuse the uploader's row with the same name and bundle
+    contents (:func:`~omnigent.server.bundles.uploaded_agent_for`), never a row
+    matched by name alone. Child uploads receive separate rows.
 
     :param conversation_store: Store that owns the atomic
         conversation-plus-agent transaction.
@@ -10941,6 +11058,8 @@ def _create_session_from_bundle(
     :param created_by: Identity of the creating user, recorded on the
         new session-scoped agent so its code can only be mutated by the
         owner. ``None`` in single-user mode.
+    :param agent_store: Store holding the uploader's agents. ``None``
+        gives every upload its own row.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -10996,6 +11115,24 @@ def _create_session_from_bundle(
             ) from exc
         if terminal_launch_args is not None:
             metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
+
+    if agent_store is not None and metadata.parent_session_id is None:
+        agent = uploaded_agent_for(
+            agent_store,
+            artifact_store,
+            owner=created_by,
+            spec=spec,
+            bundle_bytes=bundle_bytes,
+        )
+        if agent is not None:
+            return _persist_session_for_uploaded_agent(
+                conversation_store,
+                metadata,
+                agent,
+                runner_id=runner_id,
+                inference_snapshot=inference_snapshot,
+                inference_model=inference_model,
+            )
 
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)
@@ -12134,7 +12271,7 @@ async def _get_session_snapshot(
                         agent_cache.load,
                         agent.id,
                         agent.bundle_location,
-                        expand_env=agent.session_id is None,
+                        expand_env=agent.operator_authored,
                     )
                     resolved_spec: AgentSpec | None = loaded.spec
                     if conv.sub_agent_name:

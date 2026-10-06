@@ -81,6 +81,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   context_length_exceeded: "The conversation grew past the model's context window.",
   executor_error: "The agent runtime hit an error while running the turn.",
   workspace_missing: "The session workspace no longer exists on the host.",
+  session_agent_missing:
+    "This agent no longer exists. Fork this session into another agent to continue.",
   codex_thread_reset:
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
   codex_turn_error: "Codex ran into an error during this turn.",

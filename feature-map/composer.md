@@ -37,6 +37,10 @@ and steers messages while the agent is busy.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
+- `import-bundle`: Create custom agent → Import bundle installs a `.tar.gz` agent
+  bundle and selects it. States: import in flight (Cancel and Create locked),
+  rejected bundle, imported agent missing from the refreshed list, and hidden on
+  a server without agent install.
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
 
@@ -69,6 +73,10 @@ and steers messages while the agent is busy.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi), and permission mode before the session exists.
 - Attach files or type `/` before the first send.
+- Open the agent picker's custom agents, then Create custom agent → Import
+  bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
+  selects the agent, which stays listed after a reload. A rejected bundle (for
+  example a server agent's name) keeps the dialog open with the server's reason.
 
 **Mobile** (either composer on a phone-sized viewport): the same controls with
 collapsed labels.
@@ -139,6 +147,12 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/chat/test_draft_survives_incoming_messages.py::test_mid_typing_answer_survives_arriving_prompt`
 - **`new-session-hotkey`:**
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
+- **`import-bundle`:** no browser-level coverage; the web unit tests for the
+  Create custom agent and new-session dialogs cover it. Manually: open the agent
+  picker's custom agents, then Create custom agent → Import bundle, and pick a
+  `.tar.gz` of an agent directory. Expect the dialog to close with the agent
+  selected, and the agent still listed after a reload. A bundle named like a
+  server agent keeps the dialog open with the server's reason.
 - **`mobile-labels`, new-session composer:**
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
 

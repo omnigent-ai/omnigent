@@ -691,7 +691,7 @@ async def test_list_session_resources_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -1323,7 +1323,7 @@ async def test_get_resource_by_id_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -3609,7 +3609,7 @@ async def test_filesystem_download_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -3652,7 +3652,7 @@ async def test_filesystem_write_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio

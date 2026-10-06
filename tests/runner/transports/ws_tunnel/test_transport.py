@@ -70,6 +70,21 @@ async def test_handle_async_request_raises_connect_error_on_race() -> None:
         await transport.handle_async_request(_make_request())
 
 
+@pytest.mark.asyncio
+async def test_handle_async_request_rejects_replaced_generation() -> None:
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+    request = _make_request()
+    request.extensions["runner_tunnel_generation"] = old.generation
+    new = reg.register("r1", _NoopWS(), _hello())
+
+    with pytest.raises(ConnectionError, match="before request was sent"):
+        await transport.handle_async_request(request)
+    assert not new.in_flight
+    assert new.outbound_queue.empty()
+
+
 # ── handle_async_request: successful response ──────────
 
 
