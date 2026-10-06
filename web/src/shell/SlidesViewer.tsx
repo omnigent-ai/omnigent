@@ -61,6 +61,13 @@ export function isIgnoredNavKey(e: {
   return e.target instanceof Element && !!e.target.closest(SLIDES_EDITABLE_SELECTOR);
 }
 
+/** Filename for Download HTML; odd paths that strip to nothing become `deck.html`. */
+export function slidesExportFilename(path?: string | null): string {
+  const file = path?.split("/").at(-1) || "deck.slides.html";
+  const base = file.replace(/\.slides\.html$/i, "") || "deck";
+  return `${base}.html`;
+}
+
 // A stalled kit or design-system read must not leave the deck blank. A full
 // design system loads more files, so it gets longer once it is found.
 export const DESIGN_KIT_TIMEOUT_MS = 2000;
@@ -255,13 +262,35 @@ export function SlidesViewer({
 
   const empty = total === 0;
   // A notice means the kit or design system did not load, so assets would be missing.
-  const canExport = brandingReady && !truncated && !branding.notice;
+  const canExport = !empty && brandingReady && !truncated && !branding.notice;
+  const exportTitle = empty
+    ? "Download HTML needs at least one slide"
+    : canExport
+      ? "Download HTML"
+      : "Download HTML needs the full deck with its branding loaded";
   const downloadHtml = () => {
-    const file = deckPath?.split("/").at(-1) ?? "deck.slides.html";
-    const name = file.replace(/\.slides\.html$/i, "");
+    if (!canExport) return;
     const html = prepareSlidesExport(deckContent, kitStyle, systemStyle);
-    triggerBrowserDownload(new Blob([html], { type: "text/html" }), `${name}.html`);
+    triggerBrowserDownload(
+      new Blob([html], { type: "text/html" }),
+      slidesExportFilename(deckPath),
+    );
   };
+  const downloadButton = (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      aria-label="Download HTML"
+      title={exportTitle}
+      disabled={!canExport}
+      onClick={downloadHtml}
+      className="h-8 gap-1.5 px-2"
+    >
+      <DownloadIcon className="size-4" />
+      <span className="hidden sm:inline">Download HTML</span>
+    </Button>
+  );
 
   // One tree for both states so the iframe stays mounted (hidden) while empty
   // and can still report a runtime count.
@@ -290,7 +319,10 @@ export function SlidesViewer({
           <PresentationIcon className="size-6" />
           <p className="font-medium text-foreground">No slides yet</p>
           <p>Add a top-level &lt;section&gt; for each slide.</p>
-          {sourceButton}
+          <div className="flex items-center gap-1">
+            {downloadButton}
+            {sourceButton}
+          </div>
         </div>
       )}
       <div
@@ -366,23 +398,7 @@ export function SlidesViewer({
               <PrinterIcon className="size-4" />
               <span className="hidden sm:inline">Print / Save as PDF</span>
             </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              aria-label="Download HTML"
-              title={
-                canExport
-                  ? "Download HTML"
-                  : "Download HTML needs the full deck with its branding loaded"
-              }
-              disabled={!canExport}
-              onClick={downloadHtml}
-              className="h-8 gap-1.5 px-2"
-            >
-              <DownloadIcon className="size-4" />
-              <span className="hidden sm:inline">Download HTML</span>
-            </Button>
+            {downloadButton}
             {sourceButton}
             {fullscreenSupported && (
               <Button
