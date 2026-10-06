@@ -774,6 +774,287 @@ def test_input_file_zip_is_materialized_without_workspace(
     ]
 
 
+# Codex rejects a turn whose text items total more than this many characters.
+_CODEX_TEXT_LIMIT = 1_048_576
+
+
+def _text_chars(items: list[dict[str, Any]]) -> int:
+    """
+    Count the characters Codex charges against its per-turn text limit.
+
+    :param items: Codex input items.
+    :returns: Total characters across the ``text`` items.
+    """
+    return sum(len(item["text"]) for item in items if item["type"] == "text")
+
+
+def _referenced_file(item: dict[str, Any]) -> Path:
+    """
+    Resolve the file an ``[Attached file: <path>]`` reference item points at.
+
+    :param item: A Codex ``text`` input item.
+    :returns: The referenced path.
+    """
+    text = item["text"]
+    assert text.startswith("[Attached file: ") and text.endswith("]"), text
+    return Path(text[len("[Attached file: ") : -1])
+
+
+def _input_text(text: str) -> dict[str, Any]:
+    """Build an ``input_text`` content block."""
+    return {"type": "input_text", "text": text}
+
+
+def _text_file_block(text: str, filename: str | None = None) -> dict[str, Any]:
+    """
+    Build a ``text/plain`` ``input_file`` block carrying *text*.
+
+    :param text: File content.
+    :param filename: Optional upload name, e.g. ``"server.log"``.
+    :returns: The content block.
+    """
+    block: dict[str, Any] = {
+        "type": "input_file",
+        "file_data": "data:text/plain;base64," + base64.b64encode(text.encode()).decode(),
+    }
+    if filename is not None:
+        block["filename"] = filename
+    return block
+
+
+def test_oversized_text_block_spills_to_an_attachment_file(tmp_path: Path) -> None:
+    """
+    A text block past Codex's input limit is sent as a file reference.
+
+    Codex rejects a turn whose text exceeds 1,048,576 characters, so a huge
+    paste used to fail the turn with ``input_too_large``. The full text now
+    lands in the session's attachment cache and the turn carries only the
+    reference line, like a binary attachment.
+    """
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    text = "HEAD" + "a" * 1_499_992 + "TAIL"
+
+    items = _content_to_input_items([_input_text(text)], tmp_path)
+
+    assert len(items) == 1
+    assert _text_chars(items) < _CODEX_TEXT_LIMIT
+    path = _referenced_file(items[0])
+    assert path.parent == attachment_cache_dir(tmp_path)
+    assert path.read_text(encoding="utf-8") == text
+
+
+def test_oversized_string_content_spills_to_an_attachment_file(tmp_path: Path) -> None:
+    """Plain-string message content is bounded the same way as a text block."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    text = "b" * 1_331_269
+
+    items = _content_to_input_items(text, tmp_path)
+
+    assert len(items) == 1
+    assert _text_chars(items) < _CODEX_TEXT_LIMIT
+    assert _referenced_file(items[0]).read_text(encoding="utf-8") == text
+
+
+def test_oversized_text_file_spills_under_its_own_name(tmp_path: Path) -> None:
+    """An inline ``text/*`` upload past the limit is written out under its filename."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    text = "worker started\n" * 220_000
+
+    items = _content_to_input_items([_text_file_block(text, "server.log")], tmp_path)
+
+    expected = attachment_cache_dir(tmp_path) / "server.log"
+    assert items == [{"type": "text", "text": f"[Attached file: {expected}]"}]
+    assert expected.read_text(encoding="utf-8") == text
+
+
+@pytest.mark.parametrize(
+    ("chars", "spilled"),
+    [(900_000, False), (900_001, True)],
+    ids=["at-threshold", "past-threshold"],
+)
+def test_text_spills_only_past_the_inline_threshold(
+    tmp_path: Path, chars: int, spilled: bool
+) -> None:
+    """Text up to the threshold stays inline; one character more moves to a file."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    text = "c" * chars
+
+    items = _content_to_input_items([_input_text(text)], tmp_path)
+
+    if spilled:
+        assert _referenced_file(items[0]).read_text(encoding="utf-8") == text
+    else:
+        assert items == [{"type": "text", "text": text}]
+        assert not attachment_cache_dir(tmp_path).exists()
+
+
+def test_small_text_and_text_files_are_sent_inline_unchanged(tmp_path: Path) -> None:
+    """Nothing is written to disk for text that fits."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    items = _content_to_input_items(
+        [_input_text("hello"), _text_file_block("line one\nline two\n")], tmp_path
+    )
+
+    assert items == [
+        {"type": "text", "text": "hello"},
+        {"type": "text", "text": "line one\nline two\n"},
+    ]
+    assert not attachment_cache_dir(tmp_path).exists()
+
+
+def test_turn_text_total_stays_under_the_limit_across_blocks(tmp_path: Path) -> None:
+    """
+    Blocks that each fit still share one limit: the largest spill first.
+
+    The question and the smaller blocks stay inline, in their original order.
+    """
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    question = "Which of these logs is the noisy one?"
+
+    items = _content_to_input_items(
+        [
+            _input_text(question),
+            _input_text("A" * 500_000),
+            _input_text("B" * 450_000),
+            _input_text("C" * 400_000),
+        ],
+        tmp_path,
+    )
+
+    assert len(items) == 4
+    assert items[0] == {"type": "text", "text": question}
+    assert _referenced_file(items[1]).read_text(encoding="utf-8") == "A" * 500_000
+    assert items[2] == {"type": "text", "text": "B" * 450_000}
+    assert items[3] == {"type": "text", "text": "C" * 400_000}
+    assert _text_chars(items) <= 900_000
+
+
+def test_text_file_and_message_text_share_the_turn_limit(tmp_path: Path) -> None:
+    """An inlined text file counts toward the same limit as the message text."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    items = _content_to_input_items(
+        [_input_text("d" * 300_000), _text_file_block("e" * 700_000, "data.csv")], tmp_path
+    )
+
+    assert items[0] == {"type": "text", "text": "d" * 300_000}
+    spilled = _referenced_file(items[1])
+    assert spilled == attachment_cache_dir(tmp_path) / "data.csv"
+    assert spilled.read_text(encoding="utf-8") == "e" * 700_000
+
+
+def test_spilled_text_is_reused_when_the_same_message_is_sent_again(tmp_path: Path) -> None:
+    """A retried send points at the file already written instead of adding another."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    content = [_input_text("f" * 1_200_000)]
+
+    first = _content_to_input_items(content, tmp_path)
+    second = _content_to_input_items(content, tmp_path)
+
+    assert first == second
+    assert len(list(attachment_cache_dir(tmp_path).iterdir())) == 1
+
+
+def test_text_stays_inline_when_the_attachment_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed write never drops the user's text; Codex reports the overflow itself."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    monkeypatch.setattr(codex_native_executor, "materialize_text", lambda *_a, **_k: None)
+    text = "g" * 1_200_000
+
+    assert _content_to_input_items([_input_text(text)], tmp_path) == [
+        {"type": "text", "text": text}
+    ]
+
+
+def test_spilling_logs_the_size_and_kind_but_not_the_text(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each spill leaves a structured event with how much moved, never what it said."""
+    from omnigent.debug_logging import record_to_row
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    with caplog.at_level(logging.INFO, logger=codex_native_executor.__name__):
+        _content_to_input_items(
+            [_input_text("SECRETPASTE" * 150_000)], tmp_path, session_id="conv_123"
+        )
+        _content_to_input_items(
+            [_text_file_block("SECRETFILE\n" * 150_000, "notes.txt")],
+            tmp_path,
+            session_id="conv_123",
+        )
+
+    rows = [
+        record_to_row(record, source="runner")
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_native_text_spilled"
+    ]
+    assert [(row["attributes"]["kind"], row["attributes"]["chars"]) for row in rows] == [
+        ("text", "1650000"),
+        ("file", "1650000"),
+    ]
+    assert {row["session_id"] for row in rows} == {"conv_123"}
+    dumped = json.dumps(rows)
+    assert "SECRET" not in dumped
+    assert str(attachment_cache_dir(tmp_path)) not in dumped
+
+
+def test_run_turn_sends_an_oversized_message_as_an_attachment_reference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The turn Codex receives stays under its limit, so the huge paste no longer fails."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    text = "z" * 1_309_439
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), text)
+
+    assert [type(event) for event in events] == [TurnComplete]
+    method, params = _FakeCodexNativeClient.requests[-1]
+    assert method == "turn/start"
+    assert _text_chars(params["input"]) < _CODEX_TEXT_LIMIT
+    assert _referenced_file(params["input"][0]).read_text(encoding="utf-8") == text
+
+
+def test_steering_sends_an_oversized_message_as_an_attachment_reference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``turn/steer`` enforces the same limit as ``turn/start``, so it gets the same treatment."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_live")
+    text = "y" * 1_500_000
+
+    steered = asyncio.run(
+        CodexNativeExecutor(bridge_dir=tmp_path).enqueue_session_message("k", [_input_text(text)])
+    )
+
+    assert steered is True
+    method, params = _FakeCodexNativeClient.requests[-1]
+    assert method == "turn/steer"
+    assert _text_chars(params["input"]) < _CODEX_TEXT_LIMIT
+    assert _referenced_file(params["input"][0]).read_text(encoding="utf-8") == text
+
+
 async def test_executor_reaches_app_server_over_ws_transport(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
