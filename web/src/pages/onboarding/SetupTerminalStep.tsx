@@ -206,11 +206,11 @@ export function SetupTerminalStep({
       <ConnectStatus connection={connection} onCancel={onCancelConnect} />
 
       {phase === "failed" && (
-        <div className="mt-3 flex gap-2">
-          <Button variant="outline" className="flex-1" onClick={onBack}>
+        <div className="mt-3 flex justify-between gap-2">
+          <Button variant="outline" onClick={onBack}>
             Back
           </Button>
-          <Button className="flex-1" onClick={() => setAttempt((n) => n + 1)}>
+          <Button onClick={() => setAttempt((n) => n + 1)}>
             <RotateCw className="size-4" aria-hidden />
             Retry
           </Button>
