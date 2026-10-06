@@ -38,6 +38,7 @@ from omnigent.errors import (
     StaleCursorError,
     restart_on_stale_cursor,
 )
+from omnigent.harness_aliases import is_claude_sdk_harness_name
 from omnigent.inner.model_egress import (
     UCODE_SIGNER_BINDING_ID,
     registered_model_provider_binding,
@@ -1142,7 +1143,7 @@ def _resolve_provider_for_build(
     :param for_launch: ``True`` for the spawn-env builders (permissive: fold
         legacy Databricks credentials into the provider path and fall back to
         the first available credential). ``False`` (readout / cost / native)
-        keeps strict, config-only resolution with no synthesis or fallback.
+        omits legacy synthesis and the arbitrary first-available fallback.
     :param actual_harness: Preserve a native harness identity when its transport
         reuses an SDK provider adapter.
     :returns: The :class:`ProviderEntry` to route through, or ``None``.
@@ -1224,7 +1225,11 @@ def _resolve_provider_for_build(
         return ambient_default
     # A saved CLI subscription suppresses its ambient detection. Keep managed
     # Claude auth/model ahead of unrelated, unselected saved API keys.
-    if harness_type == "claude-sdk" and claude_managed_gateway()[1]:
+    if (
+        harness_type == "claude-sdk"
+        and is_claude_sdk_harness_name(identity)
+        and claude_managed_gateway()[1]
+    ):
         for entry in load_providers(effective).values():
             if entry.kind == SUBSCRIPTION_KIND and entry.cli == "claude":
                 return entry

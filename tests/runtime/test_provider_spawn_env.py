@@ -643,6 +643,24 @@ def test_claude_sdk_managed_fallback_preserves_spec_model(
     assert "HARNESS_CLAUDE_SDK_GATEWAY" not in env
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "native-claude"])
+def test_claude_sdk_managed_fallback_does_not_change_native_resolution(
+    config_home: Path, managed_claude_settings: Path, harness: str
+) -> None:
+    """Native Claude retains its own fallback despite sharing the SDK adapter."""
+    _write_config(
+        config_home,
+        {"providers": {"claude-subscription": {"kind": "subscription", "cli": "claude"}}},
+    )
+
+    assert (
+        _resolve_provider_for_build(
+            _make_spec(harness=harness), harness_type="claude-sdk", actual_harness=harness
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("selection", ["named", "default"])
 def test_claude_sdk_explicit_provider_beats_managed_fallback(
     config_home: Path, managed_claude_settings: Path, selection: str
