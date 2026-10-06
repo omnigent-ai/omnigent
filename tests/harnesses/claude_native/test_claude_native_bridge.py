@@ -10380,6 +10380,111 @@ def test_a_dialog_that_never_closes_gives_up_instead_of_retrying_forever(
     assert len(enters) >= 2, f"the swallowed confirm Enter was never retried; got {enters}"
 
 
+def test_a_swallowed_confirm_enter_is_not_retried_past_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The confirm retries stop at the caller's deadline, not at their own budget.
+
+    A model change the caller already failed must not land afterwards: with
+    every Enter swallowed, the retries would otherwise keep pressing for the
+    whole accept budget, each one a chance to commit the rolled-back switch.
+    """
+    clock = _VirtualClock()
+    sends: list[tuple[float, str]] = []
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_run_tmux",
+        lambda _socket, *args: sends.append((clock.monotonic(), args[-1])),
+    )
+    # Nothing here ever clears the dialog, however many Enters arrive.
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _s, _t: _EFFORT_DIALOG_PANE)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    deadline = 1.0
+    # Shorter than the accept budget, so only the deadline can be what stops the retries.
+    assert deadline < claude_native_bridge._CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            deadline=deadline,
+        )
+
+    # The first Enter and one retry fit before the deadline; the next retry would not.
+    assert [key for _, key in sends] == ["Enter", "Enter"]
+    assert all(at < deadline for at, _ in sends), sends
+    assert clock.monotonic() < deadline + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+
+
+@pytest.mark.parametrize(
+    ("pane", "timeout_s", "deadline"),
+    [
+        pytest.param(_EFFORT_DIALOG_PANE, 4.0, 0.0, id="dialog-shows-after-the-deadline"),
+        pytest.param(_IDLE_PANE, 4.0, 1.0, id="watch-cut-short-by-the-deadline"),
+        pytest.param(_IDLE_PANE, 1.0, 1.0, id="blind-enter-due-at-the-deadline"),
+    ],
+)
+def test_confirm_sends_no_enter_once_the_deadline_has_passed(
+    monkeypatch: pytest.MonkeyPatch, pane: str, timeout_s: float, deadline: float
+) -> None:
+    """Neither a confirm Enter nor the blind timeout Enter goes out past the deadline.
+
+    The dialog watch ends at the deadline too, instead of running out its own
+    timeout: the caller is no longer there to use what it finds.
+    """
+    clock = _VirtualClock()
+    tails: list[str] = []
+    monkeypatch.setattr(
+        claude_native_bridge, "_run_tmux", lambda _s, *args: tails.append(args[-1])
+    )
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _s, _t: pane)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            timeout_s=timeout_s,
+            deadline=deadline,
+        )
+
+    assert tails == []
+    assert clock.monotonic() <= deadline + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+
+
+def test_confirm_dialog_if_open_sends_nothing_once_the_deadline_has_passed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The in-request dialog check answers only while the caller is still waiting."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    captures: list[str] = []
+    tails: list[str] = []
+
+    def _capture(_socket_path: str, _tmux_target: str) -> str:
+        captures.append("capture")
+        return _EFFORT_DIALOG_PANE
+
+    monkeypatch.setattr(
+        claude_native_bridge, "_run_tmux", lambda _s, *args: tails.append(args[-1])
+    )
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    hint = claude_native_bridge.EFFORT_DIALOG_HINT
+
+    assert (
+        claude_native_bridge.confirm_dialog_if_open(bridge_dir, hint=hint, deadline=0.0) is False
+    )
+    assert captures == [] and tails == []
+
+    assert (
+        claude_native_bridge.confirm_dialog_if_open(bridge_dir, hint=hint, deadline=60.0) is True
+    )
+    assert tails[:1] == ["Enter"]
+
+
 def test_a_slash_command_submit_waits_for_the_command_to_render(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10495,6 +10600,108 @@ def test_a_slash_command_draft_that_never_renders_submits_blind(
     assert tails == ["C-u", "/effort high", "Enter"], (
         f"An unverifiable draft must submit blind exactly once; got {tails}."
     )
+
+
+def test_inject_slash_command_does_not_submit_blind_past_the_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command that never echoes is submitted blind only while the caller still waits.
+
+    With no deadline the paste wait falls through to an unverified Enter after
+    its own 5s; one landing after the caller gave up could still apply it.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    clock = _VirtualClock()
+    tails: list[str] = []
+    monkeypatch.setattr(
+        claude_native_bridge, "_run_tmux", lambda _s, *args: tails.append(args[-1])
+    )
+    # The composer never shows the typed command.
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _s, _t: _IDLE_PANE)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high", deadline=2.0)
+
+    assert tails == ["C-u", "/effort high"]
+    assert clock.monotonic() < claude_native_bridge._PASTE_COMMIT_TIMEOUT_S
+
+
+def test_inject_slash_command_stops_retrying_the_submit_at_the_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A swallowed submit Enter is re-sent only until the caller's deadline.
+
+    With the command still drafted, the retries would otherwise run on for the
+    whole verify window.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    clock = _VirtualClock()
+    sends: list[tuple[float, str]] = []
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_run_tmux",
+        lambda _s, *args: sends.append((clock.monotonic(), args[-1])),
+    )
+    # Every Enter is swallowed: the command stays in the composer.
+    monkeypatch.setattr(
+        claude_native_bridge, "_capture_pane", lambda _s, _t: _composer_pane("/effort high")
+    )
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    deadline = 1.5
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/effort high", deadline=deadline
+        )
+
+    # The submit and its first retry fit before the deadline; the next retry is 2s later.
+    assert [key for _, key in sends] == ["C-u", "/effort high", "Enter", "Enter"]
+    assert all(at < deadline for at, _ in sends), sends
+    assert clock.monotonic() < deadline + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+
+
+def test_inject_slash_command_types_nothing_when_the_prompt_renders_after_the_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A boot that outlasts the deadline leaves the composer untouched, not half-typed.
+
+    The prompt wait returns once the box finally mounts, which can be past the
+    caller's deadline; typing the command then would leave it drafted, with no
+    one left to submit or clear it.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=2.0)
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/effort high", deadline=pane.boot_s
+        )
+
+    assert pane.clock.monotonic() >= pane.boot_s
+    assert pane.composer_keys() == []
+
+
+def test_inject_slash_command_touches_nothing_once_the_deadline_has_passed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command whose deadline lapsed before it got the injection lock is dropped untouched."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    run_tmux = Mock()
+    capture_pane = Mock(return_value=_IDLE_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture_pane)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high", deadline=0.0)
+
+    run_tmux.assert_not_called()
+    capture_pane.assert_not_called()
 
 
 def test_an_effort_switch_with_a_swallowed_confirm_leaves_the_pane_usable(
@@ -11242,6 +11449,33 @@ def test_capped_readiness_probes_liveness_until_its_cap(
     assert clock.monotonic() == 3.5
     # One probe per liveness interval (1s, 2s, 3s), none at the cap itself.
     assert probe.call_count == 3
+
+
+@pytest.mark.parametrize("ready_timeout_s", [30.0, None], ids=["generous-cap", "no-cap"])
+def test_inject_slash_command_waits_for_the_prompt_only_until_its_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ready_timeout_s: float | None,
+) -> None:
+    """
+    The caller's deadline bounds the prompt wait, whatever cap it is given.
+
+    Without a cap a live pane would earn the slow-boot extension, far past the
+    moment the caller stopped waiting.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=1000.0)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout, match="did not become ready"):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir,
+            command="/effort high",
+            ready_timeout_s=ready_timeout_s,
+            deadline=pane.clock.monotonic() + 4.0,
+        )
+
+    assert pane.clock.monotonic() <= 4.0 + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+    assert pane.composer_keys() == []
 
 
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(

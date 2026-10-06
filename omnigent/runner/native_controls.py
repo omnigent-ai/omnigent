@@ -947,6 +947,9 @@ def build_native_controls(
         if model is None or not model.strip():
             return Response(status_code=204)
         started = time.monotonic()
+        # One deadline for the whole request: the server rolls the pick back after
+        # its forward timeout, so no key may reach the terminal past this point.
+        change_deadline = started + _CLAUDE_MODEL_CHANGE_BUDGET_S
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client,
             session_id=conv_id,
@@ -1016,7 +1019,7 @@ def build_native_controls(
         # pane's model rather than an empty or leftover snapshot.
         prompt_budget_s = min(
             _CLAUDE_CONTROL_PROMPT_WAIT_S,
-            max(0.0, started + _CLAUDE_MODEL_CHANGE_BUDGET_S - time.monotonic()),
+            max(0.0, change_deadline - time.monotonic()),
         )
         wait_started = time.monotonic()
         wait_error: RuntimeError | None = None
@@ -1058,6 +1061,7 @@ def build_native_controls(
                 command=command,
                 timeout_s=1.0,
                 ready_timeout_s=max(0.0, prompt_budget_s - waited_s),
+                deadline=change_deadline,
                 auto_confirm=True,
                 confirm_hint=SWITCH_MODEL_DIALOG_HINT,
             )
@@ -1084,9 +1088,9 @@ def build_native_controls(
         # inside the server's forward timeout.
         confirm_window_s = min(
             _CLAUDE_MODEL_CONFIRM_TIMEOUT_S,
-            max(0.0, started + _CLAUDE_MODEL_CHANGE_BUDGET_S - time.monotonic()),
+            max(0.0, change_deadline - time.monotonic()),
         )
-        deadline = time.monotonic() + confirm_window_s
+        confirm_deadline = time.monotonic() + confirm_window_s
         while True:
             current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
             if current and (current in expected or (baseline and current != baseline)):
@@ -1111,9 +1115,12 @@ def build_native_controls(
             # short watch (a warm repaint, or a queued command surfacing) —
             # answer it whenever it shows inside the window.
             await asyncio.to_thread(
-                confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
+                confirm_dialog_if_open,
+                bridge_dir,
+                hint=SWITCH_MODEL_DIALOG_HINT,
+                deadline=change_deadline,
             )
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= confirm_deadline:
                 break
             await asyncio.sleep(_CLAUDE_MODEL_CONFIRM_POLL_S)
         if _native_pane_status.get(conv_id) in ("running", "waiting"):

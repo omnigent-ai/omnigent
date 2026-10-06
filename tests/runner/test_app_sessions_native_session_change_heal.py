@@ -204,8 +204,9 @@ async def test_session_change_heals_dead_registered_missing_tmux_socket(
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
         ready_timeout_s: float | None = None,
+        deadline: float | None = None,
     ) -> None:
-        del timeout_s, auto_confirm, confirm_hint, ready_timeout_s
+        del timeout_s, auto_confirm, confirm_hint, ready_timeout_s, deadline
         if not auto_create_calls:
             real_inject(inject_bridge_dir, command=command, timeout_s=1.0)
             raise AssertionError(
@@ -306,8 +307,9 @@ async def test_model_change_heals_before_read_model_env(
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
         ready_timeout_s: float | None = None,
+        deadline: float | None = None,
     ) -> None:
-        del command, timeout_s, auto_confirm, confirm_hint, ready_timeout_s
+        del command, timeout_s, auto_confirm, confirm_hint, ready_timeout_s, deadline
         if not auto_create_calls:
             real_inject(inject_bridge_dir, command="/model claude-opus-4-7", timeout_s=1.0)
 
@@ -377,8 +379,9 @@ async def test_session_change_live_pane_does_not_recreate(
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
         ready_timeout_s: float | None = None,
+        deadline: float | None = None,
     ) -> None:
-        del bridge_dir, timeout_s, auto_confirm, confirm_hint, ready_timeout_s
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint, ready_timeout_s, deadline
         captured.append(command)
 
     def _ready(bridge_dir: Path) -> bool:

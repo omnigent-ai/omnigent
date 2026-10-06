@@ -603,6 +603,10 @@ class ClaudeInjectionCancelled(RuntimeError):
     """The caller cancelled delivery before the injection worker finished."""
 
 
+class ClaudeInjectionDeadlineExceeded(RuntimeError):
+    """The caller's deadline passed mid-injection, so no further keys were sent."""
+
+
 class ClaudeUserPromptPending(RuntimeError):
     """A native question or permission prompt must be answered before injection."""
 
@@ -621,6 +625,39 @@ def _check_injection_cancelled() -> None:
     cancel_event = _INJECTION_CANCEL_EVENT.get()
     if cancel_event is not None and cancel_event.is_set():
         raise ClaudeInjectionCancelled("Claude Code message delivery was cancelled")
+
+
+def _raise_if_past_deadline(deadline: float | None) -> None:
+    """
+    Stop an injection whose caller has already given up waiting.
+
+    :param deadline: ``time.monotonic()`` instant the caller stops waiting at,
+        e.g. ``time.monotonic() + 18.0``; ``None`` never expires.
+    :raises ClaudeInjectionDeadlineExceeded: If *deadline* has passed. Called
+        right before every keystroke that could still change the terminal, so
+        nothing is typed once the caller has moved on.
+    """
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ClaudeInjectionDeadlineExceeded(
+            "Claude Code did not finish the slash command before its deadline; "
+            "no further keys were sent."
+        )
+
+
+def _cap_to_deadline(timeout_s: float | None, deadline: float | None) -> float | None:
+    """
+    Clip a wait to the time left before *deadline*.
+
+    :param timeout_s: Wait budget in seconds, e.g. ``9.0``; ``None`` is uncapped.
+    :param deadline: ``time.monotonic()`` instant, or ``None`` for no deadline.
+    :returns: *timeout_s* unchanged without a deadline, else the smaller of it and
+        the seconds left (``0.0`` once past), which is the full remainder when
+        *timeout_s* is ``None``.
+    """
+    if deadline is None:
+        return timeout_s
+    left_s = max(0.0, deadline - time.monotonic())
+    return left_s if timeout_s is None else min(timeout_s, left_s)
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -4267,6 +4304,7 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4286,8 +4324,13 @@ def _verify_submit_accepted(
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
     :param bridge_dir: Bridge whose pending questions protect submit retries.
+    :param deadline: ``time.monotonic()`` instant after which no Enter is
+        re-sent, e.g. ``time.monotonic() + 18.0``; ``None`` leaves only
+        :data:`_SUBMIT_VERIFY_TIMEOUT_S`.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
+    :raises ClaudeInjectionDeadlineExceeded: If *deadline* passes while the
+        draft is still in the input box.
     """
     start = time.monotonic()
     last_enter = start
@@ -4317,6 +4360,7 @@ def _verify_submit_accepted(
                     time.monotonic() - start,
                 )
             return True
+        _raise_if_past_deadline(deadline)
         now = time.monotonic()
         if not warned and now - start >= _SUBMIT_SLOW_ACCEPT_WARN_S:
             warned = True
@@ -4530,6 +4574,7 @@ def inject_slash_command(
     auto_confirm: bool = False,
     confirm_hint: str | None = None,
     ready_timeout_s: float | None = None,
+    deadline: float | None = None,
 ) -> None:
     """
     Type a Claude Code slash command into the tmux pane and submit it.
@@ -4566,13 +4611,20 @@ def inject_slash_command(
         outliving the request. ``None`` waits like :func:`inject_user_message`
         — *timeout_s* as the base budget, extended while a live pane is still
         booting.
+    :param deadline: ``time.monotonic()`` instant the caller stops waiting at,
+        e.g. ``time.monotonic() + 18.0``. Covers every stage (prompt wait,
+        paste, submit retries, dialog watch and accept retries): once it has
+        passed, no further key is sent, so a command whose request already
+        failed cannot land on the terminal afterwards. ``None`` leaves each
+        stage to its own budget.
     :raises ValueError: If *command* is empty, does not start with
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
     :raises RuntimeError: If the tmux target is not advertised in
         time, if the input box never renders (:class:`ClaudePromptTimeout`),
-        if a ``tmux send-keys`` invocation fails, or if the typed
-        command verifiably never left the input box (submit swallowed).
+        if a ``tmux send-keys`` invocation fails, if the typed
+        command verifiably never left the input box (submit swallowed), or
+        if *deadline* passes first (:class:`ClaudeInjectionDeadlineExceeded`).
     """
     if not command or not command.startswith("/"):
         raise ValueError(f"slash command must start with '/'; got {command!r}")
@@ -4583,6 +4635,8 @@ def inject_slash_command(
         if not confirm_hint:
             raise ValueError("auto_confirm needs the confirm_hint its dialog renders")
         dialog_hint = confirm_hint
+    # The injection lock can be held past the caller's deadline by another writer.
+    _raise_if_past_deadline(deadline)
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
@@ -4594,12 +4648,13 @@ def inject_slash_command(
         socket_path,
         tmux_target,
         timeout_s=timeout_s,
-        ready_timeout_s=ready_timeout_s,
+        ready_timeout_s=_cap_to_deadline(ready_timeout_s, deadline),
     )
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings."
         )
+    _raise_if_past_deadline(deadline)
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
@@ -4613,8 +4668,10 @@ def inject_slash_command(
     # left the box; an unidentifiable draft falls through to a blind submit.
     needle = _submit_needle(command)
     draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
+    paste_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    if deadline is not None:
+        paste_deadline = min(paste_deadline, deadline)
+    while time.monotonic() < paste_deadline:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(bridge_dir, pane)
         if _draft_in_input_box(pane, needle):
@@ -4626,6 +4683,7 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    _raise_if_past_deadline(deadline)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -4636,6 +4694,7 @@ def inject_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
+            deadline=deadline,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -4643,7 +4702,13 @@ def inject_slash_command(
                 "input box). The command was not delivered."
             )
     if dialog_hint is not None:
-        _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
+        _confirm_tui_dialog(
+            socket_path,
+            tmux_target,
+            hint=dialog_hint,
+            bridge_dir=bridge_dir,
+            deadline=deadline,
+        )
 
 
 def _confirm_tui_dialog(
@@ -4653,6 +4718,7 @@ def _confirm_tui_dialog(
     hint: str,
     timeout_s: float = _CONFIRM_DIALOG_TIMEOUT_S,
     bridge_dir: Path | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """
     Accept the TUI confirmation dialog titled *hint*.
@@ -4677,26 +4743,35 @@ def _confirm_tui_dialog(
     capture is a torn read under that very repaint — it means "unknown", not
     "dialog gone", so it never ends the retry.
 
+    A caller *deadline* ends the watch and the retries alike, and withholds the
+    timeout Enter: a key sent after the caller gave up could still commit the
+    change it had already reported as failed.
+
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param hint: Text the dialog renders, e.g.
         :data:`SWITCH_MODEL_DIALOG_HINT`.
     :param timeout_s: Seconds to watch for the dialog, e.g. ``4.0``.
     :param bridge_dir: Bridge whose live permission hooks protect confirmation.
+    :param deadline: ``time.monotonic()`` instant after which no Enter is sent,
+        e.g. ``time.monotonic() + 18.0``; ``None`` leaves only *timeout_s*.
     :returns: ``True`` when the dialog was seen and confirmed, ``False`` when
         the watch timed out.
+    :raises ClaudeInjectionDeadlineExceeded: If *deadline* passes before the
+        dialog is confirmed or found absent.
     """
-    deadline = time.monotonic() + timeout_s
+    watch_deadline = time.monotonic() + timeout_s
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(bridge_dir, pane)
         if hint in pane:
             _confirm_and_verify_dialog_closed(
-                socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir
+                socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir, deadline=deadline
             )
             return True
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= watch_deadline:
             break
+        _raise_if_past_deadline(deadline)
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     foreign = next((text for text in _FOREIGN_DIALOG_HINTS if text in pane), None)
     if foreign is not None:
@@ -4711,6 +4786,7 @@ def _confirm_tui_dialog(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings dialog not confirmed."
         )
+    _raise_if_past_deadline(deadline)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     return False
 
@@ -5027,7 +5103,7 @@ def set_permission_mode(
     )
 
 
-def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
+def confirm_dialog_if_open(bridge_dir: Path, *, hint: str, deadline: float | None = None) -> bool:
     """
     Accept the *hint* dialog iff it is on screen RIGHT NOW; never blind-Enter.
 
@@ -5041,8 +5117,13 @@ def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
     :param bridge_dir: Bridge directory path.
     :param hint: Text the dialog renders, e.g.
         :data:`SWITCH_MODEL_DIALOG_HINT`.
-    :returns: ``True`` when the dialog was on screen and confirmed.
+    :param deadline: ``time.monotonic()`` instant after which no Enter is sent,
+        e.g. ``time.monotonic() + 18.0``; ``None`` never expires.
+    :returns: ``True`` when the dialog was on screen and confirmed; ``False``
+        when it was not, or *deadline* had passed (nothing is sent then).
     """
+    if deadline is not None and time.monotonic() >= deadline:
+        return False
     try:
         info = _wait_for_tmux_info(bridge_dir, timeout_s=1.0)
     except (RuntimeError, OSError):
@@ -5054,7 +5135,7 @@ def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
         if hint not in pane:
             return False
         _confirm_and_verify_dialog_closed(
-            socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir
+            socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir, deadline=deadline
         )
     except (RuntimeError, OSError):
         return False
@@ -5067,6 +5148,7 @@ def _confirm_and_verify_dialog_closed(
     *,
     hint: str,
     bridge_dir: Path | None = None,
+    deadline: float | None = None,
 ) -> None:
     """
     Press Enter on the *hint* dialog, re-pressing while it stays on screen.
@@ -5083,16 +5165,21 @@ def _confirm_and_verify_dialog_closed(
     :param hint: Text the dialog renders, e.g.
         :data:`SWITCH_MODEL_DIALOG_HINT`.
     :param bridge_dir: Bridge whose pending questions protect confirmation retries.
+    :param deadline: ``time.monotonic()`` instant after which no Enter is sent,
+        e.g. ``time.monotonic() + 18.0``; ``None`` leaves only the accept budget.
     :returns: None.
+    :raises ClaudeInjectionDeadlineExceeded: If *deadline* passes before the
+        first Enter, or while the dialog is still on screen afterwards.
     """
     if bridge_dir is not None and has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings dialog not confirmed."
         )
+    _raise_if_past_deadline(deadline)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     last_enter = time.monotonic()
-    deadline = last_enter + _CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
-    while time.monotonic() < deadline:
+    accept_deadline = last_enter + _CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
+    while time.monotonic() < accept_deadline:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
         # A torn (empty) capture proves nothing — only a pane that renders
@@ -5100,6 +5187,7 @@ def _confirm_and_verify_dialog_closed(
         if pane.strip() and hint not in pane:
             return
         _raise_if_user_prompt_pending(bridge_dir, pane)
+        _raise_if_past_deadline(deadline)
         if hint in pane and time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
