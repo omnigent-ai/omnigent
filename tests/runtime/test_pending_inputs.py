@@ -602,3 +602,160 @@ def test_mark_uncertain_keeps_jumped_over_entries_out_of_the_undelivered_set() -
     assert matched.skipped == []
     assert [entry.pending_id for entry in matched.uncertain] == [second]
     assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_pending_ids_lists_queued_unheld_entries_in_queue_order() -> None:
+    """The interrupt route reads the queue before it forwards the Stop."""
+    first = pending_inputs.record("conv_a", [_text_block("first")])
+    second = pending_inputs.record("conv_a", [_text_block("second")])
+    assert pending_inputs.pending_ids("conv_a") == [first, second]
+    assert pending_inputs.pending_ids("conv_other") == []
+
+    # An entry a persist in progress holds is already being mirrored.
+    held = pending_inputs.resolve_oldest("conv_a", hold=True)
+    assert held is not None and held.pending_id == first
+    assert pending_inputs.pending_ids("conv_a") == [second]
+
+
+def test_interrupted_entry_jumped_over_by_a_later_match_is_uncertain_not_skipped() -> None:
+    """A message the person cancelled with Stop must not be recorded as undelivered.
+
+    The agent may never record it, so the next match that jumps over it would
+    turn it into a ``native_prompt_not_recorded`` error. It drains quietly in
+    ``uncertain`` instead; an unflagged lost message still comes back ``skipped``.
+    """
+    lost = pending_inputs.record("conv_a", [_text_block("lost")], created_by="a@example.com")
+    cancelled = pending_inputs.record("conv_a", [_text_block("cancelled")])
+    later = pending_inputs.record("conv_a", [_text_block("later")])
+
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+    matched = pending_inputs.resolve_matching_text("conv_a", "later")
+
+    assert matched.matched is not None and matched.matched.pending_id == later
+    assert [entry.pending_id for entry in matched.skipped] == [lost]
+    assert [entry.pending_id for entry in matched.uncertain] == [cancelled]
+    assert matched.uncertain[0].content == [_text_block("cancelled")]
+    assert pending_inputs.pending_ids("conv_a") == []
+
+
+def test_interrupted_entry_matched_by_its_own_text_drains_as_matched() -> None:
+    """The race where the agent did record the message before the Stop landed.
+
+    An exact text match on the flagged entry itself is the message arriving, so
+    it drains like any other and the receipt names it.
+    """
+    cancelled = pending_inputs.record("conv_a", [_text_block("cancelled")], stable_id="ab" * 16)
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "cancelled")
+
+    assert drained.matched is not None and drained.matched.pending_id == cancelled
+    assert drained.matched.stable_id == "ab" * 16
+    assert drained.skipped == []
+    assert drained.uncertain == []
+    assert pending_inputs.pending_ids("conv_a") == []
+
+
+def test_mark_interrupted_leaves_entries_recorded_after_the_snapshot_alone() -> None:
+    """A message sent right after Stop is a live one, not a cancelled one."""
+    before_stop = pending_inputs.record("conv_a", [_text_block("before stop")])
+    queued_at_stop = pending_inputs.pending_ids("conv_a")
+    after_stop = pending_inputs.record("conv_a", [_text_block("after stop")])
+    newest = pending_inputs.record("conv_a", [_text_block("newest")])
+
+    pending_inputs.mark_interrupted("conv_a", queued_at_stop)
+
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [
+        after_stop,
+        newest,
+    ]
+    matched = pending_inputs.resolve_matching_text("conv_a", "newest")
+    assert matched.matched is not None and matched.matched.pending_id == newest
+    # The post-Stop message is still reported lost if the agent never records it.
+    assert [entry.pending_id for entry in matched.skipped] == [after_stop]
+    assert [entry.pending_id for entry in matched.uncertain] == [before_stop]
+
+
+def test_mark_interrupted_skips_held_and_unknown_entries() -> None:
+    """Only entries still queued and unheld are flagged; anything else is ignored."""
+    held = pending_inputs.record("conv_a", [_text_block("held")])
+    queued = pending_inputs.record("conv_a", [_text_block("queued")])
+    drained = pending_inputs.resolve_oldest("conv_a", hold=True)
+    assert drained is not None and drained.pending_id == held
+
+    pending_inputs.mark_interrupted("conv_a", [held, queued, "pending_unknown"])
+    pending_inputs.mark_interrupted("conv_unknown", [held, queued])
+    # The held entry is being mirrored, so the Stop did not cancel it: if its
+    # persist is rolled back it returns to the queue as an ordinary entry.
+    pending_inputs.restore("conv_a", drained)
+
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [held]
+    assert pending_inputs.pending_ids("conv_a") == [held, queued]
+
+
+def test_has_pending_and_snapshot_ignore_interrupted_entries() -> None:
+    """A cancelled message neither keeps the session "working" nor redraws on reload."""
+    first = pending_inputs.record("conv_a", [_text_block("first")])
+    second = pending_inputs.record("conv_a", [_text_block("second")])
+
+    pending_inputs.mark_interrupted("conv_a", [first])
+    assert pending_inputs.has_pending("conv_a") is True
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [second]
+
+    pending_inputs.mark_interrupted("conv_a", [second])
+    assert pending_inputs.has_pending("conv_a") is False
+    assert pending_inputs.snapshot_for("conv_a") == []
+    # Neither is dropped: both are still queued for a later match to settle.
+    assert pending_inputs.pending_ids("conv_a") == [first, second]
+
+
+def test_interrupted_flag_survives_a_held_drain_that_is_restored() -> None:
+    """A persist that does not land puts the flagged entries back still flagged."""
+    cancelled = pending_inputs.record("conv_a", [_text_block("cancelled")])
+    later = pending_inputs.record("conv_a", [_text_block("later")])
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+
+    held = pending_inputs.resolve_matching_text("conv_a", "later", hold=True)
+    assert held.matched is not None and held.matched.pending_id == later
+    assert [entry.pending_id for entry in held.uncertain] == [cancelled]
+    for entry in reversed([*held.uncertain, held.matched]):
+        pending_inputs.restore("conv_a", entry)
+
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [later]
+    again = pending_inputs.resolve_matching_text("conv_a", "later")
+    assert again.skipped == []
+    assert [entry.pending_id for entry in again.uncertain] == [cancelled]
+
+
+def test_interrupted_entries_keep_their_place_for_the_other_readers() -> None:
+    """A flagged entry is only hidden and settled quietly; it is otherwise unchanged.
+
+    A client retry of its stable id is still answered with the queued entry (a
+    second forward would run the cancelled prompt), a positional drain can still
+    take it, and the TTL still evicts it.
+    """
+    stable_id = "cd" * 16
+    cancelled = pending_inputs.record("conv_a", [_text_block("cancelled")], stable_id=stable_id)
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+
+    assert pending_inputs.pending_id_for_stable_id("conv_a", stable_id) == cancelled
+    assert pending_inputs.record("conv_a", [_text_block("cancelled")], stable_id=stable_id) == (
+        cancelled
+    )
+    drained = pending_inputs.resolve_oldest("conv_a")
+    assert drained is not None and drained.pending_id == cancelled
+    assert pending_inputs.pending_ids("conv_a") == []
+
+
+def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cancelled message nobody ever follows does not linger past the TTL."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    cancelled = pending_inputs.record("conv_a", [_text_block("cancelled")])
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+
+    clock["t"] = 1000.0 + pending_inputs._TTL_S - 0.1
+    assert pending_inputs.pending_ids("conv_a") == [cancelled]
+
+    clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
+    assert pending_inputs.pending_ids("conv_a") == []

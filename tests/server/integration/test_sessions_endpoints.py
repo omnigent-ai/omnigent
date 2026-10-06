@@ -10020,6 +10020,298 @@ async def test_interrupt_forward_success_keeps_stop_fence(
                 _interrupt_fenced_sessions.discard(session_id)
 
 
+async def test_interrupt_forward_success_marks_queued_native_messages_interrupted(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A delivered interrupt settles the web messages queued when Stop was pressed.
+
+    The web client clears those bubbles itself and the agent may never record
+    them, so the server stops showing them as pending (session list, reload).
+    A message queued while the interrupt was still in flight is one the person
+    sent after Stop and stays live.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    sent_after_stop: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Accept the interrupt; the person sends another message while it is in flight."""
+        del request
+        sent_after_stop.append(
+            pending_inputs.record(session_id, [{"type": "input_text", "text": "after stop"}])
+        )
+        return httpx.Response(202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        try:
+            queued_at_stop = [
+                pending_inputs.record(session_id, [{"type": "input_text", "text": text}])
+                for text in ("first", "second")
+            ]
+
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "interrupt", "data": {}},
+            )
+
+            assert resp.status_code == 202, resp.text
+            assert len(sent_after_stop) == 1
+            snapshot = pending_inputs.snapshot_for(session_id)
+            assert [entry["pending_id"] for entry in snapshot] == sent_after_stop
+            assert pending_inputs.has_pending(session_id)
+            # The cancelled entries are flagged, not dropped: the next match settles them.
+            assert pending_inputs.pending_ids(session_id) == [*queued_at_stop, *sent_after_stop]
+        finally:
+            pending_inputs.reset_for_tests()
+            _interrupt_fenced_sessions.discard(session_id)
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        # Runner unreachable: the 5s POST raises.
+        "transport_error",
+        # WS tunnel closed mid-POST: a BARE ConnectionError, not an httpx.HTTPError.
+        "bare_connection_error",
+        # Runner reachable but the cancel didn't land.
+        "runner_503",
+        # No runner client resolves at all: nothing was forwarded anywhere.
+        "no_runner_client",
+    ],
+)
+async def test_interrupt_forward_failure_keeps_queued_native_messages_pending(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """
+    An interrupt that did not land leaves the queued web messages untouched.
+
+    The turn keeps running, so the agent may still record those messages:
+    hiding them or settling them quietly would lose the undelivered report if
+    it does not.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Fail the interrupt POST."""
+        del request
+        if failure_mode == "transport_error":
+            raise httpx.ConnectError("runner unreachable")
+        if failure_mode == "bare_connection_error":
+            raise ConnectionError("tunnel closed mid-request")
+        return httpx.Response(503, json={"error": "claude_native_interrupt_failed"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: Any = None,
+    ) -> httpx.AsyncClient | None:
+        """Resolve every session to the failing fake runner (or to none)."""
+        del session_id, runner_router, conversation
+        return None if failure_mode == "no_runner_client" else fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    pending_inputs.reset_for_tests()
+    session_id: str | None = None
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        session_id = session["id"]
+        queued = pending_inputs.record(session_id, [{"type": "input_text", "text": "still live"}])
+
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "interrupt", "data": {}},
+        )
+
+        assert resp.status_code == 202, resp.text
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(session_id)] == [queued]
+        assert pending_inputs.has_pending(session_id)
+    finally:
+        pending_inputs.reset_for_tests()
+        if session_id is not None:
+            _interrupt_fenced_sessions.discard(session_id)
+        await fake_runner.aclose()
+
+
+async def test_interrupt_codex_side_chat_leaves_queued_native_messages_pending(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Interrupting a Codex side chat cancels one side turn, not the queued messages.
+
+    The interrupt is forwarded to the parent's runner for the side thread only,
+    so neither the parent's nor the side chat's queued web messages are settled.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.common import (
+        _interrupt_fenced_sessions,
+        _session_status_cache,
+    )
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    child_response = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert child_response.status_code == 202, child_response.text
+    child_id = child_response.json()["child_session_id"]
+    queued = {
+        sid: pending_inputs.record(sid, [{"type": "input_text", "text": f"queued on {name}"}])
+        for sid, name in ((parent["id"], "parent"), (child_id, "side chat"))
+    }
+    try:
+        _session_status_cache[child_id] = "running"
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(204)),
+            base_url="http://runner",
+        ) as runner:
+            monkeypatch.setattr(
+                sessions_module, "_get_runner_client", AsyncMock(return_value=runner)
+            )
+            with patch.object(
+                pending_inputs, "mark_interrupted", wraps=pending_inputs.mark_interrupted
+            ) as mark_interrupted:
+                response = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={"type": "interrupt", "data": {"response_id": "codex_turn_side"}},
+                )
+
+        # 202: the side-chat interrupt landed, which is when a top-level queue gets marked.
+        assert response.status_code == 202, response.text
+        mark_interrupted.assert_not_called()
+        for sid, pending_id in queued.items():
+            snapshot = pending_inputs.snapshot_for(sid)
+            assert [entry["pending_id"] for entry in snapshot] == [pending_id], sid
+    finally:
+        pending_inputs.reset_for_tests()
+        _interrupt_fenced_sessions.discard(child_id)
+        _session_status_cache.pop(child_id, None)
+
+
+@pytest.mark.parametrize("delivered", [True, False])
+async def test_interrupted_native_message_is_not_reported_undelivered_by_a_later_mirror(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    delivered: bool,
+) -> None:
+    """
+    A message cancelled with Stop before the agent recorded it is not an error later.
+
+    The person sends a message and presses Stop before Codex records it, then
+    sends another. Without the interrupt landing, the next mirror jumps over
+    the first entry and persists it with a ``native_prompt_not_recorded`` error
+    (the ``delivered=False`` control). With it landed, the first entry is
+    settled quietly and only the message the agent did record is persisted.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    session_id = session["id"]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Land the interrupt, or fail it the way a claude-native runner does."""
+        del request
+        return httpx.Response(202 if delivered else 503)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        try:
+            cancelled = pending_inputs.record(
+                session_id, [{"type": "input_text", "text": "cancel me"}]
+            )
+            interrupted = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "interrupt", "data": {}},
+            )
+            assert interrupted.status_code == 202, interrupted.text
+            # The person's next message, sent after Stop, which the agent records.
+            kept = pending_inputs.record(session_id, [{"type": "input_text", "text": "go on"}])
+
+            mirrored = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "go on"}],
+                        },
+                        "response_id": "native_turn_2",
+                        "source_id": "codex:go-on:0",
+                    },
+                },
+            )
+            assert mirrored.status_code == 202, mirrored.text
+
+            items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+            error_codes = [item["code"] for item in items if item["type"] == "error"]
+            user_texts = [
+                block["text"]
+                for item in items
+                if item["type"] == "message" and item["role"] == "user"
+                for block in item["content"]
+            ]
+            consumed = [
+                event["data"]["cleared_pending_id"]
+                for _sid, event in published
+                if event.get("type") == "session.input.consumed"
+            ]
+            # Both entries are gone either way; what differs is whether the
+            # cancelled message is recorded as lost.
+            assert pending_inputs.pending_ids(session_id) == []
+            assert pending_inputs.snapshot_for(session_id) == []
+            if delivered:
+                assert error_codes == []
+                assert user_texts == ["go on"]
+                assert consumed == [kept]
+            else:
+                assert error_codes == ["native_prompt_not_recorded"]
+                assert user_texts == ["cancel me", "go on"]
+                assert consumed == [cancelled, kept]
+        finally:
+            pending_inputs.reset_for_tests()
+            _interrupt_fenced_sessions.discard(session_id)
+
+
 @dataclass
 class _ForwardedEffort:
     """

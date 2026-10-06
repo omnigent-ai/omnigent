@@ -56,6 +56,13 @@ receipt may really have belonged to one of them, so a later match that
 jumps over them drains them quietly instead of recording them as
 undelivered.
 
+A message the person cancelled with Stop before the agent recorded it would
+otherwise be recorded as undelivered at the next match. The interrupt route
+flags every entry queued at that moment (:func:`mark_interrupted`): a later
+match that jumps over one drains it quietly like an uncertain entry, and it
+no longer counts as pending or replays in the snapshot. A mirror carrying its
+own text still drains it normally, since the agent did record it after all.
+
 The one imperfect case is interleaving a web-composer message with a
 message typed directly in the TUI: the TUI message (which has no pending
 entry and matches none) drains the oldest web entry, so that web bubble
@@ -101,6 +108,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -183,10 +191,12 @@ class MatchedDrain:
     :param skipped: Older entries the match jumped over that are known to be
         lost: no mirror of theirs can still arrive, so the caller records them
         as undelivered.
-    :param uncertain: Older entries the match jumped over that were queued
-        when an unmatched mirror drained by position (see
-        :func:`mark_uncertain`). That mirror may have been theirs, so they are
-        drained without being declared undelivered.
+    :param uncertain: Older entries the match jumped over that are not known to
+        be lost, so they are drained without being declared undelivered. Either
+        they were queued when an unmatched mirror drained by position (that
+        mirror may have been theirs, see :func:`mark_uncertain`), or the person
+        interrupted the turn while they were queued and cancelled them (see
+        :func:`mark_interrupted`).
     """
 
     matched: DrainedInput | None
@@ -221,6 +231,11 @@ class _Entry:
     :param uncertain: ``True`` once an unmatched mirror drained by position
         while this entry was queued. That mirror may have been this entry's
         own, so a later match that jumps over it must not call it undelivered.
+    :param interrupted: ``True`` once the person interrupted the session's turn
+        while this entry was queued, so they cancelled it. It stops counting as
+        pending, is left out of the snapshot, and a later match that jumps over
+        it must not call it undelivered. A mirror of its own text still drains
+        it normally: the agent did record it.
     """
 
     pending_id: str
@@ -233,6 +248,7 @@ class _Entry:
     created_at: float = field(default_factory=lambda: _now())
     held: bool = False
     uncertain: bool = False
+    interrupted: bool = False
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -456,6 +472,49 @@ def mark_uncertain(conversation_id: str) -> None:
                 entry.uncertain = True
 
 
+def pending_ids(conversation_id: str) -> list[str]:
+    """
+    Return the ids of the session's queued, unheld entries, oldest first.
+
+    Lets the interrupt route note which messages were queued at the moment of
+    the Stop, before it forwards the interrupt (see :func:`mark_interrupted`).
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :returns: Pending ids such as ``["pending_a1b2c3"]``; empty when nothing
+        is queued.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        return [
+            pending_id
+            for pending_id, entry in _pending.get(conversation_id, {}).items()
+            if not entry.held
+        ]
+
+
+def mark_interrupted(conversation_id: str, pending_ids: Iterable[str]) -> None:
+    """
+    Flag entries the person cancelled by interrupting the session's turn.
+
+    The agent may never record a message cancelled before it reached the
+    transcript, so a later match that jumps over one drains it quietly instead
+    of recording it as undelivered. Only entries still queued and unheld are
+    flagged: one a mirror already took is settled, and one recorded after the
+    ids were read (a message sent right after Stop) is not a cancelled one.
+    Marking is per process, like the entries themselves.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_ids: Ids read with :func:`pending_ids` before the interrupt
+        was forwarded, e.g. ``["pending_a1b2c3"]``.
+    """
+    with _lock:
+        entries = _pending.get(conversation_id, {})
+        for pending_id in pending_ids:
+            entry = entries.get(pending_id)
+            if entry is not None and not entry.held:
+                entry.interrupted = True
+
+
 def restore(conversation_id: str, drained: DrainedInput) -> None:
     """
     Put a drained entry back into the pending queue.
@@ -530,10 +589,11 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
     :returns: Matched entry plus the older entries it jumped over — at most
         :data:`_MAX_ENTRIES_PER_CONVERSATION` of them, oldest first, split
         into ``skipped`` (known lost) and ``uncertain`` (queued when a
-        positional drain happened, see :func:`mark_uncertain`); any beyond
-        the cap stay queued for a later drain — or no match with empty lists
-        when nothing carries this text (e.g. it was typed directly in the
-        TUI).
+        positional drain happened, see :func:`mark_uncertain`, or cancelled
+        by an interrupt, see :func:`mark_interrupted`); any beyond the cap
+        stay queued for a later drain — or no match with empty lists when
+        nothing carries this text (e.g. it was typed directly in the TUI).
+        The matched entry is reported as such even when it was interrupted.
     """
     exact_needle = _collapse_whitespace(text)
     if not exact_needle:
@@ -578,16 +638,19 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
                 entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
+        # An entry a positional drain may have settled, or that the person
+        # cancelled with Stop, is drained without an undelivered record.
+        lost: list[DrainedInput] = []
+        uncertain: list[DrainedInput] = []
+        for _pending_id, entry in skipped_entries:
+            if entry.uncertain or entry.interrupted:
+                uncertain.append(_drained_input(entry))
+            else:
+                lost.append(_drained_input(entry))
         return MatchedDrain(
             matched=_drained_input(matched_entry),
-            skipped=[
-                _drained_input(entry)
-                for _pending_id, entry in skipped_entries
-                if not entry.uncertain
-            ],
-            uncertain=[
-                _drained_input(entry) for _pending_id, entry in skipped_entries if entry.uncertain
-            ],
+            skipped=lost,
+            uncertain=uncertain,
         )
 
 
@@ -599,11 +662,12 @@ def has_pending(conversation_id: str) -> bool:
     to boot, the session is working even though no turn has started yet.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
-    :returns: ``True`` iff at least one non-stale pending entry exists.
+    :returns: ``True`` iff at least one non-stale pending entry exists that the
+        person has not cancelled by interrupting (see :func:`mark_interrupted`).
     """
     with _lock:
         _evict_stale_locked(conversation_id, _now())
-        return bool(_pending.get(conversation_id))
+        return any(not entry.interrupted for entry in _pending.get(conversation_id, {}).values())
 
 
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
@@ -617,7 +681,9 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     the transcript round-trip persists the message.
 
     Returns deep copies of the stored content so a caller mutating the
-    replayed entry cannot poison the index.
+    replayed entry cannot poison the index. Entries the person cancelled by
+    interrupting (see :func:`mark_interrupted`) are left out, so a reload does
+    not redraw a bubble the web client already cleared.
 
     :param conversation_id: Conversation/session id to query, e.g.
         ``"conv_abc123"``.
@@ -643,6 +709,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
             }
             for entry in entries.values()
+            if not entry.interrupted
         ]
 
 
