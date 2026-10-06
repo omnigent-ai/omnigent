@@ -87,14 +87,22 @@ export function useDesignBranding(
       }
       return file;
     };
-    const finish = (b: DeckBranding) => {
+    // Timeout paints a provisional unbranded notice so the deck is never blank,
+    // but it must not cancel the in-flight load: a late kit or design-system
+    // result (success or a real not-applied reason) replaces it. Only effect
+    // cleanup sets `cancelled`.
+    const apply = (b: DeckBranding) => {
       if (cancelled) return;
-      cancelled = true;
+      setLoaded({ id: conversationId, branding: b });
+    };
+    const finishLoad = (b: DeckBranding) => {
+      if (cancelled) return;
+      clearTimeout(timer);
       // Keep only what this design read, so the cache never outgrows one design.
       for (const path of cache.keys()) if (!used.has(path)) cache.delete(path);
       setLoaded({ id: conversationId, branding: b });
     };
-    let timer = setTimeout(() => finish(KIT_TIMED_OUT), DESIGN_KIT_TIMEOUT_MS);
+    let timer = setTimeout(() => apply(KIT_TIMED_OUT), DESIGN_KIT_TIMEOUT_MS);
     void loadDeckBranding(
       content,
       {
@@ -102,11 +110,11 @@ export function useDesignBranding(
         isOwner: () => isSessionOwner(conversationId),
         onDesignSystem: () => {
           clearTimeout(timer);
-          timer = setTimeout(() => finish(SYSTEM_TIMED_OUT), DESIGN_SYSTEM_TIMEOUT_MS);
+          timer = setTimeout(() => apply(SYSTEM_TIMED_OUT), DESIGN_SYSTEM_TIMEOUT_MS);
         },
       },
       { sections },
-    ).then(finish);
+    ).then(finishLoad);
     return () => {
       cancelled = true;
       clearTimeout(timer);

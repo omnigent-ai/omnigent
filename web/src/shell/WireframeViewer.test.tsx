@@ -8,6 +8,7 @@ import { DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer } from "@/lib/desig
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { readFixtureFile } from "@/test/designSystemFixture";
 import { DESIGN_KIT_DIR, HTML_PREVIEW_SANDBOX, type KitFile } from "./codeViewerHelpers";
+import { DESIGN_KIT_TIMEOUT_MS } from "./designViewer";
 import { WireframeViewer, fitScale } from "./WireframeViewer";
 import {
   WIREFRAME_DEVICES,
@@ -338,6 +339,67 @@ describe("WireframeViewer", () => {
         "Design kit not applied: kit.json is not valid JSON",
       );
       expect(srcdoc()).toContain('<section data-screen="home"');
+    });
+
+    it("applies a kit that arrives after the timeout", async () => {
+      vi.useFakeTimers();
+      try {
+        let release!: () => void;
+        const gate = new Promise<void>((r) => {
+          release = r;
+        });
+        vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
+          await gate;
+          const f = {
+            [`${DESIGN_KIT_DIR}/kit.json`]: text(JSON.stringify(KIT)),
+          }[path];
+          if (!f) throw new Error("404 Not Found");
+          return { ...f, path } as never;
+        });
+        render(<WireframeViewer content={body(SCREENS)} conversationId="conv_1" />);
+        await act(() => vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS + 1));
+        expect(screen.getByRole("status")).toHaveTextContent("design kit timed out");
+
+        release();
+        await act(async () => {
+          await Promise.resolve();
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(screen.getByTitle("Design kit: Acme")).toBeInTheDocument();
+        expect(screen.queryByRole("status")).not.toBeInTheDocument();
+        expect(srcdoc()).toContain("--kit-primary:#ff0066");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("replaces a timed-out notice with the real reason when an invalid kit arrives late", async () => {
+      vi.useFakeTimers();
+      try {
+        let release!: () => void;
+        const gate = new Promise<void>((r) => {
+          release = r;
+        });
+        vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
+          await gate;
+          if (path !== `${DESIGN_KIT_DIR}/kit.json`) throw new Error("404 Not Found");
+          return { ...text("{"), path } as never;
+        });
+        render(<WireframeViewer content={body(SCREENS)} conversationId="conv_1" />);
+        await act(() => vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS + 1));
+        expect(screen.getByRole("status")).toHaveTextContent("design kit timed out");
+
+        release();
+        await act(async () => {
+          await Promise.resolve();
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(screen.getByRole("status")).toHaveTextContent(
+          "Design kit not applied: kit.json is not valid JSON",
+        );
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

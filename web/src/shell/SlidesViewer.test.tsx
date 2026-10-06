@@ -844,6 +844,63 @@ describe("SlidesViewer design kit", () => {
     }
   });
 
+  it("applies a kit that arrives after the timeout and enables Download HTML", async () => {
+    vi.useFakeTimers();
+    try {
+      let release!: () => void;
+      serve(
+        KIT_FILES,
+        new Promise<void>((r) => {
+          release = r;
+        }),
+      );
+      render(<SlidesViewer content={DECK} conversationId="conv_1" />);
+      await act(() => vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS + 1));
+      expect(screen.getByRole("status")).toHaveTextContent("design kit timed out");
+      expect(downloadButton()).toBeDisabled();
+
+      release();
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByTitle("Design kit: Acme")).toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+      expect(downloadButton()).toBeEnabled();
+      expect(srcdoc()).toContain("--kit-primary:#ff0066");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("replaces a timed-out notice with the real reason when an invalid kit arrives late", async () => {
+    vi.useFakeTimers();
+    try {
+      let release!: () => void;
+      serve(
+        { "kit.json": text("{") },
+        new Promise<void>((r) => {
+          release = r;
+        }),
+      );
+      render(<SlidesViewer content={DECK} conversationId="conv_1" />);
+      await act(() => vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS + 1));
+      expect(screen.getByRole("status")).toHaveTextContent("design kit timed out");
+
+      release();
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Design kit not applied: kit.json is not valid JSON",
+      );
+      expect(downloadButton()).toBeDisabled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("drops the previous session's kit until the new one loads", async () => {
     serve(KIT_FILES);
     const { rerender } = render(<SlidesViewer content={DECK} conversationId="conv_1" />);
@@ -1130,7 +1187,7 @@ describe("SlidesViewer design system", () => {
     expect(reads.filter((p) => p === DESIGN_SYSTEM_POINTER)).toHaveLength(2);
   });
 
-  it("stops reading design-system assets once the load times out", async () => {
+  it("applies a design system that finishes after the timeout", async () => {
     vi.useFakeTimers();
     try {
       let release = () => {};
@@ -1144,11 +1201,16 @@ describe("SlidesViewer design system", () => {
         vi.advanceTimersByTimeAsync(DESIGN_KIT_TIMEOUT_MS + DESIGN_SYSTEM_TIMEOUT_MS),
       );
       expect(screen.getByRole("status")).toHaveTextContent("design system timed out");
+      expect(downloadButton()).toBeDisabled();
       release();
-      await act(() => vi.advanceTimersByTimeAsync(0));
-      const reads = vi.mocked(fetchFileContent).mock.calls.map(([, p]) => p);
-      expect(reads).toContain(`${FOLDER}/assets/logo.svg`);
-      expect(reads).not.toContain(`${FOLDER}/fonts/fixture-sans.woff2`);
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByTitle("Design system: Fixture Brand")).toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+      expect(downloadButton()).toBeEnabled();
+      expect(srcdoc()).toContain("data-omnigent-design-system");
     } finally {
       vi.useRealTimers();
     }
