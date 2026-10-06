@@ -5379,6 +5379,34 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
     session_stream.publish(session_id, payload)
 
 
+def _mark_pending_inputs_interrupted(session_id: str) -> None:
+    """
+    Flag the web messages queued for a native session when a Stop is delivered.
+
+    The stopped TUI may never record a prompt it was handed moments before, so
+    a later mirror that jumps over such an entry persists a stop notice instead
+    of a "not delivered" error (see
+    :func:`omnigent.runtime.pending_inputs.mark_interrupted`). Nothing is
+    discarded: an entry the TUI did record still drains by its own text.
+
+    :param session_id: The interrupted session, e.g. ``"conv_abc123"``. A
+        session with no queued messages (every non-native one) is a no-op.
+    """
+    pending_count, oldest_age_s = pending_inputs.mark_interrupted(session_id)
+    if pending_count:
+        _logger.info(
+            "Interrupt delivered with %d pending web message(s) on session %s",
+            pending_count,
+            session_id,
+            extra=debug_event(
+                "native_interrupt_pending",
+                session_id=session_id,
+                pending_count=pending_count,
+                oldest_age_s=round(oldest_age_s, 1),
+            ),
+        )
+
+
 def _publish_session_superseded(session_id: str, target_conversation_id: str) -> None:
     """
     Publish a ``session.superseded`` event to the live stream.

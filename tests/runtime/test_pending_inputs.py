@@ -602,3 +602,167 @@ def test_mark_uncertain_keeps_jumped_over_entries_out_of_the_undelivered_set() -
     assert matched.skipped == []
     assert [entry.pending_id for entry in matched.uncertain] == [second]
     assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_resolve_matching_text_shell_command_drains_the_bang_entry_in_either_spacing() -> None:
+    """A shell command recorded without its ``!`` drains ``!cmd`` and ``! cmd`` alike."""
+    older = pending_inputs.record("conv_a", [_text_block("still on its way")])
+    tight = pending_inputs.record("conv_a", [_text_block("!ls -la")])
+    spaced = pending_inputs.record("conv_a", [_text_block("!   pwd")])
+
+    first = pending_inputs.resolve_matching_text("conv_a", "ls   -la", shell_command=True)
+    second = pending_inputs.resolve_matching_text("conv_a", "pwd", shell_command=True)
+
+    assert first.matched is not None and first.matched.pending_id == tight
+    # The older plain message is reported as jumped over, like any other match.
+    assert [entry.pending_id for entry in first.skipped] == [older]
+    assert second.matched is not None and second.matched.pending_id == spaced
+    assert second.skipped == []
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_resolve_matching_text_shell_command_ignores_entries_without_a_bang() -> None:
+    """Only ``!`` entries are shell commands; the mode never matches a plain message."""
+    plain = pending_inputs.record("conv_a", [_text_block("ls")])
+    bang = pending_inputs.record("conv_a", [_text_block("!ls")])
+
+    # A plain message with the same words is not the shell command.
+    shell = pending_inputs.resolve_matching_text("conv_a", "ls", hold=True, shell_command=True)
+    assert shell.matched is not None and shell.matched.pending_id == bang
+    assert [entry.pending_id for entry in shell.skipped] == [plain]
+    pending_inputs.restore("conv_a", shell.matched)
+    for entry in shell.skipped:
+        pending_inputs.restore("conv_a", entry)
+
+    # And the ordinary text match still ignores the bang entry's command text.
+    ordinary = pending_inputs.resolve_matching_text("conv_a", "ls")
+    assert ordinary.matched is not None and ordinary.matched.pending_id == plain
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [bang]
+
+
+def test_resolve_matching_text_shell_command_leaves_the_queue_when_nothing_matches() -> None:
+    """A command typed in the TUI, or a bare ``!``, must not consume a queued web entry."""
+    bang = pending_inputs.record("conv_a", [_text_block("!ls")])
+    bare = pending_inputs.record("conv_a", [_text_block("!")])
+
+    typed = pending_inputs.resolve_matching_text("conv_a", "pwd", shell_command=True)
+    empty = pending_inputs.resolve_matching_text("conv_a", "   ", shell_command=True)
+
+    assert typed.matched is None and typed.skipped == []
+    assert empty.matched is None and empty.skipped == []
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [bang, bare]
+
+
+def test_resolve_matching_text_shell_command_drains_identical_commands_in_queue_order() -> None:
+    """Two queued ``!ls`` entries are indistinguishable, so the oldest takes the mirror."""
+    first = pending_inputs.record("conv_a", [_text_block("!ls")])
+    second = pending_inputs.record("conv_a", [_text_block("! ls")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "ls", shell_command=True)
+
+    assert drained.matched is not None and drained.matched.pending_id == first
+    assert drained.skipped == []
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [second]
+
+
+def test_resolve_matching_text_reports_the_queue_depth() -> None:
+    """A match reports how many unheld entries were queued, counting the matched one."""
+    for text in ("a", "b", "c"):
+        pending_inputs.record("conv_a", [_text_block(text)])
+    held = pending_inputs.resolve_matching_text("conv_a", "a", hold=True)
+    assert held.matched is not None
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "c")
+
+    # "a" is held by the first drain, so only "b" and "c" count.
+    assert drained.queue_depth == 2
+
+
+def test_mark_interrupted_flags_only_entries_queued_before_it() -> None:
+    """An entry recorded after the Stop is a fresh message and is never reported as stopped."""
+    before = pending_inputs.record("conv_a", [_text_block("before the stop")])
+
+    count, _oldest_age_s = pending_inputs.mark_interrupted("conv_a")
+    after = pending_inputs.record("conv_a", [_text_block("after the stop")])
+
+    assert count == 1
+    drained = pending_inputs.resolve_matching_text("conv_a", "after the stop")
+    assert drained.matched is not None and drained.matched.pending_id == after
+    assert drained.matched.interrupted is False
+    assert [entry.pending_id for entry in drained.skipped] == [before]
+    assert drained.skipped[0].interrupted is True
+
+
+def test_mark_interrupted_reports_the_count_and_age_of_what_was_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flagged count and the oldest entry's age feed the interrupt diagnostics."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    pending_inputs.record("conv_a", [_text_block("first")])
+    clock["t"] = 1030.0
+    pending_inputs.record("conv_a", [_text_block("second")])
+    clock["t"] = 1045.0
+
+    assert pending_inputs.mark_interrupted("conv_a") == (2, 45.0)
+    assert pending_inputs.mark_interrupted("conv_other") == (0, 0.0)
+
+
+def test_mark_interrupted_ignores_entries_the_ttl_already_evicted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ghost past the TTL is not a queued message, so it is neither flagged nor counted."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    pending_inputs.record("conv_a", [_text_block("ghost")])
+    clock["t"] = 1000.0 + pending_inputs._TTL_S + 1.0
+
+    assert pending_inputs.mark_interrupted("conv_a") == (0, 0.0)
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_interrupted_flag_survives_a_held_drain_and_restore() -> None:
+    """A persist that hands an interrupted entry back must not lose the flag."""
+    first = pending_inputs.record("conv_a", [_text_block("!ls")])
+    second = pending_inputs.record("conv_a", [_text_block("second")])
+    # A persist in progress already holds the entry when the Stop lands.
+    held = pending_inputs.resolve_matching_text("conv_a", "ls", hold=True, shell_command=True)
+    assert held.matched is not None and held.matched.pending_id == first
+    assert pending_inputs.mark_interrupted("conv_a")[0] == 2
+    pending_inputs.restore("conv_a", held.matched)
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "second")
+
+    assert [entry.pending_id for entry in drained.skipped] == [first]
+    assert drained.skipped[0].interrupted is True
+    assert drained.matched is not None and drained.matched.pending_id == second
+
+
+def test_restore_of_a_gone_entry_keeps_the_interrupted_flag() -> None:
+    """An entry re-inserted after the queue dropped it is still reported as stopped."""
+    pending_inputs.record("conv_a", [_text_block("first")])
+    pending_inputs.mark_interrupted("conv_a")
+    gone = pending_inputs.resolve_oldest("conv_a")
+    assert gone is not None and gone.interrupted is True
+
+    pending_inputs.restore("conv_a", gone)
+
+    restored = pending_inputs.resolve_oldest("conv_a")
+    assert restored is not None and restored.interrupted is True
+
+
+def test_drained_input_reports_how_long_the_entry_was_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``age_s`` lets the skip diagnostics tell a stale ghost from a message sent seconds ago."""
+    clock = {"t": 500.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    pending_inputs.record("conv_a", [_text_block("lost")])
+    clock["t"] = 512.5
+    pending_inputs.record("conv_a", [_text_block("recorded")])
+    clock["t"] = 530.0
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "recorded")
+
+    assert drained.matched is not None and drained.matched.age_s == 17.5
+    assert drained.skipped[0].age_s == 30.0

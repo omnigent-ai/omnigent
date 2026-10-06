@@ -10020,6 +10020,133 @@ async def test_interrupt_forward_success_keeps_stop_fence(
                 _interrupt_fenced_sessions.discard(session_id)
 
 
+async def test_interrupt_marks_queued_native_messages_so_a_later_skip_reads_as_stopped(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delivered Stop flags the web messages queued at that moment.
+
+    The stopped TUI may never record a prompt sent just before the Stop, so no
+    mirror of it arrives. The next message that is mirrored skips it as before,
+    but the persisted pair ends in an info notice instead of a "not delivered"
+    error.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Accept the interrupt POST (2xx)."""
+        del request
+        return httpx.Response(202)
+
+    pending_inputs.reset_for_tests()
+    session_id: str | None = None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler), base_url="http://runner"
+        ) as runner:
+            _route_to_runner(monkeypatch, runner)
+            agent = await create_test_agent(client)
+            session = await _create_session(
+                client,
+                agent["id"],
+                labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            )
+            session_id = session["id"]
+            pending_inputs.record(session_id, [{"type": "input_text", "text": "stopped prompt"}])
+
+            with capture_debug_rows("server") as rows:
+                stop = await client.post(
+                    f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
+                )
+                assert stop.status_code == 202, stop.text
+                pending_inputs.record(
+                    session_id, [{"type": "input_text", "text": "after the stop"}]
+                )
+                mirrored = await client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "external_conversation_item",
+                        "data": {
+                            "item_type": "message",
+                            "item_data": {
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "after the stop"}],
+                            },
+                            "response_id": "native_turn_1",
+                            "source_id": "claude:after-the-stop:0",
+                        },
+                    },
+                )
+                assert mirrored.status_code == 202, mirrored.text
+                # The queue is empty now, so a second Stop has nothing to report.
+                await client.post(
+                    f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
+                )
+
+            interrupt_rows = [
+                row for row in rows if row["event_name"] == "native_interrupt_pending"
+            ]
+            assert len(interrupt_rows) == 1
+            assert interrupt_rows[0]["level"] == "INFO"
+            assert interrupt_rows[0]["session_id"] == session_id
+            assert interrupt_rows[0]["attributes"]["pending_count"] == "1"
+            assert float(interrupt_rows[0]["attributes"]["oldest_age_s"]) >= 0.0
+
+            items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+            assert [item["type"] for item in items] == ["message", "error", "message"]
+            stopped_user, notice, matched_user = items
+            assert stopped_user["content"] == [{"type": "input_text", "text": "stopped prompt"}]
+            assert notice["code"] == "native_prompt_interrupted"
+            assert notice["level"] == "info"
+            assert notice["message"] == "Stopped before Claude recorded this message."
+            assert matched_user["content"] == [{"type": "input_text", "text": "after the stop"}]
+            assert pending_inputs.snapshot_for(session_id) == []
+    finally:
+        pending_inputs.reset_for_tests()
+        if session_id is not None:
+            _interrupt_fenced_sessions.discard(session_id)
+
+
+async def test_interrupt_not_delivered_leaves_queued_native_messages_unmarked(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Stop the runner rejected never reached the TUI, so queued messages stay as they were."""
+    from omnigent.runtime import pending_inputs
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Reject the interrupt POST, like a runner whose bridge is not ready."""
+        del request
+        return httpx.Response(503, json={"error": "claude_native_interrupt_failed"})
+
+    pending_inputs.reset_for_tests()
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler), base_url="http://runner"
+        ) as runner:
+            _route_to_runner(monkeypatch, runner)
+            agent = await create_test_agent(client)
+            session = await _create_session(
+                client,
+                agent["id"],
+                labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            )
+            pending_inputs.record(session["id"], [{"type": "input_text", "text": "still going"}])
+
+            with capture_debug_rows("server") as rows:
+                stop = await client.post(
+                    f"/v1/sessions/{session['id']}/events", json={"type": "interrupt", "data": {}}
+                )
+
+            assert stop.status_code == 202, stop.text
+            assert not [row for row in rows if row["event_name"] == "native_interrupt_pending"]
+            queued = pending_inputs.resolve_oldest(session["id"])
+            assert queued is not None and queued.interrupted is False
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 @dataclass
 class _ForwardedEffort:
     """
