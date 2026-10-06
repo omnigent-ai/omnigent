@@ -2631,6 +2631,65 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_relay_skips_failure_when_shutdown_began_a_full_grace_earlier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A draining replica still alive when the disconnect grace runs out leaves the turn alone.
+
+    The relay decides only after the whole grace, so a shutdown mark set when the
+    tunnels closed must still read as fresh then; otherwise a runner that already
+    moved to another replica gets a ``runner_disconnected`` failure from this one.
+    """
+    import time
+
+    from omnigent.runtime import session_stream
+    from omnigent.server import shutdown_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    store = _RecordingLabelStore(live_status="running")
+    session_id = "7c2f4a9e1b3d4c5e8f6a0b1c2d3e4f5a"
+    sessions_module._session_status_cache[session_id] = "running"
+    # The production grace (the liveness TTL) has elapsed since the 1012 closes.
+    monkeypatch.setattr(
+        shutdown_state, "_marked_at", time.monotonic() - (RUNNER_LIVENESS_TTL_S + 5.0)
+    )
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_draining_replica",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        assert session_id not in store.labels, "draining replica persisted failure labels"
+        assert sessions_module._session_status_cache.get(session_id) == "running"
+    finally:
+        shutdown_state.reset_for_tests()
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 async def test_relay_reads_handoff_evidence_with_conversation_database_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
