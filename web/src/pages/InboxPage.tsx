@@ -179,7 +179,7 @@ export function InboxPage() {
   };
 
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-4 md:px-6">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Inbox</h1>
         {(items.length > 0 || commentInbox.items.length > 0) && (

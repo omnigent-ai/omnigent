@@ -5107,6 +5107,11 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "agent_install": {
+            "default": false,
+            "title": "Agent Install",
+            "type": "boolean"
+          },
           "archive_worktree_cleanup": {
             "default": true,
             "title": "Archive Worktree Cleanup",
@@ -9498,11 +9503,11 @@
     },
     "/v1/agents": {
       "get": {
-        "description": "List built-in agents with cursor-based pagination.\n\nReturns only built-in agents \u2014 `agent_store.list()` filters\n`session_id IS NULL` \u2014 so session-scoped agents never appear.\n\n**Returns:** A `PaginatedList` of built-in agents.",
+        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\n**Returns:** A `PaginatedList` of agents.",
         "operationId": "list_builtin_agents_v1_agents_get",
         "parameters": [
           {
-            "description": "Maximum number of agents to return (1-1000).",
+            "description": "Maximum number of agents to return (1-1000; `scope=user` caps it at 50).",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -9515,7 +9520,7 @@
             }
           },
           {
-            "description": "Cursor \u2014 return agents after this id.",
+            "description": "Cursor: return agents after this id.",
             "in": "query",
             "name": "after",
             "required": false,
@@ -9532,7 +9537,7 @@
             }
           },
           {
-            "description": "Cursor \u2014 return agents before this id.",
+            "description": "Cursor: return agents before this id (server agents only).",
             "in": "query",
             "name": "before",
             "required": false,
@@ -9549,7 +9554,7 @@
             }
           },
           {
-            "description": "Sort order, `\"asc\"` or `\"desc\"`.",
+            "description": "Sort order, `\"asc\"` or `\"desc\"` (server agents only).",
             "in": "query",
             "name": "order",
             "required": false,
@@ -9558,6 +9563,24 @@
               "pattern": "^(asc|desc)$",
               "title": "Order",
               "type": "string"
+            }
+          },
+          {
+            "description": "`\"user\"` to list the caller's own agents.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^user$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
             }
           }
         ],
@@ -9584,6 +9607,81 @@
           }
         },
         "summary": "List Builtin Agents",
+        "tags": [
+          "agents"
+        ]
+      },
+      "post": {
+        "description": "Install (or reinstall) the caller's user agent from a bundle.\n\nMultipart form with one `bundle` part: a gzipped tarball, the same\nshape multipart `POST /v1/sessions` accepts. The bundle is validated\nlike any tenant upload and never executed here.\n\n**Returns:** The installed agent as an `AgentObject`.",
+        "operationId": "install_agent_v1_agents_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Install Agent",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/v1/agents/{agent_id}": {
+      "delete": {
+        "description": "Remove one of the caller's user agents.\n\nSessions using it keep running while their runner holds the spec, then\nreport that the agent no longer exists, so while any exist this returns\n409 with `sessions_in_use` unless `force` is set. Server agents,\nother users' agents, and unowned rows all read as 404.\n\n**Returns:** `{\"id\": agent_id, \"deleted\": True}`, or the 409 response.",
+        "operationId": "remove_agent_v1_agents__agent_id__delete",
+        "parameters": [
+          {
+            "description": "User agent to remove.",
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Remove even though sessions still use the agent.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Force",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Remove Agent V1 Agents  Agent Id  Delete"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Agent",
         "tags": [
           "agents"
         ]
@@ -9919,7 +10017,7 @@
     },
     "/v1/hosts/{host_id}/credentials/detected": {
       "get": {
-        "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Owner-scoped and flag-gated like the\ncredential-write route (404 when disabled). Never returns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline, 502/504 on host failure/timeout.",
+        "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Owner-scoped and flag-gated like the\ncredential-write route (404 when disabled). Never returns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline or the host daemon is too old to detect credentials, 502/504 on host failure/timeout.",
         "operationId": "detect_host_credentials_v1_hosts__host_id__credentials_detected_get",
         "parameters": [
           {
@@ -10287,7 +10385,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/credential": {
       "post": {
-        "description": "Write a harness provider credential onto a connected host.\n\nBacks the Web UI setup dialog's \"Add a credential\" action so a user can\nconfigure a Claude / Codex / Pi credential on a connected host without a\nterminal. Owner-scoped, allowlisted, and gated behind\n`harness_install` release feature exactly like the install route\n(404 when disabled). The host daemon does the write with the same\nnon-interactive core the `omnigent setup` wizard uses.\n\nSecurity: the server is an authz'd pass-through \u2014 it validates\nownership + the allowlist and forwards the secret over the (TLS) tunnel;\nit never persists the secret or logs it. The secret rides in the request\nbody (not the URL), and the frame field is redaction-named so it never\nlands on a telemetry span.\n\n**Parameters**\n\n- `body` \u2014 The credential payload (kind + secret / gateway / adopt).\n\n**Returns:** `{\"object\": \"harness_credential\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 refreshed readiness so the UI can flip the badge without a reconnect, plus the refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 400 when the harness isn't UI-configurable or the body is invalid, 403 when not the owner, 409 when offline, 502 on host-side failure, 504 on timeout.",
+        "description": "Write a harness provider credential onto a connected host.\n\nBacks the Web UI setup dialog's \"Add a credential\" action so a user can\nconfigure a Claude / Codex / Pi credential on a connected host without a\nterminal. Owner-scoped, allowlisted, and gated behind\n`harness_install` release feature exactly like the install route\n(404 when disabled). The host daemon does the write with the same\nnon-interactive core the `omnigent setup` wizard uses.\n\nSecurity: the server is an authz'd pass-through \u2014 it validates\nownership + the allowlist and forwards the secret over the (TLS) tunnel;\nit never persists the secret or logs it. The secret rides in the request\nbody (not the URL), and the frame field is redaction-named so it never\nlands on a telemetry span.\n\n**Parameters**\n\n- `body` \u2014 The credential payload (kind + secret / gateway / adopt).\n\n**Returns:** `{\"object\": \"harness_credential\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 refreshed readiness so the UI can flip the badge without a reconnect, plus the refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 400 when the harness isn't UI-configurable or the body is invalid, 403 when not the owner, 409 when offline or the host daemon is too old to store credentials, 502 on host-side failure, 504 on timeout.",
         "operationId": "store_host_harness_credential_v1_hosts__host_id__harnesses__harness__credential_post",
         "parameters": [
           {
@@ -10353,7 +10451,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/install": {
       "post": {
-        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline, 502 on a host-side install failure, 504 on host timeout.",
+        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline or its daemon is too old to install harnesses, 502 on a host-side install failure, 504 on host timeout.",
         "operationId": "install_host_harness_v1_hosts__host_id__harnesses__harness__install_post",
         "parameters": [
           {
@@ -10409,7 +10507,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/model-options": {
       "get": {
-        "description": "Return pre-launch model choices resolved by the selected host.\n\nA preview of the host's ambient default catalog, not a binding\nsnapshot: launch re-resolves with the session's agent spec, and the\nin-session picker reflects that launch snapshot once the runner is up.",
+        "description": "Return pre-launch model choices resolved by the selected host.\n\nA preview of the host's ambient default catalog, not a binding\nsnapshot: launch re-resolves with the session's agent spec, and the\nin-session picker reflects that launch snapshot once the runner is up.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the host is unknown, 403 when not the owner, 409 when offline or the host daemon is too old to list model options, 502 on host-side failure, 504 on timeout.",
         "operationId": "get_host_model_options_v1_hosts__host_id__harnesses__harness__model_options_get",
         "parameters": [
           {

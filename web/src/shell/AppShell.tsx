@@ -2386,6 +2386,7 @@ export function AppShell() {
                     // appeared. Left collapsed, the breadcrumb stays put beneath
                     // the floating card (and in the title-bar strip on mac).
                     sidebarOpen={sidebarOpen}
+                    settingsMode={inSettings}
                     onOpenSidebar={(peek?: boolean) => {
                       if (peek) {
                         setSidebarPeek(true);

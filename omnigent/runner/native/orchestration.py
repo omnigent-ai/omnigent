@@ -55,7 +55,14 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.errors import (
+    SESSION_AGENT_MISSING_MESSAGE,
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+)
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.native_coding_agents import (
@@ -945,7 +952,9 @@ def _kiro_session_workspace(session_workspace: str | None) -> Path:
 # under load. Left un-retried it fails Codex terminal launch, ensure, and the
 # next turn from one blip; a bounded retry rides it out (the read is idempotent)
 # before surfacing a server-attributed hard error, so persistent cases fail loud.
-_LAUNCH_CONFIG_FETCH_TIMEOUT_S = 10.0
+# Slow reads take 10-15 s. A shorter timeout makes every retry time out, and makes
+# the single-attempt launch metadata reads below fall back to their defaults.
+_LAUNCH_CONFIG_FETCH_TIMEOUT_S = 20.0
 _LAUNCH_CONFIG_FETCH_ATTEMPTS = 3
 _LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S = 0.5
 _LAUNCH_CONFIG_FETCH_BACKOFF_CAP_S = 4.0
@@ -6966,7 +6975,7 @@ async def _session_payload_for_host_spawn_check(
         resp = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
             params=_SESSION_METADATA_PARAMS,
-            timeout=10.0,
+            timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S,
         )
     except httpx.HTTPError:
         _logger.warning(
@@ -7614,11 +7623,7 @@ def _native_terminal_start_error_payload(
         return {
             "code": ErrorCode.SESSION_AGENT_MISSING,
             "error_id": error_id,
-            "message": (
-                "This session's agent is no longer available; it was deleted "
-                "or replaced. Recreate the agent or start a new session, then "
-                f"retry. Error ID: {error_id}."
-            ),
+            "message": f"{SESSION_AGENT_MISSING_MESSAGE} Error ID: {error_id}.",
         }
     _logger.warning(
         "Native %s terminal start failed; error_id=%s: %s",
@@ -7712,11 +7717,15 @@ def _native_terminal_start_error_response(
     :param exc: Exception raised by terminal auto-create.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :param session_id: Session whose terminal ensure failed.
-    :returns: HTTP 500 response with an ``error`` object carrying the
-        real failure message.
+    :returns: HTTP 410 when the session's agent was removed (the status of
+        ``session_agent_missing``), else 500, with an ``error`` object
+        carrying the real failure message.
     """
+    status_code = 500
+    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
+        status_code = exc.http_status
     return JSONResponse(
-        status_code=500,
+        status_code=status_code,
         content={
             "error": _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
         },
@@ -7938,7 +7947,7 @@ async def _load_legacy_claude_launch_metadata(
         response = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
             params=_SESSION_METADATA_PARAMS,
-            timeout=10.0,
+            timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S,
         )
     except httpx.HTTPError:
         _logger.debug(
@@ -9921,7 +9930,7 @@ async def _claude_native_session_wants_rebuild(
         resp = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
             params=_SESSION_METADATA_PARAMS,
-            timeout=10.0,
+            timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S,
         )
     except httpx.HTTPError:
         return False

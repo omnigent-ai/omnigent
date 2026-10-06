@@ -156,7 +156,6 @@ export {
   LatestTurnSpacer,
   ScrollToBottomOnSend,
   SessionSharedContext,
-  UserMessageNavConnected,
   WORKING_MESSAGES,
   WorkingIndicator,
   bubbleKey,
@@ -3594,7 +3593,7 @@ function ComposerImpl(
   return (
     <form
       onSubmit={handleSubmit}
-      className="chat-composer-form relative px-4 pb-[max(20px,env(safe-area-inset-bottom))] md:px-6"
+      className="chat-composer-form relative px-6 pb-[max(20px,env(safe-area-inset-bottom))]"
     >
       {/* Hidden file input for the attach button */}
       <input

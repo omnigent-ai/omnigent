@@ -74,7 +74,6 @@ import {
   useScopedConversationId,
 } from "@/components/chat/conversationScope";
 import { useStickToBottomContext } from "use-stick-to-bottom";
-import { UserMessageNav } from "@/components/UserMessageNav";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
@@ -1162,18 +1161,6 @@ function AssistantBubble({
 // Scroll helpers — rendered inside <Conversation> / as its siblings.
 // ---------------------------------------------------------------------------
 
-export function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageNav>) {
-  const { isAtBottom } = useStickToBottomContext();
-  return (
-    <UserMessageNav
-      {...props}
-      // Mobile-only: the TurnRail replaces these buttons on desktop. Hidden at
-      // the bottom on mobile too. Keyboard ⌘⌥↑↓ still works on all sizes.
-      className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
-    />
-  );
-}
-
 /**
  * Forces the conversation back to the bottom when this client submits a new
  * message.
@@ -2032,7 +2019,7 @@ export function JumpToTopButton({
       // the safe-area inset, so add --omnigent-inset-top (0px off-shell).
       style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
       className={cn(
-        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150",
+        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150 max-md:hidden",
         visible ? "opacity-100" : "opacity-0",
       )}
     >

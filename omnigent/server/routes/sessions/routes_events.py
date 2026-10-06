@@ -777,8 +777,23 @@ def register_events_routes(
                 )
             except ValueError:
                 return EventAckFrame(batch.id, index, "invalid session event")
-            except Exception:
-                _logger.exception("Runner event ingestion failed for session %s", batch.session_id)
+            except Exception as exc:
+                _logger.exception(
+                    "Runner event ingestion failed for session %s",
+                    batch.session_id,
+                    extra=debug_event(
+                        "runner_event_ingest_failed",
+                        session_id=batch.session_id,
+                        runner_id=runner_id,
+                        batch_id=batch.id,
+                        batch_size=len(batch.events),
+                        applied_count=index,
+                        event_type=event_type,
+                        failure_stage="apply",
+                        error_type=type(exc).__name__,
+                        retryable=True,
+                    ),
+                )
                 return EventAckFrame(batch.id, index, "ingest failed", retryable=True)
         return EventAckFrame(batch.id, len(batch.events))
 
@@ -2727,6 +2742,7 @@ def register_events_routes(
             created_by=created_by,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
+            agent_revision=_agent.bundle_location if _agent else None,
             background_titles_enabled=background_session_titles_enabled(request.headers),
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.

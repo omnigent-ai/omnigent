@@ -5,6 +5,7 @@ import { Link } from "@/lib/routing";
 import { HostLabel } from "./HostLabel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { SettingsLabel } from "@/components/SettingsLabel";
 import {
   Select,
   SelectContent,
@@ -113,7 +114,7 @@ export function ImportSessionsPanel() {
   return (
     <div className="flex flex-col" data-testid="import-sessions-panel">
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-border pb-4">
-        <span className="text-ui font-medium">Machine</span>
+        <span className="text-ui font-normal md:font-medium">Machine</span>
         <Select value={hostId ?? ""} onValueChange={(v) => setHostId(v)}>
           <SelectTrigger className="w-full sm:w-72 sm:shrink-0" data-testid="import-host-select">
             <SelectValue placeholder="Select a machine" />
@@ -133,7 +134,7 @@ export function ImportSessionsPanel() {
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-border py-4">
-        <span className="text-ui font-medium">Import</span>
+        <span className="text-ui font-normal md:font-medium">Import</span>
         <Select
           value={mode}
           onValueChange={(value) => {
@@ -153,7 +154,7 @@ export function ImportSessionsPanel() {
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-border py-4">
-        <span className="text-ui font-medium">Harness</span>
+        <span className="text-ui font-normal md:font-medium">Harness</span>
         <Select value={source} onValueChange={(v) => setSource(v as ImportSourceSelector)}>
           <SelectTrigger className="w-full sm:w-56 sm:shrink-0" data-testid="import-source-select">
             <SelectValue />
@@ -170,15 +171,12 @@ export function ImportSessionsPanel() {
 
       {mode === "recent" ? (
         <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3 border-b border-border py-4">
-          <div className="flex min-w-0 flex-1 flex-col">
-            <span className="text-ui font-medium">
-              How many recent sessions{source === "all" ? " (across all harnesses)" : ""}
-            </span>
-            <p className="text-sm text-muted-foreground" data-testid="import-limit-help">
-              The most recent sessions you opened in the harness. Sub-agent and automation runs are
-              skipped, and sessions you've already imported are counted separately, not re-imported.
-            </p>
-          </div>
+          <SettingsLabel
+            label={`How many recent sessions${source === "all" ? " (across all harnesses)" : ""}`}
+            className="flex-1"
+            description="The most recent sessions you opened in the harness. Sub-agent and automation runs are skipped, and sessions you've already imported are counted separately, not re-imported."
+            descriptionTestId="import-limit-help"
+          />
           <Select value={String(limit)} onValueChange={(v) => setLimit(Number(v))}>
             <SelectTrigger className="w-full sm:w-56 sm:shrink-0" data-testid="import-limit-select">
               <SelectValue />
@@ -194,7 +192,7 @@ export function ImportSessionsPanel() {
         </div>
       ) : (
         <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-border py-4">
-          <label htmlFor="import-session-id" className="text-ui font-medium">
+          <label htmlFor="import-session-id" className="text-ui font-normal md:font-medium">
             Session ID
           </label>
           <Input

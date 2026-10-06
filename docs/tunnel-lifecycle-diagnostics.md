@@ -49,13 +49,28 @@ both ends.
   server upgrade is complete.
 - `runner_ping_timeout`: `runner_id`, `connection_id`, `connection_age_s`,
   `silent_s`.
+- `runner_stream_connected` and `runner_stream_ready` carry `runner_id` and
+  `telemetry_schema = runner_stream_recovery.v1`. `connected` means the runner
+  accepted the HTTP stream; `ready` means the first `session.heartbeat` arrived.
+  The marker lets rollout queries exclude older rows without adding
+  heartbeat-volume events.
 - `runner_stream_transport_lost`: one row per outage when the relay first
-  observes the loss, with `intentional_stop` and `grace_s`. An unintentional
-  loss is then held for `grace_s`; an intentional stop goes straight to the
-  give-up row.
+  observes the loss, with `outage_id`, the loss-time `runner_id` and `turn_id`
+  (when known), `stream_ready`, `intentional_stop`, `grace_s`, and the same
+  `telemetry_schema`. An unintentional loss is then held for `grace_s`; an
+  intentional stop goes straight to the give-up row.
+- `runner_stream_recovered`: at most one row per `outage_id`, emitted only
+  when a retry receives its first `session.heartbeat`. It carries the same
+  `outage_id`, loss-time `runner_id`/`turn_id`, `recovery_attempt`,
+  `outage_s`, `recovery_evidence = stream_heartbeat`, and the schema marker.
+  Initial relay readiness is not recovery. A cancellation or relay rebind
+  before a heartbeat emits no recovery row. A long attempt that resets the
+  grace window without readiness starts a new outage ID and does not recover
+  the previous one.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
   (`intentional_stop`, `server_shutdown`, `live_elsewhere`, `idle_no_failure` or
-  `failed_mid_turn`), `grace_s`, `outage_s`, `retries`. `outage_s` is the
+  `failed_mid_turn`), the matching `outage_id`, loss-time `runner_id`/`turn_id`,
+  `grace_s`, `outage_s`, `retries`, and the schema marker. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected
   stretch and is not cumulative disconnected time.
@@ -99,6 +114,22 @@ both ends.
   reconnect hook; resume set is a sub-agent restore; suppress set is a
   message forward.
 
+## Native event ingestion
+
+`runner_event_ingest_failed` adds session and batch attribution to existing
+server exception logs. Both stages include `session_id`, `runner_id`, `batch_id`,
+`batch_size`, `error_type`, and `retryable`:
+
+- `failure_stage = dispatch`: the tunnel's ingestion callback raised. Includes
+  `connection_id`; the number of events already applied is unknown.
+- `failure_stage = apply`: applying an individual event raised. Includes its
+  allowlisted `event_type` and `applied_count`, the acknowledged prefix length.
+
+These are retryable delivery attempts, not evidence that a session's turn
+ultimately failed. Replay uses source IDs to avoid duplicating persisted events.
+The structured fields contain no event bodies or credentials. Existing exception
+tracebacks and log severity are unchanged; successful retries add no error row.
+
 ## Correlation
 
 The disconnect grace task rechecks the local tunnel after loading bound
@@ -112,24 +143,10 @@ False` after earlier rows for the same `runner_id` is a new process; `pid`
 confirms it. A repeating `connection_age_s` across drops points at an
 intermediary timeout rather than either endpoint.
 
-## Host heartbeat persistence
-
-Host application pings and database heartbeat writes run in separate tasks.
-The ping loop requests a write only while incoming traffic remains within the
-liveness window. Requests coalesce while a write is pending, keeping one write
-in flight per connection without blocking pings or disconnect cleanup.
-
-`host_heartbeat_failed` warns on the first failed write and at most once per
-minute thereafter. It includes `host_id`, consecutive `failure_count`,
-`error_type`, and the write's `duration_s`, without database error text.
-`host_heartbeat_recovered` records the first successful write after failures,
-with their count and the successful write's duration. These are persistence
-diagnostics, not proof of a network failure. During a database outage, other
-replicas may still see stale host liveness until a heartbeat can be saved.
-
-Disconnect cancels the writer task without waiting for a stuck database call.
-An already-running thread may finish later, but a heartbeat never changes an
-offline host's status. Actual silent hosts still time out normally.
+Join relay loss, recovery, and give-up rows on the exact
+`session_id + attributes['outage_id'] + attributes['runner_id']` tuple. Do not
+infer a tunnel `connection_id` for relay rows; it is intentionally absent from
+this contract unless a separate event supplies the known value.
 
 ## Credential recovery
 

@@ -388,7 +388,7 @@ export function HeaderConversationMenu({
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full"
+            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
           >
             <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
           </Button>
