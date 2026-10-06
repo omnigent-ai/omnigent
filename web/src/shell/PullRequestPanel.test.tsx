@@ -251,7 +251,6 @@ describe("PullRequestPanel", () => {
     const heading = screen.getByRole("heading", { name: "GitHub" });
     expect(heading).toHaveAttribute("title", "GitHub");
     expect(screen.getByText("GitHub")).toHaveClass("sr-only");
-    expect(heading.parentElement).toHaveClass("h-11");
     // Title + number live in the shared header (both tabs).
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
     expect(screen.getByText("#6000")).toBeInTheDocument();

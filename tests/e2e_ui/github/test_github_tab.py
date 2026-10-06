@@ -181,6 +181,12 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_text(f"#{_PR_NUMBER}")).to_be_visible()
     expect(rail.get_by_label("Pull request status: Open")).to_be_visible()
 
+    # A host without tracking controls puts the provider beside the repo.
+    icon = rail.get_by_role("heading", name="GitHub", exact=True).bounding_box()
+    repository = rail.get_by_text("acme/app ·", exact=False).bounding_box()
+    assert icon is not None and repository is not None
+    assert abs(icon["y"] - repository["y"]) < 10
+
     # CI checks on their own line as labeled pills; a zero bucket shows nothing.
     expect(rail.get_by_text("Checks")).to_be_visible()
     expect(rail.get_by_text(re.compile(r"3\s*passed"))).to_be_visible()

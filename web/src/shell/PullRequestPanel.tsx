@@ -1104,11 +1104,11 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
             </div>
           </div>
         </div>
-      ) : (
+      ) : panelState.kind !== "ready" ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
           <PanelTitle copy={copy} />
         </div>
-      )}
+      ) : null}
       {showTrackingControls && (linking || update.isError) && (
         <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
       )}
@@ -1125,6 +1125,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           key={`${conversationId}:${selected ?? ""}`}
           conversationId={conversationId}
           info={info}
+          showProviderIcon={!showTrackingControls}
           emptyStateAction={
             associations?.tracking_available && linkInEmptyState ? (
               <div className="mt-2 w-full max-w-sm">
@@ -1144,10 +1145,12 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
 function PullRequestPanelDetails({
   conversationId,
   info,
+  showProviderIcon,
   emptyStateAction,
 }: {
   conversationId: string;
   info: ReturnType<typeof usePullRequestInfo>;
+  showProviderIcon: boolean;
   emptyStateAction?: React.ReactNode;
 }) {
   const baseRef = info.data?.base_ref ?? undefined;
@@ -1481,16 +1484,19 @@ function PullRequestPanelDetails({
             tabs align to the gutter and the underline row spans full width. */}
         <div className="shrink-0 border-b border-border pb-0.5">
           <div className="px-3 pt-2">
-            <span className="block min-w-0 truncate text-xs text-muted-foreground">
-              {data.repo?.name_with_owner ?? copy.label}
-              {data.branch && (
-                <>
-                  {" · "}
-                  <span className="font-mono">{data.branch}</span>
-                  {baseRef && <span className="text-muted-foreground"> → {baseRef}</span>}
-                </>
-              )}
-            </span>
+            <div className="flex items-center gap-2">
+              {showProviderIcon && <PanelTitle copy={copy} />}
+              <span className="block min-w-0 truncate text-xs text-muted-foreground">
+                {data.repo?.name_with_owner ?? copy.label}
+                {data.branch && (
+                  <>
+                    {" · "}
+                    <span className="font-mono">{data.branch}</span>
+                    {baseRef && <span className="text-muted-foreground"> → {baseRef}</span>}
+                  </>
+                )}
+              </span>
+            </div>
             <div className="mt-1 flex flex-nowrap items-center gap-2">
               <a
                 href={pr.url}
