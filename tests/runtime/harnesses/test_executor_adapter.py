@@ -682,6 +682,66 @@ def test_build_error_detail_uses_omnigent_error_code() -> None:
     assert base_detail.code == "RuntimeError"
 
 
+# Claude Code's result text when its version predates the selected model.
+_OLD_CLI_REFUSAL = (
+    'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+    "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
+    'desktop app, then try again."}'
+)
+
+
+def test_build_error_detail_codes_old_cli_model_refusal() -> None:
+    """
+    A claude-sdk turn ending on Claude Code's "version N or newer is required"
+    refusal reaches the adapter as a bare ``RuntimeError``; the detail is coded
+    ``client_update_required`` and names both versions and the update command,
+    with the raw text kept as the message.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    error = RuntimeError(f"inner executor error: {_OLD_CLI_REFUSAL}")
+
+    detail = adapter._build_error_detail(error)
+
+    assert detail.code == "client_update_required"
+    assert detail.message == str(error)
+    assert detail.title == "Claude Code needs an update"
+    assert detail.cause is not None
+    assert "2.1.217" in detail.cause
+    assert "2.1.280" in detail.cause
+    assert detail.remediation is not None
+    assert "`claude update`" in detail.remediation
+
+
+def test_old_cli_refusal_text_does_not_override_other_classifications() -> None:
+    """
+    The text check is a last resort: an executor-named code and an SDK-typed
+    failure keep their code, and an unrelated ``RuntimeError`` stays generic.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+
+    named = adapter._build_error_detail(
+        InnerExecutorError(_OLD_CLI_REFUSAL, code="databricks_sign_in_pending")
+    )
+    assert named.code == "databricks_sign_in_pending"
+    assert named.cause is None
+
+    typed = adapter._build_error_detail(httpx.ConnectError(_OLD_CLI_REFUSAL))
+    assert typed.code == "connection_error"
+    assert typed.cause is None
+
+    unrelated = adapter._build_error_detail(RuntimeError("inner executor error: boom"))
+    assert unrelated.code == "RuntimeError"
+    assert unrelated.title is None
+    assert unrelated.cause is None
+
+
 def test_classify_openai_exception_maps_known_types() -> None:
     """
     The OpenAI SDK classifier maps each recognized exception

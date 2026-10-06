@@ -5528,6 +5528,96 @@ async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     }
 
 
+_OLD_CLI_DETAIL = (
+    'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+    "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
+    'desktop app, then try again."}'
+)
+_OLD_CLI_CARD = {
+    "title": "Claude Code needs an update",
+    "cause": (
+        "Claude Code 2.1.217 on the host doesn't support this model; "
+        "version 2.1.280 or newer is required."
+    ),
+    "remediation": "Run `claude update` on the host, then start a new session.",
+}
+
+
+@pytest.mark.parametrize("wire_output", [False, True])
+@pytest.mark.parametrize(
+    ("detail", "expected_code", "card"),
+    [
+        (
+            'API Error: 499 {"error_code":"CANCELLED","message":""}',
+            "transient_upstream_error",
+            {},
+        ),
+        (_OLD_CLI_DETAIL, "client_update_required", _OLD_CLI_CARD),
+    ],
+)
+async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_after_reload(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_output: bool,
+    detail: str,
+    expected_code: str,
+    card: dict[str, str],
+) -> None:
+    """A gateway 499 is retryable and an old-CLI refusal names its fix, live and on reload."""
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    response_id = "resp_native_coded_failure"
+    item_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": response_id,
+                "source_id": "src_native_coded_failure",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": detail}],
+                },
+            },
+        },
+    )
+    assert item_resp.status_code == 202, item_resp.text
+
+    data: dict[str, Any] = {"status": "failed", "response_id": response_id}
+    if wire_output:
+        data["output"] = detail
+    status_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    assert status_resp.status_code == 202, status_resp.text
+    failed_events = [event for event in published if event.get("status") == "failed"]
+    assert len(failed_events) == 1
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == expected_code
+    assert error["message"] == detail
+    for field in ("title", "cause", "remediation"):
+        assert error[field] == card.get(field)
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    assert snapshot_resp.json()["last_task_error"] == {
+        "code": expected_code,
+        "message": detail,
+        "agent_name": "claude-native-ui",
+        **card,
+    }
+
+
 async def test_post_external_session_status_propagates_runner_delivery_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
