@@ -3722,13 +3722,15 @@ async def test_filesystem_write_proxies_to_runner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_first_wake", [False, True])
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
 async def test_filesystem_save_reconnects_runner_on_live_host(
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
     fail_first_wake: bool,
+    method: str,
 ) -> None:
-    """Save (or Retry after a failed wake) reconnects before forwarding the edit."""
+    """Save or delete (or Retry after a failed wake) reconnects before forwarding."""
     from dataclasses import replace
     from types import SimpleNamespace
 
@@ -3792,23 +3794,26 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
     monkeypatch.setattr(orchestration, "_wait_for_runner_client", _wait)
     url = f"/v1/sessions/{session_id}/resources/environments/default/filesystem/new.txt"
     body = {"content": "edited without a chat message", "encoding": "utf-8"}
+    kwargs: dict[str, Any] = {"json": body} if method == "PUT" else {}
 
     if fail_first_wake:
-        failed = await client.put(url, json=body)
+        failed = await client.request(method, url, **kwargs)
         assert failed.status_code == 503
         assert fake_runner.calls == []
 
-    response = await client.put(url, json=body)
+    response = await client.request(method, url, **kwargs)
     assert response.status_code == 200
-    assert fake_runner.calls == [("PUT", url)]
+    assert fake_runner.calls == [(method, url)]
     assert attempts == (2 if fail_first_wake else 1)
     assert store.appended_items == []
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
 async def test_filesystem_save_authorizes_before_reconnecting(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    method: str,
 ) -> None:
     """An invalid session must not trigger runner recovery."""
     from unittest.mock import AsyncMock
@@ -3817,9 +3822,10 @@ async def test_filesystem_save_authorizes_before_reconnecting(
 
     wake = AsyncMock()
     monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
-    response = await client.put(
+    response = await client.request(
+        method,
         "/v1/sessions/missing/resources/environments/default/filesystem/new.txt",
-        json={"content": "hello", "encoding": "utf-8"},
+        **({"json": {"content": "hello", "encoding": "utf-8"}} if method == "PUT" else {}),
     )
     assert response.status_code == 404
     wake.assert_not_awaited()

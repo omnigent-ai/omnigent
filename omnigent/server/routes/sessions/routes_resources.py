@@ -2226,19 +2226,19 @@ def register_resources_routes(
         conv = await _validate_session(session_id, request, required_level)
         if method == "GET":
             return await _proxy_get_to_runner(session_id, path, conv)
-        if method == "PUT":
-            # Reads can use the host tunnel, but saving needs a runner to
-            # enforce the environment's write policy. Reconnect before saving
+        if method in ("PUT", "DELETE") and request is not None:
+            # Reads can use the host tunnel, but saving or deleting needs a
+            # runner to enforce the environment's write policy. Reconnect first
             # and use the refreshed binding if recovery launched a new runner.
-            if request is not None:
-                _, conv = await ensure_runner_connected(
-                    session_id=session_id,
-                    conv=conv,
-                    app_state=request.app.state,
-                    conversation_store=conversation_store,
-                    runner_router=runner_router or get_server_runner_router(),
-                    raise_host_refusal=True,
-                )
+            _, conv = await ensure_runner_connected(
+                session_id=session_id,
+                conv=conv,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router or get_server_runner_router(),
+                raise_host_refusal=True,
+            )
+        if method == "PUT":
             status, payload = await _proxy_put_to_runner(
                 session_id,
                 path,
