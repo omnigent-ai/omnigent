@@ -24,7 +24,11 @@ import * as conversationsHook from "@/hooks/useConversations";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { CommentInbox } from "@/hooks/useCommentInbox";
-import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
+import {
+  isExplicitlyUnread,
+  resetReadStateForTests,
+  seedReadState,
+} from "@/hooks/useUnseenConversations";
 
 // Minimal ApprovalCard stub: renders the message and an Accept button that
 // forwards to the page's submit handler. The real card's form/preview UX is
@@ -520,6 +524,49 @@ describe("InboxPage unread sessions", () => {
     fireEvent.click(within(item).getByRole("button", { name: /Mark as read/ }));
     await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
     expect(screen.getByText("Nothing waiting on you")).toBeInTheDocument();
+  });
+
+  it("clears an explicitly marked-unread session when opened from the inbox", async () => {
+    // WHY: a freshly mounted chat keeps an explicit "Mark as unread" override,
+    // so Open session must mark the session read itself or the row lingers.
+    const row = conversation({
+      id: "sess_flagged",
+      title: "Flagged Session",
+      status: "idle",
+      pending_elicitations_count: 0,
+    });
+    seedReadState([{ id: row.id, viewer_last_seen: row.updated_at - 1, viewer_unread: true }]);
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-unread");
+    fireEvent.click(within(item).getByRole("button", { name: /Flagged Session/ }));
+    fireEvent.click(within(item).getByRole("link", { name: /Open session/ }));
+
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+    expect(isExplicitlyUnread("sess_flagged")).toBe(false);
+  });
+
+  it("keeps the row usable when its preview fetch fails", async () => {
+    // WHY: a missing preview isn't a load failure — the row still renders
+    // without one, raises no error banner, and can be marked read.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.fetchSessionItemsPage).mockRejectedValue(new Error("boom"));
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-unread");
+    // The preview query retries once before settling into its error state.
+    await waitFor(() => expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(2), {
+      timeout: 3_000,
+    });
+    expect(item).toHaveTextContent("Unread Session");
+    expect(item).not.toHaveTextContent("—");
+    expect(screen.queryByTestId("inbox-load-error")).not.toBeInTheDocument();
+
+    fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
+    fireEvent.click(within(item).getByRole("button", { name: /Mark as read/ }));
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
   });
 });
 

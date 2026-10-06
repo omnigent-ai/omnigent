@@ -529,7 +529,7 @@ export function InboxPage() {
 /**
  * One session with unseen agent output: a compact row (kind, title, a
  * one-line preview of the latest reply) that expands to the fuller
- * preview plus "Mark as read" / "Open session".
+ * preview plus "Mark as read" / "Open session" — both mark the session read.
  */
 function UnreadInboxRow({
   item,
@@ -600,7 +600,13 @@ function UnreadInboxRow({
               Mark as read
             </Button>
             <Button asChild variant="outline" size="sm">
-              <Link to={`/c/${item.row.id}`} componentId="inbox.unread.open_session">
+              {/* Opening is reading. Mark it here: a freshly mounted chat keeps an
+                  explicit "Mark as unread" override, so it wouldn't clear this row. */}
+              <Link
+                to={`/c/${item.row.id}`}
+                onClick={onMarkRead}
+                componentId="inbox.unread.open_session"
+              >
                 Open session
                 <ArrowRightIcon className="ml-1 size-3.5" />
               </Link>

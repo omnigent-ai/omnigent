@@ -1,24 +1,7 @@
-"""E2E: a session's unseen agent reply surfaces in the Inbox until it's read.
+"""E2E: live agent replies appear in the Inbox as unread rows.
 
-Journey under test (the unread side of ``/inbox``):
-
-1. The viewer has ``/inbox`` open while an agent turn finishes in a session
-   they aren't looking at — the same condition that lights the sidebar's
-   unread dot.
-2. The Inbox lists the session as a "Done" row previewing the reply. The
-   "Awaiting response" tab hides it (it raised no approval); "Unread" shows it.
-3. "Mark as read" clears the row, and the selected tab survives a reload.
-4. A second reply brings the row back; "Open session" reads it, so it is gone
-   when the viewer returns.
-
-If this goes red, the likely regressions are:
-
-- ``collectUnreadInboxItems`` no longer agrees with the sidebar dot's
-  ``isConversationUnseen`` (the row never appears),
-- the preview fetch stopped reading the latest assistant item (no reply text),
-- the page stopped subscribing to read-state writes (Mark as read leaves the
-  row up until a reload), or
-- the filter preference stopped persisting (the reload lands on "All").
+Verifies the tabs filter them, the selected tab persists across reloads, and
+"Mark as read" and "Open session" both clear the row.
 """
 
 from __future__ import annotations
