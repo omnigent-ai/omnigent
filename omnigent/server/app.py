@@ -46,6 +46,7 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
+from omnigent.entities import Conversation
 from omnigent.errors import (
     ErrorCategory,
     ErrorCode,
@@ -2506,9 +2507,22 @@ def create_app(
             return host_registry.get(host_id) is not None
         return host_store.is_online(host_id)
 
-    # A host already registered here is online without a store round trip.
+    def _host_is_managed_sandbox(host_id: str) -> bool:
+        """
+        Return whether ``host_id`` is a server-provisioned sandbox, not a user's machine.
+
+        :param host_id: Host identifier from the session row.
+        :returns: ``True`` when the host row names a sandbox provider; ``False`` for
+            any other host, or when no ``host_store`` is wired (no sandboxes exist).
+        """
+        host = host_store.get_host(host_id) if host_store is not None else None
+        return host is not None and host.sandbox_provider is not None
+
+    # A host already registered here is online without a store round trip. A sandbox cannot
+    # wake on its own, so a silent drop on one keeps the normal grace.
     runner_drop_state.configure_host_probe(
-        lambda host_id: host_registry.get(host_id) is not None or _host_is_online(host_id)
+        lambda host_id: host_registry.get(host_id) is not None or _host_is_online(host_id),
+        is_managed=_host_is_managed_sandbox,
     )
 
     def _bulk_hosts_online(host_ids: list[str]) -> set[str]:
@@ -3328,38 +3342,53 @@ def create_app(
         if pending is not None and not pending.done():
             pending.cancel()
 
-    async def _await_disconnect_grace(runner_id: str) -> bool:
+    async def _await_disconnect_grace(runner_id: str, reference_stamp: int | None) -> bool:
         """Wait out a dropped runner's grace; return whether it re-registered here.
 
         A vanished runner gets the liveness lease (:data:`RUNNER_DISCONNECT_GRACE_S`).
         A runner whose tunnel went silent while its host is also offline (a laptop
-        asleep or off the network) usually returns on wake, so once the lease runs
-        out its wait extends to :data:`RUNNER_SILENT_DROP_GRACE_S`, measured from
-        the drop and ended early when the host returns without it
+        asleep or off the network) usually returns on wake, so when a bound session
+        is mid-turn the wait extends to :data:`RUNNER_SILENT_DROP_GRACE_S`, measured
+        from the drop. It ends early when the host returns without the runner or the
+        runner turns up on another replica
         (:func:`omnigent.server.runner_drop_state.hold_for_silent_drop`).
 
         :param runner_id: The disconnected runner's id.
+        :param reference_stamp: This replica's own last liveness stamp for
+            *runner_id*, the reference the cross-replica check compares against.
         :returns: ``True`` when the runner re-registered on this replica in time.
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
             RUNNER_SILENT_DROP_GRACE_S,
             RUNNER_SILENT_DROP_RECHECK_S,
+            _runner_live_on_another_replica_from_conversations,
+            _turn_at_stake,
         )
 
         drop = runner_drop_state.get(runner_id)
         since = drop.dropped_at if drop is not None else time.monotonic()
+
+        async def bound_sessions() -> list[Conversation]:
+            return await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
 
         async def runner_back(timeout_s: float) -> bool:
             return (
                 await tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s) is not None
             )
 
+        async def turn_at_stake() -> bool:
+            return any(_turn_at_stake(conv.id, conv) for conv in await bound_sessions())
+
         async def bound_host_ids() -> list[str]:
-            bound = await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
+            return sorted({conv.host_id for conv in await bound_sessions() if conv.host_id})
+
+        async def live_elsewhere() -> bool:
+            return _runner_live_on_another_replica_from_conversations(
+                await bound_sessions(), runner_id, reference_stamp
             )
-            return sorted({conv.host_id for conv in bound if conv.host_id is not None})
 
         def log_end(
             outcome: runner_drop_state.GraceOutcome, *, extended: bool, host_online: bool | None
@@ -3390,7 +3419,9 @@ def create_app(
                     grace_s=RUNNER_SILENT_DROP_GRACE_S,
                     recheck_s=RUNNER_SILENT_DROP_RECHECK_S,
                     wait_for_runner=runner_back,
+                    turn_at_stake=turn_at_stake,
                     bound_host_ids=bound_host_ids,
+                    runner_live_elsewhere=live_elsewhere,
                 )
         except asyncio.CancelledError:
             # A newer disconnect, a crash report, or app shutdown took over the long wait.
@@ -3402,7 +3433,7 @@ def create_app(
         if held is None:
             log_end("reconnected" if back else "expired", extended=False, host_online=None)
             return back
-        log_end(held.outcome, extended=held.extended, host_online=held.host_online)
+        log_end(held.outcome, extended=True, host_online=held.host_online)
         return held.outcome == "reconnected"
 
     async def _mark_disconnected_runner_failed(
@@ -3453,7 +3484,7 @@ def create_app(
         )
         from omnigent.server.schemas import ErrorDetail
 
-        reconnected = await _await_disconnect_grace(runner_id)
+        reconnected = await _await_disconnect_grace(runner_id, reference_stamp)
         if shutdown_state.server_shutting_down():
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",

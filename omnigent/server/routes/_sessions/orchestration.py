@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
 import time
@@ -7387,9 +7388,39 @@ async def _dispatch_session_event_to_runner_impl(
 # timer, and the liveness-driven sidebar agree on when a dropped runner is
 # gone; a crash is reported separately by the daemon and never waits this out.
 RUNNER_DISCONNECT_GRACE_S: float = float(RUNNER_LIVENESS_TTL_S)
+_SILENT_DROP_GRACE_ENV = "OMNIGENT_RUNNER_SILENT_DROP_GRACE_S"
+_DEFAULT_SILENT_DROP_GRACE_S = 900.0
+
+
+def _silent_drop_grace_from_env() -> float:
+    """Read the silent-drop grace from the environment.
+
+    :returns: Seconds from ``OMNIGENT_RUNNER_SILENT_DROP_GRACE_S`` (``0`` or less
+        turns the hold off), or the 15 minute default when unset or not a number.
+    """
+    raw = os.environ.get(_SILENT_DROP_GRACE_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_SILENT_DROP_GRACE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
+        _logger.warning(
+            "Ignoring %s=%r (not a number); using %.0fs",
+            _SILENT_DROP_GRACE_ENV,
+            raw,
+            _DEFAULT_SILENT_DROP_GRACE_S,
+        )
+        return _DEFAULT_SILENT_DROP_GRACE_S
+    return max(value, 0.0)
+
+
 # A runner whose tunnel went silent while its host is also offline is usually a laptop asleep
 # or off the network, which reconnects on wake. Hold its turn this long, measured from the drop.
-RUNNER_SILENT_DROP_GRACE_S: float = 900.0
+# Set OMNIGENT_RUNNER_SILENT_DROP_GRACE_S to change it; 0 turns the hold off, so every drop
+# gets the normal grace above.
+RUNNER_SILENT_DROP_GRACE_S: float = _silent_drop_grace_from_env()
 # How often that extended wait rechecks the host; a host back without its runner ends the wait.
 RUNNER_SILENT_DROP_RECHECK_S: float = 30.0
 # Delay between relay stream reconnect attempts inside the grace window.
@@ -7616,6 +7647,41 @@ def _drop_failure_attributes(
     return {"drop_kind": drop.kind} if drop is not None else None
 
 
+def _turn_at_stake(
+    session_id: str,
+    row: Conversation | _RelayStatusSnapshot | None,
+) -> bool:
+    """
+    Return whether losing the runner now would interrupt *session_id*'s turn.
+
+    Reads the status the disconnect decision does: the local cache, else the
+    saved row. A sub-agent mirrored from a native parent is never at stake, as
+    the parent's runtime drives its turn.
+
+    :param session_id: Session/conversation identifier.
+    :param row: The session's saved row or adoption snapshot, if known.
+    :returns: ``True`` when the session reads mid-turn and is not a parent-owned mirror.
+    """
+    live = _session_status_cache.get(session_id, row.live_status if row is not None else None)
+    return live in _MID_TURN_STATUSES and not _owned_by_parent_runtime(row)
+
+
+async def _relay_turn_at_stake(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> bool:
+    """Return whether this relay's session is mid-turn (see :func:`_turn_at_stake`)."""
+    row: Conversation | _RelayStatusSnapshot | None
+    try:
+        row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    except Exception:  # noqa: BLE001 - fall back to what the relay adopted
+        row = None
+    if row is None:
+        handle = _runner_relay_tasks.get(session_id)
+        row = handle.status_snapshot if handle is not None else None
+    return _turn_at_stake(session_id, row)
+
+
 async def _relay_host_id(
     session_id: str,
     conversation_store: ConversationStore,
@@ -7625,29 +7691,21 @@ async def _relay_host_id(
 
     A sub-agent shares its parent's runner but carries no host binding of its
     own, so the nearest host-bound ancestor answers. The host retained when the
-    relay adopted its binding is preferred; an unreadable binding reads as no host.
+    relay adopted its binding is preferred.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store used to read the binding and its ancestors.
-    :returns: The host id, or ``None`` when it cannot be resolved.
+    :returns: The host id, or ``None`` when no host is bound.
+    :raises Exception: When the binding cannot be read; the hold retries the lookup.
     """
     handle = _runner_relay_tasks.get(session_id)
     snapshot = handle.status_snapshot if handle is not None else None
     if snapshot is not None and snapshot.host_id is not None:
         return snapshot.host_id
-    try:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None:
-            return None
-        return await asyncio.to_thread(routing_host_id, conv, conversation_store)
-    except Exception:  # noqa: BLE001 - an unresolved host is treated as offline
-        _logger.warning(
-            "Relay: host lookup failed for session=%s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None:
         return None
+    return await asyncio.to_thread(routing_host_id, conv, conversation_store)
 
 
 async def _hold_relay_for_silent_drop(
@@ -7665,9 +7723,9 @@ async def _hold_relay_for_silent_drop(
 
     :param session_id: Session/conversation identifier.
     :param runner_client: HTTP client pointed at the runner.
-    :param conversation_store: Store used to resolve the session's host.
+    :param conversation_store: Store used to read the session, its host and its liveness.
     :param drop: How the runner's tunnel last ended, if it was noted.
-    :returns: How the grace ended, or ``None`` when the drop earns no extra grace.
+    :returns: How the hold ended, or ``None`` when the drop earns no extra grace.
     """
     wait = getattr(getattr(runner_client, "_transport", None), "wait_for_runner", None)
     if wait is None:
@@ -7682,7 +7740,9 @@ async def _hold_relay_for_silent_drop(
         grace_s=RUNNER_SILENT_DROP_GRACE_S,
         recheck_s=RUNNER_SILENT_DROP_RECHECK_S,
         wait_for_runner=wait,
+        turn_at_stake=lambda: _relay_turn_at_stake(session_id, conversation_store),
         bound_host_ids=bound_host_ids,
+        runner_live_elsewhere=lambda: _relay_runner_live_elsewhere(session_id, conversation_store),
     )
 
 
@@ -7703,10 +7763,11 @@ async def _relay_runner_stream(
     session. An intentional Stop exits quietly at once.
 
     A runner whose tunnel went silent while its host is also offline (a laptop
-    asleep or off the network) usually returns on wake, so it is given
-    :data:`RUNNER_SILENT_DROP_GRACE_S` from the drop instead
-    (:func:`_hold_relay_for_silent_drop`), ended early if its host returns without it.
-    The stream is then retried once more before the usual give-up.
+    asleep or off the network) usually returns on wake, so a mid-turn session is
+    held for :data:`RUNNER_SILENT_DROP_GRACE_S` from the drop instead
+    (:func:`_hold_relay_for_silent_drop`), ended early if its host returns without
+    the runner or the runner turns up on another replica. The stream is then retried
+    once more before the usual give-up.
 
     Past the grace the runner is genuinely gone — unless this server is the
     one shutting down (:func:`omnigent.server.shutdown_state.server_shutting_down`):
@@ -7791,7 +7852,6 @@ async def _relay_runner_stream(
                 if wait is None or await wait(deadline - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
-            held: runner_drop_state.SilentGraceEnd | None = None
             if (
                 not lost.intentional
                 and not silent_grace_spent
@@ -7815,7 +7875,7 @@ async def _relay_runner_stream(
                         host_online=None,
                     )
                     raise
-                if held is not None and held.extended:
+                if held is not None:
                     silent_grace_spent = True
                     runner_drop_state.log_grace_end(
                         path="relay",
@@ -7843,7 +7903,7 @@ async def _relay_runner_stream(
                     grace_s=RUNNER_DISCONNECT_GRACE_S,
                     waited_s=now - outage_started,
                     extended=False,
-                    host_online=held.host_online if held is not None else None,
+                    host_online=None,
                 )
             if lost.intentional:
                 decision = "intentional_stop"

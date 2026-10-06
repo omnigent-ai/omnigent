@@ -21,10 +21,12 @@ instead of Codex's automatic reviewer.
 | The user acts during an outage | The action applied exactly once when reachable, or refused at once with the input kept | Silently dropped or applied twice |
 
 A host that goes quiet without closing its sockets (sleep, a blackholed link)
-while its runner is also away is held past the 90 s grace, up to
+while its runner is also away holds a running turn past the 90 s grace, up to
 `RUNNER_SILENT_DROP_GRACE_S` (15 min) from the drop, since it usually returns
-on wake. The wait ends early when the host comes back without its runner. A
-runner that closes or resets its socket keeps the 90 s grace.
+on wake. The wait ends early when the host comes back without its runner or the
+runner turns up on another replica. A runner that closes or resets its socket,
+a managed sandbox host, and a session with no turn running keep the 90 s grace;
+`OMNIGENT_RUNNER_SILENT_DROP_GRACE_S=0` turns the longer wait off.
 
 The committed transcript, session status, approvals and the effect of each
 user action must end up the same as in an uninterrupted run. Live preview text

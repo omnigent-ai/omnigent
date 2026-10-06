@@ -16,17 +16,26 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeVar
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.debug_logging import debug_event
 
 _logger = logging.getLogger(__name__)
 
+_T = TypeVar("_T")
+_D = TypeVar("_D")
+
 DropKind = Literal["silent", "sudden"]
-GraceOutcome = Literal["reconnected", "host_back_runner_missing", "expired", "superseded"]
+GraceOutcome = Literal[
+    "reconnected", "host_back_runner_missing", "live_elsewhere", "expired", "superseded"
+]
 
 # Longer than any grace that reads a record; older ones belong to runners that never returned.
 _RETAIN_S = 3600.0
+# How long one host's liveness answer is reused, so the holds of a laptop's many sessions
+# recheck it together instead of once each.
+_PROBE_TTL_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -44,26 +53,31 @@ class RunnerDrop:
 
 @dataclass(frozen=True)
 class SilentGraceEnd:
-    """How a silently dropped runner's grace ended once the normal grace had run out.
+    """How a held silent drop ended once the normal grace had run out.
 
     :param outcome: ``"reconnected"`` when the runner re-registered,
-        ``"host_back_runner_missing"`` when its host returned without it, or
+        ``"host_back_runner_missing"`` when its host was back without it,
+        ``"live_elsewhere"`` when it re-registered on another replica, or
         ``"expired"`` when the grace ran out.
-    :param host_online: Whether the host was online when the grace ended.
-    :param extended: Whether the wait ran past the normal grace. ``False`` when
-        the host was already online, so the normal decision applies at once.
+    :param host_online: Whether the host was online when the hold ended.
     """
 
-    outcome: Literal["reconnected", "host_back_runner_missing", "expired"]
+    outcome: Literal["reconnected", "host_back_runner_missing", "live_elsewhere", "expired"]
     host_online: bool
-    extended: bool
 
 
 _lock = threading.Lock()
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
 _drops: dict[str, RunnerDrop] = {}
-# Blocking ``host_id -> online`` lookup wired by ``create_app``; ``None`` reads hosts as offline.
+# Host answers and the lookups in flight, keyed by (workspace_id, host_id) like the host registry.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by (workspace_id, host_id)
+_probe_cache: dict[tuple[int, str], tuple[float, bool]] = {}
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by (workspace_id, host_id)
+_probe_inflight: dict[tuple[int, str], asyncio.Future[bool]] = {}
+# Blocking ``host_id -> online`` and ``host_id -> managed sandbox`` lookups wired by
+# ``create_app``; unwired, every host reads as offline and none as managed.
 _host_online_probe: Callable[[str], bool] | None = None
+_host_managed_probe: Callable[[str], bool] | None = None
 
 
 def note(runner_id: str, kind: DropKind) -> RunnerDrop:
@@ -104,35 +118,110 @@ def clear(runner_id: str) -> None:
 
 
 def reset_for_tests() -> None:
-    """Drop every record (test isolation)."""
+    """Drop every record and cached host answer (test isolation)."""
     with _lock:
         _drops.clear()
+        _probe_cache.clear()
+        _probe_inflight.clear()
 
 
-def configure_host_probe(probe: Callable[[str], bool] | None) -> None:
-    """Wire (or clear) the cross-replica host liveness lookup.
+def configure_host_probe(
+    probe: Callable[[str], bool] | None,
+    *,
+    is_managed: Callable[[str], bool] | None = None,
+) -> None:
+    """Wire (or clear) the cross-replica host lookups.
 
     :param probe: Blocking ``host_id -> online`` check, run off the event loop.
         ``None`` reads every host as offline.
+    :param is_managed: Blocking ``host_id -> server-managed sandbox`` check, run
+        off the event loop. ``None`` reads every host as a machine that can wake.
     """
-    global _host_online_probe
+    global _host_online_probe, _host_managed_probe
     _host_online_probe = probe
+    _host_managed_probe = is_managed
 
 
-async def host_is_online(host_id: str | None) -> bool:
+async def host_is_online(host_id: str | None, *, timeout_s: float | None = None) -> bool:
     """Return whether *host_id* is live, counting an unresolvable host as offline.
 
+    Answers are reused for :data:`_PROBE_TTL_S`, and concurrent callers for one host
+    share a single lookup. A lookup that fails or outlives *timeout_s* reads as
+    offline and is not reused.
+
     :param host_id: Host bound to the runner, or ``None`` when it cannot be resolved.
+    :param timeout_s: Longest to wait for the lookup, e.g. the time left in a hold.
     :returns: ``True`` only when the probe confirms the host is online.
     """
     probe = _host_online_probe
     if host_id is None or probe is None:
         return False
+    key = (current_workspace_id(), host_id)
+    loop = asyncio.get_running_loop()
+    with _lock:
+        hit = _probe_cache.get(key)
+        if hit is not None and hit[0] > time.monotonic():
+            return hit[1]
+        shared = _probe_inflight.get(key)
+        owner = shared is None or shared.get_loop() is not loop
+        if owner:
+            shared = loop.create_future()
+            _probe_inflight[key] = shared
+    assert shared is not None
+    if not owner:
+        try:
+            return await asyncio.wait_for(asyncio.shield(shared), timeout_s)
+        except asyncio.TimeoutError:
+            return False
+    online = False
     try:
-        return bool(await asyncio.to_thread(probe, host_id))
+        online = bool(await asyncio.wait_for(asyncio.to_thread(probe, host_id), timeout_s))
+        with _lock:
+            _probe_cache[key] = (time.monotonic() + _PROBE_TTL_S, online)
+    except asyncio.TimeoutError:
+        _logger.warning("Host liveness check for host=%s outlived the hold", host_id)
     except Exception:  # noqa: BLE001 - an unreadable host row must not fail a turn early
         _logger.warning("Host liveness check failed for host=%s", host_id, exc_info=True)
+    finally:
+        with _lock:
+            if _probe_inflight.get(key) is shared:
+                del _probe_inflight[key]
+        if not shared.done():
+            shared.set_result(online)
+    return online
+
+
+async def host_is_managed(host_id: str | None, *, timeout_s: float | None = None) -> bool:
+    """Return whether *host_id* is a server-managed sandbox, which cannot wake on its own.
+
+    A lookup that fails reads as managed: a host that cannot be confirmed to be a
+    laptop is not held for.
+
+    :param host_id: Host bound to the runner, or ``None`` when it cannot be resolved.
+    :param timeout_s: Longest to wait for the lookup.
+    :returns: ``True`` for a managed sandbox host.
+    """
+    probe = _host_managed_probe
+    if host_id is None or probe is None:
         return False
+    try:
+        return bool(await asyncio.wait_for(asyncio.to_thread(probe, host_id), timeout_s))
+    except Exception:  # noqa: BLE001 - unknown eligibility keeps the normal grace
+        _logger.warning("Managed-host check failed for host=%s", host_id, exc_info=True)
+        return True
+
+
+async def _bounded(
+    call: Callable[[], Awaitable[_T]], default: _D, *, deadline: float, what: str
+) -> _T | _D:
+    """Await *call* inside the hold window; a slow or failing lookup yields *default*."""
+    try:
+        return await asyncio.wait_for(call(), max(deadline - time.monotonic(), 0.0))
+    except asyncio.TimeoutError:
+        _logger.warning("Silent-drop %s outlived the hold window", what)
+    except Exception:  # noqa: BLE001 - a failed lookup must not fail the turn early
+        _logger.warning("Silent-drop %s failed", what, exc_info=True)
+    return default
 
 
 async def hold_for_silent_drop(
@@ -141,54 +230,73 @@ async def hold_for_silent_drop(
     grace_s: float,
     recheck_s: float,
     wait_for_runner: Callable[[float], Awaitable[bool]],
+    turn_at_stake: Callable[[], Awaitable[bool]],
     bound_host_ids: Callable[[], Awaitable[Sequence[str]]],
+    runner_live_elsewhere: Callable[[], Awaitable[bool]],
 ) -> SilentGraceEnd | None:
     """Keep a silently dropped runner's turn open while its host is also away.
 
     Called once the normal grace has run out. Applies only to a silent drop that
-    is not past *grace_s* and whose runner is still absent. If its host is online
-    the normal decision stands; otherwise (an unresolvable host counts as offline)
-    it waits, event-driven, for the runner to re-register, rechecking the host every
-    *recheck_s*. A host that returns without its runner gets one more recheck before
-    the wait ends: a host that woke without its runner means the runner is gone.
+    is not past *grace_s* (``0`` turns the hold off), whose runner is still absent
+    and not live on another replica, that has a mid-turn session to lose, and
+    whose host is not a managed sandbox. An unresolvable host counts as offline; a
+    failed host lookup is retried at each recheck.
+
+    It then waits, event-driven, for the runner to re-register, rechecking the host
+    every *recheck_s*. A host that is back, including one already online when the
+    normal grace ended, gets one more recheck for its runner to follow: a host that
+    woke without its runner means the runner is gone.
 
     :param drop: The runner's last drop record.
     :param grace_s: Total silent-drop grace, measured from the drop.
     :param recheck_s: Seconds between host rechecks.
     :param wait_for_runner: Waits up to the given seconds for the runner to
         re-register; ``True`` when it is registered. ``0`` checks without waiting.
+    :param turn_at_stake: Whether a bound session is mid-turn and worth holding for.
     :param bound_host_ids: Resolves the host(s) the runner's sessions are bound to.
-    :returns: How the grace ended, or ``None`` when this drop earns no extra grace
-        and its host was not consulted.
+    :param runner_live_elsewhere: Whether another replica now holds the runner.
+    :returns: How the hold ended, or ``None`` when this drop earns no extra grace.
     """
-    if drop is None or drop.kind != "silent":
+    if drop is None or drop.kind != "silent" or grace_s <= 0:
         return None
-    remaining = grace_s - (time.monotonic() - drop.dropped_at)
+    deadline = drop.dropped_at + grace_s
     # A registered runner has not dropped; its stream failed for another reason.
-    if remaining <= 0 or await wait_for_runner(0.0):
+    if deadline <= time.monotonic() or await wait_for_runner(0.0):
         return None
-    try:
-        host_ids = await bound_host_ids()
-    except Exception:  # noqa: BLE001 - an unresolved host is treated as offline
-        _logger.warning("Could not resolve the host of a silently dropped runner", exc_info=True)
-        host_ids = ()
+    if not await _bounded(turn_at_stake, False, deadline=deadline, what="turn check"):
+        _logger.info("Silent drop not held: no mid-turn session is bound to the runner")
+        return None
+    if await _bounded(runner_live_elsewhere, False, deadline=deadline, what="liveness check"):
+        _logger.info("Silent drop not held: the runner is live on another replica")
+        return None
+    host_ids = await _bounded(bound_host_ids, None, deadline=deadline, what="host lookup")
+    if host_ids is not None:
+        left = deadline - time.monotonic()
+        if any([await host_is_managed(host_id, timeout_s=left) for host_id in host_ids]):
+            _logger.info("Silent drop not held: the host is a managed sandbox")
+            return None
 
     async def host_up() -> bool:
-        return any([await host_is_online(host_id) for host_id in host_ids])
+        nonlocal host_ids
+        if host_ids is None:
+            host_ids = await _bounded(bound_host_ids, None, deadline=deadline, what="host lookup")
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        return any([await host_is_online(host_id, timeout_s=left) for host_id in host_ids or ()])
 
-    if await host_up():
-        return SilentGraceEnd("expired", host_online=True, extended=False)
-    deadline = time.monotonic() + remaining
-    host_back = False
+    host_back = await host_up()
     while True:
         left = deadline - time.monotonic()
         if left <= 0:
-            return SilentGraceEnd("expired", host_online=host_back, extended=True)
+            return SilentGraceEnd("expired", host_online=host_back)
         if await wait_for_runner(min(max(recheck_s, 0.01), left)):
-            return SilentGraceEnd("reconnected", host_online=host_back, extended=True)
+            return SilentGraceEnd("reconnected", host_online=host_back)
+        if await _bounded(runner_live_elsewhere, False, deadline=deadline, what="liveness check"):
+            return SilentGraceEnd("live_elsewhere", host_online=host_back)
         was_back, host_back = host_back, await host_up()
         if was_back and host_back:
-            return SilentGraceEnd("host_back_runner_missing", host_online=True, extended=True)
+            return SilentGraceEnd("host_back_runner_missing", host_online=True)
 
 
 def log_grace_end(

@@ -74,21 +74,35 @@ both ends.
 - `runner_disconnect_grace`: one row when a disconnect grace ends, from the
   per-runner timer (`path = timer`) and from a session's relay
   (`path = relay`, with `session_id`). A `sudden` drop keeps the normal grace
-  (`RUNNER_DISCONNECT_GRACE_S`, 90 s). A `silent` drop whose host is also
-  offline (or cannot be resolved) is held up to `RUNNER_SILENT_DROP_GRACE_S`
-  (15 min) from the drop, because a sleeping laptop usually reconnects on wake.
-  The host is rechecked every `RUNNER_SILENT_DROP_RECHECK_S` (30 s); a host
-  that is back without its runner ends the wait one recheck later. Fields:
-  `drop_kind`, `host_online` (`True` or `False` once the host was checked,
-  absent otherwise), `grace_s` (the grace that applied: 900 once `extended`),
+  (`RUNNER_DISCONNECT_GRACE_S`, 90 s). A `silent` drop is held past it, up to
+  `RUNNER_SILENT_DROP_GRACE_S` (15 min) from the drop, because a sleeping
+  laptop usually reconnects on wake, when all of these hold:
+  - a bound session is mid-turn (the relay reads its own session's status the
+    way the disconnect decision does; the timer needs one of the runner's
+    sessions) and is not a sub-agent mirrored from a native parent, whose turn
+    the parent's runtime owns;
+  - the runner is not registered or live on another replica;
+  - its host is not a managed sandbox, which cannot wake on its own;
+  - the hold is not turned off: `OMNIGENT_RUNNER_SILENT_DROP_GRACE_S` sets the
+    seconds (default 900) and `0` restores the plain 90 s grace for every drop.
+  Otherwise the row reads `extended = False`. The host, resolved from the bound
+  sessions (an unresolvable host counts as offline, and a failed lookup is
+  retried at each recheck), is rechecked every `RUNNER_SILENT_DROP_RECHECK_S`
+  (30 s), reusing one answer per host for 10 s. A host that is online, including
+  one already online when the normal grace ends, gets one recheck for its
+  runner to follow; then the usual give-up runs. Fields: `drop_kind`,
+  `host_online` (`True` or `False` once the host was checked, absent
+  otherwise), `grace_s` (the grace that applied: 900 once `extended`),
   `extended`, `waited_s` (from the drop to the end of the grace) and `outcome`:
   `reconnected` (the runner re-registered), `host_back_runner_missing` (the
-  host returned without it), `expired` (the grace ran out) or `superseded` (a
-  newer disconnect, a crash report or a relay rebind cancelled an extended
-  wait). After a relay's extended wait the stream is retried once more before
-  the usual give-up, so an `expired` or `host_back_runner_missing` row is
-  followed by `runner_stream_disconnected` and `session_turn_failed`. The
-  relay emits no row for a reconnect inside the normal grace; the timer does.
+  host was back without it), `live_elsewhere` (it re-registered on another
+  replica, so the usual live-elsewhere branch lets go of the session without
+  failing it), `expired` (the grace ran out) or `superseded` (a newer
+  disconnect, a crash report or a relay rebind cancelled an extended wait).
+  After a relay's extended wait the stream is retried once more before the
+  usual give-up, so an `expired` or `host_back_runner_missing` row is followed
+  by `runner_stream_disconnected` and `session_turn_failed`. The relay emits no
+  row for a reconnect inside the normal grace; the timer does.
 - `runner_disconnect_decision`: a warning explaining the status check in the
   relay (`origin = runner_disconnected_mid_turn`) or offline sweep
   (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
@@ -216,7 +230,9 @@ then thaw them a few minutes later. `runner_tunnel` should show
 `runner_disconnect_grace` should end `reconnected` with `extended = True`.
 With the host left offline for the whole 15 minutes the turn fails with
 `outcome = expired`; a runner killed instead of frozen closes its socket
-(`drop_kind = sudden`) and fails on the 90 s grace.
+(`drop_kind = sudden`) and fails on the 90 s grace. Start the server with
+`OMNIGENT_RUNNER_SILENT_DROP_GRACE_S=0` and repeat: the freeze must fail the
+turn after 90 s like a killed runner.
 
 For idle-child handling, let a Claude subsession become idle, then stop its
 host without using the session's Stop action. After the disconnect grace,

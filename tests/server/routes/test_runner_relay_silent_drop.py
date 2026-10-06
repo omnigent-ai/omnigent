@@ -15,6 +15,7 @@ import pytest
 from omnigent.runtime import session_stream
 from omnigent.server import runner_drop_state, shutdown_state
 from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes._sessions.common import _ACP_SUBAGENT_ID_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.budgets import budget
 
@@ -81,10 +82,10 @@ class _RelayCase:
     transport: _TunnelLikeTransport
     host_online: threading.Event
 
-    def start(self) -> asyncio.Task[None]:
+    def start(self, session_id: str | None = None) -> asyncio.Task[None]:
         return asyncio.create_task(
             orchestration._relay_runner_stream(
-                self.session_id, self.client, self.store, runner_id=_RUNNER_ID
+                session_id or self.session_id, self.client, self.store, runner_id=_RUNNER_ID
             )
         )
 
@@ -111,6 +112,8 @@ async def relay_case(
     monkeypatch.setattr(
         runner_drop_state, "_host_online_probe", lambda _host_id: host_online.is_set()
     )
+    monkeypatch.setattr(runner_drop_state, "_host_managed_probe", None)
+    monkeypatch.setattr(runner_drop_state, "_PROBE_TTL_S", 0.0)
     store = SqlAlchemyConversationStore(db_uri)
     conversation = store.create_conversation(runner_id=_RUNNER_ID)
     store.set_host_id(conversation.id, _HOST_ID, workspace="/tmp/relay-silent-drop")
@@ -241,21 +244,47 @@ async def test_sudden_or_unrecorded_drop_keeps_the_normal_grace(
     assert failed.attributes.get("drop_kind") == recorded
 
 
-async def test_silent_drop_with_the_host_online_keeps_the_normal_grace(
+async def test_silent_drop_with_the_host_already_online_gets_one_recheck(
     relay_case: _RelayCase, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A host that woke a moment ago gives its runner one more recheck, then the give-up."""
     monkeypatch.setattr(orchestration, "RUNNER_SILENT_DROP_GRACE_S", 60.0)
+    monkeypatch.setattr(orchestration, "RUNNER_SILENT_DROP_RECHECK_S", 0.2)
     relay_case.host_online.set()
     runner_drop_state.note(_RUNNER_ID, "silent")
+    task = relay_case.start()
+    await asyncio.wait_for(relay_case.transport.extension_waiting.wait(), budget(5.0))
+    assert not task.done(), "the host being online must not end the wait at once"
 
-    await asyncio.wait_for(relay_case.start(), budget(5.0))
+    await asyncio.wait_for(task, budget(5.0))
 
     assert relay_case.status() == "failed"
     (grace,) = _rows(caplog, "runner_disconnect_grace")
-    assert grace.attributes["outcome"] == "expired"
-    assert grace.attributes["extended"] is False
+    assert grace.attributes["outcome"] == "host_back_runner_missing"
+    assert grace.attributes["extended"] is True
     assert grace.attributes["host_online"] is True
     assert grace.attributes["drop_kind"] == "silent"
+    assert 0.2 in relay_case.transport.waits, "the runner was given a full recheck interval"
+
+
+async def test_a_runner_following_an_already_online_host_resumes_the_stream(
+    relay_case: _RelayCase, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestration, "RUNNER_SILENT_DROP_GRACE_S", 60.0)
+    monkeypatch.setattr(orchestration, "RUNNER_SILENT_DROP_RECHECK_S", 5.0)
+    relay_case.host_online.set()
+    runner_drop_state.note(_RUNNER_ID, "silent")
+    task = relay_case.start()
+    await asyncio.wait_for(relay_case.transport.extension_waiting.wait(), budget(5.0))
+
+    runner_drop_state.clear(_RUNNER_ID)
+    relay_case.transport.register()
+    await asyncio.wait_for(task, budget(5.0))
+
+    assert relay_case.status() == "idle"
+    (grace,) = _rows(caplog, "runner_disconnect_grace")
+    assert grace.attributes["outcome"] == "reconnected"
+    assert grace.attributes["host_online"] is True
 
 
 async def test_a_registered_runner_whose_stream_errors_is_not_held(
@@ -351,13 +380,167 @@ async def test_a_sub_agent_relay_resolves_the_host_of_its_parent(
     assert await orchestration._relay_host_id(relay_case.session_id, relay_case.store) == _HOST_ID
 
 
-async def test_an_unreadable_or_unbound_session_has_no_host(relay_case: _RelayCase) -> None:
+async def test_an_unbound_session_has_no_host_and_an_unreadable_one_raises(
+    relay_case: _RelayCase,
+) -> None:
     unbound = relay_case.store.create_conversation()
     assert await orchestration._relay_host_id(unbound.id, relay_case.store) is None
-    assert await orchestration._relay_host_id("missing-session", relay_case.store) is None
+    assert (
+        await orchestration._relay_host_id("0123456789abcdef0123456789abcdef", relay_case.store)
+        is None
+    )
 
     class _BrokenStore:
         def get_conversation(self, _session_id: str) -> None:
             raise RuntimeError("database unavailable")
 
-    assert await orchestration._relay_host_id(relay_case.session_id, _BrokenStore()) is None  # type: ignore[arg-type]
+    # The hold treats a failed lookup as an unresolved host and retries it at each recheck.
+    with pytest.raises(RuntimeError):
+        await orchestration._relay_host_id(relay_case.session_id, _BrokenStore())  # type: ignore[arg-type]
+
+
+# ── what is worth holding for ───────────────────────────────────────────────
+
+
+async def test_an_idle_session_is_not_held(
+    relay_case: _RelayCase, caplog: pytest.LogCaptureFixture
+) -> None:
+    orchestration._session_status_cache[relay_case.session_id] = "idle"
+    runner_drop_state.note(_RUNNER_ID, "silent")
+
+    await asyncio.wait_for(relay_case.start(), budget(5.0))
+
+    assert relay_case.status() == "idle"
+    assert relay_case.last_error_code() is None
+    assert relay_case.transport.extension_started.is_set(), "the drop was weighed"
+    assert not relay_case.transport.extension_waiting.is_set(), "but never waited on"
+    (grace,) = _rows(caplog, "runner_disconnect_grace")
+    assert grace.attributes["extended"] is False
+    (gave_up,) = _rows(caplog, "runner_stream_disconnected")
+    assert gave_up.attributes["decision"] == "idle_no_failure"
+
+
+async def test_a_cold_cache_is_read_from_the_saved_row(relay_case: _RelayCase) -> None:
+    """Without a live edge the relay holds on what the disconnect decision would read."""
+    orchestration._session_status_cache.pop(relay_case.session_id, None)
+    relay_case.store.set_session_live_status(relay_case.session_id, "running")
+    runner_drop_state.note(_RUNNER_ID, "silent")
+    task = relay_case.start()
+    await asyncio.wait_for(relay_case.transport.extension_waiting.wait(), budget(5.0))
+    assert not task.done()
+
+    runner_drop_state.clear(_RUNNER_ID)
+    relay_case.transport.register()
+    await asyncio.wait_for(task, budget(5.0))
+    assert relay_case.last_error_code() is None
+
+
+async def test_a_parent_owned_mirror_is_not_held(
+    relay_case: _RelayCase, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A native parent's runtime drives a mirrored sub-agent's turn, so nothing is lost here."""
+    mirror = relay_case.store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=relay_case.session_id,
+        runner_id=_RUNNER_ID,
+        labels={_ACP_SUBAGENT_ID_LABEL_KEY: "acp-subagent-1"},
+    )
+    relay_case.store.set_session_live_status(mirror.id, "running")
+    runner_drop_state.note(_RUNNER_ID, "silent")
+    try:
+        await asyncio.wait_for(relay_case.start(mirror.id), budget(5.0))
+    finally:
+        orchestration._session_status_cache.pop(mirror.id, None)
+
+    assert relay_case.transport.extension_started.is_set()
+    assert not relay_case.transport.extension_waiting.is_set()
+    (decision,) = _rows(caplog, "runner_disconnect_decision")
+    assert decision.attributes["decision"] == "subagent_unobserved"
+    (grace,) = _rows(caplog, "runner_disconnect_grace")
+    assert grace.attributes["extended"] is False
+    assert not _rows(caplog, "session_turn_failed")
+
+
+async def test_a_managed_sandbox_host_is_not_held(
+    relay_case: _RelayCase, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sandbox cannot wake on its own, so a silent drop there keeps the normal grace."""
+    monkeypatch.setattr(
+        runner_drop_state, "_host_managed_probe", lambda host_id: host_id == _HOST_ID
+    )
+    runner_drop_state.note(_RUNNER_ID, "silent")
+
+    await asyncio.wait_for(relay_case.start(), budget(5.0))
+
+    assert relay_case.status() == "failed"
+    assert not relay_case.transport.extension_waiting.is_set()
+    (grace,) = _rows(caplog, "runner_disconnect_grace")
+    assert grace.attributes["extended"] is False
+    assert grace.attributes["drop_kind"] == "silent"
+
+
+async def test_a_zero_silent_grace_turns_the_hold_off(
+    relay_case: _RelayCase, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestration, "RUNNER_SILENT_DROP_GRACE_S", 0.0)
+    runner_drop_state.note(_RUNNER_ID, "silent")
+
+    await asyncio.wait_for(relay_case.start(), budget(5.0))
+
+    assert relay_case.status() == "failed"
+    assert 0.0 not in relay_case.transport.waits, "nothing about the silent drop is consulted"
+    (grace,) = _rows(caplog, "runner_disconnect_grace")
+    assert grace.attributes["extended"] is False
+    assert grace.attributes["grace_s"] == _NORMAL_GRACE_S
+
+
+async def test_a_runner_live_on_another_replica_ends_the_hold_without_failing_the_turn(
+    relay_case: _RelayCase, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestration, "RUNNER_SILENT_DROP_GRACE_S", 60.0)
+    runner_drop_state.note(_RUNNER_ID, "silent")
+    task = relay_case.start()
+    await asyncio.wait_for(relay_case.transport.extension_waiting.wait(), budget(5.0))
+    assert not task.done()
+
+    # The runner re-tunnels to another replica, which stamps the shared row.
+    relay_case.store.touch_runner_liveness([_RUNNER_ID], int(time.time()) + 5)
+    await asyncio.wait_for(task, budget(5.0))
+
+    (grace,) = _rows(caplog, "runner_disconnect_grace")
+    assert grace.attributes["outcome"] == "live_elsewhere"
+    assert grace.attributes["extended"] is True
+    (gave_up,) = _rows(caplog, "runner_stream_disconnected")
+    assert gave_up.attributes["decision"] == "live_elsewhere"
+    assert not _rows(caplog, "session_turn_failed")
+    assert relay_case.last_error_code() is None
+    assert relay_case.status() is None, "this replica let go of the session"
+
+
+# ── configuration ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 900.0),
+        ("", 900.0),
+        ("   ", 900.0),
+        ("120", 120.0),
+        ("45.5", 45.5),
+        ("0", 0.0),
+        ("-30", 0.0),
+        ("soon", 900.0),
+        ("nan", 900.0),
+        ("inf", 900.0),
+    ],
+)
+def test_silent_drop_grace_comes_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: float
+) -> None:
+    name = "OMNIGENT_RUNNER_SILENT_DROP_GRACE_S"
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+    assert orchestration._silent_drop_grace_from_env() == expected
