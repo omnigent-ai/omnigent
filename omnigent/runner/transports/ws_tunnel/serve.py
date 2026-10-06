@@ -975,9 +975,7 @@ async def _serve_tunnel_once(
         diagnostics.settings.update(
             protocol_ping_interval_s=getattr(ws, "ping_interval", None),
             protocol_ping_timeout_s=getattr(ws, "ping_timeout", None),
-            protocol_keepalive_source=(
-                "websockets_connection" if hasattr(ws, "ping_interval") else "unavailable"
-            ),
+            protocol_keepalive_source="websockets_connection",
         )
 
         async def send_text(data: str) -> None:

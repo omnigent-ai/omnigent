@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 
 import pytest
 
+from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     ResponseHeadFrame,
@@ -348,6 +350,12 @@ async def test_send_text_enqueues_on_outbound_queue() -> None:
 async def test_send_diagnostics_follow_owner_loop_and_connection_generation() -> None:
     registry = TunnelRegistry()
     first = registry.register("r1", _NoopWS(), _hello())
+    owner_thread = threading.get_ident()
+    owner_now = 102.0
+    # The caller requests at 100; handoff reaches the socket loop at 102.
+    first.diagnostics = TunnelDiagnostics(
+        clock=lambda: owner_now if threading.get_ident() == owner_thread else 100.0
+    )
     await asyncio.to_thread(
         lambda: asyncio.run(registry.send_text(first, "heartbeat", app_ping_ts=123))
     )
@@ -355,17 +363,21 @@ async def test_send_diagnostics_follow_owner_loop_and_connection_generation() ->
     assert queued is not None
     assert queued.data == "heartbeat"
     assert queued.app_ping_ts == 123
+    assert queued.queued_at == 102.0
     snapshot = first.diagnostics.snapshot()
     assert snapshot["app_pings_queued"] == 1
     assert snapshot["outbound_queue_depth"] == 1
-    assert snapshot["enqueue_delay_s"] >= 0
+    assert snapshot["enqueue_delay_s"] == 2.0
+    owner_now = 107.0
+    first.diagnostics.dequeued(queued)
+    assert first.diagnostics.snapshot()["queue_wait_s"] == 5.0
 
     second = registry.register("r1", _NoopWS(), _hello())
     with pytest.raises(ConnectionError, match="replaced"):
         await registry.send_text(first, "stale", app_ping_ts=456)
     assert second.diagnostics.snapshot()["app_pings_queued"] == 0
     assert second.diagnostics.snapshot()["last_app_ping_queued_age_s"] is None
-    assert first.diagnostics.snapshot()["app_pings_queued"] == 1
+    assert first.diagnostics.snapshot()["app_pings_queued"] == 0
 
 
 @pytest.mark.asyncio

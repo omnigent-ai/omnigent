@@ -148,6 +148,10 @@ class TunnelDiagnostics:
         self._frozen: TunnelDiagnosticAttrs | None = None
         self._frozen_at = 0.0
 
+    def timestamp(self) -> float:
+        """Read this connection's monotonic clock for queue timing."""
+        return self._clock()
+
     @contextlib.asynccontextmanager
     async def monitoring(self, report: Callable[[], None]) -> AsyncIterator[None]:
         """Sample scheduling delays and report slow operations at most once/minute."""
@@ -157,10 +161,13 @@ class TunnelDiagnostics:
         try:
             yield
         finally:
-            self.freeze()
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            self._report = None
+            try:
+                self.freeze()
+            finally:
+                task.cancel()
+                self._loop_due_at = None
+                self._report = None
+                await asyncio.gather(task, return_exceptions=True)
 
     async def _monitor(self) -> None:
         try:

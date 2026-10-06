@@ -107,6 +107,8 @@ async def test_monitor_failure_is_logged_without_interrupting_sends(
 
     diagnostics = TunnelDiagnostics(clock=clock)
     async with diagnostics.monitoring(lambda: None):
+        now += 8
+        assert diagnostics.snapshot()["loop_lag_max_s"] == 3.0
         fail_clock = True
         await asyncio.wait_for(failed.wait(), timeout=budget(1))
         records = [r for r in caplog.records if r.message == "Tunnel diagnostics monitor failed"]
@@ -121,23 +123,22 @@ async def test_monitor_failure_is_logged_without_interrupting_sends(
     assert diagnostics.snapshot()["sends_in_flight"] == 0
 
 
-async def test_pending_lag_snapshots_do_not_change_sample_history() -> None:
+async def test_loop_lag_sample_age_is_preserved_across_snapshots() -> None:
     clock = _Clock()
     diagnostics = TunnelDiagnostics(clock=clock)
-    async with diagnostics.monitoring(lambda: None):
+    sampled = asyncio.Event()
+    async with diagnostics.monitoring(sampled.set):
         clock.advance(8)
         assert diagnostics.snapshot()["loop_lag_max_s"] == 3.0
         clock.advance(1)
         assert diagnostics.snapshot()["loop_lag_max_s"] == 4.0
-        assert diagnostics._loop_lag.max_s is None
-
-        async with asyncio.timeout(budget(1)):
-            while diagnostics._loop_lag.max_s is None:
-                await asyncio.sleep(0)
+        await asyncio.wait_for(sampled.wait(), timeout=budget(1))
         clock.advance(2)
         snapshot = diagnostics.snapshot()
         assert snapshot["loop_lag_max_s"] == 4.0
         assert snapshot["loop_lag_max_age_s"] == 2.0
+        clock.advance(1)
+        assert diagnostics.snapshot()["loop_lag_max_age_s"] == 3.0
 
 
 async def test_queue_handoff_send_and_ping_rtt_are_separate_timings() -> None:

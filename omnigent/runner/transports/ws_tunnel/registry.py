@@ -741,7 +741,7 @@ class TunnelRegistry:
         :raises ConnectionError: If ``session`` is no longer the
             registry's current generation for its runner id.
         """
-        requested_at = time.monotonic()
+        requested_at = session.diagnostics.timestamp()
         ack: concurrent.futures.Future[None] = concurrent.futures.Future()
 
         def _enqueue() -> None:
@@ -752,7 +752,7 @@ class TunnelRegistry:
                     error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
                 else:
                     frame = OutboundFrame(
-                        data, queued_at=time.monotonic(), app_ping_ts=app_ping_ts
+                        data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
                     )
                     session.outbound_queue.put_nowait(frame)
                     session.diagnostics.enqueued(

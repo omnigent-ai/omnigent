@@ -704,9 +704,11 @@ async def test_serve_tunnel_replaces_rejected_host_bootstrap_token(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("keepalive", [(17.0, 41.0), (None, None)], ids=["enabled", "disabled"])
 async def test_serve_tunnel_once_sends_bearer_header(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    keepalive: tuple[float | None, float | None],
 ) -> None:
     """Authenticated remote tunnels pass the bearer on the WS handshake.
 
@@ -737,8 +739,7 @@ async def test_serve_tunnel_once_sends_bearer_header(
         """WebSocket stub that accepts hello then closes the connection."""
 
         # Deliberately differ from the requested defaults: read the connection.
-        ping_interval = 17.0
-        ping_timeout = 41.0
+        ping_interval, ping_timeout = keepalive
         # What a real connection retains after the peer's clean 1001 close.
         close_code = 1001
         close_reason = "server shutdown"
@@ -836,8 +837,8 @@ async def test_serve_tunnel_once_sends_bearer_header(
     assert attributes["pid"] == os.getpid()
     assert attributes["downtime_s"] is None
     assert attributes["protocol_keepalive_source"] == "websockets_connection"
-    assert attributes["protocol_ping_interval_s"] == 17.0
-    assert attributes["protocol_ping_timeout_s"] == 41.0
+    assert attributes["protocol_ping_interval_s"] == keepalive[0]
+    assert attributes["protocol_ping_timeout_s"] == keepalive[1]
     assert attributes["last_sent_frame_age_s"] >= 0
     sent = captured["sent"]
     assert isinstance(sent, str)
