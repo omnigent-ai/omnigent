@@ -170,6 +170,10 @@ _STREAM_READ_CHUNK_SIZE = 65536
 # home starts with no memories and past-conversation context is lost. The ``_1``
 # suffix is Codex's schema version — update if Codex migrates to a newer schema.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json", ".credentials.json", "memories_1.sqlite")
+# Bridged as hard links instead: Codex rewrites its OAuth store in place through
+# an ``O_NOFOLLOW`` open, which fails on a symlink (ELOOP). A hard link shares the
+# inode, so refreshes still reach the real home.
+_CODEX_HOME_HARDLINK_FILES = frozenset({".credentials.json"})
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 # Name of the hooks file inside a CODEX_HOME. Symlinked from the user's home
 # by default; generated as a merged regular file when subagent routing is on.
@@ -1160,17 +1164,23 @@ def _populate_codex_home_config(
         # home would either shadow it or (worse) be written through.
         symlink_files = tuple(name for name in symlink_files if name != _CODEX_HOOKS_FILENAME)
     for filename in symlink_files:
+        link_path = target_dir / filename
+        if filename in _CODEX_HOME_HARDLINK_FILES and link_path.is_symlink():
+            # A home reused from before hard-linking still holds the symlink.
+            link_path.unlink()
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
-        link_path = target_dir / filename
         if link_path.exists() or link_path.is_symlink():
             continue
         try:
-            link_path.symlink_to(source_file)
+            if filename in _CODEX_HOME_HARDLINK_FILES:
+                os.link(source_file, link_path)
+            else:
+                link_path.symlink_to(source_file)
         except OSError as exc:
             logger.warning(
-                "could not symlink %r into %s (%s); copying instead",
+                "could not link %r into %s (%s); copying instead",
                 filename,
                 target_dir,
                 exc,

@@ -3699,13 +3699,14 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
-def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) -> None:
-    """``.credentials.json`` and its lock dir are symlinked, not left behind.
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="requires O_NOFOLLOW")
+def test_populate_codex_home_config_hard_links_remote_mcp_oauth(tmp_path: Path) -> None:
+    """``.credentials.json`` is hard-linked and its lock dir symlinked.
 
     Codex keeps OAuth tokens for remote (``url =``) MCP servers in
-    ``.credentials.json``, guarded across processes by
-    ``mcp-oauth-locks/``. A private home missing them starts those servers
-    unauthenticated while ``command =`` (stdio) servers still work.
+    ``.credentials.json``, guarded across processes by ``mcp-oauth-locks/``,
+    and rewrites it through an ``O_NOFOLLOW`` open that fails on a symlink
+    with ELOOP, so those servers never start.
     """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
@@ -3720,11 +3721,36 @@ def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) ->
 
     _populate_codex_home_config(target, source)
 
-    # Symlinked (not copied) so a refresh in either direction is shared.
-    assert (target / ".credentials.json").is_symlink()
-    assert (target / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert bridged.samefile(source / ".credentials.json")
+    # Codex's in-place rewrite succeeds and the refresh reaches the real home.
+    fd = os.open(bridged, os.O_WRONLY | os.O_NOFOLLOW)
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, b'{"linear|abc": {"access_token": "t2"}}')
+    finally:
+        os.close(fd)
+    assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t2"}}'
     assert (target / "mcp-oauth-locks").is_symlink()
     assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
+
+
+def test_populate_codex_home_config_replaces_legacy_credentials_symlink(tmp_path: Path) -> None:
+    """A native session home reused from before hard-linking drops its symlink."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "reused_codex_home"
+    target.mkdir()
+    (target / ".credentials.json").symlink_to(source / ".credentials.json")
+
+    _populate_codex_home_config(target, source)
+
+    assert not (target / ".credentials.json").is_symlink()
+    assert (target / ".credentials.json").samefile(source / ".credentials.json")
 
 
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
