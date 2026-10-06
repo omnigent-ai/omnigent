@@ -261,6 +261,16 @@ describe("SlidesViewer", () => {
     expect(screen.getByText(`1 / ${MAX_SLIDE_COUNT}`)).toBeInTheDocument();
   });
 
+  it("caps the source section count before the iframe reports", () => {
+    const sections = Array.from(
+      { length: MAX_SLIDE_COUNT + 500 },
+      (_, i) => `<section>${i}</section>`,
+    ).join("");
+    render(<SlidesViewer content={body(sections)} />);
+    expect(screen.getByText(`1 / ${MAX_SLIDE_COUNT}`)).toBeInTheDocument();
+    expect(screen.queryByText(`1 / ${MAX_SLIDE_COUNT + 500}`)).toBeNull();
+  });
+
   it("clamps when the deck shrinks so the next keypress still moves", () => {
     render(<SlidesViewer content={DECK} />);
     const viewer = screen.getByRole("region", { name: "Slide deck" });

@@ -63,7 +63,7 @@ export function SlidesViewer({
   const srcDoc = useMemo(() => prepareSlidesDoc(content), [content]);
   // The iframe's runtime count wins once it reports for the current document.
   const [runtime, setRuntime] = useState<{ srcDoc: string; total: number } | null>(null);
-  const total = runtime?.srcDoc === srcDoc ? runtime.total : sourceTotal;
+  const total = Math.min(runtime?.srcDoc === srcDoc ? runtime.total : sourceTotal, MAX_SLIDE_COUNT);
   const [index, setIndex] = useState(0);
   const [scale, setScale] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -92,10 +92,8 @@ export function SlidesViewer({
       const win = iframeRef.current?.contentWindow;
       if (!win || e.source !== win || e.data?.source !== SLIDES_MSG_SOURCE) return;
       const { type, key, total: n } = e.data;
-      // Only finite non-negative integers; clamp so a hostile deck cannot claim billions.
-      if (type === "count" && Number.isInteger(n) && Number.isFinite(n) && n >= 0) {
-        setRuntime({ srcDoc, total: Math.min(n, MAX_SLIDE_COUNT) });
-      }
+      // Non-negative integers only; the shared total clamp caps both source and runtime.
+      if (type === "count" && Number.isInteger(n) && n >= 0) setRuntime({ srcDoc, total: n });
       else if (type === "key" && PREV_KEYS.has(key)) step(-1);
       else if (type === "key" && NEXT_KEYS.has(key)) step(1);
     };
