@@ -70,6 +70,8 @@ from omnigent.errors import (
     OmnigentError,
     category_for_code,
     restart_on_stale_cursor,
+    turn_failure_category,
+    turn_failure_phase,
 )
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -4906,6 +4908,9 @@ def _publish_status(
         # for <id>: <detail>" shape so existing detail-matching stays valid.
         origin = failure_origin or "unattributed"
         failure_code = error.code if error is not None else "none"
+        # Stamp owner, impact and phase so the dashboard splits failures without
+        # matching detail text; a failure with no error resolves to UNKNOWN.
+        error_code = error.code if error is not None else None
         _logger.error(
             "session turn failed for %s (origin=%s code=%s prev=%s): %s",
             session_id,
@@ -4920,13 +4925,16 @@ def _publish_status(
                 code=failure_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
+                error_category=turn_failure_category(error_code).value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=turn_failure_phase(error_code).value,
                 **failure_log_attributes(failure_context),
             ),
         )
         session_live_state.persist_scheduled_run_completion(
             session_id,
             "failed",
-            error_code=error.code if error is not None else None,
+            error_code=error_code,
             error=error.message if error is not None else None,
         )
     # Track the in-flight response id for snapshot-based reconnect (see
@@ -8019,6 +8027,11 @@ async def _relay_persist_error_once(
                 code=item.data.code,
                 level=item.data.level,
                 source=item.data.source,
+                error_category=turn_failure_category(item.data.code).value,
+                # An info-level item is a notice, not a halted turn.
+                error_impact=(
+                    ErrorImpact.BENIGN if item.data.level == "info" else ErrorImpact.BLOCKING
+                ).value,
             ),
         )
         return "persisted"

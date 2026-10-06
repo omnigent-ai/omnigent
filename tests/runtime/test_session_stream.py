@@ -1040,6 +1040,108 @@ def test_sse_safe_attributes_uses_real_serializer_for_info_notice() -> None:
     assert "message" not in attrs
 
 
+@pytest.mark.parametrize(
+    ("code", "category"),
+    [
+        ("runner_disconnected", "runner"),
+        ("transient_upstream_error", "upstream"),
+        ("codex_reauth_required", "config"),
+        ("budget_exhausted", "user"),
+        # ErrorCode values keep the owner their own map gives them.
+        ("workspace_missing", "user"),
+        # Catch-alls, relayed exception names and non-string codes are unattributed.
+        ("native_turn_error", "unknown"),
+        ("RuntimeError", "unknown"),
+        (500, "unknown"),
+    ],
+)
+def test_sse_safe_attributes_adds_error_category_for_failed_status(
+    code: object, category: str
+) -> None:
+    # A failed session.status carries the error code; the owner derived from it is
+    # an enum string, so the row can be split by fault without the message text.
+    event = {
+        "type": "session.status",
+        "conversation_id": "conv_1",
+        "status": "failed",
+        "error": {"code": code, "message": "private failure detail"},
+    }
+    attrs = session_stream._sse_safe_attributes(event)
+    assert attrs["status"] == "failed"
+    assert attrs["error_code"] == code
+    assert attrs["error_category"] == category
+    assert "private" not in repr(attrs)
+
+
+def test_sse_safe_attributes_adds_error_category_for_nested_response_error() -> None:
+    # response.failed nests the error under ``response``; it gets the same owner.
+    event = {
+        "type": "response.failed",
+        "response": {
+            "id": "resp_1",
+            "error": {"code": "budget_exhausted", "message": "private failure detail"},
+        },
+    }
+    attrs = session_stream._sse_safe_attributes(event)
+    assert attrs["error_code"] == "budget_exhausted"
+    assert attrs["error_category"] == "user"
+    assert "private" not in repr(attrs)
+
+
+def test_sse_safe_attributes_omits_error_category_without_an_error_code() -> None:
+    # Nothing to attribute: no error, or an error with no code, adds no owner.
+    assert "error_category" not in session_stream._sse_safe_attributes(
+        {"type": "session.status", "status": "idle"}
+    )
+    assert "error_category" not in session_stream._sse_safe_attributes(
+        {"type": "response.error", "error": {"message": "private failure detail"}}
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "category"),
+    [
+        ("pi_native_effort_ignored", "config"),
+        ("native_terminal_start_failed", "runner"),
+        ("native_turn_error", "unknown"),
+        ("unmapped_future_code", "unknown"),
+    ],
+)
+def test_sse_safe_attributes_adds_item_category_for_error_items(code: str, category: str) -> None:
+    # A persisted error item names its owner under ``item_category``, a key apart
+    # from ``error_category`` so it is not read as a failed-status row.
+    event = {
+        "type": "response.output_item.done",
+        "item": {
+            "id": "item_e",
+            "type": "error",
+            "source": "execution",
+            "code": code,
+            "message": "private error text",
+        },
+    }
+    attrs = session_stream._sse_safe_attributes(event)
+    assert attrs["item_code"] == code
+    assert attrs["item_category"] == category
+    assert "error_category" not in attrs
+    assert "private" not in repr(attrs)
+
+
+def test_sse_safe_attributes_omits_item_category_without_a_logged_code() -> None:
+    # The category derives from ``item_code``: no logged code, no owner. That holds
+    # for an oversized code and for item types other than ``error``.
+    oversized = {
+        "type": "response.output_item.done",
+        "item": {"id": "item_e", "type": "error", "code": "x" * 65},
+    }
+    other_type = {
+        "type": "response.output_item.done",
+        "item": {"id": "item_m", "type": "message", "code": "runner_disconnected"},
+    }
+    for event in (oversized, other_type):
+        assert "item_category" not in session_stream._sse_safe_attributes(event)
+
+
 @contextlib.contextmanager
 def _capturing_sse_logger() -> Iterator[list[logging.LogRecord]]:
     """Attach a capturing handler to the SSE logger for the duration of the block."""
@@ -1135,12 +1237,64 @@ def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.Monke
     assert failed.levelno == logging.WARNING
     # A failed turn is the authoritative blocking signal; error_impact rides the
     # same row so "sessions actually blocked" is a direct query. No message text.
+    # "timeout" has no turn-failure rule, so its owner is the unknown bucket.
     assert failed.attributes == {
         "outcome": "failed",
         "error_code": "timeout",
+        "error_category": "unknown",
         "error_impact": "blocking",
         "error_phase": "turn",
     }
+
+
+@pytest.mark.parametrize(
+    ("code", "category"),
+    [
+        ("runner_disconnected", "runner"),
+        ("rate_limit_exceeded", "upstream"),
+        ("codex_reauth_required", "config"),
+        ("context_length_exceeded", "user"),
+        ("native_turn_error", "unknown"),
+        ("RuntimeError", "unknown"),
+    ],
+)
+def test_failed_turn_rows_carry_the_error_owner(
+    monkeypatch: pytest.MonkeyPatch, code: str, category: str
+) -> None:
+    # The failed SSE row and its turn_finished audit row both name who owns the
+    # failure, derived from the error code alone (never the message).
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    event = {
+        "type": "response.failed",
+        "response": {"id": "resp_1", "error": {"code": code, "message": "private detail"}},
+    }
+    with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
+        session_stream._log_sse_event("conv_1", event)
+
+    assert len(sse_records) == len(audit_records) == 1
+    assert sse_records[0].attributes["error_category"] == category
+    assert audit_records[0].attributes["error_category"] == category
+    # The outcome row still reports the authoritative blocking impact beside it.
+    assert audit_records[0].attributes["error_impact"] == "blocking"
+    for record in (*sse_records, *audit_records):
+        assert "private" not in repr(record.attributes)
+
+
+def test_turn_finished_omits_error_category_without_an_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No error code to attribute: the row stays as before, with no owner.
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    with _capturing_audit_logger() as audit_records:
+        session_stream._log_sse_event("conv_1", {"type": "response.failed"})
+        session_stream._log_sse_event(
+            "conv_1", {"type": "response.completed", "response": {"id": "resp_1"}}
+        )
+
+    assert [r.attributes["outcome"] for r in audit_records] == ["failed", "completed"]
+    assert all("error_category" not in r.attributes for r in audit_records)
 
 
 @pytest.mark.parametrize("legacy_error", [False, True])
@@ -1178,15 +1332,18 @@ def test_failed_event_logs_nested_error_code_without_content(
         session_stream._log_sse_event("conv_failed", event)
 
     assert len(sse_records) == len(audit_records) == 1
+    # Neither ``runner_error`` (a catch-all) nor ``legacy_error`` has an owner rule.
     assert sse_records[0].attributes == {
         "response_id": "resp_failed",
         "error_code": expected_code,
+        "error_category": "unknown",
         "error_source": source,
     }
     assert audit_records[0].attributes == {
         "outcome": "failed",
         "response_id": "resp_failed",
         "error_code": expected_code,
+        "error_category": "unknown",
         "error_source": source,
         "error_impact": "blocking",
         "error_phase": "turn",

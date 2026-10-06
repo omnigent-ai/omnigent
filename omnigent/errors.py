@@ -421,6 +421,137 @@ def phase_for_code(code: str) -> ErrorPhase:
     return _CODE_TO_PHASE.get(code, ErrorPhase.UNKNOWN)
 
 
+# Fault attribution per turn-failure code (the ``code`` on a failed turn or error
+# item). A separate namespace from ErrorCode (see _CODE_TO_CATEGORY); never overlaps.
+_TURN_FAILURE_CATEGORY: dict[str, ErrorCategory] = {
+    # The runner or its harness process dropped, exited, or could not complete a
+    # step of the turn that it owns.
+    "runner_disconnected": ErrorCategory.RUNNER,
+    "required_terminal_exited": ErrorCategory.RUNNER,
+    "codex_thread_reset": ErrorCategory.RUNNER,
+    "codex_turn_rejected": ErrorCategory.RUNNER,
+    "connection_error": ErrorCategory.RUNNER,
+    "executor_error": ErrorCategory.RUNNER,
+    "model_change_not_applied": ErrorCategory.RUNNER,
+    "native_prompt_not_recorded": ErrorCategory.RUNNER,
+    "kiro_native_prompt_not_recorded": ErrorCategory.RUNNER,
+    "native_policy_not_enforced": ErrorCategory.RUNNER,
+    "pi_model_change_failed": ErrorCategory.RUNNER,
+    "runner_failed_to_start": ErrorCategory.RUNNER,
+    "native_terminal_start_failed": ErrorCategory.RUNNER,
+    "native_terminal_ensure_failed": ErrorCategory.RUNNER,
+    "terminal_launch_failed": ErrorCategory.RUNNER,
+    "agent_startup_pending": ErrorCategory.RUNNER,
+    "codex_thread_not_started": ErrorCategory.RUNNER,
+    # The model provider failed or throttled the request; any fix is upstream.
+    "transient_upstream_error": ErrorCategory.UPSTREAM,
+    "rate_limit_exceeded": ErrorCategory.UPSTREAM,
+    # Credentials, install, or client version are stale or incomplete; the user
+    # or admin must reconfigure.
+    "codex_reauth_required": ErrorCategory.CONFIG,
+    "client_update_required": ErrorCategory.CONFIG,
+    "claude_native_default_model_demoted": ErrorCategory.CONFIG,
+    "pi_native_effort_ignored": ErrorCategory.CONFIG,
+    "databricks_sign_in_pending": ErrorCategory.CONFIG,
+    "databricks_sign_in_completed": ErrorCategory.CONFIG,
+    "pi_credentials_unresolved": ErrorCategory.CONFIG,
+    # The human's own input, budget, or action stopped the turn.
+    "budget_exhausted": ErrorCategory.USER,
+    "context_length_exceeded": ErrorCategory.USER,
+    "input_too_large": ErrorCategory.USER,
+    "native_prompt_interrupted": ErrorCategory.USER,
+    # Catch-alls that name no cause; UNKNOWN until a specific code replaces them.
+    "native_turn_error": ErrorCategory.UNKNOWN,
+    "codex_turn_error": ErrorCategory.UNKNOWN,
+    "runner_error": ErrorCategory.UNKNOWN,
+}
+
+# Catch-all codes that name no cause. They stay UNKNOWN on purpose and are the
+# burn-down list; every other documented turn-failure code needs a rule above.
+GENERIC_TURN_FAILURE_CODES: frozenset[str] = frozenset(
+    {"native_turn_error", "codex_turn_error", "runner_error"}
+)
+
+# Lifecycle phase per turn-failure code, a default like _CODE_TO_PHASE. Codes absent
+# here fall back to _CODE_TO_PHASE, then UNKNOWN.
+_TURN_FAILURE_PHASE: dict[str, ErrorPhase] = {
+    # The runner process itself was still being launched.
+    "runner_failed_to_start": ErrorPhase.RUNNER_LAUNCH,
+    # The harness process was spawning, waiting on sign-in, or handshaking.
+    "native_terminal_start_failed": ErrorPhase.HARNESS_STARTUP,
+    "native_terminal_ensure_failed": ErrorPhase.HARNESS_STARTUP,
+    "terminal_launch_failed": ErrorPhase.HARNESS_STARTUP,
+    "agent_startup_pending": ErrorPhase.HARNESS_STARTUP,
+    "codex_thread_not_started": ErrorPhase.HARNESS_STARTUP,
+    "databricks_sign_in_pending": ErrorPhase.HARNESS_STARTUP,
+    "databricks_sign_in_completed": ErrorPhase.HARNESS_STARTUP,
+    "pi_credentials_unresolved": ErrorPhase.HARNESS_STARTUP,
+    # The harness was up and a turn was running (catch-alls included).
+    "runner_disconnected": ErrorPhase.TURN,
+    "required_terminal_exited": ErrorPhase.TURN,
+    "codex_thread_reset": ErrorPhase.TURN,
+    "codex_turn_rejected": ErrorPhase.TURN,
+    "connection_error": ErrorPhase.TURN,
+    "executor_error": ErrorPhase.TURN,
+    "model_change_not_applied": ErrorPhase.TURN,
+    "native_prompt_not_recorded": ErrorPhase.TURN,
+    "kiro_native_prompt_not_recorded": ErrorPhase.TURN,
+    "native_policy_not_enforced": ErrorPhase.TURN,
+    "pi_model_change_failed": ErrorPhase.TURN,
+    "transient_upstream_error": ErrorPhase.TURN,
+    "rate_limit_exceeded": ErrorPhase.TURN,
+    "codex_reauth_required": ErrorPhase.TURN,
+    "client_update_required": ErrorPhase.TURN,
+    "claude_native_default_model_demoted": ErrorPhase.TURN,
+    "pi_native_effort_ignored": ErrorPhase.TURN,
+    "budget_exhausted": ErrorPhase.TURN,
+    "context_length_exceeded": ErrorPhase.TURN,
+    "input_too_large": ErrorPhase.TURN,
+    "native_prompt_interrupted": ErrorPhase.TURN,
+    "native_turn_error": ErrorPhase.TURN,
+    "codex_turn_error": ErrorPhase.TURN,
+    "runner_error": ErrorPhase.TURN,
+}
+
+
+def turn_failure_category(code: str | None) -> ErrorCategory:
+    """Return the fault attribution for a turn-failure code.
+
+    Turn-failure codes are a separate namespace from :class:`ErrorCode`, so they
+    resolve here first. A failed turn can also carry an :class:`ErrorCode` value
+    (e.g. ``workspace_missing``), which falls back to :func:`category_for_code`.
+
+    :param code: The failure code, e.g. ``"runner_disconnected"``; ``None`` when
+        the failure carried no code.
+    :returns: The mapped category. ``UNKNOWN`` for ``None``, the catch-alls in
+        :data:`GENERIC_TURN_FAILURE_CODES`, and any code with no rule yet, such as
+        an exception class name the runner relays as a code (``"RuntimeError"``).
+    """
+    if code is None:
+        return ErrorCategory.UNKNOWN
+    if code in _TURN_FAILURE_CATEGORY:
+        return _TURN_FAILURE_CATEGORY[code]
+    return category_for_code(code)
+
+
+def turn_failure_phase(code: str | None) -> ErrorPhase:
+    """Return the likely lifecycle phase for a turn-failure code.
+
+    Same lookup order as :func:`turn_failure_category`: the turn-failure map, then
+    :func:`phase_for_code` for an :class:`ErrorCode` value.
+
+    :param code: The failure code, e.g. ``"native_terminal_start_failed"``;
+        ``None`` when the failure carried no code.
+    :returns: The mapped phase, or ``UNKNOWN`` for ``None`` or a code with no
+        rule yet.
+    """
+    if code is None:
+        return ErrorPhase.UNKNOWN
+    if code in _TURN_FAILURE_PHASE:
+        return _TURN_FAILURE_PHASE[code]
+    return phase_for_code(code)
+
+
 class OmnigentError(Exception):
     """
     Application-level error with a machine-readable code.

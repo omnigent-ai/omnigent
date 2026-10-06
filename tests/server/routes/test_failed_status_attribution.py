@@ -120,6 +120,55 @@ def test_unattributed_failure_is_labelled_not_blank(
     assert record.attributes["origin"] == "unattributed"
 
 
+@pytest.mark.parametrize(
+    ("code", "category", "phase"),
+    [
+        ("runner_disconnected", "runner", "turn"),
+        ("runner_failed_to_start", "runner", "runner_launch"),
+        ("native_terminal_start_failed", "runner", "harness_startup"),
+        ("transient_upstream_error", "upstream", "turn"),
+        ("codex_reauth_required", "config", "turn"),
+        ("budget_exhausted", "user", "turn"),
+        # An ErrorCode published by a host launch refusal keeps its own owner.
+        ("workspace_missing", "user", "harness_setup"),
+        # Catch-alls and relayed exception names are the burn-down bucket.
+        ("native_turn_error", "unknown", "turn"),
+        ("RuntimeError", "unknown", "unknown"),
+    ],
+)
+def test_failed_edge_names_its_owner(
+    caplog: pytest.LogCaptureFixture, code: str, category: str, phase: str
+) -> None:
+    """The ERROR row carries who owns the failure, so no detail-text matching is needed."""
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(code=code, message="private failure detail"),
+        origin="relayed_runner_status",
+    )
+    assert record.attributes["error_category"] == category
+    # Every row logged from a failed edge is a turn that stopped.
+    assert record.attributes["error_impact"] == "blocking"
+    assert record.attributes["error_phase"] == phase
+    # The original label is unchanged beside the new dimensions.
+    assert record.attributes["code"] == code
+    # Nothing ambient overrides the explicit values on the way to the sink.
+    shipped = _attributes(record, source="server")
+    assert shipped["error_category"] == category
+    assert shipped["error_impact"] == "blocking"
+    assert shipped["error_phase"] == phase
+
+
+def test_detail_less_failure_is_blocking_with_unknown_owner(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed edge with no ``ErrorDetail`` still counts as blocked, owner unknown."""
+    record = _publish_failed(caplog, error=None, origin="native_terminal_boot_failed")
+    assert record.attributes["code"] == "none"
+    assert record.attributes["error_category"] == "unknown"
+    assert record.attributes["error_impact"] == "blocking"
+    assert record.attributes["error_phase"] == "unknown"
+
+
 def _failure_publish_calls(source: str) -> list[ast.Call]:
     """Return ``_publish_status`` calls that can publish a failure."""
     calls: list[ast.Call] = []

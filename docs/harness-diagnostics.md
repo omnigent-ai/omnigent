@@ -335,6 +335,30 @@ new Claude native failure's `session_turn_failed` attributes for the category,
 detail source, and capture state. Older runners still receive fallback
 provenance from the updated server but cannot supply the new native fields.
 
+### Failure ownership
+
+Failed-turn rows also name who owns the failure, so a dashboard can split
+Omnigent-owned failures from upstream, user, and config ones without matching
+detail text. `turn_failure_category()` in `omnigent/errors.py` derives the owner
+from the failure code alone, and `turn_failure_phase()` derives the lifecycle
+phase. `native_error_category` is unrelated: it keeps the native tool's own category.
+
+| Row | Attributes |
+| --- | --- |
+| `session_turn_failed` | `error_category`, `error_impact` (always `blocking`), `error_phase` |
+| `turn_finished`, when the terminal event has an error code | `error_category`, beside the existing `error_impact` and `error_phase` |
+| SSE rows for events with an error code: failed `session.status`, `response.error`, `response.failed` | `error_category` |
+| SSE rows for persisted `type="error"` items | `item_category`, beside `item_code` |
+| `error_item_persisted` | `error_category`, `error_impact` (`benign` for an info-level notice, otherwise `blocking`) |
+
+`error_category` is `runner`, `upstream`, `config`, `user`, `server`, or
+`unknown`. `unknown` means the failure has no specific code yet: a catch-all
+(`native_turn_error`, `codex_turn_error`, `runner_error`), a missing code, a code
+with no rule, or an exception class name the runner relays as the code, such as
+`RuntimeError`. It is the list to burn down: group `unknown` rows by code and add
+a rule to `_TURN_FAILURE_CATEGORY` for each frequent one. A test fails when a
+documented server failure code has no rule and is not a declared catch-all.
+
 ## Claude continuous diagnostics
 
 Both CLI and host-managed native launches add `--debug-file` pointing to a fresh

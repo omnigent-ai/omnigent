@@ -3228,9 +3228,60 @@ async def test_relay_persist_error_once_emits_debug_row() -> None:
     assert row["attributes"]["source"] == "execution"
     # level is None for a destructive error; it must not appear in attributes.
     assert "level" not in row["attributes"] or row["attributes"]["level"] is None
+    # The row names who owns the failure and that it stopped the turn.
+    assert row["attributes"]["error_category"] == "config"
+    assert row["attributes"]["error_impact"] == "blocking"
     # message text must never reach the debug table
     assert "credential warning" not in str(row)
     assert "do not log" not in str(row)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "level", "category", "impact"),
+    [
+        # An info-level item is a notice, not a halted turn.
+        ("codex_thread_reset", "info", "runner", "benign"),
+        ("native_terminal_start_failed", None, "runner", "blocking"),
+        ("rate_limit_exceeded", "error", "upstream", "blocking"),
+        # A catch-all or a code with no rule yet is the burn-down bucket.
+        ("native_turn_error", None, "unknown", "blocking"),
+        ("unmapped_future_code", None, "unknown", "blocking"),
+    ],
+)
+async def test_relay_persist_error_once_debug_row_names_owner_and_impact(
+    code: str, level: str | None, category: str, impact: str
+) -> None:
+    """The error_item_persisted row carries the owner and whether the item blocked."""
+    from unittest.mock import MagicMock
+
+    from omnigent.entities.conversation import ErrorData, NewConversationItem
+    from omnigent.server.routes._sessions.helpers import _relay_persist_error_once
+
+    fake_store = MagicMock()
+    fake_store.list_items.return_value = MagicMock(data=[])
+    item = NewConversationItem(
+        type="error",
+        response_id="resp_test",
+        data=ErrorData(
+            source="execution",
+            code=code,
+            message="private error text; do not log this",
+            level=level,
+        ),
+    )
+
+    with capture_debug_rows("server") as rows:
+        result = await _relay_persist_error_once(fake_store, "conv_test", item)
+
+    assert result == "persisted"
+    persist_rows = [r for r in rows if r.get("event_name") == "error_item_persisted"]
+    assert len(persist_rows) == 1
+    attributes = persist_rows[0]["attributes"]
+    assert attributes["code"] == code
+    assert attributes["error_category"] == category
+    assert attributes["error_impact"] == impact
+    assert "do not log" not in str(persist_rows[0])
 
 
 def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:

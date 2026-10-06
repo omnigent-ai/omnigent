@@ -12,6 +12,9 @@ from omnigent.errors import (
     _CODE_TO_IMPACT,
     _CODE_TO_PHASE,
     _STALE_CURSOR_ATTEMPTS,
+    _TURN_FAILURE_CATEGORY,
+    _TURN_FAILURE_PHASE,
+    GENERIC_TURN_FAILURE_CODES,
     ErrorCategory,
     ErrorCode,
     ErrorImpact,
@@ -25,7 +28,10 @@ from omnigent.errors import (
     is_cancelled_rpc_error,
     phase_for_code,
     restart_on_stale_cursor,
+    turn_failure_category,
+    turn_failure_phase,
 )
+from omnigent.runner.launch_failure import _FAILURE_CODE_DESCRIPTIONS
 
 
 def _all_error_code_values() -> list[str]:
@@ -419,6 +425,136 @@ def test_harness_boundary_is_startup_not_before() -> None:
     assert is_before_harness_start(ErrorPhase.HARNESS_STARTUP) is False
     assert is_before_harness_start(ErrorPhase.TURN) is False
     assert is_before_harness_start(ErrorPhase.UNKNOWN) is False
+
+
+@pytest.mark.parametrize(
+    "code,expected_category,expected_phase",
+    [
+        # Runner-owned, after the harness is up.
+        ("runner_disconnected", ErrorCategory.RUNNER, ErrorPhase.TURN),
+        ("required_terminal_exited", ErrorCategory.RUNNER, ErrorPhase.TURN),
+        ("connection_error", ErrorCategory.RUNNER, ErrorPhase.TURN),
+        ("native_prompt_not_recorded", ErrorCategory.RUNNER, ErrorPhase.TURN),
+        ("kiro_native_prompt_not_recorded", ErrorCategory.RUNNER, ErrorPhase.TURN),
+        # Runner-owned, before the harness is up.
+        ("runner_failed_to_start", ErrorCategory.RUNNER, ErrorPhase.RUNNER_LAUNCH),
+        ("native_terminal_start_failed", ErrorCategory.RUNNER, ErrorPhase.HARNESS_STARTUP),
+        ("codex_thread_not_started", ErrorCategory.RUNNER, ErrorPhase.HARNESS_STARTUP),
+        # The model provider failed or throttled the request.
+        ("transient_upstream_error", ErrorCategory.UPSTREAM, ErrorPhase.TURN),
+        ("rate_limit_exceeded", ErrorCategory.UPSTREAM, ErrorPhase.TURN),
+        # Credentials or install need a change.
+        ("codex_reauth_required", ErrorCategory.CONFIG, ErrorPhase.TURN),
+        ("client_update_required", ErrorCategory.CONFIG, ErrorPhase.TURN),
+        ("databricks_sign_in_pending", ErrorCategory.CONFIG, ErrorPhase.HARNESS_STARTUP),
+        ("pi_credentials_unresolved", ErrorCategory.CONFIG, ErrorPhase.HARNESS_STARTUP),
+        # The human's own input or budget stopped the turn.
+        ("budget_exhausted", ErrorCategory.USER, ErrorPhase.TURN),
+        ("context_length_exceeded", ErrorCategory.USER, ErrorPhase.TURN),
+        ("input_too_large", ErrorCategory.USER, ErrorPhase.TURN),
+        ("native_prompt_interrupted", ErrorCategory.USER, ErrorPhase.TURN),
+        # Catch-alls: no owner, but still a turn failure.
+        ("native_turn_error", ErrorCategory.UNKNOWN, ErrorPhase.TURN),
+        ("runner_error", ErrorCategory.UNKNOWN, ErrorPhase.TURN),
+    ],
+)
+def test_turn_failure_code_attribution(
+    code: str, expected_category: ErrorCategory, expected_phase: ErrorPhase
+) -> None:
+    """Pin the owner and phase of the turn-failure codes that drive dashboards."""
+    assert turn_failure_category(code) is expected_category
+    assert turn_failure_phase(code) is expected_phase
+
+
+@pytest.mark.parametrize(
+    "code,expected_category,expected_phase",
+    [
+        (ErrorCode.WORKSPACE_MISSING, ErrorCategory.USER, ErrorPhase.HARNESS_SETUP),
+        (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorCategory.CONFIG, ErrorPhase.HARNESS_SETUP),
+        (ErrorCode.RUNNER_UNAVAILABLE, ErrorCategory.CONFIG, ErrorPhase.RUNNER_LAUNCH),
+        (ErrorCode.SESSION_AGENT_MISSING, ErrorCategory.USER, ErrorPhase.HARNESS_SETUP),
+        (ErrorCode.INVALID_INPUT, ErrorCategory.USER, ErrorPhase.REQUEST),
+        (ErrorCode.INTERNAL_ERROR, ErrorCategory.SERVER, ErrorPhase.UNKNOWN),
+        (ErrorCode.UPSTREAM_CANCELLED, ErrorCategory.UPSTREAM, ErrorPhase.UNKNOWN),
+    ],
+)
+def test_turn_failure_falls_back_to_the_error_code_namespace(
+    code: str, expected_category: ErrorCategory, expected_phase: ErrorPhase
+) -> None:
+    """A failed turn can carry an ErrorCode (e.g. a host launch refusal); it keeps
+    the owner and phase its own maps give it."""
+    assert turn_failure_category(code) is expected_category
+    assert turn_failure_phase(code) is expected_phase
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        None,
+        "none",
+        "",
+        # Exception class names the runner relays as the code of an uncoded failure.
+        "RuntimeError",
+        "ConnectionRefusedError",
+        "ImportError",
+        "OSError",
+        "some_new_code",
+    ],
+)
+def test_turn_failure_without_a_rule_is_unknown(code: str | None) -> None:
+    """No code, or a code nobody wrote a rule for, is the burn-down bucket."""
+    assert turn_failure_category(code) is ErrorCategory.UNKNOWN
+    assert turn_failure_phase(code) is ErrorPhase.UNKNOWN
+
+
+def test_generic_turn_failure_codes_stay_unattributed() -> None:
+    """Catch-all codes name no cause, so they must not guess an owner."""
+    assert GENERIC_TURN_FAILURE_CODES
+    for code in GENERIC_TURN_FAILURE_CODES:
+        assert turn_failure_category(code) is ErrorCategory.UNKNOWN, code
+    # The explicit UNKNOWN entries and the declared catch-alls are the same set,
+    # so neither can drift from the other.
+    explicit_unknown = {
+        code
+        for code, category in _TURN_FAILURE_CATEGORY.items()
+        if category is ErrorCategory.UNKNOWN
+    }
+    assert explicit_unknown == GENERIC_TURN_FAILURE_CODES
+
+
+def test_turn_failure_maps_cover_the_same_codes() -> None:
+    """A code with an owner but no phase would silently lose its phase."""
+    assert set(_TURN_FAILURE_CATEGORY) == set(_TURN_FAILURE_PHASE)
+
+
+def test_turn_failure_maps_do_not_shadow_error_codes() -> None:
+    """ErrorCode values resolve through ``_CODE_TO_CATEGORY`` / ``_CODE_TO_PHASE``.
+
+    Repeating one in a turn-failure map would give the code two sources of truth.
+    """
+    error_codes = set(_all_error_code_values())
+    assert not error_codes & set(_TURN_FAILURE_CATEGORY)
+    assert not error_codes & set(_TURN_FAILURE_PHASE)
+
+
+def test_every_documented_failure_code_has_an_owner() -> None:
+    """A server-emitted failure code must attribute an owner or be a declared catch-all.
+
+    ``_FAILURE_CODE_DESCRIPTIONS`` is the documented list of server-emitted failure
+    codes. A new code missing from the maps would silently land in the ``unknown``
+    burn-down bucket instead of being attributed where it is introduced.
+    """
+    unattributed = sorted(
+        code
+        for code in _FAILURE_CODE_DESCRIPTIONS
+        if code not in GENERIC_TURN_FAILURE_CODES
+        and turn_failure_category(code) is ErrorCategory.UNKNOWN
+    )
+    assert not unattributed, (
+        f"failure codes with no owner: {unattributed}. Add each to "
+        "_TURN_FAILURE_CATEGORY (and _TURN_FAILURE_PHASE) in omnigent/errors.py, "
+        "or to GENERIC_TURN_FAILURE_CODES if it is a deliberate catch-all."
+    )
 
 
 def test_stale_cursor_error_carries_cursor_and_maps_to_400() -> None:

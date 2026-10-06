@@ -41,7 +41,7 @@ from omnigent.debug_logging import (
     sse_event_logger,
     sse_logging_enabled,
 )
-from omnigent.errors import ErrorImpact, ErrorPhase
+from omnigent.errors import ErrorImpact, ErrorPhase, turn_failure_category
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -202,6 +202,7 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
             code = item.get("code")
             if isinstance(code, str) and len(code) <= 64:
                 attrs["item_code"] = code
+                attrs["item_category"] = turn_failure_category(code).value
             source = item.get("source")
             if isinstance(source, str) and len(source) <= 32:
                 attrs["item_source"] = source
@@ -211,6 +212,7 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
     if isinstance(error, dict):
         if error.get("code") is not None:
             attrs["error_code"] = error["code"]
+            attrs["error_category"] = turn_failure_category(str(error["code"])).value
         if error.get("source") is not None:
             attrs["error_source"] = error["source"]
     if event.get("type") == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
@@ -264,7 +266,9 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
         if not isinstance(error, dict) and isinstance(response, dict):
             error = response.get("error")
         if isinstance(error, dict) and error.get("code") is not None:
-            attributes["error_code"] = str(error["code"])
+            error_code = str(error["code"])
+            attributes["error_code"] = error_code
+            attributes["error_category"] = turn_failure_category(error_code).value
         if event_type == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
             attributes["error_source"] = event["source"]
         impact = _TURN_OUTCOME_IMPACT.get(outcome)
