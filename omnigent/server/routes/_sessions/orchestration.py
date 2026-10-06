@@ -211,6 +211,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _recent_mirrored_tool_calls,
     _RelayHandle,
+    _RelayLiveness,
     _RelayStatusSnapshot,
     _runner_relay_tasks,
     _runner_status_probe_backoff,
@@ -7581,10 +7582,10 @@ async def _runner_disconnect_requires_failure(
     return decision in ("failed_mid_turn", "failed_before_start")
 
 
-async def _relay_runner_live_elsewhere(
+async def _relay_runner_liveness(
     session_id: str,
     conversation_store: ConversationStore,
-) -> bool:
+) -> _RelayLiveness:
     """
     Check this relay's bound runner using shared runner metadata.
 
@@ -7593,31 +7594,53 @@ async def _relay_runner_live_elsewhere(
     relay's runner binding, falling back to the metadata binding when called
     without a registered relay.
 
+    The row's stamp is compared with this replica's own stamp from when the
+    relay's stream first dropped, raised to any it wrote since, so its own
+    writes are never read as another replica's.
+
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store used to read runner metadata.
-    :returns: ``True`` when the bound runner is confirmed live on
-        another replica; ``False`` when unbound, unreadable, or not.
+    :returns: What the check saw. ``live_elsewhere`` is ``True`` only when the
+        bound runner is confirmed live on another replica, never when it is
+        unbound, unreadable, or stale.
     """
     try:
         liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, session_id)
-    except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
+    except Exception:  # noqa: BLE001 — the caller decides without this evidence
         _logger.warning(
             "Relay: runner liveness lookup failed for session=%s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return False
+        return _RelayLiveness(lookup="error")
     if liveness is None:
-        return False
+        return _RelayLiveness(lookup="missing")
     bound_runner_id, runner_last_seen = liveness
     handle = _runner_relay_tasks.get(session_id)
     runner_id = handle.runner_id if handle is not None else bound_runner_id
     if runner_id is None:
-        return False
-    reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
-        stamp=runner_last_seen,
+        return _RelayLiveness(
+            lookup="unbound", bound_runner_id=bound_runner_id, runner_last_seen=runner_last_seen
+        )
+    own_stamps = [
+        stamp
+        for stamp in (
+            handle.reference_stamp if handle is not None else None,
+            session_live_state.last_liveness_stamp(runner_id),
+        )
+        if stamp is not None
+    ]
+    reference_stamp = max(own_stamps, default=None)
+    return _RelayLiveness(
+        lookup="found",
+        live_elsewhere=bound_runner_id == runner_id
+        and _runner_stamp_is_live_elsewhere(
+            stamp=runner_last_seen,
+            reference_stamp=reference_stamp,
+        ),
+        bound_runner_id=bound_runner_id,
+        runner_last_seen=runner_last_seen,
         reference_stamp=reference_stamp,
     )
 
@@ -7648,6 +7671,12 @@ async def _relay_runner_stream(
     other sessions. An idle session had no work to interrupt, so it stays
     idle and the disconnect surfaces through liveness instead.
 
+    A relay that never received the runner's ready heartbeat (its tunnel was
+    retired before the stream came up, as when a rollout moves the runner
+    between replicas) saw none of the turn, so it fails nothing
+    (``never_attached``). The replica's per-runner disconnect timer, which
+    sees the runner itself, fails the mid-turn session if the runner is gone.
+
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param runner_client: HTTP client pointed at the runner.
@@ -7664,6 +7693,7 @@ async def _relay_runner_stream(
     outage_runner_id: str | None = None
     outage_turn_id: str | None = None
     retries = 0
+    ever_ready = False
 
     def _on_stream_ready() -> None:
         """Record one ready-confirmed recovery for the active outage."""
@@ -7713,6 +7743,7 @@ async def _relay_runner_stream(
             return
         except _RelayTransportLost as lost:
             now = loop.time()
+            ever_ready = ever_ready or lost.stream_ready
             # A ready heartbeat confirms recovery, even on a brief connection.
             # Its next disconnect starts a new outage with a full grace window.
             if deadline is None or lost.stream_ready or now - started > RUNNER_DISCONNECT_GRACE_S:
@@ -7722,6 +7753,13 @@ async def _relay_runner_stream(
                 outage_id = uuid.uuid4().hex
                 outage_runner_id = runner_id
                 outage_turn_id = _session_active_response_cache.get(session_id)
+                # The disconnect timer compares against the stamp at the drop;
+                # fix the relay's reference to the same moment.
+                handle = _runner_relay_tasks.get(session_id)
+                if handle is not None and handle.task is asyncio.current_task():
+                    handle.reference_stamp = session_live_state.last_liveness_stamp(
+                        handle.runner_id
+                    )
                 _logger.info(
                     "Relay: runner transport lost for session=%s (intentional=%s, grace=%.1fs)",
                     session_id,
@@ -7760,18 +7798,25 @@ async def _relay_runner_stream(
                 if wait is None or await wait(deadline - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
+            liveness: _RelayLiveness | None = None
             if lost.intentional:
                 decision = "intentional_stop"
             elif shutdown_state.server_shutting_down():
                 decision = "server_shutdown"
-            elif await _relay_runner_live_elsewhere(session_id, conversation_store):
-                decision = "live_elsewhere"
-            elif await _runner_disconnect_requires_failure(
-                session_id, conversation_store, origin="runner_disconnected_mid_turn"
-            ):
-                decision = "failed_mid_turn"
             else:
-                decision = "idle_no_failure"
+                liveness = await _relay_runner_liveness(session_id, conversation_store)
+                if liveness.live_elsewhere:
+                    decision = "live_elsewhere"
+                elif not ever_ready:
+                    # Never subscribed to the runner, so it has no view of the turn;
+                    # the disconnect timer settles a runner that is really gone.
+                    decision = "never_attached"
+                elif await _runner_disconnect_requires_failure(
+                    session_id, conversation_store, origin="runner_disconnected_mid_turn"
+                ):
+                    decision = "failed_mid_turn"
+                else:
+                    decision = "idle_no_failure"
             # One row per outage outcome: which branch below fired, how long the
             # runner was gone against the grace, and how many retries it got.
             _logger.warning(
@@ -7794,6 +7839,8 @@ async def _relay_runner_stream(
                     ),
                     retries=retries,
                     telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
+                    ever_ready=ever_ready,
+                    **(liveness.log_fields() if liveness is not None else {}),
                 ),
             )
             if decision == "intentional_stop":
@@ -7822,6 +7869,15 @@ async def _relay_runner_stream(
                 _relinquish_session_live_state(session_id)
                 _logger.info(
                     "Relay: runner live on another replica for session=%s; no failure to report",
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+            elif decision == "never_attached":
+                # The tunnel was retired before this stream came up, so the turn may
+                # be running fine elsewhere; the disconnect timer fails it if not.
+                _logger.info(
+                    "Relay: never attached to the runner stream for session=%s; "
+                    "leaving the outcome to the runner disconnect timer",
                     session_id,
                     extra={"session_id": session_id},
                 )

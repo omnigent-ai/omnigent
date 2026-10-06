@@ -36,6 +36,7 @@ import asyncio
 import contextlib
 import io
 import json
+import logging
 import tarfile
 import threading
 from collections.abc import AsyncIterator, Iterator
@@ -1831,6 +1832,132 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
             # proving the foreign write, not the setup, spares the session.
             assert cached == "failed", f"expected the grace timer to fail the turn, got {cached!r}"
     finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_active_response_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("runner_elsewhere", [False, True])
+async def test_never_attached_relay_leaves_the_turn_to_the_disconnect_timer(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    runner_elsewhere: bool,
+) -> None:
+    """A relay whose tunnel is retired before its stream came up fails nothing itself.
+
+    The runner's disconnect timer alone settles the mid-turn session: it fails
+    the turn when the runner is really gone, and spares it when another
+    replica has stamped the runner since (the rollout case, where the turn is
+    running fine on the replica the runner moved to). Nothing is cached here,
+    like a replica that only just met the runner.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.4
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", grace
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S", 0.05
+    )
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+    real_ensure_relay = sessions_module._ensure_runner_relay
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-never-attached"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    store.set_session_live_status(session_id, "running")
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    registry = ap_app.state.tunnel_registry
+    stream_client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, runner_id), base_url="http://runner"
+    )
+    try:
+        # The pump-less tunnel never answers the stream request, so the relay
+        # is still waiting for its ready heartbeat when the tunnel goes away.
+        handle = real_ensure_relay(session_id, runner_id, stream_client, store)
+        assert handle is not None
+
+        async def _stream_requested() -> None:
+            while not registry.get(runner_id).in_flight:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_stream_requested(), timeout=budget(2.0))
+        if runner_elsewhere:
+            # The replica the runner moved to stamps the row (after this
+            # replica's own connect stamp landed) before this tunnel's drop is seen.
+            async def _own_stamp_recorded() -> None:
+                while session_live_state.last_liveness_stamp(runner_id) is None:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(_own_stamp_recorded(), timeout=budget(2.0))
+            _drain_session_live_state()
+            own = session_live_state.last_liveness_stamp(runner_id)
+            assert own is not None
+            store.touch_runner_liveness([runner_id], own + 6)
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.wait(timeout=budget(2.0))
+
+        async def _settled() -> None:
+            while not handle.task.done() or any(
+                task.get_name() == f"runner-disconnect-grace-{runner_id}" and not task.done()
+                for task in asyncio.all_tasks()
+            ):
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_settled(), timeout=budget(5.0))
+
+        rows = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_stream_disconnected"
+            and r.session_id == session_id
+        ]
+        assert len(rows) == 1, [r.getMessage() for r in caplog.records]
+        assert rows[0].attributes["ever_ready"] is False
+        failures = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+        ]
+        conv = store.get_conversation(session_id)
+        assert conv is not None
+        error = sessions_module._last_task_error_from_labels(conv.labels)
+        if runner_elsewhere:
+            assert rows[0].attributes["decision"] == "live_elsewhere"
+            assert not failures
+            assert error is None
+            assert sessions_module._session_status_cache.get(session_id) != "failed"
+        else:
+            assert rows[0].attributes["decision"] == "never_attached"
+            assert sessions_module._session_status_cache.get(session_id) == "failed"
+            assert error is not None and error["code"] == "runner_disconnected"
+            # The timer, not the relay, failed it.
+            assert [r.attributes["origin"] for r in failures] == ["runner_offline_sweep"]
+    finally:
+        await stream_client.aclose()
         sessions_module._session_status_cache.pop(session_id, None)
         sessions_module._session_active_response_cache.pop(session_id, None)
 

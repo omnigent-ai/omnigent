@@ -150,10 +150,12 @@ async def test_persistent_natural_eof_exhausts_disconnect_grace(
         nonlocal attempts
         attempts += 1
         relay_clock.now += 4.0
-        return httpx.Response(
-            200,
-            stream=_NaturalEofStream(b'data: {"type":"session.status","status":"running"}\n\n'),
-        )
+        frames = [b'data: {"type":"session.status","status":"running"}\n\n']
+        if attempts == 1:
+            # Only the first attach is confirmed; later heartbeat-less streams
+            # must not reset the grace, but the relay has carried the turn.
+            frames.insert(0, b'data: {"type":"session.heartbeat"}\n\n')
+        return httpx.Response(200, stream=_NaturalEofStream(*frames))
 
     try:
         async with httpx.AsyncClient(
@@ -312,6 +314,7 @@ async def test_repeated_recovery_keeps_backoff_and_remains_cancellable(
 async def test_an_unrecovered_stream_still_exhausts_its_grace(
     db_uri: str, relay_clock: _RelayClock, healthy_attempts: int
 ) -> None:
+    """A stream that attached and never recovers fails the turn; one never attached does not."""
     store = SqlAlchemyConversationStore(db_uri)
     conversation = store.create_conversation()
     session_id = conversation.id
@@ -332,10 +335,15 @@ async def test_an_unrecovered_stream_still_exhausts_its_grace(
                 orchestration._relay_runner_stream(session_id, client, store), timeout=10
             )
         assert attempts == max(1, healthy_attempts) + 2
-        assert orchestration._session_status_cache[session_id] == "failed"
         persisted = store.get_conversation(session_id)
         assert persisted is not None
-        assert persisted.labels["omnigent.last_task_error_code"] == "runner_disconnected"
+        if healthy_attempts:
+            assert orchestration._session_status_cache[session_id] == "failed"
+            assert persisted.labels["omnigent.last_task_error_code"] == "runner_disconnected"
+        else:
+            # No ready heartbeat ever arrived: the disconnect timer owns the outcome.
+            assert orchestration._session_status_cache[session_id] == "running"
+            assert not persisted.labels.get("omnigent.last_task_error_code")
     finally:
         orchestration._session_status_cache.pop(session_id, None)
         orchestration._session_active_response_cache.pop(session_id, None)
