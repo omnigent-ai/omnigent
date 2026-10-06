@@ -1134,3 +1134,235 @@ def test_antigravity_provider_reads_agents_skills_not_claude_skills(
 
     names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "antigravity-native")]
     assert names == ["neutral-skill"]
+
+
+def _write_plugin_command(commands_dir: Path, name: str, text: str) -> None:
+    """Write a ``<commands_dir>/<name>.md`` plugin command file."""
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    (commands_dir / f"{name}.md").write_text(text)
+
+
+def _claude_home_with_plugin_command(
+    home: Path, *, plugin: str = "knowledge-base", marketplace: str = "mkt"
+) -> tuple[Path, Path]:
+    """Seed a fake ~/.claude with one enabled plugin carrying a skill and a command.
+
+    :returns: ``(home, install)`` where *install* is the plugin's install path.
+    """
+    _claude_home_with_plugin(
+        home, plugin=plugin, marketplace=marketplace, skill="kb-search", enabled=True
+    )
+    install = home / ".claude" / "plugins" / "cache" / marketplace / plugin / "1.0.0"
+    _write_plugin_command(
+        install / "commands",
+        "kb-review",
+        "---\n"
+        "description: Review a knowledge-base PR\n"
+        "argument-hint: --pr <number>\n"
+        "---\n"
+        "Review the KB pull request given as $ARGUMENTS.\n",
+    )
+    return home, install
+
+
+def test_claude_provider_surfaces_plugin_commands_namespaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plugin's ``commands/<name>.md`` shows up next to its skills."""
+    home, _ = _claude_home_with_plugin_command(tmp_path / "home")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    by_name = {s.name: s for s in out}
+    assert "knowledge-base:kb-search" in by_name
+    command = by_name.get("knowledge-base:kb-review")
+    assert command is not None
+    assert command.description == "Review a knowledge-base PR"
+    # Sibling files under commands/ are other commands, not skill resources.
+    assert command.skill_dir is None
+
+
+def test_plugin_command_without_frontmatter_uses_first_body_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Frontmatter is optional on plugin commands; the body's first line labels it."""
+    home = tmp_path / "home"
+    install = home / ".claude" / "plugins" / "cache" / "mkt" / "tools" / "1.0.0"
+    _write_plugin_command(install / "commands", "deploy", "Deploy the current branch.\n")
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"tools@mkt": True}})
+    )
+    (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": {"tools@mkt": [{"installPath": str(install)}]}})
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    by_name = {s.name: s for s in out}
+    command = by_name.get("tools:deploy")
+    assert command is not None
+    assert command.description == "Deploy the current branch."
+    assert command.content == "Deploy the current branch."
+
+
+def test_plugin_commands_respect_list_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``skills_filter`` list selects plugin commands by bare name, as it does skills."""
+    home, _ = _claude_home_with_plugin_command(tmp_path / "home")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    selected = _ctx(tmp_path / "ws", home, skills_filter=["kb-review"])
+    names = [s.name for s in resolve_harness_skills(selected, "claude-native")]
+    assert names == ["knowledge-base:kb-review"]
+
+
+def test_plugin_command_description_with_colon_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prose description containing ``: `` still labels the command."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    _write_plugin_command(
+        install / "commands",
+        "kb-triage",
+        "---\ndescription: Triage a ticket: label, assign, and reply\n---\nTriage $ARGUMENTS.\n",
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    command = {s.name: s for s in out}["knowledge-base:kb-triage"]
+    assert command.description == "Triage a ticket: label, assign, and reply"
+
+
+def test_plugin_command_marked_not_user_invocable_is_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``user-invocable: false`` hides a command from the menu, as it does a skill."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    _write_plugin_command(
+        install / "commands",
+        "kb-internal",
+        "---\ndescription: model-only step\nuser-invocable: false\n---\nbody\n",
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-review" in names
+    assert "knowledge-base:kb-internal" not in names
+
+
+def test_plugin_commands_namespace_nested_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nested files are ``<plugin>:<dir>:<name>``; hidden paths and any-case ``.md`` count."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    (install / "commands" / "notes.txt").write_text("not a command")
+    _write_plugin_command(
+        install / "commands" / "group", "inner", "---\ndescription: nested\n---\nbody\n"
+    )
+    _write_plugin_command(install / "commands" / "group" / "deep", "leaf", "Deep command.\n")
+    _write_plugin_command(install / "commands" / ".drafts", "wip", "Hidden paths count.\n")
+    (install / "commands" / "SHOUT.MD").write_text("Only a lowercase .md is stripped.\n")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-review" in names
+    assert "knowledge-base:group:inner" in names
+    assert "knowledge-base:group:deep:leaf" in names
+    assert "knowledge-base:.drafts:wip" in names
+    assert "knowledge-base:SHOUT.MD" in names
+    for absent in ("knowledge-base:notes", "knowledge-base:inner", "knowledge-base:group"):
+        assert absent not in names
+
+
+def test_plugin_command_directory_with_skill_md_is_one_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``<dir>/skill.md`` is the command ``<plugin>:<dir>``; its siblings are ignored."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    (install / "commands" / "legacy").mkdir()
+    (install / "commands" / "legacy" / "skill.md").write_text("Directory-named command.\n")
+    _write_plugin_command(install / "commands" / "legacy", "sibling", "Ignored next to skill.md\n")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    by_name = {s.name: s for s in out}
+    assert by_name["knowledge-base:legacy"].description == "Directory-named command."
+    assert "knowledge-base:legacy:skill" not in by_name
+    assert "knowledge-base:legacy:sibling" not in by_name
+
+
+def test_plugin_commands_stop_at_claude_code_depth_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Commands 31 directories deep are offered; the 32nd level is beyond Claude Code's bound."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    deepest = install / "commands" / Path(*(f"d{index}" for index in range(31)))
+    _write_plugin_command(deepest, "ok", "Thirty-one directories deep.\n")
+    _write_plugin_command(deepest / "d31", "too-deep", "Beyond Claude Code's depth bound.\n")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    deep_prefix = "knowledge-base:" + ":".join(f"d{index}" for index in range(31))
+    assert f"{deep_prefix}:ok" in names
+    assert f"{deep_prefix}:d31:too-deep" not in names
+
+
+def test_plugin_commands_do_not_follow_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Symlinked entries are skipped, so a directory cycle cannot mint duplicate commands."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    commands = install / "commands"
+    (commands / "loop").mkdir()
+    (commands / "loop" / "back").symlink_to(commands, target_is_directory=True)
+    (commands / "alias.md").symlink_to(commands / "kb-review.md")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert names.count("knowledge-base:kb-review") == 1
+    assert not any(":loop" in name or name == "knowledge-base:alias" for name in names)
+
+
+def test_plugin_command_over_size_limit_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code ignores command files over 1 MiB; a file at the limit is still offered."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    header = "---\ndescription: big\n---\n"
+    _write_plugin_command(install / "commands", "kb-huge", header + "x" * (1024 * 1024))
+    _write_plugin_command(
+        install / "commands", "kb-limit", header + "x" * (1024 * 1024 - len(header))
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-review" in names
+    assert "knowledge-base:kb-limit" in names
+    assert "knowledge-base:kb-huge" not in names
+
+
+def test_plugin_skill_wins_name_collision_with_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a plugin ships skills/x and commands/x.md, the skill entry wins."""
+    home = tmp_path / "home"
+    install = home / ".claude" / "plugins" / "cache" / "mkt" / "dup" / "1.0.0"
+    _write_skill(install / "skills", "review")
+    _write_plugin_command(
+        install / "commands", "review", "---\ndescription: command flavor\n---\nbody\n"
+    )
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"dup@mkt": True}})
+    )
+    (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": {"dup@mkt": [{"installPath": str(install)}]}})
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    matches = [s for s in out if s.name == "dup:review"]
+    assert len(matches) == 1
+    assert matches[0].skill_dir is not None  # the skill entry won, not the command

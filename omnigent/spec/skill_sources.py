@@ -23,8 +23,17 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
+import yaml
+
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
+from omnigent.spec.parser import (
+    _FRONTMATTER_RE,
+    _discover_skills,
+    _falsey_flag,
+    _parse_skill,
+    _quote_description_with_colon,
+    discover_host_skills,
+)
 from omnigent.spec.types import AgentSpec, SkillSpec
 
 _log = logging.getLogger(__name__)
@@ -439,17 +448,115 @@ def _plugin_install_paths(
     return out
 
 
-def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
-    """
-    Enabled Claude Code plugin skills, namespaced ``<plugin>:<skill>``.
+# Claude Code's plugin command loader stops at these bounds; so does the menu.
+_MAX_PLUGIN_COMMAND_BYTES = 1024 * 1024
+_MAX_PLUGIN_COMMAND_DEPTH = 32
+_MAX_PLUGIN_COMMAND_DIRS = 4096
 
-    Plugin skills are host skills, so they obey the spec's
-    ``skills_filter`` exactly as :func:`discover_host_skills` does:
-    ``"none"`` suppresses them entirely (hermetic), ``"all"`` surfaces
-    every skill from every enabled plugin, and a list selects by the
-    skill's own (bare) name — matching how the filter names skills,
-    independent of the display namespace.
-    """
+
+def _parse_plugin_command(command_md: Path, name: str) -> SkillSpec | None:
+    """Parse a plugin command; fall back to its first body line for the description.
+
+    Commands have no skill_dir because sibling command files are not resources.
+    :param command_md: Command markdown path.
+    :param name: The command's bare name, e.g. ``"kb-review"`` or ``"group:inner"``.
+    :returns: The command spec, or None for unreadable or oversized files."""
+    try:
+        if command_md.stat().st_size > _MAX_PLUGIN_COMMAND_BYTES:
+            _log.warning("Skipping oversized plugin command %s", command_md)
+            return None
+        text = command_md.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        _log.warning("Skipping unreadable plugin command %s: %s", command_md, exc)
+        return None
+    description = ""
+    user_invocable = True
+    body = text
+    match = _FRONTMATTER_RE.match(text)
+    if match:
+        frontmatter_str, body = match.groups()
+        try:
+            frontmatter = yaml.safe_load(frontmatter_str)
+        except yaml.YAMLError:
+            # Prose descriptions carry colons; recover them as SKILL.md parsing does.
+            try:
+                frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
+            except yaml.YAMLError:
+                frontmatter = None
+        if isinstance(frontmatter, dict):
+            raw = frontmatter.get("description")
+            if isinstance(raw, str):
+                description = raw.strip()
+            user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
+    if not description:
+        description = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    return SkillSpec(
+        name=name,
+        description=description,
+        content=body.strip(),
+        skill_dir=None,
+        user_invocable=user_invocable,
+    )
+
+
+def _discover_plugin_commands(commands_dir: Path) -> list[SkillSpec]:
+    """Read a plugin's command markdown files in stable order, skipping unreadable ones.
+
+    Mirrors Claude Code's plugin command loader: ``commands/<dir>/<name>.md``
+    is the command ``<dir>:<name>`` with every subdirectory segment joined by
+    ``:``, a ``<dir>/skill.md`` makes the directory the single command
+    ``<dir>``, and symlinked entries are not followed.
+
+    :param commands_dir: Plugin commands directory.
+    :returns: Parsed commands, or an empty list when the directory is unavailable."""
+    out: list[SkillSpec] = []
+    scanned = 0
+
+    def _is_markdown(entry: Path) -> bool:
+        return not entry.is_symlink() and entry.is_file() and entry.name.lower().endswith(".md")
+
+    def _walk(directory: Path, prefix: tuple[str, ...]) -> None:
+        nonlocal scanned
+        scanned += 1
+        if len(prefix) >= _MAX_PLUGIN_COMMAND_DEPTH or scanned > _MAX_PLUGIN_COMMAND_DIRS:
+            _log.warning("Skipping plugin commands beyond the walk's bounds: %s", directory)
+            return
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError as exc:
+            _log.warning("Skipping unreadable plugin commands dir %s: %s", directory, exc)
+            return
+        skill_md = next(
+            (e for e in entries if e.name.lower() == "skill.md" and _is_markdown(e)), None
+        )
+        if skill_md is not None and prefix:
+            # The directory is one command; Claude Code ignores its siblings.
+            spec = _parse_plugin_command(skill_md, ":".join(prefix))
+            if spec is not None:
+                out.append(spec)
+            return
+        for entry in entries:
+            if entry.is_symlink():
+                continue
+            if entry.is_dir():
+                _walk(entry, (*prefix, entry.name))
+            elif _is_markdown(entry) and entry.name.lower() != "skill.md":
+                # Claude Code accepts any-case ``.md`` but strips only the lowercase spelling.
+                name = entry.name[:-3] if entry.name.endswith(".md") else entry.name
+                spec = _parse_plugin_command(entry, ":".join((*prefix, name)))
+                if spec is not None:
+                    out.append(spec)
+
+    if commands_dir.is_dir():
+        _walk(commands_dir, ())
+    return out
+
+
+def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """Discover enabled plugin skills and commands, namespaced as plugin:name.
+
+    Skills precede commands on name collisions. Filtering uses bare names;
+    "none" suppresses all entries, while "all" includes every enabled plugin."""
     if ctx.skills_filter == "none":
         return []
     filter_names: set[str] | None = (
@@ -462,7 +569,9 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     for key, install_path in _plugin_install_paths(ctx, enabled).items():
         plugin = key.split("@", 1)[0]
         skipped: list[str] = []
-        for spec in _discover_skills(install_path / "skills", skipped=skipped):
+        specs = _discover_skills(install_path / "skills", skipped=skipped)
+        specs += _discover_plugin_commands(install_path / "commands")
+        for spec in specs:
             if filter_names is not None and spec.name not in filter_names:
                 continue
             out.append(replace(spec, name=f"{plugin}:{spec.name}"))
