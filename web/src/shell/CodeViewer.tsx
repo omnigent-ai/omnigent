@@ -516,8 +516,12 @@ export function CodeViewer({
   // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
   const isRenderedPreview =
     viewMode === "preview" && (lang === "html" || lang === "markdown" || isNotebookPath(path));
-  // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
-  const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
+  // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
+  // rendered previews, which never render these lines.
+  const rawLines = useMemo(
+    () => (showMonaco || isRenderedPreview ? [] : content.split("\n")),
+    [content, showMonaco, isRenderedPreview],
+  );
 
   const revealedPositionRef = useRef<FilePosition | undefined>(undefined);
   useEffect(() => {

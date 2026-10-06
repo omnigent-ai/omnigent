@@ -693,18 +693,36 @@ describe("CodeViewer HTML preview sandbox", () => {
   });
 });
 
-describe("CodeViewer HTML preview skips Shiki highlighting", () => {
-  // A large HTML file opened in preview froze the renderer: the highlight effect
-  // ran Shiki over the whole file even though the HTML preview is a sandboxed
-  // iframe that never consumes the tokens.
-  it("does not tokenize file content when rendering the HTML preview", () => {
-    const largeHtml =
-      "<!doctype html><html><body><table>" +
-      "<tr><td>cell</td></tr>\n".repeat(20_000) +
-      "</table></body></html>";
+describe("CodeViewer rendered previews skip Shiki highlighting", () => {
+  // These previews render through their own surfaces (iframe / MarkdownPreview /
+  // NotebookPreview) and never consume Shiki tokens, so tokenizing the whole file
+  // is wasted work that can freeze the renderer on a large file.
+  const NB = JSON.stringify({
+    nbformat: 4,
+    cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook\n"] }],
+  });
+
+  it("does not tokenize the file when rendering the HTML preview", () => {
     vi.mocked(highlightCode).mockClear();
-    const { container } = renderViewer(largeHtml, true, "report.html", { viewMode: "preview" });
+    const { container } = renderViewer(
+      "<!doctype html><html><body><p>hello</p></body></html>",
+      true,
+      "report.html",
+      { viewMode: "preview" },
+    );
     expect(container.querySelector('iframe[title="HTML preview"]')).not.toBeNull();
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+
+  it("does not tokenize the file when rendering the markdown preview", () => {
+    vi.mocked(highlightCode).mockClear();
+    renderViewer("# heading", true, "notes.md", { viewMode: "preview" });
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+
+  it("does not tokenize the file when rendering the notebook preview", () => {
+    vi.mocked(highlightCode).mockClear();
+    renderViewer(NB, true, "analysis.ipynb", { viewMode: "preview" });
     expect(highlightCode).not.toHaveBeenCalled();
   });
 });
