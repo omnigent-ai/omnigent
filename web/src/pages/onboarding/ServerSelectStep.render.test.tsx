@@ -27,6 +27,45 @@ describe("ServerSelectStep", () => {
     expect(onConnect).toHaveBeenCalledWith("https://team.example.com/");
   });
 
+  it("titles a recent with the name it gave itself, beside its host", () => {
+    render(
+      <ServerSelectStep
+        {...baseProps}
+        recentServers={["https://omni.example/", "https://plain.example/"]}
+        serverNames={{ "https://omni.example": "Acme Engineering" }}
+        onConnect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Acme Engineering (omni.example)")).toBeInTheDocument();
+    expect(screen.getByText("plain.example")).toBeInTheDocument();
+  });
+
+  it("keeps the local install's label even when it named itself", () => {
+    render(
+      <ServerSelectStep
+        {...baseProps}
+        recentServers={["http://localhost:6767/"]}
+        serverNames={{ "http://localhost:6767": "My laptop" }}
+        onConnect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Local installation (localhost:6767)")).toBeInTheDocument();
+  });
+
+  it("titles a managed server with the organization's name over the server's own", () => {
+    render(
+      <ServerSelectStep
+        {...baseProps}
+        managedServers={["https://omni.example/"]}
+        managedServerNames={{ "https://omni.example/": "Engineering" }}
+        serverNames={{ "https://omni.example": "Self-chosen" }}
+        onConnect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Engineering")).toBeInTheDocument();
+    expect(screen.queryByText(/Self-chosen/)).not.toBeInTheDocument();
+  });
+
   it("with recents, starts on the list (no input) and 'Add server' opens the add view", () => {
     render(
       <ServerSelectStep

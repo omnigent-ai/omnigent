@@ -612,12 +612,20 @@
       // Organization-provided and recent servers share one rendering path.
       // Managed choices are read-only offers: selecting one uses the ordinary
       // explicit Connect flow and never auto-connects the app.
-      function renderServerList(urls, sectionId, listId, sourceLabel) {
+      function renderServerList(urls, sectionId, listId, sourceLabel, names = {}) {
         if (!Array.isArray(urls) || urls.length === 0) return;
         const section = document.getElementById(sectionId);
         const list = document.getElementById(listId);
         for (const url of urls) {
-          const label = serverDisplayLabel(url);
+          // A server's own name is display only, so its host always shows too.
+          let name = null;
+          try {
+            name = names[new URL(url).origin] ?? null;
+          } catch {
+            // Unparseable entries keep their plain label.
+          }
+          const host = serverDisplayLabel(url);
+          const label = typeof name === "string" && name ? `${name} (${host})` : host;
           const row = document.createElement("div");
           row.className = "recent-row";
 
@@ -677,9 +685,16 @@
           renderServerList(servers, "managed", "managed-list", "organization-provided"),
         )
         .catch(() => {});
+      // Names are cosmetic: a shell without them, or a failed read, lists hosts.
+      const serverNames =
+        typeof setup.getServerNames === "function"
+          ? setup.getServerNames().catch(() => ({}))
+          : Promise.resolve({});
       setup
         .getRecentServers()
-        .then((servers) => renderServerList(servers, "recents", "recents-list", "recent"))
+        .then(async (servers) =>
+          renderServerList(servers, "recents", "recents-list", "recent", (await serverNames) ?? {}),
+        )
         .catch(() => {});
 
       // The exact URL value the user has already been warned about — a

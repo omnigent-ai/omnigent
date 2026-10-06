@@ -187,6 +187,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
     _deferred_elicitation_clear_tasks,
+    _intentional_runner_stop_locks,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
     _llm_response_denied_turns,
@@ -257,6 +258,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _handle_advise_models_mcp,
+    _HostRunnerStopAttempt,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
@@ -739,6 +741,96 @@ _pending_archive_stops: dict[str, asyncio.Task[None]] = {}
 # failure, not a sustained outage.
 _ARCHIVE_STOP_LOOKUP_ATTEMPTS = 3
 _ARCHIVE_STOP_LOOKUP_RETRY_S = 0.2
+_RUNNER_STOP_STATUS_BATCH_SIZE = 200
+
+
+async def _stop_host_runner_intentionally(
+    session_id: str,
+    host_id: str,
+    runner_id: str,
+    host_registry: Any,
+    conversation_store: ConversationStore,
+) -> bool:
+    """Carry stop intent to the active sessions sharing the terminated runner.
+
+    Relays consume their own markers; the disconnect sweep settles sessions
+    without a relay. Definitive rejection removes newly added markers, while
+    an unacknowledged dispatch retains intent through timeout or cancellation.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    # An unsuccessful concurrent stop must not roll back a delivered stop's intent.
+    lock = _intentional_runner_stop_locks.setdefault(runner_id, asyncio.Lock())
+    async with lock:
+        statuses: dict[str, str | None] = {}
+        after: str | None = None
+        try:
+            while True:
+                batch = await asyncio.to_thread(
+                    conversation_store.list_runner_session_statuses,
+                    runner_id,
+                    after=after,
+                    limit=_RUNNER_STOP_STATUS_BATCH_SIZE,
+                )
+                statuses.update(batch)
+                if len(batch) < _RUNNER_STOP_STATUS_BATCH_SIZE:
+                    break
+                after = batch[-1][0]
+        except Exception:  # noqa: BLE001
+            # Keep Stop available during a store outage; only known sessions can
+            # inherit intent, so unseen cold sessions keep normal disconnect handling.
+            _logger.warning(
+                "Cannot load all sessions for intentionally stopped runner %s; "
+                "using partial results and live relays",
+                runner_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        for related_id, handle in _runner_relay_tasks.items():
+            if handle.runner_id == runner_id and not handle.task.done():
+                statuses.setdefault(related_id, None)
+        statuses.setdefault(session_id, None)
+        marked: set[str] = set()
+        completed_stop_relays: dict[str, tuple[_RelayHandle, int]] = {}
+        for related_id, persisted_status in statuses.items():
+            handle = _runner_relay_tasks.get(related_id)
+            if handle is not None and handle.runner_id != runner_id:
+                continue
+            live_status = _session_status_cache.get(related_id, persisted_status)
+            # Completed work and earlier task failures keep their existing outcome.
+            if related_id != session_id and live_status not in (*_MID_TURN_STATUSES, None):
+                continue
+            if _intentional_stop_sessions.get(related_id) != runner_id:
+                marked.add(related_id)
+            # Each Stop needs a fresh disconnect window, including repeated requests.
+            _intentional_stop_sessions[related_id] = runner_id
+            if handle is not None:
+                if handle.intentional_stop_turn_ended:
+                    completed_stop_relays[related_id] = (handle, handle.running_event_count)
+                handle.intentional_stop_turn_ended = False
+
+        acknowledged = False
+        attempt = _HostRunnerStopAttempt()
+        try:
+            acknowledged = await _facade._stop_session_host_runner(
+                session_id, host_id, runner_id, host_registry, attempt=attempt
+            )
+        finally:
+            if not acknowledged and (not attempt.dispatched or attempt.rejected):
+                for related_id in marked:
+                    if _intentional_stop_sessions.get(related_id) == runner_id:
+                        _intentional_stop_sessions.pop(related_id, None)
+                # Rejection must not revive stale intent from an earlier completed turn.
+                for related_id, (handle, running_event_count) in completed_stop_relays.items():
+                    if (
+                        _intentional_stop_sessions.get(related_id) == runner_id
+                        and _runner_relay_tasks.get(related_id) is handle
+                    ):
+                        if handle.running_event_count == running_event_count:
+                            handle.intentional_stop_turn_ended = True
+                        else:
+                            _intentional_stop_sessions.pop(related_id, None)
+        return acknowledged
 
 
 async def _archive_stop(
@@ -816,7 +908,21 @@ async def _archive_stop(
 
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
     if conv.host_id and conv.runner_id:
-        await _archive_stop_host_runner(session_id, conv.host_id, conv.runner_id, host_registry)
+        try:
+            await _stop_host_runner_intentionally(
+                session_id,
+                conv.host_id,
+                conv.runner_id,
+                host_registry,
+                conversation_store,
+            )
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Archive host-runner teardown failed for %s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
     # Runs after the runner teardown so the agent isn't left in a deleted cwd.
     if delete_worktree and conv.git_branch and conv.workspace and conv.host_id:
         from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
@@ -840,47 +946,6 @@ async def _archive_stop(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-
-
-async def _archive_stop_host_runner(
-    session_id: str,
-    host_id: str,
-    runner_id: str,
-    host_registry: Any,
-) -> None:
-    """
-    Tear down an archived session's host-launched runner, best-effort.
-
-    :param session_id: Session/conversation identifier.
-    :param host_id: Host that launched the runner.
-    :param runner_id: Runner bound to the session.
-    :param host_registry: The ``HostRegistry`` tracking live host
-        tunnels, or ``None`` when host support is not wired.
-    """
-    from omnigent.server.routes import sessions as _facade
-
-    # Mark the tunnel drop intentional BEFORE tearing it down so the relay
-    # renders a quiet stopped state rather than "runner_disconnected".
-    _intentional_stop_sessions.add(session_id)
-    try:
-        delivered = await _facade._stop_session_host_runner(
-            session_id,
-            host_id,
-            runner_id,
-            host_registry,
-        )
-    except Exception:  # noqa: BLE001
-        _logger.debug(
-            "Archive host-runner teardown failed for %s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-        delivered = False
-    if not delivered:
-        # No tunnel drop will follow, so the marker would outlive this stop
-        # and later swallow a genuine runner_disconnected as a quiet idle.
-        _intentional_stop_sessions.discard(session_id)
 
 
 def _spawn_archive_stop(
@@ -3560,6 +3625,9 @@ async def _publish_runner_recovered_status_impl(
     await _persist_session_status_error_labels(session_id, None, conversation_store)
 
 
+_RUNNER_OFFLINE_RETRY_DELAYS_S = (0.5, 1.0)
+
+
 async def _mark_runner_sessions_offline_impl(
     convs: list[Conversation],
     error: ErrorDetail,
@@ -3586,6 +3654,10 @@ async def _mark_runner_sessions_offline_impl(
     runner comes back — that helper only clears a failure it can identify
     as a disconnect.
 
+    Retry transient binding and settlement errors after reconciling the
+    other sessions. Each retry rechecks current intent and runner ownership;
+    a persistent metadata outage leaves state untouched after three attempts.
+
     :param convs: Conversations bound to the departed runner, from
         :meth:`ConversationStore.list_conversations_by_runner_id`.
     :param error: The cause to publish and persist, e.g.
@@ -3599,11 +3671,88 @@ async def _mark_runner_sessions_offline_impl(
         children are skipped either way.
     :returns: None.
     """
+    pending = convs
+    for delay in (0.0, *_RUNNER_OFFLINE_RETRY_DELAYS_S):
+        if delay:
+            await asyncio.sleep(delay)
+        pending = await _mark_runner_sessions_offline_once(
+            pending, error, conversation_store, fail_idle_top_level=fail_idle_top_level
+        )
+        if not pending:
+            return
+    _logger.warning(
+        "Runner offline reconciliation exhausted metadata retries for %d session(s); "
+        "sample session IDs: %s",
+        len(pending),
+        [conv.id for conv in pending[:10]],
+    )
+
+
+async def _mark_runner_sessions_offline_once(
+    convs: list[Conversation],
+    error: ErrorDetail,
+    conversation_store: ConversationStore,
+    *,
+    fail_idle_top_level: bool,
+) -> list[Conversation]:
+    """Reconcile each session once and return the ones blocked by metadata errors."""
+    retry: list[Conversation] = []
     for conv in convs:
-        # An intentional teardown (Stop / archive) drops the tunnel on
-        # purpose. The relay owns that path — it publishes a quiet idle and
-        # consumes the marker — so peek without discarding here.
-        if conv.id in _intentional_stop_sessions:
+        handle = _runner_relay_tasks.get(conv.id)
+        stopped_runner_id = _intentional_stop_sessions.get(conv.id)
+        if handle is not None and handle.runner_id != conv.runner_id:
+            # A stale sweep must not settle or fail work on a replacement runner.
+            if stopped_runner_id == conv.runner_id:
+                _intentional_stop_sessions.pop(conv.id, None)
+            continue
+        if stopped_runner_id is not None and stopped_runner_id != conv.runner_id:
+            try:
+                binding = await asyncio.to_thread(conversation_store.get_runner_liveness, conv.id)
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Cannot resolve runner binding for %s during offline sweep",
+                    conv.id,
+                    exc_info=True,
+                    extra={"session_id": conv.id},
+                )
+                retry.append(conv)
+                continue
+            if binding is None or binding[0] != conv.runner_id:
+                continue
+            if _intentional_stop_sessions.get(conv.id) == stopped_runner_id:
+                _intentional_stop_sessions.pop(conv.id, None)
+        # The relay consumes stop intent; the sweep settles sessions without
+        # a local relay so they cannot remain running after an expected exit.
+        if stopped_runner_id is not None and stopped_runner_id == conv.runner_id:
+            if handle is None or handle.task.done():
+                if _session_status_cache.get(conv.id, conv.live_status) in _MID_TURN_STATUSES:
+                    # Order the conditional settlement after earlier live-state writes.
+                    # The database binding guards sessions rebound before a relay exists.
+                    settled = await asyncio.wrap_future(
+                        session_live_state.submit(
+                            "settle_intentional_stop",
+                            conversation_store.settle_intentionally_stopped_session,
+                            conv.id,
+                            stopped_runner_id,
+                        )
+                    )
+                    if settled is None:
+                        retry.append(conv)
+                        continue
+                    current_handle = _runner_relay_tasks.get(conv.id)
+                    if (
+                        current_handle is not None
+                        and current_handle.runner_id == stopped_runner_id
+                        and not current_handle.task.done()
+                    ):
+                        continue
+                    if settled and (
+                        current_handle is None or current_handle.runner_id == stopped_runner_id
+                    ):
+                        session_live_state.forget_live_status(conv.id)
+                        _publish_status(conv.id, "idle", persist_live_status=False)
+                if _intentional_stop_sessions.get(conv.id) == stopped_runner_id:
+                    _intentional_stop_sessions.pop(conv.id, None)
             continue
         if not await _runner_disconnect_requires_failure(
             conv.id,
@@ -3620,6 +3769,7 @@ async def _mark_runner_sessions_offline_impl(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
+    return retry
 
 
 async def _wait_for_host_reconnect(
@@ -7358,7 +7508,11 @@ async def _runner_disconnect_requires_failure(
         live, source = None, "unknown"
 
     conv = persisted if persisted is not None else fallback
-    if snapshot is not None and session_id in _intentional_stop_sessions:
+    if (
+        snapshot is not None
+        and snapshot.runner_id is not None
+        and _intentional_stop_sessions.get(session_id) == snapshot.runner_id
+    ):
         # A Stop can arrive while the sweep refreshes its row.
         decision = "intentional_stop"
     elif live in _MID_TURN_STATUSES and source != "cache" and _owned_by_parent_runtime(conv):
@@ -7445,6 +7599,8 @@ async def _relay_runner_stream(
     runner_client: httpx.AsyncClient,
     conversation_store: ConversationStore,
     ready: asyncio.Event | None = None,
+    *,
+    runner_id: str | None = None,
 ) -> None:
     """
     Run the runner-stream relay, riding out transient tunnel drops.
@@ -7471,6 +7627,7 @@ async def _relay_runner_stream(
         extracted from the runner's SSE stream.
     :param ready: Optional event set once the runner stream emits its
         ready heartbeat; see :func:`_relay_runner_stream_once`.
+    :param runner_id: The runner this relay owns, including after a session rebind.
     """
     loop = asyncio.get_running_loop()
     deadline: float | None = None
@@ -7484,6 +7641,7 @@ async def _relay_runner_stream(
                 runner_client,
                 conversation_store,
                 ready,
+                runner_id=runner_id,
             )
             return
         except _RelayTransportLost as lost:
@@ -7558,20 +7716,15 @@ async def _relay_runner_stream(
                 ),
             )
             if decision == "intentional_stop":
-                # User clicked Stop: the Stop handler brought this runner's
-                # tunnel down on purpose (see _stop_session_host_runner), so
-                # the drop is expected — not a failure. Publish a quiet idle
-                # and clear any error label so the chat and sidebar settle
-                # to a stopped state instead of rendering
-                # "Error · runner_disconnected". The one-shot marker was
-                # already consumed by the relay teardown, so a genuine later
-                # disconnect surfaces normally.
+                # An expected drop must not erase a real failure reported during
+                # teardown: preserve its labels when the sticky status stays failed.
                 _publish_status(session_id, "idle")
-                await _persist_session_status_error_labels(
-                    session_id,
-                    None,
-                    conversation_store,
-                )
+                if _session_status_cache.get(session_id) != "failed":
+                    await _persist_session_status_error_labels(
+                        session_id,
+                        None,
+                        conversation_store,
+                    )
             elif decision == "server_shutdown":
                 # This server closed the tunnel on its way down; the runner is
                 # reachable, just not by a process that stopped listening. The
@@ -7645,6 +7798,8 @@ async def _relay_runner_stream_once(
     runner_client: httpx.AsyncClient,
     conversation_store: ConversationStore,
     ready: asyncio.Event | None = None,
+    *,
+    runner_id: str | None = None,
 ) -> None:
     """
     Subscribe to the runner's SSE stream and relay events locally.
@@ -7672,6 +7827,7 @@ async def _relay_runner_stream_once(
         slot is registered. ``None`` is accepted for direct unit tests
         that exercise relay parsing/persistence without asserting on
         startup readiness.
+    :param runner_id: The runner this attempt owns, used to match stop intent.
     """
     text_acc: list[str] = []
     current_response_id: str | None = None
@@ -7757,6 +7913,27 @@ async def _relay_runner_stream_once(
                             ready.set()
                         continue
 
+                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES or (
+                        evt_type == "session.status" and event.get("status") == "running"
+                    ):
+                        relay = _runner_relay_tasks.get(session_id)
+                        if relay is not None and relay.task is asyncio.current_task():
+                            if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                                relay.intentional_stop_turn_ended = (
+                                    runner_id is not None
+                                    and _intentional_stop_sessions.get(session_id) == runner_id
+                                )
+                            else:
+                                relay.running_event_count += 1
+                                # Running can resume the same turn, including after PTY idle.
+                                # Only completed stopped work makes its marker stale.
+                                if (
+                                    relay.intentional_stop_turn_ended
+                                    and _intentional_stop_sessions.get(session_id) == runner_id
+                                ):
+                                    _intentional_stop_sessions.pop(session_id, None)
+                                relay.intentional_stop_turn_ended = False
+
                     if evt_type == "session.created":
                         child_id = event.get("child_session_id")
                         if isinstance(child_id, str) and child_id:
@@ -7824,13 +8001,6 @@ async def _relay_runner_stream_once(
                                     None,
                                     conversation_store,
                                 )
-                                # A new turn proves the runner is live again, so
-                                # a prior Stop that never dropped the tunnel must
-                                # not leave the intentional-stop marker to swallow
-                                # this turn's genuine disconnect. Fence-independent
-                                # (the fence may already be cleared by a terminal
-                                # stop event), so it fires on every running edge.
-                                _intentional_stop_sessions.discard(session_id)
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
                             # via external_session_status (the codex-shared path)
@@ -8371,7 +8541,10 @@ async def _relay_runner_stream_once(
             # Treat a bare EOF without ``[DONE]`` as a tunnel drop.
             # Route it through the existing bounded recovery path.
             raise _RelayTransportLost(
-                intentional=session_id in _intentional_stop_sessions,
+                intentional=(
+                    runner_id is not None
+                    and _intentional_stop_sessions.get(session_id) == runner_id
+                ),
                 stream_ready=heartbeat_seen,
             )
 
@@ -8392,7 +8565,9 @@ async def _relay_runner_stream_once(
         # intentional-stop marker, so snapshot it now for the supervisor's
         # retry-vs-quiet-exit decision.
         raise _RelayTransportLost(
-            intentional=session_id in _intentional_stop_sessions,
+            intentional=(
+                runner_id is not None and _intentional_stop_sessions.get(session_id) == runner_id
+            ),
             stream_ready=heartbeat_seen,
         ) from exc
     except asyncio.CancelledError:
@@ -8413,7 +8588,8 @@ async def _relay_runner_stream_once(
         # exits some other way (clean [DONE], rebind cancellation) can't
         # leave a stale marker to swallow a later genuine disconnect on the
         # reused per-session relay task.
-        _intentional_stop_sessions.discard(session_id)
+        if _intentional_stop_sessions.get(session_id) == runner_id:
+            _intentional_stop_sessions.pop(session_id, None)
         # Relay ended (runner dropped/rebound): re-discover runner-backed
         # snapshot overlays next time. Cancel in-flight fetches so they can't
         # land stale values from the dead runner; the model catalog is only
@@ -8462,6 +8638,9 @@ def _ensure_runner_relay(
             extra={"session_id": session_id},
         )
         return None
+    stopped_runner_id = _intentional_stop_sessions.get(session_id)
+    if stopped_runner_id is not None and stopped_runner_id != runner_id:
+        _intentional_stop_sessions.pop(session_id, None)
     existing = _runner_relay_tasks.get(session_id)
     if existing is not None:
         if existing.runner_id == runner_id and not existing.task.done():
@@ -8501,6 +8680,7 @@ def _ensure_runner_relay(
                 runner_client,
                 relay_store,
                 ready,
+                runner_id=runner_id,
             ),
             name=f"runner-relay-{session_id}",
         )
@@ -12157,6 +12337,7 @@ __all__ = [
     "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
+    "_stop_host_runner_intentionally",
     "_wait_for_host_bound_runner_client",
     "_wait_for_host_reconnect",
     "_wake_parent_for_blocked_child",

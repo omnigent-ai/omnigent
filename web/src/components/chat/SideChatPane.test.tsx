@@ -1,4 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { createPortal } from "react-dom";
+import { StrictMode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { toast } from "sonner";
@@ -48,6 +50,7 @@ beforeEach(() => {
     blockedOn: null,
     backgroundTaskCount: 0,
     sideChatDrafts: {},
+    sideChatComposers: {},
     send,
   });
   conversationRegistry.acquire(childId).setState({
@@ -309,6 +312,115 @@ describe("side-chat interrupt", () => {
 
     expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
     expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+  });
+});
+
+describe("seeded /side question survives an unmount before the child binds", () => {
+  // Switching rail tabs (or crossing the mobile breakpoint) unmounts this pane.
+  // The question must not die with it: it stays in the store until the send
+  // actually dispatches, which needs the child's agent binding.
+  it("defers the send while unbound, then sends exactly once on remount", async () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null });
+    useChatStore.setState({ sideChatDrafts: { [childId]: "why backoff?" } });
+
+    const first = renderPane(<SideChatPane childId={childId} />);
+    expect(send).not.toHaveBeenCalled();
+    // Unmount before the binding arrives (drawer closed / tab switched).
+    first.unmount();
+    expect(useChatStore.getState().sideChatDrafts[childId]).toBe("why backoff?");
+
+    // Remount with the binding known: the held question goes out, once.
+    conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" });
+    renderPane(<SideChatPane childId={childId} />);
+
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith("why backoff?", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+    // Consumed, so a later remount can't send it a second time.
+    expect(useChatStore.getState().sideChatDrafts[childId]).toBeUndefined();
+    cleanup();
+    renderPane(<SideChatPane childId={childId} />);
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+  });
+
+  it("sends once under StrictMode's replayed mount effect", async () => {
+    // React StrictMode runs mount effects twice in development. The send must
+    // consume the live store draft, not the one captured at render, or the
+    // question goes out twice.
+    useChatStore.setState({ sideChatDrafts: { [childId]: "why?" } });
+
+    renderPane(
+      <StrictMode>
+        <SideChatPane childId={childId} />
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(useChatStore.getState().sideChatDrafts[childId]).toBeUndefined();
+  });
+
+  it("sends once when the binding arrives while still mounted", async () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null });
+    useChatStore.setState({ sideChatDrafts: { [childId]: "why?" } });
+    renderPane(<SideChatPane childId={childId} />);
+    expect(send).not.toHaveBeenCalled();
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(useChatStore.getState().sideChatDrafts[childId]).toBeUndefined();
+  });
+});
+
+describe("unsent composer state survives the pane moving", () => {
+  // The pane mounts in the desktop rail OR the mobile drawer's portal, so
+  // crossing the `md` breakpoint (a phone rotating) moves it between subtrees
+  // and unmounts it — as does switching rail tabs. Its text and attachments
+  // must not go with it, so they live in the store keyed by child id.
+  function Host({ mobile }: { mobile: boolean }) {
+    const pane = <SideChatPane childId={childId} />;
+    return (
+      <>
+        <div data-testid="rail">{mobile ? <div data-testid="files" /> : pane}</div>
+        {mobile && createPortal(<div data-testid="drawer">{pane}</div>, document.body)}
+      </>
+    );
+  }
+
+  it("keeps text and attachments across the mobile/desktop breakpoint", () => {
+    const view = renderPane(<Host mobile />);
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "half-typed question" },
+    });
+    const file = new File(["x"], "notes.txt", { type: "text/plain" });
+    // The attach input is hidden (the "+" tray proxies to it), so no test id.
+    fireEvent.change(document.querySelector('input[type="file"]')!, {
+      target: { files: [file] },
+    });
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+
+    // Rotate to landscape: the rail takes over and the portal goes away.
+    act(() => view.rerender(<Host mobile={false} />));
+
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("half-typed question");
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+
+    // And back to portrait.
+    act(() => view.rerender(<Host mobile />));
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("half-typed question");
+  });
+
+  it("drops the draft once it is sent", async () => {
+    // Idle, so the trailing button is Send rather than Interrupt.
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "ask this" } });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("");
   });
 });
 
