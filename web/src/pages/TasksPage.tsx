@@ -149,7 +149,7 @@ export function TasksPage() {
   const hasAnyTasks = (tasks ?? []).length > 0;
 
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-4 md:px-6">
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
           <h1 className="text-2xl font-semibold">Automations</h1>

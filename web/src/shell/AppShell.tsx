@@ -96,6 +96,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { isTempConvId, useChatStore } from "@/store/chatStore";
+import { supportsSideChat } from "@/lib/sideChat";
 import {
   STARTING_GRACE_S,
   livenessRowFromSession,
@@ -438,6 +439,7 @@ export function AppShell() {
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
   const [githubPanelOpen, setGithubPanelOpen] = useState(false);
+  const [sideChatsPanelOpen, setSideChatsPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
   // state per session. A brand-new session (no saved `open`) follows the
   // Appearance "Workspace panel" default; reopening a session restores how
@@ -1091,6 +1093,7 @@ export function AppShell() {
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
     setGithubPanelOpen(false);
+    setSideChatsPanelOpen(false);
     setFilesPanelShowHidden(true);
     // Drop shell interaction state carried from the outgoing session: a
     // still-armed create ref would otherwise auto-focus an unrelated shell in
@@ -1321,6 +1324,10 @@ export function AppShell() {
       setExecutionLogsKey(null); // close execution-logs panel
       setFilesPanelOpen(false); // close files drawer so the viewer is unobscured
       setSubagentsPanelOpen(false); // close mobile agents drawer
+      // A side chat's reply can link into the workspace: its drawer is portaled
+      // to the body at the same z-index, so it would cover the file viewer the
+      // tap just opened and the tap would read as dead.
+      setSideChatsPanelOpen(false); // close mobile side-chats drawer
       // Pull the rail to the Files tab when parked on a tab where the viewer
       // won't render (Subagents). The Files tab surfaces the
       // FileViewer inline, so leave it undisturbed.
@@ -1792,15 +1799,38 @@ export function AppShell() {
     };
   }, [conversationId, handleRightRailTabChange, setRightPanelOpenAnimated]);
 
-  // A side chat the user just opened must be visible: reveal the Workspace rail
-  // so its soft tab shows. WorkspacePanel owns opening/selecting the tab and
-  // clearing the one-shot `sideChatToOpen` signal (it holds the side-chat tab
-  // state, like the browser tabs); AppShell only ensures the rail is open.
+  // Mobile FAB → "Side chats" opens the session's side chats as a full-screen
+  // drawer (the desktop rail shows them as soft tabs). Also used when a side
+  // chat the user just started resolves, so it is visible on a phone.
+  const openSideChatsPanel = useCallback(() => {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
+    setSideChatsPanelOpen(true);
+  }, [clearFileViewerUrl, setPanelInitialKey]);
+
+  // A side chat the user just opened must be visible: reveal the surface that
+  // shows it — the Workspace rail, or the drawer on a phone. WorkspacePanel
+  // owns opening/selecting the tab and clearing the one-shot `sideChatToOpen`
+  // signal (it holds the side-chat tab state, like the browser tabs).
   const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
   useEffect(() => {
-    if (sideChatToOpen === null) return;
+    // Only the parent that owns the side chat reveals it: a fork that resolves
+    // after the user moved to another conversation must not surface over the
+    // one on screen (WorkspacePanel applies the same test before taking the
+    // signal, so it stays queued). Keyed on `conversationId` too, so coming
+    // back to the owner re-runs this and still reveals the tab.
+    if (sideChatToOpen === null || sideChatToOpen.parentId !== conversationId) return;
     setRightPanelOpenAnimated(true);
-  }, [sideChatToOpen, setRightPanelOpenAnimated]);
+    // Phones hide the rail, so the side chat opens in its drawer instead.
+    if (isMobileViewport()) openSideChatsPanel();
+  }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
+  const showSideChats = supportsSideChat(useChatStore((s) => s.sessionHarness));
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -1929,6 +1959,7 @@ export function AppShell() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setExecutionLogsKey(key);
   }
 
@@ -1942,6 +1973,7 @@ export function AppShell() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setFilesDrawerFlatView(flatView);
     setFilesPanelOpen(true);
   }
@@ -1958,6 +1990,7 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setSubagentsPanelOpen(true);
   }
 
@@ -1973,6 +2006,7 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setShellsPanelOpen(true);
   }
 
@@ -1987,6 +2021,7 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
+    setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setGithubPanelOpen(true);
   }, [clearFileViewerUrl, setPanelInitialKey]);
 
@@ -2351,6 +2386,7 @@ export function AppShell() {
                     // appeared. Left collapsed, the breadcrumb stays put beneath
                     // the floating card (and in the title-bar strip on mac).
                     sidebarOpen={sidebarOpen}
+                    settingsMode={inSettings}
                     onOpenSidebar={(peek?: boolean) => {
                       if (peek) {
                         setSidebarPeek(true);
@@ -2394,6 +2430,8 @@ export function AppShell() {
                       subagentsPanelOpen,
                       shellsPanelOpen,
                       githubPanelOpen,
+                      sideChatsPanelOpen,
+                      showSideChats,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2411,6 +2449,7 @@ export function AppShell() {
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
                       onOpenGithub: openGithubPanel,
+                      onOpenSideChats: openSideChatsPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -2494,6 +2533,8 @@ export function AppShell() {
                     liveness={liveness}
                     onShellCreateStart={markShellCreateStarted}
                     onShellCreateFailed={clearShellCreatePending}
+                    mobileSideChatsOpen={sideChatsPanelOpen}
+                    onMobileSideChatsOpenChange={setSideChatsPanelOpen}
                   />
                 )}
               </div>

@@ -556,13 +556,11 @@ describe("HeaderConversationMenu", () => {
     expect(document.body.style.pointerEvents).toBe("none");
   });
 
-  it("wears the mobile glass surface and a round trigger", () => {
-    // The trigger sits inside the header's round floating pill; a rounded-lg
-    // open-state background showed through it as a square.
+  it("keeps the trigger flat while retaining a legible mobile menu surface", () => {
     mocks.isMobile = true;
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
-    expect(trigger).toHaveClass("max-md:rounded-full");
+    expect(trigger).not.toHaveClass("max-md:rounded-full");
 
     openMenu();
     expect(screen.getByRole("menu")).toHaveClass(

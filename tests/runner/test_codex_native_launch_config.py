@@ -246,7 +246,7 @@ async def test_native_metadata_reads_skip_usage_aggregation(
         "include_liveness": "false",
         "include_usage": "false",
     }
-    assert requests[0].extensions["timeout"]["read"] == 10.0
+    assert requests[0].extensions["timeout"]["read"] == 20.0
 
 
 @pytest.mark.asyncio

@@ -152,6 +152,16 @@ class CodexStartupFailure:
     remediation: str | None = None
 
 
+#: What a turn reports when its session's app-server is gone, and the record
+#: :func:`record_app_server_stopped` leaves so the next terminal ensure replaces the pane.
+CODEX_APP_SERVER_STOPPED = CodexStartupFailure(
+    message="Codex's app-server for this session stopped, so this message was not delivered.",
+    code="codex_app_server_stopped",
+    title="Codex stopped unexpectedly",
+    remediation="Send your message again. If it keeps failing, start a new session.",
+)
+
+
 @dataclass(frozen=True)
 class CodexNativeBridgeState:
     """
@@ -1097,6 +1107,29 @@ def read_bridge_startup_error(bridge_dir: Path) -> str | None:
     """
     failure = read_bridge_startup_failure(bridge_dir)
     return failure.message if failure is not None else None
+
+
+def record_app_server_stopped(bridge_dir: Path) -> None:
+    """
+    Record that a session's app-server is gone, unless a cause is already recorded.
+
+    A runner-owned Codex pane whose app-server is gone and whose bridge carries a
+    startup record is not reusable: the next terminal ensure replaces it with a
+    fresh app-server, instead of keeping a pane every turn would fail against.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: None.
+    """
+    if not bridge_dir.is_dir() or read_bridge_startup_error(bridge_dir) is not None:
+        return
+    failure = CODEX_APP_SERVER_STOPPED
+    write_bridge_startup_error(
+        bridge_dir,
+        failure.message,
+        code=failure.code,
+        title=failure.title,
+        remediation=failure.remediation,
+    )
 
 
 def read_mcp_startup(bridge_dir: Path) -> dict[str, dict[str, str | None]]:

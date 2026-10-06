@@ -59,6 +59,7 @@ from omnigent.models.claude_model_vocabulary import (
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 
@@ -899,7 +900,7 @@ def _build_mcp_tools(
                         "content": [
                             {
                                 "type": "text",
-                                "text": json.dumps(
+                                "text": json_dumps_transport_safe(
                                     {"error": f"No tool executor for '{tool_name}'"}
                                 ),
                             }
@@ -919,7 +920,7 @@ def _build_mcp_tools(
                         response["is_error"] = image_result.is_error
                         return response
                     response = {
-                        "content": [{"type": "text", "text": json.dumps(result)}],
+                        "content": [{"type": "text", "text": json_dumps_transport_safe(result)}],
                     }
                     if result.get("blocked") is True or (
                         "error" in result and result.get("error")
@@ -928,7 +929,12 @@ def _build_mcp_tools(
                     return response
                 except Exception as exc:  # noqa: BLE001 — tool handler converts any error to MCP error response
                     return {
-                        "content": [{"type": "text", "text": json.dumps({"error": str(exc)})}],
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json_dumps_transport_safe({"error": str(exc)}),
+                            }
+                        ],
                         "isError": True,
                     }
 

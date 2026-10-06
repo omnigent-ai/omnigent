@@ -134,7 +134,7 @@ export const SettingsHarnessesSection = () => {
       ) : (
         <>
           <div className="flex flex-wrap items-center justify-between gap-4 pb-6">
-            <h1 className="text-2xl font-semibold">Harnesses</h1>
+            <h1 className="settings-page-title text-2xl font-semibold">Harnesses</h1>
             <HostSelect hosts={sortedHosts} selected={host} onSelect={setSelectedHostId} />
           </div>
           <div className="mb-6 flex items-center gap-2">
@@ -410,7 +410,7 @@ function HarnessDetail({
         <div className="flex min-w-0 items-center gap-3">
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-2xl font-semibold">{entry.name}</h1>
+            <h1 className="settings-page-title truncate text-2xl font-semibold">{entry.name}</h1>
             <HarnessStatusText status={status} />
           </div>
         </div>

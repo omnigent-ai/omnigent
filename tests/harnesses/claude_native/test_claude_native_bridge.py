@@ -401,7 +401,7 @@ def test_prepare_bridge_dir_persists_and_applies_resolved_sandbox(
 
     ``enforce_sandbox``/``force_sandbox`` resolves a real sandbox onto the
     session's ``os_env.sandbox`` upstream (``runner/app.py``'s
-    ``_apply_sandbox_override_from_verdict``), but that decision used to
+    ``_apply_sandbox_override_from_start_data``), but that decision used to
     have no path into the claude-native bridge: ``prepare_bridge_dir``
     never wrote it to the config file, and ``_build_tools`` unconditionally
     hardcoded ``OSEnvSandboxSpec(type="none")`` regardless of the policy.

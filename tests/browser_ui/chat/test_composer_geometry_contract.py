@@ -236,7 +236,9 @@ def test_label_collapse_preserves_submit_geometry(
     _surface(page, chat, surface, DESKTOP)
     card_locator = page.locator("[data-composer-card]")
     expanded_inset = right_inset(box(card_locator), box(_submit(page, surface)))
-    page.set_viewport_size({"width": 280, "height": PHONE["height"]})
+    # Exercise the narrowest common phone width after the mobile composer
+    # adopted 24px outer gutters.
+    page.set_viewport_size({"width": 320, "height": PHONE["height"]})
     expect(_action_row(page, surface)).to_have_attribute("data-labels", "collapsed")
     collapsed_inset = right_inset(box(card_locator), box(_submit(page, surface)))
     assert collapsed_inset == pytest.approx(expanded_inset, abs=TOLERANCE)

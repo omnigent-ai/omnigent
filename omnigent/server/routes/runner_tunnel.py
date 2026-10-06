@@ -55,7 +55,7 @@ SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
-_ON_RUNNER_CONNECT_TIMEOUT_SEC = 30.0
+_RUNNER_RECOVERY_SLOW_SEC = 30.0
 
 # Lifetime of a managed runner's minted owner bearer (POST
 # /v1/runners/{id}/token). Short by design: the runner re-mints on demand
@@ -184,8 +184,8 @@ def create_runner_tunnel_router(
     registry: TunnelRegistry,
     *,
     allowed_tunnel_tokens: frozenset[str] | None = None,
-    on_runner_disconnect: Callable[[str], Awaitable[None]] | None = None,
-    on_runner_connect: Callable[[str], Awaitable[None]] | None = None,
+    on_runner_disconnect: Callable[[str, RunnerSession], Awaitable[None]] | None = None,
+    on_runner_connect: Callable[[str, RunnerSession], Awaitable[None]] | None = None,
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
@@ -204,10 +204,10 @@ def create_runner_tunnel_router(
         shared remote-server behavior by accepting any token-bound
         runner id.
     :param on_runner_disconnect: Optional async callback fired when
-        a runner's tunnel closes. Receives the ``runner_id``. Used
+        a runner's tunnel closes. Receives the ``runner_id`` and connection. Used
         by the sessions module to mark sessions ``runner_offline``.
     :param on_runner_connect: Optional async callback fired when a
-        runner tunnel is established. Receives the ``runner_id``.
+        runner tunnel is established. Receives the ``runner_id`` and connection.
         Used to re-assign sessions on runner reconnect.
     :param auth_provider: Optional auth provider for user identity
         extraction. When set, runner listing is scoped to the
@@ -476,6 +476,7 @@ def create_runner_tunnel_router(
         await ws.accept()
         session: RunnerSession | None = None
         ended_by: str | None = None
+        owned: list[asyncio.Task[None]] = []
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
             now = time.time()
@@ -555,115 +556,82 @@ def create_runner_tunnel_router(
                 name=f"tunnel-receive:{runner_id}",
             )
 
+            owned.extend((sender_task, ping_task, keepalive_task, receive_task))
+
             if EVENT_INGEST_CAPABILITY in frame.capabilities and callable(
                 getattr(ws.app.state, "runner_event_ingest", None)
             ):
                 await registry.send_text(session, encode_frame(EventReadyFrame()))
 
             if on_runner_connect is not None:
-                # Bounded so a slow / hung hook can't stall WS
-                # shutdown: helper tasks are already running, but
-                # we still await the hook before entering the
-                # tunnel's main wait loop.
-                try:
-                    await asyncio.wait_for(
-                        on_runner_connect(runner_id),
-                        timeout=_ON_RUNNER_CONNECT_TIMEOUT_SEC,
+                owned.append(
+                    asyncio.create_task(
+                        _run_connect_hook(on_runner_connect, session),
+                        name=f"tunnel-recovery:{runner_id}",
                     )
-                except asyncio.TimeoutError:
-                    _logger.warning(
-                        "on_runner_connect callback timed out for %s after %ss",
-                        runner_id,
-                        _ON_RUNNER_CONNECT_TIMEOUT_SEC,
-                    )
-                except Exception:
-                    _logger.exception(
-                        "on_runner_connect callback failed for %s",
-                        runner_id,
-                    )
+                )
 
-            try:
-                done, _pending = await asyncio.wait(
-                    {sender_task, ping_task, receive_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                # Every helper that had finished, by role: a server-declared
-                # ping timeout may or may not already carry the peer's close.
-                ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
-                for task in done:
-                    task_name = task.get_name()
-                    if task.cancelled():
-                        _logger.warning(
-                            "Tunnel helper task cancelled for runner %s: %s",
-                            runner_id,
-                            task_name,
-                        )
-                        continue
-                    task_error = task.exception()
-                    if task_error is None:
-                        _logger.warning(
-                            "Tunnel helper task ended for runner %s: %s",
-                            runner_id,
-                            task_name,
-                        )
-                        continue
-                    if isinstance(task_error, WebSocketDisconnect):
-                        shutdown_state.note_tunnel_close_code(getattr(task_error, "code", None))
-                        _logger.warning(
-                            "Tunnel helper task disconnected for runner %s: %s "
-                            "(code=%s, reason=%r)",
-                            runner_id,
-                            task_name,
-                            getattr(task_error, "code", None),
-                            getattr(task_error, "reason", None),
-                        )
-                    else:
-                        _logger.warning(
-                            "Tunnel helper task failed for runner %s: %s",
-                            runner_id,
-                            task_name,
-                            exc_info=(
-                                type(task_error),
-                                task_error,
-                                task_error.__traceback__,
-                            ),
-                        )
-                    raise task_error
-                # Server-initiated closes may end a helper without a peer reply.
-                # Emit the same event shape as the WebSocketDisconnect path.
-                _logger.info(
-                    "Runner %s tunnel closed (%s ended; code=%s, reason=%r)",
-                    runner_id,
-                    ended_by,
-                    session.close_code,
-                    session.close_reason,
-                    extra=debug_event(
-                        "runner_tunnel",
-                        phase="disconnected",
-                        code=session.close_code,
-                        reason=session.close_reason,
-                        **_connection_attrs(),
-                    ),
-                )
-            finally:
-                for task in (sender_task, ping_task, receive_task, keepalive_task):
-                    task.cancel()
-                await asyncio.gather(
-                    sender_task,
-                    ping_task,
-                    receive_task,
-                    keepalive_task,
-                    return_exceptions=True,
-                )
-                registry.deregister(runner_id, session)
-                if on_runner_disconnect is not None:
-                    try:
-                        await on_runner_disconnect(runner_id)
-                    except Exception:
-                        _logger.exception(
-                            "on_runner_disconnect callback failed for %s",
-                            runner_id,
-                        )
+            done, _pending = await asyncio.wait(
+                {sender_task, ping_task, receive_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Every helper that had finished, by role: a server-declared
+            # ping timeout may or may not already carry the peer's close.
+            ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
+            for task in done:
+                task_name = task.get_name()
+                if task.cancelled():
+                    _logger.warning(
+                        "Tunnel helper task cancelled for runner %s: %s",
+                        runner_id,
+                        task_name,
+                    )
+                    continue
+                task_error = task.exception()
+                if task_error is None:
+                    _logger.warning(
+                        "Tunnel helper task ended for runner %s: %s",
+                        runner_id,
+                        task_name,
+                    )
+                    continue
+                if isinstance(task_error, WebSocketDisconnect):
+                    shutdown_state.note_tunnel_close_code(getattr(task_error, "code", None))
+                    _logger.warning(
+                        "Tunnel helper task disconnected for runner %s: %s (code=%s, reason=%r)",
+                        runner_id,
+                        task_name,
+                        getattr(task_error, "code", None),
+                        getattr(task_error, "reason", None),
+                    )
+                else:
+                    _logger.warning(
+                        "Tunnel helper task failed for runner %s: %s",
+                        runner_id,
+                        task_name,
+                        exc_info=(
+                            type(task_error),
+                            task_error,
+                            task_error.__traceback__,
+                        ),
+                    )
+                raise task_error
+            # Server-initiated closes may end a helper without a peer reply.
+            # Emit the same event shape as the WebSocketDisconnect path.
+            _logger.info(
+                "Runner %s tunnel closed (%s ended; code=%s, reason=%r)",
+                runner_id,
+                ended_by,
+                session.close_code,
+                session.close_reason,
+                extra=debug_event(
+                    "runner_tunnel",
+                    phase="disconnected",
+                    code=session.close_code,
+                    reason=session.close_reason,
+                    **_connection_attrs(),
+                ),
+            )
 
         except WebSocketDisconnect as exc:
             shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
@@ -680,34 +648,64 @@ def create_runner_tunnel_router(
                     **_connection_attrs(),
                 ),
             )
-            if on_runner_disconnect is not None:
-                try:
-                    await on_runner_disconnect(runner_id)
-                except Exception:
-                    _logger.exception(
-                        "on_runner_disconnect callback failed for %s",
-                        runner_id,
-                    )
         except Exception:
             _logger.exception(
                 "Tunnel error for runner %s",
                 runner_id,
                 extra=debug_event("runner_tunnel", phase="error", **_connection_attrs()),
             )
+        finally:
+            for task in owned:
+                task.cancel()
+            await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
                 registry.deregister(runner_id, session)
-            else:
-                registry.deregister(runner_id)
-            if on_runner_disconnect is not None:
-                try:
-                    await on_runner_disconnect(runner_id)
-                except Exception:
-                    _logger.exception(
-                        "on_runner_disconnect callback failed for %s",
-                        runner_id,
-                    )
+                if on_runner_disconnect is not None:
+                    try:
+                        await on_runner_disconnect(runner_id, session)
+                    except Exception:
+                        _logger.exception("on_runner_disconnect callback failed for %s", runner_id)
 
     return router
+
+
+async def _run_connect_hook(
+    hook: Callable[[str, RunnerSession], Awaitable[None]], session: RunnerSession
+) -> None:
+    """Recover for the connection's lifetime, warning without cancelling slow work."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    runner_id = session.runner_id
+    attrs = {"runner_id": runner_id, "connection_id": session.hello.connection_id}
+    slow = loop.call_later(
+        _RUNNER_RECOVERY_SLOW_SEC,
+        lambda: _logger.warning(
+            "Runner recovery still running for %s after %ss",
+            runner_id,
+            _RUNNER_RECOVERY_SLOW_SEC,
+            extra=debug_event("runner_recovery", outcome="slow", **attrs),
+        ),
+    )
+    outcome = "completed"
+    try:
+        await hook(runner_id, session)
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    except Exception:
+        outcome = "failed"
+        _logger.exception("on_runner_connect callback failed for %s", runner_id)
+    finally:
+        slow.cancel()
+        _logger.info(
+            "Runner recovery %s for %s after %.1fs",
+            outcome,
+            runner_id,
+            loop.time() - started,
+            extra=debug_event(
+                "runner_recovery", outcome=outcome, duration_s=loop.time() - started, **attrs
+            ),
+        )
 
 
 async def _sender_loop(ws: WebSocket, session: RunnerSession) -> None:
@@ -821,8 +819,22 @@ async def _receive_loop(
                     runner_id=runner_id,
                     batch=batch,
                 )
-        except Exception:
-            _logger.exception("Runner %s event ingestion failed", runner_id)
+        except Exception as exc:
+            _logger.exception(
+                "Runner %s event ingestion failed",
+                runner_id,
+                extra=debug_event(
+                    "runner_event_ingest_failed",
+                    session_id=batch.session_id,
+                    runner_id=runner_id,
+                    connection_id=session.hello.connection_id,
+                    batch_id=batch.id,
+                    batch_size=len(batch.events),
+                    failure_stage="dispatch",
+                    error_type=type(exc).__name__,
+                    retryable=True,
+                ),
+            )
             ack = EventAckFrame(batch.id, 0, "ingest failed", retryable=True)
         if registry.get(runner_id) is session:
             # A replacement tunnel can register between the check and enqueue.

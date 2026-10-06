@@ -64,6 +64,8 @@ export interface ServerSelectorV2Setup {
   managedServers: string[];
   /** Display names for managed servers, server URL → name (from the MDM URL). */
   managedServerNames?: Record<string, string>;
+  /** Names servers gave themselves, origin → name. Display only. */
+  serverNames?: Record<string, string>;
   /** Whether the `omnigent` CLI is already installed. Drives the "Install" vs
    *  "Start"/"Open" action label and whether install runs first. */
   installed?: boolean;
@@ -369,6 +371,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
           <LandingStep
             managedServers={setup.managedServers}
             managedServerNames={setup.managedServerNames}
+            serverNames={setup.serverNames}
             recentServers={setup.recentServers}
             error={landingError}
             connection={connection}
@@ -437,6 +440,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             error={setup.error}
             recentServers={setup.recentServers}
             managedServers={setup.managedServers}
+            managedServerNames={setup.managedServerNames}
+            serverNames={setup.serverNames}
             installed={setup.installed}
             onBack={() => setStep("landing")}
             onConnect={connect}

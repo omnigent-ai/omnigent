@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from websockets.exceptions import ConnectionClosedError, InvalidMessage
 
 import omnigent.inner.codex_native_executor as codex_native_executor
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
+    CODEX_APP_SERVER_STOPPED,
     CodexNativeBridgeState,
     read_bridge_state,
     read_codex_config_effort,
@@ -1621,6 +1623,258 @@ def test_run_turn_surfaces_coded_startup_failure(
     assert "HQ7M-2KPD" in error.remediation
     # The message never reached Codex: the sender's queued copy is the record.
     assert error.undelivered is True
+
+
+class _UnreachableClient(_FakeCodexNativeClient):
+    """Fail the connect the way a vanished app-server does; ``error`` says how."""
+
+    error: Exception = ConnectionRefusedError(111, "Connect call failed")
+    closes = 0
+
+    async def connect(self) -> None:
+        """
+        Raise ``error`` instead of connecting.
+
+        :returns: None.
+        """
+        raise type(self).error
+
+    async def close(self) -> None:
+        """
+        Count the release of the half-open client.
+
+        :returns: None.
+        """
+        type(self).closes += 1
+        await super().close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 9876)"),
+        FileNotFoundError(2, "No such file or directory"),
+        ConnectionError("Codex app-server disconnected before responding to initialize"),
+        InvalidMessage("did not receive a valid HTTP response"),
+        ConnectionClosedError(None, None),
+    ],
+    ids=[
+        "refused",
+        "socket-missing",
+        "dropped-in-handshake",
+        "accept-then-close",
+        "closed-in-initialize",
+    ],
+)
+def test_run_turn_reports_unreachable_app_server_as_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    error: Exception,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A turn that cannot reach its app-server fails as a coded, undelivered error.
+
+    The forwarder's cleanup closes the session's app-server, so the recorded
+    port is dead. Connecting used to raise the raw socket error out of the
+    turn; it is now the same coded failure as a missing bridge, flagged
+    undelivered so the sender's queued message is kept, and nothing is sent.
+    A websocket handshake failure (accept-then-close, a close during the
+    initialize exchange) counts the same: no turn input was sent yet.
+    The failure still logs at ERROR, as every turn-delivery failure does.
+    """
+    _UnreachableClient.requests = []
+    _UnreachableClient.created = []
+    _UnreachableClient.error = error
+    _UnreachableClient.closes = 0
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _UnreachableClient,
+    )
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.code == CODEX_APP_SERVER_STOPPED.code
+    assert failure.title == CODEX_APP_SERVER_STOPPED.title
+    assert failure.remediation == CODEX_APP_SERVER_STOPPED.remediation
+    assert str(error) not in failure.message
+    assert _UnreachableClient.requests == []
+    assert _UnreachableClient.closes == 1
+
+    from omnigent.debug_logging import record_to_row
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("Codex native app-server unreachable")
+    )
+    assert record.levelno == logging.ERROR
+    row = record_to_row(record, source="runner")
+    assert row["event_name"] == "codex_app_server_unreachable"
+    assert row["session_id"] == "conv_123"
+    assert row["attributes"]["thread_id"] == "thread_123"
+    assert "hello" not in json.dumps(row["attributes"])
+
+
+@pytest.mark.asyncio
+async def test_refused_connect_reaches_the_turn_error_as_an_undelivered_coded_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Through the harness adapter, a dead app-server port fails the turn with the
+    coded, undelivered detail the server settles on, not a bare
+    ``ConnectionRefusedError`` that leaves the sender's message queued.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    _UnreachableClient.requests = []
+    _UnreachableClient.created = []
+    _UnreachableClient.error = ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 9)")
+    _UnreachableClient.closes = 0
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _UnreachableClient,
+    )
+    _start_state(tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: CodexNativeExecutor(bridge_dir=tmp_path))
+    ctx = TurnContext(
+        response_id="resp_refused", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(InnerExecutorError) as raised:
+        await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+    await adapter.on_shutdown()
+
+    detail = adapter._build_error_detail(raised.value)
+    assert detail.code == CODEX_APP_SERVER_STOPPED.code
+    assert detail.undelivered is True
+    assert detail.title == CODEX_APP_SERVER_STOPPED.title
+    assert "ConnectionRefusedError" not in f"{detail.code} {detail.message}"
+
+
+class _ResetAfterSubmitClient(_FakeCodexNativeClient):
+    """Connect fine, then drop the connection as the turn is submitted."""
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Record the request, then fail it with a connection error.
+
+        :param method: JSON-RPC method, e.g. ``"turn/start"``.
+        :param params: JSON-RPC params.
+        :returns: Never returns.
+        """
+        type(self).requests.append((method, params))
+        raise ConnectionResetError("Connection reset by peer")
+
+
+def test_run_turn_error_after_submit_is_not_marked_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A connection error once the turn was submitted stays an ambiguous failure.
+
+    Codex may already have accepted the message, so it must not be reported
+    undelivered (its sender's copy would be re-sent) and must not be retried.
+    """
+    _ResetAfterSubmitClient.requests = []
+    _ResetAfterSubmitClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _ResetAfterSubmitClient,
+    )
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is False
+    assert failure.code is None
+    assert failure.message.startswith("Codex native executor error:")
+    assert [method for method, _params in _ResetAfterSubmitClient.requests] == ["turn/start"]
+
+
+def test_run_turn_leaves_non_connection_connect_failures_unclassified(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Only connection-level connect errors mean "unreachable"; others keep raising."""
+    _UnreachableClient.requests = []
+    _UnreachableClient.created = []
+    _UnreachableClient.error = RuntimeError("initialize rejected")
+    _UnreachableClient.closes = 0
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _UnreachableClient,
+    )
+    _start_state(tmp_path)
+
+    with pytest.raises(RuntimeError, match="initialize rejected"):
+        _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    # Unclassified, but the half-open client is still released.
+    assert _UnreachableClient.closes == 1
+
+
+class _HangingClient(_UnreachableClient):
+    """Start connecting and never finish, like a handshake that stalls."""
+
+    started: asyncio.Event
+
+    async def connect(self) -> None:
+        """
+        Signal that connecting began, then wait until cancelled.
+
+        :returns: Never returns.
+        """
+        type(self).started.set()
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_connect_closes_the_half_open_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A cancel mid-connect releases the client, so its reader task is not leaked."""
+    _HangingClient.requests = []
+    _HangingClient.created = []
+    _HangingClient.closes = 0
+    _HangingClient.started = asyncio.Event()
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _HangingClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def drive() -> None:
+        """Run one turn to completion, discarding its events."""
+        async for _event in executor.run_turn(
+            [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            [],
+            "",
+        ):
+            pass
+
+    task = asyncio.create_task(drive())
+    await asyncio.wait_for(_HangingClient.started.wait(), timeout=5.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert _HangingClient.closes == 1
+    assert _HangingClient.requests == []
 
 
 def test_bridge_state_wait_preserves_legacy_and_configured_command_contracts(
