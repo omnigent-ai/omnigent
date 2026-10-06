@@ -115,9 +115,8 @@ def test_file_viewer_rehydrates_from_url_after_reload(
     A failure means either the SPA didn't restore ``selectedFilePath``
     from the URL on a cold load (AppShell hydration regression) or the
     server didn't persist the seeded file (filesystem store regression).
-    The ``:visible`` filter targets whichever FileViewer instance is
-    on-screen — the desktop inline aside renders one and the mobile
-    push-panel renders another, both with the same testid.
+    The ``:visible`` filter targets the on-screen FileViewer instance
+    (the desktop inline aside at this viewport).
     """
     base_url, session_id = seeded_text_file
     page.goto(f"{base_url}/c/{session_id}?file={_TEXT_FILE_PATH}")

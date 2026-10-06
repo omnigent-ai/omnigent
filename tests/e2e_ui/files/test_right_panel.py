@@ -153,10 +153,8 @@ def test_right_panel_terminals_and_file_viewer(
         expect(file_button).to_be_visible(timeout=60_000)
         file_button.click()
 
-        # Two FileViewer instances mount (hidden mobile drawer + desktop
-        # rail); scope to the rail so the locator is single-element and the
-        # visible desktop instance — the bare-page ``.last`` can resolve to
-        # the hidden drawer once other push panels have mounted.
+        # Scope to the rail so the locator stays single-element under strict
+        # mode even if another panel mirrors the testid.
         file_viewer = rail.get_by_test_id("file-viewer")
         expect(file_viewer).to_be_visible()
         # The open file is identified by its tab (the desktop viewer header no

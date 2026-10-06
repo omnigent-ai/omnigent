@@ -19,7 +19,9 @@ from collections.abc import Iterator
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Request, expect
+
+from tests.e2e_ui.conftest import open_right_rail
 
 # ---------------------------------------------------------------------------
 # Test constants
@@ -71,19 +73,40 @@ def seeded_image_session(
 
 
 def test_image_file_renders_as_img(
-    page: Page,
+    request: pytest.FixtureRequest,
     seeded_image_session: tuple[str, str, str],
 ) -> None:
-    """An image file renders as a blob-backed <img>, not source or placeholder."""
-    base_url, session_id, _file_path = seeded_image_session
-    page.goto(f"{base_url}/c/{session_id}?view=explore")
+    """An image opens in one viewer as a single blob-backed <img>, with one
+    content GET.
 
-    file_button = page.get_by_role("button", name=re.compile(rf"^{re.escape(_IMAGE_FILE_PATH)}\b"))
+    One mounted viewer yields one <img> and one image decode; a hidden twin
+    would add a second mount. React Query dedupes the content fetch, so the
+    single-GET count is a separate request-fan-out guard.
+    """
+    base_url, session_id, _file_path = seeded_image_session
+    # Created after seeding so a recording starts at the first navigation.
+    page: Page = request.getfixturevalue("page")
+    content_path = (
+        f"/v1/sessions/{session_id}/resources/environments/default/filesystem/{_IMAGE_FILE_PATH}"
+    )
+    content_requests: list[str] = []
+
+    def track_content_request(req: Request) -> None:
+        if req.method == "GET" and req.url.split("?")[0].endswith(content_path):
+            content_requests.append(req.url)
+
+    page.on("request", track_content_request)
+    page.goto(f"{base_url}/c/{session_id}")
+    # The rail's open state is remembered per session; expand it explicitly.
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Files")).click()
+
+    file_button = rail.get_by_role("button", name=re.compile(rf"^{re.escape(_IMAGE_FILE_PATH)}\b"))
     expect(file_button).to_be_visible(timeout=30_000)
     file_button.click()
 
-    # Two FileViewer instances mount with the same test id (mobile push-panel,
-    # md:hidden, and the desktop rail). Match the visible one directly.
+    # Scope to the on-screen viewer; the mount count is asserted below.
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer).to_be_visible()
 
@@ -104,6 +127,12 @@ def test_image_file_renders_as_img(
     expect(img).to_have_attribute("src", re.compile(r"^blob:"))
     expect(file_viewer.get_by_text("Unable to render image")).to_have_count(0)
     expect(file_viewer.locator("[contenteditable='true']")).to_have_count(0)
+
+    # Quiet window for late mounts or loads before counting.
+    page.wait_for_timeout(2_000)
+    expect(page.locator('[data-testid="file-viewer"]')).to_have_count(1)
+    expect(page.locator(f'img[alt="{_IMAGE_FILE_PATH}"]')).to_have_count(1)
+    assert len(content_requests) == 1, content_requests
 
 
 def test_image_click_opens_zoom_lightbox(

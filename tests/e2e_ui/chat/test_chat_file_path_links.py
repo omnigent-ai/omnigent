@@ -202,15 +202,9 @@ def test_chat_linkifies_workspace_paths_including_home_relative(
         "not a link — a different tag means we linkified something unopenable."
     )
 
-    # Clicking the tilde link opens the FileViewer on the RESOLVED relative path
-    # (README.md), not the literal "~/..." text. The clinching assertion is the
-    # URL: openFile writes the opened path to ``?file=<path>``, so a ``file=README.md``
-    # query proves the link target was resolved to the workspace-relative form
-    # (README.md lives only at the workspace root) rather than the raw ``~/...``.
-    # We assert the URL (not FileViewer visibility) because the viewer mounts as
-    # two testid="file-viewer" asides (mobile + desktop rail) and its slide-in
-    # transition makes a ``.last`` + to_be_visible() check flaky in CI; the URL
-    # is the deterministic signal of what this test actually verifies.
+    # The tilde link must resolve to the workspace-relative path: openFile writes
+    # it to ``?file=<path>``, so ``file=README.md`` proves resolution of "~/...".
+    # We assert the URL, not viewer visibility, whose slide-in is flaky in CI.
     tilde_link.click()
     page.wait_for_url(re.compile(r"[?&]file=README\.md(?:&|$)"), timeout=15_000)
     # Secondary confirmation the viewer mounted on the resolved file. to_contain_text

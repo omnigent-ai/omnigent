@@ -643,7 +643,7 @@ def test_comment_navigation_supersedes_citation(
 def test_markdown_diff_url_stays_stable_across_responsive_layouts(
     page: Page, seeded_session: BrowserSession
 ) -> None:
-    """Hidden responsive viewers must not undo the visible viewer's diff choice."""
+    """Resizing across the mobile breakpoint keeps the diff choice and its URL."""
     base_url, session_id = seeded_session
     path = "src/notes.md"
     before, after = "# Notes\nBefore\n", "# Notes\nAfter\n"
@@ -681,28 +681,26 @@ def test_markdown_diff_url_stays_stable_across_responsive_layouts(
         }"""
     )
     transitions: list[str | None] = []
-    for width, enabled in ((1600, True), (600, True), (600, False), (1600, False)):
+    diff_url = re.compile(r"[?&]diff=1(?:&|$)")
+    for width, diff_on in ((1600, False), (600, True), (1600, False), (600, True)):
         page.set_viewport_size({"width": width, "height": 1000})
-        label = "Show diff" if enabled else "Exit diff view"
+        # Only the active layout's viewer is mounted, so a resize swaps viewers
+        # without rewriting the URL and the new one shows the mode the URL
+        # carries; afterwards each click makes exactly one transition.
+        label = "Exit diff view" if diff_on else "Show diff"
         expect(viewer.get_by_role("button", name=label, exact=True)).to_be_visible()
-        diff_url = re.compile(r"[?&]diff=1(?:&|$)")
-        # Each viewer retains its own mode. On resize the URL follows the newly
-        # visible viewer once, then each click makes exactly one transition.
-        before_click = None if enabled else "1"
-        if (transitions[-1] if transitions else None) != before_click:
-            transitions.append(before_click)
-        if enabled:
-            expect(page).not_to_have_url(diff_url)
-        else:
+        if diff_on:
             expect(page).to_have_url(diff_url)
+        else:
+            expect(page).not_to_have_url(diff_url)
         assert page.evaluate("window.diffUrlTransitions") == transitions
         viewer.get_by_role("button", name=label, exact=True).click()
-        if enabled:
-            expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
-            expect(page).to_have_url(diff_url)
-        else:
+        if diff_on:
             expect(viewer.locator(".monaco-diff-editor")).to_have_count(0)
             expect(page).not_to_have_url(diff_url)
+        else:
+            expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
+            expect(page).to_have_url(diff_url)
         # Observe subsequent paints to catch repeated URL writes after the click.
         page.evaluate(
             """async () => {
@@ -711,5 +709,54 @@ def test_markdown_diff_url_stays_stable_across_responsive_layouts(
               }
             }"""
         )
-        transitions.append("1" if enabled else None)
+        transitions.append(None if diff_on else "1")
         assert page.evaluate("window.diffUrlTransitions") == transitions
+
+
+def test_comment_deep_link_reopens_across_responsive_layouts(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """A ?comment= deep link keeps opening the linked comment after each resize.
+
+    Only the active layout mounts a viewer, so crossing the md breakpoint
+    remounts it. The file and comment URL params must rehydrate the linked
+    comment on the fresh instance instead of being dropped.
+    """
+    base_url, session_id = seeded_session
+    path = "src/notes.md"
+    content = "# Notes\nReview this line\n"
+    _mock_markdown_files(page, seeded_session, {path: content})
+    anchor = "Review this line"
+    start = content.index(anchor)
+    seeded_session.comments.append(
+        {
+            "id": "resize-comment",
+            "conversation_id": session_id,
+            "path": path,
+            "body": "Survives the layout swap",
+            "start_index": start,
+            "end_index": start + len(anchor),
+            "anchor_content": anchor,
+            "status": "draft",
+            "created_at": 1,
+            "updated_at": 1,
+            "created_by": None,
+        }
+    )
+    page.set_viewport_size({"width": 1600, "height": 1000})
+    page.goto(f"{base_url}/c/{session_id}?file={path}&comment=resize-comment")
+    comment_url = re.compile(r"[?&]comment=resize-comment(?:&|$)")
+
+    def expect_linked_comment() -> None:
+        # URL is the deterministic signal; the panel body proves the viewer
+        # re-applied the deep link after the remount.
+        expect(page).to_have_url(comment_url)
+        viewer = page.locator('[data-testid="file-viewer"]:visible')
+        expect(viewer.get_by_text("Survives the layout swap", exact=True)).to_be_visible(
+            timeout=30_000
+        )
+
+    expect_linked_comment()
+    for width in (600, 1600, 600):
+        page.set_viewport_size({"width": width, "height": 1000})
+        expect_linked_comment()

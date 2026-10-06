@@ -3269,13 +3269,40 @@ describe("AppShell URL sync — file param", () => {
 
     renderShell("/c/conv_abc?file=README.md");
 
-    // Viewer must be open and pointing at the file from the URL.
-    // file-viewer = mobile push-panel (md:hidden); file-viewer-inline = desktop inline.
-    // Failure: the conversationId effect did not read searchParams.get("file")
-    // and call setSelectedFilePath with it.
-    const pushPanel = screen.getByTestId("file-viewer");
-    expect(pushPanel).toHaveAttribute("data-state", "open");
-    expect(pushPanel).toHaveAttribute("data-path", "README.md");
+    // jsdom's matchMedia stub never matches the mobile query, so this is the
+    // desktop layout: only the inline rail viewer may mount — a mobile push-panel
+    // (file-viewer) here would load and render the file again.
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.queryByTestId("file-viewer")).toBeNull();
+  });
+
+  it("mounts only the mobile push-panel viewer below the md breakpoint", () => {
+    // useIsMobileViewport reads matchMedia("(max-width: 767.98px)"); force the
+    // mobile side so the push-panel, not the inline rail viewer, hosts the file.
+    const defaultMatchMedia = window.matchMedia;
+    const matchMediaSpy = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...defaultMatchMedia(query),
+      matches: query.includes("max-width"),
+    }));
+    try {
+      mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+      renderShell("/c/conv_abc?file=README.md&diff=1&comment=c1");
+
+      const pushPanel = screen.getByTestId("file-viewer");
+      expect(pushPanel).toHaveAttribute("data-state", "open");
+      expect(pushPanel).toHaveAttribute("data-path", "README.md");
+      expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+
+      // Closing the push-panel clears every file param, as on desktop.
+      fireEvent.click(within(pushPanel).getByRole("button", { name: /file-viewer: close/i }));
+      const params = screen.getByTestId("url-params").textContent ?? "";
+      expect(params).not.toContain("file=");
+      expect(params).not.toContain("diff=");
+      expect(params).not.toContain("comment=");
+    } finally {
+      matchMediaSpy.mockRestore();
+    }
   });
 
   it("restores the file viewer into the desktop rail on a ?file= reload", () => {
@@ -3360,11 +3387,11 @@ describe("AppShell URL sync — file param", () => {
 
     renderShell("/c/conv_abc?file=README.md&diff=1&comment=c1");
 
-    // Scope to mobile push-panel to avoid ambiguity with the inline frameless viewer.
-    const pushPanel = screen.getByTestId("file-viewer");
-    expect(pushPanel).toHaveAttribute("data-state", "open");
+    // Desktop layout: the inline rail viewer is the only mounted instance.
+    const viewer = screen.getByTestId("file-viewer-inline");
+    expect(viewer).toHaveAttribute("data-path", "README.md");
 
-    fireEvent.click(within(pushPanel).getByRole("button", { name: /file-viewer: close/i }));
+    fireEvent.click(within(viewer).getByRole("button", { name: /file-viewer: close/i }));
 
     // After closing, all file-related params must be gone.
     // Failure: the selectedFilePath sync effect did not delete diff/comment params
