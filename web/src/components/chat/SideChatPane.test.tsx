@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createPortal } from "react-dom";
-import { StrictMode } from "react";
+import { forwardRef, StrictMode, useImperativeHandle } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { toast } from "sonner";
@@ -17,7 +17,21 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 }));
 
 vi.mock("@/components/composer/ComposerAddMenu", () => ({ ComposerAddMenu: () => null }));
-vi.mock("@/components/ComposerMicButton", () => ({ ComposerMicButton: () => null }));
+const micEndTake = vi.hoisted(() => vi.fn());
+// Capture the live props so a test can drive dictation callbacks (onInterim)
+// the way the real mic button would.
+const micProps = vi.hoisted(() => ({
+  current: null as null | { onInterim?: (text: string) => void },
+}));
+vi.mock("@/components/ComposerMicButton", () => ({
+  // forwardRef + a real endTake handle so a test can assert the pane ends the
+  // voice take on send; a bare ref would attach but prove nothing.
+  ComposerMicButton: forwardRef((props: { onInterim?: (text: string) => void }, ref) => {
+    micProps.current = props;
+    useImperativeHandle(ref, () => ({ endTake: micEndTake }));
+    return null;
+  }),
+}));
 const sessionLabels = vi.hoisted(() => ({ current: {} as Record<string, string> }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: () => ({ session: { labels: sessionLabels.current }, isLoading: false, error: null }),
@@ -37,6 +51,8 @@ const renderPane = (ui: ReactNode) =>
 
 beforeEach(() => {
   sessionLabels.current = {};
+  micEndTake.mockClear();
+  micProps.current = null;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
   vi.spyOn(sessionsApi, "interrupt").mockResolvedValue({ queued: true });
@@ -126,6 +142,8 @@ describe("side-chat working indicator", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
 
     expect(onStart).toHaveBeenCalledExactlyOnceWith("Explain the approach");
+    // Starting the fork is an accepted send, so the pending branch ends the take.
+    expect(micEndTake).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
     expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
     expect(input).toBeDisabled();
@@ -136,6 +154,38 @@ describe("side-chat working indicator", () => {
     expect(input).toBeEnabled();
     expect(input).toHaveValue("Explain the approach");
     expect(screen.getByRole("button", { name: "Send side question" })).toBeEnabled();
+  });
+
+  it("keeps a dictated draft after a failed fork so the next take appends to it", async () => {
+    // A pending-fork Send ends the take but deliberately keeps the draft for a
+    // retry. The dictation region must settle so a second take appends instead
+    // of lifting the retained words back out.
+    let rejectStart: ((error: Error) => void) | undefined;
+    const onStart = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectStart = reject;
+        }),
+    );
+    useChatStore.setState({ blockedOn: "dialog open", backgroundTaskCount: 1 });
+    renderPane(<SideChatPane childId="pending:side" onStart={onStart} />);
+    const input = screen.getByTestId("side-chat-input");
+
+    // Dictate an interim partial (not typed), so dictation owns its region.
+    act(() => micProps.current?.onInterim?.("retained words"));
+    expect(input).toHaveValue("retained words");
+
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("retained words");
+    expect(micEndTake).toHaveBeenCalledTimes(1);
+
+    await act(async () => rejectStart?.(new Error("Fork creation failed")));
+    expect(input).toHaveValue("retained words");
+
+    // Start another take: the retained words survive and the new partial
+    // appends after them rather than replacing them.
+    act(() => micProps.current?.onInterim?.("and more"));
+    expect(input).toHaveValue("retained words and more");
   });
 });
 
@@ -421,6 +471,8 @@ describe("unsent composer state survives the pane moving", () => {
     await waitFor(() => expect(send).toHaveBeenCalledOnce());
     expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
     expect(screen.getByTestId("side-chat-input")).toHaveValue("");
+    // Sending ends any live voice take so the mic stops recording.
+    expect(micEndTake).toHaveBeenCalledTimes(1);
   });
 });
 

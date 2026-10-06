@@ -140,6 +140,23 @@ describe("useDictationInsert", () => {
     expect(result.current.value).toBe("After.");
   });
 
+  it("commitPending settles the region so a kept draft survives the next take", () => {
+    const { result } = renderDictation();
+    act(() => result.current.replaceInterim("retained words"));
+    // An accepted send ends the take but keeps the draft (a failed fork).
+    act(() => result.current.commitPending());
+    // The next take appends after the retained words rather than lifting the
+    // now-settled region back out.
+    act(() => result.current.replaceInterim("and more"));
+    expect(result.current.value).toBe("retained words and more");
+  });
+
+  it("commitPending is inert with nothing pending", () => {
+    const { result } = renderDictation("typed draft");
+    act(() => result.current.commitPending());
+    expect(result.current.value).toBe("typed draft");
+  });
+
   it("never deletes text the user typed after the interim", () => {
     const composer = renderComposer();
     composer.replaceInterim("hello wor");
