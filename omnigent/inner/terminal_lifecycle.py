@@ -1,4 +1,4 @@
-"""Small, content-free diagnostic history for one terminal launch."""
+"""Small, content-free history for one terminal launch."""
 
 from __future__ import annotations
 
@@ -27,12 +27,13 @@ def lifecycle_log_attributes(context: dict[str, object]) -> dict[str, str]:
 
 @dataclass
 class TerminalLifecycleTrace:
-    """Diagnostics only: none of these observations determine terminal behavior."""
+    """Content-free launch observations; only ``input_ready_at`` also feeds exit handling."""
 
     session_id: str | None = None
     launch_session_id: str | None = None
     launch_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     launched_at: float | None = None
+    input_ready_at: float | None = None
     exit_observed_at: float | None = None
     cleanup_started_at: float | None = None
     last_activity_at: float | None = None
@@ -52,6 +53,7 @@ class TerminalLifecycleTrace:
             self.launch_id = uuid.uuid4().hex
             self.launch_session_id = self.session_id
             self.launched_at = time.time()
+            self.input_ready_at = None
             self.exit_observed_at = None
             self.cleanup_started_at = None
             self.last_activity_at = None
@@ -87,6 +89,12 @@ class TerminalLifecycleTrace:
         with self._lock:
             self.last_activity_at = time.time()
 
+    def note_input_ready(self) -> None:
+        """Remember when the native TUI first accepted input; later calls keep the first."""
+        with self._lock:
+            if self.input_ready_at is None:
+                self.input_ready_at = time.time()
+
     def note_exit(self) -> None:
         """Retain the first observation, including when cleanup later runs again."""
         with self._lock:
@@ -110,6 +118,7 @@ class TerminalLifecycleTrace:
                 "terminal_launch_session_id": self.launch_session_id,
                 "terminal_current_session_id": self.session_id,
                 "terminal_launched_at": self.launched_at,
+                "terminal_input_ready_at": self.input_ready_at,
                 "terminal_exit_observed_at": self.exit_observed_at,
                 "terminal_cleanup_started_at": self.cleanup_started_at,
                 "terminal_last_activity_at": self.last_activity_at,

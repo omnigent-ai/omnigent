@@ -1748,11 +1748,14 @@ async def test_claude_native_logs_input_ready_once_from_existing_snapshot(
     instance._remember_pane_snapshot("Sign in to Claude")
     on_tick()
     assert not any(getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records)
+    assert instance.lifecycle_trace.snapshot()["terminal_input_ready_at"] is None
     instance._remember_pane_snapshot("────────────────────\n❯ \n────────────────────")
     on_tick()
     on_tick()
     events = [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"]
     assert len(events) == 1
+    # The exit classifier reads this to tell a launch-time exit from a person's quit.
+    assert instance.lifecycle_trace.snapshot()["terminal_input_ready_at"] is not None
     assert events[0].session_id == "child"
     assert events[0].attributes["harness"] == "claude-native"
     assert events[0].attributes["terminal_instance_id"] == instance.diagnostic_id
@@ -1834,6 +1837,7 @@ async def test_pi_native_logs_input_ready_once_extension_marks_it(
 
     on_tick()  # type: ignore[operator]
     assert _input_ready_events(caplog) == []
+    assert instance.lifecycle_trace.snapshot()["terminal_input_ready_at"] is None
 
     # What the extension's session_start writes once its inbox poller is armed.
     (bridge_dir / "input_ready").write_text("", encoding="utf-8")
@@ -1842,6 +1846,7 @@ async def test_pi_native_logs_input_ready_once_extension_marks_it(
 
     events = _input_ready_events(caplog)
     assert len(events) == 1
+    assert instance.lifecycle_trace.snapshot()["terminal_input_ready_at"] is not None
     assert events[0].session_id == "conv_pi"
     assert events[0].attributes["harness"] == "pi-native"
     assert events[0].attributes["terminal_instance_id"] == instance.diagnostic_id
@@ -1873,7 +1878,7 @@ async def test_codex_native_logs_input_ready_once_thread_is_bound_to_session(
     # Thread-switch shape: the terminal moved to conv_new before the forwarder
     # rebinds bridge state, so conv_old's thread must not count as ready.
     _bind("conv_old")
-    on_tick, _instance = await _observe_native_capturing_tick(
+    on_tick, instance = await _observe_native_capturing_tick(
         tmp_path,
         "conv_new",
         "codex",
@@ -1882,6 +1887,7 @@ async def test_codex_native_logs_input_ready_once_thread_is_bound_to_session(
     )
     on_tick()  # type: ignore[operator]
     assert _input_ready_events(caplog) == []
+    assert instance.lifecycle_trace.snapshot()["terminal_input_ready_at"] is None
 
     _bind("conv_new")
     on_tick()  # type: ignore[operator]
@@ -1889,6 +1895,7 @@ async def test_codex_native_logs_input_ready_once_thread_is_bound_to_session(
 
     events = _input_ready_events(caplog)
     assert len(events) == 1
+    assert instance.lifecycle_trace.snapshot()["terminal_input_ready_at"] is not None
     assert events[0].session_id == "conv_new"
     assert events[0].attributes["harness"] == "codex-native"
 

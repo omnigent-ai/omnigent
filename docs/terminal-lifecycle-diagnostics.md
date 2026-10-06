@@ -2,7 +2,9 @@
 
 Structured fields distinguish terminal disappearance from session failure.
 Error severity, terminal lifecycle behavior, and dashboard exclusions are
-unchanged. Deploy the updated runner before expecting these fields.
+unchanged, except that a person's own quit (see
+`native_terminal_exit_classified`) settles the session idle instead of failing
+it. Deploy the updated runner before expecting these fields.
 
 The debug-log sink stores `event_name` separately and serializes non-null
 `attributes` values as strings. Booleans appear as `True` or `False`.
@@ -14,7 +16,18 @@ The debug-log sink stores `event_name` separately and serializes non-null
 - `terminal_exit_observed`: an informational lifecycle record with the owning
   `session_id`, `terminal_lifecycle` (`required` or `auxiliary`),
   `session_status_before_exit` (`idle`, `running`, or `unknown`),
-  `terminal_exit_status` when known, and `superseded`.
+  `terminal_exit_status` when known, `terminal_input_ready_at` once the native
+  TUI had accepted input, and `superseded`.
+- `native_terminal_exit_classified`: an informational record for each required
+  terminal exit with `harness`, `exit_status`, `signal`, `session_end_reason`,
+  `session_end_signal`, `banner_seen`, `interactive`, `decision`, and `rule`.
+  `voluntary` means the person quit the agent themselves (`/exit`, Ctrl-C, a
+  closed terminal): the session goes idle with a notice and the next message
+  resumes it. `failed` keeps the `required_terminal_exited` failure. A Claude,
+  Codex, or Pi exit is voluntary only after the TUI accepted input and without
+  a non-zero status or fatal signal; the rule is one of `session_end_reason`,
+  `exit_zero`, or `user_signal` (SIGINT/SIGHUP), or Claude's exit banner. The
+  record carries no pane text.
 - `terminal_close_requested`: an informational record before the explicit
   terminal-close path runs. It does not assert who requested the close or that
   cleanup succeeded.

@@ -198,13 +198,38 @@ class TerminalExitEvent:
     terminal_instance_id: str | None = None
     lifecycle_context: dict[str, str] = field(default_factory=dict)
 
+    @property
+    def interactive(self) -> bool:
+        """Whether the native TUI had accepted input before it exited.
+
+        ``False`` marks a launch-time exit: the TUI never reached its input prompt.
+        """
+        return "terminal_input_ready_at" in self.lifecycle_context
+
+    @property
+    def exit_signal(self) -> str | None:
+        """Signal tmux reported for the launched command, e.g. ``"SIGINT"``."""
+        return self.lifecycle_context.get("terminal_exit_signal")
+
+    @property
+    def session_end_reason(self) -> str | None:
+        """Reason Claude's ``SessionEnd`` hook reported, e.g. ``"prompt_input_exit"``."""
+        return self.lifecycle_context.get("claude_session_end_reason")
+
+    @property
+    def session_end_signal(self) -> str | None:
+        """Signal Claude's ``SessionEnd`` hook reported, e.g. ``"SIGHUP"``."""
+        return self.lifecycle_context.get("claude_session_end_signal")
+
 
 def _terminal_lifecycle_context(
     instance: TerminalInstance | None, resource_role: str | None
 ) -> dict[str, str]:
-    """Freeze launch evidence before cleanup without changing exit handling.
+    """Freeze launch evidence before cleanup.
 
-    The size-bounded read assumes runner-local temporary storage for bridge files.
+    The exit classifier reads the readiness, exit-signal and Claude ``SessionEnd``
+    entries. The size-bounded read assumes runner-local temporary storage for
+    bridge files.
     """
     if instance is None:
         return {}
@@ -1550,6 +1575,7 @@ class SessionResourceRegistry:
                 with contextlib.suppress(Exception):
                     if input_ready_probe(session_id, instance):
                         native_input_ready = True
+                        instance.lifecycle_trace.note_input_ready()
                         _logger.info(
                             "Native input ready",
                             extra=debug_event(

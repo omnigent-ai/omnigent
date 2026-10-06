@@ -137,6 +137,7 @@ async def test_reason_survives_cleanup_and_sink_serialization_without_reclassify
         launch, monkeypatch, "SessionEnd", 103.25, reason=reason, token="private-synthetic-token"
     )
     instance = launch.instance
+    # The input box never appeared, so this is a launch-time exit whatever the reason says.
     instance._remember_exit_status("1 0")
     instance._remember_pane_snapshot("\n" * 100 + "Pane is dead")
     original_close = instance.close
@@ -195,6 +196,105 @@ async def test_reason_survives_cleanup_and_sink_serialization_without_reclassify
     assert any(
         event.get("error", {}).get("code") == "required_terminal_exited" for event in statuses
     )
+
+
+_COMPOSER_PANE = "────────────────────\n❯ \n────────────────────"
+
+
+def _show_composer(launch: _Launch) -> None:
+    """Let the watcher's readiness probe see Claude's input box, as it does after startup."""
+    launch.instance._remember_pane_snapshot(_COMPOSER_PANE)
+    launch.callbacks["on_tick"]()
+
+
+async def _exit_terminal(launch: _Launch) -> list[dict[str, object]]:
+    """Fire the watcher's exit callback and return the session events it produced."""
+    launch.instance.running = False
+    launch.callbacks["on_exit"]()
+    await asyncio.wait_for(launch.resources.wait_for_terminal_exit_cleanup(), timeout=2)
+    return _drain_session_event_queue(_session_event_queues_ref.get(_SESSION))
+
+
+def _failed_statuses(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [event for event in events if event.get("status") == "failed"]
+
+
+@pytest.mark.parametrize("reason", ["prompt_input_exit", "logout", "clear"])
+async def test_quit_reason_after_the_composer_appeared_settles_idle_instead_of_failing(
+    launch: _Launch,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reason: str,
+) -> None:
+    caplog.set_level(logging.INFO)
+    _hook(launch, monkeypatch, "SessionStart", 100.0, source="startup")
+    _show_composer(launch)
+    _hook(launch, monkeypatch, "SessionEnd", 103.0, reason=reason)
+    # No banner survived in the tail and tmux reported no status.
+    launch.instance._remember_pane_snapshot("\n" * 100 + "Pane is dead")
+
+    events = await _exit_terminal(launch)
+
+    assert {"type": "session.status", "status": "idle"} in events
+    assert _failed_statuses(events) == []
+    assert _rows(caplog, "required_terminal_exited") == []
+    [row] = _rows(caplog, "native_terminal_exit_classified")
+    assert row["session_id"] == _SESSION
+    assert row["attributes"]["decision"] == "voluntary"
+    assert row["attributes"]["rule"] == "session_end_reason"
+    assert row["attributes"]["session_end_reason"] == reason
+    assert row["attributes"]["interactive"] == "True"
+    [exit_row] = _rows(caplog, "terminal_exit_observed")
+    assert float(exit_row["attributes"]["terminal_input_ready_at"]) > 0
+
+
+@pytest.mark.parametrize(
+    ("pane_fields", "voluntary"),
+    [
+        ("1||INT", True),
+        ("1||HUP", True),
+        ("1||KILL", False),
+        ("1||SEGV", False),
+        ("1||TERM", False),
+    ],
+)
+async def test_death_by_signal_is_a_quit_only_for_ctrl_c_and_hangup(
+    launch: _Launch,
+    caplog: pytest.LogCaptureFixture,
+    pane_fields: str,
+    voluntary: bool,
+) -> None:
+    caplog.set_level(logging.INFO)
+    _show_composer(launch)
+    launch.instance._exit_status_is_pending(pane_fields)
+
+    events = await _exit_terminal(launch)
+
+    assert ({"type": "session.status", "status": "idle"} in events) is voluntary
+    assert (_failed_statuses(events) == []) is voluntary
+    assert bool(_rows(caplog, "required_terminal_exited")) is not voluntary
+    [row] = _rows(caplog, "native_terminal_exit_classified")
+    assert row["attributes"]["decision"] == ("voluntary" if voluntary else "failed")
+    assert row["attributes"]["signal"] == f"SIG{pane_fields.rsplit('|', 1)[1]}"
+
+
+async def test_exit_zero_before_the_composer_appeared_is_a_launch_failure(
+    launch: _Launch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A launcher wrapper can exit 0 after printing an error; the TUI never started."""
+    caplog.set_level(logging.INFO)
+    launch.instance._remember_exit_status("1 0")
+    launch.instance._remember_pane_snapshot("error: unknown option '--help-omnigent'")
+
+    events = await _exit_terminal(launch)
+
+    assert len(_failed_statuses(events)) == 1
+    [row] = _rows(caplog, "native_terminal_exit_classified")
+    assert row["attributes"]["decision"] == "failed"
+    assert row["attributes"]["rule"] == "not_interactive"
+    assert row["attributes"]["interactive"] == "False"
+    [failed] = _rows(caplog, "required_terminal_exited")
+    assert failed["attributes"]["diagnosis_code"] == "rejected_arguments"
 
 
 @pytest.mark.parametrize("failure", ["reader", "serialization"])

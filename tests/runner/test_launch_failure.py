@@ -79,6 +79,97 @@ def test_classifies_auth_failure(output: str) -> None:
     assert diagnosis.remediation is not None
 
 
+_PI = "/home/alice/.nvm/versions/node/v24.14.0/bin/pi"
+
+# What Pi printed in the production panes, including the mid-word wraps a narrow pane adds.
+_PI_NO_MODELS_OUTPUT = (
+    " Warning: No models available. Use /login to log into a provider via OAuth or API key. See:\n"
+    " \n /home/alice/.nvm/versions/node/v24.21.0/lib/node_modules/@earendil-works/pi-coding-ag\n"
+    " ent/docs/providers.md"
+)
+_PI_EXTENSION_OUTPUT = (
+    'h-v_data/workflows/extension/dist/snapsource-ui.js": Failed to load extension: '
+    "pi-extensible-workflows registry is unav\nailable; load the workflow core extension "
+    'before the SnapSource UI extension.\nHint: Start without extensions using "pi -ne".\n'
+    "Pane is dead (status 1, Mon Oct  5 06:36:47 2026)"
+)
+_PI_MODEL_NOT_FOUND_OUTPUT = (
+    'Error: Model "omnigent-openai/system.ai.gpt-6-sol" not found. '
+    "Use --list-models to see available models.\n"
+    "Pane is dead (status 1, Tue Oct  6 04:54:38 2026)"
+)
+# A 80-column pane wraps that line, leaving only its tail in the capture.
+_PI_MODEL_NOT_FOUND_WRAPPED_OUTPUT = (
+    "to see available models.\nPane is dead (status 1, Mon Oct  5 14:51:01 2026)"
+)
+
+
+@pytest.mark.parametrize(
+    ("output", "code", "title"),
+    [
+        (_PI_NO_MODELS_OUTPUT, "pi_no_models", "Pi has no model to use"),
+        (_PI_EXTENSION_OUTPUT, "pi_extension_load_failed", "Pi couldn't load an extension"),
+        (_PI_MODEL_NOT_FOUND_OUTPUT, "pi_model_not_found", "Pi doesn't know the selected model"),
+        (
+            _PI_MODEL_NOT_FOUND_WRAPPED_OUTPUT,
+            "pi_model_not_found",
+            "Pi doesn't know the selected model",
+        ),
+        ("No models\navailable. Use /login", "pi_no_models", "Pi has no model to use"),
+        (
+            "Failed to load\nextension: x",
+            "pi_extension_load_failed",
+            "Pi couldn't load an extension",
+        ),
+    ],
+    ids=[
+        "no-models",
+        "extension",
+        "model-not-found",
+        "model-not-found-wrapped",
+        "wrap-1",
+        "wrap-2",
+    ],
+)
+def test_classifies_pi_configuration_exits(output: str, code: str, title: str) -> None:
+    diagnosis = classify_terminal_failure(command=_PI, exit_status=1, output=output)
+
+    assert diagnosis is not None
+    assert diagnosis.code == code
+    assert diagnosis.title == title
+    assert diagnosis.category is ErrorCategory.CONFIG
+    assert diagnosis.remediation is not None
+
+
+def test_pi_extension_error_is_not_mistaken_for_a_missing_binary() -> None:
+    output = "Failed to load extension: ENOENT: no such file or directory, open '/x/ext.js'"
+
+    diagnosis = classify_terminal_failure(command=_PI, exit_status=1, output=output)
+
+    assert diagnosis is not None
+    assert diagnosis.code == "pi_extension_load_failed"
+
+
+@pytest.mark.parametrize("command", ["claude", "codex", "env", None])
+@pytest.mark.parametrize(
+    "output", [_PI_NO_MODELS_OUTPUT, _PI_EXTENSION_OUTPUT, _PI_MODEL_NOT_FOUND_WRAPPED_OUTPUT]
+)
+def test_pi_texts_only_explain_a_pi_exit(command: str | None, output: str) -> None:
+    diagnosis = classify_terminal_failure(command=command, exit_status=1, output=output)
+
+    assert diagnosis is None or not (diagnosis.code or "").startswith("pi_")
+
+
+def test_diagnosis_code_names_the_matcher() -> None:
+    root = classify_terminal_failure(command="claude", exit_status=1, output=_ROOT_REFUSAL_OUTPUT)
+    rejected = classify_terminal_failure(
+        command="env", exit_status=0, output="error: unknown option '--codex'"
+    )
+
+    assert root is not None and root.code == "root_permission"
+    assert rejected is not None and rejected.code == "rejected_arguments"
+
+
 def test_classifies_missing_binary_by_exit_code() -> None:
     diagnosis = classify_terminal_failure(command="qwen", exit_status=127, output="")
     assert diagnosis is not None

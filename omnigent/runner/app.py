@@ -193,6 +193,7 @@ from omnigent.runner.subagent_work import (
     unregister_child_session,
     unregister_subagent_work_for_session,
 )
+from omnigent.runner.terminal_exit import classify_terminal_exit, post_terminal_exit_notice
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
@@ -394,12 +395,6 @@ _SESSION_STREAM_HEARTBEAT_S = 15.0
 # that died on its own leaves the harness parked on a readiness wait, so the
 # wait is bounded and the stream failure is then attributed to the exit.
 _TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
-
-# Banner printed by Claude Code on a voluntary /exit or /quit (exit 0).
-# The pane activity from printing it can flip the idle memo back to "running"
-# before the pane dies, making session_was_idle False on a user-initiated quit.
-_CLAUDE_VOLUNTARY_EXIT_MARKER = "Resume this session with:"
-
 
 # Marker the runner stamps on action_required SSE events it intends
 # to dispatch locally. See designs/RUNNER_MCP.md §Explicit dispatch
@@ -1768,16 +1763,32 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        # A claude /exit or /quit prints this banner and exits 0. Printing it
-        # can flip the idle memo back to "running" before pane death, so treat
-        # a banner exit as a clean stop rather than a failure.
-        if (
-            event.exit_status == 0
-            and event.terminal_name == "claude"
-            and event.last_output is not None
-            and _CLAUDE_VOLUNTARY_EXIT_MARKER in event.last_output
-        ):
+        decision = classify_terminal_exit(event, runner_shutting_down=_shutting_down.is_set())
+        classified_log = debug_event(
+            "native_terminal_exit_classified", session_id=event.session_id
+        )
+        classified_log["attributes"] = decision.log_attributes()
+        _logger.info(
+            "native terminal %s exit classified as %s (%s) for %s",
+            event.terminal_name,
+            "voluntary" if decision.voluntary else "failed",
+            decision.rule,
+            event.session_id,
+            extra=classified_log,
+        )
+        if decision.voluntary:
+            # The person quit the agent themselves. Settle the session like a
+            # stop, with a notice, rather than failing a turn nobody lost.
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _notice_task = asyncio.create_task(
+                post_terminal_exit_notice(server_client, event.session_id, event.terminal_name),
+                name=f"terminal-exit-notice:{event.session_id}",
+            )
+            _notice_task.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(_notice_task)
+            if not event.session_was_idle:
+                _native_interrupt_runner.clear_pending_interrupt(event.session_id)
+                _mark_subagent_terminal_and_wake(event.session_id, status="cancelled", output=None)
             _release_required_terminal_session(event.session_id)
             return
 
@@ -1814,6 +1825,7 @@ def create_runner_app(
             # An unrecognized exit is the harness CLI dying under the runner.
             "error_category": (diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
             "error_impact": ErrorImpact.BLOCKING.value,
+            "diagnosis_code": diagnosis.code if diagnosis else None,
         }
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
