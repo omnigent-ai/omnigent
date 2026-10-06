@@ -99,6 +99,22 @@ both ends.
   reconnect hook; resume set is a sub-agent restore; suppress set is a
   message forward.
 
+## Native event ingestion
+
+`runner_event_ingest_failed` adds session and batch attribution to existing
+server exception logs. Both stages include `session_id`, `runner_id`, `batch_id`,
+`batch_size`, `error_type`, and `retryable`:
+
+- `failure_stage = dispatch`: the tunnel's ingestion callback raised. Includes
+  `connection_id`; the number of events already applied is unknown.
+- `failure_stage = apply`: applying an individual event raised. Includes its
+  allowlisted `event_type` and `applied_count`, the acknowledged prefix length.
+
+These are retryable delivery attempts, not evidence that a session's turn
+ultimately failed. Replay uses source IDs to avoid duplicating persisted events.
+The structured fields contain no event bodies or credentials. Existing exception
+tracebacks and log severity are unchanged; successful retries add no error row.
+
 ## Correlation
 
 The disconnect grace task rechecks the local tunnel after loading bound

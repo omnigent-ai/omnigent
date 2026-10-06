@@ -1278,6 +1278,88 @@ async def test_event_ingest_does_not_block_tunnel_receive_loop() -> None:
             await comm.wait(timeout=budget(1.0))
 
 
+async def test_event_ingest_failure_logs_session_and_retries_without_closing_tunnel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    route = _tunnel_route_app()
+    calls = 0
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        nonlocal calls
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary ingestion failure")
+        return EventAckFrame(batch.id, len(batch.events))
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="test",
+                        frame_protocol_version=1,
+                        capabilities=[EVENT_INGEST_CAPABILITY],
+                        connection_id="connection-test",
+                    )
+                ),
+            }
+        )
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        for batch_id in ("first", "retry"):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=batch_id,
+                            session_id="session-test",
+                            events=[
+                                {
+                                    "type": "external_output_text_delta",
+                                    "data": {"delta": "private-event-content"},
+                                }
+                            ],
+                        )
+                    ),
+                }
+            )
+            ack = decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+            assert isinstance(ack, EventAckFrame)
+            assert ack.id == batch_id
+            if batch_id == "first":
+                assert ack.applied == 0 and ack.retryable
+            else:
+                assert ack.applied == 1 and not ack.retryable
+        (failure,) = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "runner_event_ingest_failed"
+        ]
+        assert failure.session_id == "session-test"
+        assert failure.attributes == {
+            "runner_id": _RUNNER_ID,
+            "connection_id": "connection-test",
+            "batch_id": "first",
+            "batch_size": 1,
+            "failure_stage": "dispatch",
+            "error_type": "RuntimeError",
+            "retryable": True,
+        }
+        assert "private-event-content" not in caplog.text
+        assert route.registry.get(_RUNNER_ID) is not None
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(1.0))
+
+
 async def test_event_ingest_disconnect_before_worker_start_releases_slot() -> None:
     route = _tunnel_route_app()
 

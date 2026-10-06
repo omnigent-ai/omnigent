@@ -777,8 +777,23 @@ def register_events_routes(
                 )
             except ValueError:
                 return EventAckFrame(batch.id, index, "invalid session event")
-            except Exception:
-                _logger.exception("Runner event ingestion failed for session %s", batch.session_id)
+            except Exception as exc:
+                _logger.exception(
+                    "Runner event ingestion failed for session %s",
+                    batch.session_id,
+                    extra=debug_event(
+                        "runner_event_ingest_failed",
+                        session_id=batch.session_id,
+                        runner_id=runner_id,
+                        batch_id=batch.id,
+                        batch_size=len(batch.events),
+                        applied_count=index,
+                        event_type=event_type,
+                        failure_stage="apply",
+                        error_type=type(exc).__name__,
+                        retryable=True,
+                    ),
+                )
                 return EventAckFrame(batch.id, index, "ingest failed", retryable=True)
         return EventAckFrame(batch.id, len(batch.events))
 

@@ -1540,6 +1540,7 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from omnigent.server.routes.sessions import routes_events as event_routes
 
@@ -1588,6 +1589,22 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
         app=app, headers=Headers({}), owner=None, runner_id="runner-a", batch=batch
     )
     assert first.applied == 1 and first.retryable
+    (failure,) = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_event_ingest_failed"
+    ]
+    assert failure.session_id == session["id"]
+    assert failure.attributes == {
+        "runner_id": "runner-a",
+        "batch_id": "first",
+        "batch_size": 2,
+        "applied_count": 1,
+        "event_type": "external_conversation_item",
+        "failure_stage": "apply",
+        "error_type": "RuntimeError",
+        "retryable": True,
+    }
     retry = await ingest(
         app=app,
         headers=Headers({}),
@@ -1599,6 +1616,13 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
     assert [event["type"] for event in published].count("response.output_text.delta") == 1
     items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
     assert [item["content"][0]["text"] for item in items] == ["saved"]
+    assert (
+        sum(
+            getattr(record, "event_name", None) == "runner_event_ingest_failed"
+            for record in caplog.records
+        )
+        == 1
+    )
 
 
 async def test_runner_ingest_retries_internal_server_failures(
