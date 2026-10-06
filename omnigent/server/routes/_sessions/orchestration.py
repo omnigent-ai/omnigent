@@ -10660,19 +10660,13 @@ async def _create_session_from_existing_agent(
 
     # A new session from another user's agent runs on the caller's own copy, so
     # that user can never change code running here. A child reusing its parent's
-    # agent stays on it: collaborators act in the owner's session.
-    own_copy: Agent | None = None
+    # agent stays on it: collaborators act in the owner's session. A failed create
+    # below keeps the copy: it is listed to its owner from the start, so another of
+    # their requests may already be using it.
     if _parent_for_routing is None or _parent_for_routing.agent_id != agent.id:
-        bound = await asyncio.to_thread(
+        agent = await asyncio.to_thread(
             agent_for_user, agent_store, artifact_store, agent, user_id
         )
-        if bound.id != agent.id:
-            own_copy = agent = bound
-
-    def _drop_own_copy() -> None:
-        # The session was never created, so nothing uses the copy.
-        if own_copy is not None:
-            agent_store.delete(own_copy.id)
 
     try:
         # Include spec-seeded defaults before create; overflow must not leave a session.
@@ -10707,7 +10701,6 @@ async def _create_session_from_existing_agent(
                 **snapshot_kwargs,
             )
     except NameAlreadyExistsError as exc:
-        _drop_own_copy()
         if (
             created_worktree_path is not None
             and body.host_id is not None
@@ -10733,7 +10726,6 @@ async def _create_session_from_existing_agent(
         # NOT git_branch: only a worktree Omnigent created here may be
         # force-removed. An existing worktree bound via workspace_branch
         # also sets git_branch but is the user's — never destroy it.
-        _drop_own_copy()
         if (
             created_worktree_path is not None
             and body.host_id is not None

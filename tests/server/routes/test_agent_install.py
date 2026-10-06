@@ -14,6 +14,7 @@ import json
 import tarfile
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -607,6 +608,37 @@ async def test_children_and_schedules_run_another_users_agent_on_your_copy(
         headers=BOB,
     )
     assert bound_owner(schedule) == "bob@example.com"
+
+
+async def test_a_failed_session_create_keeps_a_copy_another_request_bound(
+    multi_user_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bob's copy of Alice's agent is listed to him as soon as it exists, so another of
+    his requests may bind it before this create fails; that session keeps its agent."""
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    c = multi_user_client
+    orion = (await _install(c, ALICE, "orion")).json()
+    alices = (await c.post("/v1/sessions", json={"agent_id": orion["id"]}, headers=ALICE)).json()
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user("bob@example.com")
+    perms.grant("bob@example.com", alices["id"], 1)
+    create = SqlAlchemyConversationStore.create_conversation
+    others: list[str] = []
+
+    def bind_then_fail(self: SqlAlchemyConversationStore, **kwargs: Any) -> None:
+        others.append(create(self, **kwargs).id)  # the other request binds the copy first
+        raise RuntimeError("conversation store unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SqlAlchemyConversationStore, "create_conversation", bind_then_fail)
+        with pytest.raises(RuntimeError):
+            await c.post("/v1/sessions", json={"agent_id": orion["id"]}, headers=BOB)
+
+    other = SqlAlchemyConversationStore(db_uri).get_conversation(others[0])
+    assert other is not None and other.agent_id != orion["id"]
+    assert SqlAlchemyAgentStore(db_uri).get(other.agent_id) is not None
+    assert [row["id"] for row in (await _mine(c, BOB))["data"]] == [other.agent_id]
 
 
 async def test_a_failed_schedule_switch_leaves_no_agent_copy(
