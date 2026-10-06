@@ -1,7 +1,7 @@
 """Tests for the built-in agent bundle builders in ``omnigent/server/app.py``.
 
 The server seeds Web-UI-launchable agents (claude-native, codex-native, and
-the shipped ``debby`` / ``polly`` examples) by materializing each spec into a
+the shipped example bundles) by materializing each spec into a
 gzipped tarball at startup. These builders were previously exercised only
 transitively by the agents' e2e suites; a packaging regression (a dropped
 ``config.yaml``, a spec that no longer materializes) would surface late and
@@ -38,18 +38,20 @@ _NATIVE_BUILDERS = [(agent.key, f"{agent.agent_name}.yaml") for agent in _NATIVE
 _EXAMPLE_BUILDERS = [
     ("_build_debby_bundle", "config.yaml", True),
     ("_build_polly_bundle", "config.yaml", True),
+    ("_build_superpowers_bundle", "config.yaml", True),
 ]
 
 
 def _shipped_example_missing(builder: str) -> bool:
     """Return True when ``builder``'s shipped-example source is not packaged here.
 
-    debby/polly are only seeded when their bundle ships with the wheel; a
+    Shipped examples are only seeded when their bundle ships with the wheel; a
     generic deployment legitimately omits them. Skip rather than fail there.
     """
     source = {
         "_build_debby_bundle": app._DEBBY_BUNDLE_SOURCE,
         "_build_polly_bundle": app._POLLY_BUNDLE_SOURCE,
+        "_build_superpowers_bundle": app._SUPERPOWERS_BUNDLE_SOURCE,
     }[builder]
     return not (source / "config.yaml").is_file()
 
@@ -115,6 +117,17 @@ def test_bundle_builder_is_reproducible(
 
     fn = getattr(app, builder)
     assert fn() == fn(), f"{builder} is not byte-for-byte reproducible across builds."
+
+
+def test_superpowers_bundle_ships_auxiliary_skill_resources() -> None:
+    """The packaged bundle retains upstream prompt, template, and example files."""
+    if _shipped_example_missing("_build_superpowers_bundle"):
+        pytest.skip("superpowers source not packaged in this deployment")
+
+    members = {member.lstrip("./") for member in _tar_members(app._build_superpowers_bundle())}
+    assert "skills/diagnosing-superpowers/prompts/analyst-common.md" in members
+    assert "skills/diagnosing-superpowers/templates/report.md" in members
+    assert "skills/writing-skills/examples/CLAUDE_MD_TESTING.md" in members
 
 
 # ── Backwards-compatible loading of the shipped sub-agent examples ──────────

@@ -95,19 +95,47 @@ def test_read_skill_file_traversal_blocked(
     tool_ctx: ToolContext,
 ) -> None:
     """
-    ReadSkillFileTool.invoke rejects path traversal attempts.
+    ReadSkillFileTool.invoke rejects traversal outside the skills root,
+    even when the target file exists.
     """
+    assert skill_with_resources.skill_dir is not None
+    outside = skill_with_resources.skill_dir.parent.parent / "secret.md"
+    outside.write_text("must stay private")
     tool = ReadSkillFileTool([skill_with_resources])
     result = tool.invoke(
         json.dumps(
             {
                 "skill_name": "code-review",
-                "path": "../../etc/passwd",
+                "path": "../../secret.md",
             }
         ),
         tool_ctx,
     )
     assert "traversal not allowed" in result
+
+
+def test_read_skill_file_allows_cross_skill_resource(
+    skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
+) -> None:
+    """A skill may read a sibling skill resource within the same skills root."""
+    assert skill_with_resources.skill_dir is not None
+    sibling = skill_with_resources.skill_dir.parent / "requesting-code-review"
+    sibling.mkdir()
+    (sibling / "code-reviewer.md").write_text("Review template marker.")
+    tool = ReadSkillFileTool([skill_with_resources])
+
+    result = tool.invoke(
+        json.dumps(
+            {
+                "skill_name": "code-review",
+                "path": "../requesting-code-review/code-reviewer.md",
+            }
+        ),
+        tool_ctx,
+    )
+
+    assert result == "Review template marker."
 
 
 def test_read_skill_file_absolute_path_blocked(

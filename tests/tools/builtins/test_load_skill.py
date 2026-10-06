@@ -240,6 +240,34 @@ def test_list_skill_resources_lists_root_files_before_subdirs(tmp_path: Path) ->
     ]
 
 
+def test_list_skill_resources_includes_auxiliary_directories(tmp_path: Path) -> None:
+    """Prompt, template, and example resources are advertised to the agent."""
+    from omnigent.tools.builtins.load_skill import list_skill_resources
+
+    skill_dir = tmp_path / "diagnosing-superpowers"
+    for subdir, filename in (
+        ("prompts", "analyst.md"),
+        ("templates", "report.md"),
+        ("examples", "sample.md"),
+    ):
+        resource_dir = skill_dir / subdir
+        resource_dir.mkdir(parents=True)
+        (resource_dir / filename).write_text(subdir)
+    (skill_dir / "SKILL.md").write_text("body")
+    skill = SkillSpec(
+        name="diagnosing-superpowers",
+        description="Diagnoses sessions.",
+        content="body",
+        skill_dir=skill_dir,
+    )
+
+    assert list_skill_resources(skill) == [
+        "prompts/analyst.md",
+        "templates/report.md",
+        "examples/sample.md",
+    ]
+
+
 def _spec(name: str, content: str = "body") -> SkillSpec:
     """A minimal in-memory skill spec named *name*."""
     return SkillSpec(name=name, description=f"{name} skill.", content=content)

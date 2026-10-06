@@ -45,7 +45,9 @@ class ReadSkillFileTool(Tool):
         return (
             "Read a file from a skill's directory, "
             "including files beside SKILL.md and under "
-            "references/, scripts/, or assets/. "
+            "references/, scripts/, assets/, prompts/, "
+            "templates/, or examples/. Cross-skill paths "
+            "within the same skills root are supported. "
             "Requires the skill name and a relative "
             "file path."
         )
@@ -63,7 +65,9 @@ class ReadSkillFileTool(Tool):
                 "description": (
                     "Read a file from a skill's directory, "
                     "including files beside SKILL.md and under "
-                    "references/, scripts/, or assets/. "
+                    "references/, scripts/, assets/, prompts/, "
+                    "templates/, or examples/. Cross-skill paths "
+                    "within the same skills root are supported. "
                     "Requires the skill name and a relative "
                     "file path."
                 ),
@@ -92,8 +96,9 @@ class ReadSkillFileTool(Tool):
         """
         Read a file from the named skill's directory.
 
-        Validates that the path is relative and contained
-        within the skill directory (no traversal).
+        Validates that the path is relative and contained within the
+        bundle's skills root. This permits references to sibling skills
+        while preventing traversal outside the bundle's skills tree.
 
         :param arguments: JSON with ``"skill_name"`` and
             ``"path"`` keys, e.g.
@@ -136,13 +141,15 @@ def _read_file_safely(
     Safely read a file relative to a skill directory.
 
     Uses ``PurePosixPath`` for parsing and
-    ``Path.is_relative_to()`` for containment to prevent
-    directory traversal attacks.
+    ``Path.is_relative_to()`` for containment. A skill discovered below
+    a directory named ``skills`` may read sibling skills below that same
+    root; other skill layouts retain the original single-directory boundary.
 
     :param skill_dir: Absolute path to the skill directory,
         e.g. ``Path("/agents/code-review")``.
     :param rel_path: Relative path within the skill
-        directory, e.g. ``"references/style-guide.md"``.
+        directory, e.g. ``"references/style-guide.md"`` or
+        ``"../requesting-code-review/code-reviewer.md"``.
     :returns: The file contents as a string, or an error
         message if the path is invalid or the file does
         not exist.
@@ -151,8 +158,15 @@ def _read_file_safely(
     if parsed.is_absolute():
         return "Error: path must be relative"
 
+    resolved_skill_dir = skill_dir.resolve()
+    skills_root = resolved_skill_dir
+    for parent in resolved_skill_dir.parents:
+        if parent.name == "skills":
+            skills_root = parent
+            break
+
     resolved = (skill_dir / rel_path).resolve()
-    if not resolved.is_relative_to(skill_dir.resolve()):
+    if not resolved.is_relative_to(skills_root):
         return "Error: path traversal not allowed"
     if not resolved.is_file():
         return f"Error: file not found: {rel_path}"

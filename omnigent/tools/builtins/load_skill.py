@@ -150,7 +150,8 @@ def list_skill_resources(skill: SkillSpec) -> list[str]:
 
     Covers auxiliary files beside ``SKILL.md`` (a common layout for
     skills that split long guidance across sibling documents) plus
-    everything under ``references/``, ``scripts/``, and ``assets/``.
+    everything under ``references/``, ``scripts/``, ``assets/``,
+    ``prompts/``, ``templates/``, and ``examples/``.
     Returns relative paths suitable for ``read_skill_file``.
 
     :param skill: The skill to scan.
@@ -166,7 +167,14 @@ def list_skill_resources(skill: SkillSpec) -> list[str]:
         # Dotfiles are editor/OS cruft, and SKILL.md is the skill itself.
         if fp.is_file() and fp.name != "SKILL.md" and not fp.name.startswith("."):
             files.append(fp.name)
-    for subdir_name in ("references", "scripts", "assets"):
+    for subdir_name in (
+        "references",
+        "scripts",
+        "assets",
+        "prompts",
+        "templates",
+        "examples",
+    ):
         subdir = skill.skill_dir / subdir_name
         if not subdir.is_dir():
             continue
