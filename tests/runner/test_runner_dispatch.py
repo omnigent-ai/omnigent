@@ -55,7 +55,9 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 from fastapi.responses import StreamingResponse as _StreamingResponse
 
+import omnigent.runner.app as runner_app_module
 import omnigent.runtime.harnesses._executor_adapter as _adapter_mod_recovery
+from omnigent.debug_logging import record_to_row
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE
 from omnigent.inner.executor import (
     Executor as _RecoveryExecutor,
@@ -1804,6 +1806,8 @@ async def test_runner_stream_spawn_failed_reaches_subscribers_with_detail(
 @pytest.mark.asyncio
 async def test_runner_background_spawn_failed_reaches_subscribers_with_detail(
     pinned_runner_log: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The background turn path publishes the same spawn-failure detail.
 
@@ -1840,20 +1844,24 @@ async def test_runner_background_spawn_failed_reaches_subscribers_with_detail(
         spec_resolver=_spec_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    async with _runner_test_client(app) as http:
-        response = await http.post(
-            f"/v1/sessions/{conv}/events",
-            json={
-                "type": "message",
-                "role": "user",
-                "agent_id": "ag_spawn",
-                "model": "x",
-                "content": [],
-            },
-        )
-        assert response.status_code == 202
-        await _await_bg_turn_task(conv)
-        event = await _drain_failed_status_event(app.state.session_event_queues, conv, timeout=5.0)
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "conv_parent")
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_spawn",
+                    "model": "x",
+                    "content": [],
+                },
+            )
+            assert response.status_code == 202
+            await _await_bg_turn_task(conv)
+            event = await _drain_failed_status_event(
+                app.state.session_event_queues, conv, timeout=5.0
+            )
 
     assert event is not None
     assert event["error"]["code"] == "runner_error"
@@ -1862,6 +1870,13 @@ async def test_runner_background_spawn_failed_reaches_subscribers_with_detail(
     )
     assert event["error"]["message"] == f"harness_spawn_failed: {expected_detail}"
     assert "harness returned error response" not in event["error"]["message"]
+    (failure_log,) = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "harness_turn_response_failed"
+    ]
+    assert failure_log.session_id == conv
+    assert record_to_row(failure_log, source="runner")["session_id"] == conv
 
 
 def test_direct_and_background_switch_sites_share_one_invalidation_routine() -> None:
@@ -2564,6 +2579,101 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
         # clear the spinner but tell the user nothing.
         assert isinstance(error, dict)
         assert _STREAM_FAILURE_MESSAGE in error["message"]
+
+
+@pytest.mark.parametrize("replace_owner", [False, True])
+@pytest.mark.asyncio
+async def test_background_drain_failure_owns_only_its_turn(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    replace_owner: bool,
+) -> None:
+    """A drain exception settles its turn only while its task/epoch owns it."""
+    conv = f"conv_drain_owner_{replace_owner}"
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([_SSE_RESPONSE_CREATED])),
+        ),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    replacement_task: asyncio.Task[None] | None = None
+    real_streaming_response = runner_app_module.StreamingResponse
+
+    class _FailingDrainResponse(real_streaming_response):
+        def __init__(self, content: Any, *args: Any, **kwargs: Any) -> None:
+            async def _raise_after_first() -> AsyncIterator[Any]:
+                async for chunk in content:
+                    yield chunk
+                    if replace_owner:
+                        assert replacement_task is not None
+                        old_epoch = app.state.turn_bind_epoch[conv]
+                        app.state.active_turns[conv] = replacement_task
+                        app.state.turn_bind_epoch[conv] = old_epoch + 1
+                        app.state.live_response_id[conv] = "resp_replacement"
+                    raise RuntimeError("controlled drain failure")
+
+            super().__init__(_raise_after_first(), *args, **kwargs)
+
+    monkeypatch.setattr(runner_app_module, "StreamingResponse", _FailingDrainResponse)
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "conv_parent")
+    if replace_owner:
+        replacement_task = asyncio.create_task(asyncio.Event().wait())
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
+            async with _runner_test_client(app) as http:
+                response = await http.post(
+                    f"/v1/sessions/{conv}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "harness": _TEST_HARNESS_NAME,
+                        "model": "x",
+                        "content": [],
+                    },
+                )
+                assert response.status_code == 202
+                await _await_bg_turn_task(conv)
+
+        if replace_owner:
+            assert app.state.active_turns[conv] is replacement_task
+            assert app.state.live_response_id[conv] == "resp_replacement"
+            queue = app.state.session_event_queues.get(conv)
+            queued = []
+            while queue is not None and not queue.empty():
+                queued.append(queue.get_nowait())
+            assert not any(
+                isinstance(event, dict) and event.get("status") == "failed" for event in queued
+            )
+        else:
+            failed = await _drain_failed_status_event(
+                app.state.session_event_queues, conv, timeout=2.0
+            )
+            assert failed is not None
+            assert failed["response_id"] == "resp_sf_1"
+
+        records = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "harness_stream_drain_failed"
+        ]
+        assert len(records) == 1
+        record = records[0]
+        row = record_to_row(record, source="runner")
+        assert row["session_id"] == conv
+        assert record.attributes["owner_current"] is (not replace_owner)
+        if replace_owner:
+            assert "response_id" not in row["attributes"]
+        else:
+            assert record.attributes["response_id"] == "resp_sf_1"
+    finally:
+        if replacement_task is not None:
+            replacement_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await replacement_task
+        app.state.active_turns.pop(conv, None)
+        app.state.live_response_id.pop(conv, None)
 
 
 # ── Runner-local OS env dispatch ────────────────────────

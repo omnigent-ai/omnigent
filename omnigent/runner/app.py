@@ -3723,6 +3723,8 @@ def create_runner_app(
         *,
         error: dict[str, Any] | None = None,
         owner_response_id: str | None = None,
+        owner_task: asyncio.Task[None] | None = None,
+        owner_turn_epoch: int | None = None,
     ) -> None:
         # Stale-finalizer guard: when owner_response_id no longer matches the live response,
         # a newer turn has taken over — skip all conversation-state mutations.
@@ -3735,6 +3737,23 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
             return
+        # Some failures happen before the harness emits response.created, so
+        # there is no response id to use as an ownership token. The task and
+        # turn epoch still identify the background generation that may settle.
+        if owner_task is not None and (
+            _active_turns.get(conv_id) is not owner_task
+            or (owner_turn_epoch is not None and _turn_bind_epoch.get(conv_id) != owner_turn_epoch)
+        ):
+            _logger.debug(
+                "proxy stream end for %s ignored: background turn was superseded",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            return
+        # Resolve the id only after the task/epoch guard above. A replacement
+        # turn can otherwise donate its live response id to an old finalizer.
+        if owner_response_id is None and owner_task is not None:
+            owner_response_id = _live_response_id.get(conv_id)
 
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
@@ -4716,6 +4735,7 @@ def create_runner_app(
         # Capture our own task so the finally floor can identity-compare before
         # clearing the slot (see below).
         _own_task = asyncio.current_task()
+        _own_turn_epoch = _turn_bind_epoch.get(conv)
         # A fresh turn is binding: whatever desync the previous turn ended on is
         # resolved now. Also clear a stale publish-once token (e.g. left set by a
         # wedged stream that never reached its own _on_proxy_stream_end) so it
@@ -4726,7 +4746,12 @@ def create_runner_app(
         # context carries it for its lifetime). Coded errors keep their own phase.
         with phase_scope(ErrorPhase.TURN):
             try:
-                await _run_turn_bg_setup_and_stream(msg_body, conv)
+                await _run_turn_bg_setup_and_stream(
+                    msg_body,
+                    conv,
+                    owner_task=_own_task,
+                    owner_turn_epoch=_own_turn_epoch,
+                )
             except _ContextWindowOverflow:
                 # Re-raise so the streaming-phase handler (which publishes the
                 # error event) is never shadowed by the generic except below.
@@ -4739,7 +4764,12 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": conv},
                 )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                _on_proxy_stream_end(
+                    conv,
+                    error={"message": f"turn setup failed: {exc}"},
+                    owner_task=_own_task,
+                    owner_turn_epoch=_own_turn_epoch,
+                )
                 raise
             except Exception as exc:
                 _logger.error(
@@ -4749,7 +4779,12 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": conv},
                 )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                _on_proxy_stream_end(
+                    conv,
+                    error={"message": f"turn setup failed: {exc}"},
+                    owner_task=_own_task,
+                    owner_turn_epoch=_own_turn_epoch,
+                )
             finally:
                 # Permanent-wedge floor: guarantee _active_turns is never left stale,
                 # however the body exits — including a BaseException that escapes
@@ -4789,6 +4824,9 @@ def create_runner_app(
     async def _run_turn_bg_setup_and_stream(
         msg_body: _JsonObject,
         conv: str,
+        *,
+        owner_task: asyncio.Task[None] | None,
+        owner_turn_epoch: int | None,
     ) -> None:
         _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
         await _sync_session_agent(
@@ -5175,20 +5213,38 @@ def create_runner_app(
         finally:
             _session_init_envelopes.pop(conv, None)
         if isinstance(response, StreamingResponse):
-            await _drain_streaming_response(response, conv)
+            await _drain_streaming_response(
+                response,
+                conv,
+                owner_task=owner_task,
+                owner_turn_epoch=owner_turn_epoch,
+            )
         else:
             error = _harness_error_response_error(response)
             _logger.error(
                 "turn bg error for %s: %s",
                 conv,
                 error["message"],
-                extra={"session_id": conv},
+                extra=debug_event(
+                    "harness_turn_response_failed",
+                    session_id=conv,
+                    error_code=error.get("code"),
+                    status_code=getattr(response, "status_code", None),
+                ),
             )
-            _on_proxy_stream_end(conv, error=error)
+            _on_proxy_stream_end(
+                conv,
+                error=error,
+                owner_task=owner_task,
+                owner_turn_epoch=owner_turn_epoch,
+            )
 
     async def _drain_streaming_response(
         response: StreamingResponse,
         session_id: str,
+        *,
+        owner_task: asyncio.Task[None] | None = None,
+        owner_turn_epoch: int | None = None,
     ) -> None:
         try:
             async for _chunk in response.body_iterator:
@@ -5218,17 +5274,38 @@ def create_runner_app(
                     _publish_turn_status(session_id, "idle")
             raise
         except (httpx.HTTPError, RuntimeError, StopAsyncIteration) as exc:
+            # The response ID may arrive during iteration. Read it only while
+            # the task and epoch still belong to this drain.
+            owner_current = owner_task is None or (
+                _active_turns.get(session_id) is owner_task
+                and (
+                    owner_turn_epoch is None
+                    or _turn_bind_epoch.get(session_id) == owner_turn_epoch
+                )
+            )
+            owner_response_id = _live_response_id.get(session_id) if owner_current else None
             _logger.error(
                 "drain failed for %s: %s",
                 session_id,
                 exc,
                 exc_info=True,
+                extra=debug_event(
+                    "harness_stream_drain_failed",
+                    session_id=session_id,
+                    response_id=owner_response_id,
+                    exception_type=type(exc).__name__,
+                    owner_current=owner_current,
+                    turn_epoch=owner_turn_epoch,
+                ),
             )
             _on_proxy_stream_end(
                 session_id,
                 error={
                     "message": f"background turn drain failed: {exc}",
                 },
+                owner_response_id=owner_response_id,
+                owner_task=owner_task,
+                owner_turn_epoch=owner_turn_epoch,
             )
 
     async def _stream_message_to_harness(
