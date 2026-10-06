@@ -1066,13 +1066,9 @@ export interface AppChatState {
    */
   sideChatDrafts: Record<string, string>;
   /**
-   * Unsent composer state (text + attachments) per side chat, keyed by child
-   * conversation id. App-global rather than component state because the pane
-   * mounts in two different places — the desktop rail and the mobile drawer's
-   * portal — so crossing the `md` breakpoint (a phone rotating) moves it
-   * between subtrees and unmounts it; switching rail tabs does the same. Held
-   * here, a half-typed question survives all three. In-memory only: `File`
-   * handles can't be serialized, and a reload drops the attachment anyway.
+   * Unsent composer state per side-chat child id, retained across the pane's
+   * unmounts (rail tab switch, breakpoint cross, drawer teardown). In-memory
+   * only: `File` values aren't serializable.
    */
   sideChatComposers: Record<string, SideChatComposerDraft>;
   /**

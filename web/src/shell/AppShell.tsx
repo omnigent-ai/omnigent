@@ -1324,6 +1324,10 @@ export function AppShell() {
       setExecutionLogsKey(null); // close execution-logs panel
       setFilesPanelOpen(false); // close files drawer so the viewer is unobscured
       setSubagentsPanelOpen(false); // close mobile agents drawer
+      // A side chat's reply can link into the workspace: its drawer is portaled
+      // to the body at the same z-index, so it would cover the file viewer the
+      // tap just opened and the tap would read as dead.
+      setSideChatsPanelOpen(false); // close mobile side-chats drawer
       // Pull the rail to the Files tab when parked on a tab where the viewer
       // won't render (Subagents). The Files tab surfaces the
       // FileViewer inline, so leave it undisturbed.

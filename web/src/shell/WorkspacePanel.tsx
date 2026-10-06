@@ -915,6 +915,10 @@ function WorkspacePanelImpl({
         // shared queue, so overlapping launches can't cross-assign. Seeding the
         // draft fires sideChatToOpen, which then just re-selects + reveals.
         sideChats.rekey(pendingId, childSessionId);
+        // The pending id is gone; drop its composer entry (and its File refs)
+        // now that the text has moved to the real child. Only on success — a
+        // failed create keeps it so the user can retry.
+        useChatStore.getState().clearSideChatComposer(pendingId);
         useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
       },
       (err) => {
@@ -949,8 +953,10 @@ function WorkspacePanelImpl({
   // compute is freed, then drop the browser-local tab.
   const closeSideChat = (childId: string) => {
     if (!childId.startsWith("pending:")) void stopSession(childId).catch(() => {});
-    // The tab is gone, so its unsent text/attachments have nowhere to return to.
+    // The tab is gone, so its unsent text/attachments and any seeded question
+    // that never got to send have nowhere to return to.
     useChatStore.getState().clearSideChatComposer(childId);
+    useChatStore.getState().clearSideChatDraft(childId);
     sideChats.close(childId);
   };
 
@@ -1477,10 +1483,7 @@ function WorkspacePanelImpl({
             title="Side chats"
             onClose={() => onMobileSideChatsOpenChange?.(false)}
             testId="side-chats-panel-drawer"
-            // A side chat is live: a seeded `/side` question still waiting on
-            // the child's agent binding must still send, and unsent composer
-            // text must survive, when the drawer is dismissed — the same as
-            // behind a collapsed desktop rail.
+            // Keep live side-chat work mounted while the drawer is closed.
             keepMounted
           >
             <div
