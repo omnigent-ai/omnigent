@@ -5,6 +5,7 @@
 import { act, cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  HTML_PREVIEW_HEAD,
   HTML_PREVIEW_SANDBOX,
   SLIDES_MSG_SOURCE,
   countSlideSections,
@@ -109,7 +110,7 @@ describe("prepareSlidesDoc", () => {
 
   it("appends the injection to a bare fragment with no </body>", () => {
     const doc = prepareSlidesDoc("<section>a</section>");
-    expect(doc.startsWith('<base target="_blank"><section>a</section><style>')).toBe(true);
+    expect(doc.startsWith(`${HTML_PREVIEW_HEAD}<section>a</section><style>`)).toBe(true);
     expect(doc.endsWith("</script>")).toBe(true);
   });
 
