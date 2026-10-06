@@ -172,7 +172,7 @@ def _write_discovery_skill(root: Path, name: str, *, visible: bool = True) -> No
 @pytest.mark.parametrize(
     "harness,expected",
     [
-        ("claude-native", {"project", "user", "toolkit:review"}),
+        ("claude-native", {"project", "user", "agents", "toolkit:review"}),
         ("codex-native", {"codex-user"}),
     ],
 )

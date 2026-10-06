@@ -20,7 +20,7 @@ import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
@@ -90,7 +90,7 @@ class SkillSourceContext:
         the terminal, which honors ``$CODEX_HOME`` for its skills.
     :param is_native: Whether the session's harness is a native CLI harness.
         Set by :func:`resolve_harness_skills` from the harness id. Gates the
-        terminal-matching resolution (config-home tiers, ``.agents`` exclusion)
+        terminal-matching resolution (including config-home tiers)
         so it applies only to native harnesses, never the in-process SDK ones.
     """
 
@@ -169,16 +169,19 @@ def _claude_user_dir(ctx: SkillSourceContext) -> Path:
     return ctx.home / ".claude"
 
 
-def _claude_code_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+def _claude_code_skills(
+    ctx: SkillSourceContext, dotdir: Literal[".claude", ".agents"] = ".claude"
+) -> list[SkillSpec]:
     """
-    The skill tiers Claude Code itself loads, and no others.
+    Discover standalone skills for Claude, workspace-first then user-global.
 
-    Claude Code reads workspace/ancestor ``.claude/skills`` plus the user
-    tier ``$CLAUDE_CONFIG_DIR/skills`` (default ``~/.claude/skills``). It
-    does NOT read ``.agents/skills`` (live-verified against its slash
-    menu), so the generic host walk over-reports for this family: a menu
-    entry the CLI can't expand just fails, since a native session sends
-    ``/name`` to the CLI as plaintext.
+    Claude reads ``.claude/skills`` itself; Omnigent exposes ``.agents/skills``
+    through a session-local additional directory at launch. Both use this
+    scanner so launch selection and the menu agree.
+
+    :param ctx: Discovery roots, user home and skill filter.
+    :param dotdir: Native Claude skills or portable skills to bridge.
+    :returns: Skills with the nearest occurrence of each name winning.
     """
     if ctx.skills_filter == "none":
         return []
@@ -194,17 +197,19 @@ def _claude_code_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         seen_dirs.add(candidate)
         dirs.append(candidate)
 
-    # Workspace-first: each root's .claude/skills, then its ancestors'.
-    for root in ctx.roots:
+    # Claude's native tiers follow its cwd; the bundle is loaded as a plugin.
+    roots = ctx.roots[:1] if dotdir == ".claude" else ctx.roots
+    for root in roots:
         current = root.resolve()
         while True:
-            _add(current / ".claude" / "skills")
+            _add(current / dotdir / "skills")
             parent = current.parent
             if parent == current:
                 break
             current = parent
     # User tier last, so a workspace skill wins a name collision.
-    _add(_claude_user_dir(ctx) / "skills")
+    user_dir = _claude_user_dir(ctx) if dotdir == ".claude" else ctx.home / dotdir
+    _add(user_dir / "skills")
 
     out: list[SkillSpec] = []
     for skills_dir in dirs:
@@ -462,20 +467,18 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
 def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Claude host skills, gated by native vs SDK, plus enabled plugins.
+    Claude host skills plus enabled plugins.
 
-    A native ``claude-native`` session types ``/name`` into the Claude CLI
-    as plaintext, so its menu must mirror exactly the tiers that CLI loads
-    (:func:`_claude_code_skills`: ``.claude/skills`` and the
-    ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``). The in-process
-    ``claude-sdk`` harness has no such terminal to match, so it keeps the
-    generic host walk it used before this scoping — the terminal-matching
-    behavior only affects native harnesses. Enabled plugin slash-commands are
-    added in both cases (config-dir-resolved for native, ``~/.claude`` for SDK
-    via :func:`_claude_user_dir`).
+    Native Claude loads its own tiers before the bridged ``.agents`` skills,
+    so an existing Claude command wins a collision. SDK discovery retains
+    the generic host walk.
     """
-    walk = _claude_code_skills if ctx.is_native else _generic_host_skills
-    return walk(ctx) + _claude_plugin_skills(ctx)
+    standalone = (
+        _claude_code_skills(ctx) + _claude_code_skills(ctx, ".agents")
+        if ctx.is_native
+        else _generic_host_skills(ctx)
+    )
+    return standalone + _claude_plugin_skills(ctx)
 
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:

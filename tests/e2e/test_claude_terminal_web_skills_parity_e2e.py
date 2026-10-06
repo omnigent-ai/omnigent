@@ -1,25 +1,8 @@
-"""E2E regression test: the web UI's skill menu diverges from the Claude
-terminal's loaded skills.
+"""Claude's web menu includes native and bridged portable skills.
 
-For a claude-family session the web composer's slash-command menu is fed by
-``GET /v1/skills?session_id={id}`` (``resolve_session_skills`` →
-``resolve_harness_skills``), while the embedded terminal's menu is whatever
-the real Claude Code CLI discovers itself. Live-verified against Claude Code
-v2.1.212, the two disagree in both directions:
-
-* the web menu surfaces ``<workspace>/.agents/skills/<skill>`` entries (the
-  generic host walk scans ``.agents``), but Claude Code does not read
-  ``.agents/skills`` — so the menu lists commands the terminal cannot
-  invoke (a native session sends ``/name`` to the CLI as plaintext; there
-  is no server-side resolve+inject on that path), and
-* Claude Code lists user-tier skills from ``$CLAUDE_CONFIG_DIR/skills``
-  (defaulting to ``~/.claude/skills``), but the web resolution reads only
-  ``Path.home()/.claude/skills`` — so with a non-default config dir the
-  terminal shows skills the web menu omits.
-
-These tests assert the FIXED parity contract — the claude-family web menu
-lists exactly what the Claude terminal can load — so they FAIL on the broken
-build and PASS once a fix lands (the fix step's fail→pass target).
+Omnigent exposes ``.agents/skills`` to Claude through an additional directory,
+alongside the CLI's native ``.claude/skills`` and configured user skill tiers.
+Host discovery must report the same commands.
 
 Usage::
 
@@ -58,12 +41,7 @@ def _skill_md(name: str, description: str) -> str:
 
 def _seed_workspace(workspace: Path) -> None:
     """
-    Seed the two workspace skill tiers the bug diverges on.
-
-    ``.claude/skills`` is read by both the Claude Code terminal and the web
-    resolution; ``.agents/skills`` is read ONLY by the web resolution's
-    generic host walk (live-verified: Claude Code v2.1.212's slash menu does
-    not list it).
+    Seed native and portable workspace skills.
 
     :param workspace: The session workspace directory to populate.
     """
@@ -75,7 +53,7 @@ def _seed_workspace(workspace: Path) -> None:
     agents_skill = workspace / ".agents" / "skills" / _AGENTS_ONLY_SKILL
     agents_skill.mkdir(parents=True)
     (agents_skill / "SKILL.md").write_text(
-        _skill_md(_AGENTS_ONLY_SKILL, "workspace .agents skill (web-only today)")
+        _skill_md(_AGENTS_ONLY_SKILL, "workspace .agents skill")
     )
 
 
@@ -173,22 +151,7 @@ async def test_claude_web_menu_lists_only_terminal_loadable_workspace_skills(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    The claude-family web menu must not list ``.agents/skills`` entries.
-
-    The user journey: a workspace carries skills under both
-    ``.claude/skills/`` and ``.agents/skills/``; the user opens the web
-    composer's slash menu and the embedded Claude terminal's slash menu for
-    the same claude-native session and compares them. Live-verified on
-    Claude Code v2.1.212: the terminal lists only the ``.claude/skills``
-    skill; the web menu additionally lists the ``.agents/skills`` one, and
-    selecting it sends ``/agents-only-skill`` to a CLI that has no such
-    command.
-
-    On the broken build the web menu includes ``agents-only-skill`` —
-    exactly the reported "loaded skills are different between claude
-    terminal and web ui".
-    """
+    """The menu includes portable skills exposed by the native launch bridge."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
@@ -199,20 +162,7 @@ async def test_claude_web_menu_lists_only_terminal_loadable_workspace_skills(
 
     names = _menu_names("claude-native", workspace)
 
-    # Precondition (passes on the broken build too): the tier both surfaces
-    # agree on is listed.
-    assert _CLAUDE_DIR_SKILL in names, (
-        f"precondition: workspace .claude/skills skill missing from menu; got {names}"
-    )
-
-    # THE BUG: Claude Code does not discover ``.agents/skills`` (verified
-    # live against its slash menu), so surfacing it in the web menu lists a
-    # command the terminal cannot invoke.
-    assert _AGENTS_ONLY_SKILL not in names, (
-        f"web menu for a claude session lists {_AGENTS_ONLY_SKILL!r} from "
-        f".agents/skills, which the Claude Code terminal does not load — the "
-        f"two surfaces show different skills. Menu: {names}"
-    )
+    assert set(names) == {_CLAUDE_DIR_SKILL, _AGENTS_ONLY_SKILL}
 
 
 @pytest.mark.asyncio
@@ -220,25 +170,14 @@ async def test_claude_web_menu_sources_user_skills_from_claude_config_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    The claude-family web menu must honor ``CLAUDE_CONFIG_DIR`` user skills.
-
-    The Claude Code terminal loads user-tier skills from
-    ``$CLAUDE_CONFIG_DIR/skills`` (live-verified: its slash menu labels them
-    "(user)"), while the web resolution reads only
-    ``Path.home()/.claude/skills``. With a non-default config dir the
-    terminal therefore lists a skill the web menu omits — the other
-    direction of the reported divergence.
-    """
+    """The menu honors ``CLAUDE_CONFIG_DIR`` alongside portable skill bridging."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     cfg = tmp_path / "claude-config"
     user_skill = cfg / "skills" / _USER_CFG_SKILL
     user_skill.mkdir(parents=True)
-    (user_skill / "SKILL.md").write_text(
-        _skill_md(_USER_CFG_SKILL, "user config-dir skill (terminal-only today)")
-    )
+    (user_skill / "SKILL.md").write_text(_skill_md(_USER_CFG_SKILL, "user config-dir skill"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -246,10 +185,4 @@ async def test_claude_web_menu_sources_user_skills_from_claude_config_dir(
 
     names = _menu_names("claude-native", workspace)
 
-    # THE BUG (other direction): the terminal's slash menu lists this skill
-    # as "(user)"; the web menu must list it too or the surfaces diverge.
-    assert _USER_CFG_SKILL in names, (
-        f"Claude terminal loads user skills from $CLAUDE_CONFIG_DIR/skills "
-        f"({cfg / 'skills'}), but the web menu omits {_USER_CFG_SKILL!r} — "
-        f"the two surfaces show different skills. Menu: {names}"
-    )
+    assert set(names) == {_CLAUDE_DIR_SKILL, _AGENTS_ONLY_SKILL, _USER_CFG_SKILL}

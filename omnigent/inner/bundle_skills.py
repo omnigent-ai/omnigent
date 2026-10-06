@@ -1,21 +1,19 @@
 """
-Shared helpers for exposing an agent bundle's skills to a Claude harness.
+Expose bundle and portable skills to Claude harnesses.
 
-Both the Claude Agent SDK executor (in-process, ``claude_sdk_executor``)
-and the ``claude-native`` CLI launch path expose a bundle's
-``skills/<dir>/SKILL.md`` files to Claude Code through its plugin
-convention (``--plugin-dir <bundle>``). This module centralizes the two
-pieces that wiring needs so the SDK and native paths stay in lockstep:
-writing the bundle's ``.claude-plugin/plugin.json`` manifest, and
-translating the spec's ``skills_filter`` into the Claude Code CLI args
-(``--plugin-dir`` + ``--setting-sources``) that the native path passes
-to the real ``claude`` binary.
+Both SDK and native Claude load bundled skills as plugins. Native Claude
+also loads portable ``.agents`` skills through a session-owned additional
+directory, preserving their bare command names and supporting files.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
+from dataclasses import replace
 from pathlib import Path
+
+from omnigent.spec.skill_sources import _claude_code_skills, skill_source_context_from_env
 
 
 def ensure_bundle_plugin_manifest(
@@ -112,3 +110,42 @@ def claude_native_skill_args(
         # skills ride --plugin-dir and are unaffected.
         args.extend(["--setting-sources", ""])
     return args
+
+
+def claude_agents_skill_args(
+    bridge_dir: Path,
+    roots: tuple[Path, ...],
+    skills_filter: str | list[str],
+) -> list[str]:
+    """Expose portable skills through Claude's additional-directory discovery.
+
+    :param bridge_dir: Session-owned directory for the skill links.
+    :param roots: Workspace and optional bundle discovery roots, in priority order.
+    :param skills_filter: Host skill selection from the agent spec.
+    :returns: Claude CLI arguments loading the selected portable skills.
+    """
+    overlay = bridge_dir / "agent-skills"
+    if overlay.exists():
+        shutil.rmtree(overlay)
+    ctx = skill_source_context_from_env(
+        roots=roots, harness="claude-native", skills_filter=skills_filter
+    )
+    native_names = {skill.name for skill in _claude_code_skills(replace(ctx, is_native=True))}
+    skills = [
+        skill for skill in _claude_code_skills(ctx, ".agents") if skill.name not in native_names
+    ]
+    if not skills:
+        return []
+    target = overlay / ".claude" / "skills"
+    target.mkdir(parents=True)
+    for index, skill in enumerate(skills):
+        if skill.skill_dir is None:
+            continue
+        # Claude uses frontmatter names; numeric links avoid directory-name collisions.
+        destination = target / str(index)
+        try:
+            destination.symlink_to(skill.skill_dir.resolve(), target_is_directory=True)
+        except OSError:
+            # Windows may require privileges to create directory symlinks.
+            shutil.copytree(skill.skill_dir, destination, symlinks=True)
+    return ["--add-dir", str(overlay)]

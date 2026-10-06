@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.bundle_skills import (
+    claude_agents_skill_args,
     claude_native_skill_args,
     ensure_bundle_plugin_manifest,
 )
@@ -130,3 +131,70 @@ def test_claude_native_skill_args_bundle_without_skills_dir(tmp_path: Path) -> N
     """
     (tmp_path / "no_skills").mkdir()
     assert "--plugin-dir" not in claude_native_skill_args(tmp_path / "no_skills")
+
+
+@pytest.mark.parametrize(
+    "skills_filter,expected",
+    [("all", {"portable", "hidden"}), ("none", set()), (["portable"], {"portable"})],
+)
+def test_claude_agents_skill_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skills_filter: str | list[str],
+    expected: set[str],
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    for name in ("portable", "hidden", "duplicate"):
+        source = workspace / ".agents" / "skills" / name
+        source.mkdir(parents=True)
+        hidden = "user-invocable: false\n" if name == "hidden" else ""
+        (source / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name}\n{hidden}---\nRead reference.txt.\n"
+        )
+        (source / "reference.txt").write_text(name)
+    config = tmp_path / "claude-config"
+    native = config / "skills" / "duplicate"
+    native.mkdir(parents=True)
+    (native / "SKILL.md").write_text(
+        "---\nname: duplicate\ndescription: native\n---\nNative skill."
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    bridge = tmp_path / "bridge"
+    # A relaunch must discard skills removed by a changed filter.
+    claude_agents_skill_args(bridge, (workspace,), "all")
+    args = claude_agents_skill_args(bridge, (workspace,), skills_filter)
+    if not expected:
+        assert args == []
+        assert not (bridge / "agent-skills").exists()
+        return
+    assert args[0] == "--add-dir"
+    linked = list((Path(args[1]) / ".claude" / "skills").iterdir())
+    assert {path.joinpath("reference.txt").read_text() for path in linked} == expected
+    assert all((path / "SKILL.md").is_file() for path in linked)
+    assert not (workspace / ".claude").exists()
+
+
+def test_claude_agents_skill_args_ignores_unloaded_bundle_claude_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    workspace, bundle = tmp_path / "workspace", tmp_path / "bundle"
+    for source, name, content in (
+        (workspace / ".agents", "shared", "Workspace skill"),
+        (bundle / ".agents", "shared", "Shadowed bundle skill"),
+        (bundle / ".agents", "fallback", "Bundle fallback"),
+        (bundle / ".claude", "shared", "Not loaded by Claude"),
+    ):
+        skill = source / "skills" / name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"---\nname: {name}\ndescription: {name}\n---\n{content}\n")
+
+    args = claude_agents_skill_args(tmp_path / "bridge", (workspace, bundle), "all")
+
+    exposed = (Path(args[args.index("--add-dir") + 1]) / ".claude" / "skills").glob("*/SKILL.md")
+    assert {path.read_text().splitlines()[-1] for path in exposed} == {
+        "Workspace skill",
+        "Bundle fallback",
+    }

@@ -6436,6 +6436,7 @@ def _claude_terminal_request(
     args = augment_claude_args(
         claude_args,
         bridge_dir=bridge_dir,
+        workspace=Path.cwd(),
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,

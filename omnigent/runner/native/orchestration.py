@@ -8797,6 +8797,7 @@ async def _auto_create_claude_terminal(
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
+        workspace=Path(workspace),
         ap_server_url=server_url,
         ap_auth_headers=_runner_headers,
         bundle_dir=bundle_dir,
