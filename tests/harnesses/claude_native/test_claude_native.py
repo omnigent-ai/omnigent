@@ -173,6 +173,7 @@ def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeyp
     args = body["spec"]["args"]
     overlay = Path(args[args.index("--add-dir") + 1])
     exposed = list((overlay / ".claude" / "skills").glob("*/SKILL.md"))
+    assert [path.parent.name for path in exposed] == ["portable"]
     assert [path.read_text() for path in exposed] == [skill.read_text()]
 
 

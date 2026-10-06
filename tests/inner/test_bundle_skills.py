@@ -163,7 +163,7 @@ def test_claude_agents_skill_args(
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     workspace = tmp_path / "workspace"
     for name in ("portable", "hidden", "duplicate"):
-        source = workspace / ".agents" / "skills" / name
+        source = workspace / ".agents" / "skills" / f"source-{name}"
         source.mkdir(parents=True)
         hidden = "user-invocable: false\n" if name == "hidden" else ""
         (source / "SKILL.md").write_text(
@@ -187,6 +187,7 @@ def test_claude_agents_skill_args(
         return
     assert args[0] == "--add-dir"
     linked = list((Path(args[1]) / ".claude" / "skills").iterdir())
+    assert {path.name for path in linked} == expected
     assert {path.joinpath("reference.txt").read_text() for path in linked} == expected
     assert all((path / "SKILL.md").is_file() for path in linked)
     assert not (workspace / ".claude").exists()
@@ -214,4 +215,35 @@ def test_claude_agents_skill_args_ignores_unloaded_bundle_claude_skills(
     assert {path.read_text().splitlines()[-1] for path in exposed} == {
         "Workspace skill",
         "Bundle fallback",
+    }
+
+
+@pytest.mark.parametrize("workspace_is_bundle", [False, True])
+def test_claude_agents_skill_args_keeps_bundle_discovery_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workspace_is_bundle: bool
+) -> None:
+    from omnigent.spec.skill_sources import resolve_harness_skills, skill_source_context_from_env
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    bundle_parent = tmp_path / "bundles"
+    bundle = bundle_parent / "agent"
+    workspace = bundle if workspace_is_bundle else tmp_path / "workspace"
+    for root, name in (
+        (workspace, "workspace"),
+        (bundle, "bundled"),
+        (bundle_parent, "unrelated"),
+    ):
+        skill = root / ".agents" / "skills" / name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"---\nname: {name}\ndescription: {name}\n---\nLocal test skill.\n")
+
+    roots = (workspace, bundle)
+    args = claude_agents_skill_args(tmp_path / "bridge", roots, "all")
+    exposed = Path(args[1]) / ".claude" / "skills"
+    assert {path.name for path in exposed.iterdir()} == {"workspace", "bundled"}
+    ctx = skill_source_context_from_env(roots=roots, harness="claude-native", bundle_dir=bundle)
+    assert {skill.name for skill in resolve_harness_skills(ctx, "claude-native")} == {
+        "workspace",
+        "bundled",
     }

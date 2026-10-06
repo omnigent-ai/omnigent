@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -197,14 +198,15 @@ def _claude_code_skills(
         seen_dirs.add(candidate)
         dirs.append(candidate)
 
-    # Claude's native tiers follow its cwd; the bundle is loaded as a plugin.
+    # Only workspace ancestors are skill sources; materialized bundles are local-only.
     roots = ctx.roots[:1] if dotdir == ".claude" else ctx.roots
-    for root in roots:
+    bundle_root = ctx.bundle_dir.resolve() if dotdir == ".agents" and ctx.bundle_dir else None
+    for index, root in enumerate(roots):
         current = root.resolve()
         while True:
             _add(current / dotdir / "skills")
             parent = current.parent
-            if parent == current:
+            if index > 0 or parent == current or current == bundle_root:
                 break
             current = parent
     # User tier last, so a workspace skill wins a name collision.
@@ -215,6 +217,12 @@ def _claude_code_skills(
     for skills_dir in dirs:
         skipped: list[str] = []
         for spec in _discover_skills(skills_dir, skipped=skipped):
+            # Portable command names become directory names in the launch overlay.
+            if dotdir == ".agents" and not re.fullmatch(r"[A-Za-z0-9_-]+", spec.name):
+                _log.warning(
+                    "Skipping portable skill with invalid command name: %s", spec.skill_dir
+                )
+                continue
             if filter_names is not None and spec.name not in filter_names:
                 continue
             out.append(spec)

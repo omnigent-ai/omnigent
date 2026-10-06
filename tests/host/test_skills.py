@@ -144,6 +144,13 @@ def test_host_and_runner_discover_the_same_custom_config_directory(
     directory.mkdir(parents=True)
     (directory / "SKILL.md").write_text(_skill("custom"))
     monkeypatch.setenv(variable, str(config_dir))
+    expected_names = {"custom"}
+    if harness == "claude-native":
+        for tier, name in ((".claude", "native"), (".agents", "portable")):
+            skill = tmp_path / tier / "skills" / name / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(_skill(name))
+            expected_names.add(name)
     discovery = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
     frame = HostSkillsFrame("request", harness, str(tmp_path))
     host_catalog = discovery.discover(frame, tmp_path)
@@ -161,7 +168,7 @@ def test_host_and_runner_discover_the_same_custom_config_directory(
     spec = load(bundle, dest=tmp_path / "runner-bundle", expand_env=False)
     resolved = resolve_session_skills(spec, (tmp_path,), None)
     assert host_catalog == [{"name": s.name, "description": s.description} for s in resolved]
-    assert "custom" in {s["name"] for s in host_catalog}
+    assert {s["name"] for s in host_catalog} == expected_names
 
 
 def test_directory_cache_separates_agent_filters(tmp_path: Path) -> None:

@@ -1,7 +1,8 @@
 """Record native and bridged portable skills in the Claude composer menu.
 
-The isolated host must use ``CLAUDE_CONFIG_DIR`` so the test can seed its
-user skill tier. Set ``OMNIGENT_E2E_HOST_ID`` to that connected host's ID.
+Set ``CLAUDE_CONFIG_DIR`` to the isolated host's config directory to also
+check its user skill tier. The single online host is selected automatically; set
+``OMNIGENT_E2E_HOST_ID`` to select one when multiple hosts are connected.
 The host-backed menu resolves skills without a model turn.
 """
 
@@ -75,12 +76,16 @@ def test_claude_menu_lists_only_terminal_loadable_skills(
     _seed_skill(workspace / ".claude" / "skills", "claude-dir-skill", "workspace claude skill")
     _seed_skill(workspace / ".agents" / "skills", "agents-only-skill", "workspace agents skill")
     cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
-    if not cfg:
-        pytest.skip("export CLAUDE_CONFIG_DIR to a writable dir before pytest")
     host_id = os.environ.get("OMNIGENT_E2E_HOST_ID")
     if not host_id:
-        pytest.skip("set OMNIGENT_E2E_HOST_ID to an isolated connected host")
-    _seed_skill(Path(cfg) / "skills", "user-cfg-skill", "user config-dir skill")
+        response = httpx.get(f"{live_server}/v1/hosts", timeout=10.0)
+        response.raise_for_status()
+        hosts = [host for host in response.json()["hosts"] if host.get("status") == "online"]
+        if len(hosts) != 1:
+            pytest.skip("set OMNIGENT_E2E_HOST_ID when there is not exactly one online host")
+        host_id = hosts[0]["host_id"]
+    if cfg:
+        _seed_skill(Path(cfg) / "skills", "user-cfg-skill", "user config-dir skill")
 
     create = post_session_bundle(
         httpx.post,
@@ -101,7 +106,8 @@ def test_claude_menu_lists_only_terminal_loadable_skills(
     composer.fill("/")
 
     expect(page.get_by_test_id("slash-menu-item-claude-dir-skill")).to_be_visible(timeout=15_000)
-    expect(page.get_by_test_id("slash-menu-item-user-cfg-skill")).to_be_visible()
+    if cfg:
+        expect(page.get_by_test_id("slash-menu-item-user-cfg-skill")).to_be_visible()
     expect(page.get_by_test_id("slash-menu-item-agents-only-skill")).to_be_visible()
     # Hold the corrected menu on screen so the clip ends on the outcome.
     page.wait_for_timeout(1_500)

@@ -4228,6 +4228,7 @@ async def test_auto_create_claude_terminal_loads_workspace_agents_skills(
 
     overlay = Path(spec.args[spec.args.index("--add-dir") + 1])
     exposed = list((overlay / ".claude" / "skills").glob("*/SKILL.md"))
+    assert [path.parent.name for path in exposed] == ["portable"]
     assert [path.read_text() for path in exposed] == [skill.read_text()]
 
 

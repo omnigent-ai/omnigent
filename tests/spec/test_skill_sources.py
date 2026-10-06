@@ -195,6 +195,28 @@ def test_claude_provider_includes_bridged_agents_skills(
     assert {s.name: s.skill_dir for s in out} == {name: selected[name] for name in expected}
 
 
+def test_claude_portable_skill_names_are_safe_command_basenames(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    for index, name in enumerate(
+        (
+            "portable",
+            "nested/name",
+            "nested\\name",
+            "..",
+            "",
+            "/absolute",
+            "display label",
+            "plugin:skill",
+        )
+    ):
+        skill = workspace / ".agents" / "skills" / f"source-{index}" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"---\nname: {json.dumps(name)}\ndescription: Test skill\n---\nBody.\n")
+
+    out = resolve_harness_skills(_ctx(workspace, tmp_path / "home"), "claude-native")
+    assert [skill.name for skill in out] == ["portable"]
+
+
 def test_claude_provider_sources_user_skills_from_config_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
