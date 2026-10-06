@@ -5456,6 +5456,69 @@ async def test_claude_native_shell_command_typed_in_the_terminal_leaves_the_queu
 
 
 @pytest.mark.asyncio
+async def test_claude_native_shell_command_hands_back_the_uncertain_entries_it_jumps_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older entry a positional drain made uncertain stays in play after a shell command.
+
+    A shell command drains only its own entry. An older entry queued when an
+    unmatched mirror drained by position is uncertain: neither declared lost nor
+    consumed, so the persist must hand it back. Left held, no later mirror could
+    match it: its own message would persist without a receipt and its bubble
+    would stay queued until the TTL.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    first = pending_inputs.record(sid, [{"type": "input_text", "text": "reformatted by the TUI"}])
+    second = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "!ls"}])
+    # A mirror that matched nothing drained the oldest entry by position, which
+    # leaves everything queued behind it uncertain.
+    positional = pending_inputs.resolve_oldest(sid, hold=True)
+    assert positional is not None and positional.pending_id == first
+    pending_inputs.mark_uncertain(sid)
+    pending_inputs.release(sid, positional)
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _shell_mirror("input", "claude:ls:0", input="ls"),
+            store,  # type: ignore[arg-type]
+        )
+
+        # Not persisted as undelivered, and still queued.
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [second]
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _user_mirror("still on its way", "claude:still-on-its-way:0"),
+            store,  # type: ignore[arg-type]
+        )
+
+        # Its own mirror matches it and names it in the receipt.
+        assert [item.type for item in store.appended_items] == ["terminal_command", "message"]
+        assert _consumed_receipts(published) == [second]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_claude_native_failed_shell_command_append_restores_its_entry() -> None:
     """A shell-command mirror whose append fails puts its queued entry back, in order."""
     from omnigent.runtime import pending_inputs
