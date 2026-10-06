@@ -803,6 +803,172 @@ def test_message_without_streamed_text_posts_no_delta(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+_ASSISTANT_DURABILITY_HARNESS = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const tmpDir = process.argv[2];
+const configPath = path.join(tmpDir, "config.json");
+fs.writeFileSync(
+  configPath,
+  JSON.stringify({
+    serverUrl: "http://omnigent.test",
+    sessionId: "session-1",
+    // Keep retry-timeout coverage fast; production uses the default.
+    assistantItemPostTimeoutMs: 10,
+  }),
+);
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+const posted = [];
+let fetchCalls = 0;
+const responses = [];
+global.fetch = async (_url, request) => {
+  posted.push(JSON.parse(request.body));
+  fetchCalls += 1;
+  if (responses.length) return responses.shift();
+  return { ok: true, status: 204 };
+};
+global.setInterval = () => ({ fakeInterval: true });
+
+const handlers = {};
+const pi = {
+  registerCommand() {},
+  on(name, handler) { handlers[name] = handler; },
+};
+require(extensionPath)(pi);
+const ctx = { ui: { setTitle() {}, setStatus() {}, notify() {} } };
+function assistantItems() {
+  return posted.filter(
+    (event) =>
+      event.type === "external_conversation_item" &&
+      event.data.item_type === "message" &&
+      event.data.item_data.role === "assistant",
+  );
+}
+"""
+
+
+def test_assistant_message_retries_with_stable_source_and_exact_text(
+    tmp_path: Path,
+) -> None:
+    """Pi's real assistant identity survives one transient POST failure."""
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  responses.push({ ok: false, status: 503 }, { ok: true, status: 204 });
+  const message = {
+    role: "assistant",
+    timestamp: 1700000000123,
+    responseId: "pi-response-42",
+    content: [{ type: "text", text: "exact assistant answer" }],
+  };
+  await handlers.message_end({ message }, ctx);
+
+  const attempts = assistantItems();
+  assert.equal(fetchCalls, 2, JSON.stringify(posted));
+  assert.equal(attempts.length, 2, JSON.stringify(attempts));
+  assert.match(attempts[0].data.source_id, /response:pi-response-42/);
+  assert.equal(attempts[0].data.source_id, attempts[1].data.source_id);
+  assert.deepEqual(
+    attempts.map((item) => item.data.item_data.content),
+    [
+      [{ type: "output_text", text: "exact assistant answer" }],
+      [{ type: "output_text", text: "exact assistant answer" }],
+    ],
+  );
+
+  // A duplicate callback after acceptance is suppressed; a failed callback
+  // would remain eligible because the dedupe mark is added after success.
+  await handlers.message_end({ message }, ctx);
+  assert.equal(fetchCalls, 2, JSON.stringify(posted));
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_assistant_message_failure_propagates_and_400_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    """Exhausted transient failures reject, while a permanent 400 is single-shot."""
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  global.fetch = async (_url, request) => {
+    posted.push(JSON.parse(request.body));
+    fetchCalls += 1;
+    return { ok: false, status: 503 };
+  };
+  const transientMessage = {
+    role: "assistant",
+    timestamp: 1700000000124,
+    responseId: "pi-response-transient",
+    content: [{ type: "text", text: "retry then surface" }],
+  };
+  let failure;
+  try {
+    await handlers.message_end({ message: transientMessage }, ctx);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, "exhausted assistant persistence must reject");
+  assert.match(String(failure && failure.message), /HTTP 503/);
+  assert.equal(fetchCalls, 3, JSON.stringify(posted));
+  assert.equal(assistantItems().length, 3, JSON.stringify(posted));
+  assert.equal(
+    new Set(assistantItems().map((item) => item.data.source_id)).size,
+    1,
+    JSON.stringify(posted),
+  );
+
+  // The failed callback remains eligible for a later delivery.
+  global.fetch = async (_url, request) => {
+    posted.push(JSON.parse(request.body));
+    fetchCalls += 1;
+    return { ok: true, status: 204 };
+  };
+  await handlers.message_end({ message: transientMessage }, ctx);
+  assert.equal(fetchCalls, 4, JSON.stringify(posted));
+
+  global.fetch = async (_url, request) => {
+    posted.push(JSON.parse(request.body));
+    fetchCalls += 1;
+    return { ok: false, status: 400 };
+  };
+  const permanentMessage = {
+    role: "assistant",
+    timestamp: 1700000000125,
+    responseId: "pi-response-permanent",
+    content: [{ type: "text", text: "bad request answer" }],
+  };
+  failure = undefined;
+  try {
+    await handlers.message_end({ message: permanentMessage }, ctx);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, "permanent assistant persistence must reject");
+  assert.match(String(failure && failure.message), /HTTP 400/);
+  assert.equal(fetchCalls, 5, JSON.stringify(posted));
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_registers_omnigent_tools_and_execute_round_trips(tmp_path: Path) -> None:
     """The extension registers config.tools and execute() round-trips via /mcp.
 

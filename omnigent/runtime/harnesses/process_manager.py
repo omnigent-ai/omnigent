@@ -1426,12 +1426,20 @@ class HarnessProcessManager:
 
         :param entry: The bookkeeping record to tear down.
         """
+        cancellation: asyncio.CancelledError | None = None
         try:
             await entry.client.aclose()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
         except Exception:
             # A broken transport must not skip the subprocess kill below.
             _logger.exception("error closing harness client during teardown; continuing")
-        finally:
+
+        async def _force_kill_and_wait() -> None:
+            _proc.kill_tree(entry.process)
+            await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+
+        try:
             if entry.process.returncode is None:
                 try:
                     # Tree-aware backstop: this process parents the sandbox
@@ -1439,14 +1447,27 @@ class HarnessProcessManager:
                     # handle strands both when an executor close() never runs.
                     _proc.terminate_tree(entry.process)
                     await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+                except asyncio.CancelledError as exc:
+                    # Cancellation during either wait must not abandon the child.
+                    cancellation = exc
+                    try:
+                        await _force_kill_and_wait()
+                    except asyncio.CancelledError as exc:
+                        cancellation = exc
+                    except Exception:
+                        pass
                 except Exception:
                     # Graceful SIGTERM didn't complete — it timed out, or
                     # send_signal/wait raised (e.g. the process vanished
                     # mid-teardown). Force-kill best-effort; a process that
                     # is already gone is already done.
-                    with contextlib.suppress(Exception):
-                        _proc.kill_tree(entry.process)
-                        await entry.process.wait()
+                    try:
+                        await _force_kill_and_wait()
+                    except asyncio.CancelledError as exc:
+                        cancellation = exc
+                    except Exception:
+                        pass
+        finally:
             with contextlib.suppress(Exception):
                 close_subprocess_transport(entry.process)
             # Best-effort socket cleanup. uvicorn's atexit usually
@@ -1454,6 +1475,8 @@ class HarnessProcessManager:
             # hard-killed runner won't. No-op for TCP endpoints.
             with contextlib.suppress(Exception):
                 entry.endpoint.cleanup()
+        if cancellation is not None:
+            raise cancellation
 
     async def _idle_reaper_loop(self) -> None:
         """

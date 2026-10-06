@@ -656,6 +656,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ssh-agent auth, so git-over-SSH and SSH-cert-authenticated tooling
         # fail with "dial unix: missing address".
         "SSH_AUTH_SOCK",
+        # The user's URL-opener command (e.g. a remote-dev helper that forwards
+        # URLs and OAuth callbacks to the laptop). A command name, not a secret.
+        # Without it, CLI logins in the agent fall back to a local browser.
+        "BROWSER",
         # gcloud Application Default Credentials selectors, same class as
         # KUBECONFIG above: AGY_ADC_AUTH is the boolean the Antigravity CLI
         # (agy) reads to pick ADC auth, GOOGLE_APPLICATION_CREDENTIALS is a

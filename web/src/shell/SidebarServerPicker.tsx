@@ -17,6 +17,7 @@ import {
 } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
+import { ownServerName } from "@/lib/serverNames";
 
 /** Short display label for a server URL — its host, e.g. "localhost:8000". */
 function hostOf(url: string): string {
@@ -34,6 +35,28 @@ function originOf(url: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * A server's name over its host, or just the host. The host stays visible
+ * because a server-supplied name is not proof of which server this is.
+ */
+function ServerLabel({
+  name,
+  host,
+  className,
+}: {
+  name: string | null;
+  host: string;
+  className?: string;
+}) {
+  if (!name) return <span className={cn("min-w-0 truncate", className)}>{host}</span>;
+  return (
+    <span className="flex min-w-0 flex-col">
+      <span className={cn("truncate", className)}>{name}</span>
+      <span className="truncate text-xs text-muted-foreground">{host}</span>
+    </span>
+  );
 }
 
 /** Origin plus workspace selector, so two workspaces on one host stay apart. */
@@ -97,6 +120,8 @@ export function SidebarServerPicker() {
   const currentIsManaged = managed.some(isCurrent);
   const managedNames = new Map(Object.entries(info.managedServerNames ?? {}));
   const managedLabel = (url: string) => managedNames.get(url) ?? hostOf(url);
+  // A server's own name is display only, so the host is always shown with it.
+  const ownName = (url: string) => ownServerName(info.serverNames, url);
   const recentLabels = new Map(Object.entries(info.recentLabels ?? {}));
   const shownAs = (url: string) => recentLabels.get(url) ?? url;
   // A recent reached through a managed server's URL is that server: it's listed
@@ -116,9 +141,18 @@ export function SidebarServerPicker() {
     );
   });
   const currentManaged = managed.find(isCurrent);
-  const currentHost =
-    (currentManaged !== undefined ? managedNames.get(currentManaged) : undefined) ??
-    hostOf(currentServer ?? info.currentOrigin);
+  // Name and host come from the same URL, so they always describe one server.
+  const currentAddress = hostOf(currentServer ?? info.currentOrigin);
+  const ownCurrent = ownName(currentServer ?? info.currentOrigin);
+  // A name that only repeats the host adds nothing.
+  const currentOwnName = ownCurrent === currentAddress ? null : ownCurrent;
+  const currentManagedName =
+    currentManaged !== undefined ? managedNames.get(currentManaged) : undefined;
+  const currentHost = currentManagedName ?? currentOwnName ?? currentAddress;
+  const currentDescription =
+    currentManagedName === undefined && currentOwnName !== null
+      ? `${currentOwnName} (${currentAddress})`
+      : currentHost;
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
@@ -145,7 +179,8 @@ export function SidebarServerPicker() {
               "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
               "data-[state=open]:bg-muted data-[state=open]:text-foreground",
             )}
-            aria-label={`Server: ${currentHost}. Switch server`}
+            aria-label={`Server: ${currentDescription}. Switch server`}
+            title={currentDescription}
             data-testid="sidebar-server-picker"
           >
             <ServerIcon className="ui-icon text-muted-foreground" />
@@ -182,9 +217,18 @@ export function SidebarServerPicker() {
                     ) : (
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
-                    <span className={cn("min-w-0 truncate", current && "font-medium")}>
-                      {managedLabel(url)}
-                    </span>
+                    {managedNames.has(url) ? (
+                      <span className={cn("min-w-0 truncate", current && "font-medium")}>
+                        {managedLabel(url)}
+                      </span>
+                    ) : (
+                      // No organization name: the server's own, beside its host.
+                      <ServerLabel
+                        name={ownName(url)}
+                        host={hostOf(url)}
+                        className={current ? "font-medium" : undefined}
+                      />
+                    )}
                   </DropdownMenuItem>
                 );
               })}
@@ -197,7 +241,11 @@ export function SidebarServerPicker() {
               {!currentIsManaged ? (
                 <DropdownMenuItem disabled className="gap-2 opacity-100">
                   <CheckIcon className="size-4 shrink-0" />
-                  <span className="min-w-0 truncate font-medium">{currentHost}</span>
+                  <ServerLabel
+                    name={currentOwnName}
+                    host={currentAddress}
+                    className="font-medium"
+                  />
                 </DropdownMenuItem>
               ) : null}
               {recentOthers.map((url) => (
@@ -207,7 +255,7 @@ export function SidebarServerPicker() {
                   onSelect={() => void switchServer(url)}
                 >
                   <span className="size-4 shrink-0" aria-hidden="true" />
-                  <span className="min-w-0 truncate">{hostOf(shownAs(url))}</span>
+                  <ServerLabel name={ownName(shownAs(url))} host={hostOf(shownAs(url))} />
                 </DropdownMenuItem>
               ))}
             </>

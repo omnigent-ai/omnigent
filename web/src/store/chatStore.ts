@@ -1051,7 +1051,8 @@ export interface AppChatState {
    * chat (its own managed fork) so the typed question isn't lost — the side
    * chat's composer seeds from and consumes it on mount rather than firing a
    * turn at a runner that is still launching. App-global (the side chat lives in
-   * the main chat's rail, not its own entry).
+   * the main chat's rail, not its own entry). Keyed by a `pending:` tab id, it is
+   * instead the "Ask in side chat" selection that tab's composer quotes.
    */
   sideChatDrafts: Record<string, string>;
   /**

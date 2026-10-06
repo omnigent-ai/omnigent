@@ -174,6 +174,52 @@ async def test_persistent_natural_eof_exhausts_disconnect_grace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stopped_runner", [None, "runner-current", "runner-old"])
+async def test_natural_eof_matches_intent_to_the_relay_runner(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, stopped_runner: str | None
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    runner_id = "runner-current"
+    conversation = store.create_conversation(runner_id=runner_id)
+    session_id = conversation.id
+    store.set_session_live_status(session_id, "running")
+    orchestration._session_status_cache[session_id] = "running"
+    if stopped_runner is not None:
+        orchestration._intentional_stop_sessions[session_id] = stopped_runner
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, stream=_NaturalEofStream(b'data: {"type":"session.heartbeat"}\n\n')
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://runner", transport=httpx.MockTransport(respond)
+        ) as client:
+            await asyncio.wait_for(
+                orchestration._relay_runner_stream(session_id, client, store, runner_id=runner_id),
+                timeout=10,
+            )
+        intentional = stopped_runner == runner_id
+        assert orchestration._session_status_cache[session_id] == (
+            "idle" if intentional else "failed"
+        )
+        persisted = store.get_conversation(session_id)
+        assert persisted is not None
+        error = orchestration._last_task_error_from_labels(persisted.labels)
+        if intentional:
+            assert error is None
+            assert session_id not in orchestration._intentional_stop_sessions
+        else:
+            assert error is not None and error["code"] == "runner_disconnected"
+    finally:
+        orchestration._intentional_stop_sessions.pop(session_id, None)
+        orchestration._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 async def test_short_recovered_streams_do_not_share_a_disconnect_deadline(
     db_uri: str, relay_clock: _RelayClock
 ) -> None:

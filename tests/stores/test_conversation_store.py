@@ -3166,6 +3166,132 @@ def test_replace_runner_id_allows_internal_non_session_conversation(
     assert fetched.runner_id == "runner-uuid-1"
 
 
+@pytest.mark.parametrize("limit", [1, 4])
+def test_list_runner_session_statuses_pages(
+    conversation_store: SqlAlchemyConversationStore, limit: int
+) -> None:
+    from omnigent.db.db_models import (
+        SqlConversationMetadata,
+        current_workspace_id,
+        workspace_scope,
+    )
+
+    expected = []
+    for status in (None, "running", "waiting", "idle", "failed"):
+        row = conversation_store.create_conversation(runner_id="runner-target")
+        if status is not None:
+            conversation_store.set_session_live_status(row.id, status)
+        if status == "running":
+            conversation_store.update_conversation(row.id, archived=True)
+        expected.append((row.id, status))
+    unknown = conversation_store.create_conversation(runner_id="runner-target")
+    with conversation_store._session_immediate("test_future_live_status") as session:
+        meta = session.get(SqlConversationMetadata, (current_workspace_id(), unknown.id))
+        assert meta is not None
+        meta.live_status = 32767
+    expected.append((unknown.id, None))
+    conversation_store.create_conversation(runner_id="runner-other")
+    conversation_store.create_conversation()
+    with workspace_scope(424242):
+        conversation_store.create_conversation(runner_id="runner-target")
+
+    actual = []
+    after = None
+    while True:
+        page = conversation_store.list_runner_session_statuses(
+            "runner-target", after=after, limit=limit
+        )
+        assert len(page) <= limit
+        actual.extend(page)
+        if len(page) < limit:
+            break
+        assert after is None or page[-1][0] > after
+        after = page[-1][0]
+    assert actual == sorted(expected)
+    for invalid_limit in (0, 1001):
+        with pytest.raises(ValueError, match="limit must be between 1 and 1000"):
+            conversation_store.list_runner_session_statuses("runner-target", limit=invalid_limit)
+
+
+@pytest.mark.parametrize("status", [None, "idle", "running", "waiting", "failed"])
+def test_settle_intentionally_stopped_session_requires_current_runner(
+    conversation_store: SqlAlchemyConversationStore,
+    status: str | None,
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    conv = conversation_store.create_conversation(runner_id="runner-stopped")
+    if status is not None:
+        conversation_store.set_session_live_status(conv.id, status)
+    conversation_store.set_labels(conv.id, {"omnigent.last_task_error_code": "preserved"})
+    before = conversation_store.get_conversation(conv.id)
+    with workspace_scope(424242):
+        assert not conversation_store.settle_intentionally_stopped_session(
+            conv.id, "runner-stopped"
+        )
+    assert not conversation_store.settle_intentionally_stopped_session(conv.id, "runner-other")
+    assert conversation_store.get_conversation(conv.id).live_status == status
+    settled = conversation_store.settle_intentionally_stopped_session(conv.id, "runner-stopped")
+    assert settled is (status != "failed")
+    after = conversation_store.get_conversation(conv.id)
+    assert after.live_status == ("failed" if status == "failed" else "idle")
+    assert after.labels == before.labels
+    assert after.updated_at == before.updated_at
+    assert not conversation_store.settle_intentionally_stopped_session("0" * 32, "runner-stopped")
+
+
+def test_intentional_stop_preserves_unknown_live_status(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+
+    conv = conversation_store.create_conversation(runner_id="runner-stopped")
+    metadata_key = (current_workspace_id(), conv.id)
+    with conversation_store._session_immediate("test_future_live_status") as session:
+        meta = session.get(SqlConversationMetadata, metadata_key)
+        assert meta is not None
+        meta.live_status = 32767
+
+    assert not conversation_store.settle_intentionally_stopped_session(conv.id, "runner-stopped")
+    with conversation_store._session("check_future_live_status") as session:
+        meta = session.get(SqlConversationMetadata, metadata_key)
+        assert meta is not None
+        assert meta.live_status == 32767
+
+
+def test_runner_session_status_page_uses_runner_index(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    if conversation_store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite query-plan assertion")
+    rows = [conversation_store.create_conversation(runner_id="runner-target") for _ in range(5)]
+    cursor = sorted(row.id for row in rows)[1]
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(conversation_store._engine, "before_cursor_execute", capture)
+    try:
+        page = conversation_store.list_runner_session_statuses(
+            "runner-target", after=cursor, limit=2
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", capture)
+    assert len(page) == 2
+    assert len(queries) == 1, "Teardown needs only the bounded metadata read"
+    statement, parameters = queries[0]
+    with conversation_store._engine.connect() as conn:
+        plan = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+    description = str(plan)
+    assert "ix_conversation_metadata_runner_id" in description, description
+    # SQLite's textual plan must show a cursor seek, not only use the index:
+    # scanning earlier pages through that index would still do unbounded work.
+    assert "id>?" in "".join(description.split()), description
+    assert "TEMP B-TREE" not in description, description
+
+
 def test_list_conversations_by_runner_id_filters(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
