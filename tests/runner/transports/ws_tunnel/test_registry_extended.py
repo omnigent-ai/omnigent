@@ -381,21 +381,20 @@ async def test_send_diagnostics_follow_owner_loop_and_connection_generation() ->
     assert first.diagnostics.snapshot()["app_pings_queued"] == 0
 
 
-@pytest.mark.parametrize("operation", ["timestamp", "enqueued"])
-async def test_send_text_propagates_owner_loop_callback_error(
-    monkeypatch: pytest.MonkeyPatch, operation: str
+async def test_send_text_propagates_owner_loop_timestamp_error(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = TunnelRegistry()
     session = registry.register("r1", _NoopWS(), _hello())
     owner_thread = threading.get_ident()
     error = RuntimeError("queue timing failed")
 
-    def fail_on_owner_loop(*_args: object) -> float:
+    def fail_on_owner_loop() -> float:
         if threading.get_ident() == owner_thread:
             raise error
         return 100.0
 
-    monkeypatch.setattr(session.diagnostics, operation, fail_on_owner_loop)
+    monkeypatch.setattr(session.diagnostics, "timestamp", fail_on_owner_loop)
 
     async def send_from_other_loop() -> None:
         await asyncio.wait_for(registry.send_text(session, "payload"), timeout=budget(1))
@@ -403,6 +402,36 @@ async def test_send_text_propagates_owner_loop_callback_error(
     with pytest.raises(RuntimeError) as raised:
         await asyncio.to_thread(lambda: asyncio.run(send_from_other_loop()))
     assert raised.value is error
+    assert session.outbound_queue.empty()
+
+
+@pytest.mark.parametrize("cross_loop", [False, True], ids=["same-loop", "cross-loop"])
+async def test_send_text_accepts_queued_frame_when_diagnostics_fail(
+    monkeypatch: pytest.MonkeyPatch, cross_loop: bool
+) -> None:
+    registry = TunnelRegistry()
+    session = registry.register("r1", _NoopWS(), _hello())
+
+    def fail_recording(*_args: object) -> None:
+        raise RuntimeError("queue diagnostics failed")
+
+    monkeypatch.setattr(session.diagnostics, "enqueued", fail_recording)
+
+    async def send() -> None:
+        await asyncio.wait_for(
+            registry.send_text(session, "heartbeat", app_ping_ts=123), timeout=budget(1)
+        )
+
+    if cross_loop:
+        await asyncio.to_thread(lambda: asyncio.run(send()))
+    else:
+        await send()
+
+    frame = session.outbound_queue.get_nowait()
+    assert frame is not None
+    assert frame.data == "heartbeat"
+    assert frame.app_ping_ts == 123
+    assert session.outbound_queue.empty()
 
 
 @pytest.mark.asyncio

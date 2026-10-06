@@ -754,9 +754,11 @@ class TunnelRegistry:
                         data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
                     )
                     session.outbound_queue.put_nowait(frame)
-                    session.diagnostics.enqueued(
-                        frame, session.outbound_queue.qsize(), requested_at
-                    )
+                    # Recording failures cannot undo an accepted frame.
+                    with contextlib.suppress(Exception):
+                        session.diagnostics.enqueued(
+                            frame, session.outbound_queue.qsize(), requested_at
+                        )
             except Exception as error:  # noqa: BLE001 — forward failures across loops.
                 if not ack.done():
                     ack.set_exception(error)
