@@ -7496,7 +7496,8 @@ async def _runner_disconnect_requires_failure(
     observation. Recheck the cache after the read, even when the read fails.
 
     If the read is unavailable, use the sweep or relay's adoption snapshot.
-    Without any known state, report the drop so an interruption is not lost.
+    Without any known state, preserve the session: a failed read does not
+    establish that a turn was interrupted.
     Only top-level sessions can fail before startup with ``fail_idle_top_level``.
 
     A sub-agent mirrored from a native parent fails only on a turn in the
@@ -7511,7 +7512,7 @@ async def _runner_disconnect_requires_failure(
         try:
             persisted = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             lookup = "found" if persisted is not None else "missing"
-        except Exception:  # noqa: BLE001 — a failed read must not swallow a disconnect
+        except Exception:  # noqa: BLE001 — retain fallback state when storage is unavailable
             lookup = "error"
             _logger.warning(
                 "Runner disconnect: live-status read failed for session=%s",
@@ -7545,8 +7546,10 @@ async def _runner_disconnect_requires_failure(
         decision = "intentional_stop"
     elif live in _MID_TURN_STATUSES and source != "cache" and _owned_by_parent_runtime(conv):
         decision = "subagent_unobserved"
-    elif live in _MID_TURN_STATUSES or source == "unknown":
+    elif live in _MID_TURN_STATUSES:
         decision = "failed_mid_turn"
+    elif source == "unknown":
+        decision = "unknown_no_failure"
     elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
         decision = "failed_before_start"
     else:
@@ -7826,17 +7829,11 @@ async def _relay_runner_stream(
                     extra={"session_id": session_id},
                 )
             elif decision == "idle_no_failure":
-                # The runner went away while this session sat idle (host
-                # asleep, host restart, `omnigent host` stopped). Nothing was
-                # interrupted, so there is no error to report: publishing one
-                # lit a red "connection to the host dropped" banner over a
-                # session that had simply finished its last turn. The absence
-                # is already carried by liveness (``clear_runner_liveness``),
-                # which drives the reconnect affordance. Stay silent — no
-                # status edge, and no clearing of labels either, so a genuine
-                # earlier failure keeps its error.
+                # No evidence of an interrupted turn. Liveness drives the
+                # reconnect affordance; preserve status and prior error labels.
                 _logger.info(
-                    "Relay: runner gone for idle session=%s; no failure to report",
+                    "Relay: runner gone without a known interrupted turn for session=%s; "
+                    "no failure to report",
                     session_id,
                     extra={"session_id": session_id},
                 )
