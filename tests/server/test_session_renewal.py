@@ -529,28 +529,87 @@ def _oidc_client(
     return TestClient(app, base_url=origin), provider
 
 
-def _oidc_login(client: TestClient, origin: str) -> httpx.Response:
-    """Complete ``/auth/callback`` with a valid state cookie."""
+def _oidc_login(
+    client: TestClient, origin: str, *, native: dict[str, str] | None = None
+) -> httpx.Response:
+    """Complete ``/auth/callback`` with a valid state cookie.
+
+    ``native`` makes it a native (loopback) sign-in, as ``/auth/login`` records one.
+    """
     from omnigent.server.routes.auth import _AUTH_STATE_COOKIE_PLAIN, _AUTH_STATE_COOKIE_SECURE
 
     state_cookie = (
         _AUTH_STATE_COOKIE_SECURE if origin.startswith("https://") else _AUTH_STATE_COOKIE_PLAIN
     )
-    state_jwt = jwt.encode(
-        {
-            "state": "state-xyz",
-            "code_verifier": "verifier",
-            "return_to": "/",
-            "exp": int(time.time()) + 300,
-        },
-        _SECRET,
-        algorithm="HS256",
-    )
+    state: dict[str, Any] = {
+        "state": "state-xyz",
+        "code_verifier": "verifier",
+        "return_to": "/",
+        "exp": int(time.time()) + 300,
+    }
+    if native is not None:
+        state["native"] = native
+    state_jwt = jwt.encode(state, _SECRET, algorithm="HS256")
     return client.get(
         "/auth/callback?code=auth-code&state=state-xyz",
         headers=_cookie(state_cookie, state_jwt),
         follow_redirects=False,
     )
+
+
+def test_native_sign_in_token_renews_and_logs_out_like_a_browser_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native app's exchanged token is a full browser session.
+
+    Used as the session cookie it slides and a logout ends it; a Bearer
+    copy keeps its fixed expiry, like a CLI-ticket token.
+    """
+    from urllib.parse import parse_qs, urlsplit
+
+    from omnigent.server.oidc import derive_code_challenge
+
+    clock = _JwtClock(monkeypatch)
+    client, _ = _oidc_client(monkeypatch, tmp_path, _HTTP)
+    name = _cookie_name(_HTTP)
+    loopback, verifier = "http://127.0.0.1:53682/callback", "v" * 64
+    native = {
+        "redirect_uri": loopback,
+        "state": "app-state",
+        "code_challenge": derive_code_challenge(verifier),
+    }
+    with client:
+        callback = _oidc_login(client, _HTTP, native=native)
+        assert callback.status_code == 302, callback.text
+        assert _session_set_cookies(callback, name) == []
+        code = parse_qs(urlsplit(callback.headers["location"]).query)["code"][0]
+        exchange = client.post(
+            "/auth/native-token",
+            data={"code": code, "code_verifier": verifier, "redirect_uri": loopback},
+        )
+        assert exchange.status_code == 200, exchange.text
+        token = exchange.json()["token"]
+        claims = _decode(token)
+        assert claims["auth_time"] == claims["iat"]
+        assert claims["exp"] == claims["iat"] + _TTL
+        assert isinstance(claims["sid"], str) and claims["sid"]
+
+        clock.advance(_TTL - 600)
+        renewed = _renewed_token(client.get(_PROBE, headers=_cookie(name, token)), name)
+        renewed_claims = _decode(renewed)
+        assert (renewed_claims["sid"], renewed_claims["auth_time"]) == (
+            claims["sid"],
+            claims["auth_time"],
+        )
+        assert renewed_claims["exp"] > claims["exp"]
+
+        logout = client.get("/auth/logout", headers=_cookie(name, renewed), follow_redirects=False)
+        assert logout.status_code == 302
+        for cookie in (token, renewed):
+            assert client.get(_PROBE, headers=_cookie(name, cookie)).status_code == 401
+        bearer = client.get(_PROBE, headers={"Authorization": f"Bearer {token}"})
+        assert bearer.status_code == 200
+        assert bearer.headers.get_list("set-cookie") == []
 
 
 @pytest.mark.parametrize("origin", [_HTTP, _HTTPS])
