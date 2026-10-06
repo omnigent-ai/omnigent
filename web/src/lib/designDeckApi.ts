@@ -16,8 +16,7 @@ import {
 } from "./designDecks";
 
 export type DeckSearchResult =
-  | { status: "ok"; paths: string[]; truncated: boolean }
-  | { status: "unavailable" };
+  { status: "ok"; paths: string[]; truncated: boolean } | { status: "unavailable" };
 
 /**
  * Every `*.slides.html` path in a session's workspace. A 404 (no file

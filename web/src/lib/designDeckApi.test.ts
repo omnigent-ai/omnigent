@@ -72,9 +72,7 @@ describe("fetchDeckSearch", () => {
     const data = Array.from({ length: WORKSPACE_FILE_SEARCH_LIMIT }, (_, i) =>
       entry(`decks/d${i}.slides.html`),
     );
-    searchMock.mockResolvedValue(
-      response(200, { object: "list", data, has_more: true }),
-    );
+    searchMock.mockResolvedValue(response(200, { object: "list", data, has_more: true }));
 
     const result = await fetchDeckSearch("conv_a");
     expect(result).toMatchObject({ status: "ok", truncated: true });
