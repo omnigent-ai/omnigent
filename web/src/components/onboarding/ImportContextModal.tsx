@@ -1,4 +1,4 @@
-// Post-setup "Your imports are ready" modal: one tab per harness, showing the
+// Post-setup "Your setup is ready" modal: one tab per harness, showing the
 // credential Omnigent adopted and the MCP servers, skills, and plugins found
 // there. Review only: sessions already load these, so nothing is selected.
 
@@ -68,7 +68,7 @@ function CredentialLine({ source }: { source: string }) {
       <span className="min-w-0 flex-1 truncate font-medium text-foreground">{source}</span>
       <span className="flex shrink-0 items-center gap-1 text-muted-foreground">
         <Check className="size-3.5 text-success" aria-hidden="true" />
-        Imported
+        Detected
       </span>
     </div>
   );
@@ -352,7 +352,7 @@ function ImportContextBody({
       <div className="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pt-5">
         <div className="flex flex-col items-center gap-1 py-2 text-center">
           <DialogTitle className="min-h-0 pr-0 text-2xl leading-8 font-normal tracking-[-0.02em]">
-            Your imports are ready
+            Your setup is ready
           </DialogTitle>
           <DialogDescription className="max-w-[480px] text-[14px] leading-5">
             {hostName ? `Found in your harnesses on ${hostName}.` : "Found in your harnesses."}{" "}
