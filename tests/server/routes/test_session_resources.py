@@ -5108,6 +5108,65 @@ async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry()
 
 
 @pytest.mark.asyncio
+async def test_claude_native_mirror_without_text_match_never_takes_an_interrupted_entry() -> None:
+    """A message typed in the TUI after a cancelled web message is not the cancelled one.
+
+    With no text match the mirror falls back to the oldest entry. A cancelled
+    entry is never that guess: the TUI message would inherit its attachment,
+    author and client id, and the entry would be reported as settled.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    cancelled = pending_inputs.record(
+        sid,
+        [
+            {"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"},
+            {"type": "input_text", "text": "the cancelled web message"},
+        ],
+        created_by="alice@example.com",
+        stable_id="ab" * 16,
+    )
+    pending_inputs.mark_interrupted(sid, [cancelled])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "typed in the terminal"}],
+            },
+            "response_id": "resp_typed",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            created_by="bob@example.com",
+        )
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        typed = store.appended_items[0]
+        assert typed.data.content == [{"type": "input_text", "text": "typed in the terminal"}]
+        assert typed.created_by == "bob@example.com"
+        assert store.persisted_by_stable_id == {}
+        # The cancelled entry is untouched: hidden, and left to a later match or the TTL.
+        assert pending_inputs.pending_ids(sid) == [cancelled]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_claude_native_mirror_matches_text_behind_attachment_markers() -> None:
     """Attachment marker lines the executor prepends don't defeat the text match."""
     from omnigent.runtime import pending_inputs

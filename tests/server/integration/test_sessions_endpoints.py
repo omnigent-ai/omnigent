@@ -1335,6 +1335,45 @@ async def test_external_session_superseded_drains_pending_inputs(
         pending_inputs.reset_for_tests()
 
 
+async def test_external_session_superseded_leaves_interrupted_entries_hidden(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The ``/clear`` drain settles live entries and stops at the ones the person cancelled.
+
+    The drain still ends, the ``/clear`` entry is gone, and the cancelled entry
+    stays hidden (not in the snapshot, not "working") until the TTL evicts it.
+    """
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    try:
+        cancelled = pending_inputs.record(
+            session["id"], [{"type": "input_text", "text": "cancel me"}]
+        )
+        pending_inputs.mark_interrupted(session["id"], [cancelled])
+        pending_inputs.record(session["id"], [{"type": "input_text", "text": "/clear"}])
+
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_session_superseded",
+                "data": {"target_conversation_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d"},
+            },
+        )
+        assert resp.status_code in (200, 202)
+
+        assert pending_inputs.snapshot_for(session["id"]) == []
+        assert pending_inputs.has_pending(session["id"]) is False
+        assert pending_inputs.pending_ids(session["id"]) == [cancelled]
+        items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+        assert not any(item["type"] == "message" for item in items)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 # ── POST /v1/sessions/{id}/events external_subagent_start ─────────
 
 
@@ -10217,6 +10256,114 @@ async def test_interrupt_codex_side_chat_leaves_queued_native_messages_pending(
         _session_status_cache.pop(child_id, None)
 
 
+@asynccontextmanager
+async def _codex_native_session(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    interrupt_status: int = 202,
+) -> AsyncIterator[tuple[str, list[tuple[str, dict[str, Any]]]]]:
+    """
+    Scope a codex-native session whose runner answers every interrupt with one status.
+
+    Captures the published events, and clears the pending-input index and the
+    stop fence on exit.
+
+    :param client: The test HTTP client.
+    :param monkeypatch: Used to capture published events and route to the runner.
+    :param interrupt_status: The runner's reply; a 2xx lands the interrupt, a
+        4xx/5xx is one that did not.
+    :yields: The session id and the list the published events are captured into.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    session_id = session["id"]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(interrupt_status)),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        try:
+            yield session_id, published
+        finally:
+            pending_inputs.reset_for_tests()
+            _interrupt_fenced_sessions.discard(session_id)
+
+
+def _queue_web_message(session_id: str, text: str) -> str:
+    """Record a native web message as the message route does; returns its pending id."""
+    from omnigent.runtime import pending_inputs
+
+    return pending_inputs.record(session_id, [{"type": "input_text", "text": text}])
+
+
+async def _press_stop(client: httpx.AsyncClient, session_id: str) -> None:
+    """POST an interrupt, as the web client's Stop button does."""
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
+    )
+    assert response.status_code == 202, response.text
+
+
+async def _mirror_user_message(
+    client: httpx.AsyncClient, session_id: str, text: str, source_id: str
+) -> dict[str, Any]:
+    """
+    Post the transcript mirror of a user message, as a native forwarder does.
+
+    :param client: The test HTTP client.
+    :param session_id: The native session the message was sent to.
+    :param text: The text the agent recorded, e.g. ``"go on"``.
+    :param source_id: The forwarder's retry-safe id for the record, e.g. ``"codex:go-on:0"``.
+    :returns: The response body, which carries the persisted ``item_id``.
+    """
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": f"native_turn_{source_id}",
+                "source_id": source_id,
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    return response.json()
+
+
+async def _persisted_user_texts_and_error_codes(
+    client: httpx.AsyncClient, session_id: str
+) -> tuple[list[str], list[str]]:
+    """Return the session's persisted user message texts and error codes, in order."""
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    user_texts = [
+        block["text"]
+        for item in items
+        if item["type"] == "message" and item["role"] == "user"
+        for block in item["content"]
+    ]
+    return user_texts, [item["code"] for item in items if item["type"] == "error"]
+
+
+def _consumed_pending_ids(published: list[tuple[str, dict[str, Any]]]) -> list[str]:
+    """The pending ids the published ``session.input.consumed`` events cleared, in order."""
+    return [
+        event["data"]["cleared_pending_id"]
+        for _sid, event in published
+        if event.get("type") == "session.input.consumed"
+    ]
+
+
 @pytest.mark.parametrize("delivered", [True, False])
 async def test_interrupted_native_message_is_not_reported_undelivered_by_a_later_mirror(
     client: httpx.AsyncClient,
@@ -10233,83 +10380,119 @@ async def test_interrupted_native_message_is_not_reported_undelivered_by_a_later
     settled quietly and only the message the agent did record is persisted.
     """
     from omnigent.runtime import pending_inputs
-    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
 
-    published: list[tuple[str, dict[str, Any]]] = []
-    _capture_published(monkeypatch, published)
-    pending_inputs.reset_for_tests()
-    agent = await create_test_agent(client)
-    session = await _create_session(
-        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
-    )
-    session_id = session["id"]
+    async with _codex_native_session(
+        client, monkeypatch, interrupt_status=202 if delivered else 503
+    ) as (session_id, published):
+        cancelled = _queue_web_message(session_id, "cancel me")
+        await _press_stop(client, session_id)
+        # The person's next message, sent after Stop, which the agent records.
+        kept = _queue_web_message(session_id, "go on")
+        await _mirror_user_message(client, session_id, "go on", "codex:go-on:0")
 
-    def _handler(request: httpx.Request) -> httpx.Response:
-        """Land the interrupt, or fail it the way a claude-native runner does."""
-        del request
-        return httpx.Response(202 if delivered else 503)
+        user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        # Both entries are gone either way; what differs is whether the
+        # cancelled message is recorded as lost.
+        assert pending_inputs.pending_ids(session_id) == []
+        assert pending_inputs.snapshot_for(session_id) == []
+        if delivered:
+            assert error_codes == []
+            assert user_texts == ["go on"]
+            assert _consumed_pending_ids(published) == [kept]
+        else:
+            assert error_codes == ["native_prompt_not_recorded"]
+            assert user_texts == ["cancel me", "go on"]
+            assert _consumed_pending_ids(published) == [cancelled, kept]
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_handler), base_url="http://runner"
-    ) as fake_runner:
-        _route_to_runner(monkeypatch, fake_runner)
-        try:
-            cancelled = pending_inputs.record(
-                session_id, [{"type": "input_text", "text": "cancel me"}]
-            )
-            interrupted = await client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={"type": "interrupt", "data": {}},
-            )
-            assert interrupted.status_code == 202, interrupted.text
-            # The person's next message, sent after Stop, which the agent records.
-            kept = pending_inputs.record(session_id, [{"type": "input_text", "text": "go on"}])
 
-            mirrored = await client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={
-                    "type": "external_conversation_item",
-                    "data": {
-                        "item_type": "message",
-                        "item_data": {
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": "go on"}],
-                        },
-                        "response_id": "native_turn_2",
-                        "source_id": "codex:go-on:0",
-                    },
-                },
-            )
-            assert mirrored.status_code == 202, mirrored.text
+async def test_message_resent_after_stop_takes_the_mirror_of_the_same_text(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Stop, then resend the same text: the resend is the message the agent records.
 
-            items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-            error_codes = [item["code"] for item in items if item["type"] == "error"]
-            user_texts = [
-                block["text"]
-                for item in items
-                if item["type"] == "message" and item["role"] == "user"
-                for block in item["content"]
-            ]
-            consumed = [
-                event["data"]["cleared_pending_id"]
-                for _sid, event in published
-                if event.get("type") == "session.input.consumed"
-            ]
-            # Both entries are gone either way; what differs is whether the
-            # cancelled message is recorded as lost.
-            assert pending_inputs.pending_ids(session_id) == []
-            assert pending_inputs.snapshot_for(session_id) == []
-            if delivered:
-                assert error_codes == []
-                assert user_texts == ["go on"]
-                assert consumed == [kept]
-            else:
-                assert error_codes == ["native_prompt_not_recorded"]
-                assert user_texts == ["cancel me", "go on"]
-                assert consumed == [cancelled, kept]
-        finally:
-            pending_inputs.reset_for_tests()
-            _interrupt_fenced_sessions.discard(session_id)
+    Matching the cancelled copy first would leave the resend queued, so the next
+    unrelated mirror would persist it with a ``native_prompt_not_recorded`` error.
+    """
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(client, monkeypatch) as (session_id, published):
+        _queue_web_message(session_id, "continue")
+        await _press_stop(client, session_id)
+        resent = _queue_web_message(session_id, "continue")
+        await _mirror_user_message(client, session_id, "continue", "codex:continue:0")
+        then = _queue_web_message(session_id, "then this")
+        await _mirror_user_message(client, session_id, "then this", "codex:then-this:0")
+
+        user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        assert user_texts == ["continue", "then this"]
+        assert error_codes == []
+        assert _consumed_pending_ids(published) == [resent, then]
+        assert pending_inputs.pending_ids(session_id) == []
+
+
+async def test_cancelled_message_the_agent_did_record_drains_as_matched(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The agent recorded the message before the Stop landed: its mirror still settles it.
+
+    The exact mirror drains the flagged entry as the match: one user message, no
+    error, and the receipt names its pending id. A forwarder retry of the same
+    mirror persists and publishes nothing more.
+    """
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(client, monkeypatch) as (session_id, published):
+        cancelled = _queue_web_message(session_id, "cancel me")
+        await _press_stop(client, session_id)
+        assert pending_inputs.snapshot_for(session_id) == []
+
+        first = await _mirror_user_message(client, session_id, "cancel me", "codex:cancel-me:0")
+        retry = await _mirror_user_message(client, session_id, "cancel me", "codex:cancel-me:0")
+
+        user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        assert user_texts == ["cancel me"]
+        assert error_codes == []
+        assert _consumed_pending_ids(published) == [cancelled]
+        assert retry["item_id"] == first["item_id"]
+        assert pending_inputs.pending_ids(session_id) == []
+
+
+async def test_btw_settles_its_own_entry_rather_than_a_cancelled_one(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``/btw`` typed after a cancelled message settles its own bubble.
+
+    The overlay never round-trips through the transcript, so the server drops the
+    oldest pending entry when it arrives. That must be the ``/btw`` entry, not the
+    cancelled one: otherwise the session list shows "running" and the ``/btw``
+    bubble comes back on every reload until the TTL.
+    """
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(client, monkeypatch) as (session_id, _published):
+        cancelled = _queue_web_message(session_id, "cancel me")
+        await _press_stop(client, session_id)
+        _queue_web_message(session_id, "/btw what is this?")
+
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_btw_sidechat",
+                "data": {"question": "what is this?", "answer": "A test."},
+            },
+        )
+
+        assert response.status_code == 202, response.text
+        assert pending_inputs.snapshot_for(session_id) == []
+        assert pending_inputs.has_pending(session_id) is False
+        # The cancelled entry is hidden and left to the TTL.
+        assert pending_inputs.pending_ids(session_id) == [cancelled]
 
 
 @dataclass

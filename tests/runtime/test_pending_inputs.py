@@ -656,6 +656,59 @@ def test_interrupted_entry_matched_by_its_own_text_drains_as_matched() -> None:
     assert pending_inputs.pending_ids("conv_a") == []
 
 
+def test_resolve_matching_text_prefers_a_live_resend_over_an_interrupted_twin() -> None:
+    """Stop, then resend the same text: the resend takes the mirror.
+
+    The agent recorded the resend, not the cancelled copy. Matching the cancelled
+    one first would leave the resend queued, to be called lost at the next match.
+    """
+    cancelled = pending_inputs.record("conv_a", [_text_block("continue")])
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+    other = pending_inputs.record("conv_a", [_text_block("something else")])
+    resend = pending_inputs.record("conv_a", [_text_block("continue")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "continue")
+
+    assert drained.matched is not None and drained.matched.pending_id == resend
+    # The cancelled twin drains quietly; a live message in between is still lost.
+    assert [entry.pending_id for entry in drained.uncertain] == [cancelled]
+    assert [entry.pending_id for entry in drained.skipped] == [other]
+    assert pending_inputs.pending_ids("conv_a") == []
+
+
+def test_resolve_matching_text_keeps_queue_order_when_the_first_twin_is_live() -> None:
+    """The preference only reaches past a cancelled entry, not past a live one."""
+    live = pending_inputs.record("conv_a", [_text_block("yes")])
+    cancelled = pending_inputs.record("conv_a", [_text_block("yes")])
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "yes")
+
+    assert drained.matched is not None and drained.matched.pending_id == live
+    assert drained.skipped == [] and drained.uncertain == []
+    assert pending_inputs.pending_ids("conv_a") == [cancelled]
+
+
+def test_resolve_matching_text_prefers_a_live_resend_behind_attachment_markers() -> None:
+    """The marker-stripping pass makes the same choice as the exact pass."""
+    image = {"type": "input_image", "url": "img://1"}
+    mirror = "[Attached: /tmp/x.png]\n\nlook at this"
+    cancelled = pending_inputs.record("conv_a", [image, _text_block("look at this")])
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+    resend = pending_inputs.record("conv_a", [image, _text_block("look at this")])
+    alone = pending_inputs.record("conv_b", [image, _text_block("look at this")])
+    pending_inputs.mark_interrupted("conv_b", [alone])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", mirror)
+    without_twin = pending_inputs.resolve_matching_text("conv_b", mirror)
+
+    assert drained.matched is not None and drained.matched.pending_id == resend
+    assert drained.skipped == []
+    assert [entry.pending_id for entry in drained.uncertain] == [cancelled]
+    # A cancelled entry with no live twin still matches: the agent did record it.
+    assert without_twin.matched is not None and without_twin.matched.pending_id == alone
+
+
 def test_mark_interrupted_leaves_entries_recorded_after_the_snapshot_alone() -> None:
     """A message sent right after Stop is a live one, not a cancelled one."""
     before_stop = pending_inputs.record("conv_a", [_text_block("before stop")])
@@ -727,12 +780,10 @@ def test_interrupted_flag_survives_a_held_drain_that_is_restored() -> None:
     assert [entry.pending_id for entry in again.uncertain] == [cancelled]
 
 
-def test_interrupted_entries_keep_their_place_for_the_other_readers() -> None:
-    """A flagged entry is only hidden and settled quietly; it is otherwise unchanged.
+def test_interrupted_entry_still_answers_a_stable_id_retry() -> None:
+    """A client retry of a cancelled send is answered with its queued entry.
 
-    A client retry of its stable id is still answered with the queued entry (a
-    second forward would run the cancelled prompt), a positional drain can still
-    take it, and the TTL still evicts it.
+    A second forward would run the prompt the person cancelled.
     """
     stable_id = "cd" * 16
     cancelled = pending_inputs.record("conv_a", [_text_block("cancelled")], stable_id=stable_id)
@@ -742,9 +793,63 @@ def test_interrupted_entries_keep_their_place_for_the_other_readers() -> None:
     assert pending_inputs.record("conv_a", [_text_block("cancelled")], stable_id=stable_id) == (
         cancelled
     )
-    drained = pending_inputs.resolve_oldest("conv_a")
-    assert drained is not None and drained.pending_id == cancelled
-    assert pending_inputs.pending_ids("conv_a") == []
+    assert pending_inputs.pending_ids("conv_a") == [cancelled]
+
+
+def test_resolve_oldest_skips_interrupted_entries() -> None:
+    """A positional drain hands the mirror to a live entry, never to a cancelled one.
+
+    Otherwise a ``/btw`` typed after a cancelled message would settle the
+    cancelled entry and leave its own bubble pending, and a message typed in the
+    TUI would inherit the cancelled entry's attachments and author.
+    """
+    cancelled = pending_inputs.record(
+        "conv_a", [_text_block("cancelled")], created_by="alice@example.com"
+    )
+    live = pending_inputs.record("conv_a", [_text_block("/btw what is this")])
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+
+    drained = pending_inputs.resolve_oldest("conv_a", hold=True)
+
+    assert drained is not None and drained.pending_id == live
+    assert drained.created_by is None
+    pending_inputs.release("conv_a", drained)
+    assert pending_inputs.pending_ids("conv_a") == [cancelled]
+
+
+def test_resolve_oldest_returns_none_when_only_interrupted_or_held_entries_remain() -> None:
+    """With nothing live to guess at, the mirror is a plain committed message."""
+    assert pending_inputs.resolve_oldest("conv_a") is None
+    cancelled = pending_inputs.record("conv_a", [_text_block("cancelled")])
+    live = pending_inputs.record("conv_a", [_text_block("live")])
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+    taken = pending_inputs.resolve_oldest("conv_a", hold=True)
+    assert taken is not None and taken.pending_id == live
+
+    assert pending_inputs.resolve_oldest("conv_a") is None
+    assert pending_inputs.resolve_oldest("conv_a", hold=True) is None
+    # Nothing was dropped: a failed persist puts the held entry back.
+    pending_inputs.restore("conv_a", taken)
+    again = pending_inputs.resolve_oldest("conv_a")
+    assert again is not None and again.pending_id == live
+    assert pending_inputs.pending_ids("conv_a") == [cancelled]
+
+
+def test_draining_until_none_settles_live_entries_and_leaves_interrupted_ones() -> None:
+    """The ``/clear`` loop ends at the cancelled entries, which stay hidden until the TTL."""
+    first = pending_inputs.record("conv_a", [_text_block("first")])
+    cancelled = pending_inputs.record("conv_a", [_text_block("cancelled")])
+    last = pending_inputs.record("conv_a", [_text_block("/clear")])
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+
+    drained: list[str] = []
+    while (entry := pending_inputs.resolve_oldest("conv_a")) is not None:
+        drained.append(entry.pending_id)
+
+    assert drained == [first, last]
+    assert pending_inputs.pending_ids("conv_a") == [cancelled]
+    assert pending_inputs.has_pending("conv_a") is False
+    assert pending_inputs.snapshot_for("conv_a") == []
 
 
 def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -61,7 +61,9 @@ otherwise be recorded as undelivered at the next match. The interrupt route
 flags every entry queued at that moment (:func:`mark_interrupted`): a later
 match that jumps over one drains it quietly like an uncertain entry, and it
 no longer counts as pending or replays in the snapshot. A mirror carrying its
-own text still drains it normally, since the agent did record it after all.
+own text still drains it normally, since the agent did record it after all,
+unless a live entry has the same text (a resend after Stop): that one takes
+the mirror. The positional drain (:func:`resolve_oldest`) never picks one.
 
 The one imperfect case is interleaving a web-composer message with a
 message typed directly in the TUI: the TUI message (which has no pending
@@ -427,21 +429,29 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
     typed directly in the TUI on a session with no queued web messages;
     the caller then renders it as a plain committed item.
 
+    An entry the person cancelled by interrupting (see
+    :func:`mark_interrupted`) is never the guess: it would hand its
+    attachments and author to a later message, or take the place of the
+    entry a ``/btw`` or ``/clear`` means to settle.
+
     :param conversation_id: Conversation/session id the message was
         persisted on, e.g. ``"conv_abc123"``.
     :param hold: Keep the entry in place, marked held, instead of removing it;
         the caller settles it with :func:`release` once the persist landed or
         :func:`restore` if it did not. Entries already held are skipped.
     :returns: The drained :class:`DrainedInput`, or ``None`` when no
-        entry was pending.
+        entry was pending, or only held or interrupted ones remain.
     """
     with _lock:
         _evict_stale_locked(conversation_id, _now())
         entries = _pending.get(conversation_id)
         if entries is None:
             return None
-        # Insertion order = FIFO; the first unheld key is the oldest entry.
-        oldest_id = next((pid for pid, entry in entries.items() if not entry.held), None)
+        # Insertion order = FIFO; the first live, unheld key is the oldest entry.
+        oldest_id = next(
+            (pid for pid, entry in entries.items() if not entry.held and not entry.interrupted),
+            None,
+        )
         if oldest_id is None:
             return None
         entry = entries[oldest_id]
@@ -492,7 +502,7 @@ def pending_ids(conversation_id: str) -> list[str]:
         ]
 
 
-def mark_interrupted(conversation_id: str, pending_ids: Iterable[str]) -> None:
+def mark_interrupted(conversation_id: str, ids: Iterable[str]) -> None:
     """
     Flag entries the person cancelled by interrupting the session's turn.
 
@@ -504,12 +514,12 @@ def mark_interrupted(conversation_id: str, pending_ids: Iterable[str]) -> None:
     Marking is per process, like the entries themselves.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
-    :param pending_ids: Ids read with :func:`pending_ids` before the interrupt
-        was forwarded, e.g. ``["pending_a1b2c3"]``.
+    :param ids: Ids read with :func:`pending_ids` before the interrupt was
+        forwarded, e.g. ``["pending_a1b2c3"]``.
     """
     with _lock:
         entries = _pending.get(conversation_id, {})
-        for pending_id in pending_ids:
+        for pending_id in ids:
             entry = entries.get(pending_id)
             if entry is not None and not entry.held:
                 entry.interrupted = True
@@ -581,6 +591,10 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
     returns the older skipped entries so the caller can surface them as
     undelivered web messages.
 
+    Identical texts match in queue order, except that an entry the person
+    cancelled by interrupting yields to a later live one with the same text:
+    the resend after Stop is the one the agent recorded.
+
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param text: User-message text mirrored from the native transcript.
     :param hold: Keep the matched and skipped entries in place, marked held,
@@ -605,14 +619,16 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
             return MatchedDrain(matched=None, skipped=[])
         ordered = [(pid, entry) for pid, entry in entries.items() if not entry.held]
         texts = [_collapse_whitespace(_content_text(entry.content)) for _pid, entry in ordered]
+        interrupted = [entry.interrupted for _pid, entry in ordered]
         # Two passes. An exact (whitespace-collapsed) match first, so two
         # messages that differ only in a marker-like phrase the person typed
         # at the front stay distinct. Then, for entries carrying attachments:
         # the executor pastes one generated marker line per file block ahead
         # of the text, so drop exactly that many from the mirror and compare
         # with the entry's own text — typed marker-like text still counts.
-        match_index = _first_match(texts, exact_needle)
+        match_index = _first_match(texts, exact_needle, interrupted)
         if match_index is None:
+            marker_matches: list[int] = []
             for index, (_pid, entry) in enumerate(ordered):
                 attachments = _attachment_count(entry.content)
                 if attachments == 0 or not texts[index]:
@@ -621,8 +637,8 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
                     _collapse_whitespace(_strip_generated_markers(text, attachments))
                     == texts[index]
                 ):
-                    match_index = index
-                    break
+                    marker_matches.append(index)
+            match_index = _prefer_live(marker_matches, interrupted)
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
         # Bound one drain's work: report at most a cap's worth of skipped
@@ -683,7 +699,9 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     Returns deep copies of the stored content so a caller mutating the
     replayed entry cannot poison the index. Entries the person cancelled by
     interrupting (see :func:`mark_interrupted`) are left out, so a reload does
-    not redraw a bubble the web client already cleared.
+    not redraw a bubble the web client already cleared. The native request-phase
+    policy hook (``routes_hooks``) also reads this as "a web prompt is in
+    flight", so a cancelled entry does not exempt a later prompt from its gate.
 
     :param conversation_id: Conversation/session id to query, e.g.
         ``"conv_abc123"``.
@@ -738,9 +756,9 @@ def _content_text(content: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def _first_match(texts: list[str], needle: str) -> int | None:
+def _first_match(texts: list[str], needle: str, interrupted: list[bool]) -> int | None:
     """
-    Index of the first non-empty text equal to ``needle``.
+    Index of the first non-empty text equal to ``needle``, preferring a live one.
 
     Equality only: an unanchored suffix check (``"noyes".endswith("yes")``)
     can pick an unrelated queued entry whenever its text happens to trail a
@@ -749,14 +767,33 @@ def _first_match(texts: list[str], needle: str) -> int | None:
 
     :param texts: Whitespace-collapsed queued entry texts in queue order.
     :param needle: The whitespace-collapsed mirrored text.
-    :returns: The matching index, or ``None``.
+    :param interrupted: Per entry, whether the person cancelled it by interrupting.
+    :returns: The matching index (see :func:`_prefer_live`), or ``None``.
     """
     if not needle:
         return None
-    for index, text in enumerate(texts):
-        if text and text == needle:
+    return _prefer_live(
+        [index for index, text in enumerate(texts) if text and text == needle], interrupted
+    )
+
+
+def _prefer_live(candidates: list[int], interrupted: list[bool]) -> int | None:
+    """
+    Pick the first candidate the person did not cancel, else the first one.
+
+    A resend of the same text after Stop leaves a cancelled entry and a live
+    one that match the same mirror. The agent recorded the resend, so it takes
+    the mirror and the cancelled entry is jumped over. A cancelled entry with
+    no live twin still matches: the agent did record it.
+
+    :param candidates: Queue indices of the entries that match, oldest first.
+    :param interrupted: Per entry, whether the person cancelled it by interrupting.
+    :returns: The chosen index, or ``None`` when there are no candidates.
+    """
+    for index in candidates:
+        if not interrupted[index]:
             return index
-    return None
+    return candidates[0] if candidates else None
 
 
 def _collapse_whitespace(text: str) -> str:
