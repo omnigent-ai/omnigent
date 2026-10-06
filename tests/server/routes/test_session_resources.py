@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -5267,12 +5268,16 @@ async def test_claude_native_mirrored_slash_command_drains_its_queued_entry() ->
 
 
 def _slash_mirror(
-    name: str, arguments: str, source_id: str, command_message: str | None = None
+    name: str,
+    arguments: str,
+    source_id: str,
+    command_message: str | None = None,
+    kind: str = "skill",
 ) -> SessionEventInput:
     """A ``slash_command`` item the transcript mirrored back, with the typed name if sent."""
     event = _mirror_event(
         "slash_command",
-        {"agent": "claude-native-ui", "kind": "skill", "name": name, "arguments": arguments},
+        {"agent": "claude-native-ui", "kind": kind, "name": name, "arguments": arguments},
         source_id,
     )
     if command_message is not None:
@@ -5400,6 +5405,64 @@ async def test_claude_native_unmatched_slash_command_drains_the_oldest_queued_co
         assert [item.type for item in store.appended_items] == ["slash_command", "message"]
         assert pending_inputs.snapshot_for(sid) == []
         assert not [row for row in rows if row["event_name"] == "native_pending_input_skipped"]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_builtin_command_echo_never_takes_an_entry_by_position() -> None:
+    """A built-in's echo claims an entry only by spelling, never as the oldest command's.
+
+    Built-ins such as ``/context`` or ``/usage`` run from the terminal or the model
+    picker as often as from the web; guessing that a queued ``/other`` command owns
+    the echo would settle the wrong bubble and later brand the right one lost.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    queued = pending_inputs.record(sid, [{"type": "input_text", "text": "/other-skill"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _slash_mirror("context", "", "claude:context:0", kind="command"),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [queued]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_builtin_command_echo_still_drains_its_own_entry() -> None:
+    """The restriction is on the positional guess only: a typed ``/context`` still matches."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(sid, [{"type": "input_text", "text": "/context"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _slash_mirror("context", "", "claude:context:0", kind="command"),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert pending_inputs.snapshot_for(sid) == []
     finally:
         pending_inputs.reset_for_tests()
 
@@ -6198,15 +6261,17 @@ _ACCEPTED_STABLE_ID = "a1" * 16
 
 
 @pytest.mark.asyncio
-async def test_claude_native_accepted_entry_jumped_over_is_drained_without_an_error(
+async def test_claude_native_accepted_entry_jumped_over_is_persisted_with_a_notice_and_a_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A message the terminal took is not reported lost when no mirror of it arrives.
+    """A message the terminal took is settled, not lost, when no mirror of it arrives.
 
     The runner saw Claude Code's input box empty after the paste, so a later
-    message that jumps over the entry is not evidence it was lost: it leaves the
-    queue without an error item, and clients are told nothing about it. The
-    skip is still traceable from an info-level ``native_pending_input_accepted``.
+    message that jumps over the entry is not evidence it was lost. It is still
+    persisted like any skipped one, so a reload keeps it and its bubble is
+    settled by its own receipt in queue order, but next to an info notice
+    rather than an error. The skip stays traceable from an info-level
+    ``native_pending_input_accepted``.
     """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
@@ -6237,10 +6302,26 @@ async def test_claude_native_accepted_entry_jumped_over_is_drained_without_an_er
                 store,  # type: ignore[arg-type]
             )
 
-        assert [item.type for item in store.appended_items] == ["message"]
-        assert store.appended_items[0].data.content == [{"type": "input_text", "text": "thanks"}]
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[0].data.content == [
+            {"type": "input_text", "text": "/dev-tools"}
+        ]
+        notice = store.appended_items[1].data
+        assert notice.code == "native_prompt_unrecorded"
+        assert notice.level == "info"
+        assert notice.message == (
+            "Claude accepted this message but did not record it in its transcript."
+        )
+        assert store.appended_items[2].data.content == [{"type": "input_text", "text": "thanks"}]
+        # Ids derive from the pending id, so a retried mirror appends the pair once.
+        assert {
+            uuid.uuid5(uuid.NAMESPACE_URL, f"omnigent-skipped-native-{kind}:{sid}:{taken}").hex
+            for kind in ("user", "error")
+        } <= set(store.persisted_by_stable_id)
         assert pending_inputs.snapshot_for(sid) == []
-        assert _consumed_receipts(published) == [matched]
+        # One receipt per bubble, oldest first: a receipt-less drain would leave the
+        # taken bubble to be popped by the next message's receipt instead.
+        assert _consumed_receipts(published) == [taken, matched]
         assert not [row for row in rows if row["event_name"] == "native_pending_input_skipped"]
         (accepted_row,) = [
             row for row in rows if row["event_name"] == "native_pending_input_accepted"
@@ -6260,18 +6341,55 @@ async def test_claude_native_accepted_entry_jumped_over_is_drained_without_an_er
 
 
 @pytest.mark.asyncio
-async def test_claude_native_unaccepted_entry_is_still_reported_when_another_was_accepted() -> (
-    None
-):
+async def test_claude_native_accepted_entry_mirrored_normally_adds_nothing_extra() -> None:
+    """The acceptance mark only matters to an entry a later mirror jumps over."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(
+        sid, [{"type": "input_text", "text": "hello"}], stable_id=_ACCEPTED_STABLE_ID
+    )
+    pending_inputs.mark_accepted(sid, _ACCEPTED_STABLE_ID)
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _user_mirror("hello", "claude:hello:0"),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_unaccepted_entry_is_still_reported_when_another_was_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Evidence for one message does not excuse an older one nothing vouches for.
 
     Without the runner's acceptance report (an older runner, or a message the
-    terminal never took) the entry behaves exactly as before: persisted next to
-    ``native_prompt_not_recorded`` and logged as skipped with ``accepted`` false.
+    terminal never took) the entry is persisted next to ``native_prompt_not_recorded``
+    and logged as skipped with ``accepted`` false, while the one that was taken
+    gets the info notice. Every bubble gets its receipt, oldest first.
     """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
 
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
     pending_inputs.reset_for_tests()
     store = _ConversationStore()
     sid = "64a784c3aa907d1774f44313546947c6"
@@ -6283,7 +6401,7 @@ async def test_claude_native_unaccepted_entry_is_still_reported_when_another_was
         [{"type": "input_text", "text": "taken but unmirrored"}],
         stable_id=_ACCEPTED_STABLE_ID,
     )
-    pending_inputs.record(sid, [{"type": "input_text", "text": "recorded"}])
+    matched = pending_inputs.record(sid, [{"type": "input_text", "text": "recorded"}])
     pending_inputs.mark_accepted(sid, _ACCEPTED_STABLE_ID)
 
     try:
@@ -6295,11 +6413,19 @@ async def test_claude_native_unaccepted_entry_is_still_reported_when_another_was
                 store,  # type: ignore[arg-type]
             )
 
-        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert [item.type for item in store.appended_items] == [
+            "message",
+            "error",
+            "message",
+            "error",
+            "message",
+        ]
         assert store.appended_items[0].data.content == [
             {"type": "input_text", "text": "never recorded"}
         ]
         assert store.appended_items[1].data.code == "native_prompt_not_recorded"
+        assert store.appended_items[3].data.code == "native_prompt_unrecorded"
+        assert _consumed_receipts(published) == [lost, taken, matched]
         skipped = [row for row in rows if row["event_name"] == "native_pending_input_skipped"]
         assert [row["attributes"]["pending_id"] for row in skipped] == [lost]
         assert skipped[0]["attributes"]["accepted"] == "False"
@@ -6349,7 +6475,7 @@ async def test_claude_native_accepted_entry_the_person_stopped_keeps_the_stop_no
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("terminal", "fields", "quiet"),
+    ("terminal", "fields", "vouched"),
     [
         pytest.param(
             "response.completed",
@@ -6390,15 +6516,16 @@ async def test_claude_native_accepted_entry_the_person_stopped_keeps_the_stop_no
     ],
 )
 async def test_relay_reads_the_acceptance_proof_off_the_turns_terminal_event(
-    monkeypatch: pytest.MonkeyPatch, terminal: str, fields: dict[str, str], quiet: bool
+    monkeypatch: pytest.MonkeyPatch, terminal: str, fields: dict[str, str], vouched: bool
 ) -> None:
     """The proof on a turn's terminal event reaches the queue, and only well-formed proof counts.
 
-    The message the terminal took is then jumped over by the next mirror without an
-    error; the same message with no proof (an older runner, or proof that names
-    nothing queued) still gets ``native_prompt_not_recorded``, like the message
-    behind it that no proof could ever name. The terminal event is forwarded to
-    clients as usual, extra fields and all.
+    The message the terminal took is then jumped over by the next mirror with an
+    info notice; the same message with no proof (an older runner, or proof that
+    names nothing queued) gets ``native_prompt_not_recorded``, like the message
+    behind it that no proof could ever name. Either way each bubble is settled by
+    its own receipt. Every event the relay publishes passes the stream validation
+    the SSE boundary applies, and the terminal event is forwarded as usual.
     """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import (
@@ -6411,11 +6538,11 @@ async def test_relay_reads_the_acceptance_proof_off_the_turns_terminal_event(
     store = _ConversationStore()
     conv = store.get_conversation(sid)
     assert conv is not None
-    pending_inputs.record(
+    taken = pending_inputs.record(
         sid, [{"type": "input_text", "text": "taken"}], stable_id=_ACCEPTED_STABLE_ID
     )
-    pending_inputs.record(sid, [{"type": "input_text", "text": "never recorded"}])
-    pending_inputs.record(sid, [{"type": "input_text", "text": "next"}])
+    never = pending_inputs.record(sid, [{"type": "input_text", "text": "never recorded"}])
+    following = pending_inputs.record(sid, [{"type": "input_text", "text": "next"}])
     published: list[dict[str, Any]] = []
     real_publish = session_stream.publish
 
@@ -6424,9 +6551,14 @@ async def test_relay_reads_the_acceptance_proof_off_the_turns_terminal_event(
         real_publish(session_id, event)
 
     monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
-    response = {"id": "resp_turn", "model": "claude", "status": terminal.split(".")[1]}
+    response: dict[str, Any] = {
+        "id": "resp_turn",
+        "model": "claude",
+        "status": terminal.split(".")[1],
+        "created_at": 1,
+    }
     if terminal == "response.failed":
-        response["error"] = {"code": "turn_failed", "message": "the turn failed"}  # type: ignore[assignment]
+        response["error"] = {"code": "turn_failed", "message": "the turn failed"}
     client = _ScriptedStreamingRunnerClient(
         [
             _sse_frame({"type": "response.in_progress", "response": response}),
@@ -6447,10 +6579,99 @@ async def test_relay_reads_the_acceptance_proof_off_the_turns_terminal_event(
             _user_mirror("next", "claude:next:0"),
             store,  # type: ignore[arg-type]
         )
-        kinds = [item.type for item in store.appended_items][settled:]
-        # The message nothing vouches for is reported either way.
-        lost = ["message", "error"]
-        assert kinds == (lost if quiet else lost * 2) + ["message"]
+        appended = store.appended_items[settled:]
+        assert [item.type for item in appended] == [
+            "message",
+            "error",
+            "message",
+            "error",
+            "message",
+        ]
+        assert [item.data.code for item in appended if item.type == "error"] == [
+            "native_prompt_unrecorded" if vouched else "native_prompt_not_recorded",
+            "native_prompt_not_recorded",
+        ]
+        assert [
+            event["data"]["cleared_pending_id"]
+            for event in published
+            if event.get("type") == "session.input.consumed"
+        ] == [taken, never, following]
+        for event in published:
+            _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "clears"),
+    [
+        pytest.param(
+            {
+                "type": "session.resource.deleted",
+                "resource_id": "terminal_claude_main",
+                "resource_type": "terminal",
+                "session_id": "64a784c3aa907d1774f44313546947c6",
+            },
+            True,
+            id="main-terminal-exited",
+        ),
+        pytest.param(
+            {
+                "type": "session.resource.created",
+                "resource": {"id": "terminal_claude_main", "type": "terminal"},
+            },
+            True,
+            id="main-terminal-restarted",
+        ),
+        pytest.param(
+            {
+                "type": "session.resource.deleted",
+                "resource_id": "terminal_build_watch",
+                "resource_type": "terminal",
+                "session_id": "64a784c3aa907d1774f44313546947c6",
+            },
+            False,
+            id="another-terminal-exited",
+        ),
+        pytest.param(
+            {
+                "type": "session.resource.deleted",
+                "resource_id": "file_claude_main",
+                "resource_type": "file",
+                "session_id": "64a784c3aa907d1774f44313546947c6",
+            },
+            False,
+            id="not-a-terminal",
+        ),
+    ],
+)
+async def test_relay_forgets_what_the_terminal_took_when_its_pane_goes_away(
+    event: dict[str, Any], clears: bool
+) -> None:
+    """A pane that exited or restarted can no longer vouch for the messages it accepted.
+
+    Accepted means the input box emptied, which a crash (or a replaced pane) right
+    after leaves true forever; the mark would otherwise live until the queue entry
+    expires and mislabel a lost message as merely unrecorded.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    pending_inputs.record(
+        sid, [{"type": "input_text", "text": "taken"}], stable_id=_ACCEPTED_STABLE_ID
+    )
+    assert pending_inputs.mark_accepted(sid, _ACCEPTED_STABLE_ID) is not None
+    client = _ScriptedStreamingRunnerClient([_sse_frame(event), "data: [DONE]\n\n"])
+
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        drained = pending_inputs.resolve_oldest(sid)
+        assert drained is not None and drained.accepted is (not clears)
     finally:
         pending_inputs.reset_for_tests()
 

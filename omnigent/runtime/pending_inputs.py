@@ -65,7 +65,9 @@ it drains through :func:`resolve_matching_text` with ``shell_command=True``.
 
 A missing mirror is weak evidence of loss, so a runner that saw the terminal
 take a message reports it (:func:`mark_accepted`): a later match that jumps over
-such an entry drains it quietly instead of calling it undelivered.
+such an entry still settles it, but the caller words it as unrecorded instead of
+undelivered. The report is dropped if the terminal exits or restarts
+(:func:`clear_accepted`).
 
 The one imperfect case is interleaving a web-composer message with a
 message typed directly in the TUI: the TUI message (which has no pending
@@ -217,17 +219,14 @@ class MatchedDrain:
     Result from draining pending inputs up to a text-matched entry.
 
     :param matched: The entry whose text the mirror carried, or ``None``.
-    :param skipped: Older entries the match jumped over that are known to be
-        lost: no mirror of theirs can still arrive, so the caller records them
-        as undelivered.
+    :param skipped: Older entries the match jumped over that no mirror can still
+        reach: the caller persists each with the message and a notice, chosen by
+        its flags. Lost by default; ``interrupted`` (a Stop was delivered) and
+        ``accepted`` (the terminal took it) soften the wording.
     :param uncertain: Older entries the match jumped over that were queued
         when an unmatched mirror drained by position (see
         :func:`mark_uncertain`). That mirror may have been theirs, so they are
         drained without being declared undelivered.
-    :param accepted: Older entries the match jumped over that the terminal was
-        seen to take (see :func:`mark_accepted`) and that are neither uncertain
-        nor interrupted: no mirror is coming, but they are not lost either, so
-        they are drained without being declared undelivered.
     :param queue_depth: Unheld entries queued when the match was made,
         counting the matched and skipped ones; diagnostics only.
     """
@@ -235,7 +234,6 @@ class MatchedDrain:
     matched: DrainedInput | None
     skipped: list[DrainedInput]
     uncertain: list[DrainedInput] = field(default_factory=list)
-    accepted: list[DrainedInput] = field(default_factory=list)
     queue_depth: int = 0
 
 
@@ -565,8 +563,9 @@ def mark_accepted(conversation_id: str, stable_id: str) -> str | None:
     Called when the runner reports positive evidence that the terminal accepted
     a message (Claude Code cleared its input box), which is what a mirror would
     otherwise be the only proof of. A later match that jumps over the entry then
-    drains it as ``accepted`` instead of ``skipped``. Idempotent, and a no-op
-    once the entry is gone (already mirrored, or evicted by the TTL).
+    reports it ``accepted``, so it is worded as unrecorded rather than lost.
+    Idempotent, and a no-op once the entry is gone (already mirrored, or evicted
+    by the TTL).
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param stable_id: The web client's stable message id the entry was recorded
@@ -581,6 +580,24 @@ def mark_accepted(conversation_id: str, stable_id: str) -> str | None:
                 entry.accepted = True
                 return entry.pending_id
     return None
+
+
+def clear_accepted(conversation_id: str) -> int:
+    """
+    Forget every acceptance report for a conversation.
+
+    Called when the terminal exits or restarts: a report describes the pane that
+    took the message, and a message that pane took before dying was never
+    recorded, so a later skip must read as lost again.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :returns: How many entries lost the flag.
+    """
+    with _lock:
+        flagged = [entry for entry in _pending.get(conversation_id, {}).values() if entry.accepted]
+        for entry in flagged:
+            entry.accepted = False
+        return len(flagged)
 
 
 def restore(conversation_id: str, drained: DrainedInput) -> None:
@@ -664,12 +681,11 @@ def resolve_matching_text(
         with ``!`` never match.
     :returns: Matched entry plus the older entries it jumped over — at most
         :data:`_MAX_ENTRIES_PER_CONVERSATION` of them, oldest first, split
-        into ``skipped`` (known lost), ``uncertain`` (queued when a
-        positional drain happened, see :func:`mark_uncertain`) and
-        ``accepted`` (the terminal was seen to take them, see
-        :func:`mark_accepted`); any beyond the cap stay queued for a later
-        drain — or no match with empty lists when nothing carries this text
-        (e.g. it was typed directly in the TUI).
+        into ``skipped`` (no mirror can reach them) and ``uncertain`` (queued
+        when a positional drain happened, see :func:`mark_uncertain`); any
+        beyond the cap stay queued for a later drain — or no match with empty
+        lists when nothing carries this text (e.g. it was typed directly in
+        the TUI).
     """
     exact_needle = _collapse_whitespace(text)
     if not exact_needle:
@@ -716,22 +732,16 @@ def resolve_matching_text(
                 entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
-        lost: list[DrainedInput] = []
-        uncertain: list[DrainedInput] = []
-        accepted: list[DrainedInput] = []
-        for _pending_id, entry in skipped_entries:
-            # A stopped entry keeps its own explanation even if the terminal took it.
-            if entry.uncertain:
-                uncertain.append(_drained_input(entry))
-            elif entry.accepted and not entry.interrupted:
-                accepted.append(_drained_input(entry))
-            else:
-                lost.append(_drained_input(entry))
         return MatchedDrain(
             matched=_drained_input(matched_entry),
-            skipped=lost,
-            uncertain=uncertain,
-            accepted=accepted,
+            skipped=[
+                _drained_input(entry)
+                for _pending_id, entry in skipped_entries
+                if not entry.uncertain
+            ],
+            uncertain=[
+                _drained_input(entry) for _pending_id, entry in skipped_entries if entry.uncertain
+            ],
             queue_depth=len(ordered),
         )
 

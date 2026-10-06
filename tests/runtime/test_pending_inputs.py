@@ -840,8 +840,8 @@ def test_mark_accepted_is_a_noop_without_a_queued_entry() -> None:
     assert other is not None and other.accepted is False
 
 
-def test_resolve_matching_text_drains_an_accepted_entry_quietly() -> None:
-    """A jumped-over entry the terminal took is reported as accepted, not skipped."""
+def test_resolve_matching_text_keeps_an_accepted_entry_among_the_skipped() -> None:
+    """A jumped-over entry the terminal took is still settled, flagged rather than hidden."""
     first = pending_inputs.record("conv_a", [_text_block("taken")], stable_id=_STABLE_A)
     second = pending_inputs.record("conv_a", [_text_block("recorded")], stable_id=_STABLE_B)
     pending_inputs.mark_accepted("conv_a", _STABLE_A)
@@ -849,13 +849,12 @@ def test_resolve_matching_text_drains_an_accepted_entry_quietly() -> None:
     drained = pending_inputs.resolve_matching_text("conv_a", "recorded")
 
     assert drained.matched is not None and drained.matched.pending_id == second
-    assert drained.skipped == []
-    assert [entry.pending_id for entry in drained.accepted] == [first]
+    assert [(entry.pending_id, entry.accepted) for entry in drained.skipped] == [(first, True)]
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
-def test_resolve_matching_text_still_skips_an_entry_nothing_vouches_for() -> None:
-    """Without the terminal's evidence a jumped-over entry is still reported lost."""
+def test_resolve_matching_text_skips_accepted_and_lost_entries_in_queue_order() -> None:
+    """Both kinds are drained in order so each gets its receipt in the queue's FIFO order."""
     taken = pending_inputs.record("conv_a", [_text_block("taken")], stable_id=_STABLE_A)
     lost = pending_inputs.record("conv_a", [_text_block("lost")])
     pending_inputs.record("conv_a", [_text_block("recorded")])
@@ -863,8 +862,10 @@ def test_resolve_matching_text_still_skips_an_entry_nothing_vouches_for() -> Non
 
     drained = pending_inputs.resolve_matching_text("conv_a", "recorded")
 
-    assert [entry.pending_id for entry in drained.skipped] == [lost]
-    assert [entry.pending_id for entry in drained.accepted] == [taken]
+    assert [(entry.pending_id, entry.accepted) for entry in drained.skipped] == [
+        (taken, True),
+        (lost, False),
+    ]
 
 
 def test_accepted_entries_keep_the_uncertain_and_stopped_handling() -> None:
@@ -882,8 +883,7 @@ def test_accepted_entries_keep_the_uncertain_and_stopped_handling() -> None:
     drained = pending_inputs.resolve_matching_text("conv_a", "recorded")
 
     assert [entry.pending_id for entry in drained.uncertain] == [uncertain]
-    assert drained.accepted == []
-    # The stopped entry stays in the skipped list so the caller words it as stopped.
+    # The stopped entry stays flagged so the caller words it as stopped.
     assert [
         (entry.pending_id, entry.interrupted, entry.accepted) for entry in drained.skipped
     ] == [(stopped, True, True)]
@@ -900,8 +900,40 @@ def test_accepted_flag_survives_a_held_drain_and_restore() -> None:
 
     drained = pending_inputs.resolve_matching_text("conv_a", "second")
 
-    assert [entry.pending_id for entry in drained.accepted] == [first]
+    assert [(entry.pending_id, entry.accepted) for entry in drained.skipped] == [(first, True)]
     assert drained.matched is not None and drained.matched.pending_id == second
+
+
+def test_clear_accepted_drops_every_flag_and_counts_them() -> None:
+    """A terminal that exited or restarted can no longer vouch for what it took."""
+    first = pending_inputs.record("conv_a", [_text_block("first")], stable_id=_STABLE_A)
+    second = pending_inputs.record("conv_a", [_text_block("second")], stable_id=_STABLE_B)
+    pending_inputs.record("conv_a", [_text_block("recorded")])
+    pending_inputs.mark_accepted("conv_a", _STABLE_A)
+    pending_inputs.mark_accepted("conv_a", _STABLE_B)
+
+    assert pending_inputs.clear_accepted("conv_a") == 2
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "recorded")
+    assert [(entry.pending_id, entry.accepted) for entry in drained.skipped] == [
+        (first, False),
+        (second, False),
+    ]
+
+
+def test_clear_accepted_is_scoped_to_its_conversation_and_idempotent() -> None:
+    """Another session's flags are untouched, and a second clear finds nothing."""
+    pending_inputs.record("conv_a", [_text_block("mine")], stable_id=_STABLE_A)
+    pending_inputs.record("conv_b", [_text_block("theirs")], stable_id=_STABLE_A)
+    pending_inputs.mark_accepted("conv_a", _STABLE_A)
+    pending_inputs.mark_accepted("conv_b", _STABLE_A)
+
+    assert pending_inputs.clear_accepted("conv_a") == 1
+    assert pending_inputs.clear_accepted("conv_a") == 0
+    assert pending_inputs.clear_accepted("conv_unknown") == 0
+
+    theirs = pending_inputs.resolve_oldest("conv_b")
+    assert theirs is not None and theirs.accepted is True
 
 
 def test_restore_of_a_gone_entry_keeps_the_accepted_flag() -> None:
