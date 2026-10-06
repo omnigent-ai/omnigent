@@ -8161,43 +8161,120 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("terminal_command (claude-native !cmd)", () => {
-    const terminalCommand = (kind: "input" | "output"): StreamEvent => ({
+    const shellEvent = (kind: "input" | "output", command = "ls"): StreamEvent => ({
       type: "terminal_command",
       kind,
-      input: kind === "input" ? "ls" : null,
+      input: kind === "input" ? command : null,
       stdout: kind === "output" ? "a.txt" : null,
       stderr: null,
       itemId: `item_shell_${kind}`,
       responseId: "resp_shell_1",
     });
+    const bubble = (tempId: string, text: string) => ({
+      tempId,
+      content: [{ type: "input_text" as const, text }],
+    });
 
-    it("pops the FIFO head on the input half so the optimistic bubble clears", () => {
+    it("pops the queued bubble whose command was mirrored", () => {
       // A `!cmd` runs as a shell command, so no `session.input.consumed`
-      // follows. The server settles the queued entry on the input half; the
-      // bubble `send` parked in `pendingUserMessages` must clear with it, or
-      // the next message's receipt would pop this one and strand its own.
+      // follows. The server settles the entry whose text is that command; the
+      // matching bubble must clear with it, or the next message's receipt would
+      // pop this one and strand its own.
       useChatStore.setState({
         blocks: [],
-        pendingUserMessages: [
-          { tempId: "pend_1", content: [{ type: "input_text", text: "!ls" }] },
-          { tempId: "pend_2", content: [{ type: "input_text", text: "next" }] },
-        ],
+        pendingUserMessages: [bubble("pend_1", "!ls"), bubble("pend_2", "next")],
       });
 
-      handleSessionEvent(terminalCommand("input"));
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([bubble("pend_2", "next")]);
+    });
+
+    it("pops only the `!ls` bubble when it is queued behind a plain message", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [bubble("pend_1", "fix the bug"), bubble("pend_2", "!ls")],
+      });
+
+      handleSessionEvent(shellEvent("input"));
 
       expect(useChatStore.getState().pendingUserMessages).toEqual([
-        { tempId: "pend_2", content: [{ type: "input_text", text: "next" }] },
+        bubble("pend_1", "fix the bug"),
       ]);
     });
 
-    it("leaves pendingUserMessages alone on the output half", () => {
+    it("pops nothing for a command typed in the terminal", () => {
+      // No web bubble is that command, so the queued messages are still queued.
       const pending = [
-        { tempId: "pend_1", content: [{ type: "input_text" as const, text: "!ls" }] },
+        bubble("pend_1", "fix the bug"),
+        bubble("pend_2", "!ls"),
+        bubble("pend_3", "next"),
       ];
       useChatStore.setState({ blocks: [], pendingUserMessages: pending });
 
-      handleSessionEvent(terminalCommand("output"));
+      handleSessionEvent(shellEvent("input", "pwd"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+    });
+
+    it.each([
+      ["!  ls   -la", "ls -la"],
+      ["!ls -la", "ls   -la"],
+      ["! ls -la", "ls -la"],
+    ])("matches %j against the mirrored command %j across spacing", (queued, command) => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: [bubble("pend_1", queued)] });
+
+      handleSessionEvent(shellEvent("input", command));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+
+    it("pops the oldest of two identical commands", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [bubble("pend_1", "!ls"), bubble("pend_2", "! ls")],
+      });
+
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([bubble("pend_2", "! ls")]);
+    });
+
+    it("does not take a plain message that repeats the command for the shell command", () => {
+      const pending = [bubble("pend_1", "ls")];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+    });
+
+    it("never pops an unsent draft", () => {
+      const draft = {
+        ...bubble("pend_draft", "!ls"),
+        initialDraft: { text: "!ls", files: [] },
+      };
+      useChatStore.setState({ blocks: [], pendingUserMessages: [draft] });
+
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([draft]);
+    });
+
+    it("matches nothing for an empty command", () => {
+      const pending = [bubble("pend_1", "!")];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(shellEvent("input", "  "));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+    });
+
+    it("leaves pendingUserMessages alone on the output half", () => {
+      const pending = [bubble("pend_1", "!ls")];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(shellEvent("output"));
 
       expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
     });
@@ -8205,7 +8282,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     it("is a no-op when pendingUserMessages is empty (observing client)", () => {
       useChatStore.setState({ blocks: [], pendingUserMessages: [] });
 
-      handleSessionEvent(terminalCommand("input"));
+      handleSessionEvent(shellEvent("input"));
 
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
     });

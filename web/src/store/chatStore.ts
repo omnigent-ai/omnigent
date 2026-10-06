@@ -6744,6 +6744,25 @@ function messageContentText(content: MessageContentBlock[]): string {
 }
 
 /**
+ * Whether a queued bubble is the `!cmd` web message whose shell command the
+ * transcript just mirrored.
+ *
+ * Mirrors the server's shell-mode match on its pending-input queue: the
+ * bubble's text starts with `!` and, behind that `!` and the spaces after it,
+ * equals the mirrored command with whitespace collapsed. An unsent draft was
+ * never posted and an empty command matches nothing.
+ *
+ * @param bubble - A queued optimistic bubble.
+ * @param command - The mirrored command, without its leading `!`.
+ */
+function isShellCommandBubble(bubble: PendingUserMessage, command: string): boolean {
+  const wanted = command.replace(/\s+/g, " ").trim();
+  if (bubble.initialDraft || wanted === "") return false;
+  const text = messageContentText(bubble.content);
+  return text.startsWith("!") && text.slice(1).trimStart() === wanted;
+}
+
+/**
  * Normalized texts of the committed user-message blocks in `blocks`,
  * dropping empties (image-only messages). The dedup baseline for the
  * the snapshot replay in `bindStream`.
@@ -7523,19 +7542,27 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return { pendingUserMessages: rest };
       });
       return;
-    case "terminal_command":
+    case "terminal_command": {
       // Claude-native: a `!cmd` typed in the web composer runs as a shell
       // command, so its input comes back as this item instead of a user
       // message and no `session.input.consumed` fires. The server drains the
-      // queued entry on the input half; ack the local send the same way as
-      // `slash_command`. The output half acknowledges nothing.
-      if (event.kind !== "input") return;
+      // oldest queued entry whose text is that command; pop the matching
+      // bubble the same way. A command typed in the TUI, and the output half,
+      // match no bubble and acknowledge nothing.
+      const command = event.kind === "input" ? event.input : null;
+      if (command === null) return;
       applyToConversation((s) => {
-        if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
-        const [, ...rest] = s.pendingUserMessages;
-        return { pendingUserMessages: rest };
+        const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
+        if (at < 0) return {};
+        return {
+          pendingUserMessages: [
+            ...s.pendingUserMessages.slice(0, at),
+            ...s.pendingUserMessages.slice(at + 1),
+          ],
+        };
       });
       return;
+    }
     case "session_interrupted":
       // Explicit user-cancel signal. Distinguishes "interrupted by
       // user action" from the generic `response.incomplete` that
