@@ -2729,6 +2729,7 @@ def _queued_command_texts(item: NewConversationItem) -> list[str]:
     data = item.data
     if item.type == "slash_command" and isinstance(data, SlashCommandData):
         return [f"/{data.name} {data.arguments}".strip()]
+    # Only runners before 0.18.0 paste a leading "!" unescaped, so only they produce this mirror.
     if (
         item.type == "terminal_command"
         and isinstance(data, TerminalCommandData)
@@ -3035,7 +3036,7 @@ async def _persist_external_conversation_item_unlocked(
         return persisted.id
     # Landed: the drained entries are settled (uncertain ones leave without a
     # record — their mirror may already have been attributed by position);
-    # older messages a slash command jumped over are still on their way and
+    # older messages a command item jumped over are still on their way and
     # go back into play.
     _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
     _restore_drained_inputs(session_id, held_older, None)
@@ -3127,9 +3128,12 @@ async def _persist_external_conversation_items(
     """
     Persist a run of external items with one store append.
 
-    Matches :func:`_persist_external_conversation_item` per body for items
-    that neither drain a pending input nor seed a title. As on the per-entry
-    path, a malformed body raises only after the bodies before it are applied.
+    Never drains the pending-input queue or seeds a title, so the route sends
+    it only items that do neither (``_is_batchable_external_item``). A user
+    message, slash command or shell-mode ``terminal_command`` input goes
+    through :func:`_persist_external_conversation_item` instead. As on the
+    per-entry path, a malformed body raises only after the bodies before it
+    are applied.
 
     :returns: Store-assigned item ids, in body order.
     """
@@ -3239,7 +3243,7 @@ def _restore_drained_inputs(
     Put a mirror's drained pending entries back into play, in queue order.
 
     Compensation for a drain whose persist did not land (a deduplicated retry,
-    or an append that raised), and the way a slash command hands back the
+    or an append that raised), and the way a command item hands back the
     older entries it only held. Held entries are unheld in place; one the TTL
     evicted meanwhile is re-inserted at the front, newest-first, so the
     original order survives either way.

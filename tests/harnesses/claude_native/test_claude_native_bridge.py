@@ -4257,6 +4257,42 @@ def test_escape_shell_mode_text(content: str, expected: str) -> None:
     assert claude_native_bridge._escape_shell_mode_text(content) == expected
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "!ls",
+        "  !ls",
+        "!",
+        "!!",
+        "!/help",
+        "!a\nb",
+        "/help x",
+        "  /help",
+        "/exit",
+        "/clear",
+        "/my-skill some args",
+        "hello!",
+        "plain text",
+    ],
+)
+def test_mirrored_user_text_round_trips_the_bridge_escape(content: str, wrapped: bool) -> None:
+    """
+    A web message comes back from the transcript exactly as it was sent.
+
+    The escape applied on the way in and the strip applied on the way out must
+    stay in step: the server matches the mirror to its queued entry by text, so
+    changing one without the other leaves every escaped message unmatched.
+    """
+    pasted = claude_native_bridge._escape_shell_mode_text(
+        _escape_unsupported_slash_command(content)
+    )
+    # Claude records a bracketed paste wrapped in these markers.
+    recorded = f'\n\n<pasted_content id="x">\n{pasted}\n</pasted_content id="x">\n'
+
+    assert claude_native_bridge._mirrored_user_text(recorded if wrapped else pasted) == content
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [

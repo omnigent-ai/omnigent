@@ -5326,6 +5326,7 @@ async def test_claude_native_mirrored_shell_input_drains_its_queued_entry(
         )
 
         assert [item.type for item in store.appended_items] == ["terminal_command"]
+        # Pins the server-side drain only: the publish path forwards no cleared id for this item.
         assert cleared == [command]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
     finally:

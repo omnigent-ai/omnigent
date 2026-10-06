@@ -1,9 +1,9 @@
 """Tests for the batch path in POST /v1/sessions/{id}/events.
 
 When a batch contains consecutive batchable external_conversation_item entries
-(other than user messages, slash_command items, and entries with created_by or
-tools), the route authorizes once and calls conversation_store.append once per
-run instead of once per item.
+(other than user messages, slash_command items, shell-mode terminal_command
+inputs, and entries with created_by or tools), the route authorizes once and
+calls conversation_store.append once per run instead of once per item.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from itertools import count
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -23,7 +24,9 @@ import omnigent.server.routes.sessions.routes_events as routes_events_mod
 from omnigent.entities import NewConversationItem
 from omnigent.entities.conversation import Conversation, ConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runtime import pending_inputs
 from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.schemas import SessionEventInput
 
 _SESSION_ID = "conv_test"
 
@@ -274,6 +277,23 @@ def _slash_command_event(
     }
 
 
+def _terminal_command_event(kind: str, *, response_id: str = "resp_shell") -> dict:
+    """A ``!cmd`` record: ``kind`` is ``"input"`` (the command) or ``"output"`` (its result)."""
+    item_data: dict[str, Any] = (
+        {"kind": "input", "input": "ls -la"}
+        if kind == "input"
+        else {"kind": "output", "stdout": "total 0", "stderr": ""}
+    )
+    return {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": "terminal_command",
+            "item_data": item_data,
+            "response_id": response_id,
+        },
+    }
+
+
 # ── tests: one append + one auth ─────────────────────────────────────────────
 
 
@@ -355,6 +375,78 @@ def test_slash_command_in_middle_splits_run() -> None:
     assert resp.status_code == 202, resp.text
     assert len(resp.json()) == 3
     assert [len(c) for c in store.append_calls] == [1, 1, 1]
+
+
+def test_terminal_command_input_in_middle_splits_run() -> None:
+    """A shell-mode input drains a queued entry, which the batched append never does."""
+    batch = [
+        _assistant_event(source_id="pre"),
+        _terminal_command_event("input"),
+        _assistant_event(source_id="post"),
+    ]
+    resp, store = _post(batch)
+
+    assert resp.status_code == 202, resp.text
+    assert len(resp.json()) == 3
+    assert [len(c) for c in store.append_calls] == [1, 1, 1]
+
+
+def test_terminal_command_output_stays_batched() -> None:
+    """The result record of a ``!cmd`` drains nothing, so it coalesces with its neighbors."""
+    batch = [
+        _assistant_event(source_id="pre"),
+        _terminal_command_event("output"),
+        _assistant_event(source_id="post"),
+    ]
+    resp, store = _post(batch)
+
+    assert resp.status_code == 202, resp.text
+    assert len(resp.json()) == 3
+    assert [len(c) for c in store.append_calls] == [3]
+
+
+def test_batched_terminal_command_input_drains_its_queued_entry() -> None:
+    """A ``!cmd`` input posted inside an array settles its queued web entry.
+
+    Through the batched append it would persist without touching the queue, and
+    the next mirrored message would report the entry as never recorded.
+    """
+    pending_inputs.reset_for_tests()
+    pending_inputs.record(_SESSION_ID, [{"type": "input_text", "text": "!ls -la"}])
+    try:
+        resp, _store = _post([_assistant_event(source_id="pre"), _terminal_command_event("input")])
+
+        assert resp.status_code == 202, resp.text
+        assert pending_inputs.snapshot_for(_SESSION_ID) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        _user_event("hello"),
+        _slash_command_event(),
+        _terminal_command_event("input"),
+        _terminal_command_event("output"),
+        _assistant_event(),
+        _tool_call_event("call_1"),
+    ],
+    ids=["user", "slash", "shell-input", "shell-output", "assistant", "tool-call"],
+)
+def test_batch_predicate_agrees_with_the_drain_predicate(event: dict) -> None:
+    """Items the drain predicate accepts never batch; every other item here does.
+
+    The batch route sees raw events, so its predicate restates the drain
+    predicate's item types. A draining item the route missed would be
+    appended without draining its queued entry.
+    """
+    body = SessionEventInput.model_validate(event)
+    item = orchestration_mod._new_external_conversation_item(_SESSION_ID, body)
+
+    drains = orchestration_mod._drains_pending_inputs(item)
+
+    assert routes_events_mod._is_batchable_external_item(body) is (not drains)
 
 
 def test_other_event_type_in_middle_splits_run() -> None:
