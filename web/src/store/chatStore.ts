@@ -80,6 +80,7 @@ import type {
   McpServerStartup,
   SessionInputConsumedEvent,
   SessionViewer,
+  SlashCommand,
   StreamEvent,
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
@@ -6769,6 +6770,11 @@ function rawMessageText(content: MessageContentBlock[]): string {
 /** Zero-width characters and the BOM, which the server's text matching ignores. */
 const INVISIBLE_CHARS = /[\u200b-\u200d\u2060\ufeff]/g;
 
+/** Text with invisible characters dropped and whitespace collapsed, as the server matches it. */
+function collapseForMatch(text: string): string {
+  return text.replace(INVISIBLE_CHARS, "").replace(/\s+/g, " ").trim();
+}
+
 /**
  * Whether a queued bubble is the `!cmd` web message whose shell command the
  * transcript just mirrored.
@@ -6783,11 +6789,43 @@ const INVISIBLE_CHARS = /[\u200b-\u200d\u2060\ufeff]/g;
  * @param command - The mirrored command, without its leading `!`.
  */
 function isShellCommandBubble(bubble: PendingUserMessage, command: string): boolean {
-  const collapse = (text: string) => text.replace(INVISIBLE_CHARS, "").replace(/\s+/g, " ").trim();
-  const wanted = collapse(command);
+  const wanted = collapseForMatch(command);
   if (bubble.initialDraft || wanted === "") return false;
-  const text = collapse(rawMessageText(bubble.content));
+  const text = collapseForMatch(rawMessageText(bubble.content));
   return text.startsWith("!") && text.slice(1).trimStart() === wanted;
+}
+
+/**
+ * Index of the queued bubble whose web message a mirrored slash command came
+ * from, or -1 when none did.
+ *
+ * Mirrors the server's match on its pending-input queue: the bubble's
+ * collapsed text equals `/name args` for the recorded name or for the name
+ * behind a `plugin:` qualifier (Claude records `plugin:skill` for a typed
+ * `/skill`). Only a skill can be recorded under a name no spelling covers, so
+ * only a skill falls back to the oldest queued command; a built-in such as
+ * `/context` takes a bubble only by its own spelling. Unsent drafts never
+ * match.
+ *
+ * @param pending - The queued optimistic bubbles, oldest first.
+ * @param event - The mirrored slash command.
+ */
+function slashCommandBubbleIndex(pending: PendingUserMessage[], event: SlashCommand): number {
+  const texts = pending.map((p) =>
+    p.initialDraft ? "" : collapseForMatch(rawMessageText(p.content)),
+  );
+  const names = [event.name];
+  let bare = event.name;
+  while (bare.includes(":")) {
+    bare = bare.slice(bare.indexOf(":") + 1);
+    names.push(bare);
+  }
+  for (const name of names) {
+    if (name === "") continue;
+    const at = texts.indexOf(collapseForMatch(`/${name} ${event.arguments}`));
+    if (at >= 0) return at;
+  }
+  return event.kind === "skill" ? texts.findIndex((text) => text.startsWith("/")) : -1;
 }
 
 /** Most settled `!cmd` ids kept per conversation; the server's queue caps what it can skip. */
@@ -7577,13 +7615,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // persistence for these (no `session.input.consumed` fires),
       // so the optimistic bubble in `pendingUserMessages` would
       // otherwise linger next to the rendered SlashCommandBlock
-      // until refresh. Pop the FIFO head here to ack the local
-      // send; observing clients and drafts still held locally cannot
-      // acknowledge a send, so they just render the block.
+      // until refresh. Pop the bubble that typed the command to ack
+      // the local send; a command no queued bubble typed (run from the
+      // terminal or the model picker), observing clients and drafts
+      // still held locally cannot acknowledge a send, so they just
+      // render the block and leave the queue alone.
       applyToConversation((s) => {
-        if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
-        const [, ...rest] = s.pendingUserMessages;
-        return { pendingUserMessages: rest };
+        const at = slashCommandBubbleIndex(s.pendingUserMessages, event);
+        if (at < 0) return {};
+        return {
+          pendingUserMessages: [
+            ...s.pendingUserMessages.slice(0, at),
+            ...s.pendingUserMessages.slice(at + 1),
+          ],
+        };
       });
       return;
     case "terminal_command": {

@@ -8111,50 +8111,213 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("a message the terminal took but never mirrored", () => {
+    // The server settles it like a skipped message: a receipt of its own, in queue
+    // order, before the receipt of the message that jumped over it.
+    const receipt = (
+      itemId: string,
+      text: string,
+      clearedPendingId: string | null,
+    ): SessionInputConsumedEvent => ({
+      type: "session_input_consumed",
+      itemId,
+      itemType: "message",
+      clearedPendingId,
+      data: { role: "user", content: [{ type: "input_text", text }], user_authored: true },
+    });
+    const twoBubbles = () =>
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "/dev-tools" }] },
+          { tempId: "pend_2", content: [{ type: "input_text", text: "thanks" }] },
+        ],
+      });
+    const committedTexts = () =>
+      useChatStore
+        .getState()
+        .blocks.filter((b): b is UserMessageBlock => b.type === "user_message")
+        .map((b) => [b.ctx.itemId, b.content]);
+
+    it("settles exactly one bubble per receipt", () => {
+      twoBubbles();
+
+      // The ids are not adopted yet, so the receipt lands on the FIFO head.
+      handleSessionEvent(receipt("msg_taken", "/dev-tools", "pending_srv_1"));
+
+      expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_2"]);
+      expect(committedTexts()).toEqual([
+        ["msg_taken", [{ type: "input_text", text: "/dev-tools" }]],
+      ]);
+    });
+
+    it("renders each message once when the receipts arrive in queue order", () => {
+      twoBubbles();
+
+      handleSessionEvent(receipt("msg_taken", "/dev-tools", "pending_srv_1"));
+      handleSessionEvent(receipt("msg_next", "thanks", "pending_srv_2"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(committedTexts()).toEqual([
+        ["msg_taken", [{ type: "input_text", text: "/dev-tools" }]],
+        ["msg_next", [{ type: "input_text", text: "thanks" }]],
+      ]);
+    });
+
+    it("settles each bubble by the id its receipt names", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pending_srv_1", content: [{ type: "input_text", text: "/dev-tools" }] },
+          { tempId: "pending_srv_2", content: [{ type: "input_text", text: "thanks" }] },
+        ],
+      });
+
+      handleSessionEvent(receipt("msg_taken", "/dev-tools", "pending_srv_1"));
+      handleSessionEvent(receipt("msg_next", "thanks", "pending_srv_2"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(committedTexts().map(([id]) => id)).toEqual(["msg_taken", "msg_next"]);
+    });
+  });
+
   describe("slash_command (claude-native skill / surfaced command)", () => {
-    it("pops the FIFO head of pendingUserMessages so the optimistic bubble clears", () => {
+    const bubble = (tempId: string, text: string, extra: Record<string, unknown> = {}) => ({
+      tempId,
+      content: [{ type: "input_text" as const, text }],
+      ...extra,
+    });
+    const slash = (name: string, args = "", kind: "skill" | "command" = "skill"): StreamEvent => ({
+      type: "slash_command",
+      kind,
+      name,
+      arguments: args,
+      output: null,
+      agentName: "claude-native-ui",
+      itemId: `item_slash_${name}`,
+      responseId: "resp_slash",
+    });
+    const queued = () => useChatStore.getState().pendingUserMessages.map((p) => p.tempId);
+
+    it("pops the bubble that typed the command so the optimistic bubble clears", () => {
       // Claude-native skips `session.input.consumed` for slash invocations;
       // the slash_command output_item is the only ack, so it must clear
       // the optimistic bubble that `send` parked in `pendingUserMessages`.
       useChatStore.setState({
         blocks: [],
+        pendingUserMessages: [bubble("pend_1", "/mlflow-bug"), bubble("pend_2", "next")],
+      });
+
+      handleSessionEvent(slash("mlflow-bug"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([bubble("pend_2", "next")]);
+    });
+
+    it("pops the typing bubble even when an older message is still queued", () => {
+      // The FIFO head belongs to a plain message that is still on its way.
+      useChatStore.setState({
+        blocks: [],
         pendingUserMessages: [
-          { tempId: "pend_1", content: [{ type: "input_text", text: "/mlflow-bug" }] },
-          { tempId: "pend_2", content: [{ type: "input_text", text: "next" }] },
+          bubble("pend_1", "hello"),
+          bubble("pend_2", "/simplify   the diff"),
+          bubble("pend_3", "later"),
         ],
       });
 
-      const event: StreamEvent = {
-        type: "slash_command",
-        kind: "skill",
-        name: "mlflow-bug",
-        arguments: "",
-        output: null,
-        agentName: "claude-native-ui",
-        itemId: "item_slash_1",
-        responseId: "resp_slash_1",
-      };
-      handleSessionEvent(event);
+      handleSessionEvent(slash("simplify", "the diff"));
 
-      expect(useChatStore.getState().pendingUserMessages).toEqual([
-        { tempId: "pend_2", content: [{ type: "input_text", text: "next" }] },
-      ]);
+      expect(queued()).toEqual(["pend_1", "pend_3"]);
+    });
+
+    it.each([
+      ["dev-productivity:simplify", "a plugin qualifier"],
+      ["team:tools:simplify", "nested qualifiers"],
+    ])("matches a bubble typed without the qualifier in %s (%s)", (name) => {
+      // An older command bubble sits in front, so only the spelling finds the right one.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          bubble("pend_1", "hello"),
+          bubble("pend_2", "/other-skill"),
+          bubble("pend_3", "/simplify the diff"),
+        ],
+      });
+
+      handleSessionEvent(slash(name, "the diff"));
+
+      expect(queued()).toEqual(["pend_1", "pend_2"]);
+    });
+
+    it("ignores invisible characters in the queued text", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          bubble("pend_1", "hello"),
+          bubble("pend_2", "\ufeff/effort\u200b high"),
+        ],
+      });
+
+      handleSessionEvent(slash("effort", "high", "command"));
+
+      expect(queued()).toEqual(["pend_1"]);
+    });
+
+    it("leaves the queue alone for a built-in nobody typed in the web", () => {
+      // `/context` run from the terminal or the model picker owns no bubble, so
+      // the oldest queued message must keep its bubble for its own receipt.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [bubble("pend_1", "hello"), bubble("pend_2", "/other-skill")],
+      });
+
+      handleSessionEvent(slash("context", "", "command"));
+
+      expect(queued()).toEqual(["pend_1", "pend_2"]);
+    });
+
+    it("gives a skill recorded under an unknown name the oldest queued command", () => {
+      // An alias the spellings do not cover: the server guesses the oldest queued
+      // command, and so does the bubble.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          bubble("pend_1", "plain on its way"),
+          bubble("pend_2", "/alias-typed"),
+          bubble("pend_3", "/other"),
+        ],
+      });
+
+      handleSessionEvent(slash("some-real-name"));
+
+      expect(queued()).toEqual(["pend_1", "pend_3"]);
+    });
+
+    it("leaves plain messages alone when a skill matches no command bubble", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [bubble("pend_1", "hello")],
+      });
+
+      handleSessionEvent(slash("some-real-name"));
+
+      expect(queued()).toEqual(["pend_1"]);
+    });
+
+    it("never pops an unsent draft", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [bubble("pend_1", "/simplify", { initialDraft: true })],
+      });
+
+      handleSessionEvent(slash("simplify"));
+
+      expect(queued()).toEqual(["pend_1"]);
     });
 
     it("is a no-op when pendingUserMessages is empty (observing client)", () => {
       useChatStore.setState({ blocks: [], pendingUserMessages: [] });
 
-      const event: StreamEvent = {
-        type: "slash_command",
-        kind: "command",
-        name: "clear",
-        arguments: "",
-        output: null,
-        agentName: "claude-native-ui",
-        itemId: "item_slash_2",
-        responseId: "resp_slash_2",
-      };
-      handleSessionEvent(event);
+      handleSessionEvent(slash("clear", "", "command"));
 
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
     });
@@ -17017,6 +17180,48 @@ it("renders one named error for metadata-less runner failure and status frames",
       },
     ]);
     expect(state.activeResponse?.state).toBe("failed");
+  } finally {
+    controller.abort();
+  }
+});
+
+it("renders one error for an undelivered setup failure and its failed status edge", async () => {
+  // The runner publishes a turn-setup failure twice: a response.failed naming the
+  // queued web message (flagged undelivered) and the failed status edge. Both
+  // describe one failure, so they must share one card.
+  useChatStore.setState({ conversationId: "conv_setup_failed", blocks: [] });
+  const sink = pushableStream();
+  const controller = new AbortController();
+  const setState = useChatStore.setState as unknown as Parameters<typeof pumpStreamEvents>[3];
+  const getState = useChatStore.getState as unknown as Parameters<typeof pumpStreamEvents>[4];
+  const immediate: FrameScheduler = { schedule: (cb) => cb(), cancel: () => {} };
+  void pumpStreamEvents(
+    "conv_setup_failed",
+    sink.stream,
+    controller,
+    setState,
+    getState,
+    immediate,
+  );
+  try {
+    const error = { code: "runner_error", message: "turn setup failed: boom" };
+    sink.push(
+      sse("response.failed", {
+        source: "execution",
+        input_stable_id: "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+        response: { status: "failed", error: { ...error, undelivered: true } },
+        error: { ...error, undelivered: true },
+      }),
+    );
+    await tick();
+    sink.push(
+      sse("session.status", { conversation_id: "conv_setup_failed", status: "failed", error }),
+    );
+    await tick();
+
+    const state = useChatStore.getState();
+    expect(state.blocks.filter((block) => block.type === "error")).toMatchObject([error]);
+    expect(state.activeResponse?.state).not.toBe("streaming");
   } finally {
     controller.abort();
   }
