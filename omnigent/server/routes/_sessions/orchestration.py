@@ -41,6 +41,7 @@ from omnigent.entities import (
     NewConversationItem,
     ResourceEventData,
     SlashCommandData,
+    TerminalCommandData,
 )
 from omnigent.entities.conversation import (
     FunctionCallData,
@@ -2710,19 +2711,66 @@ def _native_mirror_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _queued_command_texts(item: NewConversationItem) -> list[str]:
+    """
+    Return the texts a mirrored command item may have been queued under.
+
+    A command typed in the web composer is queued as plain text and comes back
+    as a ``slash_command`` item. A ``!`` message that an older runner pasted
+    unescaped runs in Claude Code's shell mode instead and comes back as a
+    ``terminal_command`` input; its ``output`` sibling carries only the result,
+    so it names no entry. The ``!`` may have been typed with or without a
+    following space, so both spellings are offered.
+
+    :param item: The parsed external item.
+    :returns: Candidate queue texts in match order, e.g. ``["/model sonnet"]``
+        or ``["!ls -la", "! ls -la"]``; empty for any other item.
+    """
+    data = item.data
+    if item.type == "slash_command" and isinstance(data, SlashCommandData):
+        return [f"/{data.name} {data.arguments}".strip()]
+    if (
+        item.type == "terminal_command"
+        and isinstance(data, TerminalCommandData)
+        and data.kind == "input"
+        and data.input
+    ):
+        return [f"!{data.input}", f"! {data.input}"]
+    return []
+
+
+def _resolve_queued_command(
+    session_id: str, command_texts: list[str]
+) -> pending_inputs.MatchedDrain:
+    """
+    Drain, held in place, the queued entry a mirrored command was typed as.
+
+    :param session_id: Conversation whose pending inputs are matched.
+    :param command_texts: Candidate texts from :func:`_queued_command_texts`.
+    :returns: The first spelling that matches an entry, else the last miss.
+    """
+    matched = pending_inputs.MatchedDrain(matched=None, skipped=[])
+    for command_text in command_texts:
+        matched = pending_inputs.resolve_matching_text(session_id, command_text, hold=True)
+        if matched.matched is not None:
+            break
+    return matched
+
+
 def _drains_pending_inputs(item: NewConversationItem) -> bool:
     """
     Whether a mirrored item settles a queued web message.
 
     True for a web-composer user message echoed back by the transcript and for
-    a slash command (typed in the web composer as plain text, mirrored as a
-    ``slash_command`` item). Assistant and tool items never touch the queue.
+    a command item (see :func:`_queued_command_texts`): a slash command, or the
+    shell-mode input of a ``!`` message. Assistant and tool items never touch
+    the queue.
 
     :param item: The parsed external item.
     :returns: ``True`` when persisting *item* drains a pending-input entry.
     """
-    if item.type == "slash_command":
-        return isinstance(item.data, SlashCommandData)
+    if item.type in ("slash_command", "terminal_command"):
+        return bool(_queued_command_texts(item))
     return (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -2872,7 +2920,7 @@ async def _persist_external_conversation_item_unlocked(
     # their slot until the append settles, so a failed append restores the
     # queue exactly and a refill meanwhile cannot evict them. Older entries a
     # text match jumped over: a user message with a retry-safe identity
-    # surfaces them as undelivered; a source-less mirror or a slash command
+    # surfaces them as undelivered; a source-less mirror or a command item
     # only holds them and puts them back afterwards.
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
@@ -2938,16 +2986,16 @@ async def _persist_external_conversation_item_unlocked(
             item = item.model_copy(
                 update={"data": item.data.model_copy(update={"user_authored": True})}
             )
-    elif item.type == "slash_command" and isinstance(item.data, SlashCommandData):
-        # A command typed in the web composer was queued as plain text but comes
-        # back as a slash_command item. Drain its own entry so it is not later
-        # mistaken for a lost message; older entries stay in place.
-        command_line = f"/{item.data.name} {item.data.arguments}".strip()
-        matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+    elif command_texts := _queued_command_texts(item):
+        # A web-typed command comes back as a command item: drain its own entry
+        # by text so it is not later mistaken for a lost message. Never by
+        # position (a terminal ``!cmd`` owns no entry); older entries stay.
+        matched = _resolve_queued_command(session_id, command_texts)
         drained = matched.matched
         if drained is not None:
             cleared_pending_id = drained.pending_id
-        held_older = matched.skipped
+        # The match held every older entry it jumped over, uncertain ones too.
+        held_older = [*matched.skipped, *matched.uncertain]
     # Build the batch: skipped entries first (their positions must precede
     # the matched item to match broadcast order), then the anchor. Each
     # skipped entry gets a pair of items (user message + error) with stable

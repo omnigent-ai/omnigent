@@ -1406,6 +1406,57 @@ def test_native_agent_tool_result_carries_only_completion_provenance(
     assert response_id == "active"
 
 
+@pytest.mark.parametrize("shape", ["string", "blocks", "queued"])
+@pytest.mark.parametrize(
+    ("recorded", "mirrored"),
+    [
+        # The escape the bridge pastes before a leading "!" or "/" is removed.
+        ("\ufeff!ls -la", "!ls -la"),
+        ("\ufeff/help", "/help"),
+        ("  \ufeff!ls", "  !ls"),
+        ('\n\n<pasted_content id="x">\n\ufeff!ls -la\n</pasted_content id="x">\n', "!ls -la"),
+        # Any other U+FEFF is the person's own text and is kept.
+        ("hello \ufeff!x", "hello \ufeff!x"),
+        ("\ufeffhello", "\ufeffhello"),
+        ("\ufeff\ufeff!x", "\ufeff\ufeff!x"),
+        ("!x\ufeff", "!x\ufeff"),
+    ],
+)
+def test_user_message_mirror_strips_only_the_command_escape(
+    tmp_path: Path, shape: str, recorded: str, mirrored: str
+) -> None:
+    """
+    A mirrored web message equals what the person sent, escape removed.
+
+    The bridge pastes a zero-width prefix before a leading ``!`` or ``/`` so
+    Claude Code keeps prompt mode, and Claude records it verbatim. Left in, the
+    mirror never text-matches the queued web message.
+    """
+    content: Any = [{"type": "text", "text": recorded}] if shape == "blocks" else recorded
+    _, _, items = _read_native_user(
+        tmp_path, content, queued="prompt" if shape == "queued" else None
+    )
+
+    [item] = items
+    assert item.data == {"role": "user", "content": [{"type": "input_text", "text": mirrored}]}
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("\ufeff!x", "!x"),
+        ("\ufeff/help", "/help"),
+        ("\n \ufeff!x", "\n !x"),
+        ("\ufeff!\ufeff!x", "!\ufeff!x"),
+        ("!x", "!x"),
+        ("", ""),
+    ],
+)
+def test_strip_command_escape_removes_one_leading_char(text: str, expected: str) -> None:
+    """Only the single U+FEFF directly before a leading ``/`` or ``!`` goes."""
+    assert claude_native_bridge._strip_command_escape(text) == expected
+
+
 def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
     """
     An ``isCompactSummary`` user record is flagged, not rendered as a bubble.
@@ -4181,6 +4232,34 @@ def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
+        ("!ls -la", "\ufeff!ls -la"),
+        ("  !ls", "  \ufeff!ls"),
+        ("\n!ls", "\n\ufeff!ls"),
+        ("!", "\ufeff!"),
+        ("!!", "\ufeff!!"),
+        ("!ls\n!pwd", "\ufeff!ls\n!pwd"),
+        # Only a leading "!" is touched.
+        ("hello!", "hello!"),
+        ("hi !there", "hi !there"),
+        ("line one\n!two", "line one\n!two"),
+        ("/clear", "/clear"),
+        ("plain text", "plain text"),
+        ("", ""),
+        # Already escaped: the first visible character is no longer "!".
+        ("\ufeff!ls", "\ufeff!ls"),
+    ],
+)
+def test_escape_shell_mode_text(content: str, expected: str) -> None:
+    """
+    A leading ``!`` gets a zero-width escape so Claude Code stays in prompt
+    mode; a ``!`` anywhere else, and every other message, is untouched.
+    """
+    assert claude_native_bridge._escape_shell_mode_text(content) == expected
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
         ("/login", True),
         ("  /login", True),
         ("/logout", True),
@@ -4245,6 +4324,83 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
 
     inject_user_message(bridge_dir, content="/clear")
     assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("content", "pasted", "needle"),
+    [
+        ("!ls -la", "\ufeff!ls -la", "!ls -la"),
+        ("  !ls", "  \ufeff!ls", "!ls"),
+        ("!ls\nsecond line", "\ufeff!ls\nsecond line", "!ls"),
+        ("hello!", "hello!", "hello!"),
+        ("/clear", "/clear", "/clear"),
+    ],
+)
+def test_inject_user_message_escapes_a_leading_bang_but_keeps_the_original_needle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+    pasted: str,
+    needle: str,
+) -> None:
+    """
+    A web message starting with ``!`` is pasted behind a zero-width escape.
+
+    Pasted bare, Claude Code flips the composer to ``!`` shell mode: the
+    bridge never sees the draft behind the prompt glyph, submits blind after
+    the paste timeout, and the text runs as a bash command instead of
+    reaching the model. The draft needle still comes from the original text
+    because the composer row renders no U+FEFF.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    loaded_payloads: list[bytes] = []
+    pastes: list[tuple[str, str]] = []
+    tui = {"pane": _composer_pane()}
+    paste_and_submit = claude_native_bridge._paste_and_submit
+
+    def _spy_paste(*args: Any, **kwargs: Any) -> None:
+        """
+        Record the pasted text and draft needle, then deliver for real.
+
+        :param args: Positional arguments of ``_paste_and_submit``.
+        :param kwargs: Keyword arguments of ``_paste_and_submit``.
+        :returns: None.
+        """
+        pastes.append((kwargs["text"], kwargs["needle"]))
+        paste_and_submit(*args, **kwargs)
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Record buffer payloads and simulate a TUI that stays in prompt mode.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane(content.split("\n")[0])
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(claude_native_bridge, "_paste_and_submit", _spy_paste)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert pastes == [(pasted, needle)]
+    assert loaded_payloads == [claude_native_bridge._paste_payload_bytes(pasted + "\n")]
 
 
 def _rejection_pane(name: str, draft: str = "") -> str:

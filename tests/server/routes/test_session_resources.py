@@ -5261,6 +5261,404 @@ async def test_claude_native_mirrored_slash_command_drains_its_queued_entry() ->
         pending_inputs.reset_for_tests()
 
 
+def _terminal_command_body(
+    item_data: dict[str, Any], source_id: str = "claude:shell:0"
+) -> SessionEventInput:
+    """Build the event the forwarder posts for a mirrored ``!cmd`` transcript record."""
+    return SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "terminal_command",
+            "item_data": item_data,
+            "response_id": "resp_shell",
+            "source_id": source_id,
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("queued_text", "mirrored_input"),
+    [
+        ("!ls -la", "ls -la"),
+        ("! ls -la", "ls -la"),
+        ("! ls -la", " ls -la"),
+    ],
+)
+async def test_claude_native_mirrored_shell_input_drains_its_queued_entry(
+    monkeypatch: pytest.MonkeyPatch, queued_text: str, mirrored_input: str
+) -> None:
+    """A ``!`` web message that ran in shell mode clears its own queued entry.
+
+    An older runner pasted the text unescaped, so Claude Code ran it as a bash
+    command and the transcript mirrors a terminal_command input, not a user
+    message. Without this the entry outlives the command and the next ordinary
+    message flags it ``native_prompt_not_recorded``. Older entries stay queued.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    cleared: list[str | None] = []
+    publish_persisted = orchestration._publish_persisted_external_item
+
+    def spy(
+        session_id: str, body: Any, persisted: Any, cleared_pending_id: str | None = None
+    ) -> None:
+        cleared.append(cleared_pending_id)
+        publish_persisted(session_id, body, persisted, cleared_pending_id=cleared_pending_id)
+
+    monkeypatch.setattr(orchestration, "_publish_persisted_external_item", spy)
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    command = pending_inputs.record(sid, [{"type": "input_text", "text": queued_text}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _terminal_command_body({"kind": "input", "input": mirrored_input}),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert cleared == [command]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirrored_shell_input_without_a_match_drains_nothing() -> None:
+    """A ``!cmd`` typed in the embedded terminal owns no entry and takes none.
+
+    An unmatched user message drains the oldest entry by position; a shell-mode
+    input must not, or a command the person ran by hand would settle (and hide)
+    an unrelated web message that is still on its way.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    first = pending_inputs.record(sid, [{"type": "input_text", "text": "first web message"}])
+    second = pending_inputs.record(sid, [{"type": "input_text", "text": "!echo other"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _terminal_command_body({"kind": "input", "input": "ls -la"}),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            first,
+            second,
+        ]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirrored_shell_input_leaves_older_entries_queued() -> None:
+    """Older entries a shell-mode input jumped over are not reported as lost.
+
+    They may still be on their way, so no undelivered message/error pair is
+    written (``native_prompt_not_recorded``) and they stay drainable: the later
+    mirror of the older message settles its own entry.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "!ls -la"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _terminal_command_body({"kind": "input", "input": "ls -la"}),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+
+        older_body = SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "still on its way"}],
+                },
+                "response_id": "resp_older",
+                "source_id": "claude:older:0",
+            },
+        )
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            older_body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command", "message"]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_message_after_shell_input_does_not_flag_it_as_lost() -> None:
+    """The next mirrored message must not report the shell-mode ``!`` message as undelivered.
+
+    Before the shell-mode input drained its entry, that entry sat at the head of
+    the queue; the next message's text match jumped over it and persisted a
+    user-message/``native_prompt_not_recorded`` pair for a message Claude ran.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(sid, [{"type": "input_text", "text": "!ls -la"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "what did that show?"}])
+    next_body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "what did that show?"}],
+            },
+            "response_id": "resp_next",
+            "source_id": "claude:next:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _terminal_command_body({"kind": "input", "input": "ls -la"}),
+            store,  # type: ignore[arg-type]
+        )
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            next_body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command", "message"]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirrored_shell_output_drains_nothing() -> None:
+    """The result record of a ``!cmd`` names no command, so it settles no entry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    queued = pending_inputs.record(sid, [{"type": "input_text", "text": "!ls -la"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _terminal_command_body(
+                {"kind": "output", "stdout": "total 0", "stderr": ""}, "claude:shell:1"
+            ),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [queued]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("item_type", "item_data", "queued_text"),
+    [
+        (
+            "slash_command",
+            {
+                "agent": "claude-native-ui",
+                "kind": "command",
+                "name": "model",
+                "arguments": "sonnet",
+            },
+            "/model sonnet",
+        ),
+        ("terminal_command", {"kind": "input", "input": "ls -la"}, "!ls -la"),
+    ],
+)
+async def test_claude_native_mirrored_command_keeps_uncertain_older_entries_queued(
+    item_type: str, item_data: dict[str, Any], queued_text: str
+) -> None:
+    """Older entries a positional drain may have settled are handed back, not stranded.
+
+    The text match holds every entry it jumps over. The ones flagged uncertain
+    must be unheld along with the rest, or they sit held in the queue and no
+    later mirror can ever drain them.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older_a = pending_inputs.record(sid, [{"type": "input_text", "text": "older A"}])
+    older_b = pending_inputs.record(sid, [{"type": "input_text", "text": "older B"}])
+    pending_inputs.mark_uncertain(sid)
+    pending_inputs.record(sid, [{"type": "input_text", "text": queued_text}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": item_type,
+            "item_data": item_data,
+            "response_id": "resp_command",
+            "source_id": "claude:command:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == [item_type]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            older_a,
+            older_b,
+        ]
+        drained = pending_inputs.resolve_oldest(sid)
+        assert drained is not None, "the uncertain older entries were left held"
+        assert drained.pending_id == older_a
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_retried_shell_input_mirror_leaves_the_queue_alone() -> None:
+    """A forwarder retry of a persisted shell-mode mirror must not drain again.
+
+    The retried command can match a NEWER identical queued message; draining it
+    would settle an entry whose own command never ran.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    body = _terminal_command_body({"kind": "input", "input": "ls -la"})
+
+    try:
+        first_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+        newer = pending_inputs.record(sid, [{"type": "input_text", "text": "!ls -la"}])
+
+        retried_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert retried_id == first_id
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [newer]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    ("item_type", "item_data", "texts", "drains"),
+    [
+        (
+            "terminal_command",
+            {"kind": "input", "input": "ls -la"},
+            ["!ls -la", "! ls -la"],
+            True,
+        ),
+        ("terminal_command", {"kind": "input", "input": ""}, [], False),
+        ("terminal_command", {"kind": "input"}, [], False),
+        ("terminal_command", {"kind": "output", "stdout": "ls -la"}, [], False),
+        (
+            "slash_command",
+            {"agent": "claude-native-ui", "kind": "command", "name": "model", "arguments": "x"},
+            ["/model x"],
+            True,
+        ),
+        # A user message drains through its own branch and has no command text.
+        (
+            "message",
+            {"role": "user", "content": [{"type": "input_text", "text": "!ls"}]},
+            [],
+            True,
+        ),
+    ],
+)
+def test_queued_command_texts_only_names_commands_that_can_drain(
+    item_type: str, item_data: dict[str, Any], texts: list[str], drains: bool
+) -> None:
+    """Only a slash command or a non-empty shell-mode input names queue texts to match."""
+    from omnigent.entities import NewConversationItem
+    from omnigent.entities.conversation import parse_item_data
+    from omnigent.server.routes._sessions.orchestration import (
+        _drains_pending_inputs,
+        _queued_command_texts,
+    )
+
+    item = NewConversationItem(
+        type=item_type,
+        response_id="resp_command",
+        data=parse_item_data(item_type, {"type": item_type, **item_data}),
+    )
+
+    assert _queued_command_texts(item) == texts
+    assert _drains_pending_inputs(item) is drains
+
+
 @pytest.mark.asyncio
 async def test_claude_native_overlapping_retries_persist_nothing_extra() -> None:
     """Two overlapping posts of one mirror persist it once and skip nothing.
@@ -5521,6 +5919,48 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry() ->
         )
 
         assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_failed_shell_input_append_restores_its_entry() -> None:
+    """A shell-mode mirror whose append fails puts its queued entries back, in order."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _FailOnceStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    command = pending_inputs.record(sid, [{"type": "input_text", "text": "!ls -la"}])
+    body = _terminal_command_body({"kind": "input", "input": "ls -la"})
+
+    try:
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                body,
+                store,  # type: ignore[arg-type]
+            )
+        assert store.appended_items == []
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            older,
+            command,
+        ]
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["terminal_command"]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
     finally:
         pending_inputs.reset_for_tests()

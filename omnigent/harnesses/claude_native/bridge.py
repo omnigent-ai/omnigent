@@ -4043,6 +4043,11 @@ def inject_user_message(
     silently swallowed. A recognized skill prints no rejection and runs
     exactly as before.
 
+    A message leading with ``!`` is always escaped the same way: pasted
+    bare, Claude Code flips the composer to ``!`` shell mode, the draft is
+    never visible behind the prompt glyph, and the text runs as a bash
+    command instead of reaching the model.
+
     :param bridge_dir: Bridge directory path.
     :param content: User text from the Omnigent web UI. Must be non-empty.
     :param timeout_s: Seconds to wait for each readiness gate
@@ -4079,6 +4084,9 @@ def inject_user_message(
     # that Omnigent cannot drive. Allowed commands (``/clear``,
     # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
     injected_text = _escape_unsupported_slash_command(content)
+    # A leading ``!`` would flip the composer into shell mode; escape it too.
+    injected_text = _escape_shell_mode_text(injected_text)
+    # Built from the unescaped text: the zero-width prefix never shows in the draft row.
     needle = _submit_needle(content)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
@@ -7899,12 +7907,10 @@ def _attachment_transcript_items_from_entry(
         item_type="message",
         data={
             "role": "user",
-            "content": [{"type": "input_text", "text": _unwrap_pasted_content_markers(prompt)}],
+            "content": [{"type": "input_text", "text": _mirrored_user_text(prompt)}],
         },
         response_id=_response_id_from_source(source_key),
-        agent_message_candidate=_is_agent_notification_text(
-            _unwrap_pasted_content_markers(prompt)
-        ),
+        agent_message_candidate=_is_agent_notification_text(_mirrored_user_text(prompt)),
     )
     return None, [item]
 
@@ -7965,6 +7971,41 @@ def _unwrap_pasted_content_markers(text: str) -> str:
     if unwrapped == text:
         return text
     return unwrapped.strip("\n")
+
+
+# The zero-width prefix ``_escape_slash_command_text`` and
+# ``_escape_shell_mode_text`` put before a leading ``/`` or ``!``.
+_COMMAND_ESCAPE_RE = re.compile(r"^(\s*)\ufeff(?=[/!])")
+
+
+def _strip_command_escape(text: str) -> str:
+    r"""
+    Remove the escape the bridge put before a leading ``/`` or ``!``.
+
+    Claude records the escaped paste verbatim, so the mirrored user message
+    would differ from the web message by one invisible character and miss the
+    server's text match for its queued entry. Drops a single U+FEFF that sits
+    directly before the leading ``/`` or ``!`` (after optional leading
+    whitespace); a U+FEFF anywhere else is kept.
+
+    :param text: User text from a Claude transcript record, e.g.
+        ``"\ufeff!ls -la"``.
+    :returns: The text as the person sent it, e.g. ``"!ls -la"``.
+    """
+    return _COMMAND_ESCAPE_RE.sub(r"\1", text, count=1)
+
+
+def _mirrored_user_text(text: str) -> str:
+    """
+    Return a user record's text as the person sent it.
+
+    Removes Claude's ``<pasted_content>`` wrappers and the bridge's command
+    escape, so the mirrored message equals the web message it echoes.
+
+    :param text: User text from a Claude transcript record.
+    :returns: The text without paste wrappers or the leading command escape.
+    """
+    return _strip_command_escape(_unwrap_pasted_content_markers(text))
 
 
 _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
@@ -8179,6 +8220,23 @@ def _escape_unsupported_slash_command(content: str) -> str:
         # Unknown name: likely a skill; let Claude Code handle it.
         return content
     return _escape_slash_command_text(content)
+
+
+def _escape_shell_mode_text(content: str) -> str:
+    """
+    Return *content* escaped so a leading ``!`` stays chat text.
+
+    Claude Code flips its composer into ``!`` shell mode when the input
+    starts with ``!``, and the submitted text then runs as a bash command
+    instead of reaching the model. Inserts a zero-width no-break space
+    (U+FEFF) before a ``!`` that is the first non-whitespace character, as
+    :func:`_escape_slash_command_text` does for ``/``. Only that leading
+    ``!`` is touched: ``hello!`` and ``/clear`` come back unchanged.
+    """
+    match = re.match(r"^(\s*)(!)(.*)$", content, re.DOTALL)
+    if not match:
+        return content
+    return f"{match.group(1)}\ufeff{match.group(2)}{match.group(3)}"
 
 
 def is_auth_slash_command(content: str) -> bool:
@@ -8613,14 +8671,10 @@ def _user_transcript_items_from_entry(
                 item_type="message",
                 data={
                     "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": _unwrap_pasted_content_markers(content)}
-                    ],
+                    "content": [{"type": "input_text", "text": _mirrored_user_text(content)}],
                 },
                 response_id=fallback_response_id,
-                agent_message_candidate=_is_agent_notification_text(
-                    _unwrap_pasted_content_markers(content)
-                ),
+                agent_message_candidate=_is_agent_notification_text(_mirrored_user_text(content)),
             )
         )
         return None, items
@@ -8665,9 +8719,7 @@ def _user_transcript_items_from_entry(
                 stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
             ):
                 continue
-            user_blocks.append(
-                {"type": "input_text", "text": _unwrap_pasted_content_markers(text)}
-            )
+            user_blocks.append({"type": "input_text", "text": _mirrored_user_text(text)})
             saw_user_text = True
             continue
         if block_type != "tool_result":
