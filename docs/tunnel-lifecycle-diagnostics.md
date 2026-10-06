@@ -7,6 +7,20 @@ sink as `event_name` plus string `attributes`; booleans appear as `True` or
 `False`. Deploy both the server and the runner before expecting the fields on
 both ends.
 
+## Native event delivery
+
+`runner_event_delivery_retry` identifies a durable batch waiting for delivery.
+It includes `session_id`, a bounded `reason` (`delivery_timeout`,
+`transport_error`, or `retryable_ack`), `retry_count`, `elapsed_retry_s`,
+`batch_size`, and `remaining_count`. Warnings are limited to one per minute
+for each batch. `runner_event_delivery_recovered` records the eventual
+acknowledgement with the retry count, elapsed retry time, and original batch
+size. Neither event includes payloads, source IDs, or server error text.
+
+Retries are not terminal session failures. They preserve source-keyed replay
+and per-session ordering. One stalled session occupies at most one of the two
+delivery workers; two independently stalled sessions can still occupy both.
+
 ## Runner events (`source = 'runner'`)
 
 - `runner_connected`: `connection_id`, `reconnect` (an earlier connection on

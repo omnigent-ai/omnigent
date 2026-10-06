@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
 from urllib.parse import unquote, urlsplit
@@ -14,6 +16,7 @@ from urllib.parse import unquote, urlsplit
 import httpx
 from websockets.exceptions import ConnectionClosed
 
+from omnigent.debug_logging import debug_event
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
     EventBatchFrame,
@@ -24,6 +27,7 @@ _logger = logging.getLogger(__name__)
 _EVENTS_PATH = re.compile(r"/v1/sessions/([^/]+)/events$")
 _MAX_EVENTS = 32
 _MAX_BATCH_BYTES = 256 * 1024
+_RETRY_LOG_INTERVAL_S = 60.0
 
 
 class TunnelIngestUnsupported(Exception):
@@ -45,9 +49,11 @@ class RunnerEventDispatcher:
         self._send: Callable[[str], Awaitable[None]] | None = None
         self._pending: dict[str, asyncio.Future[EventAckFrame]] = {}
         self._queue: asyncio.Queue[
-            tuple[str, list[dict[str, Any]], asyncio.Future[EventAckFrame]]
+            tuple[str, list[dict[str, Any]], asyncio.Future[EventAckFrame], asyncio.Lock]
         ] = asyncio.Queue(maxsize=32)
-        self._locks: dict[str, asyncio.Lock] = {}
+        # A lock is held by a waiting submitter, a queued item, or its worker.
+        # Once the session has no admitted work, the weak map can release it.
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._workers: list[asyncio.Task[None]] = []
         self._outstanding = 0
 
@@ -129,49 +135,69 @@ class RunnerEventDispatcher:
             ]
         result: asyncio.Future[EventAckFrame] = asyncio.get_running_loop().create_future()
         self._outstanding += 1
+        lock = self._locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[session_id] = lock
+        lock_acquired = False
         try:
-            await self._queue.put((session_id, events, result))
+            # Admission happens before queueing so a producer waiting behind a
+            # stalled session does not consume one of the two delivery workers.
+            await lock.acquire()
+            lock_acquired = True
+            await self._queue.put((session_id, events, result, lock))
+            # Ownership transfers to the worker once the item enters the queue.
+            lock_acquired = False
             return await result
         finally:
             self._outstanding -= 1
             if not result.done():
                 result.cancel()
+            if lock_acquired:
+                lock.release()
 
     async def _worker(self) -> None:
         while True:
-            session_id, events, result = await self._queue.get()
+            session_id, events, result, lock = await self._queue.get()
             try:
                 if result.cancelled():
                     continue
-                async with self._locks.setdefault(session_id, asyncio.Lock()):
-                    delivery = asyncio.create_task(self._deliver(session_id, events))
+                delivery = asyncio.create_task(self._deliver(session_id, events))
 
-                    def stop_abandoned(
-                        future: asyncio.Future[EventAckFrame],
-                        delivery_task: asyncio.Task[EventAckFrame] = delivery,
-                    ) -> None:
-                        if future.cancelled():
-                            delivery_task.cancel()
+                def stop_abandoned(
+                    future: asyncio.Future[EventAckFrame],
+                    delivery_task: asyncio.Task[EventAckFrame] = delivery,
+                ) -> None:
+                    if future.cancelled():
+                        delivery_task.cancel()
 
-                    result.add_done_callback(stop_abandoned)
-                    try:
-                        ack = await delivery
-                    finally:
-                        result.remove_done_callback(stop_abandoned)
+                result.add_done_callback(stop_abandoned)
+                try:
+                    ack = await delivery
+                finally:
+                    result.remove_done_callback(stop_abandoned)
                 if not result.done():
                     result.set_result(ack)
             except asyncio.CancelledError:
-                if not result.cancelled():
+                worker = asyncio.current_task()
+                if not result.cancelled() or (worker is not None and worker.cancelling()):
                     raise
             except Exception as exc:  # noqa: BLE001 - propagate to the waiting producer.
                 if not result.done():
                     result.set_exception(exc)
             finally:
+                # The producer transfers lock ownership with the queued item,
+                # including the cancelled-before-dispatch path above.
+                lock.release()
+                del lock
                 self._queue.task_done()
 
     async def _deliver(self, session_id: str, events: list[dict[str, Any]]) -> EventAckFrame:
         remaining = events
         preview = all(event["type"] == "external_output_text_delta" for event in events)
+        retry_count = 0
+        retry_started_at: float | None = None
+        last_retry_log_at: float | None = None
         while True:
             if not await self._mode(initial_fallback=False, preview=preview):
                 raise TunnelIngestUnsupported
@@ -184,11 +210,23 @@ class RunnerEventDispatcher:
             try:
                 await send(encode_frame(EventBatchFrame(batch_id, session_id, remaining)))
                 ack = await asyncio.wait_for(future, timeout=30.0)
-            except (ConnectionError, ConnectionClosed, OSError, TimeoutError):
+            except (ConnectionError, ConnectionClosed, OSError, TimeoutError) as exc:
                 # An ACK can disappear after the server committed the item.
                 # All durable events admitted here carry a stable source_id.
                 if preview:
                     raise
+                retry_count += 1
+                retry_started_at, last_retry_log_at = self._log_retry(
+                    session_id,
+                    batch_size=len(events),
+                    remaining_count=len(remaining),
+                    retry_count=retry_count,
+                    retry_started_at=retry_started_at,
+                    last_retry_log_at=last_retry_log_at,
+                    reason="delivery_timeout"
+                    if isinstance(exc, TimeoutError)
+                    else "transport_error",
+                )
                 await asyncio.sleep(0.25)
                 continue
             finally:
@@ -197,12 +235,64 @@ class RunnerEventDispatcher:
                 raise ValueError("invalid event acknowledgement")
             remaining = remaining[ack.applied :]
             if not remaining:
+                if retry_started_at is not None:
+                    _logger.info(
+                        "Runner event delivery recovered",
+                        extra=debug_event(
+                            "runner_event_delivery_recovered",
+                            session_id=session_id,
+                            retry_count=retry_count,
+                            elapsed_retry_s=round(time.monotonic() - retry_started_at, 3),
+                            batch_size=len(events),
+                        ),
+                    )
                 return EventAckFrame(ack.id, len(events))
             if not ack.retryable:
                 return EventAckFrame(ack.id, len(events) - len(remaining), ack.error)
             if preview:
                 raise ConnectionError("preview backpressure")
+            retry_count += 1
+            retry_started_at, last_retry_log_at = self._log_retry(
+                session_id,
+                batch_size=len(events),
+                remaining_count=len(remaining),
+                retry_count=retry_count,
+                retry_started_at=retry_started_at,
+                last_retry_log_at=last_retry_log_at,
+                reason="retryable_ack",
+            )
             await asyncio.sleep(0.25)
+
+    @staticmethod
+    def _log_retry(
+        session_id: str,
+        *,
+        batch_size: int,
+        remaining_count: int,
+        retry_count: int,
+        retry_started_at: float | None,
+        last_retry_log_at: float | None,
+        reason: str,
+    ) -> tuple[float, float | None]:
+        """Record a rate-limited, payload-free retry observation."""
+        now = time.monotonic()
+        started_at = retry_started_at if retry_started_at is not None else now
+        if last_retry_log_at is None or now - last_retry_log_at >= _RETRY_LOG_INTERVAL_S:
+            _logger.warning(
+                "Runner event delivery retrying (reason=%s)",
+                reason,
+                extra=debug_event(
+                    "runner_event_delivery_retry",
+                    session_id=session_id,
+                    reason=reason,
+                    retry_count=retry_count,
+                    elapsed_retry_s=round(now - started_at, 3),
+                    batch_size=batch_size,
+                    remaining_count=remaining_count,
+                ),
+            )
+            last_retry_log_at = now
+        return started_at, last_retry_log_at
 
 
 class TunnelEventClient(httpx.AsyncClient):
