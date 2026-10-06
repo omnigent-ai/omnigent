@@ -10,6 +10,7 @@ vi.mock("@/lib/host", () => ({ getEmbedRoot: vi.fn(() => null) }));
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 function renderViewer(content: string, truncated = false, embedded = false) {
@@ -81,7 +82,6 @@ describe("HtmlCommentViewer", () => {
     );
     const srcDoc = iframe.getAttribute("srcdoc") ?? "";
     expect(srcDoc).not.toContain("htmlCommentBridgeRuntime.js");
-    warn.mockRestore();
   });
 
   it("shows the truncated banner only when truncated", () => {

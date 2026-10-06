@@ -81,7 +81,6 @@ _HTML_CONTENT = f"""\
     <title>Design doc</title>
   </head>
   <body>
-    <script>window.__omniCspInlineCanary = true;</script>
     <h1>Design Doc</h1>
     <h2 id="repeated-title">{_REPEATED_PHRASE}</h2>
     <p id="anchor">{_ANCHOR_SENTENCE}</p>
@@ -214,6 +213,18 @@ def test_html_comment_external_runtime_connects_under_strict_csp(
     page.evaluate(
         r"""
         ({ assetUrl, nonce }) => {
+          const protocol = JSON.stringify({
+            source: "omni-html-comment",
+            types: {
+              init: "omni:init",
+              ready: "omni:ready",
+              setComments: "omni:setComments",
+              setActive: "omni:setActive",
+              selection: "omni:selection",
+              commentClick: "omni:commentClick",
+              selectionCleared: "omni:selectionCleared",
+            },
+          }).replaceAll("&", "&amp;").replaceAll('"', "&quot;");
           const iframe = document.createElement("iframe");
           iframe.id = "external-bridge-probe";
           iframe.dataset.ready = "false";
@@ -238,7 +249,8 @@ def test_html_comment_external_runtime_connects_under_strict_csp(
           });
           iframe.srcdoc = `<!doctype html><html><body>
             <script>window.__omniCspInlineCanary = true;<\/script>
-            <script src="${assetUrl}" data-omni-nonce="${nonce}"><\/script>
+            <script src="${assetUrl}" data-omni-nonce="${nonce}"
+              data-omni-protocol="${protocol}"><\/script>
           </body></html>`;
           document.body.append(iframe);
         }

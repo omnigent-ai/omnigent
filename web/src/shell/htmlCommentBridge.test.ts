@@ -66,7 +66,7 @@ describe("injectCommentBridge", () => {
 
   it("injects the same runtime inline without a network dependency", () => {
     const out = injectCommentBridge("<body></body>", NONCE);
-    expect(out).toContain(`<script data-omni-nonce="${NONCE}">`);
+    expect(out).toContain(`<script data-omni-nonce="${NONCE}" data-omni-protocol=`);
     expect(out).toContain(HTML_COMMENT_BRIDGE_RUNTIME);
     expect(out).not.toContain("<script src=");
   });
@@ -78,20 +78,23 @@ describe("injectCommentBridge", () => {
   it("escapes runtime URLs and nonces as HTML attributes", () => {
     const out = injectCommentBridge(
       "<body></body>",
-      'nonce&"value',
-      'https://app.example/a?x=1&y="2"',
+      "nonce&\"'<>value",
+      'https://app.example/a?x=1&y="2"\'<>',
     );
-    expect(out).toContain('src="https://app.example/a?x=1&amp;y=&quot;2&quot;"');
-    expect(out).toContain('data-omni-nonce="nonce&amp;&quot;value"');
+    expect(out).toContain('src="https://app.example/a?x=1&amp;y=&quot;2&quot;&#39;&lt;&gt;"');
+    expect(out).toContain('data-omni-nonce="nonce&amp;&quot;&#39;&lt;&gt;value"');
   });
 
-  it("keeps protocol constants in sync without dynamic compilation", () => {
+  it("passes protocol constants to the runtime as data", () => {
+    const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL);
+    const doc = new DOMParser().parseFromString(out, "text/html");
+    const script = doc.querySelector(`script[data-omni-nonce="${NONCE}"]`);
+    expect(JSON.parse(script?.getAttribute("data-omni-protocol") ?? "")).toEqual({
+      source: BRIDGE_SOURCE,
+      types: BRIDGE_MSG,
+    });
     expect(HTML_COMMENT_BRIDGE_RUNTIME).not.toMatch(/\b(?:eval|Function)\s*\(/);
     expect(HTML_COMMENT_BRIDGE_RUNTIME).toContain("script instanceof HTMLScriptElement");
-    expect(HTML_COMMENT_BRIDGE_RUNTIME).toContain(`var SRC = "${BRIDGE_SOURCE}"`);
-    for (const [name, value] of Object.entries(BRIDGE_MSG)) {
-      expect(HTML_COMMENT_BRIDGE_RUNTIME).toContain(`${name}: "${value}"`);
-    }
   });
 
   it("ships a syntactically valid classic script", () => {

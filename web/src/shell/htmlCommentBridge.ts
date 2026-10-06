@@ -288,14 +288,16 @@ const BRIDGE_HIGHLIGHT_STYLE =
  *
  * @param html  Raw artifact HTML.
  * @param nonce Per-mount nonce shared with the parent for message validation.
+ * @param runtimeUrl External runtime asset for embeds whose CSP blocks inline scripts.
  */
 export function injectCommentBridge(html: string, nonce: string, runtimeUrl?: string): string {
   const prepared = prepareHtmlPreviewDoc(html);
   const src = runtimeUrl ? ` src="${escapeHtmlAttr(runtimeUrl)}"` : "";
   const body = runtimeUrl ? "" : HTML_COMMENT_BRIDGE_RUNTIME;
+  const protocol = escapeHtmlAttr(JSON.stringify({ source: BRIDGE_SOURCE, types: BRIDGE_MSG }));
   const inject =
     BRIDGE_HIGHLIGHT_STYLE +
-    `<script${src} data-omni-nonce="${escapeHtmlAttr(nonce)}">${body}</script>`;
+    `<script${src} data-omni-nonce="${escapeHtmlAttr(nonce)}" data-omni-protocol="${protocol}">${body}</script>`;
 
   const bodyClose = prepared.search(/<\/body\s*>/i);
   if (bodyClose !== -1) {

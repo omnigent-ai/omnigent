@@ -112,16 +112,23 @@ export function HtmlCommentViewer({
   const readyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [floating, setFloating] = useState<FloatingAnchor | null>(null);
 
-  const setIframeRef = useCallback((iframe: HTMLIFrameElement | null) => {
-    if (iframeRef.current !== iframe) {
-      if (readyTimerRef.current !== null) clearTimeout(readyTimerRef.current);
-      readyTimerRef.current = null;
-      channelRef.current?.port1.close();
-      channelRef.current = null;
-      portRef.current = null;
-    }
-    iframeRef.current = iframe;
+  const clearReadyTimer = useCallback(() => {
+    if (readyTimerRef.current !== null) clearTimeout(readyTimerRef.current);
+    readyTimerRef.current = null;
   }, []);
+
+  const setIframeRef = useCallback(
+    (iframe: HTMLIFrameElement | null) => {
+      if (iframeRef.current !== iframe) {
+        clearReadyTimer();
+        channelRef.current?.port1.close();
+        channelRef.current = null;
+        portRef.current = null;
+      }
+      iframeRef.current = iframe;
+    },
+    [clearReadyTimer],
+  );
 
   // Latest values for the port message handler without re-establishing the channel.
   const commentsRef = useRef(comments);
@@ -132,11 +139,6 @@ export function HtmlCommentViewer({
   onSetActiveSelectionRef.current = onSetActiveSelection;
   const activeSelectionRef = useRef(activeSelection);
   activeSelectionRef.current = activeSelection;
-
-  const clearReadyTimer = () => {
-    if (readyTimerRef.current !== null) clearTimeout(readyTimerRef.current);
-    readyTimerRef.current = null;
-  };
 
   const postState = () => {
     const port = portRef.current;
@@ -219,6 +221,7 @@ export function HtmlCommentViewer({
     channelRef.current?.port1.close();
     const channel = new MessageChannel();
     channelRef.current = channel;
+    // The port pins this closure, so mutable values in handleInbound must come from refs.
     channel.port1.onmessage = (ev) => handleInbound(ev.data);
     portRef.current = channel.port1;
     // targetOrigin "*" is required: the sandboxed frame has an opaque ("null")
