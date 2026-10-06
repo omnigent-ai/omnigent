@@ -81,7 +81,7 @@ def _restorable(conv: Conversation) -> bool:
         conv.agent_id is not None
         and not conv.archived
         and not is_session_closed(conv.labels, conv.title)
-        and conv.id not in _intentional_stop_sessions
+        and (conv.runner_id is None or _intentional_stop_sessions.get(conv.id) != conv.runner_id)
         and conv.id not in _interrupt_fenced_sessions
     )
 

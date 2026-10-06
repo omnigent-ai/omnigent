@@ -24,12 +24,10 @@
 
 "use strict";
 
-const http = require("node:http");
 const crypto = require("node:crypto");
-const fs = require("node:fs");
-const path = require("node:path");
-const os = require("node:os");
-const { shell, safeStorage } = require("electron");
+const { shell } = require("electron");
+const { base64url, makePkce, runLoopbackAuthorization } = require("./loopback-oauth");
+const { createTokenStore } = require("./token_store");
 
 // The loopback redirect every published client registers. Not configurable: the
 // port is ephemeral per RFC 8252 (Databricks ignores it), and pinning a host,
@@ -81,79 +79,15 @@ function isTrustedDatabricksOrigin(url) {
   }
 }
 
-// ── PKCE (S256) ────────────────────────────────────────────────────────────
-
-function base64url(buf) {
-  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function makePkce() {
-  const verifier = base64url(crypto.randomBytes(64));
-  const challenge = base64url(crypto.createHash("sha256").update(verifier).digest());
-  return { verifier, challenge };
-}
-
 // ── Token store (~/.omnigent, encrypted at rest via safeStorage) ─────────────
-//
-// A dedicated file, NOT the CLI's auth_tokens.json: the shapes differ and mixing
-// them would confuse omnigent_cli.js's readers. Keyed by the trailing-slash-
-// stripped workspace origin, mirroring that store's keying.
 
-function tokenStorePath() {
-  return path.join(os.homedir(), ".omnigent", "databricks_oauth_tokens.json");
-}
-
-function storeKey(origin) {
-  return String(origin).replace(/\/+$/, "");
-}
-
-function readStore() {
-  try {
-    return JSON.parse(fs.readFileSync(tokenStorePath(), "utf8"));
-  } catch {
-    return {};
-  }
-}
-
-function writeStore(store) {
-  const p = tokenStorePath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(store, null, 2), { mode: 0o600 });
-  try {
-    fs.chmodSync(p, 0o600);
-  } catch {
-    // Non-POSIX filesystem — the write-time mode is best effort.
-  }
-}
-
-function saveTokens(origin, tokens) {
-  const store = readStore();
-  if (safeStorage.isEncryptionAvailable()) {
-    store[storeKey(origin)] = {
-      enc: safeStorage.encryptString(JSON.stringify(tokens)).toString("base64"),
-    };
-  } else {
-    console.warn(
-      "[omnigent] safeStorage unavailable; storing Databricks tokens unencrypted (0600)",
-    );
-    store[storeKey(origin)] = { plain: tokens };
-  }
-  writeStore(store);
-}
-
-function loadTokens(origin) {
-  const entry = readStore()[storeKey(origin)];
-  if (!entry || typeof entry !== "object") return null;
-  if (typeof entry.enc === "string") {
-    try {
-      return JSON.parse(safeStorage.decryptString(Buffer.from(entry.enc, "base64")));
-    } catch {
-      return null;
-    }
-  }
-  if (entry.plain && typeof entry.plain === "object") return entry.plain;
-  return null;
-}
+const tokenStore = createTokenStore({
+  fileName: "databricks_oauth_tokens.json",
+  label: "Databricks tokens",
+});
+const saveTokens = tokenStore.save;
+const loadTokens = tokenStore.load;
+const deleteStoredToken = tokenStore.remove;
 
 /** Mark only the cached access token expired, preserving its refresh grant. */
 function expireStoredAccessToken(origin) {
@@ -169,15 +103,6 @@ function removeStoredRefreshToken(origin) {
   if (!entry || typeof entry.refresh_token !== "string" || !entry.refresh_token) return false;
   saveTokens(origin, { ...entry, refresh_token: undefined });
   return true;
-}
-
-function deleteStoredToken(origin) {
-  const key = storeKey(origin);
-  const store = readStore();
-  if (store[key]) {
-    Reflect.deleteProperty(store, key);
-    writeStore(store);
-  }
 }
 
 /**
@@ -343,7 +268,7 @@ async function doRefresh(workspaceOrigin, entry) {
 }
 
 function refreshStoredToken(workspaceOrigin, entry) {
-  const key = storeKey(workspaceOrigin);
+  const key = tokenStore.key(workspaceOrigin);
   const existing = inflightRefresh.get(key);
   if (existing) return existing;
   const p = doRefresh(workspaceOrigin, entry).finally(() => inflightRefresh.delete(key));
@@ -471,110 +396,17 @@ async function runInteractiveLogin(origin, { signal } = {}) {
   }
   signal?.throwIfAborted();
   const { verifier, challenge } = makePkce();
-  const state = base64url(crypto.randomBytes(24));
   const base = new URL(REDIRECT_BASE);
-  let redirectUri;
-
-  const callback = await new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      let reqUrl;
-      try {
-        reqUrl = new URL(req.url, base.origin);
-      } catch {
-        reqUrl = null;
-      }
-      if (!reqUrl || reqUrl.pathname !== base.pathname) {
-        res.writeHead(404);
-        res.end();
-        return;
-      }
-      const params = reqUrl.searchParams;
-      // An old browser tab must not terminate a new login on a reused loopback port.
-      if (params.get("state") !== state) {
-        res.writeHead(400, { "Content-Type": "text/plain" });
-        res.end("This callback does not match the current sign-in.");
-        return;
-      }
-      // Validate before answering: the desktop still has to exchange the code and
-      // create the session, so this page must not claim sign-in succeeded.
-      const page = (heading, detail) =>
-        '<html><body style="font-family:system-ui;text-align:center;padding:60px">' +
-        `<h2>${heading}</h2><p>${detail}</p></body></html>`;
-      const fail = (error, heading, detail) => {
-        res.writeHead(400, { "Content-Type": "text/html" });
-        res.end(page(heading, detail));
-        cleanup();
-        reject(error);
-      };
-      const err = params.get("error");
-      if (err) {
-        const desc = params.get("error_description");
-        fail(
-          new Error(`authorization error: ${err}${desc ? ` - ${desc}` : ""}`),
-          "Databricks sign-in was not completed",
-          "Close this tab and try connecting again in Omnigent.",
-        );
-        return;
-      }
-      const c = params.get("code");
-      if (!c) {
-        fail(
-          new Error("no code in callback"),
-          "Databricks sign-in could not be completed",
-          "Close this tab and try connecting again in Omnigent.",
-        );
-        return;
-      }
-      res.writeHead(200, { "Content-Type": "text/html" });
-      res.end(
-        page(
-          "Databricks sign-in received",
-          "Return to Omnigent to finish connecting, then close this tab.",
-        ),
-      );
-      cleanup();
-      resolve({ code: c, iss: params.get("iss") });
-    });
-
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error("timed out waiting for browser login"));
-    }, AUTH_TIMEOUT_MS);
-
-    function cleanup() {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      server.close();
-    }
-
-    function onAbort() {
-      cleanup();
-      reject(signal.reason);
-    }
-
-    server.on("error", (e) => {
-      cleanup();
-      reject(e);
-    });
-
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) {
-      onAbort();
-      return;
-    }
-    // Port 0: the OS picks a free port, so there is nothing to reserve and no
-    // cross-app collision. Databricks matches the registration ignoring the port.
-    server.listen(0, base.hostname, () => {
-      if (signal?.aborted) {
-        server.close();
-        return;
-      }
-      const port = server.address().port;
-      redirectUri = `${base.protocol}//${base.hostname}:${port}`;
+  const { params, redirectUri } = await runLoopbackAuthorization({
+    hostname: base.hostname,
+    callbackPath: base.pathname,
+    // Databricks matches the registration ignoring the ephemeral port.
+    redirectUri: (port) => `${base.protocol}//${base.hostname}:${port}`,
+    authorizeUrl: (uri, state) => {
       const authQuery = new URLSearchParams({
         response_type: "code",
         client_id: OAUTH_CLIENT_ID,
-        redirect_uri: redirectUri,
+        redirect_uri: uri,
         scope: scopes,
         state,
         code_challenge: challenge,
@@ -583,18 +415,28 @@ async function runInteractiveLogin(origin, { signal } = {}) {
       // Authorize directly against the entered origin. A workspace host issues a
       // workspace-scoped token; an account/SPOG host issues an account-scoped one
       // (the workspace is chosen afterward from the account workspaces API).
-      const authorizeUrl = `${origin}/oidc/v1/authorize?${authQuery}`;
-      shell.openExternal(authorizeUrl).then(
-        () => console.log("[omnigent] databricks oauth: opened system browser for sign-in"),
-        (e) => {
-          // Can't hand off to the browser — fail fast instead of waiting out the
-          // auth timeout with a window the user can't complete.
-          cleanup();
-          reject(new Error(`could not open the system browser: ${e.message}`));
-        },
-      );
-    });
+      return `${origin}/oidc/v1/authorize?${authQuery}`;
+    },
+    openExternal: (url) => shell.openExternal(url),
+    onOpened: () => console.log("[omnigent] databricks oauth: opened system browser for sign-in"),
+    pages: {
+      received: [
+        "Databricks sign-in received",
+        "Return to Omnigent to finish connecting, then close this tab.",
+      ],
+      failed: [
+        "Databricks sign-in was not completed",
+        "Close this tab and try connecting again in Omnigent.",
+      ],
+      incomplete: [
+        "Databricks sign-in could not be completed",
+        "Close this tab and try connecting again in Omnigent.",
+      ],
+    },
+    signal,
+    timeoutMs: AUTH_TIMEOUT_MS,
   });
+  const callback = { code: params.get("code"), iss: params.get("iss") };
 
   signal?.throwIfAborted();
   // The origin the token was issued by comes from the issuer (iss, RFC 9207) when

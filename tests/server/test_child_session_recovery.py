@@ -120,7 +120,7 @@ async def test_do_not_restore_excluded_children(
     elif exclusion == "archived":
         store.update_conversation(row.id, archived=True)
     elif exclusion == "stopped":
-        _intentional_stop_sessions.add(row.id)
+        _intentional_stop_sessions[row.id] = "old"
     elif exclusion == "hosted":
         store.set_host_id(row.id, "a" * 32, workspace="/tmp")
     elif exclusion == "side_chat":
@@ -137,7 +137,26 @@ async def test_do_not_restore_excluded_children(
         assert store.get_conversation(row.id).runner_id == "old"
         relay.assert_not_called()
     finally:
-        _intentional_stop_sessions.discard(row.id)
+        _intentional_stop_sessions.pop(row.id, None)
+
+
+@pytest.mark.asyncio
+async def test_child_stop_for_an_older_runner_does_not_block_recovery(recovery_tree: Any) -> None:
+    from omnigent.server.routes._sessions.common import _intentional_stop_sessions
+
+    store, parent, child, relay, _, initializer = recovery_tree
+    row = child()
+    _intentional_stop_sessions[row.id] = "previously-stopped"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(201)),
+            base_url="http://runner",
+        ) as client:
+            await restore_active_children(parent, client, store, initializer)
+        assert store.get_conversation(row.id).runner_id == "new"
+        relay.assert_called_once()
+    finally:
+        _intentional_stop_sessions.pop(row.id, None)
 
 
 @pytest.mark.asyncio

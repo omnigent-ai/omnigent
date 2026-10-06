@@ -41,6 +41,7 @@ import {
   OnboardingHeading,
 } from "@/pages/onboarding/primitives";
 import { cn } from "@/lib/utils";
+import { ownServerName } from "@/lib/serverNames";
 
 const DEFAULT_LOCAL = "http://localhost:6767";
 const CREATE_SERVER_URL = "https://omnigent.ai/";
@@ -69,9 +70,13 @@ export function isLocalInstall(url: string): boolean {
   return u.protocol === "http:" && u.port === LOCAL_SERVER_PORT && u.pathname === "/";
 }
 
-/** Card title: local servers read as "Local installation (host)". */
-function serverTitle(url: string): string {
-  return isLocal(url) ? `Local installation (${displayName(url)})` : displayName(url);
+/** Card title: the organization's name for a managed server; local servers
+ *  read as "Local installation (host)"; else the server's own name beside its
+ *  host (display only), else the host. */
+function serverTitle(url: string, managedName?: string | null, ownName?: string | null): string {
+  if (managedName) return managedName;
+  if (isLocal(url)) return `Local installation (${displayName(url)})`;
+  return ownName ? `${ownName} (${displayName(url)})` : displayName(url);
 }
 
 /**
@@ -144,6 +149,8 @@ export function ServerSelectStep({
   error,
   recentServers,
   managedServers,
+  managedServerNames,
+  serverNames,
   installed,
   onBack,
   onConnect,
@@ -158,6 +165,10 @@ export function ServerSelectStep({
   error?: string;
   recentServers: string[];
   managedServers: string[];
+  /** Display names for managed servers, server URL → name (from MDM). */
+  managedServerNames?: Record<string, string>;
+  /** Names servers gave themselves, origin → name. */
+  serverNames?: Record<string, string>;
   /** CLI installed → "Open"/"Start Omnigent"; missing → "Install Omnigent". */
   installed?: boolean;
   /** Reports whether the URL-input ("add") view is showing, so the parent can
@@ -288,6 +299,12 @@ export function ServerSelectStep({
   const startsLocal =
     selected !== null && isLocalInstall(selected) && checks[selected] === "unreachable";
 
+  const managedName = (url: string): string | null =>
+    managedServers.includes(url) && managedServerNames && Object.hasOwn(managedServerNames, url)
+      ? managedServerNames[url]
+      : null;
+  const ownName = (url: string): string | null => ownServerName(serverNames, url);
+
   const renderRow = (url: string) => {
     const isSelected = selected === url;
     const removable = onRemove != null && !managedServers.includes(url);
@@ -326,7 +343,9 @@ export function ServerSelectStep({
               )}
             </span>
             <span className="flex min-w-0 flex-1 flex-col">
-              <span className="truncate text-base text-foreground">{serverTitle(url)}</span>
+              <span className="truncate text-base text-foreground">
+                {serverTitle(url, managedName(url), ownName(url))}
+              </span>
               <span className="flex items-center gap-1.5 text-base text-muted-foreground">
                 {isFirstRecent && (
                   <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] leading-none">

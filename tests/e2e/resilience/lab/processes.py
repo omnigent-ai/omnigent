@@ -155,6 +155,27 @@ def processes_mentioning(marker: str) -> list[psutil.Process]:
     return found
 
 
+def processes_with_home(home: Path) -> list[psutil.Process]:
+    """Return this user's processes whose ``HOME`` is *home*.
+
+    Harness helpers such as Codex's app-server leave the lab's process tree
+    and name no lab path on their command line, but inherit the lab's ``HOME``.
+
+    :param home: The lab's host-side home directory.
+    :returns: Matching processes; unreadable ones are skipped.
+    """
+    target = str(home)
+    found: list[psutil.Process] = []
+    me = psutil.Process().username()
+    for proc in psutil.process_iter(["username"]):
+        try:
+            if proc.info["username"] == me and proc.environ().get("HOME") == target:
+                found.append(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            continue
+    return found
+
+
 @contextlib.contextmanager
 def frozen(processes: Sequence[psutil.Process], events: EventLog) -> Iterator[None]:
     """SIGSTOP *processes* for the duration of the block, then SIGCONT them.
