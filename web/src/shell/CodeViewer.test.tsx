@@ -714,18 +714,6 @@ describe("CodeViewer rendered previews skip Shiki highlighting", () => {
     expect(highlightCode).not.toHaveBeenCalled();
   });
 
-  it("does not tokenize the file when rendering the markdown preview", () => {
-    vi.mocked(highlightCode).mockClear();
-    renderViewer("# heading", true, "notes.md", { viewMode: "preview" });
-    expect(highlightCode).not.toHaveBeenCalled();
-  });
-
-  it("does not tokenize the file when rendering the notebook preview", () => {
-    vi.mocked(highlightCode).mockClear();
-    renderViewer(NB, true, "analysis.ipynb", { viewMode: "preview" });
-    expect(highlightCode).not.toHaveBeenCalled();
-  });
-
   it("tokenizes markdown only on entering source view, not across preview transitions", () => {
     const fileQuery = makeFileQuery("# heading");
     const build = (viewMode: "preview" | "source") => (
@@ -752,6 +740,38 @@ describe("CodeViewer rendered previews skip Shiki highlighting", () => {
 
     vi.mocked(highlightCode).mockClear();
     rerender(build("preview"));
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+
+  // `.ipynb` and `.txt` both detect as "text", so only the notebook path makes
+  // this a rendered preview; toggling it must start and stop highlighting even
+  // though the language never changes.
+  it("toggles highlighting when notebook eligibility changes with the language unchanged", () => {
+    const fileQuery = makeFileQuery(NB);
+    const build = (path: string) => (
+      <CodeViewer
+        conversationId="conv_1"
+        path={path}
+        fileQuery={fileQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="preview"
+      />
+    );
+    vi.mocked(highlightCode).mockClear();
+    const { rerender } = render(build("analysis.ipynb"));
+    expect(highlightCode).not.toHaveBeenCalled();
+
+    rerender(build("analysis.txt"));
+    expect(highlightCode).toHaveBeenCalled();
+
+    vi.mocked(highlightCode).mockClear();
+    rerender(build("analysis.ipynb"));
     expect(highlightCode).not.toHaveBeenCalled();
   });
 });
@@ -996,10 +1016,12 @@ describe("CodeViewer .ipynb routing", () => {
     cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
   });
 
-  it("renders the notebook preview in preview mode", () => {
+  it("renders the notebook preview in preview mode without tokenizing the file", () => {
+    vi.mocked(highlightCode).mockClear();
     renderViewer(MINIMAL_NB, true, "analysis.ipynb", { viewMode: "preview" });
     expect(screen.getByRole("heading", { name: "Notebook Title" })).toBeDefined();
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    expect(highlightCode).not.toHaveBeenCalled();
   });
 
   it("keeps raw-JSON Monaco as the source-view escape hatch", () => {
