@@ -152,6 +152,14 @@ events the runner buffered during the outage: the stream has no cursor, so
 they replay late and out of order. The race hit 4 of 30 short S3 Codex runs,
 plus the blackhole and flap idle rows at 120 s.
 
+The runner stream's local replay path preserves an interrupted event ahead of
+newer queued events and releases the old reader before a replacement reports
+ready. It also restores an interrupted `[DONE]` marker. The deterministic
+regressions in `tests/runner/test_session_stream_delivery.py` cover the
+`running, idle` ordering and ASGI disconnect paths. They do not establish
+network exactly-once delivery or resolve every cross-replica status race;
+rerun the native scenarios before changing the R8 matrix result above.
+
 ### Other observations
 
 - Each Codex tool call made while the server is down waits on the

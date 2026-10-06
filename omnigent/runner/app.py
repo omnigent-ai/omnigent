@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -155,6 +155,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
+from omnigent.runner.session_stream import SessionEventQueue, SessionStreamResponse
 from omnigent.runner.sign_in_watch import build_sign_in_watch
 from omnigent.runner.subagent_recovery import build_subagent_recovery
 from omnigent.runner.subagent_routing import (
@@ -1049,7 +1050,7 @@ _session_histories_ref: dict[str, list[_JsonObject]] = {}
 # ``_publish_event`` are visible by the time the producer's await
 # call returns, so tests don't need to subscribe to the HTTP
 # ``/stream`` endpoint just to assert on emitted events).
-_session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
+_session_event_queues_ref: dict[str, SessionEventQueue[_JsonObject | None]] = {}
 
 
 def get_session_agent_id(session_id: str) -> str | None:
@@ -1407,7 +1408,7 @@ def create_runner_app(
         event_body = cast(_JsonObject, event)
         queue = _session_event_queues.get(session_id)
         if queue is None:
-            queue = asyncio.Queue()
+            queue = SessionEventQueue()
             _session_event_queues[session_id] = queue
         queue.put_nowait(event_body)
         if event_body.get("type") == "session.status":
@@ -2578,7 +2579,7 @@ def create_runner_app(
             # registered predates the cutoff and is released.
             await process_manager.release(session_id, only_if_idle_cutoff=time.monotonic())
         if session_id not in _session_event_queues:
-            _session_event_queues[session_id] = asyncio.Queue()
+            _session_event_queues[session_id] = SessionEventQueue()
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
         # A fresh queue can mean a fresh runner process rather than a fresh
@@ -3120,39 +3121,53 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/stream")
     async def stream_session(session_id: str) -> StreamingResponse:
-        async def _event_generator() -> AsyncIterator[bytes]:
+        async def _event_generator() -> AsyncGenerator[bytes, None]:
             queue = _session_event_queues.get(session_id)
             if queue is None:
-                queue = asyncio.Queue()
+                queue = SessionEventQueue()
                 _session_event_queues[session_id] = queue
             heartbeat_frame = b'data: {"type": "session.heartbeat"}\n\n'
-            yield heartbeat_frame
-            while True:
-                try:
-                    event = await asyncio.wait_for(
-                        queue.get(), timeout=_SESSION_STREAM_HEARTBEAT_S
+            async with queue.reader_lock:
+                yield heartbeat_frame
+                while True:
+                    try:
+                        event = await asyncio.wait_for(
+                            queue.get(), timeout=_SESSION_STREAM_HEARTBEAT_S
+                        )
+                    except asyncio.TimeoutError:
+                        yield heartbeat_frame
+                        continue
+                    frame = (
+                        "data: [DONE]\n\n"
+                        if event is None
+                        else "data: " + json.dumps(event) + "\n\n"
                     )
-                except asyncio.TimeoutError:
-                    yield heartbeat_frame
-                    continue
-                if event is None:
-                    break
-                frame = "data: " + json.dumps(event) + "\n\n"
-                try:
-                    yield frame.encode("utf-8")
-                except (GeneratorExit, asyncio.CancelledError):
-                    queue.put_nowait(event)
-                    return
-            yield b"data: [DONE]\n\n"
+                    try:
+                        yield frame.encode("utf-8")
+                    except (GeneratorExit, asyncio.CancelledError):
+                        queue.put_back_front(event)
+                        _logger.info(
+                            "Runner stream restored an unconfirmed event",
+                            extra=debug_event(
+                                "runner_stream_event_requeued",
+                                session_id=session_id,
+                                event_type=(
+                                    "end_of_stream"
+                                    if event is None
+                                    else "session.status"
+                                    if event.get("type") == "session.status"
+                                    else "other"
+                                ),
+                                queue_depth=queue.qsize(),
+                                delivery_state="unconfirmed",
+                            ),
+                        )
+                        return
+                    queue.task_done()
+                    if event is None:
+                        return
 
-        return StreamingResponse(
-            _event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
+        return SessionStreamResponse(_event_generator())
 
     @app.get("/v1/sessions/{session_id}")
     async def get_session(session_id: str) -> JSONResponse:
