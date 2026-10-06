@@ -1732,6 +1732,12 @@ def test_read_transcript_rewrites_flagged_api_error_anywhere(
             'Please run /login. API Error: 403 Budget "test-budget" has reached its limit of $1.',
             id="inexact-lead-in-untouched",
         ),
+        # Whitespace before the lead-in makes it inexact too.
+        pytest.param(
+            f"\nPlease run /login · {_IP_ACL_403}",
+            f"\nPlease run /login · {_IP_ACL_403}",
+            id="leading-whitespace-untouched",
+        ),
     ],
 )
 def test_read_transcript_flagged_non_auth_403_drops_login_remedy(
@@ -1739,14 +1745,7 @@ def test_read_transcript_flagged_non_auth_403_drops_login_remedy(
     raw_text: str,
     expected: str,
 ) -> None:
-    """
-    A budget or IP ACL 403 loses the CLI's ``/login`` lead-in and gets no guidance.
-
-    The CLI treats every 401/403 as an auth failure and leads it with
-    "Please run /login · ", but neither refusal is lifted by signing in,
-    so the ``omni setup`` guidance would send the user the wrong way.
-    The rest of the CLI's text, which names the real cause, is untouched.
-    """
+    """Non-auth 403s drop only the CLI login remedy while preserving refusal text."""
     rendered = _assistant_transcript_text(tmp_path, raw_text, is_api_error=True)
 
     assert rendered == expected

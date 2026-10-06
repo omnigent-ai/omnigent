@@ -9043,8 +9043,7 @@ def _without_login_lead_in(text: str) -> str:
     :returns: The text after the lead-in, or *text* unchanged when it does
         not start with it.
     """
-    body = text.lstrip()
-    return body.removeprefix(_LOGIN_LEAD_IN) if body.startswith(_LOGIN_LEAD_IN) else text
+    return text.removeprefix(_LOGIN_LEAD_IN)
 
 
 def _display_text(text: str, *, is_api_error: bool) -> str:
