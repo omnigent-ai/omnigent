@@ -604,7 +604,7 @@ from omnigent.server.routes._sessions.orchestration import (
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
     RUNNER_SILENT_DROP_GRACE_S as RUNNER_SILENT_DROP_GRACE_S,
     RUNNER_SILENT_DROP_RECHECK_S as RUNNER_SILENT_DROP_RECHECK_S,
-    _turn_at_stake as _turn_at_stake,
+    _RunnerStake as _RunnerStake,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
     _stop_host_runner_intentionally as _stop_host_runner_intentionally,

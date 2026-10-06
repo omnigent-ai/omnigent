@@ -3918,7 +3918,7 @@ class SqlAlchemyConversationStore(ConversationStore):
     def list_runner_session_statuses(
         self, runner_id: str, *, after: str | None = None, limit: int = 200
     ) -> list[tuple[str, str | None]]:
-        """Page teardown candidates through the workspace/runner/session-ID index."""
+        """Page a runner's sessions through the workspace/runner/session-ID index."""
         if not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
         statement = select(SqlConversationMetadata.id, SqlConversationMetadata.live_status).where(

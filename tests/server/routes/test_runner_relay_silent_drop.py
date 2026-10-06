@@ -52,6 +52,10 @@ class _TunnelLikeTransport(httpx.AsyncBaseTransport):
         self.online = True
         self._registered.set()
 
+    def go_offline(self) -> None:
+        self.online = False
+        self._registered.clear()
+
     async def wait_for_runner(self, timeout_s: float) -> bool:
         self.waits.append(timeout_s)
         if timeout_s <= 0:
@@ -193,6 +197,79 @@ async def test_runner_returning_within_the_silent_grace_resumes_the_stream(
     assert grace.attributes["outcome"] == "reconnected"
     assert grace.attributes["extended"] is True
     assert grace.attributes["drop_kind"] == "silent"
+
+
+async def test_a_second_silent_drop_after_the_stream_resumes_is_held_again(
+    relay_case: _RelayCase, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stream that reaches ready confirms recovery; the next silent drop earns its own hold."""
+    monkeypatch.setattr(orchestration, "RUNNER_SILENT_DROP_GRACE_S", 60.0)
+    transport = relay_case.transport
+    resumed = asyncio.Event()
+
+    def ready_then_quiet_again(_request: httpx.Request) -> httpx.Response:
+        # The resumed stream reaches ready; then the laptop goes quiet again mid-turn.
+        transport.respond = lambda _request: httpx.Response(200, text=_DONE_STREAM)
+        runner_drop_state.note(_RUNNER_ID, "silent")
+        transport.go_offline()
+        resumed.set()
+        return httpx.Response(200, text='data: {"type":"session.heartbeat"}\n\n')
+
+    transport.respond = ready_then_quiet_again
+    runner_drop_state.note(_RUNNER_ID, "silent")
+    task = relay_case.start()
+    await asyncio.wait_for(transport.extension_started.wait(), budget(5.0))
+    runner_drop_state.clear(_RUNNER_ID)
+    transport.register()
+    await asyncio.wait_for(resumed.wait(), budget(5.0))
+
+    async def _second_hold_waiting() -> None:
+        # The second hold opens with its own zero-length check, then parks on the runner.
+        while transport.waits.count(0.0) < 2:
+            await asyncio.sleep(0.01)
+        parked_after = len(transport.waits)
+        while len(transport.waits) <= parked_after:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_second_hold_waiting(), budget(5.0))
+    assert not task.done()
+    assert relay_case.status() == "running", "the second drop must not fail the turn"
+
+    runner_drop_state.clear(_RUNNER_ID)
+    transport.register()
+    await asyncio.wait_for(task, budget(5.0))
+
+    assert relay_case.status() == "idle"
+    assert relay_case.last_error_code() is None
+    assert not _rows(caplog, "session_turn_failed")
+    first, second = _rows(caplog, "runner_disconnect_grace")
+    for grace in (first, second):
+        assert grace.attributes["outcome"] == "reconnected"
+        assert grace.attributes["extended"] is True
+        assert grace.attributes["drop_kind"] == "silent"
+
+
+@pytest.mark.parametrize("kind", ["silent", "sudden"])
+async def test_waited_time_is_measured_from_the_recorded_drop(
+    relay_case: _RelayCase,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: runner_drop_state.DropKind,
+) -> None:
+    """The tunnel ended before the relay noticed; the clock starts at the drop, as the timer's."""
+    age_s = 0.5
+    monkeypatch.setitem(
+        runner_drop_state._drops,
+        _RUNNER_ID,
+        runner_drop_state.RunnerDrop(kind=kind, dropped_at=time.monotonic() - age_s),
+    )
+
+    await asyncio.wait_for(relay_case.start(), budget(5.0))
+
+    (grace,) = _rows(caplog, "runner_disconnect_grace")
+    assert grace.attributes["extended"] is (kind == "silent")
+    # A silent drop is held to the end of its 0.8 s grace; a sudden one to the normal 0.1 s.
+    assert grace.attributes["waited_s"] >= (0.8 if kind == "silent" else age_s + _NORMAL_GRACE_S)
 
 
 async def test_host_back_without_its_runner_ends_the_wait_and_fails_the_turn(

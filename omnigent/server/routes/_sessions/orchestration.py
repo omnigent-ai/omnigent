@@ -7416,10 +7416,7 @@ def _silent_drop_grace_from_env() -> float:
     return max(value, 0.0)
 
 
-# A runner whose tunnel went silent while its host is also offline is usually a laptop asleep
-# or off the network, which reconnects on wake. Hold its turn this long, measured from the drop.
-# Set OMNIGENT_RUNNER_SILENT_DROP_GRACE_S to change it; 0 turns the hold off, so every drop
-# gets the normal grace above.
+# Silent-drop grace is measured from the drop; zero disables it.
 RUNNER_SILENT_DROP_GRACE_S: float = _silent_drop_grace_from_env()
 # How often that extended wait rechecks the host; a host back without its runner ends the wait.
 RUNNER_SILENT_DROP_RECHECK_S: float = 30.0
@@ -7746,6 +7743,135 @@ async def _hold_relay_for_silent_drop(
     )
 
 
+# The timer's hold reads a runner's sessions in pages of this many rows, at most this many
+# pages, and weighs at most this many that read mid-turn, however many share the runner.
+_STAKE_PAGE_SIZE = 100
+_STAKE_MAX_PAGES = 10
+_STAKE_MAX_SESSIONS = 32
+# Sessions asked whether their runner is live elsewhere, and ancestor reads per host lookup.
+_STAKE_LIVENESS_WITNESSES = 3
+_STAKE_MAX_ANCESTOR_READS = 16
+
+
+async def _runner_sessions_at_stake(
+    runner_id: str,
+    conversation_store: ConversationStore,
+) -> list[Conversation]:
+    """
+    Return the runner's sessions whose turn would be lost with it.
+
+    Pages the runner's saved statuses and reads a full row only for a session that reads
+    mid-turn, so the work is capped by the ``_STAKE_*`` limits however many sessions share
+    the runner. A session counts as :func:`_turn_at_stake` does for the relay.
+
+    :param runner_id: The dropped runner.
+    :param conversation_store: Store used to page the runner's sessions and read candidates.
+    :returns: The mid-turn sessions still bound to the runner that are not parent-owned mirrors.
+    :raises Exception: When the store cannot be read; the hold treats that as nothing at stake.
+    """
+    at_stake: list[Conversation] = []
+    weighed = 0
+    after: str | None = None
+    for _ in range(_STAKE_MAX_PAGES):
+        page = await asyncio.to_thread(
+            conversation_store.list_runner_session_statuses,
+            runner_id,
+            after=after,
+            limit=_STAKE_PAGE_SIZE,
+        )
+        for session_id, saved_status in page:
+            if _session_status_cache.get(session_id, saved_status) not in _MID_TURN_STATUSES:
+                continue
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if (
+                conv is not None
+                and conv.runner_id == runner_id
+                and _turn_at_stake(session_id, conv)
+            ):
+                at_stake.append(conv)
+            weighed += 1
+            if weighed >= _STAKE_MAX_SESSIONS:
+                return at_stake
+        if len(page) < _STAKE_PAGE_SIZE:
+            break
+        after = page[-1][0]
+    return at_stake
+
+
+class _RunnerStake:
+    """
+    What the per-runner disconnect timer weighs before holding a silent drop.
+
+    The runner's sessions at stake are read once, however often the hold asks, and the
+    rechecks after that are point reads of a few heartbeat stamps. Eligibility, hosts and
+    liveness all come from the same sessions, as the relay's come from its own.
+
+    :param runner_id: The dropped runner.
+    :param reference_stamp: This replica's own last liveness stamp for *runner_id*.
+    :param conversation_store: Store used for every read.
+    """
+
+    def __init__(
+        self,
+        runner_id: str,
+        reference_stamp: int | None,
+        conversation_store: ConversationStore,
+    ) -> None:
+        self._runner_id = runner_id
+        self._reference_stamp = reference_stamp
+        self._store = conversation_store
+        self._at_stake: list[Conversation] | None = None
+
+    async def _sessions(self) -> list[Conversation]:
+        if self._at_stake is None:
+            self._at_stake = await _runner_sessions_at_stake(self._runner_id, self._store)
+        return self._at_stake
+
+    async def turn_at_stake(self) -> bool:
+        """Return whether a session on the runner is mid-turn and worth holding for."""
+        return bool(await self._sessions())
+
+    async def host_ids(self) -> list[str]:
+        """
+        Return the hosts serving the sessions at stake, sorted.
+
+        A sub-agent carries no host of its own, so its nearest host-bound ancestor answers,
+        as it does for the relay (:func:`_relay_host_id`).
+
+        :raises Exception: When an ancestor cannot be read; the hold retries the lookup.
+        """
+        hosts: set[str] = set()
+        for conv in await self._sessions():
+            host_id = await asyncio.to_thread(
+                routing_host_id,
+                conv,
+                self._store,
+                max_ancestor_reads=_STAKE_MAX_ANCESTOR_READS,
+            )
+            if host_id is not None:
+                hosts.add(host_id)
+        return sorted(hosts)
+
+    async def live_elsewhere(self) -> bool:
+        """
+        Return whether another replica stamped the runner alive since this one's last stamp.
+
+        Every session on the runner is stamped at once, so a few of the sessions at stake
+        speak for all of them.
+        """
+        for conv in (await self._sessions())[:_STAKE_LIVENESS_WITNESSES]:
+            liveness = await asyncio.to_thread(self._store.get_runner_liveness, conv.id)
+            if (
+                liveness is not None
+                and liveness[0] == self._runner_id
+                and _runner_stamp_is_live_elsewhere(
+                    stamp=liveness[1], reference_stamp=self._reference_stamp
+                )
+            ):
+                return True
+        return False
+
+
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -7794,6 +7920,13 @@ async def _relay_runner_stream(
     retries = 0
     outage_drop: runner_drop_state.RunnerDrop | None = None
     silent_grace_spent = False
+
+    def waited_s() -> float:
+        """Seconds since the runner dropped, else since this outage began."""
+        if outage_drop is not None:
+            return time.monotonic() - outage_drop.dropped_at
+        return loop.time() - outage_started
+
     while True:
         started = loop.time()
         try:
@@ -7870,7 +8003,7 @@ async def _relay_runner_stream(
                         drop=outage_drop,
                         outcome="superseded",
                         grace_s=RUNNER_SILENT_DROP_GRACE_S,
-                        waited_s=loop.time() - outage_started,
+                        waited_s=waited_s(),
                         extended=True,
                         host_online=None,
                     )
@@ -7884,7 +8017,7 @@ async def _relay_runner_stream(
                         drop=outage_drop,
                         outcome=held.outcome,
                         grace_s=RUNNER_SILENT_DROP_GRACE_S,
-                        waited_s=loop.time() - outage_started,
+                        waited_s=waited_s(),
                         extended=True,
                         host_online=held.host_online,
                     )
@@ -7901,7 +8034,7 @@ async def _relay_runner_stream(
                     drop=outage_drop,
                     outcome="expired",
                     grace_s=RUNNER_DISCONNECT_GRACE_S,
-                    waited_s=now - outage_started,
+                    waited_s=waited_s(),
                     extended=False,
                     host_online=None,
                 )

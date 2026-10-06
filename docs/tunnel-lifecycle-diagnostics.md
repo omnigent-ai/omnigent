@@ -78,22 +78,27 @@ both ends.
   `RUNNER_SILENT_DROP_GRACE_S` (15 min) from the drop, because a sleeping
   laptop usually reconnects on wake, when all of these hold:
   - a bound session is mid-turn (the relay reads its own session's status the
-    way the disconnect decision does; the timer needs one of the runner's
-    sessions) and is not a sub-agent mirrored from a native parent, whose turn
-    the parent's runtime owns;
+    way the disconnect decision does; the timer pages the runner's saved
+    statuses once and weighs at most 32 sessions that read mid-turn) and is not
+    a sub-agent mirrored from a native parent, whose turn the parent's runtime
+    owns;
   - the runner is not registered or live on another replica;
   - its host is not a managed sandbox, which cannot wake on its own;
   - the hold is not turned off: `OMNIGENT_RUNNER_SILENT_DROP_GRACE_S` sets the
     seconds (default 900) and `0` restores the plain 90 s grace for every drop.
-  Otherwise the row reads `extended = False`. The host, resolved from the bound
-  sessions (an unresolvable host counts as offline, and a failed lookup is
-  retried at each recheck), is rechecked every `RUNNER_SILENT_DROP_RECHECK_S`
-  (30 s), reusing one answer per host for 10 s. A host that is online, including
-  one already online when the normal grace ends, gets one recheck for its
-  runner to follow; then the usual give-up runs. Fields: `drop_kind`,
-  `host_online` (`True` or `False` once the host was checked, absent
-  otherwise), `grace_s` (the grace that applied: 900 once `extended`),
-  `extended`, `waited_s` (from the drop to the end of the grace) and `outcome`:
+  Otherwise the row reads `extended = False`. The host, resolved from those
+  same sessions (a sub-agent takes its nearest host-bound ancestor's host; an
+  unresolvable host counts as offline, and a failed lookup is retried at each
+  recheck and checked for being a managed sandbox once it succeeds), is
+  rechecked every `RUNNER_SILENT_DROP_RECHECK_S` (30 s), reusing one answer per
+  host for 10 s. Every lookup is bounded by the time left in the grace, shared
+  by all the hosts. A host that is online, including one already online when
+  the normal grace ends, gets one recheck for its runner to follow; then the
+  usual give-up runs. Fields: `drop_kind`, `host_online` (`True` or `False`
+  once the host was checked, absent otherwise), `grace_s` (the grace that
+  applied: 900 once `extended`), `extended`, `waited_s` (from the drop to the
+  end of the grace; from the first sight of the disconnect when no drop was
+  recorded) and `outcome`:
   `reconnected` (the runner re-registered), `host_back_runner_missing` (the
   host was back without it), `live_elsewhere` (it re-registered on another
   replica, so the usual live-elsewhere branch lets go of the session without

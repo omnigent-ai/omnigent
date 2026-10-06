@@ -40,7 +40,7 @@ import logging
 import tarfile
 import threading
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1909,6 +1909,8 @@ async def test_server_initiated_close_never_fails_the_turn(
 
 
 _SILENT_HOST_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+_OTHER_HOST_ID = "b1b2c3d4e5f60718293a4b5c6d7e8f91"
+_PARENT_HOST_ID = "c1b2c3d4e5f60718293a4b5c6d7e8f92"
 _NORMAL_GRACE_S = 0.15
 
 
@@ -2020,6 +2022,17 @@ async def _wait_for_grace_row(
         return rows[0]
 
     return await asyncio.wait_for(_found(), timeout=budget(timeout_s))
+
+
+async def _wait_for_timer_done(runner_id: str, *, timeout_s: float = 5.0) -> None:
+    """Wait for the runner's disconnect timer to finish, failing or sparing its sessions."""
+    name = f"runner-disconnect-grace-{runner_id}"
+
+    async def _done() -> None:
+        while any(task.get_name() == name for task in asyncio.all_tasks()):
+            await asyncio.sleep(0.02)
+
+    await asyncio.wait_for(_done(), timeout=budget(timeout_s))
 
 
 @pytest.mark.asyncio
@@ -2375,106 +2388,261 @@ async def _wait_for_cache_status_cleared(session_id: str, *, timeout_s: float = 
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
-async def test_a_runner_with_only_idle_sessions_is_not_held(
+@pytest.mark.parametrize(
+    "exclusion",
+    ["idle_session", "parent_owned_mirror", "managed_sandbox_host", "hold_turned_off"],
+)
+async def test_a_silent_drop_that_is_not_worth_holding_keeps_the_normal_grace(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    exclusion: str,
 ) -> None:
-    from omnigent.server.routes import sessions as sessions_module
-
-    case = await _connect_mid_turn_runner(
-        tunnel_three_layer_stack,
-        monkeypatch,
-        caplog,
-        runner_id="runner-silent-idle",
-        silent_grace_s=60.0,
-        status="idle",
-    )
-    try:
-        await _drop_runner(case, silently=True)
-        grace = await _wait_for_grace_row(caplog)
-        assert grace.attributes["outcome"] == "expired"
-        assert grace.attributes["extended"] is False
-        assert grace.attributes["drop_kind"] == "silent"
-        assert sessions_module._session_status_cache.get(case.session_id) == "idle"
-        assert not _event_rows(caplog, "session_turn_failed")
-    finally:
-        sessions_module._session_status_cache.pop(case.session_id, None)
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("_isolated_session_status_cache")
-async def test_a_runner_with_only_a_parent_owned_mirror_mid_turn_is_not_held(
-    tunnel_three_layer_stack: _TunnelStack,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The parent's runtime owns a mirrored sub-agent's turn, so there is nothing to wait for."""
+    """No turn to lose, a sandbox that cannot wake, or 0 restoring the plain 90 s grace."""
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions.common import _ACP_SUBAGENT_ID_LABEL_KEY
 
+    turn_lost = exclusion in ("managed_sandbox_host", "hold_turned_off")
     case = await _connect_mid_turn_runner(
         tunnel_three_layer_stack,
         monkeypatch,
         caplog,
-        runner_id="runner-silent-mirror",
+        runner_id=f"runner-silent-{exclusion}",
         silent_grace_s=60.0,
-        status="idle",
+        status="running" if turn_lost else "idle",
     )
-    store = get_conversation_store()
-    mirror = store.create_conversation(
-        kind="sub_agent",
-        parent_conversation_id=case.session_id,
-        runner_id=case.runner_id,
-        labels={_ACP_SUBAGENT_ID_LABEL_KEY: "acp-subagent-1"},
-    )
-    store.set_session_live_status(mirror.id, "running")
-    try:
-        await _drop_runner(case, silently=True)
-        grace = await _wait_for_grace_row(caplog)
-        assert grace.attributes["outcome"] == "expired"
-        assert grace.attributes["extended"] is False
-        assert not _event_rows(caplog, "session_turn_failed")
-    finally:
-        sessions_module._session_status_cache.pop(case.session_id, None)
-        sessions_module._session_status_cache.pop(mirror.id, None)
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("_isolated_session_status_cache")
-@pytest.mark.parametrize("reason", ["managed_sandbox_host", "hold_turned_off"])
-async def test_a_silent_drop_that_is_not_worth_holding_fails_on_the_normal_grace(
-    tunnel_three_layer_stack: _TunnelStack,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    reason: str,
-) -> None:
-    """A sandbox cannot wake on its own, and 0 restores the plain 90 s grace everywhere."""
-    from omnigent.server.routes import sessions as sessions_module
-
-    case = await _connect_mid_turn_runner(
-        tunnel_three_layer_stack,
-        monkeypatch,
-        caplog,
-        runner_id=f"runner-silent-{reason}",
-        silent_grace_s=60.0,
-    )
-    if reason == "managed_sandbox_host":
+    cached = [case.session_id]
+    if exclusion == "parent_owned_mirror":
+        # The parent's runtime owns a mirrored sub-agent's turn, so there is nothing to wait for.
+        store = get_conversation_store()
+        mirror = store.create_conversation(
+            kind="sub_agent",
+            parent_conversation_id=case.session_id,
+            runner_id=case.runner_id,
+            labels={_ACP_SUBAGENT_ID_LABEL_KEY: "acp-subagent-1"},
+        )
+        store.set_session_live_status(mirror.id, "running")
+        cached.append(mirror.id)
+    elif exclusion == "managed_sandbox_host":
         monkeypatch.setattr(runner_drop_state, "_host_managed_probe", lambda _host_id: True)
-    else:
+    elif exclusion == "hold_turned_off":
         monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_SILENT_DROP_GRACE_S", 0.0)
     try:
         await _drop_runner(case, silently=True)
-        await _wait_for_cache_status(case.session_id, "failed")
+        await _wait_for_timer_done(case.runner_id)
 
         (grace,) = _event_rows(caplog, "runner_disconnect_grace")
         assert grace.attributes["outcome"] == "expired"
         assert grace.attributes["extended"] is False
         assert grace.attributes["drop_kind"] == "silent"
         assert grace.attributes["grace_s"] == _NORMAL_GRACE_S
-        (failed,) = _event_rows(caplog, "session_turn_failed")
-        assert failed.attributes["drop_kind"] == "silent"
+        if turn_lost:
+            assert sessions_module._session_status_cache.get(case.session_id) == "failed"
+            (failed,) = _event_rows(caplog, "session_turn_failed")
+            assert failed.attributes["drop_kind"] == "silent"
+        else:
+            assert sessions_module._session_status_cache.get(case.session_id) == "idle"
+            assert not _event_rows(caplog, "session_turn_failed")
+    finally:
+        for session_id in cached:
+            sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_a_silent_drop_while_the_server_shuts_down_is_not_held(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The server that is going away fails nothing and waits for nothing; a successor adopts."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import shutdown_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    case = await _connect_mid_turn_runner(
+        tunnel_three_layer_stack,
+        monkeypatch,
+        caplog,
+        runner_id="runner-silent-shutdown",
+        silent_grace_s=60.0,
+    )
+    try:
+        shutdown_state.mark_server_shutting_down()
+        await _drop_runner(case, silently=True)
+        # The timer ends on the normal grace, not the 60 s one.
+        await _wait_for_timer_done(case.runner_id)
+
+        (grace,) = _event_rows(caplog, "runner_disconnect_grace")
+        assert grace.attributes["outcome"] == "expired"
+        assert grace.attributes["extended"] is False
+        assert grace.attributes["drop_kind"] == "silent"
+        assert sessions_module._session_status_cache.get(case.session_id) == "running"
+        assert not _event_rows(caplog, "session_turn_failed")
+        conv = get_conversation_store().get_conversation(case.session_id)
+        assert conv is not None
+        assert sessions_module._last_task_error_from_labels(conv.labels) is None
+    finally:
+        shutdown_state.reset_for_tests()
+        sessions_module._session_status_cache.pop(case.session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("other_host", ["online", "managed_sandbox"])
+async def test_an_idle_session_on_another_host_neither_ends_nor_blocks_the_hold(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    other_host: str,
+) -> None:
+    """Only the host of the turn at stake decides whether, and for how long, to wait."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    case = await _connect_mid_turn_runner(
+        tunnel_three_layer_stack,
+        monkeypatch,
+        caplog,
+        runner_id=f"runner-silent-other-host-{other_host}",
+        silent_grace_s=60.0,
+    )
+    store = get_conversation_store()
+    idle = store.create_conversation(runner_id=case.runner_id)
+    store.set_host_id(idle.id, _OTHER_HOST_ID, workspace="/tmp/silent-drop")
+    store.set_session_live_status(idle.id, "idle")
+    if other_host == "online":
+        monkeypatch.setattr(
+            runner_drop_state,
+            "_host_online_probe",
+            lambda host_id: host_id == _OTHER_HOST_ID or case.host_online.is_set(),
+        )
+    else:
+        monkeypatch.setattr(
+            runner_drop_state, "_host_managed_probe", lambda host_id: host_id == _OTHER_HOST_ID
+        )
+    try:
+        await _drop_runner(case, silently=True)
+        # Well past the one recheck the other host would have allowed, or the normal grace.
+        await asyncio.sleep(_NORMAL_GRACE_S * 4)
+        assert sessions_module._session_status_cache.get(case.session_id) == "running"
+
+        # The host of the turn at stake wakes without its runner: that ends the wait.
+        case.host_online.set()
+        await _wait_for_cache_status(case.session_id, "failed")
+        (grace,) = _event_rows(caplog, "runner_disconnect_grace")
+        assert grace.attributes["outcome"] == "host_back_runner_missing"
+        assert grace.attributes["extended"] is True
+        assert grace.attributes["host_online"] is True
+    finally:
+        sessions_module._session_status_cache.pop(case.session_id, None)
+        sessions_module._session_status_cache.pop(idle.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("parent_host", ["back_online", "managed_sandbox"])
+async def test_a_hostless_child_takes_the_host_of_its_rebound_parent(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    parent_host: str,
+) -> None:
+    """The child stays on the dropped runner while its parent, which has the host, moved on."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    case = await _connect_mid_turn_runner(
+        tunnel_three_layer_stack,
+        monkeypatch,
+        caplog,
+        runner_id=f"runner-silent-rebound-{parent_host}",
+        silent_grace_s=60.0,
+        status="idle",
+    )
+    store = get_conversation_store()
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=case.session_id, runner_id=case.runner_id
+    )
+    assert child.host_id is None
+    store.set_session_live_status(child.id, "running")
+    sessions_module._session_status_cache[child.id] = "running"
+    store.replace_runner_id(case.session_id, "runner-parent-rebound")
+    store.set_host_id(case.session_id, _PARENT_HOST_ID, workspace="/tmp/silent-drop")
+    if parent_host == "managed_sandbox":
+        monkeypatch.setattr(
+            runner_drop_state, "_host_managed_probe", lambda host_id: host_id == _PARENT_HOST_ID
+        )
+    try:
+        await _drop_runner(case, silently=True)
+        if parent_host == "back_online":
+            await asyncio.sleep(_NORMAL_GRACE_S * 4)
+            assert sessions_module._session_status_cache.get(child.id) == "running"
+
+            case.host_online.set()
+            await _wait_for_cache_status(child.id, "failed")
+            (grace,) = _event_rows(caplog, "runner_disconnect_grace")
+            assert grace.attributes["outcome"] == "host_back_runner_missing"
+            assert grace.attributes["extended"] is True
+            assert grace.attributes["host_online"] is True
+            assert grace.attributes["waited_s"] < 30.0
+        else:
+            await _wait_for_cache_status(child.id, "failed")
+            (grace,) = _event_rows(caplog, "runner_disconnect_grace")
+            assert grace.attributes["outcome"] == "expired"
+            assert grace.attributes["extended"] is False
+    finally:
+        sessions_module._session_status_cache.pop(case.session_id, None)
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_a_held_drop_reads_the_runners_sessions_once_however_long_it_waits(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rechecks are point reads; only the final reconciliation lists every bound session."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    silent_grace_s = 1.0
+    case = await _connect_mid_turn_runner(
+        tunnel_three_layer_stack,
+        monkeypatch,
+        caplog,
+        runner_id="runner-silent-bounded-reads",
+        silent_grace_s=silent_grace_s,
+    )
+    store = get_conversation_store()
+    reads: dict[str, list[str]] = {
+        "list_conversations_by_runner_id": [],
+        "list_runner_session_statuses": [],
+        "get_runner_liveness": [],
+    }
+
+    def _recorded(name: str) -> Callable[..., Any]:
+        real = getattr(store, name)
+
+        def record(key: str, *args: Any, **kwargs: Any) -> Any:
+            reads[name].append(key)
+            return real(key, *args, **kwargs)
+
+        return record
+
+    for name in reads:
+        monkeypatch.setattr(store, name, _recorded(name))
+    try:
+        dropped_at = await _drop_runner(case, silently=True)
+        await _wait_for_cache_status(case.session_id, "failed")
+        assert time.monotonic() - dropped_at >= silent_grace_s
+
+        assert reads["list_conversations_by_runner_id"] == [case.runner_id]
+        assert reads["list_runner_session_statuses"] == [case.runner_id]
+        assert reads["get_runner_liveness"], "the hold never rechecked the runner's liveness"
+        assert set(reads["get_runner_liveness"]) == {case.session_id}
     finally:
         sessions_module._session_status_cache.pop(case.session_id, None)
 

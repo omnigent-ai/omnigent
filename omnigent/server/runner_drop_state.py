@@ -224,6 +224,23 @@ async def _bounded(
     return default
 
 
+async def _any_host(
+    check: Callable[..., Awaitable[bool]], host_ids: Sequence[str], *, deadline: float
+) -> bool:
+    """Ask *check* about each host in turn until one says yes or the window closes.
+
+    Each call gets only the time left, so the hosts share one deadline however many
+    there are, and the first yes skips the rest.
+    """
+    for host_id in host_ids:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        if await check(host_id, timeout_s=left):
+            return True
+    return False
+
+
 async def hold_for_silent_drop(
     drop: RunnerDrop | None,
     *,
@@ -240,12 +257,16 @@ async def hold_for_silent_drop(
     is not past *grace_s* (``0`` turns the hold off), whose runner is still absent
     and not live on another replica, that has a mid-turn session to lose, and
     whose host is not a managed sandbox. An unresolvable host counts as offline; a
-    failed host lookup is retried at each recheck.
+    failed host lookup is retried at each recheck, and the hosts it finds then get
+    the same sandbox check.
 
     It then waits, event-driven, for the runner to re-register, rechecking the host
     every *recheck_s*. A host that is back, including one already online when the
     normal grace ended, gets one more recheck for its runner to follow: a host that
     woke without its runner means the runner is gone.
+
+    Every lookup is bounded by the time left in the window, and a runner's hosts
+    share that time between them.
 
     :param drop: The runner's last drop record.
     :param grace_s: Total silent-drop grace, measured from the drop.
@@ -253,9 +274,10 @@ async def hold_for_silent_drop(
     :param wait_for_runner: Waits up to the given seconds for the runner to
         re-register; ``True`` when it is registered. ``0`` checks without waiting.
     :param turn_at_stake: Whether a bound session is mid-turn and worth holding for.
-    :param bound_host_ids: Resolves the host(s) the runner's sessions are bound to.
+    :param bound_host_ids: Resolves the host(s) serving the sessions at stake.
     :param runner_live_elsewhere: Whether another replica now holds the runner.
-    :returns: How the hold ended, or ``None`` when this drop earns no extra grace.
+    :returns: How the hold ended, or ``None`` when this drop earns no extra grace,
+        including when a host found late proves to be a managed sandbox.
     """
     if drop is None or drop.kind != "silent" or grace_s <= 0:
         return None
@@ -269,22 +291,25 @@ async def hold_for_silent_drop(
     if await _bounded(runner_live_elsewhere, False, deadline=deadline, what="liveness check"):
         _logger.info("Silent drop not held: the runner is live on another replica")
         return None
-    host_ids = await _bounded(bound_host_ids, None, deadline=deadline, what="host lookup")
-    if host_ids is not None:
-        left = deadline - time.monotonic()
-        if any([await host_is_managed(host_id, timeout_s=left) for host_id in host_ids]):
-            _logger.info("Silent drop not held: the host is a managed sandbox")
-            return None
+
+    host_ids: Sequence[str] | None = None
+
+    async def host_is_sandbox() -> bool:
+        """Look the hosts up until a lookup succeeds; whether one of them is a sandbox."""
+        nonlocal host_ids
+        if host_ids is not None:
+            return False
+        host_ids = await _bounded(bound_host_ids, None, deadline=deadline, what="host lookup")
+        return host_ids is not None and await _any_host(
+            host_is_managed, host_ids, deadline=deadline
+        )
 
     async def host_up() -> bool:
-        nonlocal host_ids
-        if host_ids is None:
-            host_ids = await _bounded(bound_host_ids, None, deadline=deadline, what="host lookup")
-        left = deadline - time.monotonic()
-        if left <= 0:
-            return False
-        return any([await host_is_online(host_id, timeout_s=left) for host_id in host_ids or ()])
+        return await _any_host(host_is_online, host_ids or (), deadline=deadline)
 
+    if await host_is_sandbox():
+        _logger.info("Silent drop not held: the host is a managed sandbox")
+        return None
     host_back = await host_up()
     while True:
         left = deadline - time.monotonic()
@@ -294,6 +319,9 @@ async def hold_for_silent_drop(
             return SilentGraceEnd("reconnected", host_online=host_back)
         if await _bounded(runner_live_elsewhere, False, deadline=deadline, what="liveness check"):
             return SilentGraceEnd("live_elsewhere", host_online=host_back)
+        if await host_is_sandbox():
+            _logger.info("Silent drop no longer held: the host is a managed sandbox")
+            return None
         was_back, host_back = host_back, await host_up()
         if was_back and host_back:
             return SilentGraceEnd("host_back_runner_missing", host_online=True)

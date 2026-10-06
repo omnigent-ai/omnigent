@@ -46,7 +46,6 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.entities import Conversation
 from omnigent.errors import (
     ErrorCategory,
     ErrorCode,
@@ -3362,32 +3361,16 @@ def create_app(
             RUNNER_DISCONNECT_GRACE_S,
             RUNNER_SILENT_DROP_GRACE_S,
             RUNNER_SILENT_DROP_RECHECK_S,
-            _runner_live_on_another_replica_from_conversations,
-            _turn_at_stake,
+            _RunnerStake,
         )
 
         drop = runner_drop_state.get(runner_id)
         since = drop.dropped_at if drop is not None else time.monotonic()
-
-        async def bound_sessions() -> list[Conversation]:
-            return await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
+        stake = _RunnerStake(runner_id, reference_stamp, conversation_store)
 
         async def runner_back(timeout_s: float) -> bool:
             return (
                 await tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s) is not None
-            )
-
-        async def turn_at_stake() -> bool:
-            return any(_turn_at_stake(conv.id, conv) for conv in await bound_sessions())
-
-        async def bound_host_ids() -> list[str]:
-            return sorted({conv.host_id for conv in await bound_sessions() if conv.host_id})
-
-        async def live_elsewhere() -> bool:
-            return _runner_live_on_another_replica_from_conversations(
-                await bound_sessions(), runner_id, reference_stamp
             )
 
         def log_end(
@@ -3419,9 +3402,9 @@ def create_app(
                     grace_s=RUNNER_SILENT_DROP_GRACE_S,
                     recheck_s=RUNNER_SILENT_DROP_RECHECK_S,
                     wait_for_runner=runner_back,
-                    turn_at_stake=turn_at_stake,
-                    bound_host_ids=bound_host_ids,
-                    runner_live_elsewhere=live_elsewhere,
+                    turn_at_stake=stake.turn_at_stake,
+                    bound_host_ids=stake.host_ids,
+                    runner_live_elsewhere=stake.live_elsewhere,
                 )
         except asyncio.CancelledError:
             # A newer disconnect, a crash report, or app shutdown took over the long wait.
@@ -3451,10 +3434,8 @@ def create_app(
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
 
-        A tunnel that went silent while its host is also offline earns a
-        longer wait (:func:`_await_disconnect_grace`): a laptop asleep past
-        the lease is still expected back, unlike a runner that closed its
-        socket.
+        A silently dropped host can earn a longer wait; see
+        :func:`_await_disconnect_grace`.
 
         This is the transport-drop path only. A runner that actually
         crashed is reported by its daemon on the host tunnel and handled by

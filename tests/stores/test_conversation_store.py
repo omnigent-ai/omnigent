@@ -3292,6 +3292,76 @@ def test_runner_session_status_page_uses_runner_index(
     assert "TEMP B-TREE" not in description, description
 
 
+@contextmanager
+def _captured_selects(store: SqlAlchemyConversationStore) -> Iterator[list[tuple[str, Any]]]:
+    """Collect the ``(statement, parameters)`` of every SELECT the metadata engine runs."""
+    queries: list[tuple[str, Any]] = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        yield queries
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+
+
+def _query_plan(store: SqlAlchemyConversationStore, statement: str, parameters: Any) -> str:
+    with store._engine.connect() as conn:
+        plan = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+    return str(plan)
+
+
+def test_runner_session_status_page_is_limited_in_sql_whatever_the_runner_size(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The silent-drop hold pages a runner's sessions; one page never reads the rest.
+
+    The page size must reach the database as a ``LIMIT`` rather than be applied to
+    rows already loaded, and a runner with many more sessions costs the same single
+    statement as one with few.
+    """
+    for _ in range(12):
+        conversation_store.create_conversation(runner_id="runner-large")
+    for _ in range(2):
+        conversation_store.create_conversation(runner_id="runner-small")
+
+    with _captured_selects(conversation_store) as queries:
+        large = conversation_store.list_runner_session_statuses("runner-large", limit=5)
+        small = conversation_store.list_runner_session_statuses("runner-small", limit=5)
+
+    assert (len(large), len(small)) == (5, 2)
+    assert len(queries) == 2, "one statement per page, whatever the runner's size"
+    for statement, _parameters in queries:
+        assert "LIMIT" in statement.upper(), statement
+    if conversation_store._engine.dialect.name == "sqlite":
+        statement, parameters = queries[0]
+        assert 5 in parameters, "the page size is a bound parameter of the statement"
+        assert "TEMP B-TREE" not in _query_plan(conversation_store, statement, parameters)
+
+
+def test_runner_liveness_is_a_single_primary_key_read(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Each recheck of a held drop asks one session, not the runner's whole session set."""
+    if conversation_store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite query-plan assertion")
+    rows = [conversation_store.create_conversation(runner_id="runner-target") for _ in range(6)]
+    conversation_store.touch_runner_liveness(["runner-target"], 1_000_000)
+
+    with _captured_selects(conversation_store) as queries:
+        liveness = conversation_store.get_runner_liveness(rows[0].id)
+
+    assert liveness == ("runner-target", 1_000_000)
+    assert len(queries) == 1
+    statement, parameters = queries[0]
+    description = _query_plan(conversation_store, statement, parameters)
+    assert "SEARCH" in description and "SCAN" not in description, description
+    assert "workspace_id=?ANDid=?" in "".join(description.split()), description
+
+
 def test_list_conversations_by_runner_id_filters(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

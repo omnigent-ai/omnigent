@@ -544,17 +544,87 @@ async def test_a_runner_turning_up_on_another_replica_ends_the_hold() -> None:
     assert time.monotonic() - started < 5.0
 
 
-async def test_a_hung_host_probe_cannot_outlive_the_window() -> None:
+@pytest.mark.parametrize("hung", ["online", "managed"])
+async def test_a_hung_host_probe_cannot_outlive_the_window(hung: str) -> None:
     probe = _CountingProbe()
     probe.release.clear()
-    runner_drop_state.configure_host_probe(probe)
-    started = time.monotonic()
+    expected: SilentGraceEnd | None
+    if hung == "online":
+        runner_drop_state.configure_host_probe(probe)
+        expected = SilentGraceEnd("expired", host_online=False)
+    else:
+        runner_drop_state.configure_host_probe(lambda _host_id: False, is_managed=probe)
+        # A check that cannot answer in time reads as managed, which keeps the normal grace.
+        expected = None
+    grace_s = 0.5
+    drop = _silent()
     try:
-        end = await _hold(_silent(), _FakeRunner(), grace_s=0.3, recheck_s=0.05)
+        end = await _hold(
+            drop,
+            _FakeRunner(),
+            hosts=_hosts("host-a", "host-b"),
+            grace_s=grace_s,
+            recheck_s=0.05,
+        )
     finally:
         probe.release.set()
+    assert end == expected
+    # Two hung hosts share the one window; a budget each would take twice the grace.
+    assert time.monotonic() - drop.dropped_at < grace_s * 1.5
+
+
+@pytest.mark.parametrize("question", ["online", "managed"])
+async def test_the_first_host_to_say_yes_spares_the_rest(question: str) -> None:
+    asked: list[str] = []
+
+    def host_a_says_yes(host_id: str) -> bool:
+        asked.append(host_id)
+        return host_id == "host-a"
+
+    hosts = _hosts("host-a", "host-b")
+    if question == "online":
+        runner_drop_state.configure_host_probe(host_a_says_yes)
+        end = await _hold(_silent(), _FakeRunner(), hosts=hosts, grace_s=30.0, recheck_s=0.05)
+        assert end == SilentGraceEnd("host_back_runner_missing", host_online=True)
+    else:
+        runner_drop_state.configure_host_probe(lambda _host_id: False, is_managed=host_a_says_yes)
+        assert await _hold(_silent(), _FakeRunner(), hosts=hosts) is None
+    assert set(asked) == {"host-a"}, "host-b was asked after host-a had already said yes"
+
+
+async def test_the_sandbox_check_runs_once_per_lookup() -> None:
+    managed = _CountingProbe(answer=False)
+    runner_drop_state.configure_host_probe(lambda _host_id: False, is_managed=managed)
+    end = await _hold(_silent(), _FakeRunner(), grace_s=0.4, recheck_s=0.05)
     assert end == SilentGraceEnd("expired", host_online=False)
-    assert time.monotonic() - started < 2.0
+    assert managed.calls == 1, "the rechecks must not ask again about a host already weighed"
+
+
+async def test_a_host_found_on_a_retry_is_still_checked_for_being_a_sandbox() -> None:
+    online_asked: list[str] = []
+
+    def online(host_id: str) -> bool:
+        online_asked.append(host_id)
+        return False
+
+    runner_drop_state.configure_host_probe(
+        online, is_managed=lambda host_id: host_id == "host-sandbox"
+    )
+    lookups: list[int] = []
+
+    async def flaky_lookup() -> list[str]:
+        lookups.append(1)
+        if len(lookups) == 1:
+            raise RuntimeError("conversations table unavailable")
+        return ["host-sandbox"]
+
+    grace_s = 2.0
+    drop = _silent()
+    end = await _hold(drop, _FakeRunner(), hosts=flaky_lookup, grace_s=grace_s, recheck_s=0.05)
+    assert end is None, "a sandbox cannot wake, however late the lookup finds it"
+    assert time.monotonic() - drop.dropped_at < grace_s / 2, "the hold must end at that recheck"
+    assert len(lookups) == 2
+    assert online_asked == [], "a sandbox that cannot wake is not polled"
 
 
 async def test_a_hung_lookup_cannot_outlive_the_window() -> None:
