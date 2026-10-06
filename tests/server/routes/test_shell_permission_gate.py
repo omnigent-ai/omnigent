@@ -496,13 +496,8 @@ async def test_filesystem_marks_reach_scope_for_the_owner_only(
     url: str,
     marked: bool,
 ) -> None:
-    """A workspace symlink may lead outside the workspace. The runner follows
-    it only when the request carries ``scope=reach``, which is added for the
-    effective owner alone -- the bar an absolute path already needs -- so a
-    shared session cannot reach past the workspace through a link. On a child
-    session that decision follows the parent chain, exactly as the absolute
-    gate does: inherited manage/edit/read access is not ownership. An absolute
-    path needs no mark; it is authorized as itself."""
+    """Only effective owners receive reach scope for relative reads, including
+    ownership inherited through a parent; an absolute path needs no mark."""
     resp = await client.get(url, headers={"X-Forwarded-Email": caller})
 
     assert resp.status_code == 200, resp.text
