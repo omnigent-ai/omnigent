@@ -5582,6 +5582,54 @@ async def test_claude_native_message_after_a_transcript_command_reports_no_lost_
         pending_inputs.reset_for_tests()
 
 
+@pytest.mark.asyncio
+async def test_claude_native_escaped_slash_command_mirror_matches_its_queued_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command the bridge escaped before pasting is found by text, not by position.
+
+    ``/help`` is a built-in the web composer cannot drive, so the bridge pastes
+    it with a leading BOM and Claude records that as a plain message. Its text
+    then differed from the queued ``/help``, so the mirror fell back to the
+    oldest entry: the receipt named a message the terminal never recorded and the
+    command's own entry was left to be reported "not delivered" later.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    lost = pending_inputs.record(sid, [{"type": "input_text", "text": "never recorded"}])
+    escaped = pending_inputs.record(sid, [{"type": "input_text", "text": "/help me"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            _user_mirror("\ufeff/help me", "claude:help:0"),
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[0].data.content == [
+            {"type": "input_text", "text": "never recorded"}
+        ]
+        assert store.appended_items[1].data.code == "native_prompt_not_recorded"
+        assert _consumed_receipts(published) == [lost, escaped]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 def _mirror_event(item_type: str, item_data: dict[str, Any], source_id: str) -> SessionEventInput:
     """Build the ``external_conversation_item`` event a transcript forwarder posts."""
     return SessionEventInput(

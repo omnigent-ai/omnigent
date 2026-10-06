@@ -942,3 +942,50 @@ def test_resolve_oldest_slash_command_drains_nothing_without_a_queued_command() 
     # Without the option the oldest entry is still the oldest entry.
     drained = pending_inputs.resolve_oldest("conv_a")
     assert drained is not None and drained.pending_id == plain
+
+
+@pytest.mark.parametrize(
+    ("queued", "mirrored"),
+    [
+        pytest.param("/help me", "\ufeff/help me", id="escaped-slash-redelivery-leads-with-a-bom"),
+        pytest.param("hello there", "hello\u200b there", id="zero-width-space"),
+        pytest.param("hello", "he\u200cl\u200dlo\u2060", id="zero-width-joiners-and-word-joiner"),
+        pytest.param("\ufeffhello", "hello", id="invisible-only-in-the-queued-text"),
+    ],
+)
+def test_resolve_matching_text_ignores_invisible_characters(queued: str, mirrored: str) -> None:
+    """A BOM or zero-width character on either side does not keep a message from matching.
+
+    The bridge escapes a slash command it cannot drive with a leading BOM before
+    pasting it, so the mirror never equals the queued text and the entry was
+    reported lost.
+    """
+    lost = pending_inputs.record("conv_a", [_text_block("never recorded")])
+    entry = pending_inputs.record("conv_a", [_text_block(queued)])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", mirrored)
+
+    assert drained.matched is not None and drained.matched.pending_id == entry
+    assert [skipped.pending_id for skipped in drained.skipped] == [lost]
+
+
+def test_resolve_matching_text_removes_invisible_characters_without_joining_words() -> None:
+    """Dropping a zero-width character is not the same as a space between words."""
+    joined = pending_inputs.record("conv_a", [_text_block("ab")])
+    spaced = pending_inputs.record("conv_a", [_text_block("a b")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "a\u200bb")
+
+    assert drained.matched is not None and drained.matched.pending_id == joined
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [spaced]
+
+
+def test_resolve_matching_text_treats_invisible_only_text_as_empty() -> None:
+    """A mirror that is nothing but invisible characters matches no entry."""
+    pending_inputs.record("conv_a", [_text_block("\u200b\ufeff")])
+    pending_inputs.record("conv_a", [_text_block("hello")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "\ufeff\u200b")
+
+    assert drained.matched is None and drained.skipped == []
+    assert len(pending_inputs.snapshot_for("conv_a")) == 2

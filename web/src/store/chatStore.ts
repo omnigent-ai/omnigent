@@ -6756,12 +6756,18 @@ async function refetchRunnerBackedSessionState(
  * "can't dedupe by text".
  */
 function messageContentText(content: MessageContentBlock[]): string {
+  return rawMessageText(content).replace(/\s+/g, " ").trim();
+}
+
+/** The text blocks of a user message joined with spaces, before any normalization. */
+function rawMessageText(content: MessageContentBlock[]): string {
   return content
     .map((b) => (b.type === "input_text" || b.type === "output_text" ? b.text : ""))
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .join(" ");
 }
+
+/** Zero-width characters and the BOM, which the server's text matching ignores. */
+const INVISIBLE_CHARS = /[\u200b-\u200d\u2060\ufeff]/g;
 
 /**
  * Whether a queued bubble is the `!cmd` web message whose shell command the
@@ -6769,16 +6775,18 @@ function messageContentText(content: MessageContentBlock[]): string {
  *
  * Mirrors the server's shell-mode match on its pending-input queue: the
  * bubble's text starts with `!` and, behind that `!` and the spaces after it,
- * equals the mirrored command with whitespace collapsed. An unsent draft was
- * never posted and an empty command matches nothing.
+ * equals the mirrored command with whitespace collapsed and invisible
+ * characters dropped. An unsent draft was never posted and an empty command
+ * matches nothing.
  *
  * @param bubble - A queued optimistic bubble.
  * @param command - The mirrored command, without its leading `!`.
  */
 function isShellCommandBubble(bubble: PendingUserMessage, command: string): boolean {
-  const wanted = command.replace(/\s+/g, " ").trim();
+  const collapse = (text: string) => text.replace(INVISIBLE_CHARS, "").replace(/\s+/g, " ").trim();
+  const wanted = collapse(command);
   if (bubble.initialDraft || wanted === "") return false;
-  const text = messageContentText(bubble.content);
+  const text = collapse(rawMessageText(bubble.content));
   return text.startsWith("!") && text.slice(1).trimStart() === wanted;
 }
 

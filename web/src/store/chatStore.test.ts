@@ -8242,6 +8242,29 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
     });
 
+    it.each([
+      ["!ls\u200b -la", "ls -la"],
+      ["!l\ufeffs", "ls"],
+      ["!ls", "l\u200cs\u2060"],
+    ])("ignores invisible characters when matching %j against %j", (queued, command) => {
+      // The server drops zero-width characters and the BOM before it compares, so
+      // the bubble must leave with the entry it settled.
+      useChatStore.setState({ blocks: [], pendingUserMessages: [bubble("pend_1", queued)] });
+
+      handleSessionEvent(shellEvent("input", command));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+
+    it("does not join two words by dropping an invisible character", () => {
+      const pending = [bubble("pend_1", "!ls -la")];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(shellEvent("input", "ls\u200b-la"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+    });
+
     it("pops the oldest of two identical commands", () => {
       useChatStore.setState({
         blocks: [],

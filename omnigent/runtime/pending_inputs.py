@@ -140,6 +140,10 @@ _MAX_ENTRIES_PER_CONVERSATION = 64
 _ONE_LEADING_ATTACHMENT_MARKER_RE = re.compile(rf"^\s*(?:{ATTACHMENT_MARKER_STRIP_PATTERN})\s*")
 _ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
 
+# Zero-width characters and the BOM are not whitespace to ``str.split`` yet show as
+# nothing; a slash command the bridge escapes before pasting comes back led by a BOM.
+_INVISIBLE_CHARS_RE = re.compile("[\u200b-\u200d\u2060\ufeff]")
+
 
 def _now() -> float:
     """
@@ -842,8 +846,8 @@ def _first_match(texts: list[str], needle: str) -> int | None:
 
 
 def _collapse_whitespace(text: str) -> str:
-    """Collapse whitespace runs so paste and mirror spacing differences cancel out."""
-    return " ".join(text.split())
+    """Collapse whitespace and drop invisible characters so paste and mirror differences cancel."""
+    return " ".join(_INVISIBLE_CHARS_RE.sub("", text).split())
 
 
 def _shell_command_of(text: str) -> str:
