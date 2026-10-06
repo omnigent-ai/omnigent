@@ -73,7 +73,10 @@ def test_github_connection_controls(
     expect(page.get_by_role("status")).to_contain_text("GitHub account connected.")
     if width < 768:
         page.get_by_test_id("settings-nav-integrations").click()
-    expect(page.get_by_text(re.compile(r"Connected as octocat\."))).to_be_visible()
+        page.get_by_role("button", name="About GitHub", exact=True).focus()
+        expect(page.get_by_role("tooltip")).to_contain_text("Connected as octocat.")
+    else:
+        expect(page.get_by_text(re.compile(r"Connected as octocat\."))).to_be_visible()
     assert parse_qs(urlsplit(connect_urls[0]).query)["return_to"] == ["/settings/integrations"]
     page.screenshot(path=tmp_path / "github-connected.png", animations="disabled")
     page.get_by_role("button", name="Disconnect", exact=True).click()
