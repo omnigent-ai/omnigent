@@ -1302,6 +1302,7 @@ function visibleModelLabel(label: string): string {
 }
 
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
+type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
@@ -1385,6 +1386,7 @@ export function AgentHarnessPicker({
   triggerTooltip,
   triggerTooltipRows,
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
+  modelCatalogAvailability,
   triggerIcon,
   selectedConfigContent,
   isEntryConfigurable,
@@ -1445,6 +1447,10 @@ export function AgentHarnessPicker({
   triggerTooltipRows?: readonly { label: string; value: string }[];
   /** Model / effort values joined inside the harness trigger. */
   triggerDetails?: readonly { label: string; value: string }[];
+  /** Explicit status for the selected model catalog. `unknown` means there is
+   * no known catalog because lookup is disabled or still loading; omit it for
+   * consumers without catalog state. */
+  modelCatalogAvailability?: ModelCatalogAvailability;
   /** Harness glyph rendered before the joined model / effort label. */
   triggerIcon?: ReactNode;
   /** Integrated configuration menu for the currently selected entry. */
@@ -1495,15 +1501,20 @@ export function AgentHarnessPicker({
     : null;
   const triggerModelText = triggerModel ? compactModelTriggerLabel(triggerModel.value) : "";
   const triggerEffortText = triggerEffort ? compactModelTriggerLabel(triggerEffort.value) : "";
+  const modelCatalogUnavailable = modelCatalogAvailability === "unavailable";
   const visibleModelText = selectedUnavailable
     ? ""
-    : triggerModelText === "Default"
+    : modelCatalogUnavailable
       ? "Models unavailable"
       : triggerModelText;
   const visibleEffortText =
     triggerEffortText === "Default" || triggerEffortText === "—" ? "" : triggerEffortText;
   const triggerAccessibleDetails = triggerDetails
-    .map((detail) => `${detail.label} ${compactModelTriggerLabel(detail.value)}`)
+    .map((detail) =>
+      detail.label === "Model" && modelCatalogUnavailable
+        ? "Model unavailable"
+        : `${detail.label} ${compactModelTriggerLabel(detail.value)}`,
+    )
     .join(", ");
   const triggerAccessibleName = [
     hasAgents ? agentLabel : "No agents",
@@ -1520,10 +1531,15 @@ export function AgentHarnessPicker({
     : visibleEffortText;
   const previewOnly = loading && !interactiveWhileLoading;
   const cachedPreview = previewOnly ? readNewChatPickerCache(cacheKey) : null;
-  const visibleCachedPreview = selectedUnavailable ? null : cachedPreview;
+  const visibleCachedPreview =
+    selectedUnavailable || modelCatalogUnavailable ? null : cachedPreview;
   const resolvedPreview = useMemo<NewChatPickerPreview | null>(
     () =>
-      selectedEntry && hasAgents && visibleModelText !== "Models unavailable"
+      selectedEntry &&
+      hasAgents &&
+      !selectedUnavailable &&
+      modelCatalogAvailability !== "unavailable" &&
+      modelCatalogAvailability !== "unknown"
         ? {
             agent: { name: selectedEntry.name, harness: selectedEntry.harness },
             label: triggerAccessibleName,
@@ -1535,7 +1551,8 @@ export function AgentHarnessPicker({
     [
       selectedEntry,
       hasAgents,
-      visibleModelText,
+      selectedUnavailable,
+      modelCatalogAvailability,
       triggerAccessibleName,
       triggerText,
       triggerSecondaryText,
@@ -3472,6 +3489,17 @@ export function NewChatLandingScreen() {
         : selectedNativeHarness === "devin-native"
           ? hostDevinModelsError
           : null;
+  const modelCatalogLookupEnabled = sandboxSelected
+    ? sandboxPreviewEnabled && sandboxInferenceConfigured
+    : selectedNativeHarness !== null && canLoadHostModels(selectedNativeHarness);
+  const modelCatalogAvailability: ModelCatalogAvailability | undefined =
+    harnessTriggerDetails.some((row) => row.label === "Model") && !routingOn
+      ? pickerModelOptions.length > 0
+        ? "available"
+        : !modelCatalogLookupEnabled || pickerModelsLoading
+          ? "unknown"
+          : "unavailable"
+      : undefined;
   const pickerDataLoading =
     sandboxCatalogPending ||
     agentsLoading ||
@@ -6747,6 +6775,7 @@ export function NewChatLandingScreen() {
                             : undefined
                         }
                         triggerDetails={harnessTriggerDetails}
+                        modelCatalogAvailability={modelCatalogAvailability}
                         triggerIcon={
                           selectedAgent ? (
                             <span
