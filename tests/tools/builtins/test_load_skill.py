@@ -397,4 +397,4 @@ def test_broken_framework_skill_is_skipped_with_warning(
 
     assert [s.name for s in tool.skills] == ["build-omnigent", "slide-decks"]
     assert "slide-decks" in tool.get_schema()["function"]["description"]
-    assert str(broken) in caplog.text
+    assert "Skipping broken framework skill broken:" in caplog.text

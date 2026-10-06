@@ -35,7 +35,7 @@ def framework_skills() -> list[SkillSpec]:
         try:
             skills.append(_parse_skill(d / "SKILL.md"))
         except OmnigentError as exc:
-            _log.warning("Skipping broken framework skill %s: %s", d, exc)
+            _log.warning("Skipping broken framework skill %s: %s", d.name, exc)
     return skills
 
 
