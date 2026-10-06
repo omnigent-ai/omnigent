@@ -66,9 +66,6 @@ interface BrowserPaneBridge {
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
-  onBrowserHostActiveChanged?: (
-    callback: (payload: { conversationId: string | null }) => void,
-  ) => () => void;
   onBrowserViewCreated?: (callback: (payload: { conversationId: string }) => void) => () => void;
   onBrowserViewClosed?: (
     callback: (payload: { conversationId: string; reason: string | null }) => void,
@@ -120,9 +117,9 @@ export function BrowserPane({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
-  // Whether a native view is attached for THIS conversation — drives when the
-  // measuring placeholder mounts (no empty pane on an idle conversation).
-  const [viewActive, setViewActive] = useState(false);
+  // A detached view still exists; only `active` controls its attachment.
+  const [viewConversationId, setViewConversationId] = useState<string | null>(null);
+  const viewActive = viewConversationId === conversationId;
 
   // Toolbar state. `currentUrl` tracks the real view URL EXCEPT while the user
   // edits the input (urlEditingRef gates the stomp); canGoBack/Forward drive
@@ -139,44 +136,46 @@ export function BrowserPane({
   const [designMode, setDesignMode] = useState(false);
   const designModeRef = useRef(false);
 
-  // Feed `viewActive` from three signals so the placeholder mounts exactly when
-  // a view exists: (1) browser-view-created — first navigate (often detached,
-  // no host-active event; breaks the activation deadlock); (2) browserHasView
-  // probe on re-mount; (3) host-active-changed for later attach/detach.
-  // browser-view-closed flips it false.
+  // Track existence through create/close events and a remount probe.
+  // Host attach/detach events do not change whether the retained page exists.
   useEffect(() => {
     if (!browserSupported) return;
     const bridge = getBridge();
     if (!bridge) return;
     let cancelled = false;
+    let viewChanged = false;
+    setViewConversationId(null);
+    setCurrentUrl("");
+    setNavigationError(null);
+    setCanGoBack(false);
+    setCanGoForward(false);
+    urlEditingRef.current = false;
 
-    // (2) Re-show an already-created view when the pane remounts.
+    // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && r?.exists) {
-        setViewActive(true);
+      if (!cancelled && !viewChanged && r?.exists) {
+        setViewConversationId(conversationId);
         if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
       }
     });
 
-    // (1) A view was just created for this conversation (first navigate).
     const unsubCreated = bridge.onBrowserViewCreated?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(true);
-    });
-    // (3) Attach/detach transitions. An attach for another conversation, or a
-    // detach (null), means this pane's view is no longer the visible one.
-    const unsubActive = bridge.onBrowserHostActiveChanged?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(true);
-      else if (payload.conversationId === null) setViewActive(false);
+      if (payload.conversationId !== conversationId) return;
+      viewChanged = true;
+      setViewConversationId(conversationId);
     });
     const unsubClosed = bridge.onBrowserViewClosed?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(false);
+      if (payload.conversationId !== conversationId) return;
+      viewChanged = true;
+      setViewConversationId(null);
+      setCanGoBack(false);
+      setCanGoForward(false);
     });
     return () => {
       cancelled = true;
       unsubCreated?.();
-      unsubActive?.();
       unsubClosed?.();
     };
   }, [conversationId, browserSupported]);

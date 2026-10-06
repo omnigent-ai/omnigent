@@ -574,7 +574,7 @@ bounds sync. Without this signal the pane would gate itself off forever and the
 embedded browser would stay invisible. (`browserViewRegistry.test.js` locks the
 create-signal → setActive → attached transition.)
 
-**Toolbar.** When a view is attached, `BrowserPane` renders a user-facing
+**Toolbar.** Even before a page is opened, `BrowserPane` renders a user-facing
 toolbar above the page: back / forward / reload, a DevTools toggle, and an
 editable URL bar (Enter navigates; the typed value is normalized to add a
 scheme — a dotless host like `localhost` gets `http://`, everything else
@@ -585,6 +585,41 @@ native `WebContentsView` paints over that container's rect — a toolbar inside 
 would be hidden by the overlay. The URL bar reuses the existing
 `browserOpenOrNavigate(..., {force:true})` path (the same one the relay uses), so
 no separate navigation IPC exists for manual entry.
+
+**Manual previews with Companion.**
+
+For an app running on a remote development host (such as Arca), forwarding
+must already be available on the machine running the Omnigent desktop app.
+Companion is an external prerequisite for the Arca-to-Mac workflow; Omnigent
+does not install, start, establish, or verify its forwarding, and does not
+resolve local port collisions. Other forwarding tools can provide the same
+manual workflow.
+
+1. Ask the agent to start the app on the remote host and report its URL.
+2. Use Companion to forward the app's port to your Mac. Check the actual
+   forwarded address: the local port may differ from the remote port.
+3. In the Omnigent desktop app, open the session's Workspace **+** menu and
+   choose **Browser**. Type the forwarded URL, for example
+   `http://localhost:5273/`, in the address bar and press Enter. Here
+   `localhost` is the desktop machine, not the agent's remote host.
+4. Hide and reopen the Workspace, or switch tabs or sessions and return.
+   The existing page is retained without navigating or reloading it. Closing
+   the Browser tab destroys that view; opening a new tab does not restore it.
+
+If the page is unreachable, check that the app is still running and that the
+forwarded URL reaches the intended app in your Mac's regular browser. Check
+Companion's forwarding and local port selection separately. Normal TLS, CORS,
+authentication, and local-network permission rules still apply. This pane is
+desktop-only; it is not available in the plain web UI.
+
+Manual URL entry does not enable agent navigation to localhost or private
+addresses: `browser_navigate` keeps its existing restrictions, even after
+you open the page yourself. The existing `browser_snapshot`, `browser_screenshot`,
+`browser_click`, and `browser_type` actions target the session's agent browser
+view and can inspect or interact with a manually opened page in **that** view;
+they do not target additional user-created Browser tabs. Manual opening is
+therefore not a read-only boundary for the agent browser view. This workflow
+adds no automatic agent localhost navigation or new permission grants.
 
 **Design mode (point-and-prompt).** A toolbar toggle (next to DevTools) injects
 an in-page element picker into the `WebContentsView` via `executeJavaScript`:
