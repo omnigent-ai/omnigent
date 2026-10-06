@@ -4908,8 +4908,6 @@ def _publish_status(
         # for <id>: <detail>" shape so existing detail-matching stays valid.
         origin = failure_origin or "unattributed"
         failure_code = error.code if error is not None else "none"
-        # Stamp owner, impact and phase so the dashboard splits failures without
-        # matching detail text; a failure with no error resolves to UNKNOWN.
         error_code = error.code if error is not None else None
         _logger.error(
             "session turn failed for %s (origin=%s code=%s prev=%s): %s",
@@ -4925,6 +4923,8 @@ def _publish_status(
                 code=failure_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
+                # Owner, impact and phase let the dashboard split failures without
+                # matching detail text; a missing error resolves to UNKNOWN.
                 error_category=turn_failure_category(error_code).value,
                 error_impact=ErrorImpact.BLOCKING.value,
                 error_phase=turn_failure_phase(error_code).value,
@@ -8028,10 +8028,9 @@ async def _relay_persist_error_once(
                 level=item.data.level,
                 source=item.data.source,
                 error_category=turn_failure_category(item.data.code).value,
-                # An info-level item is a notice, not a halted turn.
-                error_impact=(
-                    ErrorImpact.BENIGN if item.data.level == "info" else ErrorImpact.BLOCKING
-                ).value,
+                # Only an info notice is known harmless; a failed turn, not an item,
+                # is the blocking signal, so other levels carry no impact.
+                error_impact=ErrorImpact.BENIGN.value if item.data.level == "info" else None,
             ),
         )
         return "persisted"

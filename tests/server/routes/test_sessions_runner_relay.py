@@ -3228,9 +3228,9 @@ async def test_relay_persist_error_once_emits_debug_row() -> None:
     assert row["attributes"]["source"] == "execution"
     # level is None for a destructive error; it must not appear in attributes.
     assert "level" not in row["attributes"] or row["attributes"]["level"] is None
-    # The row names who owns the failure and that it stopped the turn.
+    # The row names who owns the failure; an item alone does not say the turn stopped.
     assert row["attributes"]["error_category"] == "config"
-    assert row["attributes"]["error_impact"] == "blocking"
+    assert "error_impact" not in row["attributes"]
     # message text must never reach the debug table
     assert "credential warning" not in str(row)
     assert "do not log" not in str(row)
@@ -3240,19 +3240,23 @@ async def test_relay_persist_error_once_emits_debug_row() -> None:
 @pytest.mark.parametrize(
     ("code", "level", "category", "impact"),
     [
-        # An info-level item is a notice, not a halted turn.
+        # An info-level item is a notice, so it is the only level known to be harmless.
         ("codex_thread_reset", "info", "runner", "benign"),
-        ("native_terminal_start_failed", None, "runner", "blocking"),
-        ("rate_limit_exceeded", "error", "upstream", "blocking"),
-        # A catch-all or a code with no rule yet is the burn-down bucket.
-        ("native_turn_error", None, "unknown", "blocking"),
-        ("unmapped_future_code", None, "unknown", "blocking"),
+        # Any other level is not proof the turn stopped: no impact, the failed turn
+        # row is the blocking signal.
+        ("codex_app_server_stopped", None, "runner", None),
+        ("rate_limit_exceeded", "error", "upstream", None),
+        # An LLM adapter code keeps the LLM owner.
+        ("timeout", "error", "upstream", None),
+        # Generic codes and codes with no rule yet are the burn-down bucket.
+        ("native_terminal_start_failed", None, "unknown", None),
+        ("unmapped_future_code", None, "unknown", None),
     ],
 )
 async def test_relay_persist_error_once_debug_row_names_owner_and_impact(
-    code: str, level: str | None, category: str, impact: str
+    code: str, level: str | None, category: str, impact: str | None
 ) -> None:
-    """The error_item_persisted row carries the owner and whether the item blocked."""
+    """The error_item_persisted row carries the owner, and benign impact for a notice."""
     from unittest.mock import MagicMock
 
     from omnigent.entities.conversation import ErrorData, NewConversationItem
@@ -3280,7 +3284,10 @@ async def test_relay_persist_error_once_debug_row_names_owner_and_impact(
     attributes = persist_rows[0]["attributes"]
     assert attributes["code"] == code
     assert attributes["error_category"] == category
-    assert attributes["error_impact"] == impact
+    if impact is None:
+        assert "error_impact" not in attributes
+    else:
+        assert attributes["error_impact"] == impact
     assert "do not log" not in str(persist_rows[0])
 
 

@@ -31,6 +31,7 @@ from omnigent.errors import (
     turn_failure_category,
     turn_failure_phase,
 )
+from omnigent.llms.errors import llm_error_category
 from omnigent.runner.launch_failure import _FAILURE_CODE_DESCRIPTIONS
 
 
@@ -432,13 +433,12 @@ def test_harness_boundary_is_startup_not_before() -> None:
     [
         # Runner-owned, after the harness is up.
         ("runner_disconnected", ErrorCategory.RUNNER, ErrorPhase.TURN),
-        ("required_terminal_exited", ErrorCategory.RUNNER, ErrorPhase.TURN),
-        ("connection_error", ErrorCategory.RUNNER, ErrorPhase.TURN),
+        ("codex_app_server_stopped", ErrorCategory.RUNNER, ErrorPhase.TURN),
         ("native_prompt_not_recorded", ErrorCategory.RUNNER, ErrorPhase.TURN),
         ("kiro_native_prompt_not_recorded", ErrorCategory.RUNNER, ErrorPhase.TURN),
         # Runner-owned, before the harness is up.
         ("runner_failed_to_start", ErrorCategory.RUNNER, ErrorPhase.RUNNER_LAUNCH),
-        ("native_terminal_start_failed", ErrorCategory.RUNNER, ErrorPhase.HARNESS_STARTUP),
+        ("native_terminal_ensure_failed", ErrorCategory.RUNNER, ErrorPhase.HARNESS_STARTUP),
         ("codex_thread_not_started", ErrorCategory.RUNNER, ErrorPhase.HARNESS_STARTUP),
         # The model provider failed or throttled the request.
         ("transient_upstream_error", ErrorCategory.UPSTREAM, ErrorPhase.TURN),
@@ -453,9 +453,14 @@ def test_harness_boundary_is_startup_not_before() -> None:
         ("context_length_exceeded", ErrorCategory.USER, ErrorPhase.TURN),
         ("input_too_large", ErrorCategory.USER, ErrorPhase.TURN),
         ("native_prompt_interrupted", ErrorCategory.USER, ErrorPhase.TURN),
-        # Catch-alls: no owner, but still a turn failure.
+        # Catch-alls, and codes whose producers span owners: no owner is guessed, but
+        # the phase still locates the failure.
         ("native_turn_error", ErrorCategory.UNKNOWN, ErrorPhase.TURN),
         ("runner_error", ErrorCategory.UNKNOWN, ErrorPhase.TURN),
+        ("executor_error", ErrorCategory.UNKNOWN, ErrorPhase.TURN),
+        ("codex_turn_rejected", ErrorCategory.UNKNOWN, ErrorPhase.TURN),
+        ("required_terminal_exited", ErrorCategory.UNKNOWN, ErrorPhase.TURN),
+        ("native_terminal_start_failed", ErrorCategory.UNKNOWN, ErrorPhase.HARNESS_STARTUP),
     ],
 )
 def test_turn_failure_code_attribution(
@@ -488,6 +493,43 @@ def test_turn_failure_falls_back_to_the_error_code_namespace(
 
 
 @pytest.mark.parametrize(
+    "code,expected_category",
+    [
+        ("429", ErrorCategory.UPSTREAM),
+        ("503", ErrorCategory.UPSTREAM),
+        ("401", ErrorCategory.CONFIG),
+        ("403", ErrorCategory.CONFIG),
+        ("timeout", ErrorCategory.UPSTREAM),
+        ("connection_error", ErrorCategory.UPSTREAM),
+        ("max_tokens_exceeded", ErrorCategory.USER),
+        # Another 4xx is our bad request or provider policy; no owner is guessed.
+        ("400", ErrorCategory.UNKNOWN),
+    ],
+)
+def test_turn_failure_falls_back_to_the_llm_code_namespace(
+    code: str, expected_category: ErrorCategory
+) -> None:
+    """SDK failures reach the turn rows with LLM adapter codes.
+
+    Their owner must match ``llm_error_category``, so one retried failure has one
+    owner on the retry row and on the failed-turn rows.
+    """
+    assert turn_failure_category(code) is expected_category
+    assert turn_failure_category(code) is llm_error_category(code)
+    # The fallback supplies an owner only; an LLM code has no phase of its own.
+    assert turn_failure_phase(code) is ErrorPhase.UNKNOWN
+
+
+def test_turn_failure_map_agrees_with_the_llm_code_namespace() -> None:
+    """A code both namespaces classify must get one owner, or a retry would get two."""
+    for code, category in _TURN_FAILURE_CATEGORY.items():
+        llm_category = llm_error_category(code)
+        assert llm_category in (ErrorCategory.UNKNOWN, category), (
+            f"{code!r} is {category.value} here but {llm_category.value} in llm_error_category"
+        )
+
+
+@pytest.mark.parametrize(
     "code",
     [
         None,
@@ -499,6 +541,9 @@ def test_turn_failure_falls_back_to_the_error_code_namespace(
         "ImportError",
         "OSError",
         "some_new_code",
+        # str.isdigit() accepts these but int() rejects them; resolving must not raise.
+        "²",
+        "9" * 4301,
     ],
 )
 def test_turn_failure_without_a_rule_is_unknown(code: str | None) -> None:
@@ -508,11 +553,11 @@ def test_turn_failure_without_a_rule_is_unknown(code: str | None) -> None:
 
 
 def test_generic_turn_failure_codes_stay_unattributed() -> None:
-    """Catch-all codes name no cause, so they must not guess an owner."""
+    """Generic codes have no single owner, so they must not guess one."""
     assert GENERIC_TURN_FAILURE_CODES
     for code in GENERIC_TURN_FAILURE_CODES:
         assert turn_failure_category(code) is ErrorCategory.UNKNOWN, code
-    # The explicit UNKNOWN entries and the declared catch-alls are the same set,
+    # The explicit UNKNOWN entries and the declared generic codes are the same set,
     # so neither can drift from the other.
     explicit_unknown = {
         code
@@ -538,11 +583,11 @@ def test_turn_failure_maps_do_not_shadow_error_codes() -> None:
 
 
 def test_every_documented_failure_code_has_an_owner() -> None:
-    """A server-emitted failure code must attribute an owner or be a declared catch-all.
+    """A documented failure code must attribute an owner or be a declared generic code.
 
-    ``_FAILURE_CODE_DESCRIPTIONS`` is the documented list of server-emitted failure
-    codes. A new code missing from the maps would silently land in the ``unknown``
-    burn-down bucket instead of being attributed where it is introduced.
+    ``_FAILURE_CODE_DESCRIPTIONS`` lists the documented failure codes (not every code
+    the server can emit). A new one missing from the maps would silently land in the
+    ``unknown`` burn-down bucket instead of being attributed where it is introduced.
     """
     unattributed = sorted(
         code
@@ -553,7 +598,7 @@ def test_every_documented_failure_code_has_an_owner() -> None:
     assert not unattributed, (
         f"failure codes with no owner: {unattributed}. Add each to "
         "_TURN_FAILURE_CATEGORY (and _TURN_FAILURE_PHASE) in omnigent/errors.py, "
-        "or to GENERIC_TURN_FAILURE_CODES if it is a deliberate catch-all."
+        "or to GENERIC_TURN_FAILURE_CODES if it has no single owner."
     )
 
 

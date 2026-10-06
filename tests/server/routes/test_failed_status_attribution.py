@@ -125,15 +125,21 @@ def test_unattributed_failure_is_labelled_not_blank(
     [
         ("runner_disconnected", "runner", "turn"),
         ("runner_failed_to_start", "runner", "runner_launch"),
-        ("native_terminal_start_failed", "runner", "harness_startup"),
+        ("native_terminal_ensure_failed", "runner", "harness_startup"),
         ("transient_upstream_error", "upstream", "turn"),
         ("codex_reauth_required", "config", "turn"),
         ("budget_exhausted", "user", "turn"),
         # An ErrorCode published by a host launch refusal keeps its own owner.
         ("workspace_missing", "user", "harness_setup"),
-        # Catch-alls and relayed exception names are the burn-down bucket.
+        # An LLM adapter code relayed from the runner keeps the LLM owner.
+        ("429", "upstream", "unknown"),
+        ("connection_error", "upstream", "unknown"),
+        # Generic codes and relayed exception names are the burn-down bucket.
         ("native_turn_error", "unknown", "turn"),
+        ("native_terminal_start_failed", "unknown", "harness_startup"),
         ("RuntimeError", "unknown", "unknown"),
+        # A malformed digit-like code must never break the failed status edge.
+        ("²", "unknown", "unknown"),
     ],
 )
 def test_failed_edge_names_its_owner(

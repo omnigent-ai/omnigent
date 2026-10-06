@@ -56,8 +56,9 @@ class ErrorCategory(str, Enum):
         timeout.
     :cvar UNKNOWN: Not attributable where observed, with no rule written yet.
         Legal ONLY where no error code exists (the catch-all handler, an uncoded
-        frame failure); never for a named :class:`ErrorCode`. A measured
-        burn-down bucket, not a resting place.
+        frame failure) or the code is a generic turn-failure code (see
+        :data:`GENERIC_TURN_FAILURE_CODES`); never for a named :class:`ErrorCode`.
+        A measured burn-down bucket, not a resting place.
     """
 
     USER = "user"
@@ -422,23 +423,19 @@ def phase_for_code(code: str) -> ErrorPhase:
 
 
 # Fault attribution per turn-failure code (the ``code`` on a failed turn or error
-# item). A separate namespace from ErrorCode (see _CODE_TO_CATEGORY); never overlaps.
+# item). ErrorCode and LLM codes resolve by fallback in turn_failure_category.
 _TURN_FAILURE_CATEGORY: dict[str, ErrorCategory] = {
     # The runner or its harness process dropped, exited, or could not complete a
     # step of the turn that it owns.
     "runner_disconnected": ErrorCategory.RUNNER,
-    "required_terminal_exited": ErrorCategory.RUNNER,
+    "codex_app_server_stopped": ErrorCategory.RUNNER,
     "codex_thread_reset": ErrorCategory.RUNNER,
-    "codex_turn_rejected": ErrorCategory.RUNNER,
-    "connection_error": ErrorCategory.RUNNER,
-    "executor_error": ErrorCategory.RUNNER,
     "model_change_not_applied": ErrorCategory.RUNNER,
     "native_prompt_not_recorded": ErrorCategory.RUNNER,
     "kiro_native_prompt_not_recorded": ErrorCategory.RUNNER,
     "native_policy_not_enforced": ErrorCategory.RUNNER,
     "pi_model_change_failed": ErrorCategory.RUNNER,
     "runner_failed_to_start": ErrorCategory.RUNNER,
-    "native_terminal_start_failed": ErrorCategory.RUNNER,
     "native_terminal_ensure_failed": ErrorCategory.RUNNER,
     "terminal_launch_failed": ErrorCategory.RUNNER,
     "agent_startup_pending": ErrorCategory.RUNNER,
@@ -460,16 +457,29 @@ _TURN_FAILURE_CATEGORY: dict[str, ErrorCategory] = {
     "context_length_exceeded": ErrorCategory.USER,
     "input_too_large": ErrorCategory.USER,
     "native_prompt_interrupted": ErrorCategory.USER,
-    # Catch-alls that name no cause; UNKNOWN until a specific code replaces them.
+    # No single owner: catch-alls, and codes whose producers span owners (a terminal
+    # exit is a config fault for some causes, a runner crash for others).
+    "required_terminal_exited": ErrorCategory.UNKNOWN,
+    "native_terminal_start_failed": ErrorCategory.UNKNOWN,
+    "executor_error": ErrorCategory.UNKNOWN,
+    "codex_turn_rejected": ErrorCategory.UNKNOWN,
     "native_turn_error": ErrorCategory.UNKNOWN,
     "codex_turn_error": ErrorCategory.UNKNOWN,
     "runner_error": ErrorCategory.UNKNOWN,
 }
 
-# Catch-all codes that name no cause. They stay UNKNOWN on purpose and are the
-# burn-down list; every other documented turn-failure code needs a rule above.
+# Codes with no single owner: catch-alls, or producers that span owners. They stay
+# UNKNOWN on purpose (the burn-down list); other documented codes need a rule above.
 GENERIC_TURN_FAILURE_CODES: frozenset[str] = frozenset(
-    {"native_turn_error", "codex_turn_error", "runner_error"}
+    {
+        "required_terminal_exited",
+        "native_terminal_start_failed",
+        "executor_error",
+        "codex_turn_rejected",
+        "native_turn_error",
+        "codex_turn_error",
+        "runner_error",
+    }
 )
 
 # Lifecycle phase per turn-failure code, a default like _CODE_TO_PHASE. Codes absent
@@ -488,10 +498,10 @@ _TURN_FAILURE_PHASE: dict[str, ErrorPhase] = {
     "pi_credentials_unresolved": ErrorPhase.HARNESS_STARTUP,
     # The harness was up and a turn was running (catch-alls included).
     "runner_disconnected": ErrorPhase.TURN,
+    "codex_app_server_stopped": ErrorPhase.TURN,
     "required_terminal_exited": ErrorPhase.TURN,
     "codex_thread_reset": ErrorPhase.TURN,
     "codex_turn_rejected": ErrorPhase.TURN,
-    "connection_error": ErrorPhase.TURN,
     "executor_error": ErrorPhase.TURN,
     "model_change_not_applied": ErrorPhase.TURN,
     "native_prompt_not_recorded": ErrorPhase.TURN,
@@ -518,27 +528,39 @@ def turn_failure_category(code: str | None) -> ErrorCategory:
     """Return the fault attribution for a turn-failure code.
 
     Turn-failure codes are a separate namespace from :class:`ErrorCode`, so they
-    resolve here first. A failed turn can also carry an :class:`ErrorCode` value
-    (e.g. ``workspace_missing``), which falls back to :func:`category_for_code`.
+    resolve here first. A miss falls back to the :class:`ErrorCode` map (e.g.
+    ``workspace_missing``), then to :func:`~omnigent.llms.errors.llm_error_category`
+    for an LLM adapter code (``"429"``, ``"401"``, ``"timeout"``,
+    ``"connection_error"``), so one retried LLM failure has one owner on every row.
 
     :param code: The failure code, e.g. ``"runner_disconnected"``; ``None`` when
         the failure carried no code.
-    :returns: The mapped category. ``UNKNOWN`` for ``None``, the catch-alls in
-        :data:`GENERIC_TURN_FAILURE_CODES`, and any code with no rule yet, such as
-        an exception class name the runner relays as a code (``"RuntimeError"``).
+    :returns: The mapped category. ``UNKNOWN`` for ``None``, the generic codes in
+        :data:`GENERIC_TURN_FAILURE_CODES`, and any code with no rule in those
+        namespaces, such as an exception class name the runner relays as a code
+        (``"RuntimeError"``).
     """
     if code is None:
         return ErrorCategory.UNKNOWN
     if code in _TURN_FAILURE_CATEGORY:
         return _TURN_FAILURE_CATEGORY[code]
-    return category_for_code(code)
+    if code in _CODE_TO_CATEGORY:
+        return _CODE_TO_CATEGORY[code]
+    # Imported here: omnigent.llms.errors imports this module.
+    from omnigent.llms.errors import llm_error_category
+
+    try:
+        return llm_error_category(code)
+    except ValueError:  # str.isdigit() admits digits that int() rejects (superscripts)
+        return ErrorCategory.UNKNOWN
 
 
 def turn_failure_phase(code: str | None) -> ErrorPhase:
     """Return the likely lifecycle phase for a turn-failure code.
 
-    Same lookup order as :func:`turn_failure_category`: the turn-failure map, then
-    :func:`phase_for_code` for an :class:`ErrorCode` value.
+    Looks up the turn-failure map, then :func:`phase_for_code` for an
+    :class:`ErrorCode` value. There is no LLM-code fallback, so the phase of an
+    LLM adapter code (``"429"``, ``"connection_error"``) stays ``UNKNOWN``.
 
     :param code: The failure code, e.g. ``"native_terminal_start_failed"``;
         ``None`` when the failure carried no code.

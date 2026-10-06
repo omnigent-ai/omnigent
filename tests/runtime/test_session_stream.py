@@ -885,6 +885,8 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
     assert attrs["status"] == "completed"
     assert attrs["error_code"] == "timeout"
     assert attrs["error_source"] == "llm"
+    # The owner is a derived enum string, never the error text.
+    assert attrs["error_category"] == "upstream"
     # Free-text / author-defined dimensions are excluded outright.
     assert "reason" not in attrs
     assert "blocked_on" not in attrs
@@ -1049,10 +1051,14 @@ def test_sse_safe_attributes_uses_real_serializer_for_info_notice() -> None:
         ("budget_exhausted", "user"),
         # ErrorCode values keep the owner their own map gives them.
         ("workspace_missing", "user"),
-        # Catch-alls, relayed exception names and non-string codes are unattributed.
+        # LLM adapter codes keep the LLM owner, whether sent as a string or an int.
+        ("429", "upstream"),
+        ("401", "config"),
+        ("timeout", "upstream"),
+        (500, "upstream"),
+        # Generic codes and relayed exception names are unattributed.
         ("native_turn_error", "unknown"),
         ("RuntimeError", "unknown"),
-        (500, "unknown"),
     ],
 )
 def test_sse_safe_attributes_adds_error_category_for_failed_status(
@@ -1102,8 +1108,9 @@ def test_sse_safe_attributes_omits_error_category_without_an_error_code() -> Non
     ("code", "category"),
     [
         ("pi_native_effort_ignored", "config"),
-        ("native_terminal_start_failed", "runner"),
-        ("native_turn_error", "unknown"),
+        ("codex_app_server_stopped", "runner"),
+        ("timeout", "upstream"),
+        ("native_terminal_start_failed", "unknown"),
         ("unmapped_future_code", "unknown"),
     ],
 )
@@ -1237,11 +1244,11 @@ def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.Monke
     assert failed.levelno == logging.WARNING
     # A failed turn is the authoritative blocking signal; error_impact rides the
     # same row so "sessions actually blocked" is a direct query. No message text.
-    # "timeout" has no turn-failure rule, so its owner is the unknown bucket.
+    # "timeout" is an LLM adapter code, so its owner is the provider side.
     assert failed.attributes == {
         "outcome": "failed",
         "error_code": "timeout",
-        "error_category": "unknown",
+        "error_category": "upstream",
         "error_impact": "blocking",
         "error_phase": "turn",
     }
@@ -1254,6 +1261,9 @@ def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.Monke
         ("rate_limit_exceeded", "upstream"),
         ("codex_reauth_required", "config"),
         ("context_length_exceeded", "user"),
+        # LLM adapter codes from an SDK failure keep the LLM owner.
+        ("429", "upstream"),
+        ("401", "config"),
         ("native_turn_error", "unknown"),
         ("RuntimeError", "unknown"),
     ],
@@ -1281,20 +1291,40 @@ def test_failed_turn_rows_carry_the_error_owner(
         assert "private" not in repr(record.attributes)
 
 
-def test_turn_finished_omits_error_category_without_an_error_code(
+def test_codeless_failed_turns_are_marked_with_an_unknown_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # No error code to attribute: the row stays as before, with no owner.
+    # A failed or incomplete turn with no error code is still a failure, so it is
+    # visible with owner unknown; a turn that did not fail carries no category.
     monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_audit_logger() as audit_records:
-        session_stream._log_sse_event("conv_1", {"type": "response.failed"})
-        session_stream._log_sse_event(
-            "conv_1", {"type": "response.completed", "response": {"id": "resp_1"}}
-        )
+        for event in (
+            {"type": "response.failed"},
+            {"type": "response.failed", "error": {"message": "private detail"}},
+            {"type": "response.incomplete"},
+            {"type": "response.completed", "response": {"id": "resp_1"}},
+            {"type": "response.cancelled"},
+        ):
+            session_stream._log_sse_event("conv_1", event)
 
-    assert [r.attributes["outcome"] for r in audit_records] == ["failed", "completed"]
-    assert all("error_category" not in r.attributes for r in audit_records)
+    assert [r.attributes["outcome"] for r in audit_records] == [
+        "failed",
+        "failed",
+        "incomplete",
+        "completed",
+        "cancelled",
+    ]
+    assert [r.attributes.get("error_category") for r in audit_records] == [
+        "unknown",
+        "unknown",
+        "unknown",
+        None,
+        None,
+    ]
+    # Nothing was logged as a code, and no message text leaked.
+    assert all("error_code" not in r.attributes for r in audit_records)
+    assert "private" not in repr([r.attributes for r in audit_records])
 
 
 @pytest.mark.parametrize("legacy_error", [False, True])

@@ -269,6 +269,9 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
             error_code = str(error["code"])
             attributes["error_code"] = error_code
             attributes["error_category"] = turn_failure_category(error_code).value
+        elif outcome in ("failed", "incomplete"):
+            # A code-less failure is still a failed turn: count it as owner unknown.
+            attributes["error_category"] = turn_failure_category(None).value
         if event_type == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
             attributes["error_source"] = event["source"]
         impact = _TURN_OUTCOME_IMPACT.get(outcome)

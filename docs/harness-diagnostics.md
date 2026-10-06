@@ -343,21 +343,31 @@ detail text. `turn_failure_category()` in `omnigent/errors.py` derives the owner
 from the failure code alone, and `turn_failure_phase()` derives the lifecycle
 phase. `native_error_category` is unrelated: it keeps the native tool's own category.
 
+Count failed turns from `session_turn_failed` (failures the server publishes) or
+from `turn_finished` with outcome `failed` or `incomplete`. The other rows are for
+drill-down: one failure can produce several rows with a category, so do not sum them.
+
 | Row | Attributes |
 | --- | --- |
 | `session_turn_failed` | `error_category`, `error_impact` (always `blocking`), `error_phase` |
-| `turn_finished`, when the terminal event has an error code | `error_category`, beside the existing `error_impact` and `error_phase` |
-| SSE rows for events with an error code: failed `session.status`, `response.error`, `response.failed` | `error_category` |
+| `turn_finished` | `error_category` when the terminal event has an error code, and `unknown` for a `failed` or `incomplete` turn without one; `error_impact` and `error_phase` as before |
+| SSE rows that log an error code: failed `session.status`, `response.error`, `response.failed`, `response.retry` | `error_category` |
 | SSE rows for persisted `type="error"` items | `item_category`, beside `item_code` |
-| `error_item_persisted` | `error_category`, `error_impact` (`benign` for an info-level notice, otherwise `blocking`) |
+| `error_item_persisted` | `error_category`, and `error_impact=benign` for an info-level notice; other levels carry no impact |
+
+A code resolves through the turn-failure rules, then the `ErrorCode` rules, then
+`llm_error_category()`. An LLM code such as `429`, `401`, or `timeout` therefore has
+the same owner on the retry row and on the failed-turn rows.
 
 `error_category` is `runner`, `upstream`, `config`, `user`, `server`, or
-`unknown`. `unknown` means the failure has no specific code yet: a catch-all
-(`native_turn_error`, `codex_turn_error`, `runner_error`), a missing code, a code
-with no rule, or an exception class name the runner relays as the code, such as
-`RuntimeError`. It is the list to burn down: group `unknown` rows by code and add
-a rule to `_TURN_FAILURE_CATEGORY` for each frequent one. A test fails when a
-documented server failure code has no rule and is not a declared catch-all.
+`unknown`. `unknown` means no owner is known yet: a generic code
+(`native_turn_error`, `codex_turn_error`, `runner_error`) or one whose producers
+span owners (`required_terminal_exited`), a missing code, a code with no rule, or
+an exception class name the runner relays as the code, such as `RuntimeError`. It
+is the list to burn down: group `unknown` rows by code and add a rule to
+`_TURN_FAILURE_CATEGORY` for each frequent one. A test fails when a documented
+failure code (`_FAILURE_CODE_DESCRIPTIONS`) has no rule and is not a declared
+generic code.
 
 ## Claude continuous diagnostics
 
