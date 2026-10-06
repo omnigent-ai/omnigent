@@ -3,7 +3,7 @@ import { fetchFileContent } from "@/hooks/useFileContent";
 import * as workspaceFiles from "@/hooks/useWorkspaceChangedFiles";
 import { fetchDeckSearch, fetchKitIndicator } from "./designDeckApi";
 
-const { WORKSPACE_FILE_SEARCH_LIMIT, requestWorkspaceFileSearch } = workspaceFiles;
+const { requestWorkspaceFileSearch } = workspaceFiles;
 
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importActual) => ({
@@ -68,15 +68,21 @@ describe("fetchDeckSearch", () => {
     });
   });
 
-  it("treats a full page of results as truncated via has_more", async () => {
-    const data = Array.from({ length: WORKSPACE_FILE_SEARCH_LIMIT }, (_, i) =>
-      entry(`decks/d${i}.slides.html`),
+  it("treats has_more as truncated even for a small result page", async () => {
+    searchMock.mockResolvedValue(
+      response(200, {
+        object: "list",
+        data: [entry("decks/q3.slides.html")],
+        has_more: true,
+        truncated: false,
+      }),
     );
-    searchMock.mockResolvedValue(response(200, { object: "list", data, has_more: true }));
 
-    const result = await fetchDeckSearch("conv_a");
-    expect(result).toMatchObject({ status: "ok", truncated: true });
-    expect(result.status === "ok" && result.paths).toHaveLength(WORKSPACE_FILE_SEARCH_LIMIT);
+    expect(await fetchDeckSearch("conv_a")).toEqual({
+      status: "ok",
+      paths: ["decks/q3.slides.html"],
+      truncated: true,
+    });
   });
 
   it.each([404, 503])("reads a %s as an unavailable workspace", async (status) => {
