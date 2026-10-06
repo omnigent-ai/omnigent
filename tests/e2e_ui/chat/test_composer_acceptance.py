@@ -195,8 +195,10 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     page.screenshot(path=tmp_path / f"status-page-{theme}.png", animations="disabled")
     directory_icon = icon_bounds["composer-workspace-dir"][0]
     center_y = directory_icon["y"] + directory_icon["height"] / 2
-    assert bounds["height"] == pytest.approx(37, abs=0.5)
-    assert center_y == pytest.approx(bounds["y"] + 19, abs=0.5)
+    expected_bar_height = 28 if is_mobile else 37
+    expected_center_offset = 14 if is_mobile else 19
+    assert bounds["height"] == pytest.approx(expected_bar_height, abs=0.5)
+    assert center_y == pytest.approx(bounds["y"] + expected_center_offset, abs=0.5)
     trailing = control_bounds[status_ids[-1]]
     # The docked tray's content inset matches the card's shared inset
     # (1px border + 12px padding).

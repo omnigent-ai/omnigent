@@ -1,4 +1,4 @@
-// Post-setup "Your imports are ready" modal: one tab per harness, showing the
+// Post-setup "Your setup is ready" modal: one tab per harness, showing the
 // credential Omnigent adopted and the MCP servers, skills, and plugins found
 // there. Review only: sessions already load these, so nothing is selected.
 
@@ -30,6 +30,9 @@ import {
   type InventoryAssetKind,
 } from "@/hooks/useHarnessInventory";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { Link } from "@/lib/routing";
 
 export type ImportHarness = BrandHarness;
 export type ImportContext = HarnessInventoryContext;
@@ -68,7 +71,7 @@ function CredentialLine({ source }: { source: string }) {
       <span className="min-w-0 flex-1 truncate font-medium text-foreground">{source}</span>
       <span className="flex shrink-0 items-center gap-1 text-muted-foreground">
         <Check className="size-3.5 text-success" aria-hidden="true" />
-        Imported
+        Detected
       </span>
     </div>
   );
@@ -121,7 +124,7 @@ function assetLists(context: ImportContext, harness: ImportHarness): AssetList[]
       rows: own(context.plugins).map((plugin) => ({
         id: plugin.id,
         name: plugin.name,
-        metadata: countLabel(plugin.skillCount, "skill"),
+        metadata: countLabel(plugin.skills.length || undefined, "skill"),
       })),
     },
   ];
@@ -154,6 +157,7 @@ function AssetRows({ list }: { list: AssetList }) {
 const UNAVAILABLE_LABEL: Record<InventoryAssetKind, string> = {
   mcps: "MCP servers",
   skills: "skills and plugins",
+  plugins: "plugins",
 };
 
 /** Names the asset kinds the host couldn't report, e.g. "Couldn't read MCP servers". */
@@ -243,6 +247,7 @@ export interface ImportContextModalProps {
   hostName?: string;
   /** Asset kinds the host couldn't report. */
   unavailable?: InventoryAssetKind[];
+  mcpUnsupported?: boolean;
   /** Replaces the default loading copy, e.g. while the host is still connecting. */
   loadingMessage?: string;
 }
@@ -279,10 +284,20 @@ function ImportContextBody({
   status = "ready",
   hostName,
   unavailable = NONE_UNAVAILABLE,
+  mcpUnsupported = false,
   loadingMessage = "Checking your harnesses…",
 }: Omit<ImportContextModalProps, "open" | "onOpenChange">) {
+  const info = useServerInfo();
   const harnesses = detectedHarnesses(context);
-  const notice = unavailableNotice(unavailable);
+  const notice =
+    [
+      mcpUnsupported && "Please update this host to list MCP servers.",
+      unavailableNotice(
+        mcpUnsupported ? unavailable.filter((kind) => kind !== "mcps") : unavailable,
+      ),
+    ]
+      .filter(Boolean)
+      .join(" ") || null;
   const machine = hostName ?? "This machine";
 
   let content: ReactNode;
@@ -341,7 +356,7 @@ function ImportContextBody({
       <div className="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pt-5">
         <div className="flex flex-col items-center gap-1 py-2 text-center">
           <DialogTitle className="min-h-0 pr-0 text-2xl leading-8 font-normal tracking-[-0.02em]">
-            Your imports are ready
+            Your setup is ready
           </DialogTitle>
           <DialogDescription className="max-w-[480px] text-[14px] leading-5">
             {hostName ? `Found in your harnesses on ${hostName}.` : "Found in your harnesses."}{" "}
@@ -351,7 +366,14 @@ function ImportContextBody({
         {content}
       </div>
 
-      <div className="flex shrink-0 justify-end px-5 pt-4 pb-5">
+      <div className="flex shrink-0 justify-end gap-2 px-5 pt-4 pb-5">
+        {isFeatureEnabled(info, "harness_settings_ui") && (
+          <DialogClose asChild>
+            <Button variant="outline" asChild componentId="onboarding.import.seeMore">
+              <Link to="/settings/harnesses">See more</Link>
+            </Button>
+          </DialogClose>
+        )}
         <Button onClick={onConfirm} componentId="onboarding.import.confirm">
           Confirm
         </Button>

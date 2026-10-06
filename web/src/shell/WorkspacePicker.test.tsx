@@ -784,7 +784,7 @@ describe("WorkspacePicker modal actions", () => {
     expect(screen.getByTestId("workspace-picker-entry-src")).toHaveClass("h-7", "px-2", "py-[3px]");
     expect(screen.getByTestId("workspace-picker-listing")).toHaveClass("space-y-px", "px-2");
     expect(screen.getByTestId("workspace-picker-header")).toHaveClass("h-12", "px-3", "py-0");
-    expect(screen.getByTestId("workspace-picker-breadcrumbs")).toHaveClass("px-1");
+    expect(screen.getByTestId("workspace-picker-breadcrumbs")).not.toHaveClass("px-1");
     expect(screen.getByTestId("workspace-picker-search-row")).toHaveClass("border-b-0");
     expect(screen.getByTestId("workspace-picker-search-field")).toHaveClass(
       "h-8",
@@ -906,8 +906,8 @@ describe("WorkspacePicker modal actions", () => {
         "py-[3px]",
       );
       expect(screen.getByTestId("workspace-picker-select")).toHaveClass(
-        "h-7",
-        "px-3",
+        "h-8",
+        "px-2.5",
         "font-normal",
       );
 

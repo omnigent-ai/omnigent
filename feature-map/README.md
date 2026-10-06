@@ -151,13 +151,17 @@ map an area, remove it here in the same change.
   `omnigent import`
 - Bundled agents and the Copilot harness: `omnigent polly`, `omnigent debby`,
   `omnigent copilot`
+- Installing reusable agents: `omnigent agent`
 - Integrations, extensions, and remote sandboxes: `omnigent integration`,
   `omnigent extensions`, `omnigent sandbox`
 
 **Partly mapped:** embedded authentication covers project writes and supporting
 account-context tests; other resource APIs and real identity-provider journeys
 remain unmapped. Native disconnect recipes cover Codex transport/startup and
-browser stream recovery, not live reconnect across every harness. The
+browser stream recovery, not live reconnect across every harness. Network
+interruptions for claude-native are tracked as scenario rows in
+`docs/network-resilience.md`, driven by the resilience lab in
+`tests/e2e/resilience/`. The
 header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost

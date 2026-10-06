@@ -62,14 +62,6 @@ FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY = "omnigent.fork.source_external_session_
 # ``external_session_id`` is NULL).
 FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 
-# Set by an in-place agent switch (``POST /v1/sessions/{id}/switch-agent``):
-# the BUILT-IN agent id the session was switched away from, so the UI can
-# offer a one-click "Switch back". A convenience pointer only — switching
-# back is a fresh re-clone of that built-in (a new session-scoped agent,
-# fresh harness), not a transactional undo. Persisted (not instance-scoped),
-# so it survives across turns and is overwritten by each subsequent switch.
-SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
-
 # Opt-in DANGEROUS launch directive for a codex-native session: when set to
 # ``"1"`` the runner launches Codex with
 # ``--dangerously-bypass-approvals-and-sandbox`` and puts the app-server
@@ -547,6 +539,19 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+        """Return the bound runner ID and heartbeat from the metadata database.
+
+        Reads neither conversation data nor labels, so an unrelated
+        conversation backend outage cannot hide a healthy runner.
+
+        :param conversation_id: Session/conversation ID to look up.
+        :returns: ``(runner_id, runner_last_seen)``, or ``None`` if the
+            metadata row is missing. Either field may be ``None``.
+        """
+        ...
+
+    @abstractmethod
     def get_session_connectivity(
         self, conversation_ids: list[str]
     ) -> dict[str, SessionConnectivity]:
@@ -964,6 +969,31 @@ class ConversationStore(ABC):
             ``None`` leaves unchanged.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def restore_session_settings_if_matches(
+        self,
+        conversation_id: str,
+        *,
+        previous: Conversation,
+        attempted: Conversation,
+        restore_effort: bool = True,
+        restore_model: bool = False,
+    ) -> None:
+        """Restore a refused effort update without overwriting a newer selection.
+
+        Each setting is compared and restored atomically. When ``restore_model``
+        is true, also undo the model selection from a combined PATCH that was
+        aborted before forwarding its model change. Preserve other overrides.
+
+        :param conversation_id: Conversation whose settings were refused.
+        :param previous: Snapshot before persisting the requested settings.
+        :param attempted: Snapshot returned by that persistence operation.
+        :param restore_effort: Whether the refused effort needs rollback; false when
+            a newer write already replaced it.
+        :param restore_model: Whether the unforwarded model change also needs rollback.
         """
         ...
 
@@ -1443,6 +1473,19 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
+        """Set idle only while this runner still owns a non-failed session.
+
+        Match the current runner binding in the update, without changing labels
+        or ``updated_at``. A failed status must survive teardown reconciliation.
+
+        :param conversation_id: Session whose runner was intentionally stopped.
+        :param runner_id: The stopped runner, which may have been replaced.
+        :returns: Whether the conditional update matched the session.
+        """
+        ...
+
+    @abstractmethod
     def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
         """Atomically settle a stale running session to idle.
 
@@ -1546,6 +1589,23 @@ class ConversationStore(ABC):
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
+        """
+        ...
+
+    @abstractmethod
+    def list_runner_session_statuses(
+        self, runner_id: str, *, after: str | None = None, limit: int = 200
+    ) -> list[tuple[str, str | None]]:
+        """Read a bounded page of session IDs and live statuses for runner teardown.
+
+        Include archived sessions. Read bindings consistently with runner writes,
+        in ascending session-ID order; use the last ID as the next page's cursor.
+        A short page ends iteration. Do not hydrate conversation content or labels.
+
+        :param runner_id: The runner being stopped.
+        :param after: Exclusive session-ID cursor, or ``None`` for the first page.
+        :param limit: Maximum number of rows, between 1 and 1000.
+        :returns: ``(session_id, live_status)`` pairs; status can be unknown (``None``).
         """
         ...
 
@@ -1868,74 +1928,36 @@ class ConversationStore(ABC):
         """
         ...
 
-    @abstractmethod
-    def switch_conversation_agent(
-        self,
-        conversation_id: str,
-        *,
-        new_agent_id: str,
-        new_agent_name: str,
-        new_agent_bundle_location: str,
-        new_agent_description: str | None,
-        copy_model_settings: bool,
-        carry_history_into_native: bool,
-        presentation_labels: dict[str, str],
-        previous_builtin_id: str | None,
-    ) -> Conversation:
+    def list_session_roots_for_agent(self, agent_id: str, limit: int) -> list[str]:
         """
-        Rebind a session in place to a different (cloned) agent.
+        Up to *limit* distinct spawn-tree roots of sessions that use *agent_id*.
 
-        Unlike :meth:`fork_conversation`, this mutates the SAME
-        conversation row — the transcript, comments, files, host,
-        and workspace are untouched; only the agent/harness changes.
-        In one transaction it: deletes the session's current
-        session-scoped agent (now unreferenced once ``agent_id`` is
-        repointed), creates a new session-scoped agent from the
-        supplied bundle, points ``agent_id`` at it, applies the
-        model-settings and label deltas below, and clears
-        ``external_session_id`` (the old harness's native runtime
-        state). The whole operation is atomic: any failure rolls back
-        and the session stays on its current agent.
+        Forks of one user's sessions share an agent row, so several roots can
+        use it. Lets a caller be authorized by READ on any of them. Reads a
+        bounded number of rows, so an agent used very widely may return fewer.
+        Default: none (stores without the lookup authorize against one root only).
 
-        The replacement agent's ``created_by`` is left unset, so it is
-        admin-only to mutate until a full switch implementation assigns
-        the session owner (the delete is also not yet reference-safe for
-        an agent shared via reuse or named sub-agents).
-
-        :param conversation_id: Session to switch, e.g.
-            ``"conv_abc123"``.
-        :param new_agent_id: Pre-generated id for the new
-            session-scoped agent, e.g. ``"ag_def456"``.
-        :param new_agent_name: Name for the new agent row, e.g.
-            ``"Codex (switch ag_def456)"``.
-        :param new_agent_bundle_location: Artifact-store key of the
-            target built-in's bundle to clone, e.g.
-            ``"ag_builtin/abcd1234"``.
-        :param new_agent_description: Optional description from the
-            target's spec. ``None`` leaves the column NULL.
-        :param copy_model_settings: When ``True``, keep the session's
-            existing ``model_override`` / ``reasoning_effort`` (the
-            switch stays in the same provider family). When ``False``,
-            both are reset to ``None`` so the new agent's defaults
-            apply (a cross-family switch — a model id is provider-bound).
-        :param carry_history_into_native: When ``True``, stamp
-            :data:`FORK_CARRY_HISTORY_LABEL_KEY` so a native target
-            rebuilds its transcript from this session's own AP items on
-            the next turn; when ``False``, that label is removed. Set by
-            the route only when the target is native AND same-family.
-        :param presentation_labels: Replace the session's
-            ``omnigent.ui`` / ``omnigent.wrapper`` labels with these so
-            the UI mode matches the TARGET harness (native →
-            ``{ui: terminal, wrapper: ...}``; SDK → ``{}`` → chat mode).
-        :param previous_builtin_id: Built-in agent id the session is
-            switching away from, stamped as
-            :data:`SWITCH_PREVIOUS_BUILTIN_LABEL_KEY` for a one-click
-            "Switch back". ``None`` leaves it unset.
-        :returns: The updated :class:`Conversation`.
-        :raises LookupError: If no conversation with *conversation_id*
-            exists.
+        :param agent_id: Agent id, e.g. ``"0f1a2b3c..."``.
+        :param limit: Most roots to return, e.g. ``50``.
+        :returns: Distinct root conversation ids, at most *limit*.
         """
-        ...
+        del agent_id, limit
+        return []
+
+    def count_sessions_for_agent(self, agent_id: str, cap: int) -> int:
+        """
+        Count sessions that use *agent_id*, reading at most *cap* of them.
+
+        Any kind, archived included. Default: one bounded conversation page.
+
+        :param agent_id: Agent id, e.g. ``"0f1a2b3c..."``.
+        :param cap: Most sessions to count, e.g. ``101``.
+        :returns: The count, at most *cap*.
+        """
+        page = self.list_conversations(
+            limit=cap, kind=None, agent_id=agent_id, include_archived=True
+        )
+        return len(page.data)
 
     @abstractmethod
     def has_other_live_session_in_workspace(

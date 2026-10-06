@@ -38,6 +38,7 @@ from omnigent.errors import (
     StaleCursorError,
     restart_on_stale_cursor,
 )
+from omnigent.harness_aliases import is_claude_sdk_harness_name
 from omnigent.inner.model_egress import (
     UCODE_SIGNER_BINDING_ID,
     registered_model_provider_binding,
@@ -45,6 +46,7 @@ from omnigent.inner.model_egress import (
 from omnigent.llms import Client as LLMClient
 from omnigent.models.model_catalog import resolve_catalog_model
 from omnigent.models.model_resolver import ModelResolutionError
+from omnigent.onboarding.ambient import claude_managed_gateway
 from omnigent.onboarding.databricks_config import (
     get_workspace_url_for_profile,
 )
@@ -1127,7 +1129,10 @@ def _resolve_provider_for_build(
        builders thread the key themselves).
     4. The per-family global default (``providers: … default: true``), then an
        ambient-detected default.
-    5. (``for_launch`` only) the first credential that can serve the family even
+    5. For claude-sdk, a configured Claude CLI subscription backed by managed
+       credentials. The CLI owns its auth and default model, even when the
+       subscription detection was deduplicated against a saved entry.
+    6. (``for_launch`` only) the first credential that can serve the family even
        though it is not marked default — so a launch credentials the head (e.g.
        Debby's codex head with only a never-defaulted Databricks workspace)
        rather than failing with "Invalid API key". Off for the readout / cost
@@ -1138,7 +1143,7 @@ def _resolve_provider_for_build(
     :param for_launch: ``True`` for the spawn-env builders (permissive: fold
         legacy Databricks credentials into the provider path and fall back to
         the first available credential). ``False`` (readout / cost / native)
-        keeps strict, config-only resolution with no synthesis or fallback.
+        omits legacy synthesis and the arbitrary first-available fallback.
     :param actual_harness: Preserve a native harness identity when its transport
         reuses an SDK provider adapter.
     :returns: The :class:`ProviderEntry` to route through, or ``None``.
@@ -1159,6 +1164,14 @@ def _resolve_provider_for_build(
         # ambient detections, so a spec may name a detected provider too.
         providers = load_providers(effective_config_with_detected(explicit_config))
         entry = providers.get(auth.name)
+        if entry is None and os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
+            # The managed-sandbox overlay replaces the local providers block, so an
+            # explicitly named provider from ~/.omnigent/config.yaml would vanish.
+            # Server bindings already won above; fall back to the local config.
+            from omnigent.onboarding.provider_config import _load_config
+
+            local_providers = load_providers(effective_config_with_detected(_load_config()))
+            entry = local_providers.get(auth.name)
         if entry is None:
             raise OmnigentError(
                 f"executor.auth references provider {auth.name!r}, but no such provider is "
@@ -1210,6 +1223,16 @@ def _resolve_provider_for_build(
     ambient_default = default_provider_for_harness(effective, harness)
     if ambient_default is not None:
         return ambient_default
+    # A saved CLI subscription suppresses its ambient detection. Keep managed
+    # Claude auth/model ahead of unrelated, unselected saved API keys.
+    if (
+        harness_type == "claude-sdk"
+        and is_claude_sdk_harness_name(identity)
+        and claude_managed_gateway()[1]
+    ):
+        for entry in load_providers(effective).values():
+            if entry.kind == SUBSCRIPTION_KIND and entry.cli == "claude":
+                return entry
     # Launch-only last resort: no default anywhere, but a credential that serves
     # this family is configured (e.g. a Databricks workspace the user added but
     # never set as the default). The runner is the one chokepoint every head

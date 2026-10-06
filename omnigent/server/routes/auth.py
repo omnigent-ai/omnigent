@@ -1,9 +1,18 @@
-"""OIDC authentication routes: login, callback, logout, CLI login.
+"""OIDC authentication routes: login, callback, logout, CLI and native login.
 
 Provides ``/auth/login``, ``/auth/callback``, ``/auth/logout``,
-``/auth/cli-login``, and ``/auth/cli-poll`` endpoints that implement
-the full OIDC authorization code flow with PKCE. The ``cli-login``
-/ ``cli-poll`` pair supports the ``omnigent login`` CLI command.
+``/auth/cli-login``, ``/auth/cli-poll``, and ``/auth/native-token``
+endpoints that implement the full OIDC authorization code flow with
+PKCE. The ``cli-login`` / ``cli-poll`` pair supports the ``omnigent
+login`` CLI command.
+
+Native apps (the desktop shell) sign in through the system browser with
+an RFC 8252 loopback redirect: ``/auth/login`` accepts a loopback
+``native_redirect_uri`` plus a PKCE ``code_challenge``, the callback
+redirects the browser to that loopback with a one-time code, and the
+app exchanges the code and its verifier at ``/auth/native-token``. The
+code only reaches the machine whose browser signed in, and is useless
+without the verifier held by the app that started the flow.
 
 See ``designs/OIDC_AUTH.md`` for the complete design.
 
@@ -12,17 +21,20 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import hmac
 import logging
+import re
 import secrets
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 import jwt
 from fastapi import APIRouter, Query, Request
-from starlette.responses import RedirectResponse, Response
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
@@ -38,6 +50,7 @@ from omnigent.server.oidc import (
     mint_session_cookie,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
+from omnigent.server.routes._oauth import NO_STORE_HEADERS, oauth_error
 from omnigent.server.routes.device_auth import issue_login_grant
 from omnigent.stores.permission_store import PermissionStore
 
@@ -48,6 +61,18 @@ _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
+# A native sign-in code is exchanged by the app right after the browser
+# hands it over, so it only needs to outlive one loopback round trip.
+_NATIVE_CODE_TTL_SECONDS = 60
+# RFC 8252 §7.3 loopback literals. ``localhost`` is excluded (§8.3): its
+# resolution can be redirected away from this machine.
+_NATIVE_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+_NATIVE_PARAMS = ("native_redirect_uri", "native_state", "code_challenge", "code_challenge_method")
+# RFC 7636: an S256 challenge is a 43-char base64url SHA-256 digest, and a
+# verifier is 43-128 unreserved characters.
+_S256_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+_CODE_VERIFIER_RE = re.compile(r"[A-Za-z0-9._~-]{43,128}")
+_NATIVE_STATE_RE = re.compile(r"[A-Za-z0-9._~-]{1,256}")
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -79,6 +104,27 @@ class _CliTicket:
     token: str | None = None
     user_id: str | None = None
     refresh_token: str | None = None
+
+
+@dataclass
+class _NativeCode:
+    """A one-time code issued to a native app's loopback redirect.
+
+    Created by ``/auth/callback`` for a native sign-in and consumed by
+    ``POST /auth/native-token``.
+
+    :param user_id: The authenticated user's email.
+    :param code_challenge: The PKCE S256 challenge the app sent to
+        ``/auth/login``; the exchange must present its verifier.
+    :param redirect_uri: The loopback URI the code was delivered to; the
+        exchange must name the same URI.
+    :param created_at: Unix timestamp when the code was issued.
+    """
+
+    user_id: str
+    code_challenge: str
+    redirect_uri: str
+    created_at: float = field(default_factory=time.time)
 
 
 def create_auth_router(
@@ -115,7 +161,8 @@ def create_auth_router(
         ``omnigent login``. ``None`` keeps the legacy
         session-JWT-only response.
     :returns: A FastAPI router with ``/login``, ``/callback``,
-        ``/logout`` (and ``/invite`` when invites are enabled).
+        ``/logout``, ``/cli-login``, ``/cli-poll``, ``/native-token``,
+        ``/users`` (and ``/invite`` when invites are enabled).
     """
     router = APIRouter()
     config = auth_provider._oidc_config
@@ -148,6 +195,27 @@ def create_auth_router(
     # In-memory store for CLI login tickets. Tickets are short-lived
     # (5 min) and single-use. Keyed by ticket ID.
     _cli_tickets: dict[str, _CliTicket] = {}
+    # One-time codes for native (loopback) sign-ins. Single-use, 60 s.
+    _native_codes: dict[str, _NativeCode] = {}
+
+    def _verified_state(request: Request, state: str | None) -> dict[str, object] | None:
+        """Return the signed auth state when its cookie is valid and matches ``state``."""
+        raw = request.cookies.get(_state_cookie)
+        if not state or not raw:
+            return None
+        try:
+            payload = jwt.decode(raw, config.cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        return payload if payload.get("state") == state else None
+
+    def _native_failure(native: Mapping[str, str], error: str, description: str) -> Response:
+        """Report a failed native sign-in to the app's loopback listener."""
+        response = _native_redirect(native, {"error": error, "error_description": description})
+        response.delete_cookie(
+            key=_state_cookie, path="/", secure=_secure, httponly=True, samesite="lax"
+        )
+        return response
 
     @router.get("/login")
     async def login(request: Request) -> Response:
@@ -178,6 +246,19 @@ def create_auth_router(
         # Optional CLI login ticket — threaded through the state
         # cookie so the callback can fulfill it.
         ticket = request.query_params.get("ticket")
+        # Optional native (loopback) sign-in — also threaded through the
+        # signed state, so the callback knows where to deliver the code.
+        try:
+            native = _parse_native_sign_in(request.query_params)
+        except ValueError:
+            return JSONResponse(
+                status_code=400, content={"error": "Invalid native sign-in parameters"}
+            )
+        if native is not None and ticket:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "A native sign-in cannot also carry a CLI ticket"},
+            )
         # Optional OIDC invite token — threaded through the signed state
         # cookie (not a bare query param) so it can't be tampered with
         # before the callback redeems it. Only meaningful when invites
@@ -191,7 +272,7 @@ def create_auth_router(
         reauth = request.query_params.get("reauth") == "1" and config.provider_type != "github"
 
         # Store state + code_verifier in a short-lived signed cookie.
-        state_payload: dict[str, str | int] = {
+        state_payload: dict[str, object] = {
             "state": state,
             "code_verifier": code_verifier,
             "return_to": return_to,
@@ -199,6 +280,8 @@ def create_auth_router(
         }
         if ticket:
             state_payload["ticket"] = ticket
+        if native is not None:
+            state_payload["native"] = native
         if invite:
             state_payload["invite"] = invite
         if reauth:
@@ -223,7 +306,13 @@ def create_auth_router(
             # rather than silently reusing an existing IdP session.
             params["prompt"] = "login"
             params["max_age"] = "0"
-        auth_url = config.authorization_endpoint + "?" + urlencode(params)
+        endpoint = urlsplit(config.authorization_endpoint)
+        query = [
+            (name, value)
+            for name, value in parse_qsl(endpoint.query, keep_blank_values=True)
+            if name not in params
+        ]
+        auth_url = urlunsplit(endpoint._replace(query=urlencode(query + list(params.items()))))
 
         response = RedirectResponse(url=auth_url, status_code=302)
         response.set_cookie(
@@ -256,6 +345,15 @@ def create_auth_router(
         code = request.query_params.get("code")
         state = request.query_params.get("state")
         if not code or not state:
+            # An IdP error (e.g. the user declined) arrives without a code.
+            # A native sign-in hears about it at its loopback listener.
+            early_native = _native_from_state(_verified_state(request, state))
+            if early_native is not None:
+                return _native_failure(
+                    early_native,
+                    "access_denied",
+                    "Sign-in was cancelled or declined at the identity provider.",
+                )
             return JSONResponse(
                 status_code=400,
                 content={"error": "Missing code or state parameter"},
@@ -283,6 +381,15 @@ def create_auth_router(
                 content={"error": "State mismatch (possible CSRF)"},
             )
 
+        native = _native_from_state(state_payload)
+
+        def fail(status_code: int, message: str, error: str = "access_denied") -> Response:
+            # A native sign-in hears about failures at its loopback listener
+            # instead of waiting out its timeout.
+            if native is not None:
+                return _native_failure(native, error, message)
+            return JSONResponse(status_code=status_code, content={"error": message})
+
         code_verifier = state_payload.get("code_verifier", "")
         # Re-sanitize on the way out: /login sanitizes at ingest, but a
         # cookie minted before this fix (or by a tampering attempt that
@@ -296,9 +403,10 @@ def create_auth_router(
             "code": code,
             "redirect_uri": config.redirect_uri,
             "client_id": config.client_id,
-            "client_secret": config.client_secret,
             "code_verifier": code_verifier,
         }
+        if config.client_secret:
+            token_data["client_secret"] = config.client_secret
 
         async with httpx.AsyncClient() as client:
             # GitHub requires Accept: application/json to get JSON
@@ -317,18 +425,12 @@ def create_auth_router(
                     token_resp.status_code,
                     token_resp.text,
                 )
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "Token exchange failed"},
-                )
+                return fail(400, "Token exchange failed", "server_error")
 
             token_json = _json_object(_response_json(token_resp))
             if token_json is None:
                 _logger.error("Token exchange returned a non-object JSON response")
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "Token exchange returned an invalid response"},
-                )
+                return fail(400, "Token exchange returned an invalid response", "server_error")
 
             # Extract user email.
             if config.provider_type == "github":
@@ -341,10 +443,7 @@ def create_auth_router(
                 email = _resolve_oidc_email(token_json, config)
 
         if not email:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Could not determine user email from IdP"},
-            )
+            return fail(400, "Could not determine user email from IdP", "server_error")
 
         # Forced re-auth verification (anti-phishing device-consent gate).
         # /login stamped reauth_at when it sent prompt=login + max_age=0.
@@ -361,10 +460,7 @@ def create_auth_router(
                     "Rejecting reauth login: IdP id_token has no auth_time claim, "
                     "so forced re-authentication (prompt=login) cannot be verified"
                 )
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": "IdP did not confirm re-authentication"},
-                )
+                return fail(403, "IdP did not confirm re-authentication")
             if auth_time < reauth_at:
                 _logger.warning(
                     "Rejecting reauth login: id_token auth_time %d predates the "
@@ -372,10 +468,7 @@ def create_auth_router(
                     auth_time,
                     reauth_at,
                 )
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": "IdP did not re-authenticate the user"},
-                )
+                return fail(403, "IdP did not re-authenticate the user")
 
         # Normalize email to lowercase.
         email = email.lower()
@@ -399,17 +492,11 @@ def create_auth_router(
         # means "no restriction" (admit any IdP user) — the OSS default.
         if not admission.is_admitted(email):
             domain = email.rsplit("@", 1)[-1] if "@" in email else ""
-            return JSONResponse(
-                status_code=403,
-                content={"error": f"Email domain {domain!r} is not permitted on this server"},
-            )
+            return fail(403, f"Email domain {domain!r} is not permitted on this server")
 
         # Reject reserved user names.
         if email in _RESERVED_USERS:
-            return JSONResponse(
-                status_code=403,
-                content={"error": f"Reserved user name {email!r}"},
-            )
+            return fail(403, f"Reserved user name {email!r}")
 
         # Ensure user exists in the permission store, then apply the
         # file-backed admin list. Promotion is additive (never demotes)
@@ -419,6 +506,23 @@ def create_auth_router(
         if permission_store is not None:
             permission_store.ensure_user(email)
             promote_if_listed(admin_list, permission_store, email)
+
+        # A native sign-in gets a one-time code at its loopback listener;
+        # the session is minted when the app exchanges it with its verifier.
+        # The browser gets no session cookie: it never asked for one.
+        if native is not None:
+            _evict_expired_native_codes(_native_codes)
+            native_code = secrets.token_urlsafe(32)
+            _native_codes[native_code] = _NativeCode(
+                user_id=email,
+                code_challenge=native["code_challenge"],
+                redirect_uri=native["redirect_uri"],
+            )
+            response = _native_redirect(native, {"code": native_code})
+            response.delete_cookie(
+                key=_state_cookie, path="/", secure=_secure, httponly=True, samesite="lax"
+            )
+            return response
 
         # Mint session cookie.
         session_jwt = mint_session_cookie(
@@ -459,7 +563,7 @@ def create_auth_router(
                 "padding:60px'>"
                 "<h2>Login successful</h2>"
                 f"<p>Authenticated as <strong>{safe_email}</strong>.</p>"
-                "<p>You can close this tab and return to the terminal.</p>"
+                "<p>You can close this tab and return to where you started signing in.</p>"
                 "</body></html>"
             )
             resp = HTMLResponse(content=html)
@@ -655,6 +759,67 @@ def create_auth_router(
             content["refresh_token"] = refresh_token
         return JSONResponse(status_code=200, content=content)
 
+    # ── Native (loopback) sign-in ───────────────────────────────────────────
+
+    @router.post("/native-token")
+    async def native_token(request: Request) -> Response:
+        """Exchange a native sign-in code for a session token.
+
+        The form carries ``code`` (delivered to the app's loopback
+        listener by ``/auth/callback``), the PKCE ``code_verifier`` whose
+        S256 digest the app sent to ``/auth/login``, and the same
+        ``redirect_uri``. A code is consumed by its first exchange
+        attempt, whatever the outcome.
+
+        :param request: The incoming form-encoded POST.
+        :returns: 200 ``{"token", "user_id", "expires_in"}`` plus
+            ``refresh_token`` when a grant store is wired, or a 400
+            RFC 6749 error (``invalid_request`` / ``invalid_grant``).
+        """
+        form = await request.form()
+        code = form.get("code")
+        verifier = form.get("code_verifier")
+        redirect_uri = form.get("redirect_uri")
+        if not isinstance(code, str) or not code:
+            return oauth_error("invalid_request")
+        _evict_expired_native_codes(_native_codes)
+        # Consumed before anything else is checked, so even a malformed
+        # attempt burns the code.
+        pending = _native_codes.pop(code, None)
+        if not isinstance(verifier, str) or not isinstance(redirect_uri, str):
+            return oauth_error("invalid_request")
+        if (
+            pending is None
+            or time.time() - pending.created_at > _NATIVE_CODE_TTL_SECONDS
+            or redirect_uri != pending.redirect_uri
+            or not _CODE_VERIFIER_RE.fullmatch(verifier)
+            or not hmac.compare_digest(derive_code_challenge(verifier), pending.code_challenge)
+        ):
+            return oauth_error("invalid_grant")
+
+        content: dict[str, object] = {
+            "token": mint_session_cookie(
+                user_id=pending.user_id,
+                cookie_secret=config.cookie_secret,
+                ttl_hours=config.session_ttl_hours,
+                provider=config.provider_type,
+            ),
+            "user_id": pending.user_id,
+            "expires_in": config.session_ttl_hours * 3600,
+        }
+        # The desktop renews from this grant instead of reopening the
+        # browser when the session expires. Best-effort, as for CLI logins.
+        if device_grant_store is not None:
+            try:
+                content["refresh_token"] = issue_login_grant(
+                    device_grant_store,
+                    user_id=pending.user_id,
+                    cookie_secret=config.cookie_secret,
+                )
+            except Exception:
+                _logger.exception("native sign-in: refresh grant issuance failed")
+        return JSONResponse(status_code=200, content=content, headers=NO_STORE_HEADERS)
+
     # ── Admin: read-only user list ────────────────────────────────
 
     @router.get("/users")
@@ -727,6 +892,97 @@ def _evict_expired_tickets(tickets: dict[str, _CliTicket]) -> None:
     expired = [k for k, v in tickets.items() if now - v.created_at > _CLI_TICKET_TTL_SECONDS]
     for k in expired:
         del tickets[k]
+
+
+def _evict_expired_native_codes(codes: dict[str, _NativeCode]) -> None:
+    """Remove native sign-in codes past their TTL.
+
+    :param codes: The mutable code dict to prune.
+    """
+    now = time.time()
+    expired = [k for k, v in codes.items() if now - v.created_at > _NATIVE_CODE_TTL_SECONDS]
+    for k in expired:
+        del codes[k]
+
+
+def _is_loopback_redirect_uri(raw: str) -> bool:
+    """Whether ``raw`` is an RFC 8252 loopback redirect a native app can listen on.
+
+    Only ``http://127.0.0.1:<port>/...`` and ``http://[::1]:<port>/...``
+    qualify: an explicit port, no userinfo, query, or fragment. Anything
+    else could deliver the sign-in code off this machine.
+
+    :param raw: The ``native_redirect_uri`` query parameter, e.g.
+        ``"http://127.0.0.1:53682/callback"``.
+    :returns: True when the URI is an acceptable loopback redirect.
+    """
+    if not raw or "?" in raw or "#" in raw or "\\" in raw or any(c.isspace() for c in raw):
+        return False
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "http"
+        and parts.hostname in _NATIVE_LOOPBACK_HOSTS
+        and port is not None
+        and port > 0
+        and parts.username is None
+        and parts.password is None
+    )
+
+
+def _parse_native_sign_in(params: Mapping[str, str]) -> dict[str, str] | None:
+    """Read the native sign-in parameters of a ``/auth/login`` request.
+
+    :param params: The request's query parameters.
+    :returns: ``{"redirect_uri", "state", "code_challenge"}``, or ``None``
+        when the request carries no native parameter.
+    :raises ValueError: When any native parameter is present but the set
+        is incomplete or invalid. Only S256 challenges are accepted.
+    """
+    if not any(name in params for name in _NATIVE_PARAMS):
+        return None
+    redirect_uri = params.get("native_redirect_uri", "")
+    native_state = params.get("native_state", "")
+    challenge = params.get("code_challenge", "")
+    if (
+        params.get("code_challenge_method") != "S256"
+        or not _is_loopback_redirect_uri(redirect_uri)
+        or not _NATIVE_STATE_RE.fullmatch(native_state)
+        or not _S256_CHALLENGE_RE.fullmatch(challenge)
+    ):
+        raise ValueError("invalid native sign-in parameters")
+    return {"redirect_uri": redirect_uri, "state": native_state, "code_challenge": challenge}
+
+
+def _native_from_state(state_payload: Mapping[str, object] | None) -> dict[str, str] | None:
+    """Return the native sign-in recorded in a verified auth state, if any.
+
+    :param state_payload: The decoded, signature-checked state cookie.
+    :returns: The dict :func:`_parse_native_sign_in` produced at login, or
+        ``None`` for a browser or CLI-ticket sign-in.
+    """
+    native = state_payload.get("native") if state_payload else None
+    if not isinstance(native, dict):
+        return None
+    fields = ("redirect_uri", "state", "code_challenge")
+    if not all(isinstance(native.get(name), str) for name in fields):
+        return None
+    return {name: native[name] for name in fields}
+
+
+def _native_redirect(native: Mapping[str, str], params: dict[str, str]) -> RedirectResponse:
+    """Redirect the browser to a native app's loopback listener.
+
+    :param native: The native sign-in from :func:`_native_from_state`.
+    :param params: Query parameters to deliver, e.g. ``{"code": ...}``;
+        the app's ``state`` is appended.
+    :returns: A 302 to the loopback redirect URI.
+    """
+    query = urlencode({**params, "state": native["state"]})
+    return RedirectResponse(url=f"{native['redirect_uri']}?{query}", status_code=302)
 
 
 def _sanitize_return_to(raw: str | None) -> str:
@@ -881,7 +1137,7 @@ def _validate_id_token(
         return jwt.decode(
             id_token,
             signing_key.key,
-            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+            algorithms=["RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
         )

@@ -150,7 +150,7 @@ function QueuedRow({
               className={cn("shrink-0", attachmentNames.length > 1 && "max-sm:hidden")}
               aria-hidden="true"
             />
-            <span className="truncate">{attachmentNames[0]}</span>
+            <span className="min-w-6 truncate">{attachmentNames[0]}</span>
             {attachmentNames.length > 1 && (
               <>
                 <span

@@ -12,7 +12,10 @@ const tick = () =>
     setImmediate(resolve);
   });
 
-async function harness(t, { cancel = async () => true, search = "" } = {}) {
+async function harness(
+  t,
+  { cancel = async () => true, search = "", recents = [SERVER], serverNames } = {},
+) {
   const dom = new JSDOM(fs.readFileSync(path.join(__dirname, "../setup/index.html"), "utf8"), {
     url: `https://setup.example/${search}`,
     runScripts: "outside-only",
@@ -24,7 +27,8 @@ async function harness(t, { cancel = async () => true, search = "" } = {}) {
   dom.window.omnigentSetup = {
     getServerUrl: async () => SERVER,
     getManagedServers: async () => [],
-    getRecentServers: async () => [SERVER],
+    getRecentServers: async () => recents,
+    ...(serverNames ? { getServerNames: async () => serverNames } : {}),
     onConnectionProgress: (listener) => {
       progress = listener;
       return () => {
@@ -162,4 +166,23 @@ it("does not pretend login stopped if cancellation itself fails", async (t) => {
   assert.equal(h.label.textContent, "Authenticating…");
   assert.equal(h.cancel.disabled, false);
   assert.match(h.error.textContent, /Could not cancel sign-in/);
+});
+
+it("names recent servers that named themselves, keeping the host visible", async (t) => {
+  const h = await harness(t, {
+    recents: ["https://omni.example/", "http://localhost:6767/"],
+    serverNames: { "https://omni.example": "Acme Engineering" },
+  });
+  await tick();
+  const labels = [...h.document.querySelectorAll("#recents-list .recent-btn")].map(
+    (button) => button.textContent,
+  );
+  assert.deepEqual(labels, ["Acme Engineering (omni.example)", "localhost:6767"]);
+});
+
+it("lists hosts when the shell has no server names", async (t) => {
+  const h = await harness(t, { recents: ["https://omni.example/"] });
+  await tick();
+  const [button] = h.document.querySelectorAll("#recents-list .recent-btn");
+  assert.equal(button.textContent, "omni.example");
 });

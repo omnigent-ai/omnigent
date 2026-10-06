@@ -53,7 +53,6 @@ import {
   FilesIcon,
   KeyRoundIcon,
   Loader2Icon,
-  LaptopMinimalIcon,
   LogOutIcon,
   MessagesSquareIcon,
   MinusIcon,
@@ -74,13 +73,12 @@ import {
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
+import { SettingsGroup } from "@/components/SettingsGroup";
+import { SettingsLabel } from "@/components/SettingsLabel";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
-import {
-  ModePreview,
-  PaletteChip,
-  PaletteSwatchPreview,
-} from "@/components/theme/AppearancePreviews";
+import { IconSegmentedControl } from "@/components/theme/IconSegmentedControl";
+import { PaletteChip, PaletteSwatchPreview } from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -119,6 +117,7 @@ import {
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -138,14 +137,15 @@ import { isThemeMode, normalizeThemeMode, type ThemeMode } from "@/components/th
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import {
   applyDesktopUiFontSize,
+  applyStoredUiFontSize,
   applyUiFontFamily,
   clampUiFontSizePx,
   readUiFontFamily,
   readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
-  UI_FONT_SIZE_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
+  UI_FONT_SIZE_MOBILE_QUERY,
   UI_FONT_SIZE_STEP,
   writeUiFontFamily,
   writeUiFontSizePx,
@@ -206,6 +206,10 @@ import {
 } from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
+  readDeleteWorktreesOnArchive,
+  writeDeleteWorktreesOnArchive,
+} from "@/lib/archiveWorktreePreferences";
+import {
   archivedAtSeconds,
   readRetentionDays,
   writeRetentionDays,
@@ -257,7 +261,7 @@ import {
   readBackgroundSessionTitlesEnabled,
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
-import { SettingsCustomizeSection } from "./settings/SettingsCustomizeSection";
+import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { ReviewImportsPanel } from "@/components/onboarding/HostImportReview";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
@@ -285,11 +289,21 @@ export function SettingsPage() {
   // A login session exists (accounts OR OIDC) when the server advertises a
   // login_url; gates the Account section so SSO users get it too.
   const hasAuthSession = info !== "loading" && info.login_url !== null;
-  const { section, subSection } = useSettingsRoute();
+  const { section } = useSettingsRoute();
   // Per-section page view: `settings.appearance`, `settings.account`, etc. The
   // hook re-keys on pathname, so switching sections re-fires under the new id.
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
   useOmnigentPageView(`settings.${section}`);
+
+  const pageWrapperSettings = useMemo(() => {
+    if (section === "harnesses") {
+      return {
+        maxWidthClassName: "max-w-4xl",
+        contentClassName: "px-4 md:px-8",
+      };
+    }
+    return undefined;
+  }, [section]);
 
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —
@@ -312,17 +326,18 @@ export function SettingsPage() {
     );
   }
 
-  // Nested sections own their own layout. useSettingsRoute only sets
-  // subSection for a valid, feature-enabled customize route, so no extra
-  // flag check is needed here.
-  if (section === "customize" && subSection) {
-    return <SettingsCustomizeSection subSection={subSection} />;
-  }
-
   return (
-    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+    <PageScroll
+      contentClassName="px-4 md:px-8"
+      extraBottom="2.5rem"
+      // Reserve the scrollbar's width so the centered column doesn't shift when
+      // switching between a page or tab that scrolls and one that doesn't.
+      className="[scrollbar-gutter:stable]"
+      {...pageWrapperSettings}
+    >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
+      {section === "harnesses" && <SettingsHarnessesSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
@@ -349,9 +364,14 @@ function Section({
 }) {
   return (
     <section>
-      <h1 className="text-2xl font-semibold">{title}</h1>
+      <h1 className="settings-page-title text-2xl font-semibold">{title}</h1>
       {description && (
-        <p className={cn("mt-1 text-muted-foreground", descriptionClassName ?? "text-ui")}>
+        <p
+          className={cn(
+            "mt-1 text-muted-foreground max-md:hidden",
+            descriptionClassName ?? "text-ui",
+          )}
+        >
           {description}
         </p>
       )}
@@ -361,7 +381,7 @@ function Section({
 }
 
 const themeCards: { mode: ThemeMode; label: string; icon: typeof SunIcon }[] = [
-  { mode: "system", label: "System", icon: LaptopMinimalIcon },
+  { mode: "system", label: "System", icon: MonitorIcon },
   { mode: "light", label: "Light", icon: SunIcon },
   { mode: "dark", label: "Dark", icon: MoonIcon },
 ];
@@ -406,7 +426,7 @@ function iconCardBody(Icon: ComponentType<{ className?: string }>, label: string
   return (
     <>
       <Icon aria-hidden="true" className="size-6 text-muted-foreground" />
-      <span className="text-ui font-medium">{label}</span>
+      <span className="text-ui font-normal md:font-medium">{label}</span>
     </>
   );
 }
@@ -425,12 +445,7 @@ function ThemeSubsection({
 }) {
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-col">
-        <span id={labelId} className="text-ui font-medium">
-          {title}
-        </span>
-        <span className="text-sm text-muted-foreground">{helper}</span>
-      </div>
+      <SettingsLabel label={title} labelId={labelId} description={helper} />
       {children}
     </div>
   );
@@ -442,30 +457,26 @@ function ModeControl() {
   const mode = normalizeThemeMode(theme);
   const labelId = useId();
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Mode"
-      helper="Follow your system, or force light or dark."
-    >
-      <CardRadioGroup<ThemeMode>
+    <div className="flex items-center justify-between gap-4">
+      <SettingsLabel
+        label="Mode"
+        labelId={labelId}
+        description="Follow your system, or force light or dark."
+        className="flex-1"
+      />
+      <IconSegmentedControl<ThemeMode>
         labelledBy={labelId}
         value={mode}
         onSelect={(next) => setTheme(next)}
         componentId="settings.appearance.theme_mode"
-        className="grid grid-cols-3 gap-3"
-        cardClassName="gap-2 p-2"
         items={themeCards.map((card) => ({
           value: card.mode,
           testId: `theme-${card.mode}`,
-          body: (
-            <>
-              <ModePreview variant={card.mode} />
-              <span className="text-center text-ui font-medium">{card.label}</span>
-            </>
-          ),
+          label: card.label,
+          icon: card.icon,
         }))}
       />
-    </ThemeSubsection>
+    </div>
   );
 }
 
@@ -478,25 +489,26 @@ function TerminalThemeControl() {
     writeTerminalThemeMode(next);
   }, []);
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Terminal theme"
-      helper="Use a light or dark terminal, or match the app."
-    >
-      <CardRadioGroup<TerminalThemeMode>
+    <div className="flex items-center justify-between gap-4">
+      <SettingsLabel
+        label="Terminal theme"
+        labelId={labelId}
+        description="Use a light or dark terminal, or match the app."
+        className="flex-1"
+      />
+      <IconSegmentedControl<TerminalThemeMode>
         labelledBy={labelId}
         value={mode}
         onSelect={choose}
         componentId="settings.appearance.terminal_theme"
-        className="grid grid-cols-3 gap-3"
-        cardClassName="items-center gap-2 p-4"
         items={terminalThemeCards.map((card) => ({
           value: card.mode,
           testId: `terminal-theme-${card.mode}`,
-          body: iconCardBody(card.icon, card.label),
+          label: card.label,
+          icon: card.icon,
         }))}
       />
-    </ThemeSubsection>
+    </div>
   );
 }
 
@@ -650,6 +662,10 @@ function ColorThemeControl() {
           dark: customSwatches.dark,
         }
       : selectedPalette!;
+  const paletteDescription =
+    selection === "custom"
+      ? `Based on ${PALETTES.find((palette) => palette.id === customTheme.basePalette)?.label ?? "Omnigent"}`
+      : selectedPalette?.blurb;
 
   return (
     <ThemeSubsection
@@ -663,14 +679,11 @@ function ColorThemeControl() {
             <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
               <PaletteSwatchPreview swatch={isDark ? selected.dark : selected.light} />
             </div>
-            <div className="min-w-0">
-              <div className="text-ui font-medium">Theme palette</div>
-              <div className="truncate text-sm text-muted-foreground">
-                {selection === "custom"
-                  ? `Based on ${PALETTES.find((palette) => palette.id === customTheme.basePalette)?.label ?? "Omnigent"}`
-                  : selectedPalette?.blurb}
-              </div>
-            </div>
+            <SettingsLabel
+              label="Theme palette"
+              description={paletteDescription}
+              descriptionClassName="truncate"
+            />
           </div>
           <Select
             value={selection}
@@ -723,12 +736,7 @@ function ColorThemeControl() {
             onChange={(tint) => updateCustomTheme({ tint })}
           />
           <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
-            <div>
-              <div className="text-ui font-medium">Contrast</div>
-              <div className="text-sm text-muted-foreground">
-                Separates text, borders, and surfaces.
-              </div>
-            </div>
+            <SettingsLabel label="Contrast" description="Separates text, borders, and surfaces." />
             <div className="flex w-52 items-center gap-3">
               <input
                 id="custom-theme-contrast"
@@ -752,12 +760,10 @@ function ColorThemeControl() {
             </div>
           </div>
           <div className="flex items-center justify-between gap-4 py-4">
-            <div>
-              <div className="text-ui font-medium">Translucent sidebars</div>
-              <div className="text-sm text-muted-foreground">
-                Lets the canvas show through the conversation and workspace rails.
-              </div>
-            </div>
+            <SettingsLabel
+              label="Translucent sidebars"
+              description="Lets the canvas show through the conversation and workspace rails."
+            />
             <Switch
               aria-label="Translucent sidebars"
               checked={editableTheme.translucentSidebar}
@@ -787,15 +793,11 @@ function HideUnconfiguredHarnessesControl() {
   }, []);
   return (
     <div className="flex items-start justify-between gap-6">
-      <div className="flex flex-col">
-        <span id={labelId} className="text-ui font-medium">
-          Hide unconfigured harnesses
-        </span>
-        <span className="text-sm text-muted-foreground">
-          Only show harnesses that are set up on the selected host in the new-chat picker. Harnesses
-          needing a CLI install or sign-in are hidden instead of badged.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Hide unconfigured harnesses"
+        labelId={labelId}
+        description="Only show harnesses that are set up on the selected host in the new-chat picker. Harnesses needing a CLI install or sign-in are hidden instead of badged."
+      />
       <Switch
         aria-labelledby={labelId}
         checked={value}
@@ -841,7 +843,6 @@ function AppearanceSection() {
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
-    applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
@@ -874,6 +875,7 @@ function AppearanceSection() {
         // localStorage access errors are non-fatal.
       }
     }
+    applyStoredUiFontSize();
 
     // Remount the controls so they re-read the freshly-cleared defaults from
     // localStorage rather than keeping their stale seeded state.
@@ -900,7 +902,7 @@ function AppearanceSection() {
       // Note: web-theme is stored as plain string by next-themes, not JSON.
       const themeMode = imported.settings["web-theme"];
       if (themeMode && isThemeMode(themeMode)) setTheme(themeMode);
-      applyDesktopUiFontSize(readUiFontSizePx());
+      applyStoredUiFontSize();
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
       applyCustomTheme(readCustomTheme());
@@ -918,115 +920,141 @@ function AppearanceSection() {
       description="Choose how Omnigent looks on this device."
       descriptionClassName="text-sm"
     >
-      <div key={resetKey} className="flex flex-col gap-8">
-        {isEmbedded ? (
-          <div className="flex flex-col gap-3">
-            <span className="text-ui font-medium">Theme</span>
-            <p className="text-sm text-muted-foreground">
-              Light and dark mode are configured in Databricks preferences.
-              {themeSettingsUrl ? (
-                <>
-                  {" "}
+      <div className="flex flex-col gap-6">
+        <div key={resetKey} className="flex flex-col gap-6">
+          <SettingsGroup title="Theme" testId="settings-group-theme">
+            {isEmbedded ? (
+              <div className="flex flex-col gap-3">
+                <SettingsLabel
+                  label="Theme"
+                  tooltipDescription="Light and dark mode are configured in Databricks preferences."
+                  description={
+                    <>
+                      Light and dark mode are configured in Databricks preferences.
+                      {themeSettingsUrl ? (
+                        <>
+                          {" "}
+                          <a
+                            href={themeSettingsUrl}
+                            className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+                          >
+                            Click to open Databricks user preferences page.
+                          </a>
+                          .
+                        </>
+                      ) : null}
+                    </>
+                  }
+                />
+                {themeSettingsUrl && (
                   <a
                     href={themeSettingsUrl}
-                    className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+                    className="text-sm font-medium text-primary underline underline-offset-2 md:hidden"
                   >
-                    Click to open Databricks user preferences page.
+                    Open Databricks preferences
                   </a>
-                  .
-                </>
-              ) : null}
-            </p>
-          </div>
-        ) : (
-          <ModeControl />
-        )}
+                )}
+              </div>
+            ) : (
+              <ModeControl />
+            )}
+            <div className="mt-4 border-t border-border pt-4">
+              <TerminalThemeControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <ColorThemeControl />
+            </div>
+          </SettingsGroup>
 
-        <TerminalThemeControl />
+          <SettingsGroup title="Chat defaults" testId="settings-group-chat">
+            <TranscriptViewDefaultControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <WorkspacePanelDefaultControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <WorkspaceTabDefaultControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <HideUnconfiguredHarnessesControl />
+            </div>
+          </SettingsGroup>
 
-        <ColorThemeControl />
+          <SettingsGroup title="Interface typography" testId="settings-group-interface-type">
+            <UiFontSizeControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <UiFontFamilyControl />
+            </div>
+          </SettingsGroup>
 
-        <TranscriptViewDefaultControl />
+          <SettingsGroup title="Code typography" testId="settings-group-code-type">
+            <UiCodeFontSizeControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <UiCodeFontFamilyControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <UiCodeFontWeightControl />
+            </div>
+          </SettingsGroup>
+        </div>
 
-        <WorkspacePanelDefaultControl />
-
-        <WorkspaceTabDefaultControl />
-
-        <HideUnconfiguredHarnessesControl />
-
-        <UiFontSizeControl />
-
-        <UiFontFamilyControl />
-
-        {/* Code font (Monaco + xterm) sits as its own rows — labelled in full
-            ("Code font size" / "Code font family" / "Code font weight") rather than under a shared
-            heading — so each control reads unambiguously next to the UI-font rows
-            above and it's clear these don't scale the surrounding chrome. */}
-        <UiCodeFontSizeControl />
-
-        <UiCodeFontFamilyControl />
-
-        <UiCodeFontWeightControl />
-      </div>
-
-      <div className="mt-8 flex items-center justify-end gap-2">
-        <Button
-          variant="outline"
-          size="sm"
-          data-testid="export-settings-button"
-          onClick={exportSettings}
-        >
-          <DownloadIcon className="size-4" />
-          Export
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          data-testid="import-settings-button"
-          onClick={() => {
-            setImportError(null);
-            setIsImportDialogOpen(true);
-          }}
-        >
-          <UploadIcon className="size-4" />
-          Import
-        </Button>
-        <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
-          <DialogTrigger asChild>
+        <SettingsGroup title="Settings data" testId="settings-group-data">
+          <div className="flex flex-wrap items-center justify-end gap-2">
             <Button
               variant="outline"
               size="sm"
-              data-testid="reset-appearance-button"
-              componentId="settings.appearance.open_reset_dialog"
+              data-testid="export-settings-button"
+              onClick={exportSettings}
             >
-              Reset to defaults
+              <DownloadIcon className="size-4" />
+              Export
             </Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Reset appearance?</DialogTitle>
-              <DialogDescription>
-                This will reset every appearance choice back to its default.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <DialogClose asChild>
-                <Button variant="outline" size="sm">
-                  Cancel
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="import-settings-button"
+              onClick={() => {
+                setImportError(null);
+                setIsImportDialogOpen(true);
+              }}
+            >
+              <UploadIcon className="size-4" />
+              Import
+            </Button>
+            <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
+              <DialogTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  data-testid="reset-appearance-button"
+                  componentId="settings.appearance.open_reset_dialog"
+                >
+                  Reset to defaults
                 </Button>
-              </DialogClose>
-              <Button
-                variant="default"
-                size="sm"
-                onClick={confirmResetAppearance}
-                data-testid="reset-appearance-confirm"
-                componentId="settings.appearance.reset"
-              >
-                Reset
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Reset appearance?</DialogTitle>
+                  <DialogDescription>
+                    This will reset every appearance choice back to its default.
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose asChild>
+                    <Button variant="outline">Cancel</Button>
+                  </DialogClose>
+                  <Button
+                    variant="default"
+                    onClick={confirmResetAppearance}
+                    data-testid="reset-appearance-confirm"
+                    componentId="settings.appearance.reset"
+                  >
+                    Reset
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          </div>
+        </SettingsGroup>
       </div>
 
       <input
@@ -1060,13 +1088,10 @@ function AppearanceSection() {
           )}
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="outline" size="sm">
-                Cancel
-              </Button>
+              <Button variant="outline">Cancel</Button>
             </DialogClose>
             <Button
               variant="default"
-              size="sm"
               data-testid="import-settings-choose-file"
               onClick={() => fileInputRef.current?.click()}
             >
@@ -1081,17 +1106,21 @@ function AppearanceSection() {
 
 /** Git behavior settings. */
 function GitSection() {
+  const info = useServerInfo();
+  const archiveWorktreeCleanup = info !== "loading" && info.archive_worktree_cleanup === true;
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
-      <div className="flex flex-col gap-3">
-        <h2 className="text-ui font-medium">Worktrees</h2>
-        <div className="rounded-xl border border-border bg-card p-4">
-          <AlwaysUseWorktreeControl />
-          <div className="mt-4 border-t border-border pt-4">
-            <DefaultBaseBranchControl />
-          </div>
+      <SettingsGroup title="Worktrees" testId="settings-group-worktrees">
+        <AlwaysUseWorktreeControl />
+        <div className="mt-4 border-t border-border pt-4">
+          <DefaultBaseBranchControl />
         </div>
-      </div>
+        {archiveWorktreeCleanup && (
+          <div className="mt-4 border-t border-border pt-4">
+            <DeleteWorktreesOnArchiveControl />
+          </div>
+        )}
+      </SettingsGroup>
     </Section>
   );
 }
@@ -1129,10 +1158,16 @@ function IntegrationsSection() {
       title="Sandbox Integrations"
       description="External accounts your sandboxes use on your behalf."
     >
-      {providers.map((provider) => {
-        const Panel = CONNECTION_PANELS[provider];
-        return Panel ? <Panel key={provider} /> : null;
-      })}
+      <SettingsGroup title="Connections" testId="settings-group-integrations">
+        {providers.map((provider, index) => {
+          const Panel = CONNECTION_PANELS[provider];
+          return Panel ? (
+            <div key={provider} className={cn(index > 0 && "mt-4 border-t border-border pt-4")}>
+              <Panel />
+            </div>
+          ) : null;
+        })}
+      </SettingsGroup>
     </Section>
   );
 }
@@ -1210,14 +1245,16 @@ function GithubIntegrationControl() {
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <div className="flex min-w-0 flex-1 flex-col">
-          <span className="text-sm font-medium">GitHub</span>
-          <span className="text-sm text-muted-foreground">
-            {status.connected && status.login
+        <SettingsLabel
+          label="GitHub"
+          labelClassName="text-sm"
+          className="flex-1"
+          description={
+            status.connected && status.login
               ? `Connected as ${status.login}. New sandboxes authenticate gh and git as you, and your public SSH keys are added so you can SSH in.`
-              : "Connect your GitHub account so new sandboxes authenticate gh and git as you, and your public SSH keys are injected."}
-          </span>
-        </div>
+              : "Connect your GitHub account so new sandboxes authenticate gh and git as you, and your public SSH keys are injected."
+          }
+        />
         <div className="flex shrink-0 items-center gap-2">
           {status.connected ? (
             <Button
@@ -1278,15 +1315,13 @@ function AlwaysUseWorktreeControl() {
   }, []);
   return (
     <div className="flex items-start justify-between gap-6">
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span id={labelId} className="text-ui font-medium">
-          Always use a random worktree
-        </span>
-        <span className="text-ui text-muted-foreground">
-          Start new sessions in a fresh randomly-named git worktree in any git workspace. A
-          project's own Random worktree setting overrides this.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Always use a random worktree"
+        labelId={labelId}
+        className="flex-1"
+        description="Start new sessions in a fresh randomly-named git worktree in any git workspace. A project's own Random worktree setting overrides this."
+        descriptionClassName="text-ui"
+      />
       <Switch
         aria-labelledby={labelId}
         checked={value}
@@ -1294,6 +1329,38 @@ function AlwaysUseWorktreeControl() {
         data-testid="settings-always-use-worktree-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.git.always_use_worktree"
+      />
+    </div>
+  );
+}
+
+/**
+ * Remove a session's git worktree when it's archived. Off until chosen; while
+ * unset, the first archive of a worktree session asks instead.
+ */
+function DeleteWorktreesOnArchiveControl() {
+  const [value, setValue] = useState(() => readDeleteWorktreesOnArchive() === true);
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeDeleteWorktreesOnArchive(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Delete worktrees for archived sessions"
+        labelId={labelId}
+        className="flex-1"
+        description="Remove a session's git worktree directory, including uncommitted changes, when you archive it. The branch is kept."
+        descriptionClassName="text-ui"
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="settings-delete-worktrees-on-archive-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.git.delete_worktrees_on_archive"
       />
     </div>
   );
@@ -1376,14 +1443,16 @@ function DatabricksIntegrationControl() {
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <div className="flex min-w-0 flex-1 flex-col">
-          <span className="text-sm font-medium">Databricks</span>
-          <span className="text-sm text-muted-foreground">
-            {status.connected && status.workspace_host
+        <SettingsLabel
+          label="Databricks"
+          labelClassName="text-sm"
+          className="flex-1"
+          description={
+            status.connected && status.workspace_host
               ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks AI Gateway (MCP + model serving) as you.`
-              : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."}
-          </span>
-        </div>
+              : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."
+          }
+        />
         <div className="flex shrink-0 items-center gap-2">
           {status.connected ? (
             <Button
@@ -1436,15 +1505,13 @@ function AlwaysSteerControl() {
   }, []);
   return (
     <div className="flex items-start justify-between gap-6">
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span id={labelId} className="text-ui font-medium">
-          Always steer
-        </span>
-        <span className="text-ui text-muted-foreground">
-          Send follow-ups straight into the running turn instead of queuing them. The agent folds
-          each one into its current work where the harness supports it, otherwise at the next turn.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Always steer"
+        labelId={labelId}
+        className="flex-1"
+        description="Send follow-ups straight into the running turn instead of queuing them. The agent folds each one into its current work where the harness supports it, otherwise at the next turn."
+        descriptionClassName="text-ui"
+      />
       <Switch
         aria-labelledby={labelId}
         checked={value}
@@ -1468,15 +1535,19 @@ function ComposerSendShortcutControl() {
 
   return (
     <div className="flex items-start justify-between gap-6">
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span id={labelId} className="text-ui font-medium">
-          Submit with {MOD_KEY} + Enter on desktop
-        </span>
-        <div id={descriptionId} className="text-ui text-muted-foreground">
-          <p>Off: Enter submits and Shift+Enter inserts a newline.</p>
-          <p>On: Enter inserts a newline and {MOD_KEY}+Enter submits.</p>
-        </div>
-      </div>
+      <SettingsLabel
+        label={`Submit with ${MOD_KEY} + Enter on desktop`}
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description={
+          <>
+            <p>Off: Enter submits and Shift+Enter inserts a newline.</p>
+            <p>On: Enter inserts a newline and {MOD_KEY}+Enter submits.</p>
+          </>
+        }
+        descriptionClassName="text-ui"
+      />
       <Switch
         aria-labelledby={labelId}
         aria-describedby={descriptionId}
@@ -1507,15 +1578,14 @@ function OpenLinksInAppControl() {
 
   return (
     <div className="flex items-start justify-between gap-6">
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span id={labelId} className="text-ui font-medium">
-          Open links in the in-app browser
-        </span>
-        <span id={descriptionId} className="text-ui text-muted-foreground">
-          Open web links from chat in this conversation&apos;s Browser tab instead of your default
-          browser. {MOD_KEY}+click always opens the external browser.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Open links in the in-app browser"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description={`Open web links from chat in this conversation's Browser tab instead of your default browser. ${MOD_KEY}+click always opens the external browser.`}
+        descriptionClassName="text-ui"
+      />
       <Switch
         aria-labelledby={labelId}
         aria-describedby={descriptionId}
@@ -1541,15 +1611,14 @@ function BackgroundSessionTitlesControl() {
 
   return (
     <div className="flex items-start justify-between gap-6">
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span id={labelId} className="text-ui font-medium">
-          Automatically name new sessions
-        </span>
-        <span id={descriptionId} className="text-ui text-muted-foreground">
-          Generate a concise title in the background after the first message. Turn this off to keep
-          the default session name.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Automatically name new sessions"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description="Generate a concise title in the background after the first message. Turn this off to keep the default session name."
+        descriptionClassName="text-ui"
+      />
       <Switch
         aria-labelledby={labelId}
         aria-describedby={descriptionId}
@@ -1591,15 +1660,17 @@ function TerminalClipboardControl() {
 
   return (
     <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
-      <div className="flex min-w-0 flex-1 flex-col gap-1">
-        <span id={labelId} className="text-ui font-medium">
-          Copying from terminals
-        </span>
-        <span id={descriptionId} className="text-sm text-muted-foreground">
-          {canRemember
-            ? "Controls copying text from all sessions and terminals on this server in this browser or app. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
-            : "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal."}
-        </span>
+      <div className="min-w-0 flex-1">
+        <SettingsLabel
+          label="Copying from terminals"
+          labelId={labelId}
+          descriptionId={descriptionId}
+          description={
+            canRemember
+              ? "Controls copying text from all sessions and terminals on this server in this browser or app. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
+              : "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal."
+          }
+        />
         {saveFailed && (
           <span role="alert" className="text-sm text-destructive">
             Couldn&apos;t save this preference in this browser or app. Your previous setting is
@@ -1636,29 +1707,23 @@ function TerminalClipboardControl() {
 function GeneralSection() {
   return (
     <Section title="General" description="Configure general Omnigent behavior.">
-      <div className="flex flex-col gap-3">
-        <h2 className="text-ui font-medium">Composer</h2>
-        <div className="rounded-xl border border-border bg-card p-4">
+      <div className="flex flex-col gap-6">
+        <SettingsGroup title="Composer" testId="settings-group-composer">
           <ComposerSendShortcutControl />
           <div className="mt-4 border-t border-border pt-4">
             <AlwaysSteerControl />
           </div>
-        </div>
-        <h2 className="mt-3 text-ui font-medium">Sessions</h2>
-        <div className="rounded-xl border border-border bg-card p-4">
+        </SettingsGroup>
+        <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
-        </div>
-        <h2 className="mt-3 text-ui font-medium">Terminal</h2>
-        <div className="rounded-xl border border-border bg-card p-4">
+        </SettingsGroup>
+        <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />
-        </div>
+        </SettingsGroup>
         {supportsBrowser() && (
-          <>
-            <h2 className="mt-3 text-ui font-medium">Links</h2>
-            <div className="rounded-xl border border-border bg-card p-4">
-              <OpenLinksInAppControl />
-            </div>
-          </>
+          <SettingsGroup title="Links" testId="settings-group-links">
+            <OpenLinksInAppControl />
+          </SettingsGroup>
         )}
       </div>
     </Section>
@@ -1681,12 +1746,12 @@ function DefaultBaseBranchControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span className="text-ui font-medium">Default base branch</span>
-        <span className="text-ui text-muted-foreground">
-          Auto-filled as the base when you name a new worktree branch. Leave blank to not auto-fill.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Default base branch"
+        className="flex-1"
+        description="Auto-filled as the base when you name a new worktree branch. Leave blank to not auto-fill."
+        descriptionClassName="text-ui"
+      />
       <Input
         type="text"
         aria-label="Default base branch"
@@ -1707,8 +1772,8 @@ function DefaultBaseBranchControl() {
 /**
  * UI font size stepper. Maps one of the supported discrete px values into
  * typography tokens via --desktop-ui-font-size (see lib/uiFontPreferences.ts)
- * without resizing layout or icons. Desktop reads the value directly; mobile
- * scales its own base from it, so the setting applies on both surfaces.
+ * without resizing layout or icons. The chosen value applies directly on
+ * every viewport; only the unset default differs between desktop and mobile.
  */
 function UiFontSizeControl() {
   // `px` is the committed value: clamped, persisted, and applied to the UI.
@@ -1719,6 +1784,18 @@ function UiFontSizeControl() {
   // valid in-range size; blur/Enter clamps and re-syncs the text.
   const [px, setPx] = useState(() => readUiFontSizePx());
   const [draft, setDraft] = useState(() => String(px));
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia(UI_FONT_SIZE_MOBILE_QUERY);
+    const syncViewportDefault = () => {
+      const next = readUiFontSizePx();
+      setPx(next);
+      setDraft(String(next));
+    };
+    media.addEventListener("change", syncViewportDefault);
+    return () => media.removeEventListener("change", syncViewportDefault);
+  }, []);
 
   const commit = useCallback((next: number) => {
     const clamped = clampUiFontSizePx(next);
@@ -1754,12 +1831,10 @@ function UiFontSizeControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <div className="flex flex-col">
-        <span className="text-ui font-medium">Interface font size</span>
-        <span className="text-sm text-muted-foreground">
-          Set text across the interface. Icons and spacing stay fixed.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Interface font size"
+        description="Set text across the interface. Icons and spacing stay fixed."
+      />
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
           border via inner dividers rather than floating as separate boxes. */}
       <div
@@ -1835,12 +1910,11 @@ function UiFontFamilyControl() {
       {/* Take the remaining width (and let the longer description wrap within
           this column) so the input stays inline instead of dropping to its own
           row — matches the font-size row's alignment. */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span className="text-ui font-medium">Font family</span>
-        <span className="text-sm text-muted-foreground">
-          Use any font installed on this device. Leave blank for the system default.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Font family"
+        className="flex-1"
+        description="Use any font installed on this device. Leave blank for the system default."
+      />
       {/* Reset sits left of the input so the input is the rightmost element and
           its right edge lines up flush with the font-size stepper above.
           `invisible` (not removed) at the default keeps the row from shifting. */}
@@ -1921,12 +1995,10 @@ function UiCodeFontSizeControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <div className="flex flex-col">
-        <span className="text-ui font-medium">Code font size</span>
-        <span className="text-sm text-muted-foreground">
-          Size of code in the editor and terminal.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Code font size"
+        description="Size of code in the editor and terminal."
+      />
       {/* One cohesive pill: [ −  | value px |  + ] — same shell as the UI
           font-size control. */}
       <div
@@ -1996,12 +2068,11 @@ function UiCodeFontFamilyControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span className="text-ui font-medium">Code font family</span>
-        <span className="text-sm text-muted-foreground">
-          Font for the code editor and terminal. Leave blank for the default.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Code font family"
+        className="flex-1"
+        description="Font for the code editor and terminal. Leave blank for the default."
+      />
       {/* Reset sits left of the input so the input's right edge lines up flush
           with the size stepper above. `invisible` (not removed) at the default
           keeps the row from shifting. */}
@@ -2046,12 +2117,11 @@ function UiCodeFontWeightControl() {
 
   return (
     <div className="flex items-center justify-between gap-6" data-testid="code-font-weight-control">
-      <div className="min-w-0 flex-1">
-        <span className="text-ui font-medium">Heavier code font</span>
-        <span className="block text-sm text-muted-foreground">
-          Use a slightly heavier font weight in the code editor and terminal.
-        </span>
-      </div>
+      <SettingsLabel
+        label="Heavier code font"
+        className="flex-1"
+        description="Use a slightly heavier font weight in the code editor and terminal."
+      />
       <Switch
         aria-label="Use heavier code text"
         checked={heavier}
@@ -2135,7 +2205,9 @@ function LocalCliSection() {
   if (status === "loading") {
     return (
       <Section title="Local CLI">
-        <p className="text-ui text-muted-foreground">Checking…</p>
+        <SettingsGroup title="CLI status">
+          <p className="text-ui text-muted-foreground">Checking…</p>
+        </SettingsGroup>
       </Section>
     );
   }
@@ -2145,71 +2217,78 @@ function LocalCliSection() {
       title="Local CLI"
       description="The Omnigent command-line tool this app uses to run a local server and connect this machine as a runner."
     >
-      {status === null ? (
-        <p className="text-ui text-muted-foreground">CLI status is unavailable.</p>
-      ) : (
-        <div className="flex flex-col gap-4">
-          <div className="flex items-center gap-2 text-ui">
-            <span
-              aria-hidden
-              className={cn(
-                "size-2 rounded-full",
-                status.installed ? "bg-success" : "bg-muted-foreground/40",
-              )}
-            />
-            <span>
-              {status.installed
-                ? `Found${status.version ? ` · ${status.version}` : ""}`
-                : "Not found"}
-            </span>
-          </div>
-
-          {status.path ? (
-            <div className="flex flex-col gap-1">
-              <span className="text-sm text-muted-foreground">
-                {status.source === "configured" ? "Path (custom)" : "Path (auto-detected)"}
+      <SettingsGroup title="CLI status">
+        {status === null ? (
+          <p className="text-ui text-muted-foreground">CLI status is unavailable.</p>
+        ) : (
+          <div className="flex flex-col gap-4">
+            <div className="flex items-center gap-2 text-ui">
+              <span
+                aria-hidden
+                className={cn(
+                  "size-2 rounded-full",
+                  status.installed ? "bg-success" : "bg-muted-foreground/40",
+                )}
+              />
+              <span>
+                {status.installed
+                  ? `Found${status.version ? ` · ${status.version}` : ""}`
+                  : "Not found"}
               </span>
-              <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
-                {status.path}
-              </code>
             </div>
-          ) : (
-            <div className="flex flex-col gap-2">
-              <p className="text-ui text-muted-foreground">
-                The Omnigent CLI wasn't found. Install it, then set its path from the connect
-                screen:
-              </p>
-              {status.installCommand && (
+
+            {status.path ? (
+              <div className="flex flex-col gap-1">
+                <span className="text-sm text-muted-foreground">
+                  {status.source === "configured" ? "Path (custom)" : "Path (auto-detected)"}
+                </span>
                 <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
-                  {status.installCommand}
+                  {status.path}
                 </code>
-              )}
-            </div>
-          )}
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                <p className="text-ui text-muted-foreground">
+                  The Omnigent CLI wasn't found. Install it, then set its path from the connect
+                  screen:
+                </p>
+                {status.installCommand && (
+                  <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
+                    {status.installCommand}
+                  </code>
+                )}
+              </div>
+            )}
 
-          {status.customizationDisabled ? (
-            <p className="text-sm text-muted-foreground">
-              Managed by your organization. Host enrollment uses <code>isaac omni</code>.
-            </p>
-          ) : (
-            <>
+            {status.customizationDisabled ? (
               <p className="text-sm text-muted-foreground">
-                For security, a custom path can only be set from the connect screen — this prevents
-                a connected server from pointing the app at a different binary. Open it from the
-                Server menu (Change Server…) and use the settings gear.
+                Managed by your organization. Host enrollment uses <code>isaac omni</code>.
               </p>
+            ) : (
+              <>
+                <p className="text-sm text-muted-foreground">
+                  For security, a custom path can only be set from the connect screen — this
+                  prevents a connected server from pointing the app at a different binary. Open it
+                  from the Server menu (Change Server…) and use the settings gear.
+                </p>
 
-              {status.source === "configured" && (
-                <div>
-                  <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onReset()}>
-                    Reset to auto-detected
-                  </Button>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      )}
+                {status.source === "configured" && (
+                  <div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => void onReset()}
+                    >
+                      Reset to auto-detected
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </SettingsGroup>
     </Section>
   );
 }
@@ -2292,7 +2371,9 @@ function UpdatesSection() {
   if (config === "loading") {
     return (
       <Section title="Updates">
-        <p className="text-ui text-muted-foreground">Checking…</p>
+        <SettingsGroup title="Preferences">
+          <p className="text-ui text-muted-foreground">Checking…</p>
+        </SettingsGroup>
       </Section>
     );
   }
@@ -2303,57 +2384,61 @@ function UpdatesSection() {
       description="Desktop app update preferences for this installed Omnigent shell."
     >
       {config === null ? (
-        <p className="text-ui text-muted-foreground">Update settings are unavailable.</p>
+        <SettingsGroup title="Preferences">
+          <p className="text-ui text-muted-foreground">Update settings are unavailable.</p>
+        </SettingsGroup>
       ) : (
-        <div className="flex max-w-2xl flex-col gap-5">
-          <label className="flex flex-col gap-2">
-            <span className="text-ui font-medium">Update mode</span>
-            <Select
-              value={config.mode}
-              onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
-              disabled={saving}
-              componentId="settings.updates.mode"
-              valueHasNoPii
-            >
-              <SelectTrigger className="w-full max-w-md" data-testid="update-mode-select">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {(Object.keys(UPDATE_MODE_LABELS) as UpdateMode[]).map((mode) => (
-                  <SelectItem key={mode} value={mode}>
-                    {UPDATE_MODE_LABELS[mode]}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </label>
+        <div className="flex max-w-2xl flex-col gap-6">
+          <SettingsGroup title="Preferences" testId="settings-group-update-preferences">
+            <label className="flex flex-col gap-2">
+              <span className="text-ui font-normal md:font-medium">Update mode</span>
+              <Select
+                value={config.mode}
+                onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
+                disabled={saving}
+                componentId="settings.updates.mode"
+                valueHasNoPii
+              >
+                <SelectTrigger className="w-full max-w-md" data-testid="update-mode-select">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {(Object.keys(UPDATE_MODE_LABELS) as UpdateMode[]).map((mode) => (
+                    <SelectItem key={mode} value={mode}>
+                      {UPDATE_MODE_LABELS[mode]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </label>
 
-          <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
-            <div className="flex flex-col gap-1">
-              <span className="text-ui font-medium">Install downloaded updates on next quit</span>
-              <span className="text-sm text-muted-foreground">
-                Applies only after you choose to download an update.
-              </span>
+            <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
+              <SettingsLabel
+                label="Install downloaded updates on next quit"
+                description="Applies only after you choose to download an update."
+              />
+              <Switch
+                checked={config.autoInstall}
+                onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
+                disabled={saving}
+                aria-label="Install downloaded updates on next quit"
+                componentId="settings.updates.auto_install"
+              />
             </div>
-            <Switch
-              checked={config.autoInstall}
-              onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
-              disabled={saving}
-              aria-label="Install downloaded updates on next quit"
-              componentId="settings.updates.auto_install"
-            />
-          </div>
+          </SettingsGroup>
 
-          <div className="flex flex-wrap items-center gap-3">
-            <Button
-              onClick={() => void onCheck()}
-              loading={checking}
-              componentId="settings.updates.check_now"
-            >
-              Check for updates now
-            </Button>
-            {saving && <span className="text-sm text-muted-foreground">Saving…</span>}
-          </div>
+          <SettingsGroup title="Actions" testId="settings-group-update-actions">
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                onClick={() => void onCheck()}
+                loading={checking}
+                componentId="settings.updates.check_now"
+              >
+                Check for updates now
+              </Button>
+              {saving && <span className="text-sm text-muted-foreground">Saving…</span>}
+            </div>
+          </SettingsGroup>
 
           {lastCheckError && (
             <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/50 px-3 py-2 text-ui">
@@ -2633,6 +2718,7 @@ function selectValueToRetentionDays(value: string): number | null {
 }
 
 function ImportSection() {
+  const info = useServerInfo();
   return (
     <Section
       title="Import sessions"
@@ -2644,15 +2730,17 @@ function ImportSection() {
           <ImportSessionsPanel />
         </div>
       </div>
-      <div className="mt-8 flex flex-col gap-3">
-        <h2 className="text-ui font-medium">Harness imports</h2>
-        <p className="-mt-2 text-ui text-muted-foreground">
-          See the logins, MCP servers, skills, and plugins each machine's harnesses carry over.
-        </p>
-        <div className="rounded-xl border border-border bg-card p-4">
-          <ReviewImportsPanel />
+      {!isFeatureEnabled(info, "harness_settings_ui") && (
+        <div className="mt-8 flex flex-col gap-3">
+          <h2 className="text-ui font-medium">Harness imports</h2>
+          <p className="-mt-2 text-ui text-muted-foreground">
+            See the logins, MCP servers, skills, and plugins each machine's harnesses carry over.
+          </p>
+          <div className="rounded-xl border border-border bg-card p-4">
+            <ReviewImportsPanel />
+          </div>
         </div>
-      </div>
+      )}
     </Section>
   );
 }

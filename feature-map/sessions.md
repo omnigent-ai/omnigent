@@ -14,20 +14,26 @@ the header menu), and each place is a separate entry point.
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged.
+- `stop`: Stop session ends a host-launched parent and the sub-agents on its
+  runner without reporting their expected disconnect as a task failure.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
-- `fork-custom-agent`: switch to a custom agent discovered from an existing
-  session, as well as to a built-in agent; the fork uses the chosen agent.
+- `fork-custom-agent`: switch to one of your custom agents (installed, imported,
+  or discovered from an existing session), as well as to a built-in agent; the
+  fork uses the chosen agent.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app can reconnect a local host
   itself. States: reconnecting (spinner), reconnect failed (retry), host offline.
+- `message-recovery`: a message racing initial runner binding or replacement
+  reaches the available runner without a false failed turn. Native sessions
+  initialize before delivery; SDK sub-agents reuse their loaded session state.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
@@ -49,8 +55,10 @@ renames. Sub-agent sessions hide owner-only actions.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
-dialog, keep the agent or choose another built-in or custom agent. To make a
-custom agent available, first run a session using its spec file.
+dialog, keep the agent or choose another built-in or custom agent. Your custom
+agents (installed with `omnigent agent add`, imported in the Create custom agent
+dialog, or uploaded by running a session with their spec) stay available until
+you remove them.
 
 **Archived view:** switch the sidebar to archived sessions and filter by project.
 
@@ -59,8 +67,16 @@ in the chat; the dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
 when a local session is stranded). In the desktop app, reconnect acts directly.
 
+**Message recovery:** send the first prompt while a runner is starting, or send
+another message after its runner restarts. Also open a sub-agent's conversation
+and send a follow-up after its parent runner is replaced.
+
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
+
+**Stop session:** open the native parent's sidebar menu and choose Stop session
+while a sub-agent is working. This ends the runner; the current-turn interrupt
+control is a separate action that leaves the session connected.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -137,9 +153,47 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
+- **`reconnect`, idle replica handoff (own environment):**
+  `tests/e2e_ui/sessions/test_idle_runner_handoff.py::test_idle_session_stays_healthy_after_unreadable_replica_handoff`
+  moves a real runner between two servers sharing storage, then makes the old
+  server's session and liveness reads unavailable through its production grace
+  period. A completed legacy transcript without saved lifecycle state must
+  remain readable without a disconnect error, including when the browser
+  returns to the old server after its reads recover.
+- **`stop`, `archive`, active sub-agents (own environment):**
+  `tests/e2e/test_parent_stop_subagents_e2e.py::test_native_parent_teardown_preserves_child_outcome`
+  drives real Claude and Codex parents, native children, a host daemon, and its
+  dedicated runner through the public Stop/Archive APIs. Only model replies are
+  scripted. It waits through the production disconnect grace and includes a
+  real runner crash that must still report a failure. Requires both native
+  CLIs and tmux; Claude's machine-managed credentials require an isolated
+  container for the local model endpoint.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`
+- **`message-recovery`, native binding races (own environment):**
+  `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
+  drives real servers, runners, and Claude/Codex CLIs with a mock model. It
+  covers first binding on a sibling replica and local runner replacement,
+  including explicit retry on the owner and exactly-once prompt/reply checks.
+- **`message-recovery`, native host crash (own environment, live model):**
+  `tests/e2e/test_native_host_reconnect_e2e.py::test_native_message_survives_host_restart`
+  uses a real server, host daemon, host-launched runners, and Codex CLI. After
+  a successful tool-using turn it kills the daemon, sends one follow-up, and
+  restarts the same host beyond the ten-second runner grace. The original
+  input must complete its file write exactly once on a new runner, without
+  resending or persisting a failed turn. Requires `codex`, `tmux`,
+  `OMNIGENT_E2E_CODEX_NATIVE=1`, and live `--llm-api-key` credentials (optionally
+  `--profile`). Logs and timing evidence remain in pytest's temporary directory.
+- **`message-recovery`, host relaunch (server integration, plain `uv run pytest`):**
+  `tests/server/integration/test_session_host_launch.py::test_message_relaunch_classifies_replacement_runner_liveness`
+  distinguishes a replacement live on another replica from a failed launch
+  with an old heartbeat or a local heartbeat. This controls liveness evidence;
+  it does not drive an actual cross-replica host migration.
+- **`message-recovery`, SDK sub-agent (server integration, plain `uv run pytest`):**
+  `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
+  covers recovery during ancestor healing and during the final binding refresh,
+  without initializing the SDK child's already-loaded session again.
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`
 - **`recent-switcher` (manual Electron):** open at least six sessions, hold
@@ -163,8 +217,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
-- A custom agent belongs to its original session; appearing in the picker does
-  not prove the fork API accepts it. Check the bound agent after navigation.
+- A custom agent outlives its sessions: forks of your own sessions share it,
+  and forking someone else's session gives you your own copy. Appearing in the
+  picker does not prove the fork API accepts it; check the bound agent after
+  navigation.
 - A copied web transcript does not prove the native CLI received that history.
   Native variants of the agent-switch test skip without `LLM_API_KEY`; record
   those skips and use a configured test harness before claiming native coverage.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -1245,3 +1246,58 @@ def test_runner_defaults_and_explicit_child_attribution(monkeypatch: pytest.Monk
         record.attributes = {"runner_id": "explicit_runner", "request_id": "explicit_request"}
         assert dl.record_to_row(record, "runner")["session_id"] == "explicit_child"
         assert dl.record_to_row(record, "runner")["attributes"]["runner_id"] == "explicit_runner"
+
+
+def _sink_logger(name: str, sink: dl.DebugLogHandler) -> logging.Logger:
+    """Return an isolated logger that writes only to *sink*.
+
+    :param name: Logger name, unique per test.
+    :param sink: Handler under test.
+    :returns: Configured logger.
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(sink)
+    return logger
+
+
+def test_close_drains_backlog_beyond_one_batch() -> None:
+    """Shutdown sends every queued row, not just one batch, ending with the last.
+
+    A crash row is logged last; a single-batch drain behind an in-flight upload
+    would drop it once more than one batch is pending.
+    """
+    in_flight = threading.Event()
+    release = threading.Event()
+    delivered: list[str] = []
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        if not in_flight.is_set():
+            in_flight.set()
+            release.wait(timeout=5.0)
+        delivered.extend(str(row["message"]) for row in batch)
+
+    sink = dl.DebugLogHandler("runner", send)
+    logger = _sink_logger("test.debug_logging.backlog", sink)
+    try:
+        logger.info("first")
+        assert in_flight.wait(timeout=5.0)
+        for i in range(dl._BATCH_MAX_RECORDS + 50):
+            logger.info("row %d", i)
+        logger.critical("runner exiting: uncaught RuntimeError: boom")
+        threading.Timer(0.1, release.set).start()
+        sink.close(timeout=5.0)
+    finally:
+        logger.removeHandler(sink)
+
+    assert len(delivered) == dl._BATCH_MAX_RECORDS + 52
+    assert delivered[-1] == "runner exiting: uncaught RuntimeError: boom"
+
+
+def test_close_wakes_idle_worker_promptly() -> None:
+    """Closing an idle sink does not wait out the worker's flush interval."""
+    sink = dl.DebugLogHandler("runner", lambda batch: None)
+    started = time.monotonic()
+    sink.close(timeout=5.0)
+    assert time.monotonic() - started < dl._FLUSH_INTERVAL_S / 2

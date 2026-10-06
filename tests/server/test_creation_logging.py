@@ -81,6 +81,10 @@ async def test_creation_request_correlation_and_classification(
         assert ends[0]["event_name"] == "session_creation_failed"
     if outcome in {"success", "managed_failure"}:
         assert len(created) == 1
+        assert created[0]["attributes"]["agent_id"] == agent_id
+        assert created[0]["attributes"]["harness"] == "claude-sdk"
+        assert created[0]["attributes"]["harness_source"] == "create_selection"
+        assert created[0]["attributes"]["session_kind"] == "default"
         assert ends[0]["session_id"] == created[0]["session_id"]
         assert created[0]["attributes"]["request_id"] == request_id
     else:
@@ -122,11 +126,18 @@ async def test_session_created_logs_parent_session_id_for_child(
     ]
     assert len(parent_created) == 1
     assert "parent_session_id" not in parent_created[0]["attributes"]
+    assert parent_created[0]["attributes"]["harness"] == "claude-sdk"
+
+    child_agent = await create_test_agent(
+        client,
+        name="child-other-harness",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
 
     with capture_debug_rows("server") as rows:
         child = await client.post(
             "/v1/sessions",
-            json={"agent_id": agent_id, "parent_session_id": parent_id},
+            json={"agent_id": child_agent["id"], "parent_session_id": parent_id},
         )
     assert child.status_code == 201
     child_id = child.json()["id"]
@@ -139,6 +150,9 @@ async def test_session_created_logs_parent_session_id_for_child(
     assert len(created) == 1
     assert created[0]["attributes"]["parent_session_id"] == parent_id
     assert created[0]["attributes"]["creation_kind"] == "child"
+    assert created[0]["attributes"]["session_kind"] == "sub_agent"
+    assert created[0]["attributes"]["agent_id"] == child_agent["id"]
+    assert created[0]["attributes"]["harness"] == "codex"
 
 
 @pytest.mark.asyncio
@@ -162,7 +176,9 @@ async def test_publish_session_created_logs_parent_link_for_native_subagent() ->
     debug_logging.set_current_session_id("conv_parent")
     try:
         with capture_debug_rows("server") as rows:
-            await _publish_session_created("conv_parent", "conv_child", "ag_abc", store)
+            await _publish_session_created(
+                "conv_parent", "conv_child", "ag_abc", store, harness="codex-native"
+            )
         assert debug_logging.current_session_id() == "conv_parent"
     finally:
         debug_logging.set_current_session_id(None)
@@ -175,6 +191,42 @@ async def test_publish_session_created_logs_parent_link_for_native_subagent() ->
     assert len(created) == 1
     assert created[0]["attributes"]["parent_session_id"] == "conv_parent"
     assert created[0]["attributes"]["creation_kind"] == "child"
+    assert created[0]["attributes"]["agent_id"] == "ag_abc"
+    assert created[0]["attributes"]["harness"] == "codex-native"
+    assert created[0]["attributes"]["harness_source"] == "subagent_event"
+
+
+@pytest.mark.asyncio
+async def test_acp_child_creation_does_not_infer_harness_from_transport(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(
+        client,
+        name="acp-child-logging",
+        executor={"type": "omnigent", "config": {"harness": "devin"}},
+    )
+    parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert parent.status_code == 201
+    parent_id = parent.json()["id"]
+
+    with capture_debug_rows("server") as rows:
+        response = await client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "external_acp_subagent_start",
+                "data": {"subagent_id": "worker", "title": "Worker"},
+            },
+        )
+
+    assert response.status_code == 202, response.text
+    child_id = response.json()["child_session_id"]
+    created = [row for row in rows if row["event_name"] == "session_created"]
+    assert len(created) == 1
+    assert created[0]["session_id"] == child_id
+    attrs = created[0]["attributes"]
+    assert attrs["parent_session_id"] == parent_id
+    assert "harness" not in attrs
+    assert attrs["harness_resolution"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -220,6 +272,8 @@ async def test_bundle_child_creation_logs_parent_session_id(
     ]
     assert len(created) == 1
     assert created[0]["attributes"]["parent_session_id"] == parent_id
+    assert created[0]["attributes"]["harness"] == "claude-sdk"
+    assert created[0]["attributes"]["agent_id"] == child.json()["agent_id"]
 
 
 @pytest.mark.asyncio

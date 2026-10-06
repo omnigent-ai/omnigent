@@ -113,6 +113,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Previous session")).toBeTruthy();
     expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);
     expect(keysFor("Next session")).toEqual(["Ctrl", "]"]);
+    expect(keysFor("Toggle Chat / Terminal view")).toEqual(["Ctrl", "Alt", "\\"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Focus or close workspace sidebar")).toBeTruthy();
     expect(screen.queryByText("Open a new browser tab")).toBeNull();

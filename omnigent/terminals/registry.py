@@ -257,8 +257,10 @@ class TerminalRegistry:
             sandbox_override=sandbox_override,
             conversation_link=self.conversation_link_for_id(conversation_id),
         )
+        created.instance.lifecycle_trace.transfer_session(conversation_id)
         await created.instance.launch(cwd=created.cwd)
         if not await created.instance.is_alive():
+            created.instance.lifecycle_trace.note_exit()
             try:
                 await asyncio.wait_for(created.instance.close(), timeout=_CLOSE_TIMEOUT_S)
             except asyncio.TimeoutError:
@@ -449,6 +451,7 @@ class TerminalRegistry:
             if not source_slot:
                 self._by_conversation.pop(source_conversation_id, None)
             target_slot[key] = instance
+            instance.lifecycle_trace.transfer_session(target_conversation_id)
 
             lock = self._instance_locks.pop(source_lock_key, None)
             self._instance_locks[target_lock_key] = lock or threading.Lock()

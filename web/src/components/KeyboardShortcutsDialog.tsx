@@ -21,6 +21,7 @@ import {
   Kbd,
   MOD_KEY,
   SHIFT_KEY,
+  VIEW_MODE_TOGGLE_KEYS,
 } from "@/components/KeyboardShortcut";
 import {
   Dialog,
@@ -86,6 +87,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
       { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
+      { label: "Focus chat input", keys: [CTRL_KEY, SHIFT_KEY, "L"] },
       { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
       { label: "Stop response", keys: ["Esc"] },
     ],
@@ -100,6 +102,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "View",
     items: [
+      { label: "Toggle Chat / Terminal view", keys: [...VIEW_MODE_TOGGLE_KEYS] },
       { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
       { label: "Focus or close workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
       {

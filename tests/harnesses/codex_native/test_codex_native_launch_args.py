@@ -535,3 +535,65 @@ def test_redact_codex_launch_args_masks_secret_bearing_values(
     args: list[str], expected: list[str]
 ) -> None:
     assert redact_codex_launch_args(args) == expected
+
+
+@pytest.mark.parametrize(
+    "reserved_args",
+    [
+        ["app-server", "--listen", "ws://127.0.0.1:7100"],
+        ["--remote", "ws://127.0.0.1:57831"],
+        ["--remote-control", "ws://127.0.0.1:57831"],
+        # The real OpenUI-sidecar shape: app-server + --listen + MCP + a
+        # trailing --remote, all handed in as pass-through args.
+        [
+            "app-server",
+            "--listen",
+            "ws://127.0.0.1:7100",
+            "-c",
+            "mcp_servers.openui.command=bun",
+            "--remote",
+            "ws://127.0.0.1:57831",
+        ],
+    ],
+)
+def test_reject_reserved_codex_transport_args_rejects(reserved_args: list[str]) -> None:
+    """Pass-through args that re-select/attach the runner-owned transport are rejected.
+
+    These compose an incoherent argv (``codex app-server … --remote``) that clap
+    exits 2 on, so the thread never starts; reject them at build time instead.
+    """
+    with pytest.raises(ValueError, match="runner-owned Codex transport"):
+        launch_args.reject_reserved_codex_transport_args(reserved_args)
+    with pytest.raises(ValueError, match="runner-owned Codex transport"):
+        app_server.build_codex_remote_args(
+            codex_args=tuple(reserved_args),
+            thread_id=None,
+            remote_url="ws://127.0.0.1:9876",
+        )
+
+
+@pytest.mark.parametrize(
+    "allowed_args",
+    [
+        [],
+        # ``app-server`` as an option VALUE is not the subcommand — must pass.
+        ["--model", "app-server"],
+        ["--model=app-server"],
+        ["-c", "model=app-server"],
+        # Normal permission presets and config overrides are unaffected.
+        ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+        ["--dangerously-bypass-approvals-and-sandbox"],
+        # Tokens after the ``--`` prompt separator are left alone.
+        ["--", "app-server", "--remote"],
+    ],
+)
+def test_reject_reserved_codex_transport_args_allows(allowed_args: list[str]) -> None:
+    """Legitimate pass-through args — including ``app-server`` as a value — pass."""
+    launch_args.reject_reserved_codex_transport_args(allowed_args)  # does not raise
+    result = app_server.build_codex_remote_args(
+        codex_args=tuple(allowed_args),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+    # Omnigent still appends exactly its own single attach.
+    assert result[-2:] == ["--remote", "ws://127.0.0.1:9876"]

@@ -110,10 +110,12 @@ starts the same loop on the replacement PR.
 Continue fix → test → push → both reviews → triage until no actionable findings
 remain. There is **no fixed review-round cap**. Repeated invalid findings can be
 justified against current code; they do not require meaningless edits to appease
-a reviewer. Stop early only for a concrete blocker, a necessary human decision,
-or an actual execution deadline. Preserve the head, review run links, findings,
-dispositions, and next actions in the handoff. Use `partially_fixed` (or
-`needs_more_info` for a required decision); never call that state ready or clean.
+a reviewer. For ambiguous design intent, use `resolve-investigate` to prepare a
+supported recommendation on the PR and complete independent work. A remaining
+design choice belongs in `remaining_work` with `partially_fixed`, not an
+interactive question. Concrete blockers and an actual execution deadline still
+permit an early handoff. Preserve the head, review run links, findings,
+dispositions, and next actions; never call an incomplete state ready or clean.
 
 Before `fixed`, approval, or a ready-for-maintainer handoff, write the complete
 handoff to a local JSON file and run the live gate:

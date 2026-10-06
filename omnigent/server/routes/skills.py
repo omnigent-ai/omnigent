@@ -120,7 +120,7 @@ def create_skills_router(
                     agent_cache.load,
                     agent.id,
                     agent.bundle_location,
-                    expand_env=agent.session_id is None,
+                    expand_env=agent.operator_authored,
                 )
                 spec, agent_version = loaded.spec, str(agent.version)
 
