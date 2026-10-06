@@ -2211,7 +2211,7 @@ async def test_tunnel_end_is_classified_and_recorded_before_the_disconnect_callb
     seen_at_callback: list[tuple[str | None, bool]] = []
     registry = TunnelRegistry()
 
-    async def on_disconnect(runner_id: str) -> None:
+    async def on_disconnect(runner_id: str, _connection: RunnerSession) -> None:
         drop = runner_drop_state.get(runner_id)
         seen_at_callback.append((drop.kind if drop else None, registry.get(runner_id) is None))
 
