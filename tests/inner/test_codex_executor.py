@@ -4337,15 +4337,7 @@ def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
 def test_codex_home_source_preserves_custom_home_from_inherited_credentials_hardlink(
     tmp_path: Path,
 ) -> None:
-    """
-    A nested launch resolves a custom home bridged only through its OAuth store.
-
-    The custom home has ``config.toml`` and ``.credentials.json`` but neither
-    ``auth.json`` nor the memories database, so no symlink points back to it.
-
-    :param tmp_path: Temporary directory for isolated Codex homes.
-    :returns: None.
-    """
+    """A nested launch resolves a custom home with no ``auth.json`` or memories symlink."""
     from omnigent.inner.codex_executor import (
         _populate_codex_home_config,
         _resolve_codex_home_config_source,
