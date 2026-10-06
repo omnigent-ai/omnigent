@@ -207,6 +207,7 @@ def test_claude_portable_skill_names_are_safe_command_basenames(tmp_path: Path) 
             "/absolute",
             "display label",
             "plugin:skill",
+            "x" * 256,
         )
     ):
         skill = workspace / ".agents" / "skills" / f"source-{index}" / "SKILL.md"

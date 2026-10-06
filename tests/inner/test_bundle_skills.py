@@ -8,6 +8,7 @@ lockstep).
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -191,6 +192,90 @@ def test_claude_agents_skill_args(
     assert {path.joinpath("reference.txt").read_text() for path in linked} == expected
     assert all((path / "SKILL.md").is_file() for path in linked)
     assert not (workspace / ".claude").exists()
+
+
+@pytest.mark.parametrize("failed_names", [set(), {"bad"}, {"bad", "good"}])
+def test_claude_agents_skill_args_copy_fallback_isolates_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_names: set[str]
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    workspace = tmp_path / "workspace"
+    for name in ("bad", "good"):
+        source = workspace / ".agents" / "skills" / name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Local skill\n---\nRead reference.txt.\n"
+        )
+        (source / "reference.txt").write_text(name)
+
+    def deny_symlink(self: Path, target: Path, target_is_directory: bool = False) -> None:
+        raise OSError("Symlinks unavailable")
+
+    copytree = shutil.copytree
+
+    def copy_skill(source: Path, destination: Path, *, symlinks: bool) -> Path:
+        if source.name in failed_names:
+            destination.mkdir()
+            (destination / "SKILL.md").write_text("Partial copy")
+            (destination / "SKILL.md").chmod(0o444)
+            destination.chmod(0o555)
+            raise PermissionError("Supporting file is unreadable")
+        copied = copytree(source, destination, symlinks=symlinks)
+        (copied / "SKILL.md").chmod(0o444)
+        copied.chmod(0o555)
+        return copied
+
+    monkeypatch.setattr(Path, "symlink_to", deny_symlink)
+    monkeypatch.setattr(shutil, "copytree", copy_skill)
+    bridge = tmp_path / "bridge"
+    args = claude_agents_skill_args(bridge, (workspace,), "all")
+    overlay = bridge / "agent-skills"
+    exposed = overlay / ".claude" / "skills"
+    expected = {"bad", "good"} - failed_names
+    assert args == (["--add-dir", str(overlay)] if expected else [])
+    assert {path.name for path in exposed.iterdir()} == expected
+    for name in expected:
+        assert not (exposed / name).is_symlink()
+        assert (exposed / name / "reference.txt").read_text() == name
+    for name in failed_names:
+        assert (workspace / ".agents" / "skills" / name / "reference.txt").read_text() == name
+    assert claude_agents_skill_args(bridge, (workspace,), "none") == []
+    assert not overlay.exists()
+
+
+@pytest.mark.parametrize("skills_filter", ["all", ["Deploy", "deploy", "directory", "label"]])
+def test_claude_agents_skill_args_case_collisions_match_menu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skills_filter: str | list[str]
+) -> None:
+    from omnigent.spec.skill_sources import resolve_harness_skills, skill_source_context_from_env
+
+    home, workspace = tmp_path / "home", tmp_path / "workspace"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    for root, tier, directory, name in (
+        (workspace, ".agents", "upper", "Deploy"),
+        (home, ".agents", "lower", "deploy"),
+        (workspace, ".claude", "Directory", "native-label"),
+        (workspace, ".claude", "Native", "label"),
+        (workspace, ".agents", "alias", "directory"),
+        (workspace, ".agents", "label", "label"),
+    ):
+        skill = root / tier / "skills" / directory / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"---\nname: {name}\ndescription: Local skill\n---\nBody.\n")
+
+    args = claude_agents_skill_args(tmp_path / "bridge", (workspace,), skills_filter)
+    exposed = Path(args[1]) / ".claude" / "skills"
+    assert {path.name for path in exposed.iterdir()} == {"Deploy"}
+    ctx = skill_source_context_from_env(
+        roots=(workspace,), harness="claude-native", skills_filter=skills_filter
+    )
+    menu = resolve_harness_skills(ctx, "claude-native")
+    assert {
+        skill.name for skill in menu if skill.skill_dir and ".agents" in skill.skill_dir.parts
+    } == {"Deploy"}
+    assert "label" in {skill.name for skill in menu}
 
 
 def test_claude_agents_skill_args_ignores_unloaded_bundle_claude_skills(

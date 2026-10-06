@@ -9,11 +9,19 @@ directory, preserving their bare command names and supporting files.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
 
-from omnigent.spec.skill_sources import _claude_code_skills, skill_source_context_from_env
+from omnigent.spec.skill_sources import (
+    _claude_code_skills,
+    select_claude_portable_skills,
+    skill_source_context_from_env,
+)
+
+_log = logging.getLogger(__name__)
 
 
 def ensure_bundle_plugin_manifest(
@@ -112,6 +120,23 @@ def claude_native_skill_args(
     return args
 
 
+def _remove_skill_overlay(path: Path) -> None:
+    """Remove owned copies, including read-only files, without following skill links."""
+    if path.is_symlink():
+        path.unlink()
+        return
+    if not path.exists():
+        return
+    path.chmod(path.stat().st_mode | 0o700)
+    for root, dirs, files in os.walk(path, followlinks=False):
+        for names, owner_permissions in ((dirs, 0o700), (files, 0o600)):
+            for name in names:
+                entry = Path(root) / name
+                if not entry.is_symlink():
+                    entry.chmod(entry.stat().st_mode | owner_permissions)
+    shutil.rmtree(path)
+
+
 def claude_agents_skill_args(
     bridge_dir: Path,
     roots: tuple[Path, ...],
@@ -125,8 +150,7 @@ def claude_agents_skill_args(
     :returns: Claude CLI arguments loading the selected portable skills.
     """
     overlay = bridge_dir / "agent-skills"
-    if overlay.exists():
-        shutil.rmtree(overlay)
+    _remove_skill_overlay(overlay)
     ctx = skill_source_context_from_env(
         roots=roots,
         harness="claude-native",
@@ -136,12 +160,14 @@ def claude_agents_skill_args(
     skills = _claude_code_skills(ctx, ".agents")
     if not skills:
         return []
-    native_names = {skill.name for skill in _claude_code_skills(replace(ctx, is_native=True))}
-    skills = [skill for skill in skills if skill.name not in native_names]
+    skills = select_claude_portable_skills(
+        skills, _claude_code_skills(replace(ctx, is_native=True, skills_filter="all"))
+    )
     if not skills:
         return []
     target = overlay / ".claude" / "skills"
     target.mkdir(parents=True)
+    staged = False
     for skill in skills:
         if skill.skill_dir is None:
             continue
@@ -149,7 +175,17 @@ def claude_agents_skill_args(
         destination = target / skill.name
         try:
             destination.symlink_to(skill.skill_dir.resolve(), target_is_directory=True)
+        except FileExistsError:
+            _log.warning("Skipping portable skill %s: destination already exists", skill.skill_dir)
+            continue
         except OSError:
             # Windows may require privileges to create directory symlinks.
-            shutil.copytree(skill.skill_dir, destination, symlinks=True)
-    return ["--add-dir", str(overlay)]
+            try:
+                shutil.copytree(skill.skill_dir, destination, symlinks=True)
+            except OSError as exc:
+                if not isinstance(exc, FileExistsError):
+                    _remove_skill_overlay(destination)
+                _log.warning("Skipping portable skill %s: %s", skill.skill_dir, exc)
+                continue
+        staged = True
+    return ["--add-dir", str(overlay)] if staged else []

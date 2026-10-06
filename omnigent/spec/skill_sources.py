@@ -218,7 +218,7 @@ def _claude_code_skills(
         skipped: list[str] = []
         for spec in _discover_skills(skills_dir, skipped=skipped):
             # Portable command names become directory names in the launch overlay.
-            if dotdir == ".agents" and not re.fullmatch(r"[A-Za-z0-9_-]+", spec.name):
+            if dotdir == ".agents" and not re.fullmatch(r"[A-Za-z0-9_-]{1,255}", spec.name):
                 _log.warning(
                     "Skipping portable skill with invalid command name: %s", spec.skill_dir
                 )
@@ -473,6 +473,21 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return out
 
 
+def select_claude_portable_skills(
+    portable: list[SkillSpec], native: list[SkillSpec]
+) -> list[SkillSpec]:
+    """Keep native names/aliases and one portable spelling per case-insensitive name."""
+    seen = {skill.name.casefold() for skill in native}
+    seen.update(skill.skill_dir.name.casefold() for skill in native if skill.skill_dir)
+    selected: list[SkillSpec] = []
+    for skill in portable:
+        name = skill.name.casefold()
+        if name not in seen:
+            seen.add(name)
+            selected.append(skill)
+    return selected
+
+
 def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
     Claude host skills plus enabled plugins.
@@ -481,11 +496,19 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     so an existing Claude command wins a collision. SDK discovery retains
     the generic host walk.
     """
-    standalone = (
-        _claude_code_skills(ctx) + _claude_code_skills(ctx, ".agents")
-        if ctx.is_native
-        else _generic_host_skills(ctx)
-    )
+    if ctx.is_native:
+        # Claude still loads every native skill when a named subset is requested.
+        native_ctx = (
+            replace(ctx, skills_filter="all") if isinstance(ctx.skills_filter, list) else ctx
+        )
+        native = _claude_code_skills(native_ctx)
+        standalone = [
+            skill
+            for skill in native
+            if not isinstance(ctx.skills_filter, list) or skill.name in ctx.skills_filter
+        ] + select_claude_portable_skills(_claude_code_skills(ctx, ".agents"), native)
+    else:
+        standalone = _generic_host_skills(ctx)
     return standalone + _claude_plugin_skills(ctx)
 
 
