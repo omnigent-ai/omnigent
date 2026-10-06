@@ -945,7 +945,8 @@ def _kiro_session_workspace(session_workspace: str | None) -> Path:
 # under load. Left un-retried it fails Codex terminal launch, ensure, and the
 # next turn from one blip; a bounded retry rides it out (the read is idempotent)
 # before surfacing a server-attributed hard error, so persistent cases fail loud.
-# Slow reads take 10-15 s; a shorter per-attempt timeout makes every retry time out.
+# Slow reads take 10-15 s. A shorter timeout makes every retry time out, and makes
+# the single-attempt launch metadata reads below fall back to their defaults.
 _LAUNCH_CONFIG_FETCH_TIMEOUT_S = 20.0
 _LAUNCH_CONFIG_FETCH_ATTEMPTS = 3
 _LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S = 0.5
@@ -6943,7 +6944,7 @@ async def _session_payload_for_host_spawn_check(
         resp = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
             params=_SESSION_METADATA_PARAMS,
-            timeout=10.0,
+            timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S,
         )
     except httpx.HTTPError:
         _logger.warning(
@@ -7915,7 +7916,7 @@ async def _load_legacy_claude_launch_metadata(
         response = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
             params=_SESSION_METADATA_PARAMS,
-            timeout=10.0,
+            timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S,
         )
     except httpx.HTTPError:
         _logger.debug(
@@ -9898,7 +9899,7 @@ async def _claude_native_session_wants_rebuild(
         resp = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
             params=_SESSION_METADATA_PARAMS,
-            timeout=10.0,
+            timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S,
         )
     except httpx.HTTPError:
         return False
