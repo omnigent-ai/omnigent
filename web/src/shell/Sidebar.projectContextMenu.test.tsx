@@ -9,12 +9,6 @@ const PROJECT_NAME = "Sprint 42";
 const PROJECT_ID = "p_sprint42";
 
 const mocks = vi.hoisted(() => ({
-  renameProject: {
-    mutateAsync: vi.fn(() => Promise.resolve(PROJECT_ID)),
-    isPending: false,
-    isError: false,
-    error: null,
-  },
   deleteProject: {
     mutate: vi.fn(),
     isPending: false,
@@ -42,15 +36,6 @@ vi.mock("@/hooks/useConversations", async () => {
       isFetchingNextPage: false,
     }),
     useDeleteProject: () => mocks.deleteProject,
-    useRenameProject: () => mocks.renameProject,
-    useProjectConfig: () => ({ data: {}, isLoading: false, isError: false }),
-    useUpdateProjectConfig: () => ({
-      mutate: vi.fn(),
-      mutateAsync: vi.fn(() => Promise.resolve()),
-      isPending: false,
-      isError: false,
-      error: null,
-    }),
   };
 });
 
@@ -116,7 +101,7 @@ function dispatchTouchPointer(
 
 function expectProjectMenuActions() {
   expect(screen.getByTestId("project-new-session-menu")).toBeInTheDocument();
-  expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+  expect(screen.queryByTestId("rename-project")).toBeNull();
   expect(screen.getByTestId("project-settings")).toBeInTheDocument();
   expect(screen.getByTestId("delete-project")).toBeInTheDocument();
 }
@@ -135,7 +120,7 @@ describe("project folder header context menu", () => {
     renderSidebar();
     const header = folderHeader();
 
-    expect(screen.queryByTestId("rename-project")).toBeNull();
+    expect(screen.queryByTestId("project-settings")).toBeNull();
     fireEvent.contextMenu(header);
 
     expectProjectMenuActions();
@@ -160,45 +145,14 @@ describe("project folder header context menu", () => {
     expect(contextItems).toEqual(kebabItems);
   });
 
-  it("keeps the kebab working", () => {
+  it("opens settings from the kebab", () => {
     renderSidebar();
 
     expect(contextTrigger()).toBe(folderHeader());
     fireEvent.pointerDown(screen.getByTestId("project-actions"), { button: 0 });
-    fireEvent.click(screen.getByTestId("rename-project"));
+    fireEvent.click(screen.getByTestId("project-settings"));
 
-    expect(screen.getByTestId("rename-project-confirm")).toBeInTheDocument();
-  });
-
-  it("focuses and selects the project name when the rename dialog opens", async () => {
-    renderSidebar();
-
-    fireEvent.contextMenu(folderHeader());
-    fireEvent.click(screen.getByTestId("rename-project"));
-
-    const input = screen.getByDisplayValue(PROJECT_NAME) as HTMLInputElement;
-    await waitFor(() => expect(input).toHaveFocus());
-    expect(input.selectionStart).toBe(0);
-    expect(input.selectionEnd).toBe(PROJECT_NAME.length);
-  });
-
-  it("drives Rename into the shared dialog and mutation", async () => {
-    renderSidebar();
-
-    fireEvent.contextMenu(folderHeader());
-    fireEvent.click(screen.getByTestId("rename-project"));
-    fireEvent.change(screen.getByDisplayValue(PROJECT_NAME), {
-      target: { value: "Sprint 43" },
-    });
-    fireEvent.click(screen.getByTestId("rename-project-confirm"));
-
-    await waitFor(() =>
-      expect(mocks.renameProject.mutateAsync).toHaveBeenCalledWith({
-        id: PROJECT_ID,
-        oldName: PROJECT_NAME,
-        newName: "Sprint 43",
-      }),
-    );
+    expect(screen.getByRole("dialog")).toHaveTextContent("Project settings");
   });
 
   it("drives Project settings from the context menu", () => {
@@ -254,7 +208,7 @@ describe("project folder header context menu", () => {
     renderSidebar();
 
     fireEvent.contextMenu(folderHeader());
-    expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings")).toBeInTheDocument();
     expect(folderHeader()).toHaveAttribute("aria-expanded", "false");
     dismissMenu();
     fireEvent.click(folderHeader());
@@ -292,7 +246,7 @@ describe("project folder header context menu", () => {
 
       dispatchTouchPointer(header, "pointerdown");
       act(() => vi.advanceTimersByTime(699));
-      expect(screen.queryByTestId("rename-project")).toBeNull();
+      expect(screen.queryByTestId("project-settings")).toBeNull();
       act(() => vi.advanceTimersByTime(1));
 
       // Long-press exposes the complete action set on touch.
@@ -315,14 +269,14 @@ describe("project folder header context menu", () => {
       // Prove the same touch path can open before exercising cancellation.
       dispatchTouchPointer(header, "pointerdown");
       act(() => vi.advanceTimersByTime(700));
-      expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+      expect(screen.getByTestId("project-settings")).toBeInTheDocument();
       dismissMenu();
 
       dispatchTouchPointer(header, "pointerdown");
       dispatchTouchPointer(header, "pointermove");
       act(() => vi.advanceTimersByTime(700));
 
-      expect(screen.queryByTestId("rename-project")).toBeNull();
+      expect(screen.queryByTestId("project-settings")).toBeNull();
     } finally {
       cleanup();
       vi.useRealTimers();
@@ -335,7 +289,7 @@ describe("project folder header context menu", () => {
     header.focus();
 
     fireEvent.contextMenu(header, { detail: 0 });
-    expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings")).toBeInTheDocument();
   });
 
   it("toggles on the first keyboard activation after dismissal", async () => {
@@ -344,7 +298,7 @@ describe("project folder header context menu", () => {
     header.focus();
 
     fireEvent.contextMenu(header, { detail: 0 });
-    expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings")).toBeInTheDocument();
     dismissMenu();
     await waitFor(() => expect(header).toHaveFocus());
     fireEvent.click(header, { detail: 0 });
@@ -373,7 +327,7 @@ describe("project folder header context menu", () => {
 
     expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
-    expect(screen.queryByTestId("rename-project")).toBeNull();
+    expect(screen.queryByTestId("project-settings")).toBeNull();
   });
 
   it("suppresses the context menu in bulk-selection mode", () => {
@@ -387,7 +341,7 @@ describe("project folder header context menu", () => {
     expect(folderHeader().closest('[data-slot="context-menu-trigger"]')).toBeNull();
     expect(folderHeader()).toHaveClass("select-none", "[-webkit-touch-callout:none]");
     fireEvent.contextMenu(folderHeader());
-    expect(screen.queryByTestId("rename-project")).toBeNull();
+    expect(screen.queryByTestId("project-settings")).toBeNull();
   });
 
   it("keeps the collapse toggle active when selection mode unmounts an open menu", () => {
@@ -398,7 +352,7 @@ describe("project folder header context menu", () => {
 
     fireEvent.pointerDown(screen.getByTestId("project-list-actions"), { button: 0 });
     fireEvent.contextMenu(header);
-    expect(screen.getByTestId("rename-project")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("projects-select-sessions"));
     const selectionHeader = folderHeader();
     expect(selectionHeader.closest('[data-slot="context-menu-trigger"]')).toBeNull();
