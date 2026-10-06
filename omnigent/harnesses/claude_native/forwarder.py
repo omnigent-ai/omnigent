@@ -34,8 +34,10 @@ from omnigent.harnesses.claude_native.bridge import (
     read_bridge_id,
     read_claude_context_state,
     read_claude_session_id,
+    read_claude_status_model,
     read_hook_events_from_offset,
     read_hook_events_since_with_position,
+    read_launch_model,
     read_message_deltas_from_offset,
     read_pane_signals,
     read_seen_claude_session_ids,
@@ -46,6 +48,10 @@ from omnigent.harnesses.claude_native.bridge import (
     transcript_has_recent_local_command,
     url_component,
     write_active_session_id,
+)
+from omnigent.harnesses.claude_native.client_version import (
+    record_min_client_version,
+    unsupported_model_min_version,
 )
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
@@ -3446,6 +3452,28 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
+async def _learn_min_client_version(bridge_dir: Path, record: ClaudeHookRecord) -> None:
+    """
+    Remember a model the installed Claude Code was refused, so the next launch skips it.
+
+    A ``StopFailure`` whose text says the client is too old for the model names
+    the release it needs; the pane's model at that moment (the launch model
+    when no status snapshot exists yet) is the one refused.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param record: ``StopFailure`` hook record.
+    """
+    min_version = unsupported_model_min_version(record.failure_message)
+    if min_version is None:
+        return
+    try:
+        model = read_claude_status_model(bridge_dir) or read_launch_model(bridge_dir)
+        if model is not None:
+            await asyncio.to_thread(record_min_client_version, model, min_version)
+    except Exception as exc:  # noqa: BLE001 - learning must not prevent status delivery
+        _logger.debug("Claude model floor learning failed: %s", type(exc).__name__)
+
+
 def _stop_failure_detail(record: ClaudeHookRecord) -> str | None:
     """
     Return the reason a ``StopFailure`` hook gives for its failed turn.
@@ -4170,6 +4198,7 @@ async def _forward_available_status_events(
                 )
             except Exception as exc:  # noqa: BLE001 - telemetry must not prevent status delivery
                 _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)
+            await _learn_min_client_version(bridge_dir, record)
         try:
             await post_external_session_status(
                 client,
