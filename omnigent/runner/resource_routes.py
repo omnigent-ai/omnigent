@@ -465,7 +465,7 @@ def register_resource_routes(
                 )
 
             elif terminal_name in ("pi", "opencode"):
-                # pi/opencode resolve the spec unwrapped — a resolution error
+                # pi/opencode resolve the spec unwrapped - a resolution error
                 # surfaces as a terminal-start error (the resolver does not
                 # swallow it).
                 async def _spec_ensure_build(
@@ -635,7 +635,7 @@ def register_resource_routes(
         ``ensure_native_terminal`` path. Healing restores a live pane, not the
         CLI's in-context history: a harness that records a resumable chat id may
         relaunch with its own ``--resume``, but continuity is best-effort, and a
-        harness without one (kimi — exempt from the reaper, so this only fires
+        harness without one (kimi - exempt from the reaper, so this only fires
         for a crashed pane) always restarts a fresh TUI. Either way the prior
         turns are guaranteed only in the server transcript.
 
@@ -657,7 +657,7 @@ def register_resource_routes(
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None:
             if await instance.is_alive():
-                return  # pane is registered and alive — nothing to heal
+                return  # pane is registered and alive - nothing to heal
             _logger.info(
                 "native pane registered but dead for conv=%s harness=%s; closing stale entry",
                 conv_id,
@@ -674,7 +674,7 @@ def register_resource_routes(
                     await terminal_registry.close(conv_id, terminal_name, "main")
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001 — cleanup is best-effort
+                except Exception:  # noqa: BLE001 - cleanup is best-effort
                     _logger.warning(
                         "failed to close stale native pane for conv=%s; proceeding to re-create",
                         conv_id,
@@ -1136,7 +1136,7 @@ def register_resource_routes(
                 "data": data,
                 "has_more": len(entries) >= limit,
                 # The scan budget ran out before the tree did, so "no matches"
-                # here would be a lie — the caller must be able to say so.
+                # here would be a lie - the caller must be able to say so.
                 "truncated": truncated,
             },
         )
@@ -1156,7 +1156,7 @@ def register_resource_routes(
         try:
             # ``list_changed_files`` shells out to ``git status`` synchronously,
             # which on a large repo (cold untracked cache) can take seconds.
-            # Offload to a thread so it never blocks the event loop — a blocked
+            # Offload to a thread so it never blocks the event loop - a blocked
             # loop can't answer the server's runner-stream relay probe and the
             # session's first turn 503s with runner_unavailable.
             raw_changes = (

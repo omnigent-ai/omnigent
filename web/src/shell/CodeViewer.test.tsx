@@ -54,7 +54,7 @@ function makeFileQuery(content: string, truncated = false): ReturnType<typeof us
   } as unknown as ReturnType<typeof useFileContent>;
 }
 
-// A real (1×1, transparent) PNG, base64-encoded — i.e. exactly what the server
+// A real (1×1, transparent) PNG, base64-encoded - i.e. exactly what the server
 // returns for a binary file (encoding="base64", content_type="image/png").
 const PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
@@ -69,7 +69,7 @@ function makeImageQuery(contentType: string, truncated = false): ReturnType<type
   } as unknown as ReturnType<typeof useFileContent>;
 }
 
-// A tiny base64 blob standing in for a PDF's bytes — the stubbed PdfViewer never
+// A tiny base64 blob standing in for a PDF's bytes - the stubbed PdfViewer never
 // parses it, so any base64 payload with the application/pdf content type is enough
 // to exercise routing.
 const PDF_BASE64 = "JVBERi0xLjQK";
@@ -285,7 +285,7 @@ describe("CodeViewer Cmd+A select-all and copy interception", () => {
     const setData = fireCopyEvent();
 
     // The raw file string must land in clipboardData unchanged so the user
-    // gets the original source — not the DOM-serialized text which omits
+    // gets the original source - not the DOM-serialized text which omits
     // newlines between flex-layout line rows.
     expect(setData).toHaveBeenCalledWith("text/plain", content);
   });
@@ -316,7 +316,7 @@ describe("CodeViewer Cmd+A select-all and copy interception", () => {
   it("copy without prior Cmd+A is not intercepted", () => {
     renderViewer("line1\nline2");
 
-    // No Cmd+A fired — the pending flag is never set; browser default applies.
+    // No Cmd+A fired - the pending flag is never set; browser default applies.
     const setData = fireCopyEvent();
 
     // setData must not be called because the handler only overrides clipboard
@@ -335,7 +335,7 @@ describe("CodeViewer Cmd+A select-all and copy interception", () => {
     fireEvent.mouseDown(document.body);
     const setData = fireCopyEvent();
 
-    // Flag was cleared by mousedown — the copy handler must not write to
+    // Flag was cleared by mousedown - the copy handler must not write to
     // clipboardData; the browser default handles the (now partial) selection.
     expect(setData).not.toHaveBeenCalled();
   });
@@ -381,7 +381,7 @@ describe("CodeViewer editor routing", () => {
   it("keeps markdown source on the Shiki path (not Monaco)", () => {
     vi.mocked(highlightCode).mockClear();
     renderViewer("# heading", true, "notes.md");
-    // Markdown source must NOT route to Monaco — it stays on the Shiki render
+    // Markdown source must NOT route to Monaco - it stays on the Shiki render
     // (TipTap handles markdown editing; Monaco is for non-markdown files).
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
     // The preview-only highlight skip must not reach here: markdown source still
@@ -394,7 +394,7 @@ describe("CodeViewer truncated preview", () => {
   it("shows the truncated banner in markdown preview mode", () => {
     renderViewer("# big file", true, "notes.md", { viewMode: "preview", truncated: true });
     // Preview renders incomplete content when the file is truncated; the banner
-    // is the only in-UI signal, so it must appear in preview too — not just the
+    // is the only in-UI signal, so it must appear in preview too - not just the
     // editor/source surfaces.
     expect(screen.getByText(/too large to load fully/)).toBeDefined();
   });
@@ -661,7 +661,7 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
   it("keeps explicit width/height on an embedded <img>", () => {
     // GitHub honors <img width/height>. Tailwind Preflight's `img { height:
     // auto }` overrides the HTML attributes, so the preview forwards them to an
-    // inline style (which wins the cascade) — the sized image is not left square.
+    // inline style (which wins the cascade) - the sized image is not left square.
     const { container } = renderMd(
       '<img src="https://example.com/logo.png" alt="logo" width="200" height="100">',
     );
@@ -817,7 +817,7 @@ describe("CodeViewer image rendering", () => {
   it("renders a binary PNG as a blob-backed <img>, not source or placeholder", async () => {
     renderImage("image/png", "assets/logo.png");
 
-    // alt is the basename; the src is the stubbed object URL — i.e. the image is
+    // alt is the basename; the src is the stubbed object URL - i.e. the image is
     // shown through a blob, never the base64 placeholder or Monaco/Shiki source.
     const img = (await screen.findByAltText("logo.png")) as HTMLImageElement;
     expect(img.getAttribute("src")).toBe("blob:mock-object-url");
@@ -995,7 +995,7 @@ describe("CodeViewer 3D model routing", () => {
 
   it("routes by content_type when the extension is unknown (MIME-only)", async () => {
     // A file with no recognizable model extension but a model MIME must still
-    // route to the viewer — dispatch and loader selection share one resolver.
+    // route to the viewer - dispatch and loader selection share one resolver.
     renderModel("download", "base64", "model/stl");
     expect(await screen.findByTestId("model-viewer-stub")).toBeDefined();
     expect(screen.queryByText(/binary file/i)).toBeNull();
@@ -1027,7 +1027,7 @@ describe("CodeViewer .ipynb routing", () => {
       viewMode: "preview",
       truncated: true,
     });
-    // Truncated JSON cannot parse — the preview shows its parse-error state…
+    // Truncated JSON cannot parse - the preview shows its parse-error state…
     expect(screen.getByText(/Cannot render notebook/)).toBeDefined();
     // …and the shared truncation banner is stacked above it.
     expect(screen.getByText(/truncated/i)).toBeDefined();

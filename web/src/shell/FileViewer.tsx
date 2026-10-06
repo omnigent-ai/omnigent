@@ -128,7 +128,7 @@ const MonacoDiffViewer = lazy(() =>
  * Classify comments into open/addressed and remap open draft comments to
  * their correct absolute offsets when the file content has changed.
  *
- * - **open**: draft comment — kept with updated offsets if the anchor
+ * - **open**: draft comment - kept with updated offsets if the anchor
  *   moved, or at stored offsets if the anchor is no longer present
  *   (never silently dropped).
  * - **addressed**: handled by the agent or user (status "addressed").
@@ -145,7 +145,7 @@ export function classifyAndRemapComments(
       addressed.push(c);
       continue;
     }
-    // Draft with no anchor — keep as-is.
+    // Draft with no anchor - keep as-is.
     if (!c.anchor_content) {
       open.push(c);
       continue;
@@ -156,7 +156,7 @@ export function classifyAndRemapComments(
       open.push(c);
       continue;
     }
-    // File not yet loaded — keep at stored offsets rather than dropping.
+    // File not yet loaded - keep at stored offsets rather than dropping.
     if (!fileContent) {
       open.push(c);
       continue;
@@ -184,12 +184,12 @@ export function classifyAndRemapComments(
     }
     const idx = nearbyIdx !== -1 ? nearbyIdx : fileContent.indexOf(c.anchor_content);
     if (idx === -1) {
-      // Anchor not found anywhere — keep at stored offsets rather than dropping.
+      // Anchor not found anywhere - keep at stored offsets rather than dropping.
       open.push(c);
       continue;
     }
     if (idx !== c.start_index) {
-      // Text moved — update offsets.
+      // Text moved - update offsets.
       open.push({ ...c, start_index: idx, end_index: idx + c.anchor_content.length });
     } else {
       open.push(c);
@@ -203,7 +203,7 @@ export function classifyAndRemapComments(
  * keeps a little breathing room before the toolbar collapses. */
 const TOOLBAR_MIN_TITLE_PX = 48;
 /** Ceiling (px) on the path reserve. A very long path is `truncate`d, so past
- * this we stop letting it push the toolbar into the overflow menu — otherwise a
+ * this we stop letting it push the toolbar into the overflow menu - otherwise a
  * deeply-nested filename would collapse the buttons even on a wide panel. */
 const TOOLBAR_MAX_TITLE_PX = 280;
 
@@ -211,8 +211,8 @@ const TOOLBAR_MAX_TITLE_PX = 280;
  * Decide whether a header's inline toolbar buttons fit, or must collapse into a
  * single overflow ("⋯") menu.
  *
- * The decision is a function of ONE live variable — the header's available
- * width — compared against a width requirement assembled from
+ * The decision is a function of ONE live variable - the header's available
+ * width - compared against a width requirement assembled from
  * *state-independent* measurements:
  *
  *   collapsed  ⇔  headerWidth  <  backWidth + navWidth + titleReserve + chipWidth + buttonsWidth + gaps
@@ -232,7 +232,7 @@ const TOOLBAR_MAX_TITLE_PX = 280;
  *                    toolbar earlier than a short one (path-aware), while an
  *                    absurdly long path can't collapse it on a wide panel.
  *
- * NOTE: we must NOT measure the live `flex-1` path span — neither `offsetWidth`
+ * NOTE: we must NOT measure the live `flex-1` path span - neither `offsetWidth`
  * (its rendered box grows to fill space freed by collapsing) nor `scrollWidth`
  * (which equals the box width once the box exceeds the text) is stable across
  * the toggle, so either would move the threshold and the toggle would get
@@ -263,14 +263,14 @@ function useToolbarOverflow(actionsKey: string): {
       const style = getComputedStyle(header);
       const padX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
       const available = header.clientWidth - padX;
-      if (available <= 0) return; // not laid out yet (or jsdom) — keep current state.
+      if (available <= 0) return; // not laid out yet (or jsdom) - keep current state.
 
       const backWidth = backRef.current?.offsetWidth ?? 0;
       const navWidth = navRef.current?.offsetWidth ?? 0;
       const chipWidth = chipRef.current?.offsetWidth ?? 0;
       const buttonsWidth = measure.scrollWidth;
       // Path-aware reserve: the label's intrinsic text width, clamped. Measured
-      // from an OFFSCREEN, unconstrained clone of the label — NOT the live
+      // from an OFFSCREEN, unconstrained clone of the label - NOT the live
       // `flex-1` span, whose scrollWidth would equal its (variable) box width
       // once the box grows wider than the text, breaking monotonicity.
       const pathNatural = pathMeasureRef.current?.offsetWidth ?? 0;
@@ -341,7 +341,7 @@ interface FileViewerProps {
  * This keeps the "no agent registered" fallback inside the provider.
  */
 export function FileViewer(props: FileViewerProps) {
-  // boundAgentId is populated from the active session's agent binding —
+  // boundAgentId is populated from the active session's agent binding -
   // works for both template agents and session-scoped agents from
   // `omnigent run --server`.
   const agentId = useChatStore((s) => s.boundAgentId);
@@ -372,7 +372,7 @@ function FileViewerBody({
   const [searchParams, setSearchParams] = useSearchParams();
   const isMobile = useIsMobileViewport();
   const ownsUrl = viewport === undefined || (viewport === "mobile") === isMobile;
-  // Capture URL params once on open — we don't want re-renders caused by our own
+  // Capture URL params once on open - we don't want re-renders caused by our own
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(searchParams.get("diff") === "1");
   const initialCommentIdRef = useRef(searchParams.get("comment"));
@@ -381,7 +381,7 @@ function FileViewerBody({
   // effects below only force it open, never closed, so a restored-open value
   // survives and a restored-closed value can still be opened by ?comment=.
   const [commentsOpen, setCommentsOpen] = useState(false);
-  // In frameless mode the panel is embedded in the parent aside — no own
+  // In frameless mode the panel is embedded in the parent aside - no own
   // width or slide animation. Still call the hook unconditionally to
   // satisfy Rules of Hooks; just pass false so it never animates.
   // When the comments panel is open it takes up w-60 (240px), so require
@@ -394,7 +394,7 @@ function FileViewerBody({
     frameless ? undefined : minWidthPx,
   );
   // The mobile viewer is a `fixed inset-0` overlay, so the iOS shell-lock
-  // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
+  // (useIOSViewportLock) - which only resizes flow content inside .app-shell -
   // doesn't lift it above the soft keyboard. Pad the overlay's bottom by the
   // keyboard inset so the comments panel and its (auto-focused) textarea stay
   // visible. No-op off iOS / with the keyboard closed. Not needed frameless
@@ -430,7 +430,7 @@ function FileViewerBody({
   // Measured width of the code/diff content area. Drives whether the
   // split/unified toggle is offered: split is only usable at >= the Monaco
   // breakpoint, so below it we hide the toggle to avoid a no-op control.
-  // null = not yet measured (or zero, e.g. jsdom) — treat as "wide enough" so
+  // null = not yet measured (or zero, e.g. jsdom) - treat as "wide enough" so
   // the toggle shows by default and only hides once a real narrow width lands.
   const contentAreaRef = useRef<HTMLDivElement | null>(null);
   // The viewer's outer element, used to scope Cmd+F to when focus is inside the
@@ -488,11 +488,11 @@ function FileViewerBody({
     commentsInitializedRef.current = true;
   }, [open, commentsQuery.data]);
   // Comments count as seen only while the comments panel is OPEN on
-  // this file — merely opening the file (markers in the gutter, panel
+  // this file - merely opening the file (markers in the gutter, panel
   // collapsed) must NOT clear them from the Inbox page / sidebar badge
   // (`useCommentInbox`). The panel opens via the toggle button, a
   // gutter-marker click / text selection, or an inbox "Open file"
-  // deep link (?comment= auto-opens it) — all moments the comment
+  // deep link (?comment= auto-opens it) - all moments the comment
   // bodies are actually on screen. Re-runs whenever the comment list
   // refreshes, so a comment arriving while the panel is open is
   // marked seen too.
@@ -536,13 +536,13 @@ function FileViewerBody({
 
   // Pop the HTML artifact into its own browser tab. The artifact is rendered in
   // a sandboxed, opaque-origin iframe (see `openHtmlArtifactInNewTab`), so it
-  // stays isolated from the host app — full-window rendering, no origin sharing.
+  // stays isolated from the host app - full-window rendering, no origin sharing.
   const openHtmlInNewTab = useCallback(() => {
     const data = fileQuery.data;
     if (!data) return;
     const opened = openHtmlArtifactInNewTab(data.content, path.split("/").pop() ?? path);
     if (!opened) {
-      // window.open returned null — almost always a popup blocker. There's no
+      // window.open returned null - almost always a popup blocker. There's no
       // toast surface here, so log it rather than failing silently.
       console.warn("Open in new tab: the browser blocked the popup window.");
     }
@@ -674,7 +674,7 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [open, onCloseTab, searchOpen, guardDirty]);
 
-  // View mode toggle — markdown defaults to the rich-text editor, HTML and
+  // View mode toggle - markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
   const lang = detectLang(path);
   const isPreviewable = lang === "markdown" || lang === "html" || isNotebookPath(path);
@@ -683,12 +683,12 @@ function FileViewerBody({
   // them (Monaco would otherwise render the base64 payload as garbage text).
   const isImage = isImageFile(path, fileQuery.data?.content_type);
   const isPdf = isPdfFile(path, fileQuery.data?.content_type);
-  // 3D models render through CodeViewer's <ModelViewer> — like images and PDFs,
+  // 3D models render through CodeViewer's <ModelViewer> - like images and PDFs,
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
   const isModel = isModelFile(path, fileQuery.data?.content_type);
   // Binary/base64 files render CodeViewer's "Preview not available" notice, not
-  // Monaco — mirrors CodeViewer's own base64/binary-path check.
+  // Monaco - mirrors CodeViewer's own base64/binary-path check.
   const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable =
@@ -700,7 +700,7 @@ function FileViewerBody({
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
   const revealTarget = useRevealTarget(path);
 
-  // Diff is a global toggle — turning it on/off on any file carries over as you
+  // Diff is a global toggle - turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
   // files (markdown/html/notebooks), while non-previewable files always render
   // as source.
@@ -726,7 +726,7 @@ function FileViewerBody({
     () => persistedPrefsRef.current.previewableViewMode,
   );
   // A ?comment= deep link to a markdown file must open on the rich-text editor
-  // so the comment's anchor highlight is visible in context — the whole point
+  // so the comment's anchor highlight is visible in context - the whole point
   // of following the link. The editor is forced regardless of the user's sticky
   // preference: the read-only Preview can't render the highlight at all, so a
   // Preview-preferring user would otherwise land on a surface where the comment
@@ -736,7 +736,7 @@ function FileViewerBody({
   // This is a separate override rather than a seeded `previewableViewMode`
   // because that state is persisted globally: seeding it to "editor" would write
   // "editor" back to localStorage, clobbering the user's own preference for
-  // every later markdown file. It must also be reactive — flipping this override
+  // every later markdown file. It must also be reactive - flipping this override
   // is what re-renders to the chosen surface once the user picks a mode. It's
   // the deep-linked path (not a boolean) so a navigate-away-and-back doesn't
   // re-trigger the bias on the wrong file.
@@ -744,7 +744,7 @@ function FileViewerBody({
     initialCommentIdRef.current ? path : null,
   );
 
-  // Switch a markdown file to the rich-text editor — the surface where text-
+  // Switch a markdown file to the rich-text editor - the surface where text-
   // selection commenting works. Used by the preview's "switch to edit mode"
   // hint. Coming from preview/source there are no edits to guard, so it applies
   // directly (mirrors the toolbar's switchTo for the non-editor case).
@@ -754,7 +754,7 @@ function FileViewerBody({
   }, []);
 
   // Persist the global view preferences so they survive a refresh. commentsOpen
-  // is intentionally excluded — it's contextual (per-open), not a sticky
+  // is intentionally excluded - it's contextual (per-open), not a sticky
   // preference. Idempotent on mount (writes back the seeded values).
   useEffect(() => {
     writeFileViewPreferences({
@@ -768,7 +768,7 @@ function FileViewerBody({
   // Markdown supports all three previewable modes (preview / editor / source).
   // HTML and notebooks have no rich-text editor, so their "editor" preference
   // falls back to the rendered preview; "preview" / "source" pass through. The shared
-  // preference still carries across file types — opening markdown in source
+  // preference still carries across file types - opening markdown in source
   // then switching to an HTML file keeps you in source, etc.
   const fileViewMode: "editor" | "preview" | "source" = isPreviewable
     ? lang === "markdown"
@@ -842,15 +842,15 @@ function FileViewerBody({
   // Cmd/Ctrl+F opens find-in-file on the Monaco-backed surfaces (code
   // source/editor and the diff view). Those surfaces would otherwise rely on
   // Monaco's own Cmd+F keybinding, which needs editor DOM focus and does not
-  // fire inside the managed (same-root embed) host — so cmd+f silently did
+  // fire inside the managed (same-root embed) host - so cmd+f silently did
   // nothing there. Driving `searchOpen` runs Monaco's find action imperatively
   // instead, matching how the Shiki/markdown surfaces (handled by their own
   // window listeners in CodeViewer) already open find. Gated to the Monaco
   // surfaces so it never double-handles the CodeViewer-owned ones.
   // The find toggle only reaches a Monaco surface: the diff view, or a non-diff
   // file that CodeViewer renders in Monaco. Exclude the surfaces CodeViewer
-  // returns *before* the Monaco block — markdown (rich editor / its own find
-  // bar), previews, and the image/PDF/model/binary viewers — otherwise Cmd+F
+  // returns *before* the Monaco block - markdown (rich editor / its own find
+  // bar), previews, and the image/PDF/model/binary viewers - otherwise Cmd+F
   // would swallow the browser's find-in-page with no find widget to show.
   const isMonacoFindSurface =
     diffViewActive ||
@@ -858,7 +858,7 @@ function FileViewerBody({
   // Cmd+F must open find-in-file only while the file viewer is the surface the
   // user is working in. The viewer stays mounted beside the chat, so `open`
   // alone can't tell them apart, and reading `document.activeElement` at
-  // keypress time is unreliable — clicking a non-focusable chat area drops focus
+  // keypress time is unreliable - clicking a non-focusable chat area drops focus
   // to <body>, which reads the same as "nothing focused yet". Instead we track
   // the last surface the user interacted with: seeded to the viewer (opening a
   // file makes it active) and flipped by clicks / focus moves. When the user
@@ -921,7 +921,7 @@ function FileViewerBody({
     !isFilePositionPending(filePosition),
   );
   // Measure the content area so the split toggle can hide when there isn't
-  // enough room for side-by-side. Only observe while the diff is shown — the
+  // enough room for side-by-side. Only observe while the diff is shown - the
   // ref element only exists then, and it's the only mode that cares.
   useEffect(() => {
     const el = contentAreaRef.current;
@@ -933,13 +933,13 @@ function FileViewerBody({
     return () => ro.disconnect();
   }, [diffViewActive]);
   // A measured width of 0 (pre-layout, or jsdom) is indistinguishable from
-  // "unknown", so treat null/zero as wide enough — only a real sub-threshold
+  // "unknown", so treat null/zero as wide enough - only a real sub-threshold
   // measurement hides the toggle, so it never flickers off before layout.
   const splitToggleAvailable =
     contentWidth === null || contentWidth === 0 || contentWidth >= MONACO_SPLIT_BREAKPOINT;
   useEffect(() => {
     if (viewMode !== "editor") handleDirtyChange(false);
-    // Skip on mount — only clear when the user actively switches modes.
+    // Skip on mount - only clear when the user actively switches modes.
     // Clearing on mount would race with the linked-comment effect.
     if (viewModeInitializedRef.current && (viewMode === "editor" || viewMode === "preview")) {
       setActiveSelection(null);
@@ -954,7 +954,7 @@ function FileViewerBody({
     if (!open || !ownsUrl) return;
     const wantDiff = diffActive && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
-    if (wantDiff === hasDiff) return; // already in sync — no navigate needed
+    if (wantDiff === hasDiff) return; // already in sync - no navigate needed
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -973,7 +973,7 @@ function FileViewerBody({
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
   // `active` drives the inline button's filled variant; it's omitted from the
   // dropdown rows (menu items aren't toggles). The save-status chip is NOT in
-  // this list — it stays inline regardless of width.
+  // this list - it stays inline regardless of width.
   //
   // An action can instead carry `options`: a set of mutually-exclusive choices
   // rendered as a single dropdown (a "picker" button inline, a submenu when
@@ -986,11 +986,11 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect: () => void;
     active: boolean;
-    /** Keep the menu open after selecting — for toggles the user may flip in a
+    /** Keep the menu open after selecting - for toggles the user may flip in a
      * row (e.g. wrap + whitespace). Action items (Find) omit it so the menu
      * closes as they hand off. */
     keepOpen?: boolean;
-    /** Suppress the active check mark — for toggles whose icon already reflects
+    /** Suppress the active check mark - for toggles whose icon already reflects
      * state (e.g. the whitespace eye flips open/closed). */
     noActiveCheck?: boolean;
   }
@@ -1020,11 +1020,11 @@ function FileViewerBody({
     // from the editor must guard unsaved edits; the read-only preview/source
     // surfaces carry no edits, so they switch freely.
     const switchTo = (mode: "preview" | "editor" | "source") => {
-      // No-op when already on this surface — re-selecting the active tab must
+      // No-op when already on this surface - re-selecting the active tab must
       // not run the dirty guard (which would pop a discard dialog for nothing).
       if (mode === viewMode) return;
       // Clear the deep-link bias and set the absolute mode together, and only
-      // when the switch actually proceeds — so a guarded (dirty) switch the user
+      // when the switch actually proceeds - so a guarded (dirty) switch the user
       // cancels leaves both the bias and the editor intact.
       const apply = () => {
         setDeepLinkBiasPath(null);
@@ -1078,7 +1078,7 @@ function FileViewerBody({
       options: modeOptions,
     });
   } else if ((lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
-    // HTML and notebooks have no rich-text editor — a single toggle flips
+    // HTML and notebooks have no rich-text editor - a single toggle flips
     // preview ↔ source.
     toolbarActions.push({
       key: "preview",
@@ -1099,7 +1099,7 @@ function FileViewerBody({
   }
   // HTML artifacts can be popped out into their own browser tab for full-window
   // viewing. The artifact still runs in the same sandboxed, opaque-origin iframe
-  // as the in-app preview (isolated from the host app) — just full-screen.
+  // as the in-app preview (isolated from the host app) - just full-screen.
   if (lang === "html" && fileQuery.data && viewMode !== "diff") {
     toolbarActions.push({
       key: "open-new-tab",
@@ -1159,7 +1159,7 @@ function FileViewerBody({
   // A single "⋯" menu folds the view controls that were previously separate
   // top-level icons: Find in file and Download (all views), plus the diff-only
   // toggles (wrap lines, whitespace changes). Grouping them frees toolbar width
-  // — handy when the viewer runs in a narrow pane — and mirrors GitHub's
+  // - handy when the viewer runs in a narrow pane - and mirrors GitHub's
   // diff-settings menu. The toggles keep the menu open; actions close it as they
   // hand off.
   const settingsMenu: ToolbarOption[] = [
@@ -1206,7 +1206,7 @@ function FileViewerBody({
       icon: hideWhitespace ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />,
       active: hideWhitespace,
       keepOpen: true,
-      // The eye icon already flips open/closed to show state — no check needed.
+      // The eye icon already flips open/closed to show state - no check needed.
       noActiveCheck: true,
       onSelect: () => setHideWhitespace((prev) => !prev),
     });
@@ -1253,7 +1253,7 @@ function FileViewerBody({
     ].join("|"),
   );
 
-  // The expanded inline row — rendered both offscreen (for measurement) and,
+  // The expanded inline row - rendered both offscreen (for measurement) and,
   // when it fits, as the visible toolbar. `interactive` is false for the
   // measurement clone so it stays out of the tab order / a11y tree.
   const renderActionButtons = (interactive: boolean) =>
@@ -1428,14 +1428,14 @@ function FileViewerBody({
         >
           {/* Auto-save status chip (replaces the editor's old Save button).
               Non-idle implies an editable Monaco buffer, so no extra gating.
-              Kept outside the responsive switcher — always inline. */}
+              Kept outside the responsive switcher - always inline. */}
           {saveStatus !== "idle" && (
             <span
               ref={toolbarChipRef}
               aria-live="polite"
               title={
                 saveStatus === "offline"
-                  ? "Runner offline — your changes will save when it reconnects"
+                  ? "Runner offline - your changes will save when it reconnects"
                   : undefined
               }
               className={cn(
@@ -1491,8 +1491,8 @@ function FileViewerBody({
                   {toolbarActions.map((action) =>
                     action.options ? (
                       // A mutually-exclusive picker (e.g. view mode) collapses to
-                      // a nested submenu so its "selected choice" semantics — one
-                      // highlighted option — stay intact.
+                      // a nested submenu so its "selected choice" semantics - one
+                      // highlighted option - stay intact.
                       <DropdownMenuSub key={action.key}>
                         <DropdownMenuSubTrigger className="whitespace-nowrap">
                           {action.icon}
@@ -1557,7 +1557,7 @@ function FileViewerBody({
               renderActionButtons(true)
             )}
           </div>
-          {/* Offscreen measurement clones — rendered out of flow and out of the
+          {/* Offscreen measurement clones - rendered out of flow and out of the
               a11y tree purely so the overflow hook can read intrinsic widths
               that don't depend on the live (flex-coupled) layout:
                 · the full expanded button row → its scrollWidth,
@@ -1600,7 +1600,7 @@ function FileViewerBody({
           ) : viewMode === "diff" ? (
             // A failed diff fetch (e.g. the diff endpoint returned a
             // git_status_failed 500) surfaces the server's reason instead of
-            // hanging on "Loading diff…" forever — diffQuery.data stays
+            // hanging on "Loading diff…" forever - diffQuery.data stays
             // undefined on error, which would otherwise read as still-loading.
             diffQuery.isError ? (
               <div className="flex items-center justify-center p-8 text-destructive text-ui">
@@ -1806,7 +1806,7 @@ function FileViewerBody({
       data-collapsed={!open || undefined}
       inert={!open}
     >
-      {/* Resize handle — desktop only (mobile is full-screen overlay) */}
+      {/* Resize handle - desktop only (mobile is full-screen overlay) */}
       {isDesktop && (
         <div
           {...handleProps}

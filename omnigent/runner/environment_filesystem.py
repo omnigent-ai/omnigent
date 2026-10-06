@@ -82,7 +82,7 @@ def _glob_to_regex(pattern: str) -> str:
     - ``**`` matches any run of characters including ``/`` (cross-directory).
     - ``?`` matches a single character except ``/``.
     - ``{a,b,c}`` matches any one of the comma-separated alternatives. The
-      alternatives are treated *literally* — use ``"*.{js,ts}"`` rather than
+      alternatives are treated *literally* - use ``"*.{js,ts}"`` rather than
       ``"{*.js,*.ts}"``.
     - A pattern containing no ``/`` matches the *basename* at any depth (an
       implicit ``**/`` prefix), so ``"*.ts"`` matches ``"src/a.ts"``.
@@ -91,7 +91,7 @@ def _glob_to_regex(pattern: str) -> str:
 
     Every character outside the supported metacharacters is passed through
     ``re.escape``, so a user-supplied pattern can never inject arbitrary
-    regex.  ``**`` expands to ``.*`` and ``*`` to ``[^/]*`` — both linear,
+    regex.  ``**`` expands to ``.*`` and ``*`` to ``[^/]*`` - both linear,
     so the result is not vulnerable to catastrophic backtracking.
 
     :param pattern: A single glob pattern, already stripped of surrounding
@@ -130,7 +130,7 @@ def _glob_to_regex(pattern: str) -> str:
         elif c == "{":
             close = pattern.find("}", i)
             if close == -1:
-                # Unbalanced brace — match it literally.
+                # Unbalanced brace - match it literally.
                 out.append(re.escape(c))
                 i += 1
             else:
@@ -240,14 +240,14 @@ def search_indexed_paths(
     """Match already-enumerated *paths* the way the directory walk would.
 
     Applies the same filters as :meth:`CallerProcessFilesystem.search_files`
-    — case-insensitive substring on the path, include/exclude globs — and
+    - case-insensitive substring on the path, include/exclude globs - and
     reports a matching path's ancestor directories as directory entries, so
     a query like ``"src"`` still surfaces the ``src`` folder. Only the
     entries returned are stat'ed, and never through a symlink: parents are
     opened without following links and the leaf is ``lstat``-ed, so nothing
     outside *root* is ever described, even if a link is swapped mid-search.
-    A leaf that is itself a symlink is left out — the sandboxed walk, which
-    can follow links safely, describes those — and so is a path that no
+    A leaf that is itself a symlink is left out - the sandboxed walk, which
+    can follow links safely, describes those - and so is a path that no
     longer exists (indexed but deleted from the working tree).
 
     :param root: Absolute directory the paths are relative to.
@@ -409,7 +409,7 @@ async def _run_os_env_async(
     """Call an OSEnvironment async method.
 
     The OSEnvironment protocol uses ``OpResult = dict[str, Any]``
-    for all return types. ``Any`` is intentional here — the helper
+    for all return types. ``Any`` is intentional here - the helper
     wraps methods with varying signatures and the dict values are
     heterogeneous.
 
@@ -470,7 +470,7 @@ def is_absolute_request(path: str) -> bool:
 
     The filesystem routes accept either a workspace-relative path (the
     historical contract) or an absolute one. A path is absolute exactly
-    when it starts with ``/`` — the same rule the filesystem itself uses.
+    when it starts with ``/`` - the same rule the filesystem itself uses.
     ``~`` is deliberately NOT expanded here: the environment metadata
     already reports ``home``, so the caller expands it and sends a real
     path rather than relying on whose home the runner would guess.
@@ -502,7 +502,7 @@ def resolve_browse_target(
       anything the runner can, so neither browsing nor editing there grants
       reach that was being withheld. The caller has additionally cleared the
       same permission level that grants shell access. Confined environments
-      get no such widening — their grants are the whole story, and a read
+      get no such widening - their grants are the whole story, and a read
       grant still never admits a write.
 
     :param absolute_path: Absolute path supplied by the caller.
@@ -517,7 +517,7 @@ def resolve_browse_target(
     """
     if "\x00" in absolute_path:
         raise InvalidPath("Path contains NUL bytes")
-    # An unconfined environment's reach IS the filesystem root — stating it as
+    # An unconfined environment's reach IS the filesystem root - stating it as
     # a root keeps every return below a containment check, rather than having
     # one branch hand back an unchecked path.
     allowed = (
@@ -711,7 +711,7 @@ class CallerProcessFilesystem:
         """Path to report on a returned entry.
 
         Relative to the environment root for anything inside it (the
-        historical shape), absolute otherwise — a path outside the root has
+        historical shape), absolute otherwise - a path outside the root has
         no meaningful relative form, and ``relative_to`` would raise.
 
         :param full: Resolved absolute path.
@@ -749,7 +749,7 @@ class CallerProcessFilesystem:
         path (it runs with cwd at the environment root) and entries are
         reported under that same prefix, unchanged. For an absolute request
         the helper is given the resolved absolute path and entries are
-        reported relative to it — the response envelope carries the base.
+        reported relative to it - the response envelope carries the base.
 
         :param path: Client-supplied path.
         :returns: ``(target, prefix)``.
@@ -865,8 +865,8 @@ class CallerProcessFilesystem:
         """Search recursively by name/path substring and glob filters.
 
         Walks the full directory tree via ``os.walk()`` inside the sandbox
-        (never entering ``.git``) and returns entries — both files and
-        directories — that satisfy all of the supplied filters:
+        (never entering ``.git``) and returns entries - both files and
+        directories - that satisfy all of the supplied filters:
 
         - ``exclude`` (highest priority): the entry is dropped if its path
           matches any exclude glob. Excluded subtrees are pruned from the
@@ -894,7 +894,7 @@ class CallerProcessFilesystem:
         :param include: Pre-split, non-blank glob patterns scoping which files
             are returned, e.g. ``["*.ts", "src/**"]``. ``None`` or empty means
             no include filter. Parse query strings with :func:`split_glob_list`
-            before calling — this method does not re-split or strip.
+            before calling - this method does not re-split or strip.
         :param exclude: Pre-split, non-blank glob patterns for files to drop,
             e.g. ``["**/node_modules", "*.test.ts"]``. ``None`` or empty means
             no exclude filter.
@@ -1107,8 +1107,8 @@ print(json.dumps({'r': results, 't': truncated}))
         if absolute or self._follow_outward_links:
             resolved = self._resolve(path)
             if not self._within_grants(resolved):
-                # Only reachable when the environment is unconfined —
-                # ``_resolve`` rejects out-of-grant paths otherwise — so there
+                # Only reachable when the environment is unconfined -
+                # ``_resolve`` rejects out-of-grant paths otherwise - so there
                 # is no sandbox to route around. Runs the same implementation
                 # the helper would, minus the file-tool cwd guard, which is an
                 # agent-tool policy rather than a browsing boundary.
@@ -1129,9 +1129,9 @@ print(json.dumps({'r': results, 't': truncated}))
     def _file_content(self, path: str, result: OpResult, byte_cap: int) -> FileContent:
         """Convert a read result into typed content.
 
-        Shared by both read routes — through the helper for paths the
+        Shared by both read routes - through the helper for paths the
         environment's file tools can reach, and in-process for unconfined
-        browsing — so encoding and truncation behave identically either way.
+        browsing - so encoding and truncation behave identically either way.
 
         :param path: Path as requested, echoed onto the result.
         :param result: Raw result from the read implementation.

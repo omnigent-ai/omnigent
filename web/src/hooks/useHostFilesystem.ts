@@ -96,8 +96,8 @@ const MAX_LIST_RETRIES = 3;
 /**
  * Build a human-readable error for a failed directory listing.
  *
- * A 404 means the path doesn't exist (or isn't a directory) — the common case
- * when a user types a bad path into the picker — so it gets a plain "doesn't
+ * A 404 means the path doesn't exist (or isn't a directory) - the common case
+ * when a user types a bad path into the picker - so it gets a plain "doesn't
  * exist" message naming the path instead of a bare status code. Other failures
  * use the server's ``detail`` when present, else fall back to the status code.
  *
@@ -110,7 +110,7 @@ async function describeListError(res: Response, path: string): Promise<string> {
     const where = path === "" || path === "~" ? "That directory" : path;
     return `${where} doesn't exist on this host (or isn't a directory).`;
   }
-  // Host offline / timed out (409/502/504) or another failure — surface the
+  // Host offline / timed out (409/502/504) or another failure - surface the
   // server's detail so the user sees why, else fall back to the status code.
   let detail: string | null;
   try {
@@ -207,7 +207,7 @@ async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDi
       break;
     }
     after = body.data[body.data.length - 1].path;
-    // Loop is about to exit on the cap but the server has more —
+    // Loop is about to exit on the cap but the server has more -
     // the listing is incomplete; let the UI say so.
     if (page === MAX_PAGES - 1) {
       truncated = true;
@@ -220,7 +220,7 @@ async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDi
 /**
  * React Query hook: list the contents of a directory on a host.
  *
- * Lazy — only fires when both ``hostId`` and ``path`` are set.
+ * Lazy - only fires when both ``hostId`` and ``path`` are set.
  * Paginates to completion under the hood (the picker shows a whole
  * directory at once), returning a ``truncated`` flag when the page
  * cap cuts the listing short. Cached per (host, path) so navigating
@@ -255,7 +255,7 @@ export function useHostFilesystem(hostId: string | null, path: string | null) {
 /**
  * Probe whether a directory exists (and is listable) on a host.
  *
- * Requests a single-entry ``list_dir`` page — the filesystem route
+ * Requests a single-entry ``list_dir`` page - the filesystem route
  * returns 404 for a missing (or non-directory) path, which is the
  * only existence signal exposed over HTTP (``host.stat`` is a WS
  * frame reachable from the server alone).
@@ -278,10 +278,10 @@ export async function checkHostDirectory(hostId: string, path: string): Promise<
   if (res.ok) return null;
   if (res.status === 404) {
     // The route 404s for missing paths AND for paths that exist but
-    // aren't listable directories (e.g. a file) — say so.
+    // aren't listable directories (e.g. a file) - say so.
     return `The working directory ${path} doesn't exist on this host (or isn't a directory).`;
   }
-  // Host offline / timed out (502/504) or another server failure —
+  // Host offline / timed out (502/504) or another server failure -
   // surface its detail so the user sees why the check failed.
   let detail: string | null;
   try {
@@ -298,7 +298,7 @@ export async function checkHostDirectory(hostId: string, path: string): Promise<
  * problem (exists-but-unlistable, host offline, network error).
  *
  * The fork dialog uses this to distinguish "the source's worktree directory
- * was deleted — recreatable at the same path/branch" from problems where
+ * was deleted - recreatable at the same path/branch" from problems where
  * falling back to worktree creation would be wrong.
  */
 export async function hostDirectoryMissing(hostId: string, path: string): Promise<boolean> {

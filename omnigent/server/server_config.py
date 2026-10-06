@@ -1,8 +1,8 @@
 """Server-side YAML config for the non-CLI entrypoints.
 
 The ``omnigent server`` CLI already takes ``-c/--config`` and reads a
-YAML file (see ``omnigent/cli.py``). The hosted entrypoints —
-``deploy/docker/entrypoint.py`` and ``deploy/databricks/src/app.py`` —
+YAML file (see ``omnigent/cli.py``). The hosted entrypoints -
+``deploy/docker/entrypoint.py`` and ``deploy/databricks/src/app.py`` -
 don't go through that CLI; they build the app directly from env vars.
 This module gives those entrypoints the *same* config-file experience a
 laptop gets from ``-c``, so a deployment can keep most of its settings
@@ -12,7 +12,7 @@ env vars.
 
 **Secrets stay in the environment, not this file.** ``DATABASE_URL``,
 the session cookie secret, and the OIDC client secret are injected by
-compose / ``bootstrap.sh`` / the platform — keeping them out of a
+compose / ``bootstrap.sh`` / the platform - keeping them out of a
 mounted YAML is deliberate (12-factor; the file is operator-editable
 and often world-readable on the box). This config holds non-secret
 *settings* only.
@@ -20,11 +20,11 @@ and often world-readable on the box). This config holds non-secret
 Resolution order for the config path:
 
 1. ``OMNIGENT_CONFIG`` env var, if set (explicit path).
-2. ``<data_dir>/config.yaml`` if it exists — ``<data_dir>`` is the same
+2. ``<data_dir>/config.yaml`` if it exists - ``<data_dir>`` is the same
    directory the admin list / credentials use (``/data`` in the Docker
    stack, ``~/.omnigent`` on a laptop; see
    :func:`omnigent.server.admin_list.resolve_data_dir`).
-3. Otherwise ``None`` — no file, pure env config (back-compat: existing
+3. Otherwise ``None`` - no file, pure env config (back-compat: existing
    env-only deploys keep working unchanged).
 """
 
@@ -69,7 +69,7 @@ def load_server_config() -> dict[str, Any]:
 
     :returns: The parsed mapping, or an empty dict when no config file is
         resolved. A present-but-unreadable / malformed file logs a
-        warning and returns ``{}`` rather than crashing startup — the
+        warning and returns ``{}`` rather than crashing startup - the
         entrypoint then falls back to env + defaults.
     """
     path = resolve_config_path()
@@ -79,10 +79,10 @@ def load_server_config() -> dict[str, Any]:
         with open(path, encoding="utf-8") as handle:
             data = yaml.safe_load(handle)
     except (OSError, yaml.YAMLError) as exc:
-        logger.warning("server config %s unreadable/invalid: %s — falling back to env", path, exc)
+        logger.warning("server config %s unreadable/invalid: %s - falling back to env", path, exc)
         return {}
     if not isinstance(data, dict):
-        logger.warning("server config %s is not a mapping — ignoring", path)
+        logger.warning("server config %s is not a mapping - ignoring", path)
         return {}
     logger.info("loaded server config from %s", path)
     return data
@@ -120,7 +120,7 @@ def session_title_instructions(config: Mapping[str, Any]) -> str | None:
         return None
     if not isinstance(raw, str):
         logger.warning(
-            "server config %s must be a string — using default title instructions",
+            "server config %s must be a string - using default title instructions",
             SESSION_TITLE_INSTRUCTIONS_KEY,
         )
         return None
@@ -129,7 +129,7 @@ def session_title_instructions(config: Mapping[str, Any]) -> str | None:
         return None
     if len(value) > SESSION_TITLE_INSTRUCTIONS_MAX_CHARS:
         logger.warning(
-            "server config %s exceeds %d characters — using default title instructions",
+            "server config %s exceeds %d characters - using default title instructions",
             SESSION_TITLE_INSTRUCTIONS_KEY,
             SESSION_TITLE_INSTRUCTIONS_MAX_CHARS,
         )
@@ -141,7 +141,7 @@ def _config_positive_int(key: str, default: int) -> int:
     """Read a positive-int setting from the server config, else *default*.
 
     A missing, non-numeric, or non-positive value falls back to *default*
-    rather than crashing — the config file is operator-editable and a typo
+    rather than crashing - the config file is operator-editable and a typo
     should degrade to the safe built-in limit, not take the server down.
 
     :param key: Top-level config key, e.g. ``"copy_max_files"``.
@@ -154,11 +154,11 @@ def _config_positive_int(key: str, default: int) -> int:
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        logger.warning("server config %s=%r is not an int — using default %d", key, raw, default)
+        logger.warning("server config %s=%r is not an int - using default %d", key, raw, default)
         return default
     if value <= 0:
         logger.warning(
-            "server config %s=%d is not positive — using default %d", key, value, default
+            "server config %s=%d is not positive - using default %d", key, value, default
         )
         return default
     return value
@@ -633,10 +633,10 @@ def _resolve_branding_asset(
     """Resolve a validated image below the dedicated branding-assets directory."""
     relative = Path(name)
     if relative.is_absolute() or ".." in relative.parts:
-        logger.warning("branding.logo %r escapes %s — ignoring", name, assets_dir)
+        logger.warning("branding.logo %r escapes %s - ignoring", name, assets_dir)
         return None
     if assets_dir.is_symlink():
-        logger.warning("branding assets directory %s is a symlink — ignoring", assets_dir)
+        logger.warning("branding assets directory %s is a symlink - ignoring", assets_dir)
         return None
     try:
         assets_root = assets_dir.resolve(strict=True)
@@ -645,13 +645,13 @@ def _resolve_branding_asset(
             if parent == assets_root.parent:
                 break
             if parent.is_symlink():
-                logger.warning("branding.logo %r traverses a symlink — ignoring", name)
+                logger.warning("branding.logo %r traverses a symlink - ignoring", name)
                 return None
         resolved = path.resolve(strict=True)
         resolved.relative_to(assets_root)
     except (FileNotFoundError, OSError, ValueError):
         logger.warning(
-            "branding.logo %r is outside or missing from %s — ignoring", name, assets_dir
+            "branding.logo %r is outside or missing from %s - ignoring", name, assets_dir
         )
         return None
     if not resolved.is_file():
@@ -660,7 +660,7 @@ def _resolve_branding_asset(
         return validated_assets[resolved]
     asset = validated_assets[resolved] = _validated_image(resolved)
     if asset is None:
-        logger.warning("branding.logo %r is not a supported image — ignoring", name)
+        logger.warning("branding.logo %r is not a supported image - ignoring", name)
         return None
     return asset
 

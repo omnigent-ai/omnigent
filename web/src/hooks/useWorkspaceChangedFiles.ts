@@ -2,11 +2,11 @@
 //
 // Two separate endpoints, two separate hooks:
 //
-//   useWorkspaceChangedFiles — calls `/changes` (registry-backed,
+//   useWorkspaceChangedFiles - calls `/changes` (registry-backed,
 //     flat list of every file created/modified/deleted since session start).
 //     Used by the flat "changed files" view in FilesPanel.
 //
-//   useWorkspaceAllFiles — calls `/filesystem` (directory listing, on-disk
+//   useWorkspaceAllFiles - calls `/filesystem` (directory listing, on-disk
 //     state, no change annotations).  Used by the folder tree view in
 //     FilesPanel.
 //
@@ -36,12 +36,12 @@ export function useSessionActive(conversationId: string | undefined): boolean {
  *
  * `false` only when we *know* neither source can answer: the runner is
  * offline AND the host is offline or not host-bound. While either liveness
- * is still unknown the query is allowed to fire — an offline runner with a
+ * is still unknown the query is allowed to fire - an offline runner with a
  * live host is served over the host tunnel, and if the host turns out to be
  * down the query just 503s and shows the reconnect hint anyway.
  *
  * Returns `false` to disable the query, or `true`/`undefined` (unknown)
- * to let it run — matching the tri-state semantics the query `enabled`
+ * to let it run - matching the tri-state semantics the query `enabled`
  * gates expect.
  */
 export function useWorkspaceServeable(conversationId: string | undefined): boolean | undefined {
@@ -51,7 +51,7 @@ export function useWorkspaceServeable(conversationId: string | undefined): boole
   // Runner known-offline: block only when the host is *known* unavailable
   // (`false` down, `null` not host-bound). While host liveness is still
   // `undefined` (e.g. a stream push flipped the runner before host resolved),
-  // stay unknown so the query fires — the host may serve it.
+  // stay unknown so the query fires - the host may serve it.
   if (hostOnline === undefined) return undefined;
   return hostOnline === true;
 }
@@ -117,7 +117,7 @@ export interface WorkspaceChangedFilesResult {
 /**
  * The session's runner is bound but not currently connected (the server's
  * `runner_unavailable` error, HTTP 503). For host-bound sessions this is
- * recoverable — sending a message wakes the runner — so callers render a
+ * recoverable - sending a message wakes the runner - so callers render a
  * "reconnect" hint instead of a raw error. Distinct from a 404 (no OS
  * environment at all, e.g. a cloud-only agent), which degrades to
  * `available: false`.
@@ -221,7 +221,7 @@ async function fetchWorkspaceChangedFiles(
     return { available: false, data: [] };
   }
   // The bound runner isn't connected. Throw the typed error so the panel
-  // can show a reconnect hint — but only for the app's runner_unavailable
+  // can show a reconnect hint - but only for the app's runner_unavailable
   // code, and only after retries are exhausted (see the hook's retry):
   // a new session whose runner is still spinning up also 503s, but its
   // runner connects within the retry window, so the hint never shows.
@@ -236,7 +236,7 @@ async function fetchWorkspaceChangedFiles(
       const body = (await res.json()) as { error?: { message?: string } };
       if (body?.error?.message) message = body.error.message;
     } catch {
-      // Non-JSON body (gateway/front-door error) — keep the status line.
+      // Non-JSON body (gateway/front-door error) - keep the status line.
     }
     throw new Error(message);
   }
@@ -426,7 +426,7 @@ export function useWorkspaceAllFiles(
     // Keep the tree warm on revisits: within staleTime a return to a
     // previously-loaded conversation/location paints its cached tree with no
     // loading flash. Freshness on turn-completion is still handled by
-    // useTrailingInvalidate above. No cross-key placeholderData — carrying the
+    // useTrailingInvalidate above. No cross-key placeholderData - carrying the
     // previous conversation's tree under a new conversation's key fed stale
     // files into the folder tree's default-expansion cache; virtualization
     // already keeps the per-switch render cheap, so the warm-carry isn't needed.
@@ -439,7 +439,7 @@ export function useWorkspaceAllFiles(
  *
  * A location is either workspace-relative (``"src/shell"``, the historical
  * contract) or absolute (``"/etc"``). Absolute locations keep their leading
- * slash — that is what marks them absolute — but it is sent percent-encoded:
+ * slash - that is what marks them absolute - but it is sent percent-encoded:
  * a literal ``//`` in the URL is what proxies collapse, which would silently
  * turn ``/etc`` back into a workspace-relative ``etc``. Interior slashes stay
  * literal so the path is still readable in logs.
@@ -450,12 +450,12 @@ export function useWorkspaceAllFiles(
 export function browseLocationSegment(location: string): string {
   if (location === "" || location === "/") return "";
   // A per-segment-encoded path with LITERAL slash separators and NO leading
-  // "%2F" — for BOTH workspace-relative and host-absolute locations. An
+  // "%2F" - for BOTH workspace-relative and host-absolute locations. An
   // absolute location's leading slash is stripped here and re-added by the
   // server, exactly as the host filesystem endpoint does; its base is named
   // out of band via `?base=host` (see `browseLocationBase`). A "%2F" leading
-  // marker would decode to a "//" that reverse proxies — the Databricks Apps
-  // front door among them — merge back to a single "/", silently turning an
+  // marker would decode to a "//" that reverse proxies - the Databricks Apps
+  // front door among them - merge back to a single "/", silently turning an
   // absolute path into a workspace-relative one and listing a nonexistent
   // path under the workspace.
   return location.replace(/^\//, "").split("/").map(encodeURIComponent).join("/");
@@ -559,7 +559,7 @@ async function fetchWorkspaceFileSearch(
  * Calls the server-side ``/search`` endpoint which covers the whole workspace
  * so results include files in unexpanded subdirectories.  The result carries
  * ``truncated`` when the server stopped early, so an empty ``files`` is not
- * proof of absence.  The query is disabled when ``query`` is empty — the
+ * proof of absence.  The query is disabled when ``query`` is empty - the
  * include/exclude globs only narrow an active text query, they do not search
  * on their own.
  *
@@ -634,7 +634,7 @@ async function fetchWorkspaceDirectory(
  * before its first slash (which marks a command like `git diff src/app`
  * rather than a path). Every slash-delimited segment must be non-empty and
  * not a `.`/`..` traversal segment (rejects `a/`, `a//b`, `../x`). Spaces
- * *inside* a segment are allowed — `docs/Design Notes.md` is a real filename
+ * *inside* a segment are allowed - `docs/Design Notes.md` is a real filename
  * and segments are URL-encoded when listed.
  */
 export function looksLikeWorkspaceFilePath(text: string): boolean {
@@ -658,7 +658,7 @@ export interface ChatFileResolution {
   /**
    * Workspace-relative path (``src/app.ts``), or host-absolute path with its
    * leading slash (``/etc/hosts``) when the file lies outside the workspace
-   * root. Both forms are what the FileViewer / filesystem API accept — the
+   * root. Both forms are what the FileViewer / filesystem API accept - the
    * absolute one rides the same ``base=host`` wire form the files panel's
    * outside-workspace browsing uses.
    */
@@ -674,7 +674,7 @@ export interface ChatFileResolution {
 /**
  * Resolve a path mentioned in chat to an openable form, or null.
  *
- * The agent writes paths in several shapes — plain relative
+ * The agent writes paths in several shapes - plain relative
  * (``src/app.tsx``), absolute (``/home/u/ws/foo.md``), or home-relative
  * (``~/ws/foo.md``). This maps each onto what the filesystem API speaks:
  *
@@ -686,7 +686,7 @@ export interface ChatFileResolution {
  *  - absolute OUTSIDE ``root`` → kept host-absolute. The FileViewer and the
  *    filesystem API already open such paths via ``base=host`` (the files
  *    panel's browse-anywhere plumbing), so an agent-cited file outside the
- *    workspace is openable exactly as far as the session's reach allows —
+ *    workspace is openable exactly as far as the session's reach allows -
  *    the existence check still confirms it before anything linkifies.
  *
  * Returns null when the path is the workspace root itself (a directory),
@@ -696,7 +696,7 @@ export interface ChatFileResolution {
  *
  * The returned path is always free of empty/``.``/``..`` segments: interior
  * traversal (``/root/ws/../etc/hosts``) could land the normalized fetch /
- * FileViewer URL somewhere other than the cited text claims — those resolve
+ * FileViewer URL somewhere other than the cited text claims - those resolve
  * to null instead. URLs and paths carrying a query/fragment (``?``/``#``)
  * are rejected up-front (mirroring {@link looksLikeWorkspaceFilePath}) so an
  * absolute span like ``/root/ws/foo.md#L12`` doesn't strip to ``foo.md#L12``
@@ -729,7 +729,7 @@ export function resolveChatFilePath(
     return hasUnsafeSegments(p) ? null : { path: p, trusted: false };
   }
   // Absolute: with the root unknown, inside and outside the workspace are
-  // indistinguishable — resolve nothing rather than guess (re-resolved once
+  // indistinguishable - resolve nothing rather than guess (re-resolved once
   // the environment metadata loads).
   if (!root) return null;
   const normRoot = root.replace(/\/+$/, "");
@@ -748,7 +748,7 @@ export function resolveChatFilePath(
 }
 
 /**
- * True when a relative path has any empty, ``.``, or ``..`` segment — i.e. it
+ * True when a relative path has any empty, ``.``, or ``..`` segment - i.e. it
  * is non-canonical and could traverse outside its base once resolved.
  */
 function hasUnsafeSegments(rel: string): boolean {
@@ -759,7 +759,7 @@ function hasUnsafeSegments(rel: string): boolean {
 interface DirListingPage {
   files: WorkspaceFile[];
   /** True when the listing was truncated (`has_more`), so a file missing
-   * from `files` may simply live past the page limit — absence unproven. */
+   * from `files` may simply live past the page limit - absence unproven. */
   truncated: boolean;
 }
 
@@ -767,7 +767,7 @@ async function fetchDirEntriesTolerant(
   conversationId: string,
   dirPath: string,
 ): Promise<DirListingPage | null> {
-  // An empty dirPath is the workspace root — its listing lives at the bare
+  // An empty dirPath is the workspace root - its listing lives at the bare
   // ``/filesystem`` endpoint, not ``/filesystem/`` (a root-level file like
   // ``foo.md`` resolves to a "" parent). A leading slash marks a
   // host-absolute parent (an agent-cited file outside the workspace); it
@@ -785,11 +785,11 @@ async function fetchDirEntriesTolerant(
   );
   // 404 = the directory (or the whole OS environment) is absent, so the file
   // can't exist. 403 = the path is outside this session's reach (a confined
-  // sandbox, or a viewer below the owner level absolute browsing requires) —
+  // sandbox, or a viewer below the owner level absolute browsing requires) -
   // for this caller that reads the same as "no such openable file". Degrade
   // both to "no entries" rather than surfacing an error.
   if (res.status === 404 || res.status === 403) return { files: [], truncated: false };
-  // A parked/unavailable runner can't answer at all — that's "couldn't
+  // A parked/unavailable runner can't answer at all - that's "couldn't
   // check" (null), not a verified-absent empty listing, so a dead-link
   // affordance never grows out of a runner that's merely offline.
   if (await isRunnerUnavailable503(res)) return null;
@@ -815,7 +815,7 @@ export interface WorkspaceFileExistence {
    * conversation, workspace not serveable), errored, answered by an
    * unavailable runner, skipped because the candidate isn't path-shaped, or
    * when a truncated (`has_more`) page missed the file (it may live past the
-   * page limit) — in all of those the check never ran to a verified answer,
+   * page limit) - in all of those the check never ran to a verified answer,
    * so callers must not treat the file as known-missing.
    */
   settled: boolean;
@@ -824,13 +824,13 @@ export interface WorkspaceFileExistence {
 /**
  * Check whether `path` names an existing *file* the session can open.
  *
- * Backed by a listing of the path's PARENT directory — cheap (one stat-level
+ * Backed by a listing of the path's PARENT directory - cheap (one stat-level
  * listing, metadata only), shared across sibling files via the React Query
  * cache, and far lighter than a recursive `/search` walk or a full content
  * read. Reports `exists: false` while loading, when `path` is null or not
  * path-shaped, or when the runner has no OS environment for this session.
  *
- * A host-absolute `path` (leading slash — a file outside the workspace root)
+ * A host-absolute `path` (leading slash - a file outside the workspace root)
  * lists its absolute parent via the ``base=host`` wire form; the entries echo
  * back absolute, so the same comparison applies.
  *
@@ -838,7 +838,7 @@ export interface WorkspaceFileExistence {
  * @param path Candidate workspace-relative or host-absolute path, or null to
  *   disable the check.
  * @param trusted When true, skip the {@link looksLikeWorkspaceFilePath}
- *   heuristic — the caller already proved the path's shape by resolving an
+ *   heuristic - the caller already proved the path's shape by resolving an
  *   absolute/home-relative form against the root (see
  *   {@link resolveChatFilePath}). Such a path may be a bare basename
  *   (``foo.md``, no interior slash) that the heuristic would reject.
@@ -850,7 +850,7 @@ export function useWorkspaceFileExists(
 ): WorkspaceFileExistence {
   const serveable = useWorkspaceServeable(conversationId);
   const candidate = path && (trusted || looksLikeWorkspaceFilePath(path)) ? path : null;
-  // Parent of a root-level file (no slash) is "" — the workspace root
+  // Parent of a root-level file (no slash) is "" - the workspace root
   // listing. For an absolute candidate the parent keeps its leading slash
   // ("/etc/hosts" → "/etc", "/foo" → "/") so the fetch routes via base=host.
   const parentDir = candidate
@@ -862,7 +862,7 @@ export function useWorkspaceFileExists(
     : null;
   const query = useQuery({
     // Distinct prefix from `useWorkspaceDirectory` ("workspace-dir") because
-    // this query tolerates 404 and that one throws — they must not share a
+    // this query tolerates 404 and that one throws - they must not share a
     // cache entry with conflicting queryFns.
     queryKey: ["workspace-dir-listing", conversationId, parentDir],
     queryFn: () => fetchDirEntriesTolerant(conversationId!, parentDir!),
@@ -873,14 +873,14 @@ export function useWorkspaceFileExists(
     staleTime: 30_000,
   });
   // No candidate = the check was SKIPPED (not path-shaped and untrusted),
-  // not run-and-found-nothing — it must never read as "verified absent".
+  // not run-and-found-nothing - it must never read as "verified absent".
   if (!candidate) return { exists: false, settled: false };
   const listing = query.data ?? null;
   const exists = !!listing?.files.some((e) => e.type === "file" && e.path === candidate);
   // Only a listing that genuinely completed proves absence: errors and
   // unavailable-runner responses (data === null) leave the answer open. A
   // hit settles even a truncated page, but a miss on a truncated page
-  // doesn't — the file may simply live past the page limit.
+  // doesn't - the file may simply live past the page limit.
   return { exists, settled: query.isSuccess && listing !== null && (exists || !listing.truncated) };
 }
 
@@ -903,7 +903,7 @@ export interface WorkspaceEnvironment {
    * ``unconfined`` reports that no OS-level sandbox is applied, so the
    * session's shell already reads anything the runner can and the panel may
    * navigate anywhere. ``roots`` always names the declared grants, workspace
-   * first — the anchor the panel opens at, not a ceiling when unconfined.
+   * first - the anchor the panel opens at, not a ceiling when unconfined.
    * ``null`` while the environment metadata is still loading, or when an
    * older server doesn't report it.
    */
@@ -957,7 +957,7 @@ export function useWorkspaceEnvironment(
   rawConversationId: string | undefined,
   options: WorkspaceQueryOptions = {},
 ) {
-  // A `temp:*` id (navigate-first new-chat window) has no server workspace —
+  // A `temp:*` id (navigate-first new-chat window) has no server workspace -
   // normalize to undefined so nothing (env, and the changed/all-files queries
   // that gate on its result) hits `/v1/sessions/temp:*/resources/*`.
   const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
@@ -1007,8 +1007,8 @@ export interface DirectoryResult {
  *
  * The virtualized tree flattens the visible node list from a central place, so
  * it can't call one hook per rendered row (rows come and go with scrolling, and
- * a scrolled-off row unmounting would drop its fetch). Fetching here — once,
- * for every currently-expanded lazy dir — keeps the queries alive regardless of
+ * a scrolled-off row unmounting would drop its fetch). Fetching here - once,
+ * for every currently-expanded lazy dir - keeps the queries alive regardless of
  * which rows are windowed in, and shares the same cache entries as the singular
  * hook (identical query keys).
  */
@@ -1022,7 +1022,7 @@ export function useWorkspaceDirectories(
   const enabled = !!conversationId && serveable !== false;
   // `combine` lets TanStack memoize the assembled Map. Its recompute gate is a
   // reference check on the combine fn (`combine !== lastCombine`), so the
-  // callback must be stable — an inline closure is a fresh fn every render and
+  // callback must be stable - an inline closure is a fresh fn every render and
   // defeats the gate, rebuilding the Map (and re-running the tree's flatten
   // memo + widening effect) on every render, including every scroll frame.
   // Keyed on `dirPaths`, which the caller holds stable at its widening fixpoint.

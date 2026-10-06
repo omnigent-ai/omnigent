@@ -215,8 +215,8 @@ def _has_plugin_provenance(skill: SkillSpec, plugin: str) -> bool:
     (both the Claude and Codex plugin stores use this shape), and the
     codex runtime links them into ``CODEX_HOME/skills/<skill>`` via a
     symlink that resolves back into that cache. The full structural
-    sequence is required — not just the plugin name appearing somewhere
-    in the path — so an unrelated skill under a directory that happens
+    sequence is required - not just the plugin name appearing somewhere
+    in the path - so an unrelated skill under a directory that happens
     to be named like the plugin does not acquire its provenance. An
     in-memory skill (``skill_dir is None``) never matches.
 
@@ -286,7 +286,7 @@ def format_skill_meta_text(skill: SkillSpec, arguments: str) -> str:
 
     The embedded ``<path>`` and the resource listing are resolved
     against ``skill.skill_dir``, so this MUST run on the host where the
-    harness executes (the runner) — the paths are read at runtime by
+    harness executes (the runner) - the paths are read at runtime by
     the ``read_skill_file`` tool, which resolves relative to the same
     ``skill_dir``.
 
