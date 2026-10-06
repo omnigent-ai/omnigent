@@ -255,55 +255,6 @@ def test_dedup_is_scoped_per_call_id() -> None:
     assert results == [("c1", "A"), ("c2", "B")]
 
 
-def _nearest_tool_call_ids(entries: list[dict[str, Any]], index: int) -> set[str]:
-    """Tool call ids of the assistant entry Anthropic would pair entry *index* with."""
-    for prev in reversed(entries[:index]):
-        role = prev["message"]["role"]
-        if role == "toolResult":
-            continue
-        if role != "assistant":
-            return set()
-        return {
-            block["id"] for block in prev["message"]["content"] if block.get("type") == "toolCall"
-        }
-    return set()
-
-
-def test_parallel_tool_results_stay_adjacent_to_their_calls() -> None:
-    """One response with text plus two tool calls rebuilds with each toolResult
-    directly after the assistant entry holding its toolCall; Anthropic rejects a
-    tool_result whose tool_use is not in the immediately preceding assistant message.
-    """
-    items = [
-        _user_item("read both files", item_id="u1"),
-        _assistant_item("Reading both files now.", item_id="a1"),
-        _function_call_item(name="read", call_id="c1", arguments='{"path":"a"}', item_id="fc1"),
-        _function_call_item(name="read", call_id="c2", arguments='{"path":"b"}', item_id="fc2"),
-        _function_output_item(call_id="c1", output="A", item_id="fo1"),
-        _function_output_item(call_id="c2", output="B", item_id="fo2"),
-        _assistant_item("Read both.", item_id="a2"),
-    ]
-    records = pi_session_records_from_session_items(
-        items,
-        session_id="conv_abc",
-        external_session_id=_EXTERNAL_ID,
-        cwd=Path("/repo"),
-    )
-    entries = records[1:]
-    results = [(i, e) for i, e in enumerate(entries) if e["message"]["role"] == "toolResult"]
-    assert [e["message"]["toolCallId"] for _, e in results] == ["c1", "c2"]
-    roles = [e["message"]["role"] for e in entries]
-    for index, entry in results:
-        call_id = entry["message"]["toolCallId"]
-        assert call_id in _nearest_tool_call_ids(entries, index), (
-            f"toolResult {call_id} is not adjacent to the assistant entry holding its "
-            f"toolCall; rebuilt roles: {roles}"
-        )
-    assert entries[0]["parentId"] is None
-    for prev, cur in itertools.pairwise(entries):
-        assert cur["parentId"] == prev["id"]
-
-
 def test_full_tool_roundtrip_chains_correctly() -> None:
     items = [
         _user_item("run ls", item_id="u1"),
@@ -330,166 +281,70 @@ def test_full_tool_roundtrip_chains_correctly() -> None:
         assert cur["parentId"] == prev["id"]
 
 
-def test_parallel_tool_calls_merge_into_one_assistant_message() -> None:
-    # One response with two parallel calls plus text: Anthropic replay needs both
-    # results adjacent to the single assistant message holding the calls; separate
-    # single-call messages would orphan the results behind the response text.
+@pytest.mark.parametrize(
+    "call_count,text_index,reasoning",
+    [(2, 0, False), (2, 2, False), (2, 1, True), (1, 1, False)],
+    ids=["text-first", "text-last", "interleaved-reasoning", "single-call"],
+)
+def test_response_keeps_tool_calls_and_results_adjacent(
+    call_count: int, text_index: int, reasoning: bool
+) -> None:
+    call_ids = [f"c{i}" for i in range(call_count)]
+    response = [
+        _function_call_item(name="read", call_id=cid, arguments="{}", item_id=cid)
+        for cid in call_ids
+    ]
+    response.insert(text_index, _assistant_item("Reading files."))
+    if reasoning:
+        response.insert(1, {"type": "reasoning", "id": "thinking", "response_id": "r1"})
     items = [
-        _user_item("read both files", item_id="u1", response_id="pi-user-1"),
-        _function_call_item(
-            name="read",
-            call_id="call_a",
-            arguments='{"path": "alpha.txt"}',
-            item_id="fc_a",
-            response_id="r-tools",
-        ),
-        _function_call_item(
-            name="read",
-            call_id="call_b",
-            arguments='{"path": "beta.txt"}',
-            item_id="fc_b",
-            response_id="r-tools",
-        ),
-        _assistant_item("Reading both files.", item_id="a1", response_id="r-tools"),
-        _function_output_item(
-            call_id="call_a", output="alpha", item_id="fo_a", response_id="r-tools"
-        ),
-        _function_output_item(
-            call_id="call_b", output="beta", item_id="fo_b", response_id="r-tools"
-        ),
-        _assistant_item("Both files read.", item_id="a2", response_id="r-final"),
+        _user_item("read files"),
+        *response,
+        *[
+            _function_output_item(call_id=cid, output=cid, item_id=f"out-{cid}")
+            for cid in call_ids
+        ],
+        _assistant_item("Done.", item_id="final", response_id="r2"),
     ]
     records = pi_session_records_from_session_items(
         items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
     )
     entries = records[1:]
-    assert [e["message"]["role"] for e in entries] == [
+    messages = [entry["message"] for entry in entries]
+    assert [msg["role"] for msg in messages] == [
         "user",
         "assistant",
-        "toolResult",
-        "toolResult",
+        *["toolResult"] * call_count,
         "assistant",
     ]
-    merged = entries[1]["message"]
-    assert [(b["type"], b.get("id")) for b in merged["content"]] == [
-        ("toolCall", "call_a"),
-        ("toolCall", "call_b"),
-        ("text", None),
-    ]
-    assert {entries[2]["message"]["toolCallId"], entries[3]["message"]["toolCallId"]} == {
-        "call_a",
-        "call_b",
-    }
+    content = messages[1]["content"]
+    assert [b["type"] for b in content] == (
+        ["toolCall"] * text_index + ["text"] + ["toolCall"] * (call_count - text_index)
+    )
+    assert [b["id"] for b in content if b["type"] == "toolCall"] == call_ids
+    assert content[text_index] == {"type": "text", "text": "Reading files."}
+    assert messages[1]["model"] == "claude-opus-4-8"
+    assert [msg["toolCallId"] for msg in messages[2:-1]] == call_ids
     assert entries[0]["parentId"] is None
     for prev, cur in itertools.pairwise(entries):
         assert cur["parentId"] == prev["id"]
-    # Merged entries keep deterministic ids across re-synthesis.
     again = pi_session_records_from_session_items(
         items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
     )
-    assert [r["id"] for r in records[1:]] == [r["id"] for r in again[1:]]
+    assert [r["id"] for r in records] == [r["id"] for r in again]
 
 
-def test_reasoning_between_parallel_calls_keeps_results_adjacent() -> None:
-    # A reasoning item has no Pi entry. Interleaved between two parallel calls
-    # of one response it must not end the response, or the results would be
-    # orphaned behind a second assistant message again.
-    items = [
-        _user_item("read both files", item_id="u1", response_id="pi-user-1"),
-        _function_call_item(
-            name="read",
-            call_id="call_a",
-            arguments='{"path": "alpha.txt"}',
-            item_id="fc_a",
-            response_id="r-tools",
-        ),
-        {"type": "reasoning", "id": "re1", "response_id": "r-tools", "content": "thinking"},
-        _function_call_item(
-            name="read",
-            call_id="call_b",
-            arguments='{"path": "beta.txt"}',
-            item_id="fc_b",
-            response_id="r-tools",
-        ),
-        _function_output_item(
-            call_id="call_a", output="alpha", item_id="fo_a", response_id="r-tools"
-        ),
-        _function_output_item(
-            call_id="call_b", output="beta", item_id="fo_b", response_id="r-tools"
-        ),
-        _assistant_item("Both files read.", item_id="a2", response_id="r-final"),
-    ]
+@pytest.mark.parametrize("response_ids", [("r1", "r2"), ("", ""), (None, None)])
+def test_distinct_or_missing_response_ids_stay_separate(response_ids: tuple) -> None:
+    items = [_assistant_item("first"), _assistant_item("second", item_id="a2")]
+    for item, response_id in zip(items, response_ids, strict=True):
+        item["response_id"] = response_id
     records = pi_session_records_from_session_items(
         items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
     )
-    entries = records[1:]
-    assert [e["message"]["role"] for e in entries] == [
-        "user",
-        "assistant",
-        "toolResult",
-        "toolResult",
-        "assistant",
-    ]
-    merged = entries[1]["message"]
-    assert [(b["type"], b.get("id")) for b in merged["content"]] == [
-        ("toolCall", "call_a"),
-        ("toolCall", "call_b"),
-    ]
-    for index, entry in enumerate(entries):
-        if entry["message"]["role"] != "toolResult":
-            continue
-        call_id = entry["message"]["toolCallId"]
-        assert call_id in _nearest_tool_call_ids(entries, index)
-
-
-def test_response_text_between_call_and_result_stays_with_the_call() -> None:
-    # A single call whose response text is stored between the call and its
-    # output: the text must merge into the call's assistant message rather
-    # than becoming a separate message that orphans the result.
-    items = [
-        _user_item("run it", item_id="u1", response_id="pi-user-1"),
-        _function_call_item(
-            name="bash", call_id="c1", arguments='{"cmd": "ls"}', item_id="fc1", response_id="r1"
-        ),
-        _assistant_item("Running the command.", item_id="a1", response_id="r1"),
-        _function_output_item(call_id="c1", output="a.txt", item_id="fo1", response_id="r1"),
-    ]
-    records = pi_session_records_from_session_items(
-        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
-    )
-    entries = records[1:]
-    assert [e["message"]["role"] for e in entries] == ["user", "assistant", "toolResult"]
-    merged = entries[1]["message"]
-    assert [b["type"] for b in merged["content"]] == ["toolCall", "text"]
-    # The group inherits the first non-empty per-item model.
-    assert merged["model"] == "claude-opus-4-8"
-
-
-def test_distinct_responses_keep_separate_assistant_messages() -> None:
-    # Different response ids -- or no response id at all -- never merge.
-    items = [
-        _assistant_item("first answer", item_id="a1", response_id="r1"),
-        _assistant_item("second answer", item_id="a2", response_id="r2"),
-        _function_call_item(
-            name="bash", call_id="c1", arguments="{}", item_id="fc1", response_id=""
-        ),
-        _assistant_item("no response id", item_id="a3", response_id=""),
-    ]
-    records = pi_session_records_from_session_items(
-        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
-    )
-    entries = records[1:]
-    assert [e["message"]["role"] for e in entries] == [
-        "assistant",
-        "assistant",
-        "assistant",
-        "assistant",
-    ]
-    assert [[b["type"] for b in e["message"]["content"]] for e in entries] == [
-        ["text"],
-        ["text"],
-        ["toolCall"],
-        ["text"],
+    assert [r["message"]["content"] for r in records[1:]] == [
+        [{"type": "text", "text": "first"}],
+        [{"type": "text", "text": "second"}],
     ]
 
 
