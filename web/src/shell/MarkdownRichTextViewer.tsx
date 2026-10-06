@@ -27,6 +27,7 @@ import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { useCanEdit } from "@/hooks/usePermissions";
+import { useSessionActive } from "@/hooks/useWorkspaceChangedFiles";
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -124,6 +125,10 @@ export function MarkdownRichTextViewer({
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
 
+  // True while the owning session's agent turn is in flight — used to warn
+  // before edits that would be overwritten by the agent's next write.
+  const sessionActive = useSessionActive(conversationId);
+
   // Callback registered by the inner component once its TipTap editor is ready.
   // The sync hook calls this instead of remounting (setEditorKey) when an
   // external content update arrives on a clean editor — scroll and cursor are
@@ -163,6 +168,7 @@ export function MarkdownRichTextViewer({
       conversationId={conversationId}
       path={path}
       canEdit={canEdit}
+      sessionActive={sessionActive}
       truncated={truncated}
       isDirty={isDirty}
       setDirty={setDirty}
@@ -194,6 +200,8 @@ interface InnerProps {
   conversationId: string;
   path: string;
   canEdit: boolean;
+  /** True while the owning session's agent turn is in flight. */
+  sessionActive: boolean;
   truncated: boolean;
   isDirty: boolean;
   setDirty: (dirty: boolean) => void;
@@ -219,6 +227,7 @@ function MarkdownRichTextViewerInner({
   conversationId,
   path,
   canEdit,
+  sessionActive,
   truncated,
   isDirty,
   setDirty,
@@ -530,6 +539,13 @@ function MarkdownRichTextViewerInner({
       </div>
       {canEdit && editor && (
         <TableHandles editor={editor} scrollContainerRef={scrollContainerRef} />
+      )}
+      {canEdit && sessionActive && !isDirty && !hasExternalUpdate && (
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">
+          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+          Omnigent is still working — edits you make now may be overwritten when it saves this file.
+          Wait for it to finish, or copy your changes first.
+        </div>
       )}
       {canEdit && isDirty && hasExternalUpdate && (
         <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">

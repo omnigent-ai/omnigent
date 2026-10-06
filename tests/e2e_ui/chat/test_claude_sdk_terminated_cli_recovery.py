@@ -54,7 +54,9 @@ def _build_claude_sdk_bundle(name: str, mock_llm_server_url: str) -> bytes:
         return buf.getvalue()
 
 
-def _create_claude_sdk_session(base_url: str, runner_id: str, mock_llm_server_url: str) -> str:
+def _create_claude_sdk_session(
+    base_url: str, runner_id: str, mock_llm_server_url: str
+) -> tuple[str, str]:
     """Create a runner-bound session for a claude-sdk agent."""
     name = f"sdk-term-{uuid.uuid4().hex[:8]}"
     bundle = _build_claude_sdk_bundle(name, mock_llm_server_url)
@@ -72,17 +74,16 @@ def _create_claude_sdk_session(base_url: str, runner_id: str, mock_llm_server_ur
         timeout=10.0,
     )
     patch_resp.raise_for_status()
-    return session_id
+    return session_id, name
 
 
-def _claude_cli_pids() -> set[int]:
-    """Return live SDK-launched Claude CLI PIDs owned by the e2e runner.
+def _claude_cli_pids(agent_name: str) -> set[int]:
+    """Return live Claude CLI PIDs for this agent under the e2e runner.
 
     Discovery is scoped to descendants of the test runner process
-    (``_server_state["runner_pid"]``, refreshed by ``_ensure_runner_online``)
-    so the fault injection below can only ever signal a CLI this runner
-    launched -- never one belonging to another session or application on
-    the host.
+    (``_server_state["runner_pid"]``, refreshed by ``_ensure_runner_online``).
+    The unique agent marker excludes other SDK clients, including the
+    runner's background title generation, from fault injection.
     """
     try:
         descendants = psutil.Process(int(_server_state["runner_pid"])).children(recursive=True)
@@ -98,7 +99,11 @@ def _claude_cli_pids() -> set[int]:
         if "stream-json" not in cmd:
             continue
         if name == "claude" or "/claude" in cmd.lower():
-            pids.add(proc.pid)
+            try:
+                if proc.environ().get("HARNESS_CLAUDE_SDK_AGENT_NAME") == agent_name:
+                    pids.add(proc.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
     return pids
 
 
@@ -146,7 +151,9 @@ def test_next_turn_recovers_when_claude_cli_was_terminated(
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     try:
         runner_id = str(_server_state["runner_id"])
-        session_id = _create_claude_sdk_session(live_server, runner_id, mock_llm_server_url)
+        session_id, agent_name = _create_claude_sdk_session(
+            live_server, runner_id, mock_llm_server_url
+        )
         try:
             uid = uuid.uuid4().hex[:6]
             token1 = f"sdkterm-one-{uid}"
@@ -167,7 +174,7 @@ def test_next_turn_recovers_when_claude_cli_was_terminated(
 
             page.goto(f"{live_server}/c/{session_id}")
 
-            baseline_pids = _claude_cli_pids()
+            baseline_pids = _claude_cli_pids(agent_name)
             _send(page, f"Say ack. {token1}")
             expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=180_000)
             expect(page.locator(_WORKING)).to_have_count(0, timeout=180_000)
@@ -175,13 +182,13 @@ def test_next_turn_recovers_when_claude_cli_was_terminated(
             new_pids: set[int] = set()
             deadline = time.time() + 30
             while time.time() < deadline:
-                new_pids = _claude_cli_pids() - baseline_pids
+                new_pids = _claude_cli_pids(agent_name) - baseline_pids
                 if new_pids:
                     break
                 time.sleep(0.5)
             assert new_pids, (
                 "expected a claude-sdk CLI child process to be running after turn 1; "
-                f"baseline={baseline_pids}, now={_claude_cli_pids()}"
+                f"baseline={baseline_pids}, now={_claude_cli_pids(agent_name)}"
             )
             new_pids = _single_cli_launch(new_pids)
             for pid in new_pids:

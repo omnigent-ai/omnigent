@@ -27,6 +27,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
 import { ALT_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
 import { defaultWorkspaceTabs, readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
@@ -48,6 +49,8 @@ import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
 import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
@@ -723,6 +726,11 @@ interface WorkspacePanelProps {
   /** Called when the shell create POST fails, so the focus snapshot armed by
    *  ``onShellCreateStart`` is disarmed and can't grab an unrelated shell. */
   onShellCreateFailed?: () => void;
+  /** Whether the mobile side-chats drawer is open. The rail is hidden on
+   *  phones, so side chats render in this drawer instead. */
+  mobileSideChatsOpen?: boolean;
+  /** Open or close the mobile side-chats drawer. */
+  onMobileSideChatsOpenChange?: (open: boolean) => void;
 }
 
 /**
@@ -783,6 +791,8 @@ function WorkspacePanelImpl({
   liveness,
   onShellCreateStart,
   onShellCreateFailed,
+  mobileSideChatsOpen = false,
+  onMobileSideChatsOpenChange,
 }: WorkspacePanelProps) {
   const browsers = useBrowserTabs(conversationId);
   const closeBrowserTab = async (tabId: string) => {
@@ -831,14 +841,20 @@ function WorkspacePanelImpl({
     // screen now.
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
-    // Started this session → live (not a dead restored Codex fork).
-    sideChatsStartedThisSession.add(childId);
-    const awaiting = awaitingPendingIdsRef.current.shift();
-    if (awaiting !== undefined) {
-      sideChats.rekey(awaiting, childId);
-    } else {
-      // Generic already rekeyed its own tab; this just re-selects it (idempotent).
+    if (childId.startsWith("pending:")) {
+      // "Ask in side chat": a not-yet-forked tab, so it must not take a slot in
+      // the Codex awaiting queue. Its first send creates the fork.
       sideChats.open(childId);
+    } else {
+      // Started this session → live (not a dead restored Codex fork).
+      sideChatsStartedThisSession.add(childId);
+      const awaiting = awaitingPendingIdsRef.current.shift();
+      if (awaiting !== undefined) {
+        sideChats.rekey(awaiting, childId);
+      } else {
+        // Generic already rekeyed its own tab; this just re-selects it (idempotent).
+        sideChats.open(childId);
+      }
     }
     onRightRailTabChange("sidechat");
     clearSideChatToOpen();
@@ -899,6 +915,10 @@ function WorkspacePanelImpl({
         // shared queue, so overlapping launches can't cross-assign. Seeding the
         // draft fires sideChatToOpen, which then just re-selects + reveals.
         sideChats.rekey(pendingId, childSessionId);
+        // The pending id is gone; drop its composer entry (and its File refs)
+        // now that the text has moved to the real child. Only on success — a
+        // failed create keeps it so the user can retry.
+        useChatStore.getState().clearSideChatComposer(pendingId);
         useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
       },
       (err) => {
@@ -909,10 +929,34 @@ function WorkspacePanelImpl({
       },
     );
   };
+  // The selected side chat's pane, shown in the rail or the mobile drawer. A
+  // `pending:` tab has no child yet; its first send creates the fork.
+  const isMobile = useIsMobileViewport();
+  const selectedSideChat = sideChats.selected;
+  const selectedSideChatPane =
+    selectedSideChat === null ? null : (
+      <SideChatPane
+        key={selectedSideChat}
+        childId={selectedSideChat}
+        onStart={(text) => startPendingSideChat(selectedSideChat, text)}
+        // A Codex side chat restored after a restart is a dead ephemeral
+        // fork: show it read-only (and kill it) rather than let the user
+        // send into a thread that no longer exists.
+        readOnly={
+          usesNativeSideChatFork(sideChatHarness) &&
+          !selectedSideChat.startsWith("pending:") &&
+          !sideChatsStartedThisSession.has(selectedSideChat)
+        }
+      />
+    );
   // Close a side-chat tab: stop the child's runner (real children only) so its
   // compute is freed, then drop the browser-local tab.
   const closeSideChat = (childId: string) => {
     if (!childId.startsWith("pending:")) void stopSession(childId).catch(() => {});
+    // The tab is gone, so its unsent text/attachments and any seeded question
+    // that never got to send have nowhere to return to.
+    useChatStore.getState().clearSideChatComposer(childId);
+    useChatStore.getState().clearSideChatDraft(childId);
     sideChats.close(childId);
   };
 
@@ -1397,23 +1441,11 @@ function WorkspacePanelImpl({
               onCommentsOpenChange={onCommentsOpenChange}
               sort={filesPanelSort}
             />
-          ) : sideChatSelected && sideChats.selected !== null ? (
+          ) : sideChatSelected && !isMobile ? (
             // A side chat: a forked child conversation streamed here in its own
-            // scoped surface, beside the still-active main chat. A `pending:` tab
-            // has no child yet — its first send creates the fork.
-            <SideChatPane
-              key={sideChats.selected}
-              childId={sideChats.selected}
-              onStart={(text) => startPendingSideChat(sideChats.selected!, text)}
-              // A Codex side chat restored after a restart is a dead ephemeral
-              // fork — show it read-only (and kill it) rather than let the user
-              // send into a thread that no longer exists.
-              readOnly={
-                usesNativeSideChatFork(sideChatHarness) &&
-                !sideChats.selected.startsWith("pending:") &&
-                !sideChatsStartedThisSession.has(sideChats.selected)
-              }
-            />
+            // scoped surface, beside the still-active main chat. Phones show it
+            // in the side-chats drawer instead, so it never mounts twice.
+            selectedSideChatPane
           ) : browserSelected && showBrowserTab ? (
             // Browser soft tab — BrowserPane self-gates and measures this rail
             // slot to position the native view over it.
@@ -1443,6 +1475,75 @@ function WorkspacePanelImpl({
           )}
         </div>
       </div>
+      {/* The rail is `hidden` on phones, so the drawer is portaled out of it. */}
+      {isMobile &&
+        createPortal(
+          <MobilePanelDrawer
+            open={mobileSideChatsOpen}
+            title="Side chats"
+            onClose={() => onMobileSideChatsOpenChange?.(false)}
+            testId="side-chats-panel-drawer"
+            // Keep live side-chat work mounted while the drawer is closed.
+            keepMounted
+          >
+            <div
+              role="tablist"
+              aria-label="Side chats"
+              className="flex shrink-0 items-center gap-1 overflow-x-auto border-border border-b px-2 py-1.5"
+            >
+              {sideChats.tabs.map((childId, index) => {
+                const active = sideChats.selected === childId;
+                const label = `Side chat ${index + 1}`;
+                return (
+                  <div
+                    key={childId}
+                    className={cn(
+                      "flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2 text-ui font-medium",
+                      active ? "bg-muted text-foreground" : "text-muted-foreground",
+                    )}
+                  >
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      onClick={() => sideChats.select(childId)}
+                    >
+                      {label}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Close ${label}`}
+                      className="flex size-6 items-center justify-center rounded"
+                      onClick={() => closeSideChat(childId)}
+                    >
+                      <XIcon className="size-3.5" />
+                    </button>
+                  </div>
+                );
+              })}
+              {onNewSideChat && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="New side chat"
+                  onClick={onNewSideChat}
+                >
+                  <PlusIcon className="size-4" />
+                </Button>
+              )}
+            </div>
+            {selectedSideChatPane ?? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+                <MessagesSquareIcon className="size-6 text-muted-foreground" />
+                <p className="max-w-[36ch] text-sm text-muted-foreground">
+                  Tap + to ask a question without affecting the main conversation.
+                </p>
+              </div>
+            )}
+          </MobilePanelDrawer>,
+          document.body,
+        )}
     </aside>
   );
 }

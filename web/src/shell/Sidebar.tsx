@@ -162,6 +162,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -3755,6 +3756,7 @@ function ConversationRowImpl({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
+  const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
   // The kebab's user-facing "Stop session" action. Archiving does NOT go
@@ -3994,7 +3996,16 @@ function ConversationRowImpl({
   }
 
   function runArchive() {
-    const nextArchived = !isArchived;
+    if (isArchived) {
+      runUnarchive();
+      return;
+    }
+    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+      archiveNow(deleteWorktreeIds.has(conversation.id)),
+    );
+  }
+
+  function archiveNow(deleteWorktree: boolean) {
     // The archive PATCH sends only the flag: the server stops the session (and
     // tears down a host-spawned runner) in the background once it's committed.
     // A client stop too would race that one against the same runner, and the
@@ -4007,15 +4018,15 @@ function ConversationRowImpl({
     // synchronously — not in an onSuccess callback that fires a round-trip
     // later with a stale `isActive`, which used to jump the user off whatever
     // session they'd switched to meanwhile. Mirrors confirmDelete.
-    if (nextArchived && isActive) navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: nextArchived });
+    if (isActive) navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
     // Offer an Undo (and point at where the session went) — fire NOW, not in a
     // mutate onSuccess: the optimistic overlay unmounts this row on the next
     // frame, and per-call mutate callbacks don't fire once their observer
     // unmounts. A failed archive reconciles the row back with its own error
     // toast. The toast is driven imperatively (module state + app-level
     // Toaster), so it survives this row unmounting.
-    if (nextArchived) showArchiveUndoToast(queryClient, [conversation], navigate);
+    showArchiveUndoToast(queryClient, [conversation], navigate);
   }
 
   function runUnarchive() {
@@ -4574,6 +4585,7 @@ function ConversationRowImpl({
           </DialogContent>
         )}
       </Dialog>
+      {archiveWorktreePrompt.dialog}
       <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
         {leaveOpen && (
           <DialogContent
@@ -5461,6 +5473,7 @@ function BulkActionBar({
   const queryClient = useQueryClient();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
+  const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const bulkDelete = useBulkDeleteConversations();
   const bulkMove = useBulkMoveToProject();
   const { data: projects = [] } = useProjects();
@@ -5581,20 +5594,26 @@ function BulkActionBar({
 
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
+    const toArchive = nonArchivedSelected;
+    archiveWorktreePrompt.requestArchive(toArchive, (deleteWorktreeIds) =>
+      archiveNow(toArchive, deleteWorktreeIds),
+    );
+  }
+
+  function archiveNow(toArchive: Conversation[], deleteWorktreeIds: ReadonlySet<string>) {
     // The rows leave the sidebar optimistically (useBulkArchiveConversations
     // flips their cached `archived` flag in onMutate), so this bar unmounts
     // with the selection. Navigate and deselect NOW rather than in a
     // mutate-level callback — a callback on the unmounted observer never fires,
     // and it would carry a stale `activeId` that could jump the user off a
     // session they switched to meanwhile. Mirrors handleDelete.
-    if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
-      navigate("/", { replace: true });
+    if (activeId && toArchive.some((c) => c.id === activeId)) navigate("/", { replace: true });
     onDeselectAll();
-    bulkArchive.mutate({ ids: nonArchivedSelected.map((c) => c.id), archived: true });
+    bulkArchive.mutate({ ids: toArchive.map((c) => c.id), archived: true, deleteWorktreeIds });
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
     // the cleared selection; the toast is driven by module state + the
     // app-level Toaster, so it outlives this component.
-    showArchiveUndoToast(queryClient, nonArchivedSelected, navigate);
+    showArchiveUndoToast(queryClient, toArchive, navigate);
   }
 
   function handleUnarchive() {
@@ -5619,6 +5638,7 @@ function BulkActionBar({
 
   return (
     <>
+      {archiveWorktreePrompt.dialog}
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
         <div className="flex items-center gap-2 rounded-lg border border-border bg-transparent p-1.5">
           <Tooltip>

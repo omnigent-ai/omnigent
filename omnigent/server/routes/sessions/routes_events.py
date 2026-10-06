@@ -208,7 +208,6 @@ from omnigent.server.routes._sessions.helpers import (
     _response_agent_name_from_store,
     _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
-    _stop_session_host_runner,
     _stop_session_via_runner,
     _stream_live_events,
     _wait_for_runner_client,
@@ -241,6 +240,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_native_terminal_failure,
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
+    _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
     _wait_for_host_reconnect,
     ensure_runner_connected,
@@ -549,6 +549,7 @@ async def _recover_retry_session(
             conv.runner_id,
             runner_client,
             conversation_store,
+            conversation=conv,
         )
         return {
             "queued": False,
@@ -562,6 +563,7 @@ async def _recover_retry_session(
             conv.runner_id,
             runner_client,
             conversation_store,
+            conversation=conv,
         )
         return {"queued": False, "recovered": True, "recovery": "runner_relaunched"}
 
@@ -775,8 +777,23 @@ def register_events_routes(
                 )
             except ValueError:
                 return EventAckFrame(batch.id, index, "invalid session event")
-            except Exception:
-                _logger.exception("Runner event ingestion failed for session %s", batch.session_id)
+            except Exception as exc:
+                _logger.exception(
+                    "Runner event ingestion failed for session %s",
+                    batch.session_id,
+                    extra=debug_event(
+                        "runner_event_ingest_failed",
+                        session_id=batch.session_id,
+                        runner_id=runner_id,
+                        batch_id=batch.id,
+                        batch_size=len(batch.events),
+                        applied_count=index,
+                        event_type=event_type,
+                        failure_stage="apply",
+                        error_type=type(exc).__name__,
+                        retryable=True,
+                    ),
+                )
                 return EventAckFrame(batch.id, index, "ingest failed", retryable=True)
         return EventAckFrame(batch.id, len(batch.events))
 
@@ -1015,6 +1032,23 @@ def register_events_routes(
                 parse_client_side_tool_specs(body.tools)
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if (
+            body.type == _RETRY_SESSION_TYPE
+            or (body.type == "message" and body.data.get("role") == "user")
+        ) and await _codex_side_chat_fork_lost(
+            conv,
+            conversation_store,
+            runner_router,
+            getattr(request.app.state, "host_registry", None),
+        ):
+            # The ephemeral fork died with its runner; keep the transcript read-only.
+            await asyncio.to_thread(
+                conversation_store.set_labels, conv.id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+            )
+            raise OmnigentError(
+                "This side chat ended when its runner restarted and can't be continued.",
+                code=ErrorCode.CONFLICT,
+            )
         if body.type == _RETRY_SESSION_TYPE:
             return await _retry_session_single_flight(
                 request=cast("Request", request),
@@ -1046,24 +1080,6 @@ def register_events_routes(
         ):
             raise OmnigentError(
                 "Session is closed. Start a new sub-agent session to continue.",
-                code=ErrorCode.CONFLICT,
-            )
-        if (
-            body.type == "message"
-            and body.data.get("role") == "user"
-            and await _codex_side_chat_fork_lost(
-                conv,
-                conversation_store,
-                runner_router,
-                getattr(request.app.state, "host_registry", None),
-            )
-        ):
-            # The ephemeral fork died with its runner; keep the transcript read-only.
-            await asyncio.to_thread(
-                conversation_store.set_labels, conv.id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
-            )
-            raise OmnigentError(
-                "This side chat ended when its runner restarted and can't be continued.",
                 code=ErrorCode.CONFLICT,
             )
         if (
@@ -1325,6 +1341,7 @@ def register_events_routes(
                 wake_conv.runner_id,
                 _client,
                 conversation_store,
+                conversation=wake_conv,
             )
             return wake_conv, _client
 
@@ -1438,26 +1455,13 @@ def register_events_routes(
             # only ever stop the runner bound to this session.
             stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
-                # Mark the tunnel drop as intentional BEFORE tearing it down so
-                # the relay's disconnect handler renders a quiet stopped state
-                # rather than "Error · runner_disconnected". Only host-spawned
-                # sessions drop the tunnel on Stop; other harnesses leave the
-                # runner connected, so there is nothing to suppress for them.
-                _intentional_stop_sessions.add(session_id)
-                teardown_delivered = await _stop_session_host_runner(
+                await _stop_host_runner_intentionally(
                     session_id,
                     stop_conv.host_id,
                     stop_conv.runner_id,
                     getattr(request.app.state, "host_registry", None),
+                    conversation_store,
                 )
-                if not teardown_delivered:
-                    # Best-effort stop did not land (host offline / timeout /
-                    # failure): no tunnel drop will follow, so the relay won't
-                    # reach the disconnect handler that consumes the marker.
-                    # Discard it now so it can't outlive this turn on the
-                    # reused per-session relay task and later swallow a genuine
-                    # runner_disconnected as a quiet idle.
-                    _intentional_stop_sessions.discard(session_id)
             if not stop_delivered:
                 # False-success backstop. The stop reached NO live runner
                 # (``_stop_session_via_runner`` returned False, so there was
@@ -2660,6 +2664,7 @@ def register_events_routes(
             conv.runner_id,
             runner_client,
             conversation_store,
+            conversation=conv,
         )
         _agent = agent_store.get(conv.agent_id) if conv.agent_id else None
         # Determine whether the agent has MCP servers so the runner's
@@ -2737,6 +2742,7 @@ def register_events_routes(
             created_by=created_by,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
+            agent_revision=_agent.bundle_location if _agent else None,
             background_titles_enabled=background_session_titles_enabled(request.headers),
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.
@@ -2842,6 +2848,7 @@ def register_events_routes(
             conv.runner_id,
             runner_client,
             conversation_store,
+            conversation=conv,
         )
 
         async def _resource_snapshot() -> list[dict[str, Any]]:
@@ -3067,7 +3074,7 @@ def register_events_routes(
                 worktree_path=conv.workspace,
                 branch=conv.git_branch,
                 delete_branch=True,
-                request=request,
+                host_registry=getattr(request.app.state, "host_registry", None),
                 reason="session-delete",
                 expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                 conversation_store=conversation_store,
@@ -3084,7 +3091,7 @@ def register_events_routes(
             for blob_key in orphaned_blob_keys:
                 await asyncio.to_thread(artifact_store.delete, blob_key)
         _interrupt_fenced_sessions.discard(session_id)
-        _intentional_stop_sessions.discard(session_id)
+        _intentional_stop_sessions.pop(session_id, None)
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()

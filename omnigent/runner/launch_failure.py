@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.errors import ErrorCategory
+from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
 
 __all__ = [
     "FailureDiagnosis",
@@ -302,6 +302,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "The AI gateway refused this turn because a spending budget or usage limit is "
         "exhausted. Contact an admin to raise it, or use a different budget."
     ),
+    "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 
 

@@ -55,6 +55,7 @@ from omnigent.runner.app import (
     _auto_create_cursor_terminal,
     _auto_create_kiro_terminal,
     _auto_create_pi_terminal,
+    _codex_native_launch_config,
     _KiroNativeLaunchConfig,
     _load_claude_launch_metadata,
     _log_terminal_lookup_miss,
@@ -3362,9 +3363,10 @@ class _BlockingCodexRecoveryServerClient:
         self.release_recovery = asyncio.Event()
         self.recovery_completed = asyncio.Event()
         self.requests: list[str] = []
+        self.launch_snapshot: dict[str, Any] | None = None
 
     async def get(self, url: str, **kwargs: Any) -> Any:
-        """Serve recovery/history reads and fail any session metadata callback."""
+        """Serve recovery/history; metadata reads must be explicitly enabled."""
         del kwargs
         self.requests.append(url)
         if url.endswith("/child_sessions"):
@@ -3381,6 +3383,13 @@ class _BlockingCodexRecoveryServerClient:
                 200,
                 json={"data": [], "has_more": False},
                 request=httpx.Request("GET", url),
+            )
+        if (
+            self.launch_snapshot is not None
+            and url == f"/v1/sessions/{self.launch_snapshot['id']}"
+        ):
+            return httpx.Response(
+                200, json=self.launch_snapshot, request=httpx.Request("GET", url)
             )
         raise AssertionError(f"unexpected runner-init GET: {url}")
 
@@ -3648,21 +3657,33 @@ async def test_create_session_codex_envelope_avoids_reads_and_overlaps_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Protocol-v2 metadata and inbox recovery stay off terminal startup's critical path."""
+    """Init avoids metadata reads; a later terminal ensure reads changed config."""
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://test-server")
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT",
         tmp_path / "codex-native",
     )
     terminal_started = asyncio.Event()
+    launch_configs: list[Any] = []
 
     async def _recording_auto_create(
         session_id: str,
         resource_registry: Any,
         publish_event: Any,
-        **_kwargs: Any,
-    ) -> None:
-        del session_id, resource_registry, publish_event
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event
+        launch_configs.append(
+            await _codex_native_launch_config(
+                session_id=session_id,
+                server_client=kwargs["server_client"],
+                session_init=kwargs.get("session_init"),
+            )
+        )
         terminal_started.set()
+        return SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=session_id, name="Codex"
+        )
 
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_codex_terminal",
@@ -3706,6 +3727,12 @@ async def test_create_session_codex_envelope_avoids_reads_and_overlaps_recovery(
                             "updated_at": 11,
                             "workspace": str(tmp_path),
                             "labels": {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: session_id},
+                            "model_override": "gpt-5.4-mini",
+                            "reasoning_effort": "high",
+                            "external_session_id": None,
+                            "terminal_launch_args": ["--config", "approval_policy=on-request"],
+                            "harness_override": "codex-native",
+                            "cost_control_mode_override": None,
                         },
                     },
                 },
@@ -3726,11 +3753,33 @@ async def test_create_session_codex_envelope_avoids_reads_and_overlaps_recovery(
         server_client.release_recovery.set()
         resp = await request_task
 
-    assert resp.status_code == 201, resp.text
-    assert server_client.requests == [
-        f"/v1/sessions/{session_id}/child_sessions",
-        f"/v1/sessions/{session_id}/items",
-    ]
+        assert resp.status_code == 201, resp.text
+        assert len(launch_configs) == 1
+        assert launch_configs[0].model_override == "gpt-5.4-mini"
+        assert launch_configs[0].external_session_id is None
+        assert server_client.requests == [
+            f"/v1/sessions/{session_id}/child_sessions",
+            f"/v1/sessions/{session_id}/items",
+        ]
+
+        server_client.launch_snapshot = {
+            "id": session_id,
+            "workspace": str(tmp_path),
+            "model_override": "gpt-5.4",
+            "external_session_id": "thread_current",
+            "terminal_launch_args": ["--config", "approval_policy=never"],
+        }
+        ensured = await client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
+        )
+
+    assert ensured.status_code == 200, ensured.text
+    assert len(launch_configs) == 2
+    assert launch_configs[1].model_override == "gpt-5.4"
+    assert launch_configs[1].external_session_id == "thread_current"
+    assert launch_configs[1].terminal_launch_args == ["--config", "approval_policy=never"]
+    assert server_client.requests[-1] == f"/v1/sessions/{session_id}"
 
 
 @pytest.mark.asyncio
@@ -4685,6 +4734,81 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
     )
     assert [body for body in patches if "model_override" in body] == [], (
         "a foldable pin must survive the launch un-reset"
+    )
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pick", "expected_model", "reset_pick"),
+    [
+        ("claude-opus-4-8", "system.ai.claude-opus-5-5[1m]", True),
+        ("claude-sonnet-5-5[1m]", "system.ai.claude-sonnet-5-5[1m]", False),
+        ("system.ai.claude-sonnet-5-5[1m]", "system.ai.claude-sonnet-5-5[1m]", False),
+    ],
+)
+async def test_auto_create_claude_terminal_validates_managed_gateway_pick(
+    pick: str,
+    expected_model: str,
+    reset_pick: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
+    )
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}})
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (managed_settings,),
+    )
+    catalog = [
+        {"id": "opus", "model": "system.ai.claude-opus-5-5[1m]", "isDefault": True},
+        {"id": "sonnet", "model": "system.ai.claude-sonnet-5-5[1m]"},
+    ]
+
+    async def _catalog(config: object) -> list[dict[str, object]]:
+        assert config is None
+        return catalog
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog_is_stale",
+        lambda config: False,
+    )
+    captured: dict[str, Any] = {}
+    patches: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+        return httpx.Response(200, json={"model_override": pick, "labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    await _auto_create_claude_terminal(
+        "1a2b3c4d5e6f47899a0b1c2d3e4f5061",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    args = captured["spec"].args
+    assert args[args.index("--model") + 1] == expected_model
+    assert [body for body in patches if "model_override" in body] == (
+        [{"model_override": "default"}] if reset_pick else []
     )
     await fake_client.aclose()
 

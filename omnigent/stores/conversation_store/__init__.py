@@ -1448,6 +1448,19 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
+        """Set idle only while this runner still owns a non-failed session.
+
+        Match the current runner binding in the update, without changing labels
+        or ``updated_at``. A failed status must survive teardown reconciliation.
+
+        :param conversation_id: Session whose runner was intentionally stopped.
+        :param runner_id: The stopped runner, which may have been replaced.
+        :returns: Whether the conditional update matched the session.
+        """
+        ...
+
+    @abstractmethod
     def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
         """Atomically settle a stale running session to idle.
 
@@ -1551,6 +1564,23 @@ class ConversationStore(ABC):
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
+        """
+        ...
+
+    @abstractmethod
+    def list_runner_session_statuses(
+        self, runner_id: str, *, after: str | None = None, limit: int = 200
+    ) -> list[tuple[str, str | None]]:
+        """Read a bounded page of session IDs and live statuses for runner teardown.
+
+        Include archived sessions. Read bindings consistently with runner writes,
+        in ascending session-ID order; use the last ID as the next page's cursor.
+        A short page ends iteration. Do not hydrate conversation content or labels.
+
+        :param runner_id: The runner being stopped.
+        :param after: Exclusive session-ID cursor, or ``None`` for the first page.
+        :param limit: Maximum number of rows, between 1 and 1000.
+        :returns: ``(session_id, live_status)`` pairs; status can be unknown (``None``).
         """
         ...
 
@@ -1872,6 +1902,37 @@ class ConversationStore(ABC):
             the source conversation has that ``response_id``.
         """
         ...
+
+    def list_session_roots_for_agent(self, agent_id: str, limit: int) -> list[str]:
+        """
+        Up to *limit* distinct spawn-tree roots of sessions that use *agent_id*.
+
+        Forks of one user's sessions share an agent row, so several roots can
+        use it. Lets a caller be authorized by READ on any of them. Reads a
+        bounded number of rows, so an agent used very widely may return fewer.
+        Default: none (stores without the lookup authorize against one root only).
+
+        :param agent_id: Agent id, e.g. ``"0f1a2b3c..."``.
+        :param limit: Most roots to return, e.g. ``50``.
+        :returns: Distinct root conversation ids, at most *limit*.
+        """
+        del agent_id, limit
+        return []
+
+    def count_sessions_for_agent(self, agent_id: str, cap: int) -> int:
+        """
+        Count sessions that use *agent_id*, reading at most *cap* of them.
+
+        Any kind, archived included. Default: one bounded conversation page.
+
+        :param agent_id: Agent id, e.g. ``"0f1a2b3c..."``.
+        :param cap: Most sessions to count, e.g. ``101``.
+        :returns: The count, at most *cap*.
+        """
+        page = self.list_conversations(
+            limit=cap, kind=None, agent_id=agent_id, include_archived=True
+        )
+        return len(page.data)
 
     @abstractmethod
     def has_other_live_session_in_workspace(

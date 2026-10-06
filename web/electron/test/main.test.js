@@ -142,6 +142,7 @@ function loadNavigationHarness({
   realBrowserRegistry = false,
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
+  arcaLoginResult = { ok: true },
   loadServer = async () => {},
   loadURL = null,
   managedServers = [],
@@ -151,6 +152,11 @@ function loadNavigationHarness({
   managedServerNames = {},
   // A createWorkspaceNetwork() to run the real session module against.
   network = null,
+  manifest = {},
+  deleteStoredToken,
+  notificationsSupported = false,
+  oidc = {},
+  acceptedSessions = new Set(),
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -169,19 +175,40 @@ function loadNavigationHarness({
     loading: [],
     reloads: 0,
     arcaConnects: [],
+    cookiesSet: [],
+    oidc: { refresh: 0, signIn: 0, signOut: 0 },
+    arcaLogins: [],
+    arcaLoginCancels: 0,
   };
   const pickers = [];
   const ipc = new Map();
   const webRequest = {};
+  const jar = new Map();
   const cookies = Object.assign(new EventEmitter(), {
-    get: async () => [
-      {
-        name: "DBAUTH",
-        domain: new URL(serverUrl).hostname,
-        value: "session",
-        expirationDate: Date.now() / 1000 + 3600,
-      },
-    ],
+    get: async ({ name } = {}) => {
+      if (name && name !== "DBAUTH") return jar.has(name) ? [jar.get(name)] : [];
+      return [
+        {
+          name: "DBAUTH",
+          domain: new URL(serverUrl).hostname,
+          value: "session",
+          expirationDate: Date.now() / 1000 + 3600,
+        },
+      ];
+    },
+    set: async (details) => {
+      calls.cookiesSet.push(details);
+      jar.set(details.name, {
+        name: details.name,
+        value: details.value,
+        domain: new URL(details.url).hostname,
+        expirationDate: details.expirationDate,
+      });
+    },
+    remove: async (url, name) => {
+      calls.cookiesRemoved = [...(calls.cookiesRemoved ?? []), [url, name]];
+      jar.delete(name);
+    },
   });
   const defaultSession = {
     cookies: network?.cookies ?? cookies,
@@ -208,6 +235,9 @@ function loadNavigationHarness({
     reload() {
       calls.reloads++;
     },
+    emitWith(eventName, event, ...args) {
+      for (const listener of listeners.get(eventName) ?? []) listener(event, ...args);
+    },
     removeListener(eventName, listener) {
       listeners.set(
         eventName,
@@ -232,6 +262,13 @@ function loadNavigationHarness({
     contentView: { addChildView: () => {}, removeChildView: () => {} },
     isDestroyed: () => false,
     isMaximized: () => false,
+    isMinimized: () => false,
+    isFocused: () => true,
+    restore: () => {},
+    show: () => {},
+    focus: () => {
+      calls.focused = (calls.focused ?? 0) + 1;
+    },
     getNormalBounds: () => ({ x: 0, y: 0, width: 1280, height: 860 }),
     getPosition: () => [0, 0],
     setPosition: () => {},
@@ -280,6 +317,7 @@ function loadNavigationHarness({
       setAsDefaultProtocolClient: () => {},
       setAppUserModelId: () => {},
       getVersion: () => "test",
+      focus: () => {},
     },
     BrowserWindow: Object.assign(
       function BrowserWindow(options) {
@@ -308,8 +346,33 @@ function loadNavigationHarness({
     WebContentsView: function WebContentsView(opts) {
       return electron.createWebContentsView(opts);
     },
-    Menu: { buildFromTemplate: () => ({}), setApplicationMenu: () => {} },
-    Notification: { isSupported: () => false },
+    Menu: {
+      buildFromTemplate: (template) => ({
+        template,
+        getMenuItemById: (id) => {
+          const find = (items) => {
+            for (const item of items ?? []) {
+              if (item.id === id) return item;
+              const nested = Array.isArray(item.submenu) ? find(item.submenu) : null;
+              if (nested) return nested;
+            }
+            return null;
+          };
+          return find(template);
+        },
+      }),
+      setApplicationMenu: (menu) => {
+        calls.appMenu = menu;
+      },
+      getApplicationMenu: () => calls.appMenu ?? null,
+    },
+    Notification: Object.assign(
+      function Notification(options) {
+        calls.notifications = [...(calls.notifications ?? []), options];
+        return { on: () => {}, show: () => {} };
+      },
+      { isSupported: () => notificationsSupported },
+    ),
     clipboard: { writeText: () => {} },
     dialog: {},
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
@@ -349,7 +412,7 @@ function loadNavigationHarness({
       expandDatabricksWorkspaceUrl: expandWorkspace,
       fetchServerManifest: async (url) => {
         calls.manifests.push(url);
-        return {};
+        return manifest;
       },
       PRE_MANIFEST_BASELINE: {},
     },
@@ -375,6 +438,17 @@ function loadNavigationHarness({
         const result = typeof arcaResult === "function" ? arcaResult(url) : arcaResult;
         return { command: "arca ssh", promise: Promise.resolve(result), cancel: () => {} };
       },
+      startArcaLogin: (url) => {
+        calls.arcaLogins.push(url);
+        const result =
+          typeof arcaLoginResult === "function" ? arcaLoginResult(url) : arcaLoginResult;
+        return {
+          promise: Promise.resolve(result),
+          cancel: () => {
+            calls.arcaLoginCancels += 1;
+          },
+        };
+      },
     },
     "./databricks-session": {
       ensureDatabricksSession: (...args) => {
@@ -383,8 +457,40 @@ function loadNavigationHarness({
       },
     },
     "./databricks-oauth": {
+      deleteStoredToken: (origin) => {
+        deleteStoredToken?.(origin);
+        calls.forgottenTokens = [...(calls.forgottenTokens ?? []), origin];
+      },
+      whenRefreshSettled: async () => {},
       expireStoredAccessToken: () => false,
       removeStoredRefreshToken: () => false,
+    },
+    "./oidc-credentials": {
+      ...require("../src/oidc-credentials"),
+      refreshSession: async (...args) => {
+        calls.oidc.refresh++;
+        if (!oidc.refresh) throw Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
+        return oidc.refresh(...args);
+      },
+      signInWithBrowser: async (...args) => {
+        calls.oidc.signIn++;
+        if (!oidc.signIn) throw new Error("unexpected browser sign-in");
+        return oidc.signIn(...args);
+      },
+      signOut: async () => {
+        calls.oidc.signOut++;
+      },
+      removeStoredGrant: () => false,
+    },
+    "./oidc-auth": {
+      createOidcAuth: (options) =>
+        require("../src/oidc-auth").createOidcAuth({
+          ...options,
+          // /v1/me accepts exactly the session tokens the test allows.
+          fetchFn: async (_url, init) => ({
+            status: acceptedSessions.has(init.headers.Cookie.split("=")[1]) ? 200 : 401,
+          }),
+        }),
     },
     "./databricks-auth": {
       ...require("../src/databricks-auth"),
@@ -445,6 +551,7 @@ function loadNavigationHarness({
       isExecutableFile: () => false,
       resolveCliPath: () => (cliPath ? { path: cliPath } : null),
       cliCommandParts: require("../src/omnigent_cli").cliCommandParts,
+      normalizeServerUrl: require("../src/omnigent_cli").normalizeServerUrl,
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
     },
@@ -463,7 +570,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -629,6 +736,114 @@ describe("Arca auto-connect wiring", () => {
         "remote",
       );
     const failed = { ok: false, errorKind: "timeout", error: "timed out" };
+
+    it("prepares the remote grant after an auth failure and retries the same SPOG workspace", async (t) => {
+      const spog = "https://account.databricks.com/omnigent?o=123";
+      let attempts = 0;
+      const h = harness(t, {
+        arcaResult: () =>
+          ++attempts === 1 ? { ok: false, errorKind: "omni-auth", authError: true } : { ok: true },
+      });
+      assert.equal((await connect(h, spog)).ok, true);
+      assert.deepEqual(h.calls.arcaLogins, [spog]);
+      assert.deepEqual(h.calls.arcaConnects, [spog, spog]);
+      assert.equal(saved(h).arca_auto_connect, true);
+    });
+
+    it("never prompts from passive auto-connect and never loops after rejected login", async (t) => {
+      const h = harness(t, {
+        arcaResult: { ok: false, errorKind: "omni-auth", authError: true },
+        arcaLoginResult: { ok: false, authError: true, error: "Sign-in canceled" },
+      });
+      enableFeature(h);
+      await h.api.loadServerUrl(h.win, workspace);
+      await tick();
+      assert.deepEqual(h.calls.arcaLogins, []);
+      assert.equal((await connect(h)).error, "Sign-in canceled");
+      assert.deepEqual(h.calls.arcaLogins, [workspace]);
+      assert.equal(h.calls.arcaConnects.length, 2);
+    });
+
+    it("cancels onboarding login when setup closes and does not retry", async (t) => {
+      let finishLogin;
+      let loginStarted;
+      const started = new Promise((resolve) => {
+        loginStarted = resolve;
+      });
+      const h = harness(t, {
+        arcaResult: { ok: false, errorKind: "omni-auth" },
+        arcaLoginResult: () =>
+          new Promise((resolve) => {
+            finishLogin = resolve;
+            loginStarted();
+          }),
+      });
+      let closed = false;
+      const page = Object.assign(new EventEmitter(), { send() {}, isDestroyed: () => closed });
+      const result = connect(h, workspace, page);
+      await started;
+      assert.ok(finishLogin);
+      closed = true;
+      page.emit("destroyed");
+      assert.equal((await result).canceled, true);
+      assert.equal(h.calls.arcaLoginCancels, 1);
+      finishLogin({ ok: true });
+      assert.equal(h.calls.arcaConnects.length, 1);
+      assert.equal(saved(h).arca_auto_connect, undefined);
+    });
+
+    it("shares sign-in across setup windows without letting one closure cancel the other", async (t) => {
+      let finishLogin;
+      let attempts = 0;
+      const h = harness(t, {
+        arcaResult: () => (++attempts === 1 ? { ok: false, errorKind: "omni-auth" } : { ok: true }),
+        arcaLoginResult: () =>
+          new Promise((resolve) => {
+            finishLogin = resolve;
+          }),
+      });
+      let closed = false;
+      const page = Object.assign(new EventEmitter(), { send() {}, isDestroyed: () => closed });
+      const first = connect(h, workspace, page);
+      const second = connect(h);
+      await tick();
+      assert.deepEqual(h.calls.arcaLogins, [workspace]);
+      closed = true;
+      page.emit("destroyed");
+      assert.equal((await first).canceled, true);
+      assert.equal(h.calls.arcaLoginCancels, 0);
+      finishLogin({ ok: true });
+      assert.equal((await second).ok, true);
+      assert.deepEqual(h.calls.arcaConnects, [workspace, workspace]);
+      assert.equal(h.calls.arcaLoginCancels, 0);
+      assert.equal(page.listenerCount("destroyed"), 0);
+      assert.equal(saved(h).arca_auto_connect, true);
+    });
+
+    it("does not share sign-in or host success across SPOG workspace selectors", async (t) => {
+      const firstTarget = "https://account.databricks.com/omnigent?o=123";
+      const secondTarget = "https://account.databricks.com/omnigent?o=456";
+      const authenticated = new Set();
+      const finishLogin = new Map();
+      const h = harness(t, {
+        arcaResult: (url) =>
+          authenticated.has(url) ? { ok: true } : { ok: false, errorKind: "omni-auth" },
+        arcaLoginResult: (url) =>
+          new Promise((resolve) => {
+            finishLogin.set(url, resolve);
+          }),
+      });
+      const first = connect(h, firstTarget);
+      const second = connect(h, secondTarget);
+      await tick();
+      assert.deepEqual(h.calls.arcaLogins, [firstTarget, secondTarget]);
+      authenticated.add(firstTarget);
+      finishLogin.get(firstTarget)({ ok: true });
+      assert.equal((await first).ok, true);
+      finishLogin.get(secondTarget)({ ok: false, errorKind: "omni-auth", error: "Canceled" });
+      assert.equal((await second).ok, false);
+      assert.deepEqual(h.calls.arcaConnects, [firstTarget, secondTarget, firstTarget]);
+    });
 
     it("keeps the auto-connect opt-in only when the connect succeeds", async (t) => {
       const ok = harness(t);
@@ -879,25 +1094,241 @@ describe("Databricks auth mode wiring", () => {
     );
   });
 
-  it("signs in through the browser for a different account, then reuses that sign-in", async (t) => {
+  it("signs a workspace out from the server picker, in every window on it", async (t) => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
     t.after(h.cleanup);
     h.api.registerIpc();
-    const setupEvent = {
-      sender: h.webContents,
-      senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    h.setUrl(workspace);
+    const pageEvent = { sender: h.webContents, senderFrame: { url: workspace } };
+    const picker = await h.ipc.get("omnigent:get-server-picker")(pageEvent);
+    assert.equal(picker.canSignOut, true);
+
+    // A second window on the same workspace is signed out with it.
+    const otherLoads = [];
+    const other = {
+      isDestroyed: () => false,
+      webContents: {
+        on: () => {},
+        removeListener: () => {},
+        stop: () => {},
+        getURL: () => workspace,
+      },
+      loadFile: (...args) => {
+        otherLoads.push(args);
+        return Promise.resolve();
+      },
     };
-    const connect = (opts) => h.ipc.get("omnigent:set-server-url")(setupEvent, workspace, opts);
-    await connect({ requestId: "other", browserSignIn: true });
-    await connect({ requestId: "again" });
-    await assert.rejects(connect({ browserSignIn: "yes" }), /Invalid browserSignIn option/);
-    assert.deepEqual(
-      h.calls.auth.map((call) => [call[2].interactive, call[2].useStoredCredentials]),
-      [
-        [true, false],
-        [true, true],
-      ],
+    h.api.windows.set(other, {
+      origin: new URL(workspace).origin,
+      serverUrl: workspace,
+      ephemeral: false,
+      badgeCount: 0,
+      browserRegistry: { closeAll: () => {} },
+    });
+
+    assert.equal(await h.ipc.get("omnigent:sign-out-of-server")(pageEvent), true);
+    await tick();
+    const origin = new URL(workspace).origin;
+    assert.deepEqual(h.calls.forgottenTokens, [origin]);
+    assert.equal(h.api.windows.get(other).origin, null);
+    assert.match(
+      new URLSearchParams(otherLoads.at(-1)[1].search).get("error"),
+      /^You're signed out of /,
     );
+    assert.ok(h.calls.cookiesRemoved.some(([, name]) => name === "DBAUTH"));
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    const params = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
+    assert.equal(params.get("error"), `You're signed out of ${new URL(workspace).host}.`);
+    assert.equal(params.get("url"), workspace);
+  });
+
+  it("offers Server → Sign Out of Server whatever web app the server runs", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    const item = h.calls.appMenu.getMenuItemById("sign_out_server");
+    assert.equal(item.label, "Sign Out of Server");
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    assert.equal(item.enabled, true);
+    item.click();
+    await tick();
+    assert.deepEqual(h.calls.forgottenTokens, [new URL(workspace).origin]);
+    // Back on the setup page, there's nothing to sign out of.
+    assert.equal(item.enabled, false);
+  });
+
+  it("keeps the menu item disabled for a server whose sign-in isn't the shell's", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: "https://plain.example" });
+    t.after(h.cleanup);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    await h.api.loadServerUrl(h.win, "https://plain.example");
+    assert.equal(h.calls.appMenu.getMenuItemById("sign_out_server").enabled, false);
+  });
+
+  it("waits for a renewal already running before clearing the sign-in", async (t) => {
+    let release;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async (_ses, origin, opts) => {
+        if (opts?.interactive === false) {
+          await new Promise((resolve) => {
+            release = resolve;
+          });
+        }
+        return origin;
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    h.setUrl(workspace);
+    // The cookie disappears, so a background renewal starts and stays pending.
+    h.electron.session.defaultSession.cookies.emit(
+      "changed",
+      {},
+      { name: "DBAUTH", domain: new URL(workspace).hostname, hostOnly: true },
+      "explicit",
+      true,
+    );
+    await tick();
+    assert.equal(typeof release, "function", "no renewal started");
+    const pageEvent = { sender: h.webContents, senderFrame: { url: workspace } };
+    const signingOut = h.ipc.get("omnigent:sign-out-of-server")(pageEvent);
+    await tick();
+    assert.equal(h.calls.forgottenTokens, undefined, "cleared before the renewal settled");
+    release();
+    assert.equal(await signingOut, true);
+    assert.deepEqual(h.calls.forgottenTokens, [new URL(workspace).origin]);
+  });
+
+  it("holds a connection that starts during sign-out until the credentials are gone", async (t) => {
+    const order = [];
+    let release;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      deleteStoredToken: () => order.push("forgot"),
+      ensureSession: async (_ses, origin, opts) => {
+        order.push(`session(interactive=${opts?.interactive})`);
+        if (opts?.interactive === false && !release) {
+          await new Promise((resolve) => {
+            release = resolve;
+          });
+        }
+        return origin;
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    h.setUrl(workspace);
+    h.electron.session.defaultSession.cookies.emit(
+      "changed",
+      {},
+      { name: "DBAUTH", domain: new URL(workspace).hostname, hostOnly: true },
+      "explicit",
+      true,
+    );
+    await tick();
+    const pageEvent = { sender: h.webContents, senderFrame: { url: workspace } };
+    const signingOut = h.ipc.get("omnigent:sign-out-of-server")(pageEvent);
+    await tick();
+    // A reconnect or New Window to the same workspace while sign-out waits.
+    const reconnecting = h.api.loadServerUrl(h.win, workspace).catch(() => {});
+    await tick();
+    release();
+    assert.equal(await signingOut, true);
+    await reconnecting;
+    // The reconnect never read the old credentials: it waited, and sign-out
+    // then sent its window to the connect screen.
+    assert.deepEqual(order, ["session(interactive=true)", "session(interactive=false)", "forgot"]);
+    assert.equal(h.api.windows.get(h.win).origin, null);
+  });
+
+  it("signs out a window that is reconnecting to the workspace too", async (t) => {
+    const offlineError = () => new TypeError("fetch failed");
+    let failing = false;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async (_ses, origin) => {
+        if (failing) throw offlineError();
+        return origin;
+      },
+    });
+    t.after(h.cleanup);
+    h.api.setReconnectDelaysMs([60_000]);
+    // This window goes offline and waits behind the reconnect overlay, unpinned.
+    failing = true;
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    assert.ok(h.overlay.hint, "the window should be reconnecting");
+    // Another window on the same workspace signs out.
+    const other = {
+      isDestroyed: () => false,
+      webContents: {
+        on: () => {},
+        removeListener: () => {},
+        stop: () => {},
+        getURL: () => workspace,
+      },
+      loadFile: () => Promise.resolve(),
+    };
+    h.api.windows.set(other, {
+      origin: new URL(workspace).origin,
+      serverUrl: workspace,
+      ephemeral: false,
+      badgeCount: 0,
+      browserRegistry: { closeAll: () => {} },
+    });
+    failing = false;
+    assert.equal(await h.api.signOutOfServer(other), true);
+    await tick();
+    assert.equal(h.overlay.hint, null, "the reconnect was cancelled");
+    const params = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
+    assert.equal(params.get("error"), `You're signed out of ${new URL(workspace).host}.`);
+  });
+
+  it("clears the cookie and says so when forgetting the token fails", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      deleteStoredToken: () => {
+        throw new Error("disk full");
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    h.setUrl(workspace);
+    const pageEvent = { sender: h.webContents, senderFrame: { url: workspace } };
+    assert.equal(await h.ipc.get("omnigent:sign-out-of-server")(pageEvent), false);
+    await tick();
+    assert.ok(h.calls.cookiesRemoved.some(([, name]) => name === "DBAUTH"));
+    const params = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
+    assert.match(params.get("error"), /^Couldn't finish signing out of /);
+    // The next Connect still goes to the browser, so another account can sign in.
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    assert.equal(h.calls.auth.at(-1)[2].useStoredCredentials, false);
+  });
+
+  it("only lets the connected server page ask to sign out", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.setUrl("https://evil.example/");
+    await assert.rejects(
+      h.ipc.get("omnigent:sign-out-of-server")({
+        sender: h.webContents,
+        senderFrame: { url: "https://evil.example/" },
+      }),
+      /only available to a connected server page/,
+    );
+    assert.equal(h.calls.forgottenTokens, undefined);
   });
 
   it("keeps requiring browser sign-in after a cancelled one", async (t) => {
@@ -1701,6 +2132,17 @@ describe("reconnect overlay wiring (src/main.js)", () => {
   });
 });
 
+/** Wait until a window created by `createWindow` has issued its first load. */
+async function waitForInitialLoad(harness) {
+  for (let i = 0; i < 50 && harness.calls.loadURL.length === 0; i += 1) {
+    // oxlint-disable-next-line no-await-in-loop -- polling the async connect.
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+  }
+  assert.ok(harness.calls.loadURL.length > 0, "the window never loaded its server");
+}
+
 describe("return-to-server banner wiring (src/main.js)", () => {
   it("registers the away watch against the window's current pinned origin", () => {
     assert.match(
@@ -1728,6 +2170,8 @@ describe("return-to-server banner wiring (src/main.js)", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
     harness.api.setAwayBannerDelayMs(5);
     harness.api.createWindow("https://host.example/ml/omnigents");
+    // The window's own load (after the manifest read) lands before any SSO hop.
+    await waitForInitialLoad(harness);
 
     // SSO navigates the window to the IdP and leaves it there.
     harness.setUrl("https://company.okta.com/login");
@@ -1757,6 +2201,8 @@ describe("return-to-server banner wiring (src/main.js)", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
     harness.api.setAwayBannerDelayMs(5);
     harness.api.createWindow("https://host.example/ml/omnigents");
+    // The window's own load (after the manifest read) lands before any SSO hop.
+    await waitForInitialLoad(harness);
 
     harness.setUrl("https://host.example/ml/omnigents");
     harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
@@ -3026,4 +3472,429 @@ it("dismisses native loading feedback when the server document fails", async (t)
   const shown = h.calls.loading.find((call) => call.action === "show");
   assert.equal(shown.label, "Opening Omnigent…");
   assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+});
+
+describe("OIDC system-browser sign-in wiring", () => {
+  const server = "https://omni.example";
+  const oidcManifest = {
+    manifestVersion: 1,
+    auth: { mode: "oidc", sessionCookie: "__Host-ap_session" },
+  };
+  const minted = (token) => async () => ({ token, expiresIn: 3600 });
+  const settle = () =>
+    new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+  const setupQuery = (h) => new URLSearchParams(h.calls.loadFile.at(-1)?.[1]?.search ?? "");
+
+  it("signs in through the system browser on Connect, then loads the app", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: { signIn: minted("browser-session") },
+      acceptedSessions: new Set(["browser-session"]),
+    });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, server, undefined, { interactive: true });
+    assert.equal(h.calls.oidc.signIn, 1);
+    const [cookie] = h.calls.cookiesSet;
+    assert.equal(cookie.name, "__Host-ap_session");
+    assert.equal(cookie.value, "browser-session");
+    assert.equal(cookie.httpOnly, true);
+    assert.deepEqual(h.calls.loadURL.at(-1), [server]);
+    assert.equal(h.calls.focused, 1);
+    assert.equal(h.api.windows.get(h.win).authKind, "oidc");
+  });
+
+  it("restores from the stored grant without opening the browser", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: { refresh: minted("renewed") },
+      acceptedSessions: new Set(["renewed"]),
+    });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, server);
+    assert.equal(h.calls.oidc.refresh, 1);
+    assert.equal(h.calls.oidc.signIn, 0);
+    assert.deepEqual(h.calls.loadURL.at(-1), [server]);
+  });
+
+  it("returns a restore it can't renew to the connect screen, explaining why", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, manifest: oidcManifest });
+    t.after(h.cleanup);
+    await assert.rejects(h.api.loadServerUrl(h.win, server));
+    await settle();
+    assert.equal(h.calls.oidc.signIn, 0);
+    assert.deepEqual(h.calls.loadURL, []);
+    assert.equal(
+      setupQuery(h).get("error"),
+      "Sign in to omni.example to continue. Select Connect to open your browser.",
+    );
+    assert.equal(setupQuery(h).get("url"), server);
+    assert.equal(h.api.windows.get(h.win).origin, null);
+  });
+
+  it("names an expired grant in the message", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: {
+        refresh: async () =>
+          Promise.reject(Object.assign(new Error("x"), { code: "expired_token" })),
+      },
+    });
+    t.after(h.cleanup);
+    await assert.rejects(h.api.loadServerUrl(h.win, server));
+    await settle();
+    assert.equal(
+      setupQuery(h).get("error"),
+      "Your sign-in to omni.example has expired. Select Connect to sign in again in your browser.",
+    );
+  });
+
+  it("renews in place when the app asks to sign in again", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: { refresh: minted("renewed") },
+      acceptedSessions: new Set(["renewed"]),
+    });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, server);
+    h.setUrl(`${server}/c/1`);
+    h.emit("did-navigate", `${server}/c/1`, 200);
+    let prevented = false;
+    h.webContents.emitWith(
+      "will-navigate",
+      { preventDefault: () => (prevented = true) },
+      `${server}/auth/login?return_to=/c/1`,
+    );
+    await settle();
+    assert.equal(prevented, true, "the IdP must not load in the window");
+    assert.equal(h.calls.oidc.refresh, 2);
+    assert.deepEqual(h.calls.loadURL.at(-1), [`${server}/c/1`]);
+  });
+
+  it("signs out in place and says so on the connect screen", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: { refresh: minted("renewed") },
+      acceptedSessions: new Set(["renewed"]),
+    });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, server);
+    let prevented = false;
+    h.webContents.emitWith(
+      "will-navigate",
+      { preventDefault: () => (prevented = true) },
+      `${server}/auth/logout`,
+    );
+    await settle();
+    assert.equal(prevented, true);
+    assert.equal(h.calls.oidc.signOut, 1);
+    assert.equal(setupQuery(h).get("error"), "You're signed out of omni.example.");
+  });
+
+  it("signs out from the server picker, as the app's own sign-out does", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: { refresh: minted("renewed") },
+      acceptedSessions: new Set(["renewed"]),
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, server);
+    h.setUrl(server);
+    const pageEvent = { sender: h.webContents, senderFrame: { url: server } };
+    assert.equal((await h.ipc.get("omnigent:get-server-picker")(pageEvent)).canSignOut, true);
+    assert.equal(await h.ipc.get("omnigent:sign-out-of-server")(pageEvent), true);
+    await settle();
+    assert.equal(h.calls.oidc.signOut, 1);
+    assert.equal(setupQuery(h).get("error"), "You're signed out of omni.example.");
+  });
+
+  it("enables Sign Out only once the browser sign-in finished", async (t) => {
+    let finishSignIn;
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: {
+        signIn: () =>
+          new Promise((resolve) => {
+            finishSignIn = () => resolve({ token: "browser-session", expiresIn: 3600 });
+          }),
+      },
+      acceptedSessions: new Set(["browser-session"]),
+    });
+    t.after(h.cleanup);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    const item = h.calls.appMenu.getMenuItemById("sign_out_server");
+    const connecting = h.api.loadServerUrl(h.win, server, undefined, { interactive: true });
+    await settle();
+    assert.equal(typeof finishSignIn, "function", "browser sign-in never started");
+    assert.equal(item.enabled, false, "enabled while the browser sign-in is still pending");
+    finishSignIn();
+    await connecting;
+    assert.equal(item.enabled, true);
+  });
+
+  it("offers no Sign out for a server whose sign-in isn't the shell's", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, manifest: { manifestVersion: 1 } });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, server);
+    h.setUrl(server);
+    const pageEvent = { sender: h.webContents, senderFrame: { url: server } };
+    assert.equal((await h.ipc.get("omnigent:get-server-picker")(pageEvent)).canSignOut, false);
+    assert.equal(await h.ipc.get("omnigent:sign-out-of-server")(pageEvent), false);
+    assert.equal(h.api.windows.get(h.win).origin, server);
+  });
+
+  it("leaves accounts mode and servers without an auth block signing in in the window", async (t) => {
+    // Each case builds its own harness; they run serially to keep stubs apart.
+    /* oxlint-disable no-await-in-loop */
+    for (const manifest of [
+      { manifestVersion: 1, auth: { mode: "accounts", sessionCookie: "ap_session" } },
+      { manifestVersion: 1 },
+      {},
+    ]) {
+      const h = loadNavigationHarness({ serverUrl: server, manifest });
+      t.after(h.cleanup);
+      await h.api.loadServerUrl(h.win, server, undefined, { interactive: true });
+      assert.equal(h.calls.oidc.refresh + h.calls.oidc.signIn, 0);
+      assert.deepEqual(h.calls.loadURL.at(-1), [server]);
+      assert.equal(h.api.windows.get(h.win).authKind, null);
+    }
+    /* oxlint-enable no-await-in-loop */
+  });
+
+  it("remembers the server's OIDC setup and uses it when the manifest can't be read", async (t) => {
+    const first = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: { refresh: minted("renewed") },
+      acceptedSessions: new Set(["renewed"]),
+    });
+    t.after(first.cleanup);
+    await first.api.loadServerUrl(first.win, server);
+    const saved = JSON.parse(fs.readFileSync(first.settingsPath, "utf8"));
+    assert.deepEqual(saved.oidc_servers, { [server]: "__Host-ap_session" });
+
+    // A manifest fetch that failed (the pre-manifest baseline) must not fall
+    // back to loading the IdP in the window.
+    const later = loadNavigationHarness({
+      serverUrl: server,
+      manifest: {},
+      oidc: { refresh: minted("renewed") },
+      acceptedSessions: new Set(["renewed"]),
+    });
+    t.after(later.cleanup);
+    fs.writeFileSync(later.settingsPath, JSON.stringify(saved));
+    await later.api.loadServerUrl(later.win, server);
+    assert.equal(later.calls.oidc.refresh, 1);
+    assert.equal(later.api.windows.get(later.win).authKind, "oidc");
+  });
+
+  it("forgets the OIDC setup when the server's manifest says it signs in another way", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: { manifestVersion: 1, auth: { mode: "accounts", sessionCookie: "ap_session" } },
+    });
+    t.after(h.cleanup);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ oidc_servers: { [server]: "__Host-ap_session" } }),
+    );
+    await h.api.loadServerUrl(h.win, server);
+    assert.equal(h.calls.oidc.refresh, 0);
+    assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).oidc_servers, {});
+  });
+
+  it("keeps Databricks detection URL-based, ignoring any manifest", async (t) => {
+    /* oxlint-disable no-await-in-loop */
+    for (const [url, mode] of [
+      ["https://ws.cloud.databricks.com/omnigent", "browser"],
+      ["https://app-123.aws.databricksapps.com", "browser"],
+      ["https://ws.cloud.databricks.com/omnigent", "embedded"],
+    ]) {
+      const h = loadNavigationHarness({
+        serverUrl: url,
+        manifest: oidcManifest,
+        databricksMode: mode,
+      });
+      t.after(h.cleanup);
+      await h.api.loadServerUrl(h.win, url, undefined, { interactive: true });
+      assert.equal(h.calls.oidc.refresh + h.calls.oidc.signIn, 0, url);
+      assert.equal(h.api.windows.get(h.win).authKind, null, url);
+    }
+    /* oxlint-enable no-await-in-loop */
+  });
+});
+
+describe("server names from the manifest", () => {
+  const server = "https://omni.example";
+  const setupEvent = (h) => ({
+    sender: h.webContents,
+    senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+  });
+  const pageEvent = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
+  const saved = (h) => JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+
+  it("remembers the name after connecting and shares it with the setup page and picker", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: { manifestVersion: 1, serverName: "Acme Eng" },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.ipc.get("omnigent:set-server-url")(setupEvent(h), server);
+    assert.deepEqual(saved(h).server_names, { [server]: "Acme Eng" });
+    assert.deepEqual(plain(await h.ipc.get("omnigent:get-server-names")(setupEvent(h))), {
+      [server]: "Acme Eng",
+    });
+    h.setUrl(server);
+    const picker = plain(await h.ipc.get("omnigent:get-server-picker")(pageEvent(h)));
+    assert.deepEqual(picker.serverNames, { [server]: "Acme Eng" });
+  });
+
+  it("clears a name the server no longer gives", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: { manifestVersion: 1, serverName: null },
+    });
+    t.after(h.cleanup);
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ server_names: { [server]: "Old" } }));
+    await h.api.loadServerUrl(h.win, server);
+    assert.deepEqual(saved(h).server_names, {});
+  });
+
+  it("drops the name with its recent", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({
+        recent_servers: [`${server}/`, "https://b.example/"],
+        server_names: { [server]: "Acme Eng", "https://b.example": "B" },
+      }),
+    );
+    await h.ipc.get("omnigent:forget-recent-server")(setupEvent(h), `${server}/`);
+    assert.deepEqual(saved(h).server_names, { "https://b.example": "B" });
+  });
+
+  it("names the server in the connect-screen message, the organization's name first", async (t) => {
+    const oidcManifest = {
+      manifestVersion: 1,
+      auth: { mode: "oidc", sessionCookie: "__Host-ap_session" },
+      serverName: "Acme Eng",
+    };
+    // A first connect that fails: the name comes from the manifest just read,
+    // and nothing is saved for a server that never loaded.
+    const h = loadNavigationHarness({ serverUrl: server, manifest: oidcManifest });
+    t.after(h.cleanup);
+    await assert.rejects(h.api.loadServerUrl(h.win, server));
+    assert.equal(fs.existsSync(h.settingsPath) ? saved(h).server_names : undefined, undefined);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+    const query = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
+    assert.equal(
+      query.get("error"),
+      "Sign in to Acme Eng (omni.example) to continue. Select Connect to open your browser.",
+    );
+
+    const managed = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      managedServers: [`${server}/`],
+      managedServerNames: { [`${server}/`]: "Engineering" },
+    });
+    t.after(managed.cleanup);
+    fs.writeFileSync(
+      managed.settingsPath,
+      JSON.stringify({ server_names: { [server]: "Acme Eng" } }),
+    );
+    await assert.rejects(managed.api.loadServerUrl(managed.win, server));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+    assert.match(
+      new URLSearchParams(managed.calls.loadFile.at(-1)[1].search).get("error"),
+      /^Sign in to Engineering to continue/,
+    );
+  });
+
+  it("keeps a saved name when the manifest couldn't be read", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, manifest: {} });
+    t.after(h.cleanup);
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ server_names: { [server]: "Acme Eng" } }));
+    await h.api.loadServerUrl(h.win, server);
+    assert.deepEqual(saved(h).server_names, { [server]: "Acme Eng" });
+  });
+
+  it("prefixes multi-server notifications with the name and the host", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, notificationsSupported: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ server_names: { [server]: "Production" } }));
+    h.api.windows.set({ isDestroyed: () => false }, { origin: "https://other.example" });
+    h.setUrl(server);
+    await h.ipc.get("omnigent:notify")(pageEvent(h), { title: "Done" });
+    assert.equal(h.calls.notifications.at(-1).title, "[Production (omni.example)] Done");
+  });
+
+  it("drops the name of a server that falls off the recents", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const recents = [1, 2, 3, 4, 5].map((i) => `https://s${i}.example/`);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({
+        recent_servers: recents,
+        server_names: { "https://s1.example": "One", "https://s5.example": "Five" },
+      }),
+    );
+    await h.ipc.get("omnigent:set-server-url")(setupEvent(h), server);
+    assert.deepEqual(saved(h).server_names, { "https://s1.example": "One" });
+  });
+
+  it("only gives names to the setup page", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    assert.throws(() => h.ipc.get("omnigent:get-server-names")(pageEvent(h)), /setup page/);
+  });
+
+  it("ignores malformed saved names", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({
+        server_names: { [server]: "Acme\u202e", "not an origin": "X", "https://b.example": 7 },
+      }),
+    );
+    assert.deepEqual(plain(await h.ipc.get("omnigent:get-server-names")(setupEvent(h))), {
+      [server]: "Acme",
+    });
+  });
+
+  it("never persists names for a window that must not touch settings", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: { manifestVersion: 1, serverName: "Acme Eng" },
+    });
+    t.after(h.cleanup);
+    h.api.windows.get(h.win).ephemeral = true;
+    await h.api.loadServerUrl(h.win, server);
+    assert.equal(fs.existsSync(h.settingsPath) ? saved(h).server_names : undefined, undefined);
+  });
 });

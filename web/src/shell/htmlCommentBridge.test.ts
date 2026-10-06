@@ -16,29 +16,32 @@ import {
 describe("injectCommentBridge", () => {
   const NONCE = "test-nonce-123";
 
+  // The prepared head carries its own <script> (same-page anchors), so the
+  // bridge script is located by its nonce.
   it("injects the bridge script before </body> when present", () => {
     const html = "<html><head></head><body><p>hi</p></body></html>";
     const out = injectCommentBridge(html, NONCE);
-    const scriptAt = out.indexOf("<script>");
+    const scriptAt = out.indexOf(NONCE);
     const bodyCloseAt = out.indexOf("</body>");
     expect(scriptAt).toBeGreaterThan(-1);
     expect(scriptAt).toBeLessThan(bodyCloseAt);
-    expect(out).toContain(NONCE);
   });
 
   it("falls back to before </html> when there is no body", () => {
     const html = "<html><head></head><p>hi</p></html>";
     const out = injectCommentBridge(html, NONCE);
-    expect(out.indexOf("<script>")).toBeLessThan(out.indexOf("</html>"));
+    expect(out.indexOf(NONCE)).toBeGreaterThan(-1);
+    expect(out.indexOf(NONCE)).toBeLessThan(out.indexOf("</html>"));
   });
 
   it("appends to a bare fragment with no body/html", () => {
     const out = injectCommentBridge("<p>just a fragment</p>", NONCE);
-    // prepareHtmlPreviewDoc prepends <base> for a bare fragment; the bridge is
-    // then appended at the end since there's no </body>/</html> to inject before.
+    // prepareHtmlPreviewDoc prepends its head markup for a bare fragment; the
+    // bridge is then appended at the end since there's no </body>/</html> to
+    // inject before.
     expect(out).toContain("<p>just a fragment</p>");
     const fragAt = out.indexOf("<p>just a fragment</p>");
-    expect(out.indexOf("<script>")).toBeGreaterThan(fragAt);
+    expect(out.indexOf(NONCE)).toBeGreaterThan(fragAt);
   });
 
   it("preserves the prepared <base target=_blank> link behavior", () => {

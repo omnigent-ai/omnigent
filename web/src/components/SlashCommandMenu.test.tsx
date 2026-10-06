@@ -1,8 +1,37 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SlashCommandMenu } from "./SlashCommandMenu";
+import { matchSlashCommandInvocation, SlashCommandMenu } from "./SlashCommandMenu";
 
 afterEach(cleanup);
+
+describe("matchSlashCommandInvocation", () => {
+  const commands = [
+    "/review",
+    "/review-pr",
+    "/Simplified Technical English",
+    "/Simplified Technical English (ASD-STE100)",
+  ];
+
+  it("prefers the longest known name that ends at a word boundary", () => {
+    expect(matchSlashCommandInvocation("/review-pr 123", commands)).toEqual({
+      command: "/review-pr",
+      args: "123",
+    });
+    expect(
+      matchSlashCommandInvocation("/Simplified Technical English (ASD-STE100) now", commands),
+    ).toEqual({ command: "/Simplified Technical English (ASD-STE100)", args: "now" });
+    expect(matchSlashCommandInvocation("  /Simplified Technical English  ", commands)).toEqual({
+      command: "/Simplified Technical English",
+      args: "",
+    });
+  });
+
+  it("rejects text that only shares a prefix with a known name", () => {
+    expect(matchSlashCommandInvocation("/reviewer 123", commands)).toBeNull();
+    expect(matchSlashCommandInvocation("/Simplified Technical", commands)).toBeNull();
+    expect(matchSlashCommandInvocation("/Review-pr 123", commands)).toBeNull();
+  });
+});
 
 const props = {
   query: "",
