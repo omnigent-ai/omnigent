@@ -203,7 +203,7 @@ export function HeaderConversationMenu({
     restart.mutate(conversation.id, {
       onSuccess: () => {
         setRestartOpen(false);
-        showToast("Session restarted — running the latest agent version.");
+        toast.success("Session restarted — running the latest agent version.");
       },
       onError: (error) => {
         setRestartError(error instanceof Error ? error.message : "Restart failed.");

@@ -280,7 +280,7 @@ def _patch_restart_helpers(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[st
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: A dict with the ordered stop/relaunch call log.
     """
-    calls: dict[str, list[str]] = {"stopped": [], "reset": []}
+    calls: dict[str, list[str]] = {"stopped": []}
     monkeypatch.setattr(sessions_mod, "get_agent_cache", lambda: _AgentCacheStub())
     monkeypatch.setattr(sessions_mod, "_agent_carries_native_fork_history", lambda a: False)
     monkeypatch.setattr(sessions_mod, "_agent_carries_cursor_fork_history", lambda a: False)
@@ -293,12 +293,6 @@ def _patch_restart_helpers(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[st
 
     monkeypatch.setattr(sessions_mod, "_stop_session_via_runner", _stop)
 
-    async def _reset(request: Any, conversation: Any) -> None:
-        del request
-        calls["reset"].append(conversation.id)
-
-    monkeypatch.setattr(sessions_mod, "_reset_runner_resources_after_switch", _reset)
-
     # Runner is gone after the stop → the relaunch ladder takes the
     # CLI-offline branch (no-op) for a hostless session.
     async def _no_client(*args: Any, **kwargs: Any) -> None:
@@ -307,6 +301,27 @@ def _patch_restart_helpers(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[st
 
     monkeypatch.setattr(sessions_mod, "_get_runner_client", _no_client)
     return calls
+
+
+@pytest.mark.asyncio
+async def test_restart_resets_runner_resources() -> None:
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+    class _RunnerClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, float]] = []
+
+        async def post(self, path: str, *, timeout: float) -> _Response:
+            self.calls.append((path, timeout))
+            return _Response()
+
+    runner_client = _RunnerClient()
+
+    await routes_core_mod._reset_runner_resources_after_restart(_SESSION_ID, runner_client)
+
+    assert runner_client.calls == [(f"/v1/sessions/{_SESSION_ID}/reset-state", 15.0)]
 
 
 # The session's currently-bound agent is a session-scoped clone of the

@@ -9,6 +9,7 @@ import secrets
 import time
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import (
@@ -38,7 +39,6 @@ from omnigent.entities import (
     StoredFile,
     synthesize_conversation_title,
 )
-from omnigent.entities.agent import Agent
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.models.model_override import validate_model_override
@@ -133,6 +133,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _grant_default_public,
+    _invalidate_runner_backed_snapshot_state,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
     _notify_runner_of_bundled_child,
@@ -154,6 +155,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_permission_mode_forward,
     _same_provider_family,
     _session_status_cache,
+    _session_status_from_cache,
     _set_read_state,
     _stop_session_host_runner,
     _stop_session_via_runner,
@@ -193,6 +195,7 @@ from omnigent.server.schemas import (
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
+    SessionAgentChangedEvent,
     SessionCreateRequest,
     SessionForkRequest,
     SessionLabelsResponse,
@@ -315,6 +318,22 @@ async def _wake_runner_for_model_change(
         conv.id, conv.runner_id, runner_client, conversation_store, conversation=conv
     )
     return conv
+
+
+async def _reset_runner_resources_after_restart(session_id: str, runner_client: Any) -> None:
+    try:
+        response = await runner_client.post(
+            f"/v1/sessions/{quote(session_id, safe='')}/reset-state",
+            timeout=15.0,
+        )
+        response.raise_for_status()
+    except (httpx.HTTPError, HTTPException, OmnigentError, RuntimeError):
+        _logger.warning(
+            "post-restart runner-resource reset failed for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
 
 
 def register_core_routes(
@@ -3812,7 +3831,7 @@ def register_core_routes(
         # retry path uses.
         runner_client = await _get_runner_client(session_id, runner_router, conversation=updated)
         if runner_client is not None:
-            await _reset_runner_resources_after_switch(session_id)
+            await _reset_runner_resources_after_restart(session_id, runner_client)
             if _is_native_terminal_session(updated):
                 terminal_outcome = await _ensure_native_terminal_ready(
                     runner_client,

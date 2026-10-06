@@ -32,6 +32,7 @@ const mocks = vi.hoisted(() => ({
   exportTranscript: vi.fn(),
   triggerDownload: vi.fn(),
   toastError: vi.fn(),
+  toastSuccess: vi.fn(),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -72,7 +73,12 @@ vi.mock("@/hooks/useFileContent", async (importOriginal) => {
 
 // `toast` is callable too: archiving shows the Undo pill via `toast(...)`.
 vi.mock("sonner", () => ({
-  toast: Object.assign(vi.fn(), { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() }),
+  toast: Object.assign(vi.fn(), {
+    error: mocks.toastError,
+    success: mocks.toastSuccess,
+    custom: vi.fn(),
+    dismiss: vi.fn(),
+  }),
 }));
 
 const CONVERSATION: Conversation = {
@@ -301,6 +307,11 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.restart).toHaveBeenCalledWith(
       "conv-1",
       expect.objectContaining({ onSuccess: expect.any(Function), onError: expect.any(Function) }),
+    );
+    const callbacks = mocks.restart.mock.calls[0]?.[1] as { onSuccess: () => void };
+    callbacks.onSuccess();
+    expect(mocks.toastSuccess).toHaveBeenCalledWith(
+      "Session restarted — running the latest agent version.",
     );
   });
 

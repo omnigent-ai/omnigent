@@ -49,7 +49,6 @@ import {
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
 import { showToast } from "@/components/ui/toast";
-import { revokePermission } from "@/lib/permissionsApi";
 import {
   conversationDisplayLabel,
   readPinnedConversationIds,
