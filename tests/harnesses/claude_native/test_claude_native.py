@@ -11307,6 +11307,69 @@ def test_catalog_fingerprint_survives_a_missing_binary(
 # ── ambient gateway detection ─────────────────────────────
 
 
+def test_managed_gateway_rejects_uncataloged_canonical_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}})
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    rows = [{"id": "opus", "model": "system.ai.claude-opus-5-5[1m]"}]
+
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is True
+    assert not claude_native.claude_catalog_serves_model(rows, "claude-opus-4-8", None)
+    assert claude_native.claude_catalog_serves_model(rows, "opus", None)
+    assert claude_native.claude_catalog_serves_model(rows, "system.ai.claude-opus-5-5[1m]", None)
+    rows.append({"id": "canonical", "model": "claude-opus-4-8"})
+    assert claude_native.claude_catalog_serves_model(rows, "claude-opus-4-8", None)
+
+
+@pytest.mark.parametrize(
+    ("managed_url", "env_url", "is_gateway"),
+    [
+        ("https://gateway.example/anthropic", "https://api.anthropic.com", True),
+        ("https://api.anthropic.com", "https://gateway.example/anthropic", False),
+    ],
+)
+def test_managed_gateway_endpoint_takes_precedence(
+    managed_url: str,
+    env_url: str,
+    is_gateway: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": managed_url}}))
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", env_url)
+    fingerprint = claude_native.claude_catalog_fingerprint(None)
+
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is is_gateway
+    monkeypatch.delenv("ANTHROPIC_BASE_URL")
+    assert claude_native.claude_catalog_fingerprint(None) == fingerprint
+
+
+def test_catalog_fingerprint_changes_with_managed_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    managed_settings = tmp_path / "managed-settings.json"
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    managed_settings.write_text("{}")
+    direct = claude_native.claude_catalog_fingerprint(None)
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}})
+    )
+
+    assert claude_native.claude_catalog_fingerprint(None) != direct
+
+
 def test_ambient_env_is_non_anthropic_gateway_detects_databricks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

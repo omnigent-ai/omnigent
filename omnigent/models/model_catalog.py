@@ -21,9 +21,9 @@ Enumeration is deterministic per provider kind:
   ``"openai-compatible"``).
 - ``subscription`` → live CLI discovery for Cursor; curated static aliases for
   CLIs without a listing API (source ``"static"``, ``verified: false``).
-- ``cli-config`` → the codex curated static list (source ``"static"``,
-  ``verified: false`` — the credential lives in the CLI's own config
-  file and is resolved by the CLI at launch).
+- ``cli-config`` → native Claude's shared probe catalog (source ``"cli"``)
+  when available, otherwise an empty static listing. Credentials are
+  resolved by the CLI at launch.
 - anything unresolvable → source ``"none"`` with an explanatory note,
   which doubles as a dead-worker preflight signal.
 """
@@ -249,7 +249,8 @@ class ResolvedModelProvider:
     :param auth_command: Shell command printing a bearer token, for
         providers configured with a dynamic credential.
     :param cli: ``"claude"`` / ``"codex"`` / ``"cursor-agent"`` for
-        ``kind="subscription"``; ``"codex"`` for ``kind="cli-config"``.
+        ``kind="subscription"``; ``"claude"`` / ``"codex"`` for
+        ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
     """
@@ -636,9 +637,33 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
             agent_spec, harness_type=harness_type, actual_harness=harness
         )
     )
-    if entry is not None:
-        return _provider_from_entry(entry, harness_type)
-    return _provider_from_legacy_auth(agent_spec, harness_type)
+    provider = (
+        _provider_from_entry(entry, harness_type)
+        if entry is not None
+        else _provider_from_legacy_auth(agent_spec, harness_type)
+    )
+    # With no launch overrides, Claude's managed settings still own routing
+    # and credentials; reporting a subscription would strip gateway model ids.
+    if canonical_harness in ("claude-native", "native-claude") and (
+        provider.kind == SUBSCRIPTION_KIND or (entry is None and provider.kind == NONE_KIND)
+    ):
+        from omnigent.onboarding.ambient import claude_managed_gateway
+
+        base_url, has_credential = claude_managed_gateway()
+        host = (urlsplit(base_url).hostname or "").lower() if base_url else ""
+        if (
+            base_url
+            and has_credential
+            and host != "anthropic.com"
+            and not host.endswith(".anthropic.com")
+        ):
+            return ResolvedModelProvider(
+                kind=CLI_CONFIG_KIND,
+                cli="claude",
+                base_url=base_url,
+                detail="Claude Code managed settings",
+            )
+    return provider
 
 
 def _provider_from_legacy_auth(
@@ -1427,17 +1452,37 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
 
 
 def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
-    """Build the curated static listing for a ``cli-config`` provider.
+    """Read a CLI-owned catalog, or report that it has not been probed yet.
 
-    A ``cli-config`` provider pins a custom ``[model_providers.X]`` table in
-    the codex CLI's own ``config.toml``; its credential (an auth command /
-    env key in that file) is resolved by codex at launch, so the listing is
-    the codex curated ids with a note saying the credential is the CLI's to
-    resolve — not a "no credentials" preflight failure.
+    Managed Claude gateways share the native launch catalog. Other CLI
+    configurations expose no listing before launch; credentials remain
+    the CLI's responsibility.
 
     :param provider: A ``kind="cli-config"`` provider descriptor.
-    :returns: A ``source="static"`` listing with no models.
+    :returns: A probe-backed listing when cached, else an empty static listing.
     """
+    if provider.cli == "claude":
+        from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+        from omnigent.models import model_catalog_store
+
+        fingerprint = claude_catalog_fingerprint(None)
+        rows = model_catalog_store.read_catalog("claude-native", fingerprint)
+        if rows is not None:
+            stale = model_catalog_store.catalog_is_stale("claude-native", fingerprint)
+            model_ids = dict.fromkeys(str(row.get("model") or row["id"]) for row in rows)
+            return ModelListing(
+                source="cli",
+                verified=not stale,
+                models=tuple(
+                    ModelEntry(id=model_id, family=model_family_token(model_id))
+                    for model_id in model_ids
+                ),
+                note=(
+                    "cached Claude Code model probe; catalog needs refreshing"
+                    if stale
+                    else "models advertised by the Claude Code model probe"
+                ),
+            )
     return ModelListing(
         source="static",
         verified=False,

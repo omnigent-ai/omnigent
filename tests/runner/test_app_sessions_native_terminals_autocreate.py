@@ -4739,6 +4739,81 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pick", "expected_model", "reset_pick"),
+    [
+        ("claude-opus-4-8", "system.ai.claude-opus-5-5[1m]", True),
+        ("claude-sonnet-5-5[1m]", "system.ai.claude-sonnet-5-5[1m]", False),
+        ("system.ai.claude-sonnet-5-5[1m]", "system.ai.claude-sonnet-5-5[1m]", False),
+    ],
+)
+async def test_auto_create_claude_terminal_validates_managed_gateway_pick(
+    pick: str,
+    expected_model: str,
+    reset_pick: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
+    )
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}})
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (managed_settings,),
+    )
+    catalog = [
+        {"id": "opus", "model": "system.ai.claude-opus-5-5[1m]", "isDefault": True},
+        {"id": "sonnet", "model": "system.ai.claude-sonnet-5-5[1m]"},
+    ]
+
+    async def _catalog(config: object) -> list[dict[str, object]]:
+        assert config is None
+        return catalog
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog_is_stale",
+        lambda config: False,
+    )
+    captured: dict[str, Any] = {}
+    patches: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+        return httpx.Response(200, json={"model_override": pick, "labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    await _auto_create_claude_terminal(
+        "1a2b3c4d5e6f47899a0b1c2d3e4f5061",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    args = captured["spec"].args
+    assert args[args.index("--model") + 1] == expected_model
+    assert [body for body in patches if "model_override" in body] == (
+        [{"model_override": "default"}] if reset_pick else []
+    )
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("freshness", ["fresh", "stale"])
 async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     freshness: str,
