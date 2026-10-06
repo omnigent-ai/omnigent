@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import os
 import stat
@@ -3699,7 +3700,6 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
-@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="requires O_NOFOLLOW")
 def test_populate_codex_home_config_hard_links_remote_mcp_oauth(tmp_path: Path) -> None:
     """``.credentials.json`` is hard-linked and its lock dir symlinked.
 
@@ -3725,7 +3725,7 @@ def test_populate_codex_home_config_hard_links_remote_mcp_oauth(tmp_path: Path) 
     assert not bridged.is_symlink()
     assert bridged.samefile(source / ".credentials.json")
     # Codex's in-place rewrite succeeds and the refresh reaches the real home.
-    fd = os.open(bridged, os.O_WRONLY | os.O_NOFOLLOW)
+    fd = os.open(bridged, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         os.ftruncate(fd, 0)
         os.write(fd, b'{"linear|abc": {"access_token": "t2"}}')
@@ -3734,6 +3734,34 @@ def test_populate_codex_home_config_hard_links_remote_mcp_oauth(tmp_path: Path) 
     assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t2"}}'
     assert (target / "mcp-oauth-locks").is_symlink()
     assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
+
+
+def test_populate_codex_home_config_copies_remote_mcp_oauth_across_filesystems(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the store cannot be hard-linked, it is bridged as a private copy."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    def _cross_device_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", _cross_device_link)
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    (source / ".credentials.json").chmod(0o600)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert not bridged.samefile(source / ".credentials.json")
+    assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
+    assert stat.S_IMODE(bridged.stat().st_mode) == 0o600
+    bridged.write_text('{"linear|abc": {"access_token": "t2"}}')
+    assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
 
 
 def test_populate_codex_home_config_replaces_legacy_credentials_symlink(tmp_path: Path) -> None:
@@ -4304,6 +4332,37 @@ def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
             await session.close()
 
     _run(_t())
+
+
+def test_codex_home_source_preserves_custom_home_from_inherited_credentials_hardlink(
+    tmp_path: Path,
+) -> None:
+    """
+    A nested launch resolves a custom home bridged only through its OAuth store.
+
+    The custom home has ``config.toml`` and ``.credentials.json`` but neither
+    ``auth.json`` nor the memories database, so no symlink points back to it.
+
+    :param tmp_path: Temporary directory for isolated Codex homes.
+    :returns: None.
+    """
+    from omnigent.inner.codex_executor import (
+        _populate_codex_home_config,
+        _resolve_codex_home_config_source,
+    )
+
+    custom_home = tmp_path / "custom-codex-home"
+    custom_home.mkdir()
+    (custom_home / "config.toml").write_text('model_provider = "custom"')
+    (custom_home / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    inherited = tmp_path / "home" / ".omnigent" / "codex-native" / "abc123" / "codex-home"
+    inherited.mkdir(parents=True)
+
+    _populate_codex_home_config(inherited, custom_home)
+
+    assert not (inherited / ".credentials.json").is_symlink()
+    default_home = tmp_path / "home" / ".codex"
+    assert _resolve_codex_home_config_source(inherited, default_home) == custom_home.resolve()
 
 
 def test_populate_codex_home_config_does_not_overwrite_existing(tmp_path: Path) -> None:
