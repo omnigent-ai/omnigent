@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
+from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -7202,12 +7203,12 @@ async def _execute_os_env_tool(
             tool_name,
             extra={"session_id": conversation_id},
         )
-        return json.dumps({"error": str(exc)})
+        return json_dumps_transport_safe({"error": str(exc)})
     finally:
         if os_env is not None and owns_environment:
             os_env.close()
 
-    return json.dumps(result, ensure_ascii=False)
+    return json_dumps_transport_safe(result)
 
 
 # ── REST-backed tools (Phase 1) ──────────────────────────
