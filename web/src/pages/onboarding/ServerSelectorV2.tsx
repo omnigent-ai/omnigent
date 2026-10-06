@@ -195,6 +195,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     | { kind: "local"; back: Step; url?: string }
     | { kind: "connect"; back: Step; url: string; runner?: Runner; skipInstall?: boolean }
   >({ kind: "local", back: "local" });
+  const [remoteRunnerFailed, setRemoteRunnerFailed] = useState(false);
   // Install runs in the terminal step only when the CLI is missing AND in-app
   // install is actually offered (macOS — onInstallCli is present). An installed
   // CLI, or any platform without install support, connects directly. Mocks
@@ -239,18 +240,20 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
       }
     : undefined;
 
-  // A server pick (list Join / runner step): install-then-connect when the CLI
-  // is missing (route via terminal), else connect straight away. Resolves the
-  // ConnectResult so the list can still show a connect error when connecting
-  // directly.
-  const connect = async (url: string, back: Step = "server"): Promise<ConnectResult> => {
+  // Opening a remote server needs no local CLI. Only explicit laptop setup
+  // (including older shells without onConnectRunner) requests installation.
+  const connect = async (
+    url: string,
+    back: Step = "server",
+    installCli = false,
+  ): Promise<ConnectResult> => {
     // The local install is checked in the terminal step, so a stopped one starts.
     if (isLocalInstall(url)) {
       setTerminalTarget({ kind: "local", back, url });
       setStep("terminal");
       return {};
     }
-    if (needsInstall) {
+    if (installCli || setup.mockInstall) {
       setTerminalTarget({ kind: "connect", back, url });
       setStep("terminal");
       return {};
@@ -274,10 +277,14 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // Checked at run time (Retry re-checks): a picked local install that's up opens
   // that exact URL; one that's down starts like "Get started locally".
   const runTerminal = async () => {
+    setRemoteRunnerFailed(false);
     const t = terminalTarget;
     if (t.kind === "connect" && t.runner && setup.onConnectRunner) {
       const res = await setup.onConnectRunner(t.url, t.runner);
-      if (!res.ok) return res;
+      if (!res.ok) {
+        setRemoteRunnerFailed(t.runner === "remote");
+        return res;
+      }
     }
     if (t.kind === "connect") return connectInTerminal(t.url);
     if (t.url !== undefined && (await setup.onCheckServer(t.url)).status !== "unreachable")
@@ -405,7 +412,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onInstall={async (runner) => {
               if (!setup.onConnectRunner) {
                 setRunnerError(undefined);
-                const result = await connect(runnerTarget.url, "runner");
+                const result = await connect(runnerTarget.url, "runner", needsInstall);
                 if (result.error) setRunnerError(result.error);
                 return;
               }
@@ -423,11 +430,18 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         )}
         {step === "terminal" && (
           <SetupTerminalStep
+            // Switching to server-only connect starts a fresh terminal run.
+            key={terminalRunner ?? terminalTarget.kind}
             onInstallCli={needsInstall && !skipInstall ? setup.onInstallCli : undefined}
             onInstallLog={setup.onInstallLog}
             onRun={runTerminal}
             onSetupLog={terminalRunner ? setup.onRunnerLog : setup.onSetupLog}
             onBack={() => setStep(terminalTarget.back)}
+            onConnectAnyway={
+              remoteRunnerFailed && terminalTarget.kind === "connect"
+                ? () => setTerminalTarget({ ...terminalTarget, runner: undefined })
+                : undefined
+            }
             runningLabel={terminalCopy.label}
             runningHint={terminalCopy.hint}
             connection={connection}

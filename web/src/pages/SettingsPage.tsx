@@ -326,7 +326,14 @@ export function SettingsPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem" {...pageWrapperSettings}>
+    <PageScroll
+      contentClassName="px-4 md:px-8"
+      extraBottom="2.5rem"
+      // Reserve the scrollbar's width so the centered column doesn't shift when
+      // switching between a page or tab that scrolls and one that doesn't.
+      className="[scrollbar-gutter:stable]"
+      {...pageWrapperSettings}
+    >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
       {section === "harnesses" && <SettingsHarnessesSection />}

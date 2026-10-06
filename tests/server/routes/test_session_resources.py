@@ -3483,11 +3483,16 @@ async def test_filesystem_download_streams_runner_attachment(
     client: httpx.AsyncClient,
     tmp_path: Path,
 ) -> None:
-    """``?download=true`` forwards the runner's attachment and headers verbatim."""
+    """``?download=true`` forwards the runner's attachment and headers verbatim.
+
+    The download URL is assembled separately from the listing/read URL, so
+    this also pins that the owner's workspace-relative download carries the
+    ``scope=reach`` mark the runner needs to follow an outward symlink.
+    """
     payload = bytes(range(256)) * 64
     (tmp_path / "big.bin").write_bytes(payload)
     runner = FastAPI()
-    seen: list[tuple[str, bool]] = []
+    seen: list[tuple[str, bool, str | None]] = []
 
     @runner.get(_FS_ROUTE)
     async def _serve(
@@ -3495,9 +3500,10 @@ async def test_filesystem_download_streams_runner_attachment(
         environment_id: str,
         relative_path: str,
         download: bool = False,
+        scope: str | None = None,
     ) -> FileResponse:
         del session_id, environment_id
-        seen.append((relative_path, download))
+        seen.append((relative_path, download, scope))
         return FileResponse(
             tmp_path / "big.bin",
             filename="big.bin",
@@ -3512,7 +3518,7 @@ async def test_filesystem_download_streams_runner_attachment(
     assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
     assert resp.headers["content-length"] == str(len(payload))
     assert resp.headers["cache-control"] == "no-store"
-    assert seen == [("data/big.bin", True)]
+    assert seen == [("data/big.bin", True, "reach")]
 
 
 @pytest.mark.asyncio

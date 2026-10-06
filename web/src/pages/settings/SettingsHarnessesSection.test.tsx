@@ -215,7 +215,7 @@ describe("Harnesses grid", () => {
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
 
     // codex-native reports needs-auth → warning badge + a Set-up button.
-    expect(screen.getByText("needs auth")).toBeTruthy();
+    expect(screen.getByText("Needs auth")).toBeTruthy();
     expect(screen.getByTestId("harness-action-codex-native")).toBeTruthy();
   });
 
@@ -241,7 +241,7 @@ describe("Harnesses grid", () => {
     expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
     expect(within(card("claude-native")).queryByText("Installed")).toBeNull();
-    expect(screen.queryByText("needs setup")).toBeNull();
+    expect(screen.queryByText("Needs setup")).toBeNull();
   });
 
   it("hides Set-up (keeps the badge) when harness_install is disabled", () => {
@@ -251,7 +251,7 @@ describe("Harnesses grid", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
     renderHarnesses();
 
-    expect(screen.getByText("binary missing")).toBeTruthy();
+    expect(screen.getByText("Binary missing")).toBeTruthy();
     expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
   });
 

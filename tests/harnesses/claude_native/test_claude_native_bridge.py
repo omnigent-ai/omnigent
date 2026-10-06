@@ -3622,6 +3622,34 @@ def test_augment_claude_args_preapproves_project_mcp_servers(tmp_path: Path) -> 
     assert settings.get("enableAllProjectMcpServers") is True
 
 
+@pytest.mark.parametrize(
+    "launch_args",
+    [(), ("--permission-mode", "auto")],
+    ids=["none", "auto"],
+)
+def test_augment_claude_args_disables_auto_mode_setup_offer(
+    launch_args: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    """
+    Every launch turns off auto mode's "Teach auto mode about your environment?" offer.
+
+    Claude shows it after a turn ends in auto mode, covering the input box
+    with a Yes / Not now / Don't show again menu that fires no hook, so web-UI
+    messages stall behind a prompt only the terminal can answer. The sidecar's
+    ``skillOverrides`` merges per key with the user's own overrides. It is set
+    on every launch because a session can switch into auto mode after it starts.
+    """
+    args = augment_claude_args(
+        launch_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
+
+
 def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
     tmp_path: Path,
 ) -> None:

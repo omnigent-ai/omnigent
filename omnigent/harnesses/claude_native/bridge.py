@@ -2164,7 +2164,8 @@ def build_hook_settings(
     Besides the hooks, the fragment pre-approves every project ``.mcp.json``
     server (``enableAllProjectMcpServers``): the "New MCP server found"
     dialog is another unhookable startup gate that a host-spawned terminal
-    can never answer.
+    can never answer. It also turns off auto mode's post-turn
+    environment-setup offer (``skillOverrides``) for the same reason.
 
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
@@ -2464,6 +2465,10 @@ def build_hook_settings(
     # approval dialog in every new directory (each worktree included). It
     # fires no hook either, so pre-approve them like the other consent gates.
     settings["enableAllProjectMcpServers"] = True
+    # Auto mode offers "Teach auto mode about your environment?" after a turn;
+    # only the terminal can answer it, so web-UI messages stall behind it. This
+    # Claude Code switch turns off that offer and its /auto-mode-setup wizard.
+    settings["skillOverrides"] = {"auto-mode-setup": "off"}
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:

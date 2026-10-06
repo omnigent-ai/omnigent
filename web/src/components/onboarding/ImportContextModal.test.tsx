@@ -79,7 +79,7 @@ describe("ImportContextModal – harness tabs", () => {
     expect(screen.getByRole("tab", { name: "Claude Code" })).toBe(tabs[0]);
     expect(screen.getByRole("tab", { name: "Codex" })).toBe(tabs[1]);
     expect(screen.getByRole("tab", { name: "Cursor" })).toBe(tabs[2]);
-    expect(screen.getByText("Your imports are ready")).toBeTruthy();
+    expect(screen.getByText("Your setup is ready")).toBeTruthy();
     expect(screen.getByText(/These carry over automatically\./)).toBeTruthy();
   });
 
@@ -87,7 +87,7 @@ describe("ImportContextModal – harness tabs", () => {
     renderModal();
 
     expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
-    expect(screen.getAllByText("Imported")).toHaveLength(1);
+    expect(screen.getAllByText("Detected")).toHaveLength(1);
     expect(assetTabNames()).toEqual(["MCPs 5", "Skills 10", "Plugins 3"]);
 
     expect(rowNames("MCPs")).toEqual(["databricks-v2", "jira", "safe", "web-search", "figma"]);
