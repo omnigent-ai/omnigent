@@ -120,27 +120,28 @@ class RunnerSessionInitializer:
             resume_interrupted_turn,
         )
         task = self._tasks.get(key)
-        if (
-            task is None
-            and self._agent_store is not None
-            and await asyncio.to_thread(self._agent_store.get, agent_id) is None
-        ):
-            # The user removed the agent (`omnigent agent remove`). The runner
-            # could only reject this init; the session reports the removal on
-            # its next message, so this is expected and not worth a failure.
-            _logger.warning(
-                "Not initializing session %s on its runner: its agent %s was removed",
-                conversation.id,
-                agent_id,
-            )
-            return httpx.Response(
-                410,
-                json={
-                    "error": ErrorCode.SESSION_AGENT_MISSING,
-                    "detail": SESSION_AGENT_MISSING_MESSAGE,
-                },
-                request=httpx.Request("POST", "/v1/sessions"),
-            )
+        if task is None and self._agent_store is not None:
+            async with store_slots or nullcontext():
+                agent = await asyncio.to_thread(self._agent_store.get, agent_id)
+            if agent is None:
+                # The user removed the agent (`omnigent agent remove`). The runner
+                # could only reject this init; the session reports the removal on
+                # its next message, so this is expected and not worth a failure.
+                _logger.warning(
+                    "Not initializing session %s on its runner: its agent %s was removed",
+                    conversation.id,
+                    agent_id,
+                )
+                return httpx.Response(
+                    410,
+                    json={
+                        "error": ErrorCode.SESSION_AGENT_MISSING,
+                        "detail": SESSION_AGENT_MISSING_MESSAGE,
+                    },
+                    request=httpx.Request("POST", "/v1/sessions"),
+                )
+            # Another caller may have started this initialization during the lookup.
+            task = self._tasks.get(key)
         if task is None:
             recovery_id = (
                 self._recovery_ids.setdefault(key, uuid4().hex)

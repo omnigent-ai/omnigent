@@ -479,6 +479,23 @@ async def test_initializer_skips_a_session_whose_agent_was_removed(
 
 
 @pytest.mark.asyncio
+async def test_callers_arriving_during_the_agent_check_share_one_init() -> None:
+    """The agent lookup yields, so a caller arriving meanwhile joins the first
+    caller's initialization instead of sending the runner another."""
+    client = _Client()
+    client.release.set()
+    conversation = _conversation()
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        _Registry(), server_version="test", agent_store=_Agents(conversation.agent_id)
+    )
+    responses = await asyncio.gather(
+        *(initializer.initialize(conversation, client, timeout=1) for _ in range(2))  # type: ignore[arg-type]
+    )
+    assert [response.status_code for response in responses] == [201, 201]
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalidate", ["runner", "session"])
 @pytest.mark.parametrize("cancel_caller", [False, True])
 async def test_retired_initialization_preserves_each_callers_cancellation(
