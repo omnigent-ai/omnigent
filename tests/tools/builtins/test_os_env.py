@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import cast
+
+import pytest
 
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.tools.base import ToolContext
@@ -26,14 +29,13 @@ class _FakeOSEnvironment:
         return self._result
 
 
-_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
-
-
-def test_invoke_keeps_unicode_readable_and_surrogates_transport_safe() -> None:
+def test_invoke_keeps_unicode_readable_and_surrogates_transport_safe(
+    tool_ctx: ToolContext,
+) -> None:
     result = {"content": "Привет 世界", "path": "recording-\udcff.txt"}
     tool = SysOsReadTool(cast(OSEnvironment, _FakeOSEnvironment(result=result)))
 
-    serialized = tool.invoke(json.dumps({"path": "recording.txt"}), _CTX)
+    serialized = tool.invoke(json.dumps({"path": "recording.txt"}), tool_ctx)
 
     assert "Привет 世界" in serialized
     assert "\\udcff" in serialized
@@ -41,11 +43,15 @@ def test_invoke_keeps_unicode_readable_and_surrogates_transport_safe() -> None:
     assert json.loads(serialized) == result
 
 
-def test_invoke_error_keeps_unicode_readable_and_surrogates_transport_safe() -> None:
+def test_invoke_error_keeps_unicode_readable_and_surrogates_transport_safe(
+    caplog: pytest.LogCaptureFixture,
+    tool_ctx: ToolContext,
+) -> None:
     error = RuntimeError("ошибка для recording-\udcff.txt")
     tool = SysOsReadTool(cast(OSEnvironment, _FakeOSEnvironment(error=error)))
 
-    serialized = tool.invoke(json.dumps({"path": "recording.txt"}), _CTX)
+    caplog.set_level(logging.CRITICAL + 1, logger="omnigent.tools.builtins.os_env")
+    serialized = tool.invoke(json.dumps({"path": "recording.txt"}), tool_ctx)
 
     assert "ошибка" in serialized
     assert "\\udcff" in serialized

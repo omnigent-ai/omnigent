@@ -2641,7 +2641,7 @@ async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
         def close(self) -> None:
             return None
 
-    filename = os.fsdecode(b"recording-\xff.txt")
+    filename = "recording-\udcff.txt"
     environment = _SurrogatePathEnvironment()
     monkeypatch.setattr(
         "omnigent.inner.os_env.create_os_environment",
@@ -2680,6 +2680,7 @@ async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
 
 @pytest.mark.asyncio
 async def test_runner_os_env_error_is_httpx_transport_safe(
+    caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2695,6 +2696,7 @@ async def test_runner_os_env_error_is_httpx_transport_safe(
         def close(self) -> None:
             return None
 
+    caplog.set_level(logging.CRITICAL + 1, logger="omnigent.runner.tool_dispatch")
     environment = _FailingEnvironment()
     monkeypatch.setattr(
         "omnigent.inner.os_env.create_os_environment",
