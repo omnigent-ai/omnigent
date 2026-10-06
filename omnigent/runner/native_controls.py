@@ -22,7 +22,9 @@ if TYPE_CHECKING:
 
 import httpx
 from fastapi.responses import JSONResponse, Response
+from websockets.exceptions import WebSocketException
 
+from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.runner.app_support import (
@@ -155,6 +157,12 @@ class _HandleCodexNativePlanModeChangeFn(Protocol):
     async def __call__(self, conv_id: str, *, enabled: bool) -> Response: ...
 
 
+class _HandleCodexNativeSettingsUpdateFn(Protocol):
+    async def __call__(
+        self, conv_id: str, settings: _JsonObject, *, defer_if_not_live: bool = False
+    ) -> Response: ...
+
+
 class _HandleOpencodeNativeBlockedNoticeFn(Protocol):
     async def __call__(
         self, conv_id: str, message: str, policy_name: str | None = None
@@ -185,9 +193,7 @@ class NativeControls:
     handle_codex_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_cost_popup: _HandleCodexNativeCostPopupFn
     handle_codex_native_plan_mode_change: _HandleCodexNativePlanModeChangeFn
-    handle_codex_native_settings_update: Callable[
-        [str, _JsonObject], Coroutine[Any, Any, Response]
-    ]
+    handle_codex_native_settings_update: _HandleCodexNativeSettingsUpdateFn
     handle_cursor_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_cursor_native_model_change: Callable[[str, str | None], Coroutine[Any, Any, Response]]
     handle_devin_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
@@ -251,16 +257,85 @@ def build_native_controls(
     The keyword arguments are the runner app's shared session state and helpers.
     """
 
-    async def _handle_codex_native_settings_update(
+    def _defer_codex_native_settings(
+        conv_id: str,
+        settings: _JsonObject,
+        *,
+        reason: str,
+    ) -> Response:
+        """Accept a settings update that no live app-server could take.
+
+        The session row already holds the pick and the next launch or turn
+        applies it, so a 204 keeps it instead of letting the caller roll it back.
+        """
+        setting_keys = ",".join(sorted(settings))
+        _logger.info(
+            "Codex-native settings update deferred for session=%s: %s (settings=%s)",
+            conv_id,
+            reason,
+            setting_keys,
+            extra=debug_event(
+                "codex_native_settings_deferred",
+                session_id=conv_id,
+                harness="codex-native",
+                reason=reason,
+                setting_keys=setting_keys,
+            ),
+        )
+        return Response(status_code=204)
+
+    async def _defer_codex_native_settings_unreachable(
         conv_id: str,
         settings: _JsonObject,
     ) -> Response:
+        """Defer an update whose app-server refused the connection.
+
+        A pane still alive on the dead app-server is marked for replacement;
+        one that is already gone (idle reap) needs nothing.
+        """
+        from omnigent.harnesses.codex_native.bridge import (
+            bridge_dir_for_bridge_id,
+            record_app_server_stopped,
+        )
+
+        registry = resource_registry.terminal_registry
+        pane = registry.get(conv_id, "codex", "main") if registry is not None else None
+        pane_running = pane is not None and await pane.is_alive()
+        if pane_running:
+            # The pane outlives its app-server; mark it so the next ensure replaces it.
+            record_app_server_stopped(bridge_dir_for_bridge_id(conv_id))
+        return _defer_codex_native_settings(
+            conv_id,
+            settings,
+            reason="app_server_unreachable" if pane_running else "pane_not_running",
+        )
+
+    async def _handle_codex_native_settings_update(
+        conv_id: str,
+        settings: _JsonObject,
+        *,
+        defer_if_not_live: bool = False,
+    ) -> Response:
+        """Apply ``thread/settings/update`` fields to the session's Codex app-server.
+
+        :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
+        :param settings: Fields for the update, e.g. ``{"model": "gpt-5.4"}``.
+        :param defer_if_not_live: ``True`` for settings the session row carries into
+            the next launch and turn (model, effort): with no loaded bridge or no
+            reachable app-server, e.g. after the idle reaper closed the pane, the
+            update answers 204 instead of 503. A JSON-RPC rejection from a live
+            app-server still answers 503. Leave ``False`` for settings only the
+            live thread holds (plan mode).
+        :returns: 204 when applied or deferred, else a 503 naming the failure.
+        """
         from omnigent.harnesses.codex_native.app_server import client_for_transport
 
         if not settings:
             return Response(status_code=204)
         state = await _codex_native_bridge_state_for_session(conv_id, action="settings update")
         if state is None:
+            if defer_if_not_live:
+                return _defer_codex_native_settings(conv_id, settings, reason="no_bridge_state")
             # No loaded Codex bridge means nothing applied the settings; a
             # silent 204 here would let the caller claim a switch the
             # app-server never saw.
@@ -277,7 +352,13 @@ def build_native_controls(
             client_name="omnigent-codex-native-runner",
         )
         try:
-            await codex_client.connect()
+            try:
+                await codex_client.connect()
+            except (OSError, WebSocketException):
+                # Nothing reached the app-server, so this is not a refusal of the update.
+                if not defer_if_not_live:
+                    raise
+                return await _defer_codex_native_settings_unreachable(conv_id, settings)
             await codex_client.request(
                 "thread/settings/update",
                 {
@@ -399,6 +480,8 @@ def build_native_controls(
                 },
             )
         developer_instructions = _di_read.value
+        # Not deferred: a relaunch does not restore plan mode, and the server
+        # records the toggle only on a confirmed 2xx.
         return await _handle_codex_native_settings_update(
             conv_id,
             {

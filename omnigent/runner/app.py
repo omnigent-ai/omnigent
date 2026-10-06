@@ -6550,9 +6550,11 @@ def create_runner_app(
                 _session_reasoning_effort.pop(conversation_id, None)
             if harness in ("claude-native", "codex-native", "pi-native", "devin-native"):
                 if harness == "codex-native":
+                    # The session row carries the effort into the next launch.
                     return await _handle_codex_native_settings_update(
                         conversation_id,
                         {"effort": effort},
+                        defer_if_not_live=True,
                     )
                 if harness == "pi-native":
                     return await _handle_pi_native_effort_change(
@@ -6593,9 +6595,11 @@ def create_runner_app(
                 if harness == "codex-native":
                     if model is None or not model.strip():
                         return Response(status_code=204)
+                    # The session row carries the pick into the next launch.
                     return await _handle_codex_native_settings_update(
                         conversation_id,
                         {"model": model.strip()},
+                        defer_if_not_live=True,
                     )
                 if harness == "cursor-native":
                     return await _handle_cursor_native_model_change(
