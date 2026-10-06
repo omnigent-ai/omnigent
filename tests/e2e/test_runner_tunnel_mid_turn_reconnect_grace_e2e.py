@@ -264,7 +264,9 @@ class _ReconnectStack:
         tmp_path: Path,
         *,
         fail_conversation_reads: bool = False,
+        runner_environment: dict[str, str] | None = None,
     ) -> None:
+        self._runner_environment = runner_environment or {}
         self._mock_base = f"{mock_llm_server_url}/v1"
         self._port = find_free_port()
         self.base_url = f"http://127.0.0.1:{self._port}"
@@ -347,6 +349,7 @@ class _ReconnectStack:
                 "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": self._binding_token,
                 "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
                 "RUNNER_SERVER_URL": proxy_url,
+                **self._runner_environment,
             }
         )
         self._runner_proc = subprocess.Popen(

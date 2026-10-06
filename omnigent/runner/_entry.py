@@ -465,7 +465,7 @@ def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
 
 
 class _InitialAuthTokenFactory:
-    """Use a host bearer until rejection, then lazily resolve runner auth."""
+    """Use a host bearer until rejection or a successful proactive refresh."""
 
     def __init__(self, token: str, server_url: str) -> None:
         """
@@ -484,6 +484,19 @@ class _InitialAuthTokenFactory:
         """Return the host bearer or a token from the lazy local fallback."""
         with self._lock:
             return self._call_locked()
+
+    def refresh(self) -> str | None:
+        """Resolve renewal credentials without losing a usable bootstrap on failure."""
+        with self._lock:
+            bootstrap = self._initial_token
+            self._initial_token = None
+            renewed: str | None = None
+            try:
+                renewed = self._call_locked()
+            finally:
+                if not renewed:
+                    self._initial_token = bootstrap
+            return renewed
 
     def _call_locked(self) -> str | None:
         """Body of :meth:`__call__`, run under :attr:`_lock`.
@@ -517,8 +530,8 @@ class _InitialAuthTokenFactory:
             if not self._no_credential_logged:
                 self._no_credential_logged = True
                 _logger.error(
-                    "host bootstrap bearer expired and no SDK/OIDC credential is available "
-                    "to renew it; run `databricks auth login` to re-authenticate",
+                    "no SDK/OIDC credential is available to renew the host bootstrap bearer; "
+                    "run `databricks auth login` to re-authenticate",
                     extra={"session_id": runner_primary_session_id()},
                 )
         elif token:
@@ -586,8 +599,8 @@ def _make_auth_token_factory(
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
-      1. Host's current bearer, when injected for runner bootstrap. This is
-         used until rejection; local refreshable auth resolves lazily.
+      1. Host's current bearer, when injected for runner bootstrap. Local
+         refreshable auth resolves on rejection or proactive tunnel renewal.
       2. Host-delegated runner token, when the host launch marker and
          binding token are present.
       3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
