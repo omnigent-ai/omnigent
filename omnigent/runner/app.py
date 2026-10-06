@@ -193,12 +193,7 @@ from omnigent.runner.subagent_work import (
     unregister_child_session,
     unregister_subagent_work_for_session,
 )
-from omnigent.runner.terminal_exit import (
-    TERMINAL_EXIT_NOTICE_CODE,
-    classify_terminal_exit,
-    post_terminal_exit_notice,
-    terminal_exit_notice,
-)
+from omnigent.runner.terminal_exit import VOLUNTARY_EXIT_CODE, classify_terminal_exit
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
@@ -1809,24 +1804,27 @@ def create_runner_app(
             extra=classified_log,
         )
         if decision.voluntary:
-            # The person quit the agent themselves. Settle the session like a
-            # stop, with a notice, rather than failing a turn nobody lost.
+            # The person quit the agent themselves: settle the session idle rather
+            # than failing a turn nobody lost.
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             # A turn stream still open is severed by the release below; this
             # ends it as cancelled instead of as the failed exit stored above.
             _required_terminal_exit_errors[event.session_id] = {
-                "code": TERMINAL_EXIT_NOTICE_CODE,
-                "message": terminal_exit_notice(event.terminal_name),
+                "code": VOLUNTARY_EXIT_CODE,
+                "message": "The agent exited in its terminal at the person's request.",
             }
-            _notice_task = asyncio.create_task(
-                post_terminal_exit_notice(server_client, event.session_id, event.terminal_name),
-                name=f"terminal-exit-notice:{event.session_id}",
-            )
-            _notice_task.add_done_callback(_background_tasks.discard)
-            _background_tasks.add(_notice_task)
-            if not event.session_was_idle:
+            if not event.session_was_idle or event.session_id in _active_turns:
                 _native_interrupt_runner.clear_pending_interrupt(event.session_id)
-                _mark_subagent_terminal_and_wake(event.session_id, status="cancelled", output=None)
+                if decision.strong_evidence:
+                    _mark_subagent_terminal_and_wake(
+                        event.session_id, status="cancelled", output=None
+                    )
+                else:
+                    # A bare zero exit can hide a crash behind a launcher wrapper;
+                    # fail the dispatch so a parent retries, as after any failed exit.
+                    _mark_subagent_terminal_and_wake(
+                        event.session_id, status="failed", output=error["message"]
+                    )
             _release_required_terminal_session(event.session_id)
             return
 
@@ -6069,9 +6067,9 @@ def create_runner_app(
 
             except (httpx.HTTPError, RuntimeError) as exc:
                 _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
-                if _exit_error is not None and _exit_error["code"] == TERMINAL_EXIT_NOTICE_CODE:
+                if _exit_error is not None and _exit_error["code"] == VOLUNTARY_EXIT_CODE:
                     # The person quit the agent mid-turn and the release severed this
-                    # stream: end the turn as cancelled, the way a Stop does.
+                    # stream: end the turn as cancelled rather than failed.
                     _logger.info(
                         "harness stream for %s ended by the person quitting the agent: %s",
                         conv_id,

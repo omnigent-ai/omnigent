@@ -19,19 +19,30 @@ The debug-log sink stores `event_name` separately and serializes non-null
   `terminal_exit_status` when known, `terminal_input_ready_at` once the native
   TUI had accepted input, and `superseded`.
 - `native_terminal_exit_classified`: an informational record for each required
-  terminal exit with `harness`, `exit_status`, `signal`, `session_end_reason`,
-  `session_end_signal`, `banner_seen`, `interactive`, `decision`, and `rule`.
-  `voluntary` means the person quit the agent themselves (`/exit`, Ctrl-C, a
-  closed terminal): the session goes idle with a notice and the next message
-  resumes it. `failed` keeps the `required_terminal_exited` failure. A Claude,
-  Codex, or Pi exit is voluntary only after the TUI accepted input and without
-  a non-zero status or fatal signal; the rule is one of `session_end_reason`,
-  `exit_zero`, or `user_signal` (SIGINT/SIGHUP), or Claude's exit banner. The
-  record carries no pane text.
+  terminal exit with `harness`, `command` (basename), `exit_status`, `signal`,
+  `session_end_reason`, `session_end_signal`, `session_end_evidence` (whether
+  Claude's `SessionEnd` hook fired), `banner_seen`, `interactive`, `decision`,
+  and `rule`. `voluntary` means the person quit the agent themselves: the
+  session goes idle, no conversation item is written (an `error`-type item
+  would be counted as a failure), and the next message resumes it. `failed`
+  keeps the `required_terminal_exited` failure.
+  - A Claude or Pi exit is voluntary only after the TUI accepted input and
+    without a non-zero status, a fatal signal, or a SIGTERM/SIGQUIT reported by
+    Claude's hook. The rule is `session_end_reason` (`prompt_input_exit`,
+    `logout`, `clear`), `user_signal`, or `exit_zero`; Claude's exit banner
+    also counts, even before readiness.
+  - `user_signal` is SIGINT/SIGHUP. Pi dies by the signal; Claude handles
+    SIGHUP by exiting 129, which is a non-zero exit and stays a failure.
+  - `exit_zero` alone is weak evidence: a launcher wrapper can exit 0 over a
+    crashed agent, so compare `command` and `session_end_evidence`. A tracked
+    sub-agent is settled `cancelled` on strong evidence (banner, reason, user
+    signal) and `failed` on a bare zero exit, so its parent retries.
+  - The record carries no pane text.
 - `harness_stream_ended_by_voluntary_exit`: a turn stream was still open when
   the person quit, so the release severed it. The turn ends with
-  `response.cancelled`, like a Stop, instead of `response.failed`
-  (`harness_stream_ended_by_terminal_exit`, the failure case).
+  `response.cancelled` instead of `response.failed`
+  (`harness_stream_ended_by_terminal_exit`, the failure case), and the
+  sub-agent dispatch, if any, is settled as above.
 - `terminal_close_requested`: an informational record before the explicit
   terminal-close path runs. It does not assert who requested the close or that
   cleanup succeeded.

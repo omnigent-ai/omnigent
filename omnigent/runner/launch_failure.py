@@ -60,20 +60,21 @@ class _Signal:
     :param command: Launched executable basename, lowercased (``""`` if unknown).
     :param exit_code: Inner process exit code, or ``None`` if unknown.
     :param output: Terminal's last captured output, lowercased (``""`` if none).
-    :param compact_output: ``output`` with all whitespace removed, for markers a
-        narrow pane may wrap mid-phrase.
+    :param compact_tail: The last few non-blank lines of ``output`` with all
+        whitespace removed, for markers a startup error prints last and a narrow
+        pane may wrap mid-phrase.
     """
 
     command: str
     exit_code: int | None
     output: str
-    compact_output: str
+    compact_tail: str
 
     def output_contains_any(self, needles: tuple[str, ...]) -> bool:
         return any(n in self.output for n in needles)
 
-    def compact_output_contains_any(self, needles: tuple[str, ...]) -> bool:
-        return any(n in self.compact_output for n in needles)
+    def compact_tail_contains_all(self, needles: tuple[str, ...]) -> bool:
+        return all(n in self.compact_tail for n in needles)
 
 
 @dataclass(frozen=True)
@@ -98,11 +99,12 @@ class _TerminalMatcher:
 _ROOT_MARKERS = ("root privileges", "security reasons", "cannot be run with root")
 
 # --- Pi launch and configuration problems -------------------------------------
-# Pi exits, or sits on a warning the person then quits, when no provider is signed in,
-# an extension fails to load or the model is unknown. Whitespace-free: panes wrap mid-word.
+# Pi exits 1 with these as its last output when no provider is signed in, an extension
+# fails to load or the model is unknown. Whitespace-free: panes wrap mid-word.
+_TAIL_LINES = 5
 _PI_NO_MODELS_MARKERS = ("nomodelsavailable",)
 _PI_EXTENSION_LOAD_MARKERS = ("failedtoloadextension",)
-_PI_MODEL_NOT_FOUND_MARKERS = ("toseeavailablemodels",)
+_PI_MODEL_NOT_FOUND_MARKERS = ("notfound", "toseeavailablemodels")
 
 # --- not authenticated --------------------------------------------------------
 _AUTH_MARKERS = (
@@ -136,6 +138,11 @@ _REJECTED_ARGUMENT_MARKERS = (
 )
 
 
+def _pi_startup_exit(signal: _Signal) -> bool:
+    """Whether Pi itself exited 1, so a quit (0) or a crash (signal) never matches."""
+    return signal.command == "pi" and signal.exit_code == 1
+
+
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, so it must win over the broader rules below it.
 _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
@@ -155,7 +162,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     # reads "No such file or directory".
     _TerminalMatcher(
         "pi_no_models",
-        lambda s: s.command == "pi" and s.compact_output_contains_any(_PI_NO_MODELS_MARKERS),
+        lambda s: _pi_startup_exit(s) and s.compact_tail_contains_all(_PI_NO_MODELS_MARKERS),
         FailureDiagnosis(
             title="Pi has no model to use",
             cause=(
@@ -170,7 +177,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     ),
     _TerminalMatcher(
         "pi_extension_load_failed",
-        lambda s: s.command == "pi" and s.compact_output_contains_any(_PI_EXTENSION_LOAD_MARKERS),
+        lambda s: _pi_startup_exit(s) and s.compact_tail_contains_all(_PI_EXTENSION_LOAD_MARKERS),
         FailureDiagnosis(
             title="Pi couldn't load an extension",
             cause="Pi exited at startup because one of its installed extensions failed to load.",
@@ -182,7 +189,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     ),
     _TerminalMatcher(
         "pi_model_not_found",
-        lambda s: s.command == "pi" and s.compact_output_contains_any(_PI_MODEL_NOT_FOUND_MARKERS),
+        lambda s: _pi_startup_exit(s) and s.compact_tail_contains_all(_PI_MODEL_NOT_FOUND_MARKERS),
         FailureDiagnosis(
             title="Pi doesn't know the selected model",
             cause=(
@@ -258,11 +265,12 @@ def classify_terminal_failure(
         matcher.
     """
     lowered = (output or "").lower()
+    tail = [line for line in lowered.splitlines() if line.strip()][-_TAIL_LINES:]
     signal = _Signal(
         command=(command or "").rsplit("/", 1)[-1].lower(),
         exit_code=exit_status,
         output=lowered,
-        compact_output="".join(lowered.split()),
+        compact_tail="".join("".join(line.split()) for line in tail),
     )
     for matcher in _TERMINAL_EXIT_MATCHERS:
         if matcher.predicate(signal):

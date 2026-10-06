@@ -98,8 +98,13 @@ _PI_MODEL_NOT_FOUND_OUTPUT = (
     "Use --list-models to see available models.\n"
     "Pane is dead (status 1, Tue Oct  6 04:54:38 2026)"
 )
-# A 80-column pane wraps that line, leaving only its tail in the capture.
+# A narrow pane wraps that line, even inside a phrase.
 _PI_MODEL_NOT_FOUND_WRAPPED_OUTPUT = (
+    'Error: Model "acme/model-x" not\nfound. Use --list-models to\nsee available models.\n'
+    "Pane is dead (status 1, Mon Oct  5 14:51:01 2026)"
+)
+# Only this tail of the wrapped line was captured in some panes: it alone names no model problem.
+_PI_MODEL_FRAGMENT_OUTPUT = (
     "to see available models.\nPane is dead (status 1, Mon Oct  5 14:51:01 2026)"
 )
 
@@ -150,14 +155,50 @@ def test_pi_extension_error_is_not_mistaken_for_a_missing_binary() -> None:
     assert diagnosis.code == "pi_extension_load_failed"
 
 
+_PI_TEXTS = [_PI_NO_MODELS_OUTPUT, _PI_EXTENSION_OUTPUT, _PI_MODEL_NOT_FOUND_OUTPUT]
+
+
+def _is_pi_diagnosis(diagnosis: FailureDiagnosis | None) -> bool:
+    return diagnosis is not None and (diagnosis.code or "").startswith("pi_")
+
+
 @pytest.mark.parametrize("command", ["claude", "codex", "env", None])
-@pytest.mark.parametrize(
-    "output", [_PI_NO_MODELS_OUTPUT, _PI_EXTENSION_OUTPUT, _PI_MODEL_NOT_FOUND_WRAPPED_OUTPUT]
-)
+@pytest.mark.parametrize("output", _PI_TEXTS)
 def test_pi_texts_only_explain_a_pi_exit(command: str | None, output: str) -> None:
     diagnosis = classify_terminal_failure(command=command, exit_status=1, output=output)
 
-    assert diagnosis is None or not (diagnosis.code or "").startswith("pi_")
+    assert not _is_pi_diagnosis(diagnosis)
+
+
+@pytest.mark.parametrize(
+    "exit_status",
+    [None, 0, 2, 130, 137, 139],
+    ids=["unknown", "quit", "usage", "sigint", "sigkill-137", "sigsegv-139"],
+)
+@pytest.mark.parametrize("output", _PI_TEXTS)
+def test_pi_diagnoses_need_pi_itself_to_exit_1(exit_status: int | None, output: str) -> None:
+    """A quit, a crash or an unknown status is not a startup error, whatever the pane shows."""
+    diagnosis = classify_terminal_failure(command=_PI, exit_status=exit_status, output=output)
+
+    assert not _is_pi_diagnosis(diagnosis)
+
+
+@pytest.mark.parametrize("output", _PI_TEXTS)
+def test_pi_diagnoses_ignore_text_quoted_earlier_in_the_pane(output: str) -> None:
+    """The error must be among Pi's last lines, not something it printed or quoted earlier."""
+    transcript = output + "\n" + "\n".join(f"assistant: reply line {n}" for n in range(6))
+
+    diagnosis = classify_terminal_failure(command=_PI, exit_status=1, output=transcript)
+
+    assert not _is_pi_diagnosis(diagnosis)
+
+
+def test_pi_model_diagnosis_needs_the_not_found_sentence() -> None:
+    diagnosis = classify_terminal_failure(
+        command=_PI, exit_status=1, output=_PI_MODEL_FRAGMENT_OUTPUT
+    )
+
+    assert not _is_pi_diagnosis(diagnosis)
 
 
 def test_diagnosis_code_names_the_matcher() -> None:

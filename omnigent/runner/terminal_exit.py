@@ -1,6 +1,6 @@
 """Decide whether a required native terminal's exit was the person's own quit.
 
-A person can leave a native TUI themselves (``/exit``, Ctrl-C, closing the
+A person can leave Claude or Pi themselves (``/exit``, Ctrl-C, closing the
 terminal). That is not a crash: the session goes idle and the next message
 cold-resumes the agent. Everything else about a required terminal's exit stays
 a failure, so a launch-time exit, a non-zero status or a fatal signal still
@@ -9,31 +9,31 @@ reaches the person as one.
 
 from __future__ import annotations
 
-import logging
-import urllib.parse
 from dataclasses import dataclass
-
-import httpx
+from pathlib import PurePath
 
 from omnigent.native.native_coding_agents import native_coding_agent_for_terminal_name
 from omnigent.runner.resource_registry import TerminalExitEvent
-
-_logger = logging.getLogger("omnigent.runner.app")
 
 # Banner Claude Code prints on a /exit or /quit (exit 0). Printing it can flip the
 # idle memo back to "running" before the pane dies.
 CLAUDE_EXIT_BANNER = "Resume this session with:"
 
-# Native TUIs whose exit after an interactive session can be the person quitting.
-_USER_QUIT_TERMINALS = frozenset({"claude", "codex", "pi"})
+# Stored in place of a failed exit so a turn stream the release severs ends as cancelled.
+VOLUNTARY_EXIT_CODE = "voluntary_terminal_exit"
+
+# Native TUIs whose required terminal exit can be the person quitting. The Codex TUI
+# is an auxiliary terminal and never reaches this decision.
+_USER_QUIT_TERMINALS = frozenset({"claude", "pi"})
 # Claude SessionEnd reasons that name something the person did (/exit, /logout, /clear).
 _USER_SESSION_END_REASONS = frozenset({"prompt_input_exit", "logout", "clear"})
 # SessionEnd reasons where policy, not the person, ended the session.
 _POLICY_SESSION_END_REASONS = frozenset({"bypass_permissions_disabled"})
-# Ctrl-C and a closed terminal; any other signal (SIGKILL, SIGSEGV, OOM) is a crash.
+# Ctrl-C and a closed terminal; any other signal (SIGKILL, SIGSEGV, SIGTERM) is not the person.
 _USER_SIGNALS = frozenset({"SIGINT", "SIGHUP"})
-
-TERMINAL_EXIT_NOTICE_CODE = "native_terminal_exited"
+# Rules that rest on evidence of the person's action. A bare zero exit does not: a launcher
+# wrapper can exit 0 over a crashed agent.
+_STRONG_RULES = frozenset({"claude_exit_banner", "session_end_reason", "user_signal"})
 
 
 @dataclass(frozen=True)
@@ -44,10 +44,13 @@ class TerminalExitDecision:
         session goes idle instead of failing.
     :param rule: Slug of the rule that decided, e.g. ``"exit_zero"``.
     :param harness: Native harness of the terminal, e.g. ``"pi-native"``.
+    :param command: Basename of the launched command, e.g. ``"env"`` for a wrapped Claude.
     :param exit_status: The launched command's exit code, when known.
     :param signal: Signal tmux reported for the launched command, e.g. ``"SIGINT"``.
     :param session_end_reason: Claude ``SessionEnd`` hook reason, e.g. ``"logout"``.
     :param session_end_signal: Signal Claude's ``SessionEnd`` hook reported.
+    :param session_end_evidence: Whether Claude's ``SessionEnd`` hook fired
+        (``"claude_hook"``) or was never observed (``"not_observed"``).
     :param banner_seen: Whether Claude's exit banner was in the captured pane tail.
     :param interactive: Whether the TUI had accepted input before it exited.
     """
@@ -55,21 +58,30 @@ class TerminalExitDecision:
     voluntary: bool
     rule: str
     harness: str | None
+    command: str | None
     exit_status: int | None
     signal: str | None
     session_end_reason: str | None
     session_end_signal: str | None
+    session_end_evidence: str | None
     banner_seen: bool
     interactive: bool
+
+    @property
+    def strong_evidence(self) -> bool:
+        """Whether a voluntary verdict rests on the person's action, not a bare zero exit."""
+        return self.voluntary and self.rule in _STRONG_RULES
 
     def log_attributes(self) -> dict[str, object]:
         """Return the content-free fields of the ``native_terminal_exit_classified`` event."""
         return {
             "harness": self.harness,
+            "command": self.command,
             "exit_status": self.exit_status,
             "signal": self.signal,
             "session_end_reason": self.session_end_reason,
             "session_end_signal": self.session_end_signal,
+            "session_end_evidence": self.session_end_evidence,
             "banner_seen": self.banner_seen,
             "interactive": self.interactive,
             "decision": "voluntary" if self.voluntary else "failed",
@@ -91,10 +103,11 @@ def classify_terminal_exit(
     """Decide whether a required terminal's exit was the person's own quit.
 
     Claude's exit banner on a clean exit is always voluntary. Otherwise a
-    Claude/Codex/Pi exit is voluntary only when the TUI had already accepted
-    input and nothing points to a crash: no non-zero status, no fatal signal and
-    no policy exit. The person's quit is then shown by Claude's ``SessionEnd``
-    reason, a zero exit status, or death by SIGINT/SIGHUP.
+    Claude or Pi exit is voluntary only when the TUI had already accepted
+    input and nothing points to a crash: no non-zero status, no fatal signal
+    (from tmux or Claude's hook) and no policy exit. The person's quit is then
+    shown by Claude's ``SessionEnd`` reason, a zero exit status, or death by
+    SIGINT/SIGHUP. Only the zero exit status alone is weak evidence.
 
     :param event: The required terminal's exit event.
     :param runner_shutting_down: Whether the runner is stopping, which takes the
@@ -112,10 +125,12 @@ def classify_terminal_exit(
             voluntary=voluntary,
             rule=rule,
             harness=agent.harness if agent is not None else None,
+            command=PurePath(event.command).name if event.command else None,
             exit_status=event.exit_status,
             signal=signal_name,
             session_end_reason=reason,
             session_end_signal=hook_signal,
+            session_end_evidence=event.session_end_evidence,
             banner_seen=banner_seen,
             interactive=event.interactive,
         )
@@ -132,6 +147,8 @@ def classify_terminal_exit(
         return decide(False, "nonzero_exit")
     if signal_name is not None and signal_name not in _USER_SIGNALS:
         return decide(False, "fatal_signal")
+    if hook_signal is not None and hook_signal not in _USER_SIGNALS:
+        return decide(False, "external_signal")
     if reason in _POLICY_SESSION_END_REASONS:
         return decide(False, "policy_exit")
     if reason in _USER_SESSION_END_REASONS:
@@ -141,57 +158,3 @@ def classify_terminal_exit(
     if signal_name in _USER_SIGNALS or hook_signal in _USER_SIGNALS:
         return decide(True, "user_signal")
     return decide(False, "no_quit_evidence")
-
-
-def terminal_display_name(terminal_name: str) -> str:
-    """Return the person-facing agent name for a terminal, e.g. ``"Claude"`` for ``claude``."""
-    agent = native_coding_agent_for_terminal_name(terminal_name)
-    return agent.display_name if agent is not None else terminal_name
-
-
-def terminal_exit_notice(terminal_name: str) -> str:
-    """Return the sentence shown when the person quits the agent in its terminal."""
-    return (
-        f"{terminal_display_name(terminal_name)} exited in its terminal. Send a message to resume."
-    )
-
-
-async def post_terminal_exit_notice(
-    server_client: httpx.AsyncClient, session_id: str, terminal_name: str
-) -> None:
-    """Append a neutral "exited in its terminal" notice to the session transcript.
-
-    Best-effort: a failed post only loses the notice.
-
-    :param server_client: Runner-to-server client.
-    :param session_id: Session whose terminal the person closed.
-    :param terminal_name: Terminal that exited, e.g. ``"claude"``.
-    """
-    # The headline carries the whole sentence: it is all the transcript shows until expanded.
-    notice = terminal_exit_notice(terminal_name)
-    try:
-        resp = await server_client.post(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": "error",
-                    "item_data": {
-                        "source": "harness",
-                        "code": TERMINAL_EXIT_NOTICE_CODE,
-                        "title": notice,
-                        "message": notice,
-                        "level": "info",
-                    },
-                },
-            },
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-    except (httpx.HTTPError, RuntimeError):
-        _logger.warning(
-            "Failed to post the terminal-exit notice for %s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )

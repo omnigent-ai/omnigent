@@ -221,6 +221,11 @@ class TerminalExitEvent:
         """Signal Claude's ``SessionEnd`` hook reported, e.g. ``"SIGHUP"``."""
         return self.lifecycle_context.get("claude_session_end_signal")
 
+    @property
+    def session_end_evidence(self) -> str | None:
+        """Whether Claude's ``SessionEnd`` hook fired: ``"claude_hook"`` or ``"not_observed"``."""
+        return self.lifecycle_context.get("claude_session_end_evidence")
+
 
 def _terminal_lifecycle_context(
     instance: TerminalInstance | None, resource_role: str | None

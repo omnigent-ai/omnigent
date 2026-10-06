@@ -243,6 +243,9 @@ async def test_quit_reason_after_the_composer_appeared_settles_idle_instead_of_f
     assert row["attributes"]["decision"] == "voluntary"
     assert row["attributes"]["rule"] == "session_end_reason"
     assert row["attributes"]["session_end_reason"] == reason
+    # The hook really fired, and the launcher command is named without its path.
+    assert row["attributes"]["session_end_evidence"] == "claude_hook"
+    assert row["attributes"]["command"] == "isaac"
     assert row["attributes"]["interactive"] == "True"
     [exit_row] = _rows(caplog, "terminal_exit_observed")
     assert float(exit_row["attributes"]["terminal_input_ready_at"]) > 0
@@ -293,6 +296,7 @@ async def test_exit_zero_before_the_composer_appeared_is_a_launch_failure(
     assert row["attributes"]["decision"] == "failed"
     assert row["attributes"]["rule"] == "not_interactive"
     assert row["attributes"]["interactive"] == "False"
+    assert row["attributes"]["session_end_evidence"] == "not_observed"
     [failed] = _rows(caplog, "required_terminal_exited")
     assert failed["attributes"]["diagnosis_code"] == "rejected_arguments"
 
