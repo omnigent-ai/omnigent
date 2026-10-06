@@ -1,16 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
   anchorOccurrence,
+  appendCommentBridge,
   BRIDGE_MSG,
   BRIDGE_SOURCE,
   buildBridgeScript,
   findAnchorInSource,
   injectCommentBridge,
+  mapBridgeRectToViewport,
   parseBridgeMessage,
+  slideIndexForSourceOffset,
+  wireframeScreenIdForSourceOffset,
 } from "./htmlCommentBridge";
 
 // ---------------------------------------------------------------------------
-// injectCommentBridge — script/style placement (mirrors prepareHtmlPreviewDoc)
+// injectCommentBridge  -  script/style placement (mirrors prepareHtmlPreviewDoc)
 // ---------------------------------------------------------------------------
 
 describe("injectCommentBridge", () => {
@@ -73,7 +77,7 @@ describe("injectCommentBridge", () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseBridgeMessage — inbound validation (guards against spoofed postMessage)
+// parseBridgeMessage  -  inbound validation (guards against spoofed postMessage)
 // ---------------------------------------------------------------------------
 
 describe("parseBridgeMessage", () => {
@@ -166,7 +170,7 @@ describe("parseBridgeMessage", () => {
 });
 
 // ---------------------------------------------------------------------------
-// findAnchorInSource — rendered selection text -> raw HTML source offsets
+// findAnchorInSource  -  rendered selection text -> raw HTML source offsets
 // ---------------------------------------------------------------------------
 
 describe("findAnchorInSource", () => {
@@ -203,7 +207,7 @@ describe("findAnchorInSource", () => {
   });
 
   it("resolves the requested occurrence for repeated text", () => {
-    // "Aurora Sync" as a title, then again in body prose — selecting the body
+    // "Aurora Sync" as a title, then again in body prose  -  selecting the body
     // copy (occurrence 1) must anchor to the SECOND match, not the first.
     const src = "<h1>Aurora Sync</h1><p>Aurora Sync keeps state.</p>";
     const first = src.indexOf("Aurora Sync");
@@ -230,7 +234,7 @@ describe("findAnchorInSource", () => {
   it("anchors occurrence 0 to the wrapped first copy, not a later verbatim one", () => {
     // Regression: the old occurrence-0 fast path used a verbatim indexOf, which
     // skipped the whitespace-wrapped first rendered copy and landed on the
-    // second (verbatim) one — storing the comment at the wrong offset.
+    // second (verbatim) one  -  storing the comment at the wrong offset.
     const src = "<p>then\n   latency</p><p>then latency</p>";
     const firstWrapped = src.indexOf("then\n   latency");
     const res = findAnchorInSource(src, "then latency", 0);
@@ -266,11 +270,11 @@ describe("findAnchorInSource", () => {
 });
 
 // ---------------------------------------------------------------------------
-// anchorOccurrence — which copy of repeated anchor text a comment refers to
+// anchorOccurrence  -  which copy of repeated anchor text a comment refers to
 // ---------------------------------------------------------------------------
 
 describe("anchorOccurrence", () => {
-  // A title reused verbatim in the body — the exact case that highlighted both.
+  // A title reused verbatim in the body  -  the exact case that highlighted both.
   const src = "<h1>Aurora Sync</h1><p>Aurora Sync keeps state.</p>";
   const first = src.indexOf("Aurora Sync");
   const second = src.indexOf("Aurora Sync", first + 1);
@@ -300,5 +304,74 @@ describe("anchorOccurrence", () => {
     const withAttr = '<button title="Submit"><!-- Submit --><span>Submit</span></button>';
     const rendered = withAttr.lastIndexOf("Submit");
     expect(anchorOccurrence(withAttr, "Submit", rendered)).toBe(0);
+  });
+});
+
+describe("appendCommentBridge", () => {
+  const NONCE = "n-append";
+
+  it("injects the bridge without re-running prepareHtmlPreviewDoc", () => {
+    const prepared = "<html><head></head><body><p>hi</p></body></html>";
+    const out = appendCommentBridge(prepared, NONCE);
+    expect(out).toContain("omni-html-comment");
+    expect(out).toContain(NONCE);
+    // No second <base> from prepareHtmlPreviewDoc.
+    expect(out.split('<base target="_blank">').length - 1).toBe(0);
+  });
+});
+
+describe("mapBridgeRectToViewport", () => {
+  it("maps iframe-local rects through the stage scale", () => {
+    const pos = mapBridgeRectToViewport(
+      { left: 100, top: 50 },
+      { left: 20, top: 40, right: 80, bottom: 60 },
+      0.5,
+    );
+    expect(pos).toEqual({ x: 100 + 20 * 0.5, y: 50 + 40 * 0.5 - 6 });
+  });
+
+  it("defaults scale to 1 for plain HTML previews", () => {
+    const pos = mapBridgeRectToViewport(
+      { left: 10, top: 20 },
+      { left: 5, top: 8, right: 9, bottom: 12 },
+    );
+    expect(pos).toEqual({ x: 15, y: 20 + 8 - 6 });
+  });
+});
+
+describe("slideIndexForSourceOffset", () => {
+  const deck = `<html><body>
+<section><h1>One</h1></section>
+<section><h1>Two unique slide token</h1></section>
+<section><h1>Three</h1></section>
+</body></html>`;
+
+  it("returns the slide whose source range contains the offset", () => {
+    const at = deck.indexOf("Two unique slide token");
+    expect(slideIndexForSourceOffset(deck, at)).toBe(1);
+  });
+
+  it("returns null when there are no sections", () => {
+    expect(slideIndexForSourceOffset("<html><body><p>x</p></body></html>", 0)).toBeNull();
+  });
+});
+
+describe("wireframeScreenIdForSourceOffset", () => {
+  const wf = `<html><body>
+<section data-screen="home"><h1>Home</h1></section>
+<section data-screen="settings"><p>settings unique token</p></section>
+</body></html>`;
+
+  it("returns the data-screen id for the offset", () => {
+    const at = wf.indexOf("settings unique token");
+    expect(wireframeScreenIdForSourceOffset(wf, at)).toBe("settings");
+  });
+});
+
+describe("bridge print clearing", () => {
+  it("registers beforeprint/afterprint handlers in the injected script", () => {
+    const script = buildBridgeScript("n");
+    expect(script).toContain("beforeprint");
+    expect(script).toContain("afterprint");
   });
 });

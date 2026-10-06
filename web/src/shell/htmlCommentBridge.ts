@@ -9,7 +9,7 @@
 //   So we inject a small, app-authored script into the iframe that reads the
 //   selection *inside* the frame and relays it over a private MessageChannel,
 //   and paints highlights *inside* the frame on command. The sandbox flags are
-//   unchanged — postMessage works fine across the opaque-origin boundary.
+//   unchanged  -  postMessage works fine across the opaque-origin boundary.
 //
 // Trust model:
 //   Post-handshake messages travel over a MessagePort that only the parent and
@@ -25,7 +25,7 @@
 
 import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
 
-/** Protocol version — bump on any breaking change to the message shapes. */
+/** Protocol version  -  bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
 
 /** Tag stamped on every message so we ignore unrelated postMessage traffic. */
@@ -103,7 +103,7 @@ function isRect(r: unknown): r is BridgeRect {
 /**
  * Validate and narrow a raw message received from the iframe. Returns the typed
  * message on success, or `null` for anything that isn't a well-formed bridge
- * message carrying the expected `nonce` — guarding against arbitrary
+ * message carrying the expected `nonce`  -  guarding against arbitrary
  * postMessage traffic (including spoofs from artifact JS).
  *
  * @param data  The raw `MessageEvent.data`.
@@ -118,7 +118,7 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
       return { type: BRIDGE_MSG.ready };
     case BRIDGE_MSG.selection:
       if (typeof d.text === "string" && d.text.trim() !== "" && isRect(d.rect)) {
-        // occ is optional for resilience against older frames — default to the
+        // occ is optional for resilience against older frames  -  default to the
         // first occurrence, which is the pre-occurrence behavior.
         const occ = typeof d.occ === "number" && d.occ >= 0 ? d.occ : 0;
         return { type: BRIDGE_MSG.selection, text: d.text, occ, rect: d.rect };
@@ -189,11 +189,11 @@ function inNonRendered(index: number, ranges: [number, number][]): boolean {
 /**
  * Locate `anchor` (text selected in the *rendered* HTML) within the raw HTML
  * `source`, returning absolute character offsets so the comment anchors to the
- * source the agent actually edits — consistent with how Markdown/code comments
+ * source the agent actually edits  -  consistent with how Markdown/code comments
  * store offsets.
  *
  * Rendered prose may collapse whitespace the source spells out (newlines,
- * indentation between tags), so matching is always whitespace-tolerant — never
+ * indentation between tags), so matching is always whitespace-tolerant  -  never
  * a plain `indexOf`. `occurrence` picks which copy (document order, counting
  * only *rendered* regions) the caller selected; matches inside non-rendered
  * source (tags/attributes, comments, `<script>`/`<style>`/`<title>`) are skipped
@@ -224,15 +224,15 @@ export function findAnchorInSource(
       i += 1;
     }
   } catch {
-    // Pathological anchor produced an invalid pattern — fall through to null.
+    // Pathological anchor produced an invalid pattern  -  fall through to null.
   }
   return null;
 }
 
 /**
  * Which occurrence of `anchor` (0-based, document order) the comment at
- * `startIndex` refers to. Anchor text can repeat — e.g. a title and a body
- * paragraph both containing "Aurora Sync" — and the bridge highlights by text
+ * `startIndex` refers to. Anchor text can repeat  -  e.g. a title and a body
+ * paragraph both containing "Aurora Sync"  -  and the bridge highlights by text
  * match, so without this it would light up every copy. Counting the matches
  * before `startIndex` disambiguates to the one the user actually selected.
  *
@@ -266,7 +266,7 @@ export function anchorOccurrence(source: string, anchor: string, startIndex: num
 // The script that runs INSIDE the sandboxed iframe. Authored as a plain string
 // (no template interpolation / backticks) so it can be injected verbatim; the
 // per-mount nonce is substituted via `.replace` in buildBridgeScript(). Must be
-// dependency-free vanilla JS — it runs in the artifact's opaque-origin document.
+// dependency-free vanilla JS  -  it runs in the artifact's opaque-origin document.
 const BRIDGE_SCRIPT_BODY = `(function () {
   var NONCE = "__OMNI_NONCE__";
   var SRC = "__OMNI_SRC__";
@@ -322,7 +322,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
   // Whitespace-normalized view of a string: runs of whitespace collapse to a
   // single space, with a map from each normalized index back to its raw offset
   // (plus a trailing sentinel = raw length). charAt(i) <= " " treats every code
-  // <= U+0020 (space, tab, CR/LF, FF) as whitespace without needing regex — which
+  // <= U+0020 (space, tab, CR/LF, FF) as whitespace without needing regex  -  which
   // matters here because the script is injected as a template-literal string.
   function normWs(text) {
     var norm = "";
@@ -348,7 +348,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
   // All ranges matching the anchor. anchor_content is rendered-selection text
   // (whitespace collapsed) but the haystack is raw text-node data that preserves
   // the source's newlines/indentation, so match on the normalized view and map
-  // normalized offsets back to raw node positions — mirroring the parent's
+  // normalized offsets back to raw node positions  -  mirroring the parent's
   // whitespace-tolerant findAnchorInSource. H (the normalized view of
   // index.text) is passed in so repaint builds it once for all comments.
   function anchorRanges(index, H, anchor) {
@@ -407,7 +407,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
   // Which occurrence (0-based, document order) of the selected text the current
   // selection is, so the parent can anchor to the copy actually selected rather
   // than the first text match. Counts normalized matches starting before the
-  // selection's start — mirrors anchorRanges/anchorOccurrence so a wrapped
+  // selection's start  -  mirrors anchorRanges/anchorOccurrence so a wrapped
   // occurrence still counts. Returns 0 if the position can't be resolved.
   function selectionOccurrence(range, text) {
     var index = buildIndex();
@@ -544,7 +544,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
       });
       return;
     }
-    // A plain click (collapsed selection) — did it land inside a comment range?
+    // A plain click (collapsed selection)  -  did it land inside a comment range?
     var cr = caretRange(e.clientX, e.clientY);
     if (cr) {
       for (var i = 0; i < ranges.length; i++) {
@@ -580,7 +580,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
           // If a newly-arrived comment covers the still-active native selection
           // (i.e. the user just saved a comment on it), drop that selection.
           // The browser's ::selection paints over Custom Highlights, so the range
-          // would stay grey — masking the yellow highlight — until the user
+          // would stay grey  -  masking the yellow highlight  -  until the user
           // clicked elsewhere to collapse it. Keeping the selection during
           // compose is intentional; we only clear once the comment exists.
           clearSelectionIfCommented();
@@ -602,6 +602,17 @@ const BRIDGE_SCRIPT_BODY = `(function () {
   });
 
   document.addEventListener("mouseup", onMouseUp, true);
+
+  // Print must not show review highlights; drop them for the print pass and
+  // restore afterward so the on-screen preview is unchanged.
+  window.addEventListener("beforeprint", function () {
+    if (typeof CSS === "undefined" || !CSS.highlights) return;
+    try {
+      CSS.highlights.delete("omni-comment");
+      CSS.highlights.delete("omni-comment-active");
+    } catch (e) {}
+  });
+  window.addEventListener("afterprint", function () { repaint(); });
 })();`;
 
 /** A `<style>` block that colors the Custom Highlight ranges painted by the bridge. */
@@ -631,6 +642,40 @@ export function buildBridgeScript(nonce: string): string {
 }
 
 /**
+ * Map an in-frame selection rect to host viewport coordinates for the floating
+ * Add-comment button. `scale` accounts for CSS `transform: scale(...)` on the
+ * iframe (slide/wireframe stages); plain HTML previews use the default of 1.
+ */
+export function mapBridgeRectToViewport(
+  iframeRect: Pick<DOMRectReadOnly, "left" | "top">,
+  bridgeRect: BridgeRect,
+  scale = 1,
+): { x: number; y: number } {
+  return {
+    x: iframeRect.left + bridgeRect.left * scale,
+    y: iframeRect.top + bridgeRect.top * scale - 6,
+  };
+}
+
+/**
+ * Append the highlight style + bridge script to an already-prepared preview
+ * document (e.g. after slide/wireframe design injection). Does not re-run
+ * {@link prepareHtmlPreviewDoc}. Download/export paths must not call this.
+ */
+export function appendCommentBridge(html: string, nonce: string): string {
+  const inject = BRIDGE_HIGHLIGHT_STYLE + "<script>" + buildBridgeScript(nonce) + "</script>";
+  const bodyClose = html.search(/<\/body\s*>/i);
+  if (bodyClose !== -1) {
+    return html.slice(0, bodyClose) + inject + html.slice(bodyClose);
+  }
+  const htmlClose = html.search(/<\/html\s*>/i);
+  if (htmlClose !== -1) {
+    return html.slice(0, htmlClose) + inject + html.slice(htmlClose);
+  }
+  return html + inject;
+}
+
+/**
  * Prepare HTML artifact content for the comment-enabled preview iframe: first
  * run {@link prepareHtmlPreviewDoc} (so links still open in a new tab), then
  * append the highlight `<style>` and the bridge `<script>` so the script runs
@@ -644,16 +689,126 @@ export function buildBridgeScript(nonce: string): string {
  * @param nonce Per-mount nonce shared with the parent for message validation.
  */
 export function injectCommentBridge(html: string, nonce: string): string {
-  const prepared = prepareHtmlPreviewDoc(html);
-  const inject = BRIDGE_HIGHLIGHT_STYLE + "<script>" + buildBridgeScript(nonce) + "</script>";
+  return appendCommentBridge(prepareHtmlPreviewDoc(html), nonce);
+}
 
-  const bodyClose = prepared.search(/<\/body\s*>/i);
-  if (bodyClose !== -1) {
-    return prepared.slice(0, bodyClose) + inject + prepared.slice(bodyClose);
+/** Index of the matching `</section>` for a `<section` that opens at `openAt`. */
+function sectionCloseEnd(html: string, openAt: number): number {
+  const openTag = /^<section\b[^>]*>/i.exec(html.slice(openAt));
+  if (!openTag) return openAt;
+  let i = openAt + openTag[0].length;
+  let depth = 1;
+  while (i < html.length && depth > 0) {
+    if (html.startsWith("<!--", i)) {
+      const close = html.indexOf("-->", i + 4);
+      i = close === -1 ? html.length : close + 3;
+      continue;
+    }
+    const rest = html.slice(i);
+    const nextOpen = rest.search(/<section\b/i);
+    const nextClose = rest.search(/<\/section\s*>/i);
+    if (nextClose === -1) return html.length;
+    if (nextOpen !== -1 && nextOpen < nextClose) {
+      const tag = /^<section\b[^>]*>/i.exec(html.slice(i + nextOpen));
+      i += nextOpen + (tag ? tag[0].length : 8);
+      depth += 1;
+    } else {
+      const tag = /^<\/section\s*>/i.exec(html.slice(i + nextClose));
+      i += nextClose + (tag ? tag[0].length : 10);
+      depth -= 1;
+    }
   }
-  const htmlClose = prepared.search(/<\/html\s*>/i);
-  if (htmlClose !== -1) {
-    return prepared.slice(0, htmlClose) + inject + prepared.slice(htmlClose);
+  return i;
+}
+
+/**
+ * Source ranges of `body > section` elements (top-level only), in document
+ * order. Used to map a comment's source offset to a slide/screen index.
+ */
+const VOID_TAGS = new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr",
+]);
+
+export function topLevelSectionRanges(html: string): { start: number; end: number }[] {
+  const bodyOpen = /<body\b[^>]*>/i.exec(html);
+  const from = bodyOpen && bodyOpen.index !== undefined ? bodyOpen.index + bodyOpen[0].length : 0;
+  const bodyClose = html.slice(from).search(/<\/body\s*>/i);
+  const limit = bodyClose === -1 ? html.length : from + bodyClose;
+  const ranges: { start: number; end: number }[] = [];
+  let i = from;
+  let depth = 0;
+  while (i < limit) {
+    if (html.startsWith("<!--", i)) {
+      const close = html.indexOf("-->", i + 4);
+      i = close === -1 ? limit : close + 3;
+      continue;
+    }
+    if (html.charAt(i) !== "<") {
+      i += 1;
+      continue;
+    }
+    const closeTag = /^<\/([a-zA-Z][\w:-]*)\s*>/.exec(html.slice(i));
+    if (closeTag) {
+      if (depth > 0) depth -= 1;
+      i += closeTag[0].length;
+      continue;
+    }
+    const openTag = /^<([a-zA-Z][\w:-]*)\b[^>]*>/.exec(html.slice(i));
+    if (!openTag) {
+      i += 1;
+      continue;
+    }
+    const name = openTag[1].toLowerCase();
+    const selfClosing = /\/>$/.test(openTag[0]) || VOID_TAGS.has(name);
+    if (depth === 0 && name === "section") {
+      const start = i;
+      const end = sectionCloseEnd(html, start);
+      ranges.push({ start, end: Math.min(end, limit) });
+      i = end;
+      continue;
+    }
+    i += openTag[0].length;
+    if (!selfClosing) depth += 1;
   }
-  return prepared + inject;
+  return ranges;
+}
+
+/** 0-based slide index whose source range contains `offset`, or null. */
+export function slideIndexForSourceOffset(html: string, offset: number): number | null {
+  const ranges = topLevelSectionRanges(html);
+  if (ranges.length === 0) return null;
+  for (let i = 0; i < ranges.length; i++) {
+    if (offset >= ranges[i].start && offset < ranges[i].end) return i;
+  }
+  if (offset < ranges[0].start) return 0;
+  return ranges.length - 1;
+}
+
+/**
+ * `data-screen` id of the wireframe section containing `offset`, or null when
+ * the file has no screen sections.
+ */
+export function wireframeScreenIdForSourceOffset(html: string, offset: number): string | null {
+  const ranges = topLevelSectionRanges(html);
+  for (const range of ranges) {
+    if (offset < range.start || offset >= range.end) continue;
+    const open = /^<section\b[^>]*>/i.exec(html.slice(range.start));
+    if (!open) continue;
+    const id = /\bdata-screen\s*=\s*["']([^"']+)["']/i.exec(open[0]);
+    if (id) return id[1].trim();
+  }
+  return null;
 }
