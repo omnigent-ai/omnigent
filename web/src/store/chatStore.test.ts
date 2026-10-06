@@ -8160,6 +8160,57 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("terminal_command (claude-native !cmd)", () => {
+    const terminalCommand = (kind: "input" | "output"): StreamEvent => ({
+      type: "terminal_command",
+      kind,
+      input: kind === "input" ? "ls" : null,
+      stdout: kind === "output" ? "a.txt" : null,
+      stderr: null,
+      itemId: `item_shell_${kind}`,
+      responseId: "resp_shell_1",
+    });
+
+    it("pops the FIFO head on the input half so the optimistic bubble clears", () => {
+      // A `!cmd` runs as a shell command, so no `session.input.consumed`
+      // follows. The server settles the queued entry on the input half; the
+      // bubble `send` parked in `pendingUserMessages` must clear with it, or
+      // the next message's receipt would pop this one and strand its own.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "!ls" }] },
+          { tempId: "pend_2", content: [{ type: "input_text", text: "next" }] },
+        ],
+      });
+
+      handleSessionEvent(terminalCommand("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([
+        { tempId: "pend_2", content: [{ type: "input_text", text: "next" }] },
+      ]);
+    });
+
+    it("leaves pendingUserMessages alone on the output half", () => {
+      const pending = [
+        { tempId: "pend_1", content: [{ type: "input_text" as const, text: "!ls" }] },
+      ];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(terminalCommand("output"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+    });
+
+    it("is a no-op when pendingUserMessages is empty (observing client)", () => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+
+      handleSessionEvent(terminalCommand("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+  });
+
   describe("session.interrupted", () => {
     it("sets activeResponse.state to 'cancelled'", () => {
       useChatStore.setState({

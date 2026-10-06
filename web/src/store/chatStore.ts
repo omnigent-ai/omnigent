@@ -7523,6 +7523,19 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return { pendingUserMessages: rest };
       });
       return;
+    case "terminal_command":
+      // Claude-native: a `!cmd` typed in the web composer runs as a shell
+      // command, so its input comes back as this item instead of a user
+      // message and no `session.input.consumed` fires. The server drains the
+      // queued entry on the input half; ack the local send the same way as
+      // `slash_command`. The output half acknowledges nothing.
+      if (event.kind !== "input") return;
+      applyToConversation((s) => {
+        if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
+        const [, ...rest] = s.pendingUserMessages;
+        return { pendingUserMessages: rest };
+      });
+      return;
     case "session_interrupted":
       // Explicit user-cancel signal. Distinguishes "interrupted by
       // user action" from the generic `response.incomplete` that
