@@ -8367,12 +8367,26 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     )
 
 
+def _is_command_echo(content: str) -> bool:
+    """
+    Whether a ``local_command`` record's content is a built-in command's echo.
+
+    The echo leads with the command tags; a shell-mode record leads with its
+    ``<bash-...>`` markup and may only quote the tags in the command it ran.
+
+    :param content: The record's ``content`` string.
+    :returns: ``True`` when it opens with ``<command-name>`` or ``<command-message>``.
+    """
+    return content.lstrip().startswith(("<command-name>", "<command-message>"))
+
+
 def _slash_command_item(
     payload: _SlashCommandPayload,
     *,
     agent_name: str,
     source_key: str,
     response_id: str,
+    local: bool = False,
 ) -> ClaudeTranscriptItem:
     """
     Build the ``slash_command`` item for a parsed command record.
@@ -8381,10 +8395,13 @@ def _slash_command_item(
     :param agent_name: Agent/model name the web UI attributes the invocation to.
     :param source_key: Base transcript record key used to construct the source id.
     :param response_id: Response id the item is grouped under.
+    :param local: ``True`` for the echo of a built-in local command, which is a
+        ``command`` whatever its name; otherwise only the surfaced built-ins are,
+        and any other name is taken to be a skill.
     :returns: The item; ``command_message`` is set only when the person typed a
         name other than the recorded one.
     """
-    kind = "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill"
+    kind = "command" if local or payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill"
     data: _JsonObject = {
         "agent": agent_name,
         "kind": kind,
@@ -8512,7 +8529,8 @@ def _local_command_transcript_items_from_entry(
                 is_compact_noop=True,
             )
         ]
-    if "<command-name>" in content:
+    # A shell record may merely quote the tag (``!grep "<command-name>" …``).
+    if _is_command_echo(content):
         payload = _parse_slash_command_record(content)
         if payload is None or payload.name in _CLAUDE_CLI_DROPPED_COMMANDS:
             return current_response_id, []
@@ -8523,6 +8541,7 @@ def _local_command_transcript_items_from_entry(
                 agent_name=agent_name,
                 source_key=source_key,
                 response_id=current_response_id or _response_id_from_source(source_key),
+                local=True,
             )
         ]
     fallback_response_id = _response_id_from_source(source_key)

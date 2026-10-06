@@ -2983,31 +2983,73 @@ def test_read_transcript_items_since_surfaces_a_local_command_echo(tmp_path: Pat
 
 
 @pytest.mark.parametrize(
-    ("echo", "expected_name", "expected_kind"),
+    ("name", "args"),
     [
-        pytest.param(
-            "<command-name>/rename</command-name>\n<command-message>rename</command-message>\n"
-            "<command-args>my title</command-args>",
-            "rename",
-            "skill",
-            id="unlisted-name-is-shown-like-a-skill",
-        ),
-        pytest.param(
-            "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n"
-            "<command-args>high</command-args>",
-            "effort",
-            "command",
-            id="surfaced-builtin",
-        ),
+        pytest.param("rename", "my title", id="unlisted-rename"),
+        pytest.param("context", "", id="unlisted-context"),
+        pytest.param("usage", "", id="unlisted-usage"),
+        pytest.param("theme", "dark", id="unlisted-theme"),
+        pytest.param("effort", "high", id="surfaced-builtin"),
     ],
 )
-def test_local_command_echo_kind_follows_the_user_record_rules(
-    tmp_path: Path, echo: str, expected_name: str, expected_kind: str
+def test_local_command_echo_is_a_command_whatever_its_name(
+    tmp_path: Path, name: str, args: str
 ) -> None:
-    """A local echo is classified exactly like the same command's ``role=user`` record."""
+    """
+    A local echo is a built-in by definition, so no name is shown as a skill.
+
+    Only a ``role=user`` record can be a skill; labelling an unlisted built-in
+    such as ``/context`` or ``/usage`` as one would mislabel it in the chat.
+    """
+    echo = (
+        f"<command-name>/{name}</command-name>\n<command-message>{name}</command-message>\n"
+        f"<command-args>{args}</command-args>"
+    )
     (item,) = _read_items(tmp_path, [_local_command_record("echo", echo)])
 
-    assert (item.data["name"], item.data["kind"]) == (expected_name, expected_kind)
+    assert (item.data["name"], item.data["kind"]) == (name, "command")
+
+
+def test_user_record_of_an_unlisted_name_is_still_a_skill(tmp_path: Path) -> None:
+    """The neutral kind is for local echoes only; a ``role=user`` record keeps the skill rule."""
+    record = json.dumps(
+        {
+            "type": "user",
+            "uuid": "user-rename",
+            "message": {
+                "role": "user",
+                "content": (
+                    "<command-name>/rename</command-name>\n"
+                    "<command-message>rename</command-message>\n"
+                    "<command-args>my title</command-args>"
+                ),
+            },
+        }
+    )
+    (item,) = _read_items(tmp_path, [record])
+
+    assert (item.data["name"], item.data["kind"]) == ("rename", "skill")
+
+
+def test_local_command_record_quoting_the_tag_in_a_shell_command_is_no_slash_command(
+    tmp_path: Path,
+) -> None:
+    """
+    A shell-mode record that merely mentions ``<command-name>`` is not a command echo.
+
+    ``!grep "<command-name>" log`` is recorded as a shell command whose text
+    contains the tag; parsing it as a slash command surfaced a bogus item and
+    drained the wrong queued bubble.
+    """
+    shell = "<bash-input>grep -c '<command-name>/model</command-name>' session.jsonl</bash-input>"
+    stdout = "<bash-stdout>3</bash-stdout><bash-stderr></bash-stderr>"
+    items = _read_items(
+        tmp_path,
+        [_local_command_record("shell-input", shell), _local_command_record("shell-out", stdout)],
+    )
+
+    assert [item.item_type for item in items] == ["terminal_command", "terminal_command"]
+    assert "slash_command" not in {item.item_type for item in items}
 
 
 def test_local_command_echo_of_a_hidden_builtin_is_dropped(tmp_path: Path) -> None:
