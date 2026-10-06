@@ -22,15 +22,18 @@ from tests.budgets import budget
 _RUNNER_ID = "runner-relay-silent-drop"
 _HOST_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 _NORMAL_GRACE_S = 0.1
+_READY_FRAME = 'data: {"type":"session.heartbeat"}\n\n'
 _DONE_STREAM = (
-    'data: {"type":"session.heartbeat"}\n\n'
-    'data: {"type":"session.status","status":"idle"}\n\n'
-    "data: [DONE]\n\n"
+    _READY_FRAME + 'data: {"type":"session.status","status":"idle"}\n\n' + "data: [DONE]\n\n"
 )
 
 
 class _TunnelLikeTransport(httpx.AsyncBaseTransport):
     """Models ``WSTunnelTransport``: refuses requests until the runner registers.
+
+    The first request is the relay attaching: it gets the runner's ready heartbeat and the
+    stream then ends, as when a tunnel drops under an attached relay. Later requests follow
+    the runner's registration.
 
     :param online: Whether the runner is registered.
     """
@@ -73,6 +76,9 @@ class _TunnelLikeTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.attempts += 1
+        if self.attempts == 1:
+            # The relay attaches: the ready heartbeat, then the stream ends.
+            return httpx.Response(200, text=_READY_FRAME)
         if not self.online:
             raise httpx.ConnectError("runner is offline", request=request)
         return self.respond(request)
@@ -106,7 +112,10 @@ class _RelayCase:
 async def relay_case(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> AsyncIterator[_RelayCase]:
-    """A mid-turn, host-bound session with short grace windows and an offline host."""
+    """A mid-turn, host-bound session with short graces and an offline host.
+
+    Its relay attaches on the first request, then the tunnel drops.
+    """
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", _NORMAL_GRACE_S)
     monkeypatch.setattr(orchestration, "RUNNER_SILENT_DROP_GRACE_S", 0.8)
@@ -213,7 +222,7 @@ async def test_a_second_silent_drop_after_the_stream_resumes_is_held_again(
         runner_drop_state.note(_RUNNER_ID, "silent")
         transport.go_offline()
         resumed.set()
-        return httpx.Response(200, text='data: {"type":"session.heartbeat"}\n\n')
+        return httpx.Response(200, text=_READY_FRAME)
 
     transport.respond = ready_then_quiet_again
     runner_drop_state.note(_RUNNER_ID, "silent")
@@ -410,12 +419,18 @@ async def test_server_shutdown_is_never_held(
 async def test_a_client_without_a_tunnel_transport_is_not_held(
     relay_case: _RelayCase, caplog: pytest.LogCaptureFixture
 ) -> None:
-    def refuse(request: httpx.Request) -> httpx.Response:
+    requests = 0
+
+    def attach_then_refuse(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return httpx.Response(200, text=_READY_FRAME)
         raise httpx.ConnectError("runner is offline", request=request)
 
     runner_drop_state.note(_RUNNER_ID, "silent")
     async with httpx.AsyncClient(
-        base_url="http://runner", transport=httpx.MockTransport(refuse)
+        base_url="http://runner", transport=httpx.MockTransport(attach_then_refuse)
     ) as client:
         await asyncio.wait_for(
             orchestration._relay_runner_stream(
