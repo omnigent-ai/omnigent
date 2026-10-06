@@ -627,8 +627,7 @@ async def test_rejects_host_predating_store_secret_fast_and_clearly(
             elapsed = time.monotonic() - start
     finally:
         drain_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await drain_task
+        await asyncio.gather(drain_task, return_exceptions=True)
         await _disconnect_mock_host(comm)
 
     assert resp.status_code == 409, resp.text
@@ -677,8 +676,7 @@ async def test_hosts_at_or_above_the_floor_still_write(
             )
     finally:
         drain_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await drain_task
+        await asyncio.gather(drain_task, return_exceptions=True)
         await _disconnect_mock_host(comm)
 
     assert resp.status_code == 200, resp.text
@@ -714,8 +712,7 @@ async def test_old_host_gates_detect_install_and_model_options(
             models = await client.get(f"/v1/hosts/{_HOST_ID}/harnesses/claude/model-options")
     finally:
         drain_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await drain_task
+        await asyncio.gather(drain_task, return_exceptions=True)
         await _disconnect_mock_host(comm)
     assert forwarded == []
     for resp in (detect, install, models):
