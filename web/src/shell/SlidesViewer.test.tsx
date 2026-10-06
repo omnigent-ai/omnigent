@@ -387,6 +387,8 @@ describe("SlidesViewer", () => {
     expect(slidesExportFilename(".slides.html")).toBe("deck.html");
     expect(slidesExportFilename("dir/.slides.html")).toBe("deck.html");
     expect(slidesExportFilename("")).toBe("deck.html");
+    expect(slidesExportFilename("   .slides.html")).toBe("deck.html");
+    expect(slidesExportFilename("...slides.html")).toBe("deck.html");
   });
 
   it("disables Download HTML for a truncated deck", () => {
@@ -397,10 +399,7 @@ describe("SlidesViewer", () => {
   it("disables Download HTML when the deck has no slides", () => {
     render(<SlidesViewer content="<html><body><p>hi</p></body></html>" />);
     expect(downloadButton()).toBeDisabled();
-    expect(downloadButton()).toHaveAttribute(
-      "title",
-      "Download HTML needs at least one slide",
-    );
+    expect(downloadButton()).toHaveAttribute("title", "Download HTML needs at least one slide");
   });
 
   it("shows a friendly empty state for a deck with no sections", () => {

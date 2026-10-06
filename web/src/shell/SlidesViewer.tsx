@@ -64,8 +64,11 @@ export function isIgnoredNavKey(e: {
 /** Filename for Download HTML; odd paths that strip to nothing become `deck.html`. */
 export function slidesExportFilename(path?: string | null): string {
   const file = path?.split("/").at(-1) || "deck.slides.html";
-  const base = file.replace(/\.slides\.html$/i, "") || "deck";
-  return `${base}.html`;
+  const base = file
+    .replace(/\.slides\.html$/i, "")
+    .trim()
+    .replace(/^\.+|\.+$/g, "");
+  return `${base || "deck"}.html`;
 }
 
 // A stalled kit or design-system read must not leave the deck blank. A full
@@ -271,10 +274,7 @@ export function SlidesViewer({
   const downloadHtml = () => {
     if (!canExport) return;
     const html = prepareSlidesExport(deckContent, kitStyle, systemStyle);
-    triggerBrowserDownload(
-      new Blob([html], { type: "text/html" }),
-      slidesExportFilename(deckPath),
-    );
+    triggerBrowserDownload(new Blob([html], { type: "text/html" }), slidesExportFilename(deckPath));
   };
   const downloadButton = (
     <Button
