@@ -4483,6 +4483,45 @@ def kill_session(
 
 
 @_serialize_bridge_injection
+def wait_for_input_ready(
+    bridge_dir: Path,
+    *,
+    ready_timeout_s: float,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """
+    Block until Claude's input box can take keystrokes, within a hard budget.
+
+    For a caller that reads state off the booted pane before it types, such
+    as the statusLine model a switch is judged against: a snapshot taken
+    while the TUI is still booting is empty or left over from an earlier run.
+    It runs the same reclaim-then-wait step :func:`inject_slash_command`
+    does, so a surface the person left over the composer is dismissed rather
+    than waited out.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :param ready_timeout_s: Hard cap, in seconds, on the wait, e.g. ``9.0``.
+        There is no slow-boot extension, so a terminal that is still booting
+        when it lapses fails the wait.
+    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``1.0``.
+    :returns: None.
+    :raises RuntimeError: If the tmux target is not advertised in time, if the
+        input box does not render within *ready_timeout_s*
+        (:class:`ClaudePromptTimeout`), or if a dialog, sign-in prompt or
+        pending question holds the terminal.
+    """
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    _reclaim_and_wait_for_prompt(
+        bridge_dir,
+        info["socket_path"],
+        info["tmux_target"],
+        timeout_s=timeout_s,
+        ready_timeout_s=ready_timeout_s,
+    )
+
+
+@_serialize_bridge_injection
 def inject_slash_command(
     bridge_dir: Path,
     *,
@@ -4490,20 +4529,25 @@ def inject_slash_command(
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
     auto_confirm: bool = False,
     confirm_hint: str | None = None,
+    ready_timeout_s: float | None = None,
 ) -> None:
     """
     Type a Claude Code slash command into the tmux pane and submit it.
 
-    Anything the person left occupying the composer from the embedded
-    terminal (ctrl+r history search, rewind dialog, ``!`` shell mode) is
-    dismissed first — see :func:`_restore_occupied_input` — so the
-    command cannot be typed into it.
+    Like :func:`inject_user_message`, nothing is typed until Claude's input
+    box has rendered: a TUI still booting (a session woken just before the
+    command) drops the keystrokes, so the command would never run. Anything
+    the person left occupying the composer from the embedded terminal (ctrl+r
+    history search, rewind dialog, ``!`` shell mode) is dismissed first — see
+    :func:`_restore_occupied_input` — so the command cannot be typed into it.
 
     :param bridge_dir: Bridge directory path, e.g.
         ``/tmp/omnigent/claude-native/<digest>``.
     :param command: Single-line slash command including the leading
         ``/``, e.g. ``"/effort high"``.
-    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``30.0``.
+    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``30.0``. Also
+        the base budget for the input box to render when *ready_timeout_s* is
+        ``None``.
     :param auto_confirm: If ``True``, accept the default option of the TUI
         confirmation dialog the command pops (e.g. ``/effort`` when
         switching invalidates the prompt cache). HACK — the chat UI has no
@@ -4516,11 +4560,18 @@ def inject_slash_command(
         dialog is polled for by its own title so a late render (~1.9s on a
         session with cached history) still gets its Enter, and so the Enter
         cannot answer a dialog that is not ours.
+    :param ready_timeout_s: Hard cap, in seconds, on waiting for the input box
+        to render, e.g. ``9.0``. For a caller answering a request with its own
+        deadline: a slow boot then fails the command in time instead of
+        outliving the request. ``None`` waits like :func:`inject_user_message`
+        — *timeout_s* as the base budget, extended while a live pane is still
+        booting.
     :raises ValueError: If *command* is empty, does not start with
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
     :raises RuntimeError: If the tmux target is not advertised in
-        time, if a ``tmux send-keys`` invocation fails, or if the typed
+        time, if the input box never renders (:class:`ClaudePromptTimeout`),
+        if a ``tmux send-keys`` invocation fails, or if the typed
         command verifiably never left the input box (submit swallowed).
     """
     if not command or not command.startswith("/"):
@@ -4535,9 +4586,16 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
-    # Same reclaim as inject_user_message: a surface left occupying the
-    # composer would swallow the C-u and the typed command.
-    _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+    # Same reclaim-then-wait as inject_user_message: a surface left occupying
+    # the composer would swallow the C-u and the typed command, and so would a
+    # TUI that has not mounted its input box yet.
+    _reclaim_and_wait_for_prompt(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        timeout_s=timeout_s,
+        ready_timeout_s=ready_timeout_s,
+    )
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings."
@@ -5543,7 +5601,11 @@ def acknowledge_auto_mode_billing_notice(
 
 
 def _restore_occupied_input(
-    socket_path: str, tmux_target: str, *, bridge_dir: Path | None = None
+    socket_path: str,
+    tmux_target: str,
+    *,
+    bridge_dir: Path | None = None,
+    timeout_s: float | None = None,
 ) -> None:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
@@ -5579,9 +5641,12 @@ def _restore_occupied_input(
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
+    :param timeout_s: Seconds to keep dismissing, e.g. ``1.5``. ``None`` uses
+        :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S`.
     :returns: None.
     """
-    deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
+    dismiss_timeout_s = _OCCUPIED_INPUT_DISMISS_TIMEOUT_S if timeout_s is None else timeout_s
+    deadline = time.monotonic() + dismiss_timeout_s
     last_escape: float | None = None
     confirmed = False
     while True:
@@ -5604,7 +5669,7 @@ def _restore_occupied_input(
             _logger.warning(
                 "claude-native: input box still occupied (%s) after %.1fs; proceeding",
                 surface,
-                _OCCUPIED_INPUT_DISMISS_TIMEOUT_S,
+                dismiss_timeout_s,
             )
             return
         if not confirmed:
@@ -5929,6 +5994,7 @@ def _wait_for_claude_prompt_ready(
     *,
     timeout_s: float,
     bridge_dir: Path | None = None,
+    extend_for_slow_boot: bool = True,
 ) -> None:
     """
     Block until Claude Code's TUI input box is ready for keystrokes.
@@ -5941,10 +6007,11 @@ def _wait_for_claude_prompt_ready(
     it returns immediately once mounted, so 2nd+ messages are
     unaffected.
 
-    Claude-native only — this is called from :func:`inject_user_message`,
-    which exclusively serves the Claude Code terminal. It must never be
-    used for generic terminals, whose programs never render
-    :data:`_CLAUDE_PROMPT_GLYPH` and would always time out.
+    Claude-native only — this is called from :func:`inject_user_message`
+    and :func:`inject_slash_command`, which exclusively serve the Claude
+    Code terminal. It must never be used for generic terminals, whose
+    programs never render :data:`_CLAUDE_PROMPT_GLYPH` and would always
+    time out.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
@@ -5954,6 +6021,10 @@ def _wait_for_claude_prompt_ready(
         :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
         query ends the wait at the next liveness check.
     :param bridge_dir: Protect live permission-hook waits when delivering a message.
+    :param extend_for_slow_boot: ``False`` makes *timeout_s* a hard cap with no
+        slow-boot extension, for a caller that must answer within its own
+        deadline (a settings change whose requester gives up after a fixed
+        time). A slow boot then fails the wait instead of outliving the request.
     :returns: None.
     :raises ClaudeTerminalExited: If tmux affirms the pane's process has
         exited, carrying the pane's wait-status so a clean quit is
@@ -5978,7 +6049,9 @@ def _wait_for_claude_prompt_ready(
     """
     started = time.monotonic()
     next_liveness_probe = started + timeout_s
-    hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
+    hard_deadline = started + (
+        max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S) if extend_for_slow_boot else timeout_s
+    )
     polls = 0
     empty_polls = 0
     # Keep the last non-empty capture the loop actually saw, not a fresh
@@ -6074,6 +6147,56 @@ def _wait_for_claude_prompt_ready(
         f"(input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
         + _format_terminal_failure_tail(last_nonempty)
+    )
+
+
+def _reclaim_and_wait_for_prompt(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    timeout_s: float,
+    ready_timeout_s: float | None,
+) -> None:
+    """
+    Clear anything occupying Claude's input box, then wait for its prompt.
+
+    The order :func:`inject_user_message` uses: a surface left over the
+    composer hides the input box from the readiness gate, so it is dismissed
+    first, and only then is the pane waited on until the prompt renders.
+
+    :param bridge_dir: Bridge directory path.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param timeout_s: Base readiness budget when *ready_timeout_s* is
+        ``None``, e.g. ``30.0``.
+    :param ready_timeout_s: Hard cap, in seconds, on the whole step, reclaim
+        included, e.g. ``9.0``. ``None`` waits like a message delivery:
+        *timeout_s* as the base budget, extended while a live pane is still
+        booting.
+    :returns: None.
+    :raises RuntimeError: As :func:`_wait_for_claude_prompt_ready` and
+        :func:`_restore_occupied_input` raise.
+    """
+    if ready_timeout_s is None:
+        _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+        _wait_for_claude_prompt_ready(
+            socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir
+        )
+        return
+    started = time.monotonic()
+    _restore_occupied_input(
+        socket_path,
+        tmux_target,
+        bridge_dir=bridge_dir,
+        timeout_s=min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, ready_timeout_s),
+    )
+    _wait_for_claude_prompt_ready(
+        socket_path,
+        tmux_target,
+        timeout_s=max(0.0, ready_timeout_s - (time.monotonic() - started)),
+        bridge_dir=bridge_dir,
+        extend_for_slow_boot=False,
     )
 
 

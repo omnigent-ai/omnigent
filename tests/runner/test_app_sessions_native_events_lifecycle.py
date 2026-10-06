@@ -3886,6 +3886,7 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Record the call and return without touching tmux."""
         captured.append((bridge_dir, command, timeout_s, confirm_hint))
