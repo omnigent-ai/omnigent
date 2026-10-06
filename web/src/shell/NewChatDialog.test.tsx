@@ -1083,6 +1083,14 @@ describe("matchSkillInvocation", () => {
     });
   });
 
+  it("matches a skill whose first word is not command-shaped", () => {
+    const name = "Node.js Best Practices";
+    expect(matchSkillInvocation(`/${name} here`, [...SKILLS, { name }])).toEqual({
+      name,
+      args: "here",
+    });
+  });
+
   it("tolerates surrounding whitespace (the sanitized prompt is trimmed)", () => {
     expect(matchSkillInvocation("  /review-pr 123  ", SKILLS)).toEqual({
       name: "review-pr",

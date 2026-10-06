@@ -1751,6 +1751,17 @@ describe("splitSlashCommand", () => {
     expect(splitSlashCommand(`${name} rewrite this`, ["/compact"])?.token).toBe("/Simplified");
   });
 
+  it("matches a known skill whose first word is not command-shaped", () => {
+    const name = "/Node.js Best Practices";
+    expect(splitSlashCommand(`${name} here`, [name])).toEqual({
+      before: "",
+      token: name,
+      after: " here",
+    });
+    // Not command-shaped and not in the catalog: nothing to tint.
+    expect(splitSlashCommand(`${name} here`)).toBeNull();
+  });
+
   it("returns null when the text isn't a command", () => {
     expect(splitSlashCommand("just prose")).toBeNull();
   });

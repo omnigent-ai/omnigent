@@ -35,11 +35,8 @@ const DEFAULT_BUILTIN_NAMES = new Set(Object.keys(BUILTIN_SLASH_COMMANDS));
 const SLASH_COMMAND_RE = /^\/[A-Za-z0-9][\w:-]*(\s|$)/;
 
 /**
- * True when a user message is a slash-command invocation typed in the
- * composer. The single command-shape definition shared by the in-session
- * composer's submit routing + highlight overlay and the landing
- * composer's skill matching — one guard, so the surfaces can't diverge
- * on what "reads as a command".
+ * True when a user message reads as a slash-command invocation by shape: the
+ * single guard shared by the composer's submit routing and highlight overlay.
  */
 export function isSlashCommandText(text: string): boolean {
   return SLASH_COMMAND_RE.test(text.trim());
