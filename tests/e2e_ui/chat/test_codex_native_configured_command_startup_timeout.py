@@ -139,35 +139,33 @@ for _var in ("NO_PROXY", "no_proxy"):
 def _clean_env() -> dict[str, str]:
     """Ambient env with loopback proxy-excluded and runner/host vars stripped.
 
-    Stripping ``OMNIGENT_RUNNER_*`` / ``OMNIGENT_HOST_*`` matters when the
-    test itself runs inside a server-spawned runner: leaked zygote/tunnel
-    vars make the spawned child runner take the zygote-fork path and hang.
-    ``OMNIGENT_PROCESS_LOG_FILE`` / ``OMNIGENT_DATA_DIR`` are host-owned
-    write paths; the spawned pair must not write into (or crash on) the
-    calling host's log/data locations.
+    Stripping ``OMNIGENT_*`` matters when the test itself runs inside a
+    server-spawned runner: leaked identity, zygote, tunnel, and write-path
+    settings can redirect the isolated pair back to the calling host.
+    Credential, endpoint, and config-selector suffixes keep arbitrary
+    managed-launcher state out of the generic wrapper rig.
     """
     env = os.environ.copy()
     for var in ("NO_PROXY", "no_proxy"):
         existing = env.get(var, "")
         env[var] = ",".join(filter(None, [existing, "127.0.0.1,localhost"]))
     for key in list(env):
-        if key.startswith(
+        if key.startswith(("OMNIGENT_", "CODEX_")) or key.endswith(
             (
-                "OMNIGENT_RUNNER_",
-                "OMNIGENT_HOST_",
-                "DATABRICKS_",
-                "ISAAC_",
-                "CODEX_",
+                "_API_KEY",
+                "_TOKEN",
+                "_MODEL_CATALOG_PATH",
+                "_HOST",
+                "_CONFIG_FILE",
+                "_CONFIG_PROFILE",
+                "_BEARER",
+                "_CLIENT_ID",
+                "_CLIENT_SECRET",
+                "_AUTH_TYPE",
             )
         ):
             del env[key]
-    for key in (
-        "RUNNER_SERVER_URL",
-        "OMNIGENT_PROCESS_LOG_FILE",
-        "OMNIGENT_DATA_DIR",
-        "OMNIGENT_CODEX_PATH",
-    ):
-        env.pop(key, None)
+    env.pop("RUNNER_SERVER_URL", None)
     return env
 
 
@@ -448,3 +446,31 @@ def test_configured_codex_command_setup_survives_startup_watchdog(
         if thread_id is None:
             time.sleep(0.5)
     assert thread_id, "the configured wrapper exec'd Codex but no thread became available"
+
+    # Recovery uses the public resource proxy rather than the bind-time path.
+    # Its HTTP budgets must cover the same configured-wrapper allowance.
+    wrapper_started = markers / "wrapper-started"
+    first_start_mtime = wrapper_started.stat().st_mtime_ns
+    first_exec_mtime = exec_marker.stat().st_mtime_ns
+    deleted = _client.delete(
+        f"{base_url}/v1/sessions/{session_id}/resources/terminals/terminal_codex_main",
+        timeout=30.0,
+    )
+    deleted.raise_for_status()
+    ensured = _client.post(
+        f"{base_url}/v1/sessions/{session_id}/resources/terminals",
+        json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
+        timeout=(
+            CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+            + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS
+            + 30.0
+        ),
+    )
+    ensured.raise_for_status()
+    restart_deadline = time.monotonic() + _WRAPPER_SETUP_DELAY_S + 90.0
+    while (
+        exec_marker.stat().st_mtime_ns <= first_exec_mtime and time.monotonic() < restart_deadline
+    ):
+        time.sleep(0.5)
+    assert wrapper_started.stat().st_mtime_ns > first_start_mtime
+    assert exec_marker.stat().st_mtime_ns > first_exec_mtime

@@ -167,10 +167,6 @@ _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
-# Isaac may select a model catalog outside Codex's config.toml. Keep that
-# external file in the same cache identity as the wrapped Codex executable.
-_ISAAC_CODEX_MODEL_CATALOG_PATH_ENV = "ISAAC_CODEX_MODEL_CATALOG_PATH"
-
 
 def _codex_startup_timeout_seconds(invocation: CodexInvocation, fallback: float) -> float:
     """Use the configured-wrapper allowance only when app-server is wrapped."""
@@ -1200,50 +1196,29 @@ _model_discovery_cache: TTLCache[str, tuple[_JsonObject, ...]] = TTLCache(
 )
 
 
-def _isaac_model_catalog_identity(
-    invocation: CodexInvocation | None = None,
-) -> tuple[str, str | None, int | None, int | None] | None:
-    """Return identity for Isaac's externally selected model catalog.
-
-    Relative paths resolve against this process's cwd; the child Codex cwd is
-    deliberately not inferred here. The raw value remains in the identity.
-    """
-    selected: str | None = None
-    if invocation is not None:
-        for arg in invocation.argv_prefix:
-            key, separator, value = arg.partition("=")
-            if key == _ISAAC_CODEX_MODEL_CATALOG_PATH_ENV and separator:
-                selected = value
-    if selected is None:
-        selected = os.environ.get(_ISAAC_CODEX_MODEL_CATALOG_PATH_ENV)
-    if not selected:
-        return None
-    raw_path = selected
-    path = Path(selected).expanduser()
-    try:
-        resolved_path = path.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return (raw_path, None, None, None)
-    try:
-        stat = resolved_path.stat()
-    except OSError:
-        return (raw_path, str(resolved_path), None, None)
-    return (raw_path, str(resolved_path), stat.st_size, stat.st_mtime_ns)
+def _argv_prefix_digest(argv_prefix: Sequence[str]) -> str:
+    """Digest a configured prefix without retaining its argument values."""
+    digest = hashlib.sha256()
+    for argument in argv_prefix:
+        encoded = argument.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def _codex_invocation_identity(invocation: CodexInvocation) -> tuple[object, ...]:
-    """Capture executable metadata for one Codex invocation."""
+    """Capture privacy-safe executable and prefix metadata for an invocation."""
     from omnigent.models.model_catalog_store import binary_identity
 
     prefix_identities = tuple(
-        (part, binary_identity(part))
-        for part in invocation.argv_prefix
+        (position, binary_identity(part))
+        for position, part in enumerate(invocation.argv_prefix)
         if "=" not in part and not part.startswith("-")
     )
     return (
         invocation.executable,
         binary_identity(invocation.executable),
-        invocation.argv_prefix,
+        _argv_prefix_digest(invocation.argv_prefix),
         prefix_identities,
     )
 
@@ -1251,16 +1226,8 @@ def _codex_invocation_identity(invocation: CodexInvocation) -> tuple[object, ...
 def _model_discovery_cache_key(
     invocation: CodexInvocation,
 ) -> str:
-    """Key short-lived discovery by the selected invocation and catalog."""
-    parts: list[object] = [
-        invocation.executable,
-        invocation.argv_prefix,
-        ("codex_invocation", _codex_invocation_identity(invocation)),
-    ]
-    identity = _isaac_model_catalog_identity(invocation)
-    if identity is not None:
-        parts.append(("isaac_model_catalog", identity))
-    return repr(tuple(parts))
+    """Key short-lived discovery by the selected invocation."""
+    return repr(("codex_invocation", _codex_invocation_identity(invocation)))
 
 
 async def discover_codex_model_options(
@@ -1764,9 +1731,6 @@ def codex_catalog_fingerprint(
     ]
     if invocation.argv_prefix:
         fingerprint_parts.append(("codex_invocation", _codex_invocation_identity(invocation)))
-    isaac_catalog_identity = _isaac_model_catalog_identity(invocation)
-    if isaac_catalog_identity is not None:
-        fingerprint_parts.append(("isaac_model_catalog", isaac_catalog_identity))
     return fingerprint_of(
         *fingerprint_parts,
     )
@@ -2101,7 +2065,9 @@ class CodexNativeAppServer:
         # caught below.
         assert self.codex_invocation is not None
         version_target: str | CodexInvocation = (
-            self.codex_invocation if self.codex_invocation.argv_prefix else self.codex_path
+            self.codex_invocation
+            if self.codex_invocation.app_server_configured
+            else self.codex_path
         )
         codex_version = await _codex_cli_version(version_target)
         self.codex_cli_version = codex_version
@@ -2140,7 +2106,7 @@ class CodexNativeAppServer:
             # therefore be absent even from a fresh snapshot. A present row
             # with malformed migration metadata is also unsafe to trust.
             if catalog_entry is None or _codex_model_upgrade_metadata_is_malformed(catalog_entry):
-                if self.codex_invocation.argv_prefix:
+                if self.codex_invocation.app_server_configured:
                     catalog = await asyncio.to_thread(
                         read_codex_model_catalog,
                         self.codex_path,
@@ -2169,7 +2135,7 @@ class CodexNativeAppServer:
             supported_efforts=CODEX_NATIVE_EFFORTS,
             minimal_config=minimal_config,
             codex_invocation=(
-                self.codex_invocation if self.codex_invocation.argv_prefix else None
+                self.codex_invocation if self.codex_invocation.app_server_configured else None
             ),
         )
         if minimal_config:
@@ -3894,9 +3860,9 @@ def _resolve_subscription_launch(
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     # Pin codex's built-in ``openai`` provider: the bridged config.toml may
-    # set a custom default ``model_provider`` (e.g. isaac's Databricks AI
-    # Gateway), which would silently hijack a Subscription selection. A
-    # no-op when the user's config sets no custom default.
+    # set a custom default ``model_provider`` (e.g. an enterprise gateway),
+    # which would silently hijack a Subscription selection. A no-op when the
+    # user's config sets no custom default.
     subscription_overrides = ['model_provider="openai"']
     if _codex_login_usable():
         log_info_once(

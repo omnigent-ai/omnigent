@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,6 @@ from omnigent.harnesses.codex_native.app_server import (
     NativeCodexLaunch,
     _build_native_codex_app_server_argv,
     _codex_startup_timeout_seconds,
-    _isaac_model_catalog_identity,
     _model_discovery_cache_key,
     _resolve_native_codex_invocation,
     codex_catalog_fingerprint,
@@ -29,13 +29,13 @@ def test_resolve_invocation_freezes_configured_command_and_args() -> None:
             "harness": {
                 "codex-native": {
                     "command": "env",
-                    "args": ["ISAAC_ENABLE_UG=0", "isaac", "codex", "--"],
+                    "args": ["MANAGED_CODEX_MODE=0", "managed-codex", "codex", "--"],
                 }
             }
         }
     )
     assert invocation.executable == "env"
-    assert invocation.argv_prefix == ("ISAAC_ENABLE_UG=0", "isaac", "codex", "--")
+    assert invocation.argv_prefix == ("MANAGED_CODEX_MODE=0", "managed-codex", "codex", "--")
     assert invocation.configured is True
 
 
@@ -54,7 +54,14 @@ def test_resolve_invocation_freezes_configured_command_and_args() -> None:
             {"harness": {"codex-native": {"command": "config", "args": ["--"]}}},
             "env",
             None,
-            "config",
+            "env",
+            (),
+        ),
+        (
+            {"harness": {"codex-native": {"command": "env", "args": ["--"]}}},
+            "env",
+            None,
+            "env",
             ("--",),
         ),
         (
@@ -72,7 +79,14 @@ def test_resolve_invocation_freezes_configured_command_and_args() -> None:
             ("--",),
         ),
     ],
-    ids=["config-only", "env-only", "config-beats-env", "explicit-differs", "explicit-equal"],
+    ids=[
+        "config-only",
+        "env-only",
+        "env-beats-config",
+        "env-matches-config",
+        "explicit-differs",
+        "explicit-equal",
+    ],
 )
 def test_resolve_invocation_command_precedence(
     monkeypatch: pytest.MonkeyPatch,
@@ -82,7 +96,7 @@ def test_resolve_invocation_command_precedence(
     expected_command: str,
     expected_prefix: tuple[str, ...],
 ) -> None:
-    """Codex config wins over env, while explicit commands select their own args."""
+    """Shared precedence selects the command before configured args inheritance."""
     if env_command is None:
         monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
     else:
@@ -90,6 +104,27 @@ def test_resolve_invocation_command_precedence(
     invocation = resolve_codex_invocation(explicit=explicit, cfg=cfg)
     assert invocation.executable == expected_command
     assert invocation.argv_prefix == expected_prefix
+
+
+def test_env_command_overrides_config_without_app_server_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A differing env command does not inherit config args or app-server status."""
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "managed-codex-env")
+    invocation = resolve_codex_invocation(
+        cfg={
+            "harness": {
+                "codex-native": {
+                    "command": "managed-codex-config",
+                    "args": ["--managed-config"],
+                }
+            }
+        }
+    )
+    assert invocation.executable == "managed-codex-env"
+    assert invocation.argv_prefix == ()
+    assert invocation.terminal_prefix == ()
+    assert invocation.app_server_configured is False
 
 
 def test_args_only_config_is_terminal_only() -> None:
@@ -139,6 +174,58 @@ def test_configured_app_server_timeout_is_distinct_from_args_only() -> None:
     assert _codex_startup_timeout_seconds(CodexInvocation("codex"), 60.0) == 60.0
 
 
+async def test_command_only_wrapper_reaches_extended_catalog_plumbing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Command-only wrappers stay on the resolved invocation for startup probes."""
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.inner.codex_executor import CODEX_EXTENDED_CATALOG_ENV_VAR
+    from tests.harnesses.codex_native.app_server._support import (
+        _disable_codex_startup_rpc,
+        _test_app_server,
+    )
+
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    _disable_codex_startup_rpc(monkeypatch)
+    invocation = CodexInvocation(
+        sys.executable,
+        configured=True,
+        app_server_configured=True,
+    )
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "private",
+        tmp_path / "bridge",
+        tmp_path,
+        env={CODEX_EXTENDED_CATALOG_ENV_VAR: "1"},
+    )
+    server.codex_invocation = invocation
+    server.reconcile_process_registry = False
+
+    version_targets: list[object] = []
+
+    async def _version(target: object) -> tuple[int, int, int]:
+        version_targets.append(target)
+        return (0, 154, 0)
+
+    populate_kwargs: dict[str, object] = {}
+
+    def _populate(*_args: object, **kwargs: object) -> None:
+        populate_kwargs.update(kwargs)
+
+    monkeypatch.setattr(app_server, "_codex_cli_version", _version)
+    monkeypatch.setattr(app_server, "_populate_codex_home_config", _populate)
+
+    await server.start()
+    await server.close()
+
+    assert version_targets == [invocation]
+    assert populate_kwargs["extend_model_catalog"] is True
+    assert populate_kwargs["codex_invocation"] is invocation
+
+
 def test_app_server_argv_keeps_default_bare_and_prepends_configured_prefix() -> None:
     """A configured wrapper is prepended exactly once; bare argv is unchanged."""
     assert _build_native_codex_app_server_argv(
@@ -148,13 +235,13 @@ def test_app_server_argv_keeps_default_bare_and_prepends_configured_prefix() -> 
     ) == ["codex", "app-server", "--listen", "ws://127.0.0.1:1234"]
     assert _build_native_codex_app_server_argv(
         tagged_argv0="env",
-        invocation_prefix=("ISAAC_ENABLE_UG=0", "isaac", "codex", "--"),
+        invocation_prefix=("MANAGED_CODEX_MODE=0", "managed-codex", "codex", "--"),
         listen_url="ws://127.0.0.1:1234",
         config_overrides=(),
     ) == [
         "env",
-        "ISAAC_ENABLE_UG=0",
-        "isaac",
+        "MANAGED_CODEX_MODE=0",
+        "managed-codex",
         "codex",
         "--",
         "app-server",
@@ -172,56 +259,30 @@ def test_catalog_fingerprint_includes_configured_prefix() -> None:
     )
     wrapped = codex_catalog_fingerprint(
         launch,
-        codex_invocation=CodexInvocation("env", ("isaac", "codex", "--")),
+        codex_invocation=CodexInvocation("env", ("managed-codex", "codex", "--")),
     )
     assert bare != wrapped
 
 
-def test_catalog_fingerprint_tracks_isaac_catalog_path_and_contents(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An Isaac catalog path or in-place edit selects a new disk cache entry."""
-    first = tmp_path / "catalog-a.json"
-    second = tmp_path / "catalog-b.json"
-    first.write_text("catalog-a")
-    second.write_text("catalog-b")
+def test_catalog_fingerprint_tracks_changed_wrapper_prefix() -> None:
+    """Changing a configured wrapper prefix selects a new disk cache entry."""
     launch = NativeCodexLaunch([], None, None)
-    invocation = CodexInvocation("env", ("isaac", "codex", "--"))
-
-    monkeypatch.setenv("ISAAC_CODEX_MODEL_CATALOG_PATH", str(first))
-    path_a = codex_catalog_fingerprint(launch, codex_invocation=invocation)
-    monkeypatch.setenv("ISAAC_CODEX_MODEL_CATALOG_PATH", str(second))
-    path_b = codex_catalog_fingerprint(launch, codex_invocation=invocation)
-    assert path_a != path_b
-
-    second.write_text("catalog-b-updated-with-new-content")
-    path_b_updated = codex_catalog_fingerprint(launch, codex_invocation=invocation)
-    assert path_b_updated != path_b
-
-
-def test_discovery_cache_key_tracks_isaac_catalog_path_and_contents(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Short-lived discovery does not replay rows after Isaac catalog edits."""
-    catalog = tmp_path / "catalog.json"
-    catalog.write_text("catalog-v1")
-    invocation = CodexInvocation("env", ("isaac", "codex", "--"))
-
-    monkeypatch.setenv("ISAAC_CODEX_MODEL_CATALOG_PATH", str(catalog))
-    first = _model_discovery_cache_key(invocation)
-    catalog.write_text("catalog-v2-with-new-content")
-    second = _model_discovery_cache_key(invocation)
-    assert second != first
-
-    other = tmp_path / "other-catalog.json"
-    other.write_text("catalog-v2-with-new-content")
-    monkeypatch.setenv("ISAAC_CODEX_MODEL_CATALOG_PATH", str(other))
-    assert _model_discovery_cache_key(invocation) != second
+    first = codex_catalog_fingerprint(
+        launch,
+        codex_invocation=CodexInvocation("env", ("managed-codex", "codex", "--")),
+    )
+    second = codex_catalog_fingerprint(
+        launch,
+        codex_invocation=CodexInvocation(
+            "env", ("managed-codex", "codex", "--profile", "enterprise")
+        ),
+    )
+    assert first != second
 
 
 def test_discovery_cache_key_tracks_in_place_wrapper_replacement(tmp_path: Path) -> None:
     """A wrapper update invalidates short-lived model discovery rows."""
-    wrapper = tmp_path / "isaac"
+    wrapper = tmp_path / "managed-codex"
     wrapper.write_text("wrapper-v1")
     invocation = CodexInvocation(str(wrapper))
     first = _model_discovery_cache_key(invocation)
@@ -229,25 +290,31 @@ def test_discovery_cache_key_tracks_in_place_wrapper_replacement(tmp_path: Path)
     assert _model_discovery_cache_key(invocation) != first
 
 
-def test_isaac_catalog_identity_fails_soft_and_keeps_raw_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Missing and looping paths never abort fingerprint calculation."""
-    missing = "relative/missing-catalog.json"
-    monkeypatch.chdir(tmp_path)
-    invocation = CodexInvocation("env", (f"ISAAC_CODEX_MODEL_CATALOG_PATH={missing}",))
-    missing_identity = _isaac_model_catalog_identity(invocation)
-    assert missing_identity == (missing, str(tmp_path / missing), None, None)
+def test_invocation_cache_identity_does_not_retain_prefix_values(tmp_path: Path) -> None:
+    """Cache identities do not expose assignments or arbitrary wrapper args."""
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.inner import codex_executor
 
-    loop_a = tmp_path / "loop-a"
-    loop_b = tmp_path / "loop-b"
-    loop_a.symlink_to(loop_b)
-    loop_b.symlink_to(loop_a)
-    monkeypatch.setenv("ISAAC_CODEX_MODEL_CATALOG_PATH", str(loop_a))
-    loop_identity = _isaac_model_catalog_identity(CodexInvocation("env"))
-    assert loop_identity is not None
-    assert loop_identity[0] == str(loop_a)
-    assert loop_identity[1:] == (None, None, None)
+    secret_assignment = "MANAGED_CODEX_TOKEN=do-not-retain-this-value"
+    secret_argument = "private-profile-value"
+    invocation = CodexInvocation(
+        "env",
+        (secret_assignment, "managed-codex", "--profile", secret_argument),
+    )
+    launch = NativeCodexLaunch([], None, None)
+    identities = (
+        _model_discovery_cache_key(invocation),
+        repr(app_server._codex_invocation_identity(invocation)),
+        repr(
+            codex_executor._model_catalog_cache_key("env", tmp_path, codex_invocation=invocation)
+        ),
+        codex_catalog_fingerprint(launch, codex_invocation=invocation),
+    )
+    assert all(
+        secret not in identity
+        for identity in identities
+        for secret in (secret_assignment, secret_argument)
+    )
 
 
 def test_debug_models_probe_uses_configured_prefix(
@@ -272,11 +339,11 @@ def test_debug_models_probe_uses_configured_prefix(
         codex_executor.read_codex_model_catalog(
             "env",
             tmp_path,
-            codex_invocation=CodexInvocation("env", ("isaac", "codex", "--")),
+            codex_invocation=CodexInvocation("env", ("managed-codex", "codex", "--")),
         )
         is not None
     )
-    assert captured == ["env", "isaac", "codex", "--", "debug", "models"]
+    assert captured == ["env", "managed-codex", "codex", "--", "debug", "models"]
 
 
 def test_catalog_cache_key_tracks_in_place_wrapper_changes(
@@ -347,25 +414,25 @@ async def test_discovery_process_uses_configured_prefix(monkeypatch: pytest.Monk
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _create)
     discovery = await app_server._start_codex_model_discovery_process(
         codex_path="env",
-        invocation=CodexInvocation("env", ("isaac", "codex", "--")),
+        invocation=CodexInvocation("env", ("managed-codex", "codex", "--")),
         listen_url="ws://127.0.0.1:1234",
         env={},
         cwd=Path("/tmp"),
     )
     await discovery.stderr_tail
-    assert captured[:6] == ["env", "isaac", "codex", "--", "app-server", "--listen"]
+    assert captured[:6] == ["env", "managed-codex", "codex", "--", "app-server", "--listen"]
 
 
 @pytest.mark.parametrize("command", ["--version", "debug", "models"])
 def test_invocation_builds_immutable_prefix(command: str) -> None:
     """The invocation value composes wrapper args before every Codex command."""
-    invocation = CodexInvocation("env", ("isaac", "codex", "--"))
+    invocation = CodexInvocation("env", ("managed-codex", "codex", "--"))
     if command == "--version":
-        assert invocation.argv(command) == ("env", "isaac", "codex", "--", "--version")
+        assert invocation.argv(command) == ("env", "managed-codex", "codex", "--", "--version")
     else:
         assert invocation.argv(command, "models") == (
             "env",
-            "isaac",
+            "managed-codex",
             "codex",
             "--",
             command,

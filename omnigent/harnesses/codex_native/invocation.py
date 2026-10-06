@@ -41,9 +41,10 @@ def resolve_codex_invocation(
 ) -> CodexInvocation:
     """Resolve the native Codex executable and configured prefix once.
 
-    Native Codex gives a configured command precedence over its path env var;
-    an explicit command only inherits configured args when it names that same
-    command.
+    Command precedence is shared with the other harnesses: explicit command,
+    ``OMNIGENT_CODEX_PATH``, configured command, then the bare default. A
+    configured args prefix is app-server input only when the selected command
+    is the configured command; args-only configuration remains terminal-only.
     """
     if cfg is None:
         from omnigent.config import load_effective_config
@@ -62,17 +63,12 @@ def resolve_codex_invocation(
     configured_args = entry.get("args")
     configured_prefix = tuple(configured_args) if isinstance(configured_args, list) else ()
     explicit_command = explicit.strip() if isinstance(explicit, str) and explicit.strip() else None
-    if explicit_command is not None:
-        command = explicit_command
-    elif configured_command is not None:
-        command = configured_command
-    else:
-        command = resolve_harness_command(
-            "codex-native",
-            default="codex",
-            explicit=None,
-            cfg=cfg,
-        )
+    command = resolve_harness_command(
+        "codex-native",
+        default="codex",
+        explicit=explicit_command,
+        cfg=cfg,
+    )
     same_configured_command = configured_command is not None and command == configured_command
     app_prefix = configured_prefix if same_configured_command else ()
     if configured_command is None or same_configured_command:

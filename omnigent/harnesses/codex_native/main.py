@@ -60,6 +60,8 @@ from omnigent.harnesses.codex_native.app_server import (
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS,
+    CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     CodexNativeBridgeState,
     bridge_dir_for_bridge_id,
     clear_bridge_state,
@@ -1059,7 +1061,10 @@ async def _ensure_codex_terminal_on_runner(
     resp = await client.post(
         f"/v1/sessions/{url_component(session_id)}/resources/terminals",
         json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
-        timeout=60.0,
+        timeout=(
+            CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+            + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS
+        ),
     )
     if resp.status_code >= 400:
         raise click.ClickException(

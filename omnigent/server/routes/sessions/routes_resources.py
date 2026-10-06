@@ -69,6 +69,7 @@ from omnigent.server.routes._sessions.common import (
     _logger,
     get_server_runner_router,
     host_interactive_shells_for_request,
+    runner_session_init_timeout,
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
@@ -940,11 +941,16 @@ def register_resources_routes(
                 status_code=502,
                 detail="no runner available for resource access",
             )
+        runner_timeout = 10.0
+        if body.get("ensure_native_terminal") and body.get("session_key") == "main":
+            agent = native_coding_agent_for_terminal_name(body.get("terminal"))
+            if agent is not None:
+                runner_timeout = runner_session_init_timeout(agent.harness)
         try:
             resp = await runner_client.post(
                 path,
                 json=body,
-                timeout=10.0,
+                timeout=runner_timeout,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(

@@ -383,20 +383,20 @@ async def test_cold_start_minimal_config_preserves_explicit_profile_mcps(
 async def test_cold_start_minimal_config_preserves_probe_picker_catalog(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Runtime and probe homes retain the same Isaac model catalog source."""
+    """Runtime and probe homes retain the same managed model catalog source."""
     source = tmp_path / "source"
     source.mkdir()
-    catalog = source / "isaac-models.json"
+    catalog = source / "enterprise-models.json"
     catalog.write_text(
-        json.dumps({"models": [{"slug": "system.ai.gpt-6-1-sol", "visibility": "list"}]}),
+        json.dumps({"models": [{"slug": "enterprise-model", "visibility": "list"}]}),
         encoding="utf-8",
     )
     (source / "config.toml").write_text(
-        'model = "system.ai.gpt-6-1-sol"\n'
+        'model = "enterprise-model"\n'
         'profile = "default"\n'
-        'model_catalog_json = "isaac-models.json"\n'
-        'model_provider = "Databricks"\n'
-        '[model_providers.Databricks]\nbase_url = "https://example/codex/v1"\n',
+        'model_catalog_json = "enterprise-models.json"\n'
+        'model_provider = "Gateway"\n'
+        '[model_providers.Gateway]\nbase_url = "https://example/codex/v1"\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("CODEX_HOME", str(source))
@@ -418,7 +418,7 @@ async def test_cold_start_minimal_config_preserves_probe_picker_catalog(
         assert runtime_config[key] == probe_config[key]
     assert runtime_config["model_catalog_json"] == expected_catalog
     visible_rows = json.loads(catalog.read_text(encoding="utf-8"))["models"]
-    assert visible_rows == [{"slug": "system.ai.gpt-6-1-sol", "visibility": "list"}]
+    assert visible_rows == [{"slug": "enterprise-model", "visibility": "list"}]
 
 
 def test_mcp_refresh_atomically_replaces_private_symlink(tmp_path: Path) -> None:

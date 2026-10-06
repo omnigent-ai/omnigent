@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -1765,24 +1766,31 @@ _MODEL_CATALOG_LOCK = threading.Lock()
 
 
 def _codex_invocation_identity(invocation: CodexInvocation) -> tuple[object, ...]:
-    """Capture executable metadata for a configured wrapper invocation."""
+    """Capture privacy-safe executable and prefix metadata for an invocation."""
     resolved_executable = (
         invocation.executable
         if os.path.isabs(invocation.executable)
         else shutil.which(invocation.executable)
     )
-    parts: list[object] = [
+    prefix_digest = hashlib.sha256()
+    for argument in invocation.argv_prefix:
+        encoded = argument.encode("utf-8")
+        prefix_digest.update(len(encoded).to_bytes(8, "big"))
+        prefix_digest.update(encoded)
+    prefix_identities = tuple(
         (
-            invocation.executable,
-            _codex_binary_identity(resolved_executable or invocation.executable),
+            position,
+            _codex_binary_identity(arg if os.path.isabs(arg) else shutil.which(arg) or arg),
         )
-    ]
-    for arg in invocation.argv_prefix:
-        if "=" in arg or arg.startswith("-"):
-            continue
-        resolved = arg if os.path.isabs(arg) else shutil.which(arg)
-        parts.append((arg, _codex_binary_identity(resolved or arg)))
-    return tuple(parts)
+        for position, arg in enumerate(invocation.argv_prefix)
+        if "=" not in arg and not arg.startswith("-")
+    )
+    return (
+        invocation.executable,
+        _codex_binary_identity(resolved_executable or invocation.executable),
+        prefix_digest.hexdigest(),
+        prefix_identities,
+    )
 
 
 def _model_catalog_cache_key(
@@ -1811,7 +1819,7 @@ def _model_catalog_cache_key(
     else:
         key = (codex_path, str(source_home), stat.st_mtime_ns, stat.st_size)
     if codex_invocation is not None and codex_invocation.argv_prefix:
-        return (*key, codex_invocation.argv_prefix, _codex_invocation_identity(codex_invocation))
+        return (*key, _codex_invocation_identity(codex_invocation))
     return key
 
 
