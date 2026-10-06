@@ -75,6 +75,7 @@ _HTML_CONTENT = f"""\
     <p id="dynamic-link-host"></p>
     <a id="toc-link" href="#section-3">Jump to section 3</a>
     <a id="guarded-link" href="#section-3">Guarded jump</a>
+    <a id="relative-link" href="other.html">relative link</a>
     <script>
       // An artifact handler registered on window after the preview's own script must still
       // be able to cancel a same-page link, here through the legacy return-false form.
@@ -193,6 +194,15 @@ def test_html_preview_runs_scripts_and_targets_links(
     )
     _click_without_popup(page, preview.get_by_role("link", name="Jump to section 3"), target)
     expect(page).to_have_url(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
+
+    # Every other link still opens in a new tab (#777), also after a same-page activation:
+    # the handler touches neither the links nor the injected base. A relative one resolves
+    # against the embedder, as before.
+    with page.context.expect_page() as popup_info:
+        preview.get_by_role("link", name="relative link").click()
+    popup = popup_info.value
+    expect(popup).to_have_url(f"{base_url}/c/other.html")
+    popup.close()
 
 
 def test_html_preview_open_in_new_tab_button(

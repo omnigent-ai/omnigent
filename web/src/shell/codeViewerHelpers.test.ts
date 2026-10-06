@@ -591,11 +591,8 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     HTML_PREVIEW_HEAD.lastIndexOf("</script>"),
   );
 
-  /** The window-level listeners the script registers; removed again in afterAll. */
+  /** The capture-phase window listeners the script registers; removed again in afterAll. */
   let registered: [string, EventListener][] = [];
-
-  /** The injected base element, as the artifact document carries it. */
-  const base = (): HTMLBaseElement | null => document.querySelector("base");
 
   beforeAll(() => {
     expect(SCRIPT_BODY).not.toBe("");
@@ -604,14 +601,14 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     // vitest's jsdom does not execute inserted <script> elements.
     new Function(SCRIPT_BODY)();
     registered = register.mock.calls
-      .filter(([type]) => type === "click" || type === "auxclick")
+      .filter(([type, , options]) => (type === "click" || type === "auxclick") && options === true)
       .map(([type, listener]) => [type, listener as EventListener]);
     register.mockRestore();
     expect(registered.map(([type]) => type)).toEqual(["click", "auxclick"]);
   });
 
   afterAll(() => {
-    for (const [type, listener] of registered) window.removeEventListener(type, listener);
+    for (const [type, listener] of registered) window.removeEventListener(type, listener, true);
     document.head.innerHTML = "";
   });
 
@@ -620,65 +617,87 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     document.head.innerHTML = "";
     history.replaceState(null, "", "/preview");
     // Like a srcdoc frame, whose base URL is its embedder's: a bare "#x" resolves to another
-    // document, so only a handler that steers the navigation keeps it in this frame.
+    // document, so only the handler navigating this document keeps the click on the page.
     document.head.innerHTML = '<base target="_blank"><base href="https://host.example/app/">';
     document.body.innerHTML = "";
   });
 
   /** What the injected handler did with an activation. */
-  type Outcome = "native" | "prevented" | "untouched";
+  type Outcome = "handled" | "prevented" | "untouched";
 
-  /** Let the task in which the handler restores the base element run. */
+  /** Let jsdom's asynchronous navigation and the handler's cleanup task run. */
   const settle = () =>
     new Promise<void>((resolve) => {
       setTimeout(resolve, 0);
     });
 
+  /** Rough stand-in for URL parsing's whitespace handling, enough to tell fragment links apart. */
+  const isFragment = (href: string | null): boolean =>
+    Array.from(href ?? "")
+      .filter((c) => c > " ")
+      .join("")
+      .startsWith("#");
+
   /**
-   * Dispatch an activation on `target` and report what the handler did: "native" when it left
-   * the event alone and steered the browser's own navigation (the base briefly carries an href),
-   * "prevented" when the event was already cancelled, "untouched" otherwise — then this listener,
-   * which runs after the handler, cancels it so jsdom never attempts a real navigation.
+   * Dispatch an activation on `target` and report what the handler did. A probe registered
+   * before the dispatch runs after every artifact-style listener but before the handler's
+   * finisher, which joins window's list during the dispatch: it records whether the page had
+   * already cancelled, and cancels non-fragment links itself so jsdom never attempts a real
+   * navigation. "handled" means the finisher cancelled the click and navigated the document.
    */
   async function click(
     target: string | Element,
     init: MouseEventInit = {},
     type = "click",
   ): Promise<Outcome> {
-    let outcome: Outcome = "untouched";
+    let beforeFinish = false;
+    let probeCancelled = false;
     window.addEventListener(
       type,
       (event) => {
-        if (event.defaultPrevented) outcome = "prevented";
-        else if (base()?.hasAttribute("href")) outcome = "native";
-        else event.preventDefault();
+        beforeFinish = event.defaultPrevented;
+        const anchor = event
+          .composedPath()
+          .find((node) => node instanceof Element && node.matches("a[href],area[href]"));
+        if (
+          !beforeFinish &&
+          !isFragment((anchor as Element | undefined)?.getAttribute("href") ?? null)
+        ) {
+          event.preventDefault();
+          probeCancelled = true;
+        }
       },
       { once: true },
     );
     const element = typeof target === "string" ? document.querySelector(target) : target;
     expect(element).not.toBeNull();
-    element?.dispatchEvent(
-      new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, ...init }),
-    );
+    const event = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      ...init,
+    });
+    element?.dispatchEvent(event);
     await settle();
-    return outcome;
+    if (beforeFinish) return "prevented";
+    if (probeCancelled || !event.defaultPrevented) return "untouched";
+    return "handled";
   }
 
-  it("lets the browser navigate the frame itself to a same-page fragment", async () => {
+  it("keeps a fragment-only link in the frame by navigating this document", async () => {
     document.body.innerHTML = '<a id="link" href="#section-3">Jump</a><h2 id="section-3">S3</h2>';
-    expect(await click("#link")).toBe("native");
+    expect(await click("#link")).toBe("handled");
     expect(location.hash).toBe("#section-3");
     expect(location.pathname).toBe("/preview");
-    // The base is restored once the dispatch is over, so other links still open a new tab.
-    expect(base()?.hasAttribute("href")).toBe(false);
-    expect(base()?.getAttribute("target")).toBe("_blank");
+    // Nothing in the artifact is modified on the way; the injected base is untouched.
+    expect(document.querySelector("base")?.hasAttribute("href")).toBe(false);
   });
 
   it("keeps modifier clicks in the frame too (a new tab could only show a blank page)", async () => {
     document.body.innerHTML = '<a id="a" href="#one">1</a><a id="b" href="#two">2</a>';
-    expect(await click("#a", { ctrlKey: true })).toBe("prevented");
+    expect(await click("#a", { ctrlKey: true })).toBe("handled");
     expect(location.hash).toBe("#one");
-    expect(await click("#b", { metaKey: true, shiftKey: true })).toBe("prevented");
+    expect(await click("#b", { metaKey: true, shiftKey: true })).toBe("handled");
     expect(location.hash).toBe("#two");
   });
 
@@ -686,24 +705,14 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     document.body.innerHTML = '<a id="link" href="#mid">m</a>';
     expect(await click("#link", { button: 2 }, "auxclick")).toBe("untouched");
     expect(location.hash).toBe("");
-    expect(await click("#link", { button: 1 }, "auxclick")).toBe("prevented");
+    expect(await click("#link", { button: 1 }, "auxclick")).toBe("handled");
     expect(location.hash).toBe("#mid");
   });
 
-  it("keeps a link with its own target in the frame, unless that target is _self", async () => {
-    document.body.innerHTML =
-      '<a id="blank" href="#x" target="_blank">x</a><a id="self" href="#y" target="_self">y</a>';
-    expect(await click("#blank")).toBe("prevented");
+  it("keeps a link with its own target in the frame", async () => {
+    document.body.innerHTML = '<a id="blank" href="#x" target="_blank">x</a>';
+    expect(await click("#blank")).toBe("handled");
     expect(location.hash).toBe("#x");
-    expect(await click("#self")).toBe("native");
-    expect(location.hash).toBe("#y");
-  });
-
-  it("navigates the frame itself when the injected base is gone", async () => {
-    document.head.innerHTML = "";
-    document.body.innerHTML = '<a id="link" href="#alone">a</a>';
-    expect(await click("#link")).toBe("prevented");
-    expect(location.hash).toBe("#alone");
   });
 
   it("finds links inside an open shadow root through composedPath", async () => {
@@ -713,7 +722,7 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     root.innerHTML = '<a href="#shadow">s</a>';
     const link = root.querySelector("a");
     expect(link).not.toBeNull();
-    expect(await click(link as Element)).toBe("native");
+    expect(await click(link as Element)).toBe("handled");
     expect(location.hash).toBe("#shadow");
     // A light-DOM anchor wrapping a shadow host is found along the composed path too.
     document.body.innerHTML = '<a href="#wrap"><span id="wrapped"></span></a>';
@@ -721,16 +730,17 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
       mode: "open",
     });
     inner.innerHTML = "<b>inside</b>";
-    expect(await click(inner.querySelector("b") as Element)).toBe("native");
+    expect(await click(inner.querySelector("b") as Element)).toBe("handled");
     expect(location.hash).toBe("#wrap");
   });
 
   it("handles clicks on elements nested in the anchor and on <area> hotspots", async () => {
     document.body.innerHTML =
       '<a href="#a"><span id="inner">in</span></a><map><area id="hot" href="#b" shape="default"></map>';
-    expect(await click("#inner")).toBe("native");
+    expect(await click("#inner")).toBe("handled");
     expect(location.hash).toBe("#a");
-    expect(await click("#hot")).toBe("native");
+    expect(await click("#hot")).toBe("handled");
+    expect(location.hash).toBe("#b");
   });
 
   it("lets a document-level handler the page registers later cancel the click first", async () => {
@@ -745,10 +755,10 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     }
   });
 
-  it("lets listeners the page registers later on window cancel or route the click", async () => {
-    // They run after the injected handler, which left the event untouched, so every way of
-    // cancelling still stops the navigation: preventDefault(), the legacy returnValue, and a
-    // guarded router that only acts on an uncancelled event.
+  it("runs after listeners the page registers later on window, so they still cancel or route", async () => {
+    // The finisher joins window's bubble list during the dispatch and therefore runs last. Until
+    // then the event and the document are untouched: `defaultPrevented` is false, relative URLs
+    // still resolve against the artifact's own base, and every way of cancelling counts.
     document.body.innerHTML = '<a id="route" href="#settings">settings</a>';
     async function cancelsVia(router: EventListener): Promise<void> {
       window.addEventListener("click", router);
@@ -770,6 +780,12 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
       event.preventDefault();
     });
     expect(routed).toBe(1);
+    let resolved = "";
+    await cancelsVia((event) => {
+      resolved = new URL("child.js", document.baseURI).href;
+      event.preventDefault();
+    });
+    expect(resolved).toBe("https://host.example/app/child.js");
     // `window.onclick = () => false` cancels through the browser's own handler machinery; vitest's
     // `window` global does not forward that accessor to jsdom, so the Playwright scenario in
     // tests/e2e_ui/files/test_html_preview.py covers it in a real browser.
@@ -794,7 +810,7 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     // Tab and newline go anywhere; spaces and other C0 controls only at the ends.
     document.body.innerHTML =
       '<a id="spaced-link" href=" \t#spa\nced ">s</a><h2 id="spaced">S</h2>';
-    expect(await click("#spaced-link")).toBe("native");
+    expect(await click("#spaced-link")).toBe("handled");
     expect(location.hash).toBe("#spaced");
   });
 });

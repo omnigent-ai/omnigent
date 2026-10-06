@@ -384,15 +384,15 @@ export const HTML_PREVIEW_SANDBOX =
 /**
  * In-frame handler for same-page links: a srcdoc document resolves `#x` against its
  * embedder, so with `<base target="_blank">` the host page would open in a new window.
- * For a plain click the browser's own activation behavior is steered instead: for the
- * rest of the dispatch the injected base points at this document and targets this frame,
- * so the link is a same-document fragment navigation (scroll, `:target`, `hashchange`,
- * history) and a listener the artifact registered later still sees an untouched event
- * it can cancel or route. Nothing else in the artifact is modified.
+ * A capture-phase listener on `window` only arranges for `finish` to run last: a
+ * listener added to `window` during a dispatch joins the end of its bubble-phase list,
+ * so every handler the artifact registered beforehand — at any level, by any means —
+ * has run and may have cancelled the click before the preview decides, and none of
+ * them sees a modified event, element or document. `finish` then navigates this
+ * document to the fragment, which scrolls, styles `:target`, fires `hashchange` and
+ * re-scrolls on a repeat click like a native anchor.
  */
 const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
-  // The base element (target _blank) injected right before this script.
-  const ownBase = document.currentScript ? document.currentScript.previousElementSibling : null;
   function activatedLink(event) {
     const path = event.composedPath ? event.composedPath() : [];
     for (let i = 0; i < path.length; i++) {
@@ -407,36 +407,26 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
     const href = anchor.getAttribute("href").replace(/[\\t\\n\\r]/g, "").replace(/^[\\u0000-\\u0020]+|[\\u0000-\\u0020]+$/g, "");
     return href.charAt(0) === "#" ? href : "";
   }
-  function leavesFrame(event, anchor) {
-    const target = anchor.getAttribute("target");
-    return event.type !== "click" || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey ||
-      (target !== null && target.toLowerCase() !== "_self");
-  }
-  function onActivate(event) {
-    if (event.defaultPrevented || (event.type === "auxclick" && event.button !== 1)) return;
+  function arrange(event) {
+    if (event.type === "auxclick" && event.button !== 1) return;
     const anchor = activatedLink(event);
     const href = anchor ? fragmentHref(anchor) : "";
     if (!href) return;
-    const documentUrl = location.href.split("#")[0];
-    const base = ownBase && ownBase.localName === "base" && ownBase.isConnected ? ownBase : document.querySelector("base");
-    if (!leavesFrame(event, anchor) && base && !base.hasAttribute("href")) {
-      base.setAttribute("href", documentUrl);
-      base.setAttribute("target", "_self");
-      setTimeout(function () {
-        base.removeAttribute("href");
-        base.setAttribute("target", "_blank");
-      }, 0);
-      return;
+    function finish(later) {
+      if (later !== event) return;
+      window.removeEventListener(event.type, finish);
+      if (event.defaultPrevented) return;
+      // Plain, modifier and middle clicks alike, and links with their own target: a new window
+      // could only show the host page or a blank page, never this document.
+      event.preventDefault();
+      location.assign(location.href.split("#")[0] + href);
     }
-    // Modifier and middle clicks, and links with their own target, would leave the frame, where
-    // this document cannot be shown: keep them here (a later window listener cannot cancel these).
-    event.preventDefault();
-    location.assign(documentUrl + href);
+    window.addEventListener(event.type, finish);
+    // Propagation stopped below window (accepted) would leave the finisher behind: drop it.
+    setTimeout(function () { window.removeEventListener(event.type, finish); }, 0);
   }
-  // On window, so handlers the artifact delegates to document run first and can cancel; one
-  // that only stops propagation there hides the click from this handler (accepted).
-  window.addEventListener("click", onActivate);
-  window.addEventListener("auxclick", onActivate);
+  window.addEventListener("click", arrange, true);
+  window.addEventListener("auxclick", arrange, true);
 })();</script>`;
 
 /** Markup `prepareHtmlPreviewDoc` places at the start of `<head>`. */
