@@ -168,6 +168,15 @@ sessions. A reconnect during that read logs `reconnected during offline
 lookup; skipping offline-marking`; an older database snapshot must not turn
 the live runner's sessions into disconnect failures.
 
+That task settles a relay that never attached, so a failing listing (`listing
+its sessions failed (attempt n of m)`) does not end it. It retries the
+listing, and once the quick retries are spent it settles the sessions this
+replica held a relay for when the tunnel dropped, from their own rows, which
+still carry the liveness stamps. It then rereads the listing for the rest at a
+slower pace, and logs `could not be listed after m attempts` once that is
+spent. A reconnect or a shutdown ends the retries, and nothing is failed
+without a row's stamps to check.
+
 Join the runner's and server's rows for one socket on
 `attributes['connection_id']`. A `runner_connected` row with `reconnect =
 False` after earlier rows for the same `runner_id` is a new process; `pid`

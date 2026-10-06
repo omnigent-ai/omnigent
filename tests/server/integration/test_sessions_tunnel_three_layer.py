@@ -1964,6 +1964,136 @@ async def test_never_attached_relay_leaves_the_turn_to_the_disconnect_timer(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("listing", ["raises_once", "keeps_raising"])
+async def test_disconnect_timer_survives_a_store_that_cannot_list_the_runners_sessions(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    listing: str,
+) -> None:
+    """The timer that finalizes a never-attached relay must not die on a failing read.
+
+    A dropped runner's relayed session and one with no relay are both mid-turn.
+    When the by-runner listing raises once, the retry lists both and fails them.
+    When it keeps raising, the relayed session is still failed from its own row
+    and the timer ends without an error after its bounded retries; the session
+    with no relay waits for a listing that works.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.4
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", grace
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S", 0.05
+    )
+    monkeypatch.setattr("omnigent.server.app._OFFLINE_LISTING_RETRY_DELAYS_S", (0.02, 0.02))
+    monkeypatch.setattr("omnigent.server.app._OFFLINE_LISTING_REARM_S", 0.05)
+    monkeypatch.setattr("omnigent.server.app._OFFLINE_LISTING_REARMS", 3)
+    caplog.set_level(logging.INFO, logger="omnigent.server.app")
+    real_ensure_relay = sessions_module._ensure_runner_relay
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    runner_id = "runner-unlistable-sessions"
+    store = get_conversation_store()
+    session_ids: list[str] = []
+    for _ in range(2):
+        create_resp = await ap_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps({})},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    _build_harness_agent_bundle(),
+                    "application/gzip",
+                ),
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        session_ids.append(create_resp.json()["session_id"])
+        store.replace_runner_id(session_ids[-1], runner_id)
+        store.set_session_live_status(session_ids[-1], "running")
+    relayed_id, unrelayed_id = session_ids
+
+    armed = False
+    listing_calls: list[str] = []
+    real_list = store.list_conversations_by_runner_id
+
+    def failing_list(rid: str) -> Any:
+        if not armed:
+            return real_list(rid)
+        listing_calls.append(rid)
+        if listing == "keeps_raising" or len(listing_calls) == 1:
+            raise ConnectionError("store unavailable")
+        return real_list(rid)
+
+    monkeypatch.setattr(store, "list_conversations_by_runner_id", failing_list)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    registry = ap_app.state.tunnel_registry
+    stream_client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, runner_id), base_url="http://runner"
+    )
+    try:
+        handle = real_ensure_relay(relayed_id, runner_id, stream_client, store)
+        assert handle is not None
+
+        async def _stream_requested() -> None:
+            while not registry.get(runner_id).in_flight:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_stream_requested(), timeout=budget(2.0))
+        armed = True
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.wait(timeout=budget(2.0))
+        timer = next(
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{runner_id}"
+        )
+        # Re-raises if the timer died on the failing read.
+        await asyncio.wait_for(timer, timeout=budget(5.0))
+        await asyncio.wait_for(handle.task, timeout=budget(5.0))
+
+        failures = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+        ]
+        relayed_row = store.get_conversation(relayed_id)
+        unrelayed_row = store.get_conversation(unrelayed_id)
+        assert relayed_row is not None and unrelayed_row is not None
+        assert sessions_module._session_status_cache.get(relayed_id) == "failed"
+        assert sessions_module._last_task_error_from_labels(relayed_row.labels) == {
+            "code": "runner_disconnected",
+            "message": "Runner disconnected unexpectedly.",
+        }
+        if listing == "raises_once":
+            assert len(listing_calls) == 2
+            assert sessions_module._session_status_cache.get(unrelayed_id) == "failed"
+            assert sorted(r.session_id for r in failures) == sorted(session_ids)
+        else:
+            # One attempt, two quick retries, three re-arms; then the timer gives up.
+            assert len(listing_calls) == 6
+            assert sessions_module._session_status_cache.get(unrelayed_id) is None
+            assert unrelayed_row.live_status == "running"
+            assert [r.session_id for r in failures] == [relayed_id]
+            assert "could not be listed after 6 attempts" in caplog.text
+        assert {r.attributes["origin"] for r in failures} == {"runner_offline_sweep"}
+    finally:
+        await stream_client.aclose()
+        for session_id in session_ids:
+            sessions_module._session_status_cache.pop(session_id, None)
+            sessions_module._session_active_response_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 async def test_server_initiated_close_never_fails_the_turn(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
