@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import os
 import stat
@@ -3699,13 +3700,13 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
-def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) -> None:
-    """``.credentials.json`` and its lock dir are symlinked, not left behind.
+def test_populate_codex_home_config_hard_links_remote_mcp_oauth(tmp_path: Path) -> None:
+    """``.credentials.json`` is hard-linked and its lock dir symlinked.
 
     Codex keeps OAuth tokens for remote (``url =``) MCP servers in
-    ``.credentials.json``, guarded across processes by
-    ``mcp-oauth-locks/``. A private home missing them starts those servers
-    unauthenticated while ``command =`` (stdio) servers still work.
+    ``.credentials.json``, guarded across processes by ``mcp-oauth-locks/``,
+    and rewrites it through an ``O_NOFOLLOW`` open that fails on a symlink
+    with ELOOP, so those servers never start.
     """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
@@ -3720,11 +3721,64 @@ def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) ->
 
     _populate_codex_home_config(target, source)
 
-    # Symlinked (not copied) so a refresh in either direction is shared.
-    assert (target / ".credentials.json").is_symlink()
-    assert (target / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert bridged.samefile(source / ".credentials.json")
+    # Codex's in-place rewrite succeeds and the refresh reaches the real home.
+    fd = os.open(bridged, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, b'{"linear|abc": {"access_token": "t2"}}')
+    finally:
+        os.close(fd)
+    assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t2"}}'
     assert (target / "mcp-oauth-locks").is_symlink()
     assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
+
+
+def test_populate_codex_home_config_copies_remote_mcp_oauth_across_filesystems(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the store cannot be hard-linked, it is bridged as a private copy."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    def _cross_device_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", _cross_device_link)
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    (source / ".credentials.json").chmod(0o600)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert not bridged.samefile(source / ".credentials.json")
+    assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
+    assert stat.S_IMODE(bridged.stat().st_mode) == 0o600
+    bridged.write_text('{"linear|abc": {"access_token": "t2"}}')
+    assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+
+
+def test_populate_codex_home_config_replaces_legacy_credentials_symlink(tmp_path: Path) -> None:
+    """A native session home reused from before hard-linking drops its symlink."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "reused_codex_home"
+    target.mkdir()
+    (target / ".credentials.json").symlink_to(source / ".credentials.json")
+
+    _populate_codex_home_config(target, source)
+
+    assert not (target / ".credentials.json").is_symlink()
+    assert (target / ".credentials.json").samefile(source / ".credentials.json")
 
 
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
@@ -4280,6 +4334,29 @@ def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
     _run(_t())
 
 
+def test_codex_home_source_preserves_custom_home_from_inherited_credentials_hardlink(
+    tmp_path: Path,
+) -> None:
+    """A nested launch resolves a custom home with no ``auth.json`` or memories symlink."""
+    from omnigent.inner.codex_executor import (
+        _populate_codex_home_config,
+        _resolve_codex_home_config_source,
+    )
+
+    custom_home = tmp_path / "custom-codex-home"
+    custom_home.mkdir()
+    (custom_home / "config.toml").write_text('model_provider = "custom"')
+    (custom_home / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    inherited = tmp_path / "home" / ".omnigent" / "codex-native" / "abc123" / "codex-home"
+    inherited.mkdir(parents=True)
+
+    _populate_codex_home_config(inherited, custom_home)
+
+    assert not (inherited / ".credentials.json").is_symlink()
+    default_home = tmp_path / "home" / ".codex"
+    assert _resolve_codex_home_config_source(inherited, default_home) == custom_home.resolve()
+
+
 def test_populate_codex_home_config_does_not_overwrite_existing(tmp_path: Path) -> None:
     """If a config file already exists in the target (e.g. from a
     previous partial start), it is not replaced.
@@ -4363,6 +4440,31 @@ def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path:
     assert provider["request_max_retries"] == 13
     assert provider["stream_max_retries"] == 13
     assert provider["stream_idle_timeout_ms"] == 300_000
+
+
+def test_materialize_codex_provider_config_leaves_builtin_provider_tables_untouched(
+    tmp_path: Path,
+) -> None:
+    """Built-in provider tables get no retry stamping; custom tables in the same config do."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model_provider = "amazon-bedrock"\n\n'
+        '[model_providers.amazon-bedrock.aws]\nregion = "us-east-1"\n\n'
+        '[model_providers.gateway]\nname = "Gateway"\nbase_url = "https://example.test"\n'
+    )
+
+    materialize_codex_provider_config(codex_home, [])
+
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert config["model_providers"]["amazon-bedrock"] == {"aws": {"region": "us-east-1"}}
+    gateway = config["model_providers"]["gateway"]
+    assert gateway["request_max_retries"] == RetryPolicy().max_retries
 
 
 # ---------------------------------------------------------------------------
@@ -4845,16 +4947,18 @@ def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
 
 
 def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
-    """codex_skill_sources lists <bundle>/skills before <home>/.codex/skills."""
+    """Bundle and Codex-specific skills take precedence over shared skills."""
     from omnigent.inner.codex_executor import codex_skill_sources
 
     bundle = tmp_path / "bundle"
     (bundle / "skills").mkdir(parents=True)
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
+    (home / ".agents" / "skills").mkdir(parents=True)
     assert codex_skill_sources(bundle, home) == [
         bundle / "skills",
         home / ".codex" / "skills",
+        home / ".agents" / "skills",
     ]
 
 

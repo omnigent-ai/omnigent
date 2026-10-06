@@ -18,14 +18,15 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.runtime import session_stream
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, session_metadata_logging
 from omnigent.server.routes import sessions
 from omnigent.server.routes._sessions import common
 from omnigent.server.routes.sessions import routes_events
-from omnigent.server.schemas import BackgroundTaskInfo
+from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from tests.debug_log_helpers import capture_debug_rows
 
 _BACKGROUND_TASK = BackgroundTaskInfo(status="running", description="Wait for CI")
 
@@ -240,6 +241,59 @@ async def test_subagent_idle_publishes_status_without_completion(
     route.telemetry.assert_not_called()
 
 
+@pytest.mark.parametrize("fail_idle_top_level", [False, True])
+async def test_offline_sweep_refreshes_child_status_after_idle_observation(
+    status_route: _StatusRoute, fail_idle_top_level: bool
+) -> None:
+    route = status_route
+    snapshot = route.store.get_conversation(route.child_id)
+    assert snapshot is not None and snapshot.live_status == "running"
+
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={"type": "subagent.status", "data": {"idle": True}},
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    # Another replica's sweep has an older row and no local turn edges.
+    common._session_status_cache.pop(route.child_id)
+    route.published.reset_mock()
+
+    with capture_debug_rows("server") as rows:
+        await sessions._mark_runner_sessions_offline(
+            [snapshot],
+            ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly."),
+            route.store,
+            fail_idle_top_level=fail_idle_top_level,
+        )
+        await _flush_live_state()
+
+    child = route.store.get_conversation(route.child_id)
+    assert child is not None and child.live_status == "idle"
+    assert sessions._last_task_error_from_labels(child.labels) is None
+    assert route.store.list_items(route.parent_id).data == []
+    route.published.assert_not_called()
+    assert route.forwarded == []
+
+    decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+    assert decision["session_id"] == route.child_id
+    assert decision["level"] == "WARNING"
+    assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+    assert (
+        decision["attributes"].items()
+        >= {
+            "origin": "runner_offline_sweep",
+            "decision": "idle_no_failure",
+            "status_source": "persisted",
+            "persisted_session_status": "idle",
+            "snapshot_session_status": "running",
+            "parent_session_id": route.parent_id,
+            "session_kind": "sub_agent",
+            "status_lookup": "found",
+        }.items()
+    )
+
+
 async def test_subagent_idle_preserves_failed_status(status_route: _StatusRoute) -> None:
     route = status_route
     sid = route.child_id
@@ -327,8 +381,69 @@ async def test_external_session_status_still_forwards_to_runner(
     path, body = route.forwarded[0]
     assert path == f"/v1/sessions/{sid}/events"
     assert body["type"] == "external_session_status"
-    assert body["data"] == data
+    expected_data: dict[str, object] = dict(data)
+    if status == "failed":
+        expected_data["failure_context"] = {
+            "failure_source": "external_status",
+            "detail_source": "external_status_output",
+        }
+    assert body["data"] == expected_data
     assert route.telemetry.call_count == (0 if status == "running" else 1)
+
+
+@pytest.mark.parametrize("is_child", [False, True], ids=["main", "native-child"])
+@pytest.mark.parametrize(
+    ("event_type", "data"),
+    [
+        ("external_session_status", {"status": "running"}),
+        ("external_session_status", {"status": "failed"}),
+        ("subagent.status", {"idle": True}),
+    ],
+)
+async def test_status_observes_existing_session_metadata_off_event_loop(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    is_child: bool,
+    event_type: str,
+    data: dict[str, Any],
+) -> None:
+    route = status_route
+    sid = route.child_id if is_child else route.parent_id
+    if is_child:
+        route.store.set_labels(sid, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
+    monkeypatch.setattr(routes_events, "debug_sink_enabled", lambda: True)
+    monkeypatch.setattr(session_metadata_logging, "debug_sink_enabled", lambda: True)
+    event_loop_thread = threading.get_ident()
+    observe = routes_events.log_session_metadata
+
+    def observe_in_worker(*args: Any, **kwargs: Any) -> None:
+        assert threading.get_ident() != event_loop_thread
+        observe(*args, **kwargs)
+
+    monkeypatch.setattr(routes_events, "log_session_metadata", observe_in_worker)
+    with capture_debug_rows("server") as rows:
+        response = await route.client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": event_type, "data": data},
+        )
+
+    assert response.status_code == 202, response.text
+    observations = [row for row in rows if row["event_name"] == "session_metadata"]
+    assert len(observations) == 1
+    assert observations[0]["session_id"] == sid
+    attrs = observations[0]["attributes"]
+    assert attrs["observation"] == event_type
+    assert attrs["root_session_id"] == route.parent_id
+    if is_child:
+        assert attrs["session_kind"] == "sub_agent"
+        assert attrs["parent_session_id"] == route.parent_id
+        assert attrs["harness"] == "claude-native"
+    else:
+        assert attrs["session_kind"] == "default"
+        assert "parent_session_id" not in attrs
+        assert "harness" not in attrs
+        assert attrs["harness_source"] == "missing_agent"
+        assert attrs["harness_resolution"] == "unknown"
 
 
 @pytest.mark.parametrize(

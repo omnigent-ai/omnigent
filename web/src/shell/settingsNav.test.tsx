@@ -22,7 +22,7 @@ const mocks = vi.hoisted(() => ({
   // so this is the ONLY signal that hides account/sharing chrome.
   singleUser: false,
   isAdmin: false,
-  customizeEnabled: true,
+  harnessesEnabled: true,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -30,7 +30,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
-    features: { customize: mocks.customizeEnabled },
+    features: { harness_settings_ui: mocks.harnessesEnabled },
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -64,7 +64,7 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.singleUser = false;
   mocks.isAdmin = false;
-  mocks.customizeEnabled = true;
+  mocks.harnessesEnabled = true;
 });
 afterEach(cleanup);
 
@@ -406,36 +406,21 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/inbox").inSettings).toBe(false);
   });
 
-  it("parses the customize sub-section and defaults a bare/unknown one to the first", () => {
-    expect(routeHook("/settings/customize/harnesses")).toEqual({
+  it("parses the harness details segment of the harnesses section", () => {
+    expect(routeHook("/settings/harnesses")).toEqual({ inSettings: true, section: "harnesses" });
+    expect(routeHook("/settings/harnesses/claude-native")).toEqual({
       inSettings: true,
-      section: "customize",
-      subSection: "harnesses",
-    });
-    expect(routeHook("/settings/customize/skills")).toEqual({
-      inSettings: true,
-      section: "customize",
-      subSection: "skills",
-    });
-    // Bare or unknown sub-section falls back to the first sub-section.
-    expect(routeHook("/settings/customize")).toEqual({
-      inSettings: true,
-      section: "customize",
-      subSection: "harnesses",
-    });
-    expect(routeHook("/settings/customize/nope")).toEqual({
-      inSettings: true,
-      section: "customize",
-      subSection: "harnesses",
+      section: "harnesses",
+      harness: "claude-native",
     });
   });
 
-  it("falls back to General for a customize deep link when the feature is disabled", () => {
-    mocks.customizeEnabled = false;
+  it("falls back to General for a harnesses deep link when the feature is disabled", () => {
+    mocks.harnessesEnabled = false;
     // Disabled (the default deploy) → the section resolves to General instead
-    // of an empty customize page, and no subSection is set.
-    expect(routeHook("/settings/customize")).toEqual({ inSettings: true, section: "general" });
-    expect(routeHook("/settings/customize/skills")).toEqual({
+    // of an empty harnesses page, and no harness is set.
+    expect(routeHook("/settings/harnesses")).toEqual({ inSettings: true, section: "general" });
+    expect(routeHook("/settings/harnesses/claude-native")).toEqual({
       inSettings: true,
       section: "general",
     });

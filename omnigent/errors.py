@@ -247,6 +247,13 @@ class ErrorCode:
     STALE_CURSOR = "stale_cursor"
 
 
+# Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
+# removed (``omnigent agent remove``), so the session can't load it.
+SESSION_AGENT_MISSING_MESSAGE = (
+    "This agent no longer exists. Fork this session into another agent to continue."
+)
+
+
 # Single source of truth for error code → HTTP status.
 _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.UNAUTHORIZED: 401,

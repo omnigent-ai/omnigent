@@ -119,6 +119,8 @@ interface NativeShellApi {
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
   /** Re-point this window/shell to a server URL returned by the picker. */
   switchServer?: (url: string) => Promise<void>;
+  /** Sign the window's server out. Absent on shells that predate it. */
+  signOutOfServer?: () => Promise<boolean>;
   /** Return to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
   /**
@@ -377,6 +379,17 @@ export interface ServerPickerInfo {
   managedServers?: string[];
   /** Display names for managed servers, server URL → name. Absent on older shells. */
   managedServerNames?: Record<string, string>;
+  /**
+   * Whether the shell owns this server's sign-in (Databricks or OIDC browser
+   * sign-in) and can sign it out. Absent on older shells.
+   */
+  canSignOut?: boolean;
+  /**
+   * Names servers gave themselves in their manifest, origin → name. Display
+   * only (a server can call itself anything), so show the host alongside.
+   * Absent on older shells.
+   */
+  serverNames?: Record<string, string>;
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
   /**
@@ -872,6 +885,22 @@ export async function switchServer(url: string): Promise<void> {
     await native.switchServer(url);
   } catch (err) {
     console.warn("[nativeBridge] native switchServer failed:", err);
+  }
+}
+
+/**
+ * Ask the native shell to sign this window's server out. Every window on that
+ * server returns to the setup page, and the next Connect signs in through the
+ * browser. Resolves false off-shell or when the shell can't sign it out.
+ */
+export async function signOutOfServer(): Promise<boolean> {
+  const native = nativeApi();
+  if (!native?.signOutOfServer) return false;
+  try {
+    return (await native.signOutOfServer()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] native signOutOfServer failed:", err);
+    return false;
   }
 }
 

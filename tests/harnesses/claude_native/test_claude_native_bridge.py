@@ -401,7 +401,7 @@ def test_prepare_bridge_dir_persists_and_applies_resolved_sandbox(
 
     ``enforce_sandbox``/``force_sandbox`` resolves a real sandbox onto the
     session's ``os_env.sandbox`` upstream (``runner/app.py``'s
-    ``_apply_sandbox_override_from_verdict``), but that decision used to
+    ``_apply_sandbox_override_from_start_data``), but that decision used to
     have no path into the claude-native bridge: ``prepare_bridge_dir``
     never wrote it to the config file, and ``_build_tools`` unconditionally
     hardcoded ``OSEnvSandboxSpec(type="none")`` regardless of the policy.
@@ -3408,7 +3408,7 @@ def test_generated_claude_subprocesses_pin_runner_tmpdir(
         for hook in entry["hooks"]
         if "/venv/bin/python" in hook["command"]
     ]
-    assert len(python_commands) == 18
+    assert len(python_commands) == 19
     expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
     assert all(expected_tmpdir in command for command in python_commands)
 
@@ -3620,6 +3620,34 @@ def test_augment_claude_args_preapproves_project_mcp_servers(tmp_path: Path) -> 
 
     settings = _load_invocation_settings(args)
     assert settings.get("enableAllProjectMcpServers") is True
+
+
+@pytest.mark.parametrize(
+    "launch_args",
+    [(), ("--permission-mode", "auto")],
+    ids=["none", "auto"],
+)
+def test_augment_claude_args_disables_auto_mode_setup_offer(
+    launch_args: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    """
+    Every launch turns off auto mode's "Teach auto mode about your environment?" offer.
+
+    Claude shows it after a turn ends in auto mode, covering the input box
+    with a Yes / Not now / Don't show again menu that fires no hook, so web-UI
+    messages stall behind a prompt only the terminal can answer. The sidecar's
+    ``skillOverrides`` merges per key with the user's own overrides. It is set
+    on every launch because a session can switch into auto mode after it starts.
+    """
+    args = augment_claude_args(
+        launch_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
 
 
 def test_augment_claude_args_mirrors_joined_model_arg_into_settings(

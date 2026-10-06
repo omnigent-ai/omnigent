@@ -912,6 +912,25 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
         assert leaked.lower() not in flat
 
 
+def test_sse_child_creation_preserves_relationship_without_content() -> None:
+    attrs = session_stream._sse_safe_attributes(
+        {
+            "type": "session.created",
+            "conversation_id": "parent",
+            "parent_session_id": "parent",
+            "child_session_id": "child",
+            "agent_id": "agent",
+            "title": "private task description",
+            "data": {"prompt": "private prompt"},
+        }
+    )
+    assert attrs == {
+        "parent_session_id": "parent",
+        "child_session_id": "child",
+        "agent_id": "agent",
+    }
+
+
 def test_sse_safe_attributes_captures_level_and_code_for_error_items() -> None:
     # Level and code on an error item must be captured so dashboards can
     # exclude info-level notices from error-rate metrics.
@@ -958,6 +977,67 @@ def test_sse_safe_attributes_omits_oversized_code() -> None:
     }
     attrs = session_stream._sse_safe_attributes(event)
     assert "item_code" not in attrs
+
+
+def test_sse_safe_attributes_uses_real_serializer_for_destructive_error() -> None:
+    # A destructive error item (no level) built through the real to_api_dict()
+    # serializer must have item_code and item_source captured, and item_level
+    # must be absent (the dashboard treats missing as "error").
+    from omnigent.entities.conversation import ConversationItem, ErrorData
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    persisted = ConversationItem(
+        id="item_destruct",
+        type="error",
+        status="completed",
+        response_id="resp_test",
+        created_at=1753900000,
+        data=ErrorData(
+            source="execution",
+            code="native_terminal_start_failed",
+            message="terminal failed to start; do not log this",
+        ),
+    )
+    event = OutputItemDoneEvent(type="response.output_item.done", item=persisted.to_api_dict())
+    attrs = session_stream._sse_safe_attributes(event.model_dump())
+    assert attrs["item_type"] == "error"
+    assert attrs["item_code"] == "native_terminal_start_failed"
+    assert attrs["item_source"] == "execution"
+    # No level means the dashboard should count this as a failure.
+    assert "item_level" not in attrs
+    # message text must never reach the debug table
+    assert "message" not in attrs
+    flat = repr(attrs).lower()
+    assert "terminal failed" not in flat
+    assert "do not log" not in flat
+
+
+def test_sse_safe_attributes_uses_real_serializer_for_info_notice() -> None:
+    # An info-level notice built through the real to_api_dict() serializer must
+    # have item_level="info", item_code, and item_source captured.
+    from omnigent.entities.conversation import ConversationItem, ErrorData
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    persisted = ConversationItem(
+        id="item_notice",
+        type="error",
+        status="completed",
+        response_id="resp_test",
+        created_at=1753900000,
+        data=ErrorData(
+            source="execution",
+            code="managed_sandbox_workspace_reset",
+            message="workspace reset notice; do not log this",
+            level="info",
+        ),
+    )
+    event = OutputItemDoneEvent(type="response.output_item.done", item=persisted.to_api_dict())
+    attrs = session_stream._sse_safe_attributes(event.model_dump())
+    assert attrs["item_type"] == "error"
+    assert attrs["item_level"] == "info"
+    assert attrs["item_code"] == "managed_sandbox_workspace_reset"
+    assert attrs["item_source"] == "execution"
+    assert "message" not in attrs
 
 
 @contextlib.contextmanager

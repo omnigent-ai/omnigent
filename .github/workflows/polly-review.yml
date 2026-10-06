@@ -724,6 +724,14 @@ jobs:
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
 
+      # Resolve reads these runner-generated headers even if review later times out.
+      - name: Record review target
+        if: steps.ctx.outcome == 'success'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+        run: ':'
+
       - name: Mint App token
         id: app-token
         if: steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''

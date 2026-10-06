@@ -539,6 +539,19 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+        """Return the bound runner ID and heartbeat from the metadata database.
+
+        Reads neither conversation data nor labels, so an unrelated
+        conversation backend outage cannot hide a healthy runner.
+
+        :param conversation_id: Session/conversation ID to look up.
+        :returns: ``(runner_id, runner_last_seen)``, or ``None`` if the
+            metadata row is missing. Either field may be ``None``.
+        """
+        ...
+
+    @abstractmethod
     def get_session_connectivity(
         self, conversation_ids: list[str]
     ) -> dict[str, SessionConnectivity]:
@@ -956,6 +969,31 @@ class ConversationStore(ABC):
             ``None`` leaves unchanged.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def restore_session_settings_if_matches(
+        self,
+        conversation_id: str,
+        *,
+        previous: Conversation,
+        attempted: Conversation,
+        restore_effort: bool = True,
+        restore_model: bool = False,
+    ) -> None:
+        """Restore a refused effort update without overwriting a newer selection.
+
+        Each setting is compared and restored atomically. When ``restore_model``
+        is true, also undo the model selection from a combined PATCH that was
+        aborted before forwarding its model change. Preserve other overrides.
+
+        :param conversation_id: Conversation whose settings were refused.
+        :param previous: Snapshot before persisting the requested settings.
+        :param attempted: Snapshot returned by that persistence operation.
+        :param restore_effort: Whether the refused effort needs rollback; false when
+            a newer write already replaced it.
+        :param restore_model: Whether the unforwarded model change also needs rollback.
         """
         ...
 
@@ -1435,6 +1473,19 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
+        """Set idle only while this runner still owns a non-failed session.
+
+        Match the current runner binding in the update, without changing labels
+        or ``updated_at``. A failed status must survive teardown reconciliation.
+
+        :param conversation_id: Session whose runner was intentionally stopped.
+        :param runner_id: The stopped runner, which may have been replaced.
+        :returns: Whether the conditional update matched the session.
+        """
+        ...
+
+    @abstractmethod
     def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
         """Atomically settle a stale running session to idle.
 
@@ -1538,6 +1589,23 @@ class ConversationStore(ABC):
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
+        """
+        ...
+
+    @abstractmethod
+    def list_runner_session_statuses(
+        self, runner_id: str, *, after: str | None = None, limit: int = 200
+    ) -> list[tuple[str, str | None]]:
+        """Read a bounded page of session IDs and live statuses for runner teardown.
+
+        Include archived sessions. Read bindings consistently with runner writes,
+        in ascending session-ID order; use the last ID as the next page's cursor.
+        A short page ends iteration. Do not hydrate conversation content or labels.
+
+        :param runner_id: The runner being stopped.
+        :param after: Exclusive session-ID cursor, or ``None`` for the first page.
+        :param limit: Maximum number of rows, between 1 and 1000.
+        :returns: ``(session_id, live_status)`` pairs; status can be unknown (``None``).
         """
         ...
 
@@ -1859,6 +1927,37 @@ class ConversationStore(ABC):
             the source conversation has that ``response_id``.
         """
         ...
+
+    def list_session_roots_for_agent(self, agent_id: str, limit: int) -> list[str]:
+        """
+        Up to *limit* distinct spawn-tree roots of sessions that use *agent_id*.
+
+        Forks of one user's sessions share an agent row, so several roots can
+        use it. Lets a caller be authorized by READ on any of them. Reads a
+        bounded number of rows, so an agent used very widely may return fewer.
+        Default: none (stores without the lookup authorize against one root only).
+
+        :param agent_id: Agent id, e.g. ``"0f1a2b3c..."``.
+        :param limit: Most roots to return, e.g. ``50``.
+        :returns: Distinct root conversation ids, at most *limit*.
+        """
+        del agent_id, limit
+        return []
+
+    def count_sessions_for_agent(self, agent_id: str, cap: int) -> int:
+        """
+        Count sessions that use *agent_id*, reading at most *cap* of them.
+
+        Any kind, archived included. Default: one bounded conversation page.
+
+        :param agent_id: Agent id, e.g. ``"0f1a2b3c..."``.
+        :param cap: Most sessions to count, e.g. ``101``.
+        :returns: The count, at most *cap*.
+        """
+        page = self.list_conversations(
+            limit=cap, kind=None, agent_id=agent_id, include_archived=True
+        )
+        return len(page.data)
 
     @abstractmethod
     def has_other_live_session_in_workspace(

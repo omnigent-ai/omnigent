@@ -1017,6 +1017,16 @@ export interface ConversationState {
  * screen, what its composer is holding). They stay on the root store when
  * per-conversation state moves out.
  */
+/** One side chat's unsent composer contents. */
+export interface SideChatComposerDraft {
+  text: string;
+  files: File[];
+}
+
+/** The empty composer, shared so an absent entry keeps a stable identity (a
+ *  fresh object per render would re-render every subscriber). */
+export const EMPTY_SIDE_CHAT_COMPOSER: SideChatComposerDraft = { text: "", files: [] };
+
 export interface AppChatState {
   /** The conversation currently on screen. `null` on `/`. */
   conversationId: string | null;
@@ -1051,9 +1061,16 @@ export interface AppChatState {
    * chat (its own managed fork) so the typed question isn't lost — the side
    * chat's composer seeds from and consumes it on mount rather than firing a
    * turn at a runner that is still launching. App-global (the side chat lives in
-   * the main chat's rail, not its own entry).
+   * the main chat's rail, not its own entry). Keyed by a `pending:` tab id, it is
+   * instead the "Ask in side chat" selection that tab's composer quotes.
    */
   sideChatDrafts: Record<string, string>;
+  /**
+   * Unsent composer state per side-chat child id, retained across the pane's
+   * unmounts (rail tab switch, breakpoint cross, drawer teardown). In-memory
+   * only: `File` values aren't serializable.
+   */
+  sideChatComposers: Record<string, SideChatComposerDraft>;
   /**
    * Messages submitted while the agent is busy, held client-side (not yet
    * POSTed) and shown in the composer's queue strip. The head is flushed
@@ -1100,6 +1117,13 @@ export interface ChatActions {
   openSideChatWithDraft: (childSessionId: string, draft: string, parentId: string) => void;
   /** Clear a side chat's seeded composer draft (called after it's consumed). */
   clearSideChatDraft: (childSessionId: string) => void;
+  /** Update one side chat's unsent composer state (text + attachments). */
+  updateSideChatComposer: (
+    childSessionId: string,
+    mutate: (current: SideChatComposerDraft) => SideChatComposerDraft,
+  ) => void;
+  /** Drop a side chat's unsent composer state (sent, or the tab was closed). */
+  clearSideChatComposer: (childSessionId: string) => void;
   /**
    * Queue a message client-side instead of POSTing it now, for a send made
    * while the agent is busy. The head is flushed automatically (FIFO, one per
@@ -1861,6 +1885,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   awaitingSideChatFor: null,
   sideChatToOpen: null,
   sideChatDrafts: {},
+  sideChatComposers: {},
   subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
@@ -2172,6 +2197,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       sideChatToOpen: { childId: childSessionId, parentId },
       sideChatDrafts: draft ? { ...s.sideChatDrafts, [childSessionId]: draft } : s.sideChatDrafts,
     }));
+  },
+  updateSideChatComposer: (childSessionId, mutate) => {
+    useChatStore.setState((s) => ({
+      sideChatComposers: {
+        ...s.sideChatComposers,
+        [childSessionId]: mutate(s.sideChatComposers[childSessionId] ?? EMPTY_SIDE_CHAT_COMPOSER),
+      },
+    }));
+  },
+  clearSideChatComposer: (childSessionId) => {
+    useChatStore.setState((s) => {
+      if (!(childSessionId in s.sideChatComposers)) return {};
+      return {
+        sideChatComposers: Object.fromEntries(
+          Object.entries(s.sideChatComposers).filter(([key]) => key !== childSessionId),
+        ),
+      };
+    });
   },
   clearSideChatDraft: (childSessionId) => {
     useChatStore.setState((s) => {
@@ -3021,31 +3064,44 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   setEffort: async (effort) => {
+    const { conversationId, sessionReasoningEffort: previous } = get();
     setActive({ sessionReasoningEffort: effort });
-    const { conversationId } = get();
     if (conversationId) {
       if (queryClient === null) {
         throw new Error("chatStore.setEffort: queryClient not initialized");
       }
-      const session = await queryClient.fetchQuery({
-        queryKey: ["session", conversationId],
-        queryFn: () => getSessionSlim(conversationId),
-        staleTime: Infinity,
-        retry: false,
-      });
-      // Harness has no effort control: undo the optimistic session-scoped write
-      // so this conversation doesn't claim an effort the server will never hold.
-      if (!supportsEffortControl(session)) {
-        setterFor(conversationId)({ sessionReasoningEffort: null });
-        return;
+      const pick = trackLiveSettingPick(conversationId, "reasoningEffort", previous);
+      try {
+        const session = await queryClient.fetchQuery({
+          queryKey: ["session", conversationId],
+          queryFn: () => getSessionSlim(conversationId),
+          staleTime: Infinity,
+          retry: false,
+        });
+        // Harness has no effort control: undo the optimistic session-scoped write
+        // so this conversation doesn't claim an effort the server will never hold.
+        if (!supportsEffortControl(session)) {
+          setterFor(conversationId)({ sessionReasoningEffort: null });
+          return;
+        }
+        await updateSession(conversationId, { reasoningEffort: effort });
+        pick.confirm(effort);
+      } catch (err) {
+        // Adopt the server's settled effort, not an earlier unconfirmed pick; keep a newer pick.
+        const settled = await settledSessionSetting(conversationId, "reasoningEffort", pick);
+        setterFor(conversationId)((s) =>
+          s.sessionReasoningEffort === effort ? { sessionReasoningEffort: settled } : {},
+        );
+        throw err;
+      } finally {
+        pick.done();
       }
-      await updateSession(conversationId, { reasoningEffort: effort });
     }
   },
 
   setModel: async (model, opts) => {
+    const { conversationId, sessionModelOverride: previous } = get();
     setActive({ sessionModelOverride: model });
-    const { conversationId } = get();
     if (conversationId) {
       const expectConfirmation = opts?.expectConfirmation === true && model !== null;
       if (expectConfirmation) {
@@ -3066,17 +3122,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           );
         }, 30_000);
       }
+      const pick = trackLiveSettingPick(conversationId, "modelOverride", previous);
       let session;
       try {
         session = await updateSession(conversationId, { modelOverride: model });
+        pick.confirm(session.modelOverride ?? null);
       } catch (err) {
-        // The ask never reached the server — nothing will confirm it.
-        if (expectConfirmation) {
-          setterFor(conversationId)((s) =>
-            s.pendingModelChange === model ? { pendingModelChange: null } : {},
-          );
-        }
+        // Nothing will confirm a refused ask; adopt the server's settled model unless
+        // a newer pick replaced it.
+        const settled = await settledSessionSetting(conversationId, "modelOverride", pick);
+        setterFor(conversationId)((s) => ({
+          ...(expectConfirmation && s.pendingModelChange === model
+            ? { pendingModelChange: null }
+            : {}),
+          ...(s.sessionModelOverride === model ? { sessionModelOverride: settled } : {}),
+        }));
         throw err;
+      } finally {
+        pick.done();
       }
       // Server-canonical may differ from the optimistic write (e.g.
       // when a clear alias was sent) — refresh local state to match.
@@ -3507,6 +3570,69 @@ function abortConversationStream(entry: ConversationEntry): void {
 function setterForState(conversationId: string): ChatState | null {
   const entry = conversationRegistry.peek(conversationId);
   return entry === undefined ? null : entryGetter(entry)();
+}
+
+type LiveSettingField = "reasoningEffort" | "modelOverride";
+
+/** One live pick of a session setting, sharing the confirmed value with overlapping picks. */
+interface LiveSettingPick {
+  confirm: (value: string | null) => void;
+  confirmed: () => string | null;
+  done: () => void;
+}
+
+/** Last server-confirmed value of each session setting that has picks in flight. */
+const confirmedLiveSettings = new Map<string, { value: string | null; picks: number }>();
+
+/**
+ * Track a live pick of *field*, starting from *current* when no other pick is in flight.
+ *
+ * An overlapping pick's optimistic value may never apply, so it is not a fallback.
+ */
+function trackLiveSettingPick(
+  conversationId: string,
+  field: LiveSettingField,
+  current: string | null,
+): LiveSettingPick {
+  const key = `${conversationId}:${field}`;
+  let entry = confirmedLiveSettings.get(key);
+  if (entry === undefined) {
+    entry = { value: current, picks: 0 };
+    confirmedLiveSettings.set(key, entry);
+  }
+  entry.picks += 1;
+  const tracked = entry;
+  return {
+    confirm: (value) => {
+      tracked.value = value;
+    },
+    confirmed: () => tracked.value,
+    done: () => {
+      tracked.picks -= 1;
+      if (tracked.picks === 0) confirmedLiveSettings.delete(key);
+    },
+  };
+}
+
+/**
+ * Read a session setting after a refused change.
+ *
+ * The server orders and rolls back live settings changes, so its value is the
+ * settled one; an earlier optimistic pick may never have applied. If the lookup
+ * fails, fall back to the last value the server confirmed.
+ */
+async function settledSessionSetting(
+  conversationId: string,
+  field: LiveSettingField,
+  pick: LiveSettingPick,
+): Promise<string | null> {
+  try {
+    const value = (await getSessionSlim(conversationId))[field] ?? null;
+    pick.confirm(value);
+    return value;
+  } catch {
+    return pick.confirmed();
+  }
 }
 
 /**

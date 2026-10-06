@@ -350,14 +350,16 @@ def test_composer_pr_link_opens_github_tab(
         expect(panel).to_have_attribute("data-state", "closed")
         expect(pr_link).to_be_in_viewport()
 
-    expected_font_size = font_size * 0.9 * (14 / 13 if is_mobile else 1)
+    expected_font_size = font_size * 0.9
     for test_id, actual_font_size in font_sizes.items():
         assert actual_font_size == pytest.approx(expected_font_size, abs=0.01), (
             f"{test_id} should use the caption size at {font_size}px preference: {font_sizes}"
         )
     reference_center = centers["composer-workspace-dir.icon"]
-    assert bar_bounds["height"] == pytest.approx(37, abs=0.1)
-    assert reference_center == pytest.approx(bar_bounds["y"] + 19, abs=0.5)
+    expected_bar_height = 28 if is_mobile else 37
+    expected_center_offset = 14 if is_mobile else 19
+    assert bar_bounds["height"] == pytest.approx(expected_bar_height, abs=0.1)
+    assert reference_center == pytest.approx(bar_bounds["y"] + expected_center_offset, abs=0.5)
     for name, center in centers.items():
         assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():

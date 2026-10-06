@@ -303,6 +303,11 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     # The failed edge carries BOTH the drop reason as ``output`` (#1113 — the
     # server surfaces it as the failure detail) and the turn's response id so
     # it closes the streaming turn instead of leaving its tool cards spinning.
+    context = requests[-1]["data"].pop("failure_context")
+    assert context["failure_source"] == "forwarder_delivery"
+    assert context["detail_source"] == "forwarder_delivery_error"
+    assert context["failure_id"]
+    assert "poison-item:0:message" in context["forwarder_source_id"]
     assert requests[-1]["data"] == {
         "status": "failed",
         "output": "transcript item poison-item:0:message rejected",
@@ -323,6 +328,66 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     assert record["event_type"] == "external_conversation_item"
     assert record["reason"] == "permanent HTTP failure after retries"
     assert record["payload"]["item_type"] == "message"
+
+
+@pytest.mark.asyncio
+async def test_rejected_hook_status_keeps_delivery_failure_identity(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "Stop", "session_id": "native-session"},
+    )
+    requests: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        return httpx.Response(422 if payload["data"]["status"] == "idle" else 202)
+
+    initial = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        for _ in range(2):
+            # Replaying the same hook after a restart retains the delivery failure ID.
+            state = initial
+            retry_tracker = forwarder._PostRetryTracker(
+                max_permanent_attempts=2, base_delay_s=0.0, max_delay_s=0.0
+            )
+            for attempt in range(2):
+                state = await forwarder._forward_available_status_events(
+                    client=client,
+                    session_id="conv_synthetic",
+                    bridge_dir=bridge_dir,
+                    state=state,
+                    retry_tracker=retry_tracker,
+                    dedupe=forwarder._ForwardDedupeState(),
+                    task_subjects={},
+                    task_statuses={},
+                    task_order=[],
+                    response_id="resp_synthetic",
+                )
+                assert state.event_cursor == attempt
+            assert state.byte_offset == (bridge_dir / "hooks.jsonl").stat().st_size
+
+    assert [request["type"] for request in requests] == ["external_session_status"] * 6
+    assert [request["data"]["status"] for request in requests] == ["idle", "idle", "failed"] * 2
+    first, second = [
+        request["data"] for request in requests if request["data"]["status"] == "failed"
+    ]
+    assert first == second
+    assert first["response_id"] == "resp_synthetic"
+    assert first["output"] == "hook status idle rejected"
+    context = first["failure_context"]
+    assert context["failure_source"] == "forwarder_delivery"
+    assert context["detail_source"] == "forwarder_delivery_error"
+    assert context["failure_decision"] == "session_failed"
+    assert context["failure_id"]
+    assert context["forwarder_source_id"] == f"hook:1:{state.byte_offset}:idle"
+    assert "native_error_category" not in context
+    persisted = json.loads((bridge_dir / "hook_forwarder.json").read_text("utf-8"))
+    assert persisted["event_cursor"] == 1
+    assert persisted["byte_offset"] == state.byte_offset
 
 
 @pytest.mark.asyncio
