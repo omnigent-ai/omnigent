@@ -32,6 +32,7 @@ import {
 import { useNavigate } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isMacElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -67,6 +68,11 @@ interface ActionCommand {
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
 const SEARCH_DEBOUNCE_MS = 300;
+
+/** The top strip the macOS shell reserves for its traffic lights (see the
+    [data-electron-mac] rules in index.css). The mobile sheet starts at the
+    window's top edge, so it pads past this the way it pads past a notch. */
+const MAC_TITLE_BAR_STRIP = "2.25rem";
 
 /** Split `text` on case-insensitive occurrences of `query`, bolding the matches
     so a search hit is visible in the title / content snippet. Returns the raw
@@ -269,14 +275,13 @@ export function CommandPalette({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         aria-describedby={undefined}
-        // Mobile: a top-anchored full-screen sheet sized to the keyboard-aware
-        // visible viewport (--omnigent-viewport-height), so the input and results
-        // sit above the soft keyboard instead of a centered card whose lower half
-        // hides behind it. Desktop keeps the centered command palette.
+        // Mobile: a top-anchored sheet sized to the keyboard-aware viewport
+        // (--omnigent-viewport-height); sm:max-w-full beats DialogContent's
+        // sm:max-w-sm in the 640-767px band. Desktop keeps the centered palette.
         className={cn(
           "overflow-hidden p-0",
           isMobile
-            ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none"
+            ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none sm:max-w-full"
             : "top-1/4 translate-y-0 rounded-xl sm:max-w-2xl",
         )}
         style={
@@ -285,10 +290,12 @@ export function CommandPalette({
                 top: 0,
                 height: "var(--omnigent-viewport-height, 100dvh)",
                 maxHeight: "var(--omnigent-viewport-height, 100dvh)",
-                // Pad both insets: safe-top clears the notch, safe-bottom keeps
-                // the last row above the home indicator when the keyboard is
-                // closed (the visible-viewport height then spans the home bar).
-                paddingTop: "var(--omnigent-safe-top, 0px)",
+                // Pad both insets: safe-top clears the notch (or the macOS shell's
+                // traffic lights), safe-bottom keeps the last row above the home
+                // indicator when the keyboard is closed and the viewport spans it.
+                paddingTop: isMacElectronShell()
+                  ? MAC_TITLE_BAR_STRIP
+                  : "var(--omnigent-safe-top, 0px)",
                 paddingBottom: "var(--omnigent-safe-bottom, 0px)",
               }
             : undefined

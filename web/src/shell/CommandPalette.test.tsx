@@ -368,10 +368,20 @@ describe("CommandPalette — mobile full-screen sheet", () => {
   }
 
   function dialogContent() {
-    return document.querySelector("[data-slot=dialog-content]");
+    return document.querySelector<HTMLElement>("[data-slot=dialog-content]");
   }
 
-  afterEach(() => setMobile(false));
+  // isMacElectronShell() needs the Electron preload bridge plus a Macintosh UA.
+  function setMacElectronShell() {
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 (Macintosh)");
+    Object.assign(window, { omnigentDesktop: { kind: "electron" } });
+  }
+
+  afterEach(() => {
+    setMobile(false);
+    vi.restoreAllMocks();
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+  });
 
   it("renders a top-anchored full-screen sheet with a close button on mobile", () => {
     setMobile(true);
@@ -421,6 +431,23 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("pads the sheet below the macOS shell's traffic-light strip", () => {
+    setMobile(true);
+    setMacElectronShell();
+    renderPalette();
+
+    // The sheet starts at the window's top edge, where the frameless mac shell
+    // paints its traffic lights; the search row must start below that strip.
+    expect(dialogContent()?.style.paddingTop).toBe("2.25rem");
+  });
+
+  it("pads the sheet by the OS safe-area inset off the macOS shell", () => {
+    setMobile(true);
+    renderPalette();
+
+    expect(dialogContent()?.style.paddingTop).toBe("var(--omnigent-safe-top, 0px)");
   });
 });
 

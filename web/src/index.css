@@ -769,7 +769,9 @@ aside[aria-label="Workspace"][data-maximized] {
  * to the right of the sidebar keeps its normal top alignment. Inert in a
  * plain browser and on other platforms. */
 @media (min-width: 48rem) {
-  /* md+: matches the sidebar's own desktop breakpoint.
+  /* md+: matches the sidebar's own desktop breakpoint. Below md the phone
+   * layout takes over; the (width < 48rem) block after the cluster rules
+   * handles that band.
    *
    * The sidebar starts at the window's top edge rather than below the lights, so
    * no band of empty canvas sits above it. The title-bar row itself is NOT the
@@ -831,12 +833,12 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row {
     display: none;
   }
-  /* The settings sidebar swaps the header row for a "Back" row, which would now
-   * sit under the traffic lights. Push it below them — it has no cluster to
-   * align beside the lights, so it clears them vertically instead. */
-  [data-electron-mac] .settings-sidebar-header {
-    padding-top: 2.75rem;
-  }
+}
+/* The settings sidebar's "Back" row would sit under the traffic lights at any
+ * width (below md the drawer is full-bleed from the top edge). It has no cluster
+ * to align beside the lights, so it clears them vertically instead. */
+[data-electron-mac] .settings-sidebar-header {
+  padding-top: 2.75rem;
 }
 /* The strip spans the top of the window but stops 20rem short of the right
  * edge, keeping the chat header's action cluster (share, panel toggles) and
@@ -894,6 +896,18 @@ aside[aria-label="Workspace"][data-maximized] {
  * the header bar, so that right cluster stays put. */
 [data-electron-mac] .traffic-light-clearance {
   padding-left: 10.5rem;
+}
+/* Below md the phone layout already carries these controls: hide the title-bar
+ * cluster and pad the chat header and the full-bleed drawer's header row past
+ * the lights (the row keeps its phone height, level with the chat header's). */
+@media (width < 48rem) {
+  [data-electron-mac] .electron-sidebar-header-actions {
+    display: none;
+  }
+  [data-electron-mac] .traffic-light-clearance,
+  [data-electron-mac] .sidebar-header-row {
+    padding-left: 5.5rem;
+  }
 }
 /* A maximized workspace rail breaks out to inset-0 (the left sidebar collapses
  * on entry), so its tab strip starts at the window's top-left corner — where
