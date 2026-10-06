@@ -84,14 +84,16 @@ both ends.
   came up, while the turn runs on the replica now holding the runner. When the
   final loss was the tunnel going away (`exception_cause_type` is
   `ConnectionError` or `ConnectError`: closed, retired, replaced, or the runner
-  offline) and no fresh stamp from another replica shows the runner live there
+  offline), no tunnel for the runner is registered on this replica any more,
+  and no fresh stamp from another replica shows the runner live there
   (`live_elsewhere`), such a relay gives up as `never_attached`: it publishes
   no status and leaves the outcome to the replica's per-runner disconnect
   timer, which still fails a mid-turn session (`origin = runner_offline_sweep`)
   when the runner is really gone. An unreadable or stale liveness read does not
   change that. If the final loss was the stream endpoint answering over a live
   tunnel (`HTTPStatusError`, a `RemoteProtocolError` stream fault, or no cause
-  when the body just ended), no disconnect timer is coming, so the relay
+  when the body just ended), or a tunnel is registered again (its superseded
+  predecessor arms no timer), no disconnect timer is coming, so the relay
   decides from the session status as before. A relay that attached once also
   decides from the evidence and the session status.
 
@@ -100,8 +102,8 @@ both ends.
   `missing` for an absent session row, `unbound`, or `error` when the read
   raised), `bound_runner_id` (the runner the session row binds),
   `runner_last_seen` (its heartbeat stamp, epoch seconds), `reference_stamp`
-  (this replica's own newest stamp for the runner: taken when the stream first
-  dropped, and raised by any it stamps itself afterwards), and
+  (diagnostic: this replica's own newest stamp for the runner when checked,
+  which the row's stamp must exceed to count as another replica's), and
   `live_elsewhere_fresh` (the row still binds the relay's runner and its stamp
   is fresh and newer than the reference, so another replica holds the runner).
   Attributes without a value are omitted.

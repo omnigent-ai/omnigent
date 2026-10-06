@@ -7605,9 +7605,8 @@ async def _relay_runner_liveness(
     relay's runner binding, falling back to the metadata binding when called
     without a registered relay.
 
-    The row's stamp is compared with this replica's own stamp from when the
-    relay's stream first dropped, raised to any it wrote since, so its own
-    writes are never read as another replica's.
+    The row's stamp counts as another replica's only when it is newer than
+    this replica's own last stamp for the runner, sampled at the check.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store used to read runner metadata.
@@ -7634,15 +7633,7 @@ async def _relay_runner_liveness(
         return _RelayLiveness(
             lookup="unbound", bound_runner_id=bound_runner_id, runner_last_seen=runner_last_seen
         )
-    own_stamps = [
-        stamp
-        for stamp in (
-            handle.reference_stamp if handle is not None else None,
-            session_live_state.last_liveness_stamp(runner_id),
-        )
-        if stamp is not None
-    ]
-    reference_stamp = max(own_stamps, default=None)
+    reference_stamp = session_live_state.last_liveness_stamp(runner_id)
     return _RelayLiveness(
         lookup="found",
         live_elsewhere=bound_runner_id == runner_id
@@ -7654,6 +7645,34 @@ async def _relay_runner_liveness(
         runner_last_seen=runner_last_seen,
         reference_stamp=reference_stamp,
     )
+
+
+async def _relay_runner_live_elsewhere(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> bool:
+    """
+    Check whether this relay's bound runner is confirmed live on another replica.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store used to read runner metadata.
+    :returns: ``True`` only on fresh evidence from another replica; ``False``
+        when unbound, unreadable, or not. See :func:`_relay_runner_liveness`.
+    """
+    return (await _relay_runner_liveness(session_id, conversation_store)).live_elsewhere
+
+
+async def _runner_tunnel_registered(runner_client: httpx.AsyncClient) -> bool:
+    """
+    Return whether the runner's tunnel is registered on this replica right now.
+
+    A client without a tunnel transport (in-process tests) has no registry to
+    ask, so it reports no tunnel.
+
+    :param runner_client: HTTP client pointed at the runner.
+    """
+    wait = getattr(getattr(runner_client, "_transport", None), "wait_for_runner", None)
+    return wait is not None and bool(await wait(0.0))
 
 
 async def _relay_runner_stream(
@@ -7687,8 +7706,9 @@ async def _relay_runner_stream(
     moves the runner between replicas) saw none of the turn, so it fails
     nothing (``never_attached``). The replica's per-runner disconnect timer,
     which sees the runner itself, fails the mid-turn session if the runner is
-    gone. If a live tunnel's stream endpoint answered with an error instead,
-    no timer is coming and the relay decides from the session status.
+    gone. If a live tunnel's stream endpoint answered with an error, or a
+    tunnel is registered again, no timer is coming and the relay decides from
+    the session status.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -7766,13 +7786,6 @@ async def _relay_runner_stream(
                 outage_id = uuid.uuid4().hex
                 outage_runner_id = runner_id
                 outage_turn_id = _session_active_response_cache.get(session_id)
-                # The disconnect timer compares against the stamp at the drop;
-                # fix the relay's reference to the same moment.
-                handle = _runner_relay_tasks.get(session_id)
-                if handle is not None and handle.task is asyncio.current_task():
-                    handle.reference_stamp = session_live_state.last_liveness_stamp(
-                        handle.runner_id
-                    )
                 _logger.info(
                     "Relay: runner transport lost for session=%s (intentional=%s, grace=%.1fs)",
                     session_id,
@@ -7820,9 +7833,13 @@ async def _relay_runner_stream(
                 liveness = await _relay_runner_liveness(session_id, conversation_store)
                 if liveness.live_elsewhere:
                     decision = "live_elsewhere"
-                elif not ever_ready and lost.tunnel_gone:
-                    # Never subscribed and the tunnel is gone: the disconnect timer
-                    # settles a runner that is really gone; a live tunnel has none.
+                elif (
+                    not ever_ready
+                    and lost.tunnel_gone
+                    and not await _runner_tunnel_registered(runner_client)
+                ):
+                    # Never subscribed and the tunnel is gone: its disconnect timer
+                    # settles a runner that is really gone. A live tunnel has none.
                     decision = "never_attached"
                 elif await _runner_disconnect_requires_failure(
                     session_id, conversation_store, origin="runner_disconnected_mid_turn"

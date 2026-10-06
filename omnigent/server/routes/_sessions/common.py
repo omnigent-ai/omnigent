@@ -849,8 +849,8 @@ class _RelayLiveness:
     :param bound_runner_id: Runner the session row is bound to.
     :param runner_last_seen: The row's heartbeat stamp, epoch seconds.
     :param reference_stamp: This replica's newest own stamp for the relay's
-        runner, as of its stream's first drop and raised by any written since;
-        the row's stamp must exceed it.
+        runner when it was checked; the row's stamp must exceed it. Logged next
+        to ``runner_last_seen`` so a row can be read without a store query.
     """
 
     lookup: str
@@ -888,10 +888,6 @@ class _RelayHandle:
         current stop marker was pending; reset by each Stop request.
     :param running_event_count: Running notifications observed by this relay,
         used to preserve intervening activity when a Stop is rejected.
-    :param reference_stamp: This replica's own last ``runner_last_seen`` stamp
-        for the runner when the current stream outage began; a newer stamp in
-        the row is evidence another replica holds the runner. ``None`` before
-        an outage or when this replica never stamped the runner.
     """
 
     runner_id: str
@@ -900,7 +896,6 @@ class _RelayHandle:
     status_snapshot: _RelayStatusSnapshot | None = None
     intentional_stop_turn_ended: bool = False
     running_event_count: int = 0
-    reference_stamp: int | None = None
 
 
 _runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()

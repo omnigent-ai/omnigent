@@ -1838,20 +1838,22 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
-@pytest.mark.parametrize("runner_elsewhere", [False, True])
+@pytest.mark.parametrize("warm_cache", [False, True])
+@pytest.mark.parametrize("mode", ["gone", "elsewhere", "died_after_hop"])
 async def test_never_attached_relay_leaves_the_turn_to_the_disconnect_timer(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    runner_elsewhere: bool,
+    mode: str,
+    warm_cache: bool,
 ) -> None:
     """A relay whose tunnel is retired before its stream came up fails nothing itself.
 
-    The runner's disconnect timer alone settles the mid-turn session: it fails
-    the turn when the runner is really gone, and spares it when another
-    replica has stamped the runner since (the rollout case, where the turn is
-    running fine on the replica the runner moved to). Nothing is cached here,
-    like a replica that only just met the runner.
+    The runner's disconnect timer alone settles the mid-turn session. It fails
+    the turn when the runner is really gone, including when it dies on the
+    replica it hopped to; it spares it while that replica's stamp is fresh (the
+    rollout case, where the turn is running fine there). The cache is cold
+    like a replica that only just met the runner, or warm with the turn.
     """
     from omnigent.runtime import get_conversation_store
     from omnigent.server import session_live_state
@@ -1889,6 +1891,8 @@ async def test_never_attached_relay_leaves_the_turn_to_the_disconnect_timer(
     store = get_conversation_store()
     store.replace_runner_id(session_id, runner_id)
     store.set_session_live_status(session_id, "running")
+    if warm_cache:
+        sessions_module._session_status_cache[session_id] = "running"
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
@@ -1907,7 +1911,7 @@ async def test_never_attached_relay_leaves_the_turn_to_the_disconnect_timer(
                 await asyncio.sleep(0.01)
 
         await asyncio.wait_for(_stream_requested(), timeout=budget(2.0))
-        if runner_elsewhere:
+        if mode != "gone":
             # The replica the runner moved to stamps the row (after this
             # replica's own connect stamp landed) before this tunnel's drop is seen.
             async def _own_stamp_recorded() -> None:
@@ -1919,6 +1923,18 @@ async def test_never_attached_relay_leaves_the_turn_to_the_disconnect_timer(
             own = session_live_state.last_liveness_stamp(runner_id)
             assert own is not None
             store.touch_runner_liveness([runner_id], own + 6)
+        if mode == "died_after_hop":
+            # The runner then dies on that replica, whose graceful disconnect
+            # clears the stamp with no guard, right after this replica's own.
+            real_clear = session_live_state.clear_runner_liveness
+
+            def clear_then_the_runner_dies(rid: str) -> None:
+                real_clear(rid)
+                store.clear_runner_liveness(rid)
+
+            monkeypatch.setattr(
+                session_live_state, "clear_runner_liveness", clear_then_the_runner_dies
+            )
         await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
         await communicator.wait(timeout=budget(2.0))
 
@@ -1945,11 +1961,11 @@ async def test_never_attached_relay_leaves_the_turn_to_the_disconnect_timer(
         conv = store.get_conversation(session_id)
         assert conv is not None
         error = sessions_module._last_task_error_from_labels(conv.labels)
-        if runner_elsewhere:
+        if mode == "elsewhere":
             assert rows[0].attributes["decision"] == "live_elsewhere"
             assert not failures
             assert error is None
-            assert sessions_module._session_status_cache.get(session_id) != "failed"
+            assert sessions_module._session_status_cache.get(session_id) is None
         else:
             assert rows[0].attributes["decision"] == "never_attached"
             assert sessions_module._session_status_cache.get(session_id) == "failed"
