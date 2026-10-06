@@ -87,6 +87,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("omnigent:open-path", listener);
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
+  /** The runner picked during onboarding for this server ("local" |
+   *  "remote"), returned once, else null. */
+  takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
   /**
    * Server picker data: the current origin plus organization-provided and
    * recently-connected server URLs. Resolves null off a connected server.
@@ -97,6 +100,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * rejects in the main process).
    */
   switchServer: (url) => ipcRenderer.invoke("omnigent:switch-server", url),
+  /** Sign this window's server out; every window on it returns to the setup page. */
+  signOutOfServer: () => ipcRenderer.invoke("omnigent:sign-out-of-server"),
   /** Return this window to the bundled "connect to server" setup page. */
   openServerSetup: () => {
     ipcRenderer.send("omnigent:open-server-setup");
@@ -271,6 +276,23 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("browser-host-active-changed", listener);
     return () => ipcRenderer.removeListener("browser-host-active-changed", listener);
   },
+  /**
+   * Forward Ctrl+Tab, Control release, and Escape from the focused embedded
+   * Browser WebContents so the shell's recent-session switcher can own them.
+   * @param {(payload: Record<string, unknown>) => void} callback
+   * @returns {() => void}
+   */
+  onBrowserRecentSessionInput: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-recent-session-input", listener);
+    return () => ipcRenderer.removeListener("browser-recent-session-input", listener);
+  },
+  /** Enable native Ctrl+Tab forwarding only while this renderer supports it. */
+  browserSetRecentSessionSwitchSupported: (supported) =>
+    ipcRenderer.invoke("omnigent:browser-set-recent-session-switch-supported", { supported }),
+  /** Clear the native Ctrl+Tab latch when the renderer has no sessions to show. */
+  browserCancelRecentSessionSwitch: () =>
+    ipcRenderer.invoke("omnigent:browser-cancel-recent-session-switch"),
   /**
    * Subscribe to browser-view creation (`{conversationId}`), fired the first
    * time a view is created — including detached (fresh conversation), which is
@@ -449,9 +471,27 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   },
   /** Organization-provided server URLs from macOS Managed Preferences. */
   getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
+  /** Display names for those servers, server URL → name. */
+  getManagedServerNames: () => ipcRenderer.invoke("omnigent:get-managed-server-names"),
+  /** Names servers gave themselves in their manifest, origin → name (display only). */
+  getServerNames: () => ipcRenderer.invoke("omnigent:get-server-names"),
   /** Wizard capabilities, e.g. `{v2Forced}` — v2Forced disables "Switch to
    *  legacy" because the env var pins the selector on. */
   getSetupCapabilities: () => ipcRenderer.invoke("omnigent:get-setup-capabilities"),
+  /** Runners the onboarding runner step offers for `url`: `{remote, bundledCli}`.
+   *  @param {string} url */
+  getRunnerOptions: (url) => ipcRenderer.invoke("omnigent:get-runner-options", url),
+  /** Connect the onboarding runner ("local" | "remote") to `url`. Resolves
+   *  `{ok, error?}`; output streams via onRunnerConnectLog.
+   *  @param {string} url @param {"local"|"remote"} runner */
+  connectRunner: (url, runner) => ipcRenderer.invoke("omnigent:connect-runner", url, runner),
+  /** Subscribe to connectRunner output. Returns an unsubscribe function.
+   *  @param {(line: string) => void} callback */
+  onRunnerConnectLog: (callback) => {
+    const listener = (_event, payload) => callback(payload?.line ?? "");
+    ipcRenderer.on("omnigent:runner-connect-log", listener);
+    return () => ipcRenderer.removeListener("omnigent:runner-connect-log", listener);
+  },
   /** Live color-scheme override for the wizard (System/Light/Dark). Not
    *  persisted — resets to the OS default on relaunch.
    *  @param {"light"|"dark"|"system"} scheme */

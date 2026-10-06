@@ -111,6 +111,10 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.inner._subprocess_lifecycle import (
+    await_cleanup_task,
+    terminate_direct_subprocess,
+)
 from omnigent.models import model_catalog
 from omnigent.models.claude_model_vocabulary import (
     ALIAS_MODEL_ENV_VARS,
@@ -294,6 +298,8 @@ _RESUME_ACTION_LEAVE = "leave"
 _ATTACH_INITIAL_RECONNECT_DELAY_S = 0.5
 _ATTACH_MAX_RECONNECT_DELAY_S = 5.0
 _CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S = 0.25
+_DIRECT_TMUX_ATTACH_TERMINATE_TIMEOUT_S = 5.0
+_DIRECT_TMUX_ATTACH_KILL_TIMEOUT_S = 1.0
 _CLAUDE_TERMINAL_GONE_WATCH_INTERVAL_S = 0.25
 _CLAUDE_TERMINAL_GONE_WATCH_HTTP_TIMEOUT_S = 1.0
 _CLAUDE_STARTUP_PROFILE_ENV_VAR = "OMNIGENT_CLAUDE_STARTUP_PROFILE"
@@ -3840,49 +3846,62 @@ async def _attach_direct_tmux(
         tmux_target,
         env=env,
     )
-    record_startup_event("terminal_attach_started")
-    startup_profiler.mark("tmux attach subprocess started")
-
-    # Poll for a dead pane in the background. With ``remain-on-exit on``,
-    # the tmux session outlives the inner CLI, so ``tmux attach`` never exits
-    # on its own — the user sees "Pane is dead" and Ctrl-C is silently
-    # dropped because there is no process to receive the signal. Killing the
-    # attach subprocess forces it to exit so the CLI can tear down cleanly.
-    async def _kill_when_pane_dead() -> None:
-        _POLL_INTERVAL_S = 0.5
-        while True:
-            await asyncio.sleep(_POLL_INTERVAL_S)
-            if process.returncode is not None:
-                return  # already exited naturally
-            is_dead = await _check_pane_dead_definitive(str(socket_path), tmux_target)
-            if is_dead is True:
-                _logger.debug("direct-tmux: pane is dead; killing tmux attach child")
-                with contextlib.suppress(ProcessLookupError):
-                    process.kill()
-                return
-
-    watcher = asyncio.create_task(_kill_when_pane_dead(), name="direct-tmux-pane-watcher")
+    watcher: asyncio.Task[None] | None = None
     try:
-        await process.wait()
-    finally:
-        watcher.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await watcher
+        record_startup_event("terminal_attach_started")
+        startup_profiler.mark("tmux attach subprocess started")
 
-    startup_profiler.mark("tmux attach subprocess exited")
-    record_startup_event("terminal_attach_exited", exit_code=process.returncode)
-    # Use the tri-state probe so a dead pane (session alive, pane_dead=1) is
-    # treated as EXITED rather than DETACHED. With remain-on-exit the session
-    # outlives the inner CLI, so _tmux_session_alive alone would wrongly signal
-    # a user detach and the reconnect loop would re-attach to the dead pane.
-    pane_dead = await _check_pane_dead_definitive(str(socket_path), tmux_target)
-    if pane_dead is True:
-        return _AttachOutcome.EXITED
-    if pane_dead is None:
-        # Inconclusive probe — fall back to session-existence check.
-        if not await _tmux_session_alive(str(socket_path), tmux_target):
+        # Poll for a dead pane in the background. With ``remain-on-exit on``,
+        # the tmux session outlives the inner CLI, so attach never exits alone.
+        async def _kill_when_pane_dead() -> None:
+            _POLL_INTERVAL_S = 0.5
+            while True:
+                await asyncio.sleep(_POLL_INTERVAL_S)
+                if process.returncode is not None:
+                    return  # already exited naturally
+                is_dead = await _check_pane_dead_definitive(str(socket_path), tmux_target)
+                if is_dead is True:
+                    _logger.debug("direct-tmux: pane is dead; killing tmux attach child")
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
+                    return
+
+        watcher = asyncio.create_task(_kill_when_pane_dead(), name="direct-tmux-pane-watcher")
+        await process.wait()
+        startup_profiler.mark("tmux attach subprocess exited")
+        record_startup_event("terminal_attach_exited", exit_code=process.returncode)
+        # Use the tri-state probe so a dead pane (session alive, pane_dead=1) is
+        # treated as EXITED rather than DETACHED.
+        pane_dead = await _check_pane_dead_definitive(str(socket_path), tmux_target)
+        if pane_dead is True:
             return _AttachOutcome.EXITED
-    return _AttachOutcome.DETACHED
+        if pane_dead is None:
+            # Inconclusive probe — fall back to session-existence check.
+            if not await _tmux_session_alive(str(socket_path), tmux_target):
+                return _AttachOutcome.EXITED
+        return _AttachOutcome.DETACHED
+    except BaseException:
+        cleanup = asyncio.create_task(
+            terminate_direct_subprocess(
+                process,
+                terminate_timeout=_DIRECT_TMUX_ATTACH_TERMINATE_TIMEOUT_S,
+                kill_timeout=_DIRECT_TMUX_ATTACH_KILL_TIMEOUT_S,
+            ),
+            name="direct-tmux-attach-cleanup",
+        )
+        await await_cleanup_task(cleanup)
+        raise
+    finally:
+        if watcher is not None:
+            watcher.cancel()
+            try:
+                await watcher
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 - watcher failure is secondary to attach outcome
+                _logger.warning(
+                    "direct-tmux pane watcher failed during attach cleanup", exc_info=True
+                )
 
 
 async def _attach_with_transcript_forwarder(

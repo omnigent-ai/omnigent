@@ -219,7 +219,19 @@ jobs:
           background: >-
             Review Omnigent changes for correctness, security, broken contracts,
             race conditions, and failure paths, including the tests. Verify
-            findings against surrounding code. Omit cosmetic feedback.
+            findings against surrounding code. Omit cosmetic feedback except
+            for this explicit code-comment policy: review added or modified
+            comments, preferring one line when a comment is needed and allowing
+            at most three lines per comment block. Treat consecutive line
+            comments as one block. Flag longer blocks, comments that merely
+            restate the code, and comments about PR or ticket history instead
+            of the scenario or reasoning. Useful two- or three-line explanations
+            are acceptable. Exempt docstrings, API documentation, license
+            headers, generated comments, and required tool directives. Do not
+            flag unchanged comments or prose in documentation files. Report
+            violations as low-severity findings with a concrete suggestion to
+            shorten, remove, or rewrite the comment; do not raise severity just
+            because this is an explicit policy.
           effort: medium
           review_concurrency: '2'
           review_task_timeout: '15'

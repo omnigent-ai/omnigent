@@ -235,7 +235,7 @@ def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
 ) -> None:
     """Without a configured ``$CODEX_HOME`` both codex harnesses read ``~/.codex``.
 
-    The Codex provider never scans ``.agents`` and, absent a resolved
+    Both Codex harnesses include ``~/.agents/skills``. Absent a resolved
     ``$CODEX_HOME`` (``ctx.codex_home is None``), the native provider falls back
     to the same ``~/.codex/skills`` the SDK path uses — so the two agree until a
     custom codex home is in play (see the divergence test below).
@@ -250,7 +250,7 @@ def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
 
     native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
     sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
-    assert native == sdk == {"codex-host-skill"}
+    assert native == sdk == {"codex-host-skill", "agents-only-skill"}
 
 
 def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
@@ -267,6 +267,7 @@ def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     _write_skill(home / ".codex" / "skills", "default-codex-skill")
+    _write_skill(home / ".agents" / "skills", "shared-skill")
     custom = tmp_path / "custom-codex-home"
     _write_skill(custom / "skills", "custom-codex-skill")
     workspace = tmp_path / "ws"
@@ -276,8 +277,8 @@ def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
     native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
     sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
     # Native reads $CODEX_HOME's skills; SDK ignores codex_home and reads ~/.codex.
-    assert native == {"custom-codex-skill"}
-    assert sdk == {"default-codex-skill"}
+    assert native == {"custom-codex-skill", "shared-skill"}
+    assert sdk == {"default-codex-skill", "shared-skill"}
 
 
 def test_claude_provider_defaults_user_tier_to_home_claude(

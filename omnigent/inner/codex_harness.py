@@ -123,6 +123,7 @@ _ENV_DISABLE_NATIVE_TOOLS = "HARNESS_CODEX_DISABLE_NATIVE_TOOLS"
 _ENV_OS_ENV = "HARNESS_CODEX_OS_ENV"
 _ENV_RETRY_POLICY = "HARNESS_CODEX_RETRY_POLICY"
 _ENV_SKILLS_FILTER = "HARNESS_CODEX_SKILLS_FILTER"
+_ENV_SKILLS_DIR = "HARNESS_CODEX_SKILLS_DIR"
 _ENV_BUNDLE_DIR = "HARNESS_CODEX_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_CODEX_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CODEX_GATEWAY_BASE_URL"
@@ -386,6 +387,9 @@ def _build_codex_executor() -> Executor:
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
+        skills_dir=Path(raw_skills_dir)
+        if (raw_skills_dir := os.environ.get(_ENV_SKILLS_DIR))
+        else None,
         signer_launch_config=signer_launch_config,
     )
 

@@ -197,6 +197,8 @@ interface SessionResponseWire {
     title?: string;
     cause?: string;
     remediation?: string;
+    /** For `runner_rejected_event`: the persisted item the runner refused (newer servers). */
+    item_id?: string;
   } | null;
   /**
    * Outstanding `response.elicitation_request` event dicts at the
@@ -919,35 +921,6 @@ export async function createSideChat(sourceId: string): Promise<{ childSessionId
 }
 
 /**
- * Switch an existing session in place to a different agent/harness:
- * ``POST /v1/sessions/{id}/switch-agent``.
- *
- * Unlike fork, this keeps the SAME session (transcript, comments, files,
- * workspace) and only rebinds the agent. The next turn runs on the new
- * harness; history carries per the same rule as a fork switch
- * (``forkTargetCarriesHistory``). Model settings reset to the target's
- * defaults on a cross-family switch. Only built-in agents are bindable,
- * and only while the session is idle (a running turn → 409).
- *
- * @param sessionId - The session to switch, e.g. ``"conv_abc123"``.
- * @param agentId - Built-in agent to switch to, e.g. ``"ag_builtin_codex"``.
- * @returns The session as it stands after the switch.
- * @throws Error carrying the server's failure detail (e.g. 409 when a turn
- *   is running) so the caller can surface it inline.
- */
-export async function switchSessionAgent(sessionId: string, agentId: string): Promise<Session> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/switch-agent`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agent_id: agentId }),
-    },
-  );
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
-}
-
-/**
  * Bind an existing (unbound) session to a host + working directory and
  * launch its runner: ``POST /v1/hosts/{hostId}/runners``.
  *
@@ -1464,9 +1437,13 @@ export function openSessionStream(
  * `session.interrupted` (transient) and `response.incomplete` (with
  * `incomplete_details.reason == "user_interrupt"`) on the live
  * stream — clients can mark the bubble interrupted from either.
+ * Native side chats include their observed response id to target the exact turn.
  */
-export function interrupt(sessionId: string): Promise<PostEventResponse> {
-  return postEvent(sessionId, { type: "interrupt", data: {} });
+export function interrupt(sessionId: string, responseId?: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, {
+    type: "interrupt",
+    data: responseId ? { response_id: responseId } : {},
+  });
 }
 
 /**
@@ -1486,11 +1463,15 @@ export function retrySession(sessionId: string): Promise<PostEventResponse> {
 }
 
 // Multiple error cards can describe the same failed turn.
-const rateLimitedTurnRetries = new Map<string, Promise<void>>();
+const failedTurnContinuations = new Map<string, Promise<void>>();
 
-/** Continue a rate-limited turn without replaying the original prompt or tools. */
-export function retryRateLimitedTurn(sessionId: string): Promise<void> {
-  const pending = rateLimitedTurnRetries.get(sessionId);
+/**
+ * Continue a turn whose upstream model call failed mid-stream (rate limit,
+ * transient gateway error) without replaying the original prompt or tools —
+ * the runner itself is healthy, only the turn died.
+ */
+export function continueFailedTurn(sessionId: string): Promise<void> {
+  const pending = failedTurnContinuations.get(sessionId);
   if (pending) return pending;
 
   const retry = postEvent(sessionId, {
@@ -1500,7 +1481,7 @@ export function retryRateLimitedTurn(sessionId: string): Promise<void> {
       content: [
         {
           type: "input_text",
-          text: "Please continue from where you left off before the rate limit error.",
+          text: "Please continue from where you left off.",
         },
       ],
     },
@@ -1510,9 +1491,9 @@ export function retryRateLimitedTurn(sessionId: string): Promise<void> {
       if (!result.queued) throw new Error("The retry was not accepted");
     })
     .finally(() => {
-      rateLimitedTurnRetries.delete(sessionId);
+      failedTurnContinuations.delete(sessionId);
     });
-  rateLimitedTurnRetries.set(sessionId, retry);
+  failedTurnContinuations.set(sessionId, retry);
   return retry;
 }
 

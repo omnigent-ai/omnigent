@@ -123,7 +123,17 @@ def test_responses_stream_uses_scripted_token_usage(
             json={"key": "gpt-5.4", "responses": [{**queued_response, "usage": usage}]},
         )
         assert configured.status_code == 200
-        response = client.post("/v1/responses", json={"model": "gpt-5.4", "stream": True})
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.4",
+                "stream": True,
+                "tools": [
+                    {"type": "function", "name": call["name"]}
+                    for call in queued_response.get("tool_calls", [])
+                ],
+            },
+        )
     assert response.status_code == 200
     events = [
         json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")
@@ -315,3 +325,83 @@ def test_same_implicit_selector_replaces_and_different_purpose_coexists(monkeypa
             "/v1/responses", json={"input": "nonce", "tools": [{"name": "Task"}]}
         )
         assert response.json()["output"][0]["content"][0]["text"] == "new"
+
+
+@pytest.mark.parametrize("routing", [{}, {"key": "native-model"}, {"match": "user-nonce"}])
+def test_unspecified_guard_preserves_next_tool_call_for_capable_request(monkeypatch, routing):
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        key = client.post(
+            "/mock/configure",
+            json={
+                **routing,
+                "responses": [
+                    {
+                        "tool_calls": [
+                            {"call_id": "skill-call", "name": "Skill", "arguments": "{}"}
+                        ]
+                    },
+                    {"text": "after skill"},
+                ],
+            },
+        ).json()["key"]
+        body = {"model": "native-model", "input": "user-nonce"}
+        for no_tools in ({}, {"tools": []}):
+            response = client.post("/v1/responses", json={**body, **no_tools})
+            assert "skill-call" not in response.text
+            assert mock_llm_server._state.queues[key].index == 0
+        response = client.post("/v1/responses", json={**body, "tools": [{"name": "Skill"}]})
+        assert "skill-call" in response.text
+        assert mock_llm_server._state.queues[key].index == 1
+        # Inference applies to the next tool response, not later text entries.
+        response = client.post("/v1/responses", json=body)
+        assert response.json()["output"][0]["content"][0]["text"] == "after skill"
+
+
+@pytest.mark.parametrize("required_tools", [[], ["Read"]])
+def test_explicit_guard_allows_intentionally_unadvertised_tool(monkeypatch, required_tools):
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        client.post(
+            "/mock/configure",
+            json={
+                "required_tools": required_tools,
+                "responses": [
+                    {"tool_calls": [{"call_id": "bad-call", "name": "Unknown", "arguments": "{}"}]}
+                ],
+            },
+        ).raise_for_status()
+        response = client.post(
+            "/v1/responses", json={"tools": [{"name": name} for name in required_tools]}
+        )
+        assert "bad-call" in response.text
+
+
+def test_inferred_guard_preserves_unadvertised_calls_and_tracks_next_response():
+    state = MockState()
+    queue = state.get_queue("default")
+    queue.responses = [
+        mock_llm_server.QueuedResponse(tool_calls=[{"name": "Read"}, {"name": "Write"}]),
+        mock_llm_server.QueuedResponse(tool_calls=[{"name": "Skill"}]),
+    ]
+    assert state.resolve_queue_for_request({"tools": []}) is not queue
+    assert queue.index == 0
+    # Deliberately unavailable calls still reach tests of tool-not-found behavior.
+    first = state.resolve_queue_for_request({"tools": [{"name": "Read"}]})
+    assert first is queue
+    first.next()
+    assert state.resolve_queue_for_request({"tools": []}) is not queue
+    assert state.resolve_queue_for_request({"tools": [{"name": "Skill"}]}) is queue
+
+
+def test_reset_and_reconfigure_restore_inference(monkeypatch):
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        script = {"tool_calls": [{"call_id": "skill-call", "name": "Skill", "arguments": "{}"}]}
+        client.post("/mock/configure", json={"required_tools": [], "responses": [script]})
+        client.post("/mock/set_fallback", json={"text": "persistent fallback"})
+        client.post("/mock/reset")
+        client.post("/mock/configure", json={"responses": [script]})
+        response = client.post("/v1/responses", json={"input": "title"})
+        assert "skill-call" not in response.text
+        assert mock_llm_server._state.queues["default"].index == 0

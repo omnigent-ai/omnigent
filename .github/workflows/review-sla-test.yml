@@ -9,6 +9,7 @@ name: Reviewer SLA Test
 on:
   pull_request:
     paths:
+      - '.github/workflows/review-sla-test.yml'
       - .github/workflows/review-sla.js
       - .github/workflows/review-sla.test.js
       - .github/workflows/review-sla.yml

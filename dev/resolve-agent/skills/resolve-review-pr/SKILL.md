@@ -56,7 +56,9 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    compatibility, and performance? Does it miss facets or obvious adjacent edge
    cases, or introduce a regression in the surrounding code? Complete the shared
    impact assessment and run its checks for the whole PR. Record why the selected
-   approach is preferable in the review.
+   approach is preferable in the review. Apply `resolve-investigate` to the
+   reported configuration, competing causes, and historical design rationale;
+   explicitly identify policy changes even when the repro test passes.
    "Best" means the strongest maintainable fit for this codebase and bug, not a
    license to replace a sound, idiomatic contribution with a theoretically purer
    rewrite or a personal style preference.
@@ -65,8 +67,10 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    Establish one concrete reported failure or requested outcome and its
    acceptance criteria from `bug_url` and the PR's linked issue. Different
    layers or root causes can contribute to that outcome. If the issue bundles
-   independent problems, ask the author to split them or track them separately;
-   stop with `needs_more_info` if the intended scope is unclear.
+   independent problems, identify separable follow-ups in the review. Propose the
+   best-supported scope and keep working on clear requirements. Only a concrete
+   missing input or authorization conflict blocks that work; unresolved design
+   choices remain explicit for PR review under `resolve-investigate`.
 
    For each change, ask whether removing it would leave the intended fix
    incomplete, incorrect, unsafe, or inadequately tested or documented.
@@ -103,21 +107,18 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    merge gate (a human maintainer's approval is always required); it's an
    *indicator* for that maintainer. Choose:
    - **`fixed` and you never pushed to or authored this code** (pure reviewer: the
-     repro test passes against the PR as-is, CI green, Polly clean, **the branch is
-     mergeable** — not `CONFLICTING`/`DIRTY` — the current diff stays within the
+     repro test passes against the PR as-is, CI green, Polly and OCR settled,
+     **the branch is mergeable** — not `CONFLICTING`/`DIRTY` — the current diff stays within the
      reported problem, and no fix from you was needed) →
      submit an **approving** review: `gh pr review <pr> --approve
      --body '…'`. A genuine independent verification — the "someone checked it, take
      your pass" signal a maintainer wants. Note in the body that it's an automated
      reviewer's approval and a maintainer's approval is still required to merge.
-     **"Polly clean" here means a real Polly review actually ran and came back
-     clean** — a fresh `<!-- polly-review-bot -->` comment for the current head,
-     every finding fixed or justified (4.3), **not** a green check. If you could not
-     get a real Polly review to run (the dispatch failed, no comment ever landed,
-     or you only ever saw the phantom green check on a fork PR), you have **not**
-     verified this precondition: do **not** approve. Leave a `--comment` review
-     that states the fail→pass evidence *and* that a Polly review could not be
-     obtained, and let a maintainer take over the review from there.
+     **Both reviewers must have completed on the current head**, with every
+     finding fixed or individually justified and the Step 4.3 live gate passing.
+     If either review cannot be obtained, do **not** approve: leave a `--comment`
+     review stating the behavioral evidence and the missing review, and preserve
+     an incomplete handoff for the maintainer.
    - **`not_fixed` / `partially_fixed`** → `gh pr review <pr> --request-changes
      --body '…'` naming what still fails or which unrelated changes must be
      removed or split out, even if the reproduction passes.
@@ -137,17 +138,16 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
 
 6. **Then drive it to landable — go to Step 4.** Once you've kept the PR as the
    fix (the sound-PR default), it gets the **same landing treatment as a PR you
-   authored**: `ui-preview`, green CI, a clean Polly review, a copy-paste
+   authored**: `ui-preview`, green CI, settled Polly and OCR reviews, a copy-paste
    live-validation command, and a maintainer tagged (Step 4, all sub-steps). The
    one difference is whose branch a fix lands on — Step 4's "push or take over"
    rule handles it: push fixes directly when the PR branch is in-repo; when it's a
    **fork PR** you can't push to *and it needs a fix*, take over by opening your
    own PR that carries their commits + your fix (crediting them). If the fork PR
-   needs no fix, keep it as-is. Either way you **do** iterate CI and Polly, rather
+   needs no fix, keep it as-is. Either way you **do** iterate CI, Polly, and OCR, rather
    than triggering one review and stopping — and on a fork PR you must actually
-   dispatch Polly and wait for its comment, because the automatic check reports a
-   green `pass` there without ever running (see 4.3). Record
-   `mode: "reviewed_existing_pr"`
+   dispatch both reviewers and wait for current-head completion proof (see 4.3).
+   Record `mode: "reviewed_existing_pr"`
    and its `pr_url` when you keep it; if a fork takeover made you open your own,
    record `mode: "authored_fix"` with the fork PR in `reviewed_pr_url`.
 

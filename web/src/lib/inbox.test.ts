@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import type { Conversation } from "@/hooks/useConversations";
-import { collectCommentInboxItems, collectInboxItems, sumPendingApprovals } from "./inbox";
+import {
+  collectCommentInboxItems,
+  collectInboxItems,
+  collectUnreadInboxItems,
+  sumPendingApprovals,
+} from "./inbox";
 
 function makeRow(overrides: Partial<Conversation> & { id: string }): Conversation {
   return {
@@ -260,5 +265,43 @@ describe("sumPendingApprovals", () => {
       makeRow({ id: "d", pending_elicitations_count: 3 }),
     ];
     expect(sumPendingApprovals(rows)).toBe(5);
+  });
+});
+
+describe("collectUnreadInboxItems", () => {
+  // Stand-in for the sidebar dot's predicate: unseen when finished and
+  // newer than a fixed baseline.
+  const unseenAfter =
+    (baseline: number) => (_id: string, updatedAt: number, status: string | undefined) =>
+      status !== "running" && status !== undefined && updatedAt > baseline;
+
+  it("lists unseen sessions newest first, tagging failed turns as errors", () => {
+    const rows = [
+      makeRow({ id: "old", status: "idle", updated_at: 2_000 }),
+      makeRow({ id: "new", status: "failed", updated_at: 3_000 }),
+      makeRow({ id: "seen", status: "idle", updated_at: 500 }),
+    ];
+    const items = collectUnreadInboxItems(rows, unseenAfter(1_000));
+    expect(items.map((i) => [i.row.id, i.kind])).toEqual([
+      ["new", "error"],
+      ["old", "done"],
+    ]);
+  });
+
+  it("skips archived rows and rows already listed as approvals", () => {
+    // A session with a pending prompt shows as its approval card; listing it
+    // again as unread would put one session in the inbox twice.
+    const rows = [
+      makeRow({ id: "archived", status: "idle", updated_at: 2_000, archived: true }),
+      makeRow({ id: "awaiting", status: "idle", updated_at: 2_000, pending_elicitations_count: 1 }),
+      makeRow({ id: "unread", status: "idle", updated_at: 2_000 }),
+    ];
+    const items = collectUnreadInboxItems(rows, unseenAfter(1_000));
+    expect(items.map((i) => i.row.id)).toEqual(["unread"]);
+  });
+
+  it("defers to the predicate, so running sessions stay out", () => {
+    const rows = [makeRow({ id: "running", status: "running", updated_at: 2_000 })];
+    expect(collectUnreadInboxItems(rows, unseenAfter(1_000))).toEqual([]);
   });
 });

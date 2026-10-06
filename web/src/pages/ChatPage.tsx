@@ -76,6 +76,7 @@ import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
+import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
@@ -89,12 +90,12 @@ import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
+  committedItemProvesDelivery,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
-  type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
 import {
@@ -108,11 +109,14 @@ import {
 } from "@/lib/nativeCodingAgents";
 import {
   isSideChatCommand,
+  newPendingSideChatId,
   SIDE_CHAT_COMMAND_PREFIX,
   supportsSideChat,
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
+import { shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
@@ -127,6 +131,7 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
+  restoreReplyDraft,
   serializeReplyDraft,
   snapshotReplyDraft,
   type ComposerDraft,
@@ -151,7 +156,6 @@ export {
   LatestTurnSpacer,
   ScrollToBottomOnSend,
   SessionSharedContext,
-  UserMessageNavConnected,
   WORKING_MESSAGES,
   WorkingIndicator,
   bubbleKey,
@@ -176,6 +180,7 @@ export type { ConversationScroller } from "@/components/chat/chatBubbleParts";
 import {
   type ConversationScroller,
   SessionSharedContext,
+  computeIsTurnActive,
   computeIsWorking,
 } from "@/components/chat/chatBubbleParts";
 import { useSession } from "@/hooks/useSession";
@@ -338,49 +343,6 @@ export function splitSlashCommand(
   if (!m) return null;
   const [, before, token] = m;
   return { before, token, after: value.slice(before.length + token.length) };
-}
-
-/**
- * Whether a submitted message should be queued rather than POSTed now.
- *
- * Queue when busy, or when this conversation already has a queued message even
- * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
- * later direct send could overtake a still-queued earlier one when status
- * flickers idle mid-queue (cursor-native). A new chat always sends.
- *
- * ``waiting`` is NOT busy for queueing: it means the turn already ended and the
- * agent loop is only parked on background work (background shells / sub-agents)
- * — the server's turn gate is already free, so a new message starts a fresh
- * turn immediately instead of stalling behind that background work. (The
- * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
- * reflect background activity, which is a separate concern from send gating.)
- *
- * ``alwaysSteer`` (a per-device preference) drops the busy gate entirely: a
- * follow-up sent mid-turn is POSTed now — steered into the running turn —
- * instead of parking in the queue strip. The ``hasQueued`` guard still holds:
- * once this conversation has a queued message it must drain in order, or a
- * direct send could overtake a still-queued earlier one on an idle flicker.
- *
- * ``opensSideChat`` (a codex ``/side`` command) always POSTs now. A side chat is
- * forked onto its own thread and is non-interrupting by design — asking while
- * the agent works is the whole point — so it must not park in the queue behind
- * the parent's active turn. It shares no ordering with main-thread sends, so it
- * bypasses ``hasQueued`` too.
- */
-export function shouldQueueSend(
-  conversationId: string | null,
-  status: "idle" | "streaming",
-  sessionStatus: SessionStatus,
-  queuedMessages: QueuedMessage[],
-  alwaysSteer = false,
-  opensSideChat = false,
-): boolean {
-  if (conversationId === null) return false;
-  if (opensSideChat) return false;
-  const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
-  if (alwaysSteer) return hasQueued;
-  const isBusy = status === "streaming" || sessionStatus === "running";
-  return isBusy || hasQueued;
 }
 
 // Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
@@ -728,7 +690,7 @@ export function ChatPage() {
   // Keep the parent's Stop action live while its turn waits on an elicitation.
   // Child activity and display suppression belong to `showsWorking` below.
   const isWorking =
-    computeIsWorking(sessionStatus) || status === "streaming" || hasPendingInitialMessage;
+    computeIsTurnActive(sessionStatus, status === "streaming") || hasPendingInitialMessage;
   // Managed-sandbox stages own the in-progress slot with specific pipeline
   // copy. A normal terminal runner launch keeps the standard Working shimmer
   // so startup does not introduce a second, special chat state.
@@ -2407,8 +2369,6 @@ function ComposerImpl(
     editText,
     replaceText,
     appendQuote,
-    beginSideChatQuote,
-    sideChat,
     removeQuote,
   } = useReplyDraft();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
@@ -2432,6 +2392,10 @@ function ComposerImpl(
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  // A restored failed-send draft whose fate is still unknown — flips to
+  // `delivered` when the send turns out to have reached the server, so the
+  // retraction effect below can empty the composer.
+  const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
   );
@@ -2677,6 +2641,12 @@ function ComposerImpl(
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
 
+  // Ctrl+Shift+L focuses the composer input from anywhere in the session view.
+  // No-op on mobile, where programmatic focus would pop the software keyboard.
+  useFocusComposerHotkey(() => {
+    if (!isMobileRef.current) textareaRef.current?.focus({ preventScroll: true });
+  });
+
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the
   // callbacks so the hook never learns about sessions or focus.
@@ -2792,7 +2762,7 @@ function ComposerImpl(
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
-  const skillPrefix = sessionHarness === "codex-native" ? "$" : "/";
+  const skillPrefix = skillInvocationPrefix(sessionHarness);
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
@@ -2965,6 +2935,15 @@ function ComposerImpl(
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
+    // The send may have proven delivered since the render that scheduled this
+    // effect: its committed item landed under the send's stable id (see
+    // `retractDeliveredSendDraft`), so restoring now would prime a duplicate.
+    // Not so for a send the server refused: its item is persisted too, but the
+    // runner never took it, so the text must come back for a resend.
+    if (committedItemProvesDelivery(useChatStore.getState().blocks, failedSendDraft)) {
+      useChatStore.setState({ failedSendDraft: null });
+      return;
+    }
     useChatStore.setState({
       failedSendDraft: null,
       pendingRetryStableId: failedSendDraft.stableId ?? null,
@@ -2980,8 +2959,45 @@ function ComposerImpl(
     dirtyRef.current = true;
     if (failedSendDraft.files.length > 0)
       attachmentsRef.current.replaceFiles(failedSendDraft.files);
+    // Remember what was restored: if the "failed" send proves delivered (its
+    // stable id shows up as a committed item), the retraction effect below
+    // empties the composer instead of priming a duplicate send.
+    if (failedSendDraft.stableId) {
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: failedSendDraft.conversationId,
+          stableId: failedSendDraft.stableId,
+          text: failedSendDraft.text,
+          files: failedSendDraft.files,
+          replyDraft: failedSendDraft.replyDraft,
+          serverRefused: failedSendDraft.serverRefused,
+          delivered: false,
+        },
+      });
+    }
     if (!isMobileRef.current) textareaRef.current?.focus();
   }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
+
+  // Retract a restored failed-send draft once its send proves delivered (its
+  // committed item arrived over the stream or a reconnect snapshot). Edits win:
+  // the text is cleared only while it is exactly what the restore put there.
+  useEffect(() => {
+    if (restoredSendDraft === null || !restoredSendDraft.delivered) return;
+    if (restoredSendDraft.conversationId !== conversationId) return;
+    if (settledConversationId !== conversationId) return;
+    useChatStore.setState({ restoredSendDraft: null });
+    const expected = serializeReplyDraft(
+      restoreReplyDraft(restoredSendDraft.text, restoredSendDraft.replyDraft),
+    );
+    const filesUnedited =
+      filesRef.current.length === restoredSendDraft.files.length &&
+      filesRef.current.every((f) => restoredSendDraft.files.includes(f));
+    if (valueRef.current !== expected || !filesUnedited) return;
+    replaceText("");
+    attachmentsRef.current.replaceFiles([]);
+    dirtyRef.current = false;
+    if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
+  }, [restoredSendDraft, conversationId, settledConversationId, replaceText]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -2990,14 +3006,55 @@ function ComposerImpl(
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
-      case "/compact":
+      case "/compact": {
         if (!showCompact) {
           setCommandError("/compact is not supported for this agent type");
+          return true;
+        }
+        if (
+          (sessionHarness === "codex-native" ||
+            sessionHarness === "claude-sdk" ||
+            sessionHarness === "pi-native") &&
+          arg
+        ) {
+          const harnessName = {
+            "codex-native": "Codex",
+            "pi-native": "Pi",
+            "claude-sdk": "Claude SDK",
+          }[sessionHarness];
+          setCommandError(`/compact does not accept arguments for ${harnessName}`);
+          return true;
+        }
+        const chat = useChatStore.getState();
+        if (
+          sessionHarness === "codex-native" &&
+          (chat.status === "streaming" || chat.sessionStatus === "running") &&
+          !shouldQueueSend(
+            chat.conversationId,
+            chat.status,
+            chat.sessionStatus,
+            chat.queuedMessages,
+            readAlwaysSteer(),
+          )
+        ) {
+          toast.error("Compact is disabled while a chat is in progress", { richColors: true });
           return true;
         }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
+        if (
+          sessionHarness === "claude-native" ||
+          sessionHarness === "claude-sdk" ||
+          sessionHarness === "codex-native" ||
+          sessionHarness === "pi-native"
+        ) {
+          // Use the message queue; the store dispatches SDK, Codex and Pi as controls.
+          const command = arg ? `/compact ${arg}` : "/compact";
+          appendEntry(command);
+          onSend(command);
+          return true;
+        }
         void useChatStore
           .getState()
           .compact()
@@ -3005,6 +3062,7 @@ function ComposerImpl(
             setCommandError(err instanceof Error ? err.message : "Compact failed");
           });
         return true;
+      }
       case "/effort": {
         if (!showEffort) return false;
         const valid = [...effortLevels, "default"];
@@ -3117,7 +3175,8 @@ function ComposerImpl(
       completeMenuSelection(cmd);
     } else {
       // Execute immediately — no argument needed.
-      setValue("");
+      // /compact clears its draft only after the busy guard accepts it.
+      if (cmd !== "/compact") setValue("");
       setCommandError(null);
       executeSlashCommand(cmd, "");
     }
@@ -3187,20 +3246,13 @@ function ComposerImpl(
       recallingRef.current = false;
     },
     startSideChat(selectedText) {
-      // Add the selection as a quote card (exactly like Reply) and mark the
-      // draft as opening a side chat. The user types their question below it;
-      // submit prefixes /side so it forks instead of replying inline.
-      if (disabled || isReadOnly || unreachable || composerLockedByBtw || !selectedText.trim()) {
+      // Open an empty side-chat rail tab right away with the selection quoted in
+      // its composer; the fork is created when the user sends from that tab.
+      const sourceId = useChatStore.getState().conversationId;
+      if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
         return;
       }
-      beginSideChatQuote(selectedText);
-      textareaRef.current = tailTextareaRef.current;
-      dirtyRef.current = true;
-      replyQuoteInsertedRef.current = true;
-      setCommandError(null);
-      dismissMention();
-      resetCursor();
-      recallingRef.current = false;
+      useChatStore.getState().openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
     },
   }));
 
@@ -3332,7 +3384,7 @@ function ComposerImpl(
         cmd in BUILTIN_SLASH_COMMANDS &&
         cmd in slashCommands
       ) {
-        executeSlashCommand(cmd, arg);
+        executeSlashCommand(cmd, cmd === "/compact" ? trimmed.slice(parts[0].length).trim() : arg);
         return;
       }
       // /side opens a side chat. Codex forks in-process (falls through to the
@@ -3382,18 +3434,7 @@ function ComposerImpl(
           index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
         ),
       };
-      const serialized = serializeReplyDraft(outgoing);
-      if (sideChat && usesNativeSideChatFork(sessionHarness)) {
-        // Codex: the /side pipeline keys off the leading command and forks
-        // in-process. No main-chat bubble is kept, so no reply-draft snapshot.
-        onSend(SIDE_CHAT_COMMAND_PREFIX + serialized, sendFiles);
-      } else if (sideChat && supportsSideChat(sessionHarness)) {
-        // Generic: fork onto a managed side chat, seeding its composer with the
-        // quoted selection + question (no main-chat bubble either).
-        openGenericSideChat(serialized);
-      } else {
-        onSend(serialized, sendFiles, snapshotReplyDraft(outgoing));
-      }
+      onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
       onSend(mentionPreamble + trimmed, sendFiles);
     }
@@ -3552,7 +3593,7 @@ function ComposerImpl(
   return (
     <form
       onSubmit={handleSubmit}
-      className="chat-composer-form relative px-4 pb-[max(20px,env(safe-area-inset-bottom))] md:px-6"
+      className="chat-composer-form relative px-6 pb-[max(20px,env(safe-area-inset-bottom))]"
     >
       {/* Hidden file input for the attach button */}
       <input
@@ -3708,40 +3749,29 @@ function ComposerImpl(
         slots={{
           inputPrefix:
             draft.quotes.length > 0 ? (
-              <>
-                {sideChat ? (
-                  <div
-                    data-testid="composer-side-chat-hint"
-                    className="mb-1 flex items-center gap-1 text-xs font-medium text-brand-accent"
-                  >
-                    <MessagesSquareIcon className="size-3" />
-                    Ask in a side chat forked from this main conversation
-                  </div>
-                ) : null}
-                <ReplyDraftBlocks
-                  quotes={draft.quotes}
-                  activeTextId={activeTextId}
-                  keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-                  disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
-                  onGrowth={onViewportShrinkPinScroll}
-                  onRemove={(id) => {
-                    removeQuote(id);
-                    resetCursor();
-                    recallingRef.current = false;
-                    textareaRef.current = tailTextareaRef.current;
-                    dirtyRef.current = true;
-                    dismissMention();
-                  }}
-                  inputFor={(quote) => ({
-                    onChange: (e) => handleTextChange(quote.id, e),
-                    onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
-                    onBlur: dismissMention,
-                    onKeyDown: handleKeyDown,
-                    onPaste,
-                    "data-has-draft": hasDraft ? "true" : undefined,
-                  })}
-                />
-              </>
+              <ReplyDraftBlocks
+                quotes={draft.quotes}
+                activeTextId={activeTextId}
+                keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
+                disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
+                onGrowth={onViewportShrinkPinScroll}
+                onRemove={(id) => {
+                  removeQuote(id);
+                  resetCursor();
+                  recallingRef.current = false;
+                  textareaRef.current = tailTextareaRef.current;
+                  dirtyRef.current = true;
+                  dismissMention();
+                }}
+                inputFor={(quote) => ({
+                  onChange: (e) => handleTextChange(quote.id, e),
+                  onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
+                  onBlur: dismissMention,
+                  onKeyDown: handleKeyDown,
+                  onPaste,
+                  "data-has-draft": hasDraft ? "true" : undefined,
+                })}
+              />
             ) : undefined,
           beforeInput: (
             <>

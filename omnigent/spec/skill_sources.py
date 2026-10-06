@@ -12,6 +12,7 @@ per-family provider. Unknown harnesses fall back to the generic host walk
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -377,8 +378,15 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
     return enabled | _managed_plugin_keys(ctx)
 
 
-def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[str, Path]:
-    """Map ``<plugin>@<marketplace>`` → installPath for enabled+installed plugins."""
+def _plugin_asset_id(key: str, kind: str, source: str = "") -> str:
+    """Stable inventory identity without exposing a plugin asset's filesystem path."""
+    return hashlib.sha256(json.dumps([key, kind, source]).encode()).hexdigest()
+
+
+def _plugin_install_paths(
+    ctx: SkillSourceContext, enabled: set[str] | None = None
+) -> dict[str, Path]:
+    """Map installed plugin keys to trusted paths, optionally filtering by enablement."""
     data = _read_json(_claude_user_dir(ctx) / "plugins" / "installed_plugins.json")
     if data is None:
         return {}
@@ -392,7 +400,7 @@ def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[st
     plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
-        if key not in enabled or not isinstance(entries, list):
+        if (enabled is not None and key not in enabled) or not isinstance(entries, list):
             continue
         # A plugin may have multiple scope entries (user/project); take the
         # first one carrying a usable installPath rather than assuming it's

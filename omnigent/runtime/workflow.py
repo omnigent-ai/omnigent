@@ -1159,6 +1159,14 @@ def _resolve_provider_for_build(
         # ambient detections, so a spec may name a detected provider too.
         providers = load_providers(effective_config_with_detected(explicit_config))
         entry = providers.get(auth.name)
+        if entry is None and os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
+            # The managed-sandbox overlay replaces the local providers block, so an
+            # explicitly named provider from ~/.omnigent/config.yaml would vanish.
+            # Server bindings already won above; fall back to the local config.
+            from omnigent.onboarding.provider_config import _load_config
+
+            local_providers = load_providers(effective_config_with_detected(_load_config()))
+            entry = local_providers.get(auth.name)
         if entry is None:
             raise OmnigentError(
                 f"executor.auth references provider {auth.name!r}, but no such provider is "

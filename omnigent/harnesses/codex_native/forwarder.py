@@ -1618,6 +1618,15 @@ class _OutputTextDeltaCoalescer:
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
 
 
+# Posted together so each token post is a self-contained cumulative snapshot;
+# older servers read an omitted cache count as zero cached tokens.
+_CUMULATIVE_TOKEN_KEYS = (
+    "cumulative_input_tokens",
+    "cumulative_cache_read_input_tokens",
+    "cumulative_output_tokens",
+)
+
+
 class _SessionUsageCoalescer:
     """
     Coalesce Codex token-usage updates before posting to AP.
@@ -1627,7 +1636,9 @@ class _SessionUsageCoalescer:
     (latest-only, deduped) so repeated frames collapse to one post. The
     caller flushes it per usage frame (so the web UI cost badge updates
     live mid-turn) and again at turn/session boundaries (a no-op when
-    nothing changed).
+    nothing changed). Cumulative token counts are posted as one group, so
+    a cache-miss turn still carries the unchanged cached total alongside
+    its grown input/output totals.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -1694,6 +1705,15 @@ class _SessionUsageCoalescer:
         if not data:
             self._pending.clear()
             return
+        if data.keys() & _CUMULATIVE_TOKEN_KEYS:
+            # Re-attach every cumulative count so the post stays self-contained:
+            # the latest pending value, else the last posted one when this frame
+            # omitted the field (older servers read an omitted count as zero).
+            for key in _CUMULATIVE_TOKEN_KEYS:
+                if key in self._pending:
+                    data[key] = self._pending[key]
+                elif key in self._last_posted:
+                    data[key] = self._last_posted[key]
         # Attach the model to every token-bearing post (not via the
         # changed-keys dedup, so it rides along even when only token
         # counts changed) — the server reprices cumulative tokens into

@@ -1,4 +1,5 @@
 import {
+  ArrowLeftIcon,
   BotIcon,
   EllipsisVerticalIcon,
   FileIcon,
@@ -7,6 +8,7 @@ import {
   GitForkIcon,
   InfoIcon,
   ListIcon,
+  MenuIcon,
   MessagesSquareIcon,
   PanelLeftIcon,
   PanelRightCloseIcon,
@@ -16,6 +18,7 @@ import {
   UserPlusIcon,
 } from "lucide-react";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -38,10 +41,12 @@ import type { Conversation } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
-import { MOBILE_GLASS_PILL, MOBILE_GLASS_SURFACE } from "./mobileGlass";
+import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { useCallback, useEffect, useRef, useState } from "react";
+
+const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
 /**
  * Gating flags + handlers for the mobile workspace-rail entries (Files ·
@@ -94,6 +99,12 @@ interface MobileSessionMenuProps {
   githubPanelOpen: boolean;
   /** Open the mobile GitHub drawer. */
   onOpenGithub: () => void;
+  /** True while the mobile side-chats drawer is open. */
+  sideChatsPanelOpen: boolean;
+  /** Whether the session's harness supports side chats. */
+  showSideChats: boolean;
+  /** Open the mobile side-chats drawer. */
+  onOpenSideChats: () => void;
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -108,6 +119,8 @@ interface ChatHeaderProps {
   sidebarOpen: boolean;
   /** Open the left sidebar. */
   onOpenSidebar: (peek?: boolean) => void;
+  /** Render the mobile settings-menu return affordance and fade. */
+  settingsMode?: boolean;
   /** Whether the active session is a sub-agent (appends its identity). */
   isChildSession: boolean;
   /**
@@ -203,7 +216,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
         aria-label="Session actions"
         title={PENDING_ACTION_TITLE}
         disabled
-        className="text-muted-foreground md:hidden max-md:size-11 max-md:rounded-full"
+        className="text-muted-foreground md:hidden max-md:size-11"
       >
         <EllipsisVerticalIcon className="size-4 max-md:size-5" />
       </Button>
@@ -305,6 +318,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
 export function ChatHeader({
   sidebarOpen,
   onOpenSidebar,
+  settingsMode = false,
   isChildSession,
   subAgentName,
   conversationId,
@@ -384,6 +398,7 @@ export function ChatHeader({
     !mobileMenu.subagentsPanelOpen &&
     !mobileMenu.shellsPanelOpen &&
     !mobileMenu.githubPanelOpen &&
+    !mobileMenu.sideChatsPanelOpen &&
     (hasRailContent || mobileMenu.debugMode) ? (
       <>
         {showFilesPanel && (
@@ -441,6 +456,15 @@ export function ChatHeader({
               : mobileMenu.agentCount}
           </span>
         </DropdownMenuItem>
+        {mobileMenu.showSideChats && (
+          <DropdownMenuItem
+            onSelect={mobileMenu.onOpenSideChats}
+            className="gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <MessagesSquareIcon className="size-4" />
+            Side chats
+          </DropdownMenuItem>
+        )}
         {/* Shells — the mobile entry into the session's shells
             (desktop has no Shells tab; it opens shells as soft tabs):
             visible when a real shell exists, or when the agent spec
@@ -543,7 +567,8 @@ export function ChatHeader({
         // Scrolled chat text can't render through the controls because the
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)] md:transition-[right] md:duration-300 md:ease-in-out",
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        settingsMode && "settings-mobile-header",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -577,7 +602,7 @@ export function ChatHeader({
                 // Match the right-panel toggle's 24px icon-xs geometry on
                 // desktop; mobile keeps its larger touch target below.
                 size="icon-xs"
-                aria-label="Open sidebar"
+                aria-label={settingsMode ? "Back to settings menu" : "Open sidebar"}
                 componentId="chat.header.open_sidebar"
                 onClick={() => {
                   cancelPeek();
@@ -588,20 +613,25 @@ export function ChatHeader({
                 // the same dwell-to-peek) and this would be a second, offset
                 // copy of it. Kept everywhere else, where it is the ONLY way to
                 // reopen a collapsed sidebar.
-                className={cn(
-                  "chat-header-sidebar-toggle border-none text-muted-foreground hover:text-foreground max-md:size-11",
-                  MOBILE_GLASS_PILL,
-                )}
+                className="chat-header-sidebar-toggle border-none text-muted-foreground hover:text-foreground max-md:size-11"
                 onPointerEnter={onPeekSidebar}
                 onPointerDown={cancelPeek}
                 onPointerLeave={cancelPeek}
               >
-                <PanelLeftIcon className="size-4 max-md:size-5" />
+                {settingsMode ? (
+                  <ArrowLeftIcon className="size-4 max-md:size-5" />
+                ) : isMobile ? (
+                  <MenuIcon className="size-5" />
+                ) : (
+                  <PanelLeftIcon className="size-4" />
+                )}
               </Button>
             </TooltipTrigger>
             {/* Bottom placement keeps the tooltip clear of the macOS
                 Electron shell's traffic lights at the window's top edge. */}
-            <TooltipContent side="bottom">Open sidebar</TooltipContent>
+            <TooltipContent side="bottom">
+              {settingsMode ? "Back to settings menu" : "Open sidebar"}
+            </TooltipContent>
           </Tooltip>
         )}
         {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
@@ -629,12 +659,7 @@ export function ChatHeader({
         )}
       </div>
 
-      <div
-        className={cn(
-          "flex items-center gap-2 max-md:gap-0 max-md:empty:hidden",
-          MOBILE_GLASS_PILL,
-        )}
-      >
+      <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
@@ -695,7 +720,7 @@ export function ChatHeader({
                   size="icon"
                   aria-label="Session actions"
                   data-testid="session-actions-menu"
-                  className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11 max-md:rounded-full"
+                  className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11"
                 >
                   <EllipsisVerticalIcon className="size-4 max-md:size-5" />
                 </Button>
@@ -813,6 +838,7 @@ export function ChatHeader({
                 variant="ghost"
                 size="icon-xs"
                 aria-label={rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
+                aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+]`}
                 onClick={onToggleRightPanel}
                 componentId="chat.header.toggle_right_panel"
                 className="hidden md:inline-flex text-muted-foreground hover:text-foreground border-none"
@@ -824,8 +850,8 @@ export function ChatHeader({
                 )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>
-              {rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
+            <TooltipContent shortcut={RIGHT_PANEL_KEYS}>
+              <span>{rightPanelOpen ? "Collapse right panel" : "Expand right panel"}</span>
             </TooltipContent>
           </Tooltip>
         )}

@@ -57,6 +57,12 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         monkeypatch.delenv(var, raising=False)
         monkeypatch.delenv(f"OMNIGENT_{var}", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))  # ~/.databrickscfg, gcloud ADC, …
+    # OpenCode readiness keys off its provider env vars, including the AWS
+    # credential-chain variables that autoload Bedrock.
+    import omnigent.onboarding.opencode_auth as _oc
+
+    for _provider_id, _label, var in _oc._ENV_PROVIDER_VARS:
+        monkeypatch.delenv(var, raising=False)
     import omnigent.onboarding.databricks_config as _dbc
     from omnigent.onboarding import ambient as _ambient
 
@@ -259,6 +265,40 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
     result = configured_harness_map()
     assert result["claude-native"] == "needs-auth"
     assert result["opencode-native"] == "needs-auth"
+
+
+def test_opencode_ready_via_bedrock_profile_without_stored_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
+    config_dir = tmp_path / "config" / "opencode"
+    config_dir.mkdir(parents=True)
+    (config_dir / "opencode.json").write_text(
+        '{"provider": {"amazon-bedrock": {"options": {"profile": "work"}}}}',
+        encoding="utf-8",
+    )
+
+    result = configured_harness_map()
+    for harness in ("opencode", "opencode-native", "native-opencode"):
+        assert result[harness] is True
+
+
+def test_opencode_ready_via_aws_credential_env_without_stored_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``AWS_PROFILE`` alone readies OpenCode: it autoloads Bedrock from the AWS
+    credential chain, so no ``auth.json``, provider key, or ``opencode.json``
+    block is needed and the picker map must not warn ``needs-auth``."""
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
+    monkeypatch.setenv("AWS_PROFILE", "work")
+
+    result = configured_harness_map()
+    for harness in ("opencode", "opencode-native", "native-opencode"):
+        assert result[harness] is True
 
 
 def test_claude_ready_via_configured_provider_without_cli_login(

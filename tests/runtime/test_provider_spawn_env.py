@@ -756,6 +756,89 @@ def test_named_provider_auth_missing_provider_fails_loud(config_home: Path) -> N
         _build_claude_sdk_spawn_env(spec, workdir=None)
 
 
+def test_named_provider_auth_survives_inference_config_overlay(
+    config_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    ``executor.auth: {type: provider, name: X}`` finds the local provider even
+    when ``OMNIGENT_INFERENCE_CONFIG`` is active and would otherwise displace it.
+
+    Regression guard for OMNI-11616.  The Databricks App server sets
+    ``OMNIGENT_INFERENCE_CONFIG`` with its own server-side providers.
+    ``load_runtime_inference_config`` overlays those providers on top of the
+    user's ``~/.omnigent/config.yaml``, wiping the user's custom gateway entry.
+    A custom agent spec that explicitly names this provider via
+    ``executor.auth: {type: provider, name: databricks-uc-gateway}`` must still
+    be routed through it — the overlay should not prevent the user's own
+    explicitly-declared provider from being used.
+
+    The fix in ``_resolve_provider_for_build``: when the provider is absent from
+    the overlay config, fall back to the raw local config and try there.  This
+    lets the explicit ``ProviderAuth`` win; server harness-bindings (the
+    ``resolve_bound_provider`` early-return path) still take precedence.
+    """
+    import json
+
+    # User's ~/.omnigent/config.yaml has their custom gateway provider.
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "databricks-uc-gateway": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": (
+                            "https://fevm-srijit-nair-ci-demo.cloud.databricks.com"
+                            "/ai-gateway/anthropic"
+                        ),
+                        "auth_command": (
+                            "env -u DATABRICKS_CONFIG_PROFILE "
+                            "databricks auth token -p ci-demo | jq -r .access_token"
+                        ),
+                        "models": {"default": "databricks-claude-sonnet-4-5"},
+                    },
+                }
+            }
+        },
+    )
+
+    # The managed sandbox sets OMNIGENT_INFERENCE_CONFIG with server-side
+    # providers that do NOT include 'databricks-uc-gateway'.
+    server_inference = {
+        "providers": {
+            "some-server-gateway": {
+                "kind": "gateway",
+                "anthropic": {
+                    "base_url": "https://server.databricks.com/ai-gateway/anthropic",
+                    "auth_command": "echo server-token",
+                    "models": {"default": "server-model"},
+                },
+            }
+        },
+        "inference": {},
+    }
+    inference_path = tmp_path / "inference.json"
+    inference_path.write_text(json.dumps(server_inference))
+    monkeypatch.setenv("OMNIGENT_INFERENCE_CONFIG", str(inference_path))
+
+    spec = _make_spec(harness="claude-sdk", auth=ProviderAuth(name="databricks-uc-gateway"))
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    # The user's custom gateway provider must win.
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
+    assert (
+        env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"]
+        == "https://fevm-srijit-nair-ci-demo.cloud.databricks.com/ai-gateway/anthropic"
+    )
+    assert "databricks auth token -p ci-demo" in env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"]
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-sonnet-4-5"
+    # The server's gateway must not have leaked in.
+    assert "server.databricks.com" not in env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"]
+
+
 # ── Per-family selection through the spawn path ─────────────────────────────
 
 

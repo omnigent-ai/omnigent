@@ -1,3 +1,4 @@
+import { testAgent } from "@/test/agentFixtures";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -15,7 +16,7 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
     error: null,
   })),
 }));
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
@@ -69,7 +70,12 @@ import {
   useInstallingHarnesses,
   type Host,
 } from "@/hooks/useHosts";
-import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import {
+  fetchUserAgents,
+  useAvailableAgents,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
+import { installAgentBundle } from "@/lib/agentsApi";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
@@ -206,7 +212,10 @@ vi.mock("@/components/ui/toast", () => ({ showToast: showToastMock }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
+  fetchUserAgents: vi.fn(),
+  USER_AGENTS_QUERY_KEY: ["available-agents-user"],
 }));
+vi.mock("@/lib/agentsApi", () => ({ installAgentBundle: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
@@ -390,22 +399,8 @@ const CODEX_MODEL_OPTIONS_RESULT = {
   ],
 };
 const DEFAULT_LANDING_AGENTS: AvailableAgent[] = [
-  {
-    id: "a1",
-    name: "claude-native-ui",
-    display_name: "Claude Code",
-    description: null,
-    harness: "claude-native",
-    skills: [],
-  },
-  {
-    id: "a2",
-    name: "codex-native-ui",
-    display_name: "Codex",
-    description: null,
-    harness: "codex-native",
-    skills: [],
-  },
+  testAgent("a1", "claude-native-ui", { display_name: "Claude Code", harness: "claude-native" }),
+  testAgent("a2", "codex-native-ui", { display_name: "Codex", harness: "codex-native" }),
 ];
 
 const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
@@ -498,13 +493,7 @@ describe("resolveThisMachineHostId", () => {
   });
 });
 
-// Workspace validation contract — pins the same shape the server
-// validator enforces (per designs/SESSION_WORKSPACE_SELECTION.md):
-// tilde-prefixed and relative paths are rejected; only
-// fully-absolute paths starting with `/` are accepted. If this
-// drifts out of sync with the server, the submit button would
-// either let through requests the server rejects (opaque 400) or
-// block requests the server would accept (button stuck disabled).
+// Keep the submit gate aligned with the server's workspace validation.
 describe("isValidWorkspace", () => {
   it("accepts a fully absolute path", () => {
     expect(isValidWorkspace("/Users/corey/projects/myapp")).toBe(true);
@@ -545,6 +534,25 @@ describe("isValidWorkspace", () => {
     expect(isValidWorkspace("projects/myapp")).toBe(false);
     expect(isValidWorkspace("./myapp")).toBe(false);
     expect(isValidWorkspace("../myapp")).toBe(false);
+  });
+
+  it("accepts Windows drive-letter paths", () => {
+    expect(isValidWorkspace("C:\\Users\\alice\\work")).toBe(true);
+    expect(isValidWorkspace("C:/Users/alice/work")).toBe(true);
+    expect(isValidWorkspace("c:\\work")).toBe(true);
+    expect(isValidWorkspace("  C:\\Users\\alice  ")).toBe(true);
+  });
+
+  it("rejects a bare drive letter and non-drive colon shapes", () => {
+    // "C:" without a separator is drive-relative on Windows, not absolute.
+    expect(isValidWorkspace("C:")).toBe(false);
+    expect(isValidWorkspace("C:work")).toBe(false);
+  });
+
+  it("rejects backslash UNC paths, matching the server", () => {
+    // validate_workspace only admits /-prefixed or drive-letter paths, so
+    // accepting \\server\share here would surface an opaque 400 on submit.
+    expect(isValidWorkspace("\\\\server\\share")).toBe(false);
   });
 });
 
@@ -1741,15 +1749,24 @@ describe("NewChatLandingScreen initial picker loading", () => {
         "Working directory: No host selected",
       );
       expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeDisabled();
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).not.toHaveTextContent(
+        "No host selected",
+      );
       expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveAccessibleName(
         "No host selected",
       );
       expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeDisabled();
+      expect(screen.getByTestId("new-chat-landing-branch-chip")).not.toHaveTextContent(
+        "No host selected",
+      );
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
         "No host selected",
       );
       expect(screen.getByTestId("new-chat-landing-agent-select")).toBeDisabled();
-      expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent(
+      expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+        "Permission mode: No host selected",
+      );
+      expect(screen.getByTestId("new-chat-landing-permission-chip")).not.toHaveTextContent(
         "No host selected",
       );
       expect(screen.getByTestId("new-chat-landing-permission-chip")).toBeDisabled();
@@ -3236,16 +3253,30 @@ describe("NewChatLandingScreen", () => {
     const actions = screen.getByTestId("new-chat-landing-actions");
     const landingContent = screen.getByTestId("new-chat-landing").firstElementChild;
 
-    expect(screen.getByTestId("new-chat-landing")).toHaveClass("pb-24");
-    expect(landingContent).toHaveClass("max-w-[800px]", "px-4");
+    expect(screen.getByTestId("new-chat-landing")).toHaveClass(
+      "min-h-0",
+      "items-stretch",
+      "md:items-center",
+      "md:pb-24",
+    );
+    expect(screen.getByTestId("new-chat-landing")).not.toHaveClass("pb-24");
+    expect(landingContent).toHaveClass(
+      "min-h-0",
+      "max-w-[800px]",
+      "px-4",
+      "pb-[max(20px,env(safe-area-inset-bottom))]",
+      "md:pb-16",
+    );
+    expect(landingContent?.firstElementChild).toHaveClass("flex-1", "md:flex-none");
     expect(composerSurface.firstElementChild).toBe(workspaceControls);
     expect(workspaceControls).toContainElement(workspace);
     expect(workspaceControls.nextElementSibling).toBe(composer.closest("form"));
-    expect(composerSurface).toHaveClass("gap-0");
+    expect(composerSurface).toHaveClass("gap-0", "max-md:w-[calc(100%-1rem)]");
     expect(workspaceControls).toHaveClass(
       "mx-3",
       "-mb-px",
-      "h-[37px]",
+      "h-7",
+      "md:h-[37px]",
       "min-w-0",
       "items-center",
       "gap-0.5",
@@ -3254,8 +3285,10 @@ describe("NewChatLandingScreen", () => {
       "border",
       "border-b-0",
       "composer-workspace-surface",
-      "px-3",
-      "py-1.5",
+      "px-2",
+      "py-0.5",
+      "md:px-3",
+      "md:py-1.5",
     );
     expect(workspace).toHaveClass("h-6", "gap-1", "rounded-md", "px-1", "text-xs", "leading-4");
     expect(composer).not.toHaveClass("min-h-[105px]");
@@ -3845,14 +3878,10 @@ describe("NewChatLandingScreen", () => {
     (native) => {
       const agentId = `a_${native.key}`;
       mockAgents([
-        {
-          id: agentId,
-          name: native.agentName,
+        testAgent(agentId, native.agentName, {
           display_name: native.displayName,
-          description: null,
           harness: native.harness,
-          skills: [],
-        },
+        }),
       ]);
       renderLanding();
       fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
@@ -3879,14 +3908,11 @@ describe("NewChatLandingScreen", () => {
     (key) => {
       mockAgents(
         NATIVE_CODING_AGENTS.filter((native) => native.key === "claude" || native.key === key).map(
-          (native) => ({
-            id: `a_${native.key}`,
-            name: native.agentName,
-            display_name: native.displayName,
-            description: null,
-            harness: native.harness,
-            skills: [],
-          }),
+          (native) =>
+            testAgent(`a_${native.key}`, native.agentName, {
+              display_name: native.displayName,
+              harness: native.harness,
+            }),
         ),
       );
       renderLanding();
@@ -4000,22 +4026,8 @@ describe("NewChatLandingScreen", () => {
 
   const catalogAgents: AvailableAgent[] = [
     ...DEFAULT_LANDING_AGENTS,
-    {
-      id: "a3",
-      name: "devin-native-ui",
-      display_name: "Devin",
-      description: null,
-      harness: "devin-native",
-      skills: [],
-    },
-    {
-      id: "a4",
-      name: "pi-native-ui",
-      display_name: "Pi",
-      description: null,
-      harness: "pi-native",
-      skills: [],
-    },
+    testAgent("a3", "devin-native-ui", { display_name: "Devin", harness: "devin-native" }),
+    testAgent("a4", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
   ];
   const catalogHarnesses = ["claude-native", "codex-native", "pi-native", "devin-native"];
   const readyCatalogs = Object.fromEntries(catalogHarnesses.map((harness) => [harness, true]));
@@ -4151,14 +4163,7 @@ describe("NewChatLandingScreen", () => {
     (savedModel) => {
       mockAgents([
         ...DEFAULT_LANDING_AGENTS,
-        {
-          id: "a3",
-          name: "devin-native-ui",
-          display_name: "Devin",
-          description: null,
-          harness: "devin-native",
-          skills: [],
-        },
+        testAgent("a3", "devin-native-ui", { display_name: "Devin", harness: "devin-native" }),
       ]);
       mockHosts([
         { ...host("online"), configured_harnesses: { ...readyCatalogs, "devin-native": false } },
@@ -4220,22 +4225,11 @@ describe("NewChatLandingScreen", () => {
     // config-content gate and the models-section gate must honour that flag, or a
     // Devin chat opens with no way to pick a model or effort at launch.
     mockAgents([
-      {
-        id: "a1",
-        name: "claude-native-ui",
+      testAgent("a1", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
-        skills: [],
-      },
-      {
-        id: "a3",
-        name: "devin-native-ui",
-        display_name: "Devin",
-        description: null,
-        harness: "devin-native",
-        skills: [],
-      },
+      }),
+      testAgent("a3", "devin-native-ui", { display_name: "Devin", harness: "devin-native" }),
     ]);
     mockHosts([{ ...host("online"), configured_harnesses: { "devin-native": true } } as Host]);
     useHostModelOptionsMock.mockImplementation(
@@ -4298,14 +4292,7 @@ describe("NewChatLandingScreen", () => {
       ],
     };
     mockAgents([
-      {
-        id: "a3",
-        name: "devin-native-ui",
-        display_name: "Devin",
-        description: null,
-        harness: "devin-native",
-        skills: [],
-      },
+      testAgent("a3", "devin-native-ui", { display_name: "Devin", harness: "devin-native" }),
     ]);
     mockHosts([{ ...host("online"), configured_harnesses: { "devin-native": true } } as Host]);
     useHostModelOptionsMock.mockImplementation(
@@ -4687,14 +4674,7 @@ describe("NewChatLandingScreen", () => {
   it("names the Pi default model in the harness trigger from the host catalog", () => {
     mockAgents([
       ...DEFAULT_LANDING_AGENTS,
-      {
-        id: "a4",
-        name: "pi-native-ui",
-        display_name: "Pi",
-        description: null,
-        harness: "pi-native",
-        skills: [],
-      },
+      testAgent("a4", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
     ]);
     mockModelQueries((harness) =>
       harness === "pi-native"
@@ -4836,16 +4816,7 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("names Pi model and thinking-level details in the harness trigger", () => {
-    mockAgents([
-      {
-        id: "a_pi",
-        name: "pi-native-ui",
-        display_name: "Pi",
-        description: null,
-        harness: "pi-native",
-        skills: [],
-      },
-    ]);
+    mockAgents([testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" })]);
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
@@ -4995,54 +4966,18 @@ describe("NewChatLandingScreen", () => {
 
   it("orders native built-ins together in the agent picker", () => {
     mockAgents([
-      {
-        id: "a_pi",
-        name: "pi-native-ui",
-        display_name: "Pi",
-        description: null,
-        harness: "pi-native",
-        skills: [],
-      },
-      {
-        id: "a_kiro",
-        name: "kiro-native-ui",
-        display_name: "Kiro",
-        description: null,
-        harness: "kiro-native",
-        skills: [],
-      },
-      {
-        id: "a_cursor",
-        name: "cursor-native-ui",
+      testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
+      testAgent("a_kiro", "kiro-native-ui", { display_name: "Kiro", harness: "kiro-native" }),
+      testAgent("a_cursor", "cursor-native-ui", {
         display_name: "Cursor",
-        description: null,
         harness: "cursor-native",
-        skills: [],
-      },
-      {
-        id: "a_codex",
-        name: "codex-native-ui",
-        display_name: "Codex",
-        description: null,
-        harness: "codex-native",
-        skills: [],
-      },
-      {
-        id: "a_claude",
-        name: "claude-native-ui",
+      }),
+      testAgent("a_codex", "codex-native-ui", { display_name: "Codex", harness: "codex-native" }),
+      testAgent("a_claude", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
-        skills: [],
-      },
-      {
-        id: "a_polly",
-        name: "polly",
-        display_name: "Polly",
-        description: null,
-        harness: "claude-sdk",
-        skills: [],
-      },
+      }),
+      testAgent("a_polly", "polly", { display_name: "Polly", harness: "claude-sdk" }),
     ]);
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
@@ -5077,22 +5012,11 @@ describe("NewChatLandingScreen", () => {
 
   it("promotes the selected secondary harness on reopen without interrupting configuration", () => {
     mockAgents([
-      {
-        id: "a_claude",
-        name: "claude-native-ui",
+      testAgent("a_claude", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
-        skills: [],
-      },
-      {
-        id: "a_pi",
-        name: "pi-native-ui",
-        display_name: "Pi",
-        description: null,
-        harness: "pi-native",
-        skills: [],
-      },
+      }),
+      testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
     ]);
     renderLanding();
     const picker = screen.getByTestId("new-chat-landing-agent-select");
@@ -5127,22 +5051,14 @@ describe("NewChatLandingScreen", () => {
   // cursor-native as unconfigured on this machine.
   function mockHostWithHarnessReadiness() {
     mockAgents([
-      {
-        id: "a1",
-        name: "claude-native-ui",
+      testAgent("a1", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
-        skills: [],
-      },
-      {
-        id: "a_cursor",
-        name: "cursor-native-ui",
+      }),
+      testAgent("a_cursor", "cursor-native-ui", {
         display_name: "Cursor",
-        description: null,
         harness: "cursor-native",
-        skills: [],
-      },
+      }),
     ]);
     mockHosts([
       {
@@ -5228,16 +5144,7 @@ describe("NewChatLandingScreen", () => {
         },
       } as Host,
     ]);
-    mockAgents([
-      {
-        id: "a_polly",
-        name: "polly",
-        display_name: "Polly",
-        description: null,
-        harness: "claude-sdk",
-        skills: [],
-      },
-    ]);
+    mockAgents([testAgent("a_polly", "polly", { display_name: "Polly", harness: "claude-sdk" })]);
   }
 
   it("lists every brain harness in a bundle agent's override select by default", () => {
@@ -5270,22 +5177,11 @@ describe("NewChatLandingScreen", () => {
 
   function mockClaudeAndPi() {
     mockAgents([
-      {
-        id: "a_claude",
-        name: "claude-native-ui",
+      testAgent("a_claude", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
-        skills: [],
-      },
-      {
-        id: "a_pi",
-        name: "pi-native-ui",
-        display_name: "Pi",
-        description: null,
-        harness: "pi-native",
-        skills: [],
-      },
+      }),
+      testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
     ]);
   }
 
@@ -6676,6 +6572,7 @@ describe("NewChatLandingScreen", () => {
     // connect-host proves the menu actually opened — without it, a closed
     // menu would make the absence assertion below pass vacuously.
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
+    expect(screen.getByText("My machines")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
   });
 
@@ -6909,7 +6806,9 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     await screen.findByTestId("new-chat-landing-input");
-    expect(screen.getByText("What should we build?")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "What should we build?" })).toHaveClass(
+      "text-[24px]",
+    );
     expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull();
   });
 
@@ -7318,17 +7217,14 @@ describe("NewChatLandingScreen skills menu", () => {
 
   /** A non-native agent carrying two bundled skills. */
   function skilledAgent(): AvailableAgent {
-    return {
-      id: "ag_skilled",
-      name: "skilled-agent",
+    return testAgent("ag_skilled", "skilled-agent", {
       display_name: "Skilled Agent",
-      description: null,
       harness: "claude-sdk",
       skills: [
         { name: "review-pr", description: "Review a pull request" },
         { name: "cross-review", description: "Cross-vendor review" },
       ],
-    };
+    });
   }
 
   function typeMessage(text: string) {
@@ -7582,6 +7478,18 @@ describe("NewChatLandingScreen skills menu", () => {
     },
   );
 
+  it("preserves adjacent prose after a partial inline skill", async () => {
+    mockAgents([skilledAgent()]);
+    renderLanding();
+    typeMessage("please /revthis change");
+    const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    await userEvent.click(input);
+    fireEvent.select(input, { target: { selectionStart: 11, selectionEnd: 11 } });
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(input).toHaveValue("please /review-pr this change");
+    await waitFor(() => expect(input.selectionStart).toBe(18));
+  });
+
   it.each([" then /rev", "\nkeep this", "\tkeep this"])(
     "keeps completion at the caret before %j",
     async (suffix) => {
@@ -7684,14 +7592,11 @@ describe("NewChatLandingScreen skills menu", () => {
 
   it("offers skills for native terminal agents", () => {
     mockAgents([
-      {
-        id: "a1",
-        name: "claude-native-ui",
+      testAgent("a1", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
         skills: [{ name: "review-pr", description: "Review a pull request" }],
-      },
+      }),
     ]);
     renderLanding();
     typeMessage("/");
@@ -7700,14 +7605,11 @@ describe("NewChatLandingScreen skills menu", () => {
 
   it("uses the dollar prefix for Codex native skills", () => {
     mockAgents([
-      {
-        id: "codex-native",
-        name: "codex-native-ui",
+      testAgent("codex-native", "codex-native-ui", {
         display_name: "Codex",
-        description: null,
         harness: "codex-native",
         skills: [{ name: "allowed", description: "Run an allowed workflow" }],
-      },
+      }),
     ]);
     renderLanding();
     typeMessage("/allow");
@@ -7730,9 +7632,7 @@ describe("NewChatLandingScreen skill pills", () => {
 
   /** Debby — allowlisted for pills, carrying two bundled skills. */
   function debbyAgent(): AvailableAgent {
-    return {
-      id: "ag_debby",
-      name: "debby",
+    return testAgent("ag_debby", "debby", {
       display_name: "Debby",
       description: "Multi-agent debate",
       harness: "claude-sdk",
@@ -7740,7 +7640,7 @@ describe("NewChatLandingScreen skill pills", () => {
         { name: "debate", description: "Have both heads argue it out" },
         { name: "compare", description: "Side-by-side answers from both heads" },
       ],
-    };
+    });
   }
 
   function input(): HTMLTextAreaElement {
@@ -7773,14 +7673,11 @@ describe("NewChatLandingScreen skill pills", () => {
     // ever degrades to "any agent with skills", which would spam the
     // landing screen for every custom agent.
     mockAgents([
-      {
-        id: "ag_other",
-        name: "skilled-agent",
+      testAgent("ag_other", "skilled-agent", {
         display_name: "Skilled Agent",
-        description: null,
         harness: "claude-sdk",
         skills: [{ name: "review-pr", description: "Review a pull request" }],
-      },
+      }),
     ]);
     renderLanding();
     expect(screen.queryByTestId("skill-pills")).toBeNull();
@@ -7791,14 +7688,10 @@ describe("NewChatLandingScreen skill pills", () => {
     // default selection — no pills until the user picks her. This is the
     // core interaction: click debby in the picker, her skills appear.
     mockAgents([
-      {
-        id: "a1",
-        name: "claude-native-ui",
+      testAgent("a1", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
-        skills: [],
-      },
+      }),
       debbyAgent(),
     ]);
     renderLanding();
@@ -8144,14 +8037,11 @@ describe("NewChatLandingScreen paste", () => {
     // ``files.length === 0``), the landing menu only reads the drafted text,
     // so it stays open after the paste.
     mockAgents([
-      {
-        id: "ag_skilled",
-        name: "skilled-agent",
+      testAgent("ag_skilled", "skilled-agent", {
         display_name: "Skilled Agent",
-        description: null,
         harness: "claude-sdk",
         skills: [{ name: "review-pr", description: "Review a pull request" }],
-      },
+      }),
     ]);
     renderLanding();
     const input = screen.getByTestId("new-chat-landing-input");
@@ -8254,14 +8144,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
   it("does NOT open the menu for a non-native (SDK) agent", () => {
     // Gate parity with the in-session composer: mentions are native-only.
     mockAgents([
-      {
-        id: "sdk1",
-        name: "my-sdk-agent",
-        display_name: "SDK Agent",
-        description: null,
-        harness: "claude-sdk",
-        skills: [],
-      },
+      testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
     ]);
     renderLanding();
     fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
@@ -8503,14 +8386,10 @@ describe("NewChatLandingScreen agent picker + Edit settings", () => {
 
   it("hides Edit for a harness with no configurable settings", () => {
     mockAgents([
-      {
-        id: "a_bare",
-        name: "opencode-native-ui",
+      testAgent("a_bare", "opencode-native-ui", {
         display_name: "OpenCode",
-        description: null,
         harness: "opencode-native",
-        skills: [],
-      },
+      }),
     ]);
     renderLanding({ smart_routing_enabled: true });
     openPicker();
@@ -8576,6 +8455,24 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     }
   });
 
+  it("lists your own agent on a native harness under Other..., not among the harnesses", async () => {
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("ag_orion", "orion", {
+        display_name: "Orion",
+        harness: "claude-native",
+        builtin: false,
+        mine: true,
+      }),
+    ]);
+    renderLanding({ agent_install: true });
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-agent-ag_orion")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    expect(await screen.findByTestId("new-chat-landing-agent-ag_orion")).toBeVisible();
+  });
+
   it("cancels a custom agent without replacing the selected agent", async () => {
     renderLanding();
     const agentPicker = screen.getByTestId("new-chat-landing-agent-select");
@@ -8594,6 +8491,69 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     expect(agentPicker).toHaveAccessibleName(/Claude Code/);
     fireEvent.pointerDown(agentPicker, { button: 0 });
     expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();
+  });
+
+  it("hides Import bundle on a server without agent install", async () => {
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+    await screen.findByTestId("create-agent-dialog");
+    expect(screen.queryByTestId("create-agent-import")).toBeNull();
+  });
+
+  it("imports a bundle and selects it from your refreshed agents", async () => {
+    // The merged picker query may still be waiting on sessions; selection must
+    // come from your agents the import refetches, not the merged cache.
+    const orion: AvailableAgent = {
+      id: "ag_orion",
+      name: "orion",
+      display_name: "Orion",
+      description: null,
+      harness: "claude-sdk",
+      skills: [],
+    };
+    vi.mocked(installAgentBundle).mockResolvedValue({ id: "ag_orion", name: "orion" });
+    vi.mocked(fetchUserAgents).mockResolvedValue([orion]);
+    mockAgents([...DEFAULT_LANDING_AGENTS, orion]);
+    renderLanding({ agent_install: true });
+
+    const agentPicker = screen.getByTestId("new-chat-landing-agent-select");
+    fireEvent.pointerDown(agentPicker, { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+    await screen.findByTestId("create-agent-dialog");
+    fireEvent.change(screen.getByTestId("create-agent-import-input"), {
+      target: { files: [new File([new Uint8Array([0x1f, 0x8b])], "orion.tar.gz")] },
+    });
+
+    await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
+    expect(fetchUserAgents).toHaveBeenCalled();
+    await waitFor(() => expect(agentPicker).toHaveAccessibleName(/Orion/));
+  });
+
+  it("says so when an imported agent is missing from the picker list", async () => {
+    vi.mocked(installAgentBundle).mockResolvedValue({ id: "ag_orion", name: "orion" });
+    vi.mocked(fetchUserAgents).mockResolvedValue([]);
+    // The refreshed picker list exists but lacks the import.
+    const lists = vi
+      .spyOn(QueryClient.prototype, "getQueriesData")
+      .mockReturnValue([[["available-agents"], DEFAULT_LANDING_AGENTS]]);
+    onTestFinished(() => lists.mockRestore());
+    renderLanding({ agent_install: true });
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+    await screen.findByTestId("create-agent-dialog");
+    fireEvent.change(screen.getByTestId("create-agent-import-input"), {
+      target: { files: [new File([new Uint8Array([0x1f, 0x8b])], "orion.tar.gz")] },
+    });
+
+    expect(await screen.findByTestId("create-agent-import-error")).toHaveTextContent(
+      "Installed orion, but couldn't select it: it is not in the agent list",
+    );
+    expect(screen.getByTestId("create-agent-dialog")).toBeInTheDocument();
   });
 
   // Switch the target to the connected host, then create + submit a pending
@@ -8711,14 +8671,11 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     (key) => {
       mockAgents(
         NATIVE_CODING_AGENTS.filter((native) => native.key === "claude" || native.key === key).map(
-          (native) => ({
-            id: `a_${native.key}`,
-            name: native.agentName,
-            display_name: native.displayName,
-            description: null,
-            harness: native.harness,
-            skills: [],
-          }),
+          (native) =>
+            testAgent(`a_${native.key}`, native.agentName, {
+              display_name: native.displayName,
+              harness: native.harness,
+            }),
         ),
       );
       renderLanding();
@@ -8736,14 +8693,12 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     mockAgents(
       NATIVE_CODING_AGENTS.filter((native) =>
         ["claude", "pi", "opencode"].includes(native.key),
-      ).map((native) => ({
-        id: `a_${native.key}`,
-        name: native.agentName,
-        display_name: native.displayName,
-        description: null,
-        harness: native.harness,
-        skills: [],
-      })),
+      ).map((native) =>
+        testAgent(`a_${native.key}`, native.agentName, {
+          display_name: native.displayName,
+          harness: native.harness,
+        }),
+      ),
     );
     renderLanding();
     openPicker();
@@ -8763,22 +8718,14 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
   it("drills into the custom-agent Other page in place and returns via Back", () => {
     // A custom (non-builtin) agent lands in the custom-agent group.
     mockAgents([
-      {
-        id: "a1",
-        name: "claude-native-ui",
+      testAgent("a1", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
-        skills: [],
-      },
-      {
-        id: "ag_custom",
-        name: "my-custom-agent",
+      }),
+      testAgent("ag_custom", "my-custom-agent", {
         display_name: "My Custom Agent",
-        description: null,
         harness: "claude-sdk",
-        skills: [],
-      },
+      }),
     ]);
     renderLanding();
     openPicker();
@@ -8796,22 +8743,14 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
 
   it("drills into the Other page for secondary harnesses", () => {
     mockAgents([
-      {
-        id: "a1",
-        name: "claude-native-ui",
+      testAgent("a1", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
-        skills: [],
-      },
-      {
-        id: "a_opencode",
-        name: "opencode-native-ui",
+      }),
+      testAgent("a_opencode", "opencode-native-ui", {
         display_name: "OpenCode",
-        description: null,
         harness: "opencode-native",
-        skills: [],
-      },
+      }),
     ]);
     renderLanding();
     openPicker();
@@ -8869,14 +8808,10 @@ describe("NewChatLandingScreen smart routing", () => {
 
   it("keeps non-routable Cursor modes in the hand menu", () => {
     mockAgents([
-      {
-        id: "a_cursor",
-        name: "cursor-native-ui",
+      testAgent("a_cursor", "cursor-native-ui", {
         display_name: "Cursor",
-        description: null,
         harness: "cursor-native",
-        skills: [],
-      },
+      }),
     ]);
     renderLanding({ smart_routing_enabled: true });
     openPermissions();
@@ -9243,16 +9178,7 @@ describe("NewChatLandingScreen smart routing", () => {
 describe("NewChatLandingScreen Auto harness", () => {
   beforeEach(() => {
     setupLandingMocks();
-    mockAgents([
-      {
-        id: "ag_polly",
-        name: "polly",
-        display_name: "Polly",
-        description: null,
-        harness: "pi",
-        skills: [],
-      },
-    ]);
+    mockAgents([testAgent("ag_polly", "polly", { display_name: "Polly", harness: "pi" })]);
   });
   afterEach(() => {
     cleanup();
@@ -9570,14 +9496,10 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
 
   it("hides the row and its separator when only one native wrapper agent is registered", () => {
     mockAgents([
-      {
-        id: "a1",
-        name: "claude-native-ui",
+      testAgent("a1", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
-        skills: [],
-      },
+      }),
     ]);
     renderLanding({ smart_routing_enabled: true });
     openPicker();
@@ -9955,22 +9877,8 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
   // The real shape of examples/debby and examples/polly: a bundle agent whose
   // brain harness (claude-sdk) is overridable per session.
   const BUNDLE_AGENTS: AvailableAgent[] = [
-    {
-      id: "ag_debby",
-      name: "debby",
-      display_name: "Debby",
-      description: null,
-      harness: "claude-sdk",
-      skills: [],
-    },
-    {
-      id: "ag_polly",
-      name: "polly",
-      display_name: "Polly",
-      description: null,
-      harness: "claude-sdk",
-      skills: [],
-    },
+    testAgent("ag_debby", "debby", { display_name: "Debby", harness: "claude-sdk" }),
+    testAgent("ag_polly", "polly", { display_name: "Polly", harness: "claude-sdk" }),
   ];
 
   beforeEach(() => {
@@ -10339,30 +10247,12 @@ describe("NewChatLandingScreen Smart Routing flavors are scoped separately", () 
   beforeEach(() => {
     setupLandingMocks();
     mockAgents([
-      {
-        id: "a1",
-        name: "claude-native-ui",
+      testAgent("a1", "claude-native-ui", {
         display_name: "Claude Code",
-        description: null,
         harness: "claude-native",
-        skills: [],
-      },
-      {
-        id: "a2",
-        name: "codex-native-ui",
-        display_name: "Codex",
-        description: null,
-        harness: "codex-native",
-        skills: [],
-      },
-      {
-        id: "ag_debby",
-        name: "debby",
-        display_name: "Debby",
-        description: null,
-        harness: "claude-sdk",
-        skills: [],
-      },
+      }),
+      testAgent("a2", "codex-native-ui", { display_name: "Codex", harness: "codex-native" }),
+      testAgent("ag_debby", "debby", { display_name: "Debby", harness: "claude-sdk" }),
     ]);
   });
   afterEach(() => {
@@ -10579,14 +10469,7 @@ describe("managed sandbox inference models", () => {
   it("supports an ACP agent without native model-picker capabilities", async () => {
     preview();
     mockAgents([
-      {
-        id: "a_acp",
-        name: "Private ACP",
-        display_name: "Private ACP",
-        description: null,
-        harness: "acp:private",
-        skills: [],
-      },
+      testAgent("a_acp", "Private ACP", { display_name: "Private ACP", harness: "acp:private" }),
     ]);
     authenticatedFetchMock.mockResolvedValue({
       ok: true,

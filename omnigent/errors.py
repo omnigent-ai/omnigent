@@ -11,6 +11,7 @@ New code should prefer OmnigentError for consistency.
 
 from __future__ import annotations
 
+import errno
 import functools
 import inspect
 from collections.abc import Callable
@@ -244,6 +245,13 @@ class ErrorCode:
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
     STALE_CURSOR = "stale_cursor"
+
+
+# Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
+# removed (``omnigent agent remove``), so the session can't load it.
+SESSION_AGENT_MISSING_MESSAGE = (
+    "This agent no longer exists. Fork this session into another agent to continue."
+)
 
 
 # Single source of truth for error code → HTTP status.
@@ -624,6 +632,10 @@ def is_cancelled_rpc_error(exc: BaseException) -> bool:
     return getattr(status, "name", None) == "CANCELLED"
 
 
+# EDQUOT is POSIX-only; Windows reports a full disk as ENOSPC.
+_DISK_FULL_ERRNOS = frozenset({errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)})
+
+
 def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
     """Best-effort (category, impact) for any logged exception.
 
@@ -636,6 +648,8 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
       matched by type name) read as a transient upstream blip.
     - A peer-cancelled gRPC call (see :func:`is_cancelled_rpc_error`) reads the
       same way: the dependency tore down the in-flight call, not our fault.
+    - A full disk or exhausted quota (``ENOSPC`` / ``EDQUOT``) is the host
+      machine's fault and blocks whatever tried to write.
     - Anything else is genuinely unattributed: UNKNOWN on both axes rather than a
       guessed owner. The turn's terminal outcome remains the authoritative
       blocking signal.
@@ -645,6 +659,8 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
     """
     if isinstance(exc, OmnigentError):
         return exc.category, exc.impact
+    if isinstance(exc, OSError) and exc.errno in _DISK_FULL_ERRNOS:
+        return ErrorCategory.HOST, ErrorImpact.BLOCKING
     # ConnectionError/TimeoutError are OSError subclasses: this also catches an
     # internal asyncio timeout on a slow server-side call (really ours) as
     # upstream. Same best-effort trade-off as the name set below.

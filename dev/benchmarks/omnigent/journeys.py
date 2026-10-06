@@ -900,7 +900,8 @@ async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> N
 # statusline refresh and per-tool-call policy hook. Spawn the per-chunk hook
 # exactly as Claude Code does — isolated interpreter, module entrypoint, JSON
 # payload on stdin — and time the full process lifetime. The import-graph side
-# of this guarantee is pinned by tests/test_claude_native_message_display_hook.
+# of this guarantee is pinned by
+# tests/harnesses/claude_native/test_claude_native_message_display_hook.
 _HOOK_SPAWN_PAYLOAD = json.dumps(
     {
         "hook_event_name": "MessageDisplay",

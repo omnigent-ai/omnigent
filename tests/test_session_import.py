@@ -743,6 +743,36 @@ def test_list_recent_codex_sessions_excludes_non_interactive_sources(
     )
 
 
+def test_imported_teammate_context_preserves_assistant_response_identity(tmp_path: Path) -> None:
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        ("assistant", "Before"),
+        ("user", '<teammate-message teammate_id="reviewer">Done.</teammate-message>'),
+        ("assistant", "After"),
+        ("user", "A new question"),
+        ("assistant", "A new answer"),
+    ]
+    transcript.write_text(
+        "".join(
+            json.dumps(
+                {"type": role, "uuid": str(index), "message": {"role": role, "content": text}}
+            )
+            + "\n"
+            for index, (role, text) in enumerate(records)
+        ),
+        encoding="utf-8",
+    )
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+    assert imported.title == "A new question"
+    assert imported.items[1].data.is_meta is True
+    assert imported.items[1].data.content[0]["text"] == records[1][1]
+    assert not imported.items[3].data.model_dump().get("is_meta")
+    assert imported.items[0].response_id == imported.items[2].response_id
+    assert imported.items[4].response_id != imported.items[2].response_id
+
+
 def test_list_recent_claude_sessions_orders_parents_and_applies_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

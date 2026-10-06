@@ -1,52 +1,18 @@
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
 // Behaviour tests for the mobile sidebar drawer shape: it stops short of the
 // right edge so a strip of the chat stays visible, tapping that strip dismisses
 // it (replacing the collapse toggle, which is now desktop-only), and Search /
 // Settings float at the top and bottom of the drawer.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: [] }),
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    hasNextPage: false,
-    isFetchingNextPage: false,
-    fetchNextPage: vi.fn(),
-  }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return conversationHooksMock();
+});
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
@@ -57,62 +23,11 @@ vi.mock("@/lib/serverOrigin", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
-import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
-function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
-  return {
-    id,
-    object: "conversation",
-    title: id,
-    created_at: 0,
-    updated_at: 0,
-    labels: {},
-    permission_level: null,
-    status: "idle",
-    ...partial,
-  };
-}
-
 function mockConversations(conversations: Conversation[]) {
-  useConvMock.mockImplementation(
-    () =>
-      ({
-        data: {
-          pages: [
-            {
-              data: conversations,
-              first_id: conversations[0]?.id ?? null,
-              last_id: conversations.at(-1)?.id ?? null,
-              has_more: false,
-            },
-          ],
-          pageParams: [undefined],
-        },
-        isLoading: false,
-        isError: false,
-        error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
-        isFetchingNextPage: false,
-      }) as unknown as ReturnType<typeof useConversations>,
-  );
-}
-
-function renderSidebar(props: { open?: boolean; onClose?: () => void; route?: string } = {}) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[props.route ?? "/"]}>
-            <Sidebar open={props.open ?? true} onClose={props.onClose ?? vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
+  useConvMock.mockImplementation(() => conversationPage(conversations));
 }
 
 beforeEach(() => {
@@ -204,31 +119,20 @@ describe("mobile sidebar drawer", () => {
     );
   });
 
-  it("gives both floating chips one shared glass treatment", () => {
-    // These drifted apart once — Settings landed opaque with a heavier shadow
-    // than Search. The look now lives in a single CSS class, so assert both
-    // wear it and neither carries a competing background or shadow utility.
+  it("keeps both floating actions icon-only on mobile", () => {
     renderSidebar();
 
     const search = screen.getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("sidebar-settings-float").closest("a, button")!;
 
-    // Where the chip sits, and which breakpoint it shows at, legitimately
-    // differ; everything about how it looks must not.
-    // `relative` is the Button base's own position, which tailwind-merge drops
-    // from the floating copy in favour of `absolute` — placement, not looks.
     for (const button of [search, settings]) {
-      expect(button).toHaveClass(
-        "sidebar-glass-chip",
-        "max-md:size-11",
-        "max-md:rounded-full",
-        "max-md:text-foreground",
-      );
+      expect(button).toHaveClass("max-md:size-11", "max-md:text-foreground");
+      expect(button).not.toHaveClass("sidebar-glass-chip", "max-md:rounded-full");
     }
   });
 
-  it("gives the session list a gutter so the last row clears the floating chip", () => {
-    // The chip doesn't scroll, so without this it would cover the last row,
+  it("gives the session list a gutter so the last row clears the floating action", () => {
+    // The action doesn't scroll, so without this it would cover the last row,
     // hiding its title and state badge and blocking the tap target.
     renderSidebar();
 

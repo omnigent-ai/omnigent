@@ -32,6 +32,40 @@ def test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation(
     expect(rows).to_have_count(0)
 
 
+def test_inline_skill_completion_preserves_text_around_the_caret(
+    page: Page, chat_session_contract
+) -> None:
+    chat_session_contract.set_skills(
+        [{"name": "review-pr", "description": "Review a pull request"}]
+    )
+    page.goto(chat_session_contract.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    composer.fill("please /revthis change")
+
+    page.evaluate(
+        """
+        () => {
+          const target = document.querySelector("textarea[aria-label='Message the agent']");
+          if (!target) throw new Error("composer not found");
+          target.setSelectionRange(11, 11);
+          target.dispatchEvent(new Event("select", { bubbles: true }));
+          document.dispatchEvent(new Event("selectionchange"));
+        }
+        """
+    )
+
+    skill = page.get_by_test_id("slash-menu-item-review-pr")
+    expect(skill).to_have_attribute("data-active", "true")
+    composer.press("Tab")
+
+    expect(composer).to_have_value("please /review-pr this change")
+    assert composer.evaluate("element => [element.selectionStart, element.selectionEnd]") == [
+        18,
+        18,
+    ]
+
+
 def test_enter_executes_a_substring_matched_builtin(page: Page, chat_session_contract) -> None:
     page.goto(chat_session_contract.url)
     composer = _composer(page)

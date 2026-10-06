@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import logging
@@ -36,11 +37,14 @@ if TYPE_CHECKING:
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
 from omnigent.harnesses.codex_native.launch_args import (
+    _merge_tables,
     _write_private_config,
     absolute_codex_path,
     canonical_codex_launch_args,
     codex_config_profile,
     materialize_codex_config_profile,
+    read_codex_mcp_servers,
+    reject_reserved_codex_transport_args,
     validate_codex_config_profile_state,
     without_codex_config_profile,
 )
@@ -71,6 +75,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
     codex_extended_catalog_requested,
+    codex_minimal_config_requested,
     codex_router_bridge_dir,
     codex_router_hooks_settings,
     codex_router_session_id,
@@ -190,57 +195,6 @@ def _format_codex_version(version: tuple[int, int, int] | None) -> str:
     if version is None:
         return "unknown"
     return ".".join(str(part) for part in version)
-
-
-def _toml_table_header_name(line: str) -> str | None:
-    """
-    Return the TOML table name declared by *line*, if any.
-
-    This intentionally recognizes only normal table headers because the
-    injected Codex MCP server config is a normal table. Array tables are
-    left untouched.
-
-    :param line: One config line, e.g.
-        ``"[mcp_servers.omnigent] # generated\n"``.
-    :returns: The table name, e.g. ``"mcp_servers.omnigent"``, or
-        ``None`` when *line* is not a normal table header.
-    """
-    stripped = line.strip()
-    if not stripped.startswith("["):
-        return None
-    if stripped.startswith("[["):
-        return None
-    end = stripped.find("]")
-    if end < 0:
-        return None
-    suffix = stripped[end + 1 :].strip()
-    if suffix and not suffix.startswith("#"):
-        return None
-    return stripped[1:end].strip()
-
-
-def _remove_toml_table(text: str, table_name: str) -> str:
-    """
-    Remove one TOML table and its subtables from a config document.
-
-    Used for generated private Codex config before appending the
-    Omnigent MCP server table. This avoids accumulating duplicate
-    ``[mcp_servers.omnigent]`` sections across terminal relaunches.
-
-    :param text: TOML document text.
-    :param table_name: Table name to remove, e.g.
-        ``"mcp_servers.omnigent"``.
-    :returns: TOML text with the target table block removed.
-    """
-    kept: list[str] = []
-    skipping = False
-    for line in text.splitlines(keepends=True):
-        header = _toml_table_header_name(line)
-        if header is not None:
-            skipping = header == table_name or header.startswith(f"{table_name}.")
-        if not skipping:
-            kept.append(line)
-    return "".join(kept).rstrip()
 
 
 #: Omnigent tools the framework calls on every session's behalf, pre-approved
@@ -807,10 +761,11 @@ def _inject_mcp_server_config(
     bridge_dir: Path,
     python_executable: str | None = None,
     *,
+    mcp_servers: _JsonObject,
     routed_spawns: bool = False,
 ) -> None:
     """
-    Upsert Omnigent MCP server config into ``config.toml``.
+    Refresh user MCPs and inject Omnigent's relay into the private config.
 
     Writes a ``[mcp_servers.omnigent]`` section that points Codex
     at the ``serve-mcp`` subprocess. This supplements the ``-c``
@@ -823,30 +778,28 @@ def _inject_mcp_server_config(
         and ``tool_relay.json``.
     :param python_executable: Python executable for serve-mcp.
         ``None`` uses :data:`sys.executable`.
+    :param mcp_servers: Current source-owned MCP inventory, including profile overrides.
     :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
         which pre-approves the cross-harness redirect tools too.
     :returns: None.
     """
     config_path = codex_home / "config.toml"
-    # Materialize the symlink from _populate_codex_home_config before
-    # editing so the user's real config.toml stays untouched.
-    if config_path.is_symlink():
-        target = config_path.resolve()
-        config_path.unlink()
-        if target.is_file():
-            import shutil
-
-            shutil.copy2(target, config_path)
-    if config_path.exists():
-        existing = config_path.read_text(encoding="utf-8")
-    else:
-        existing = ""
-    updated = _remove_toml_table(existing, "mcp_servers.omnigent")
+    document = (
+        tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        if config_path.exists()
+        else tomlkit.document()
+    )
+    # Replace, rather than merge, so deleted servers and fields do not survive.
+    servers = {name: config for name, config in mcp_servers.items() if name != "omnigent"}
+    document.pop("mcp_servers", None)
+    if servers:
+        document["mcp_servers"] = servers
+    updated = tomlkit.dumps(document).rstrip()
     section = _codex_mcp_server_config_section(
         bridge_dir, python_executable, routed_spawns=routed_spawns
     )
     rendered = f"{updated}\n\n{section}" if updated else section
-    config_path.write_text(rendered, encoding="utf-8")
+    _write_private_config(config_path, rendered)
 
 
 class CodexAppServerResponseError(RuntimeError):
@@ -863,6 +816,23 @@ class CodexAppServerResponseError(RuntimeError):
             self.code = code if isinstance(code, int) else None
             self.message = message if isinstance(message, str) else None
         super().__init__(str(error))
+
+
+def is_stale_active_turn_error(error: CodexAppServerResponseError) -> bool:
+    """Whether Codex rejected a turn id that ended or was replaced.
+
+    Codex 0.154.0 returns ``-32600`` with no ``data`` for these errors, so this
+    depends on its steer/interrupt message wording, including quoted turn ids.
+
+    :param error: Structured JSON-RPC response error.
+    :returns: ``True`` only for an ended or superseded active turn.
+    """
+    if error.code != -32600 or error.message is None:
+        return False
+    message = error.message.strip().casefold()
+    return message in {"no active turn to steer", "no active turn to interrupt"} or (
+        "expected active turn id" in message and "but found" in message
+    )
 
 
 #: JSON-RPC internal-error code codex returns when its thread-store fails.
@@ -1866,6 +1836,12 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
+        config_source = _codex_home_config_source_from_env()
+        if self.codex_home.resolve() == config_source.resolve():
+            raise ValueError(
+                "Omnigent could not isolate this session's Codex configuration. "
+                "Startup was stopped to protect your shared config. Please report this as a bug."
+            )
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
@@ -1903,7 +1879,13 @@ class CodexNativeAppServer:
                 router_bridge_dir = None
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
-        config_source = _codex_home_config_source_from_env()
+        minimal_config = codex_minimal_config_requested()
+        mcp_servers = read_codex_mcp_servers(
+            config_source,
+            self.config_profile,
+            codex_version=codex_version,
+            minimal_config=minimal_config,
+        )
         model_migration_target: str | None = None
         if self.trust_project and self.pinned_model:
             catalog: object = self.model_catalog_rows
@@ -1930,6 +1912,7 @@ class CodexNativeAppServer:
             inject_hooks=self.router_hooks_registered,
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
+            minimal_config=minimal_config,
         )
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
@@ -1947,6 +1930,7 @@ class CodexNativeAppServer:
             self.codex_home,
             self.bridge_dir,
             self.python_executable,
+            mcp_servers=mcp_servers,
             routed_spawns=routed_spawns,
         )
         if self.pinned_model:
@@ -3561,6 +3545,35 @@ def _codex_login_usable() -> bool:
     return codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json")
 
 
+def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
+    """Built-in provider the bridged config selects without any Codex login, if any.
+
+    Layers the selected profile over ``config.toml`` the way
+    :func:`materialize_codex_config_profile` does at start.
+    """
+    from omnigent.onboarding.codex_auth_readiness import (
+        effective_self_sufficient_builtin_provider,
+        load_codex_config,
+    )
+
+    source_home = _codex_home_config_source_from_env()
+    config_path = source_home / "config.toml"
+    config = load_codex_config(config_path) if config_path.exists() else {}
+    if config is None:
+        return None
+    if config_profile is not None:
+        overlay = load_codex_config(source_home / f"{config_profile}.config.toml")
+        if overlay is None:
+            # Codex < 0.134 keeps file profiles inline; newer codex fails at start on a
+            # missing file anyway, so the fallback only matters where it is correct.
+            profiles = config.get("profiles")
+            overlay = profiles.get(config_profile) if isinstance(profiles, dict) else None
+        if not isinstance(overlay, dict):
+            return None
+        _merge_tables(config, copy.deepcopy(overlay))
+    return effective_self_sufficient_builtin_provider(config)
+
+
 def _resolve_subscription_launch(
     entry: ProviderEntry, model: str | None, explicit: dict[str, object]
 ) -> NativeCodexLaunch:
@@ -3622,7 +3635,10 @@ def _resolve_subscription_launch(
 
 
 def resolve_native_codex_launch(
-    *, model: str | None, spec: AgentSpec | None = None
+    *,
+    model: str | None,
+    spec: AgentSpec | None = None,
+    terminal_launch_args: Sequence[str] = (),
 ) -> NativeCodexLaunch:
     """Resolve the native Codex launch config across all offerings.
 
@@ -3652,7 +3668,10 @@ def resolve_native_codex_launch(
     2. else a global ``auth:`` block → ucode for Databricks, or provider
        overrides for an inline API key;
     3. else an ambient-detected provider (first run without configure);
-    4. else the codex CLI's own login.
+    4. else a self-sufficient built-in provider the bridged ``config.toml``
+       selects, read through the ``--profile`` in *terminal_launch_args*
+       (e.g. ``amazon-bedrock`` — Codex authenticates it itself);
+    5. else the codex CLI's own login.
 
     Without a *spec* (or when the spec carries no spec-level credential),
     credentials are controlled by ``omnigent setup`` provider config (or the
@@ -3664,6 +3683,9 @@ def resolve_native_codex_launch(
     :param spec: The custom agent spec launching this session, when there is
         one, so its ``executor.auth`` / legacy profile win over machine-level
         config (issue #2744 — parity with the in-process codex harness).
+    :param terminal_launch_args: Codex CLI pass-through args; their
+        ``--profile`` selects the config-file layer the bridged config is read
+        through, as :func:`build_codex_native_server` applies it at start.
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     from omnigent.inference_config import (
@@ -3846,6 +3868,28 @@ def resolve_native_codex_launch(
             )
 
     if entry is None:
+        try:
+            ambient_profile = codex_config_profile(terminal_launch_args)
+        except ValueError:
+            # Malformed selectors are reported where launch args are validated, at start.
+            ambient_profile = None
+        ambient_builtin = _ambient_builtin_codex_provider(ambient_profile)
+        if ambient_builtin is not None:
+            log_info_once(
+                _logger,
+                "native-codex routing: config.toml built-in provider %r (Codex-native "
+                "ambient config; Codex authenticates it itself)",
+                ambient_builtin,
+            )
+            return NativeCodexLaunch(
+                config_overrides=[f"model_provider={json.dumps(ambient_builtin)}"],
+                model=model,
+                profile=None,
+                summary=(
+                    f"Codex config.toml built-in provider {ambient_builtin!r} "
+                    "(Codex-native ambient config; Codex authenticates it itself)"
+                ),
+            )
         log_info_once(
             _logger,
             "native-codex routing: Codex CLI login (no provider configured for the Codex "
@@ -4475,6 +4519,10 @@ def build_codex_remote_args(
         can accept hooks normally.
     :returns: Codex argv tail after the executable.
     """
+    # The runner owns the app-server and the TUI ``--remote`` attach it appends
+    # below; reject caller pass-through args that would re-select or re-attach
+    # that transport (e.g. ``codex app-server … --remote``, which clap rejects).
+    reject_reserved_codex_transport_args(codex_args)
     override_args: list[str] = []
     for override in config_overrides:
         if override.lstrip().startswith("model_providers."):

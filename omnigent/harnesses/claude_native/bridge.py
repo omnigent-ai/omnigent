@@ -67,12 +67,15 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+from omnigent.harnesses.claude_native import delivery_diagnostics
+from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
 from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.failure_telemetry import FailureContext
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -804,6 +807,12 @@ class ClaudeTranscriptItem:
         source=compact`` completion signal follows; the forwarder uses this
         flag to dismiss the stranded "Compacting…" spinner. Never rendered
         as a bubble. Defaults to ``False``.
+    :param subagent_return_id: Claude's native task id for an explicit
+        handback; transported separately from model-visible message content.
+    :param agent_message_candidate: Unproven team-shaped user text; the server
+        must correlate it by text without draining unrelated pending input.
+    :param failure_context: Explicit API-error evidence for diagnostic logging;
+        kept outside model-visible conversation content.
     """
 
     source_id: str
@@ -812,6 +821,9 @@ class ClaudeTranscriptItem:
     response_id: str
     is_compact_summary: bool = False
     is_compact_noop: bool = False
+    subagent_return_id: str | None = None
+    agent_message_candidate: bool = False
+    failure_context: FailureContext | None = None
 
 
 @dataclass(frozen=True)
@@ -891,6 +903,9 @@ class ClaudeHookRecord:
     :param transcript_path: Claude transcript path from the hook
         payload, e.g. ``"/home/user/.claude/projects/x/session.jsonl"``,
         or ``None`` when absent.
+    :param agent_id: Claude subagent id from the hook payload, e.g.
+        ``"a4892977eed616593"``. Claude Code sets it only for hooks fired
+        inside a subagent; ``None`` for the parent process.
     :param previous_claude_session_id: Claude session id that was
         active immediately before this hook, e.g.
         ``"a1b2c3d4-1234-5678-9abc-def012345678"``, or ``None``
@@ -939,6 +954,7 @@ class ClaudeHookRecord:
     :param failure_message: ``StopFailure`` error text Claude Code rendered
         for the turn (the payload's ``last_assistant_message``), e.g.
         ``"API Error: 500 Internal server error"``. ``None`` when absent.
+    :param failure_context: Structured evidence supplied by this hook record.
     """
 
     event_cursor: int
@@ -948,6 +964,7 @@ class ClaudeHookRecord:
     source: str | None = None
     claude_session_id: str | None = None
     transcript_path: Path | None = None
+    agent_id: str | None = None
     previous_claude_session_id: str | None = None
     claude_session_was_seen: bool | None = None
     clear_rotated_to: str | None = None
@@ -961,6 +978,7 @@ class ClaudeHookRecord:
     background_tasks: list[_JsonObject] | None = None
     failure_category: str | None = None
     failure_message: str | None = None
+    failure_context: FailureContext | None = None
 
 
 @dataclass(frozen=True)
@@ -1644,6 +1662,9 @@ def prepare_bridge_dir(
     """
     Create or refresh the bridge directory for a native Claude session.
 
+    Per-launch lifecycle files remain available to delayed exit observers until
+    session deletion or the dead-owner sweep removes the bridge directory.
+
     :param conversation_id: Omnigent conversation id, e.g.
         ``"conv_abc123"``.
     :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
@@ -2102,10 +2123,24 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
                 ],
                 "env": {
                     "PYTHONUNBUFFERED": "1",
+                    # The bridge root is derived from tempfile at import time.
+                    # Keep it aligned with the runner when Claude inherits a
+                    # different TMPDIR from the user's shell.
+                    "TMPDIR": str(_TRUSTED_PARENT),
                 },
             }
         }
     }
+
+
+def _pin_runner_tmpdir(command: str) -> str:
+    """Run a generated command with the runner's temp root."""
+    return f"env TMPDIR={shlex.quote(str(_TRUSTED_PARENT))} {command}"
+
+
+def _python_hook_command(parts: list[str]) -> str:
+    """Build a Python hook command pinned to the runner's temp root."""
+    return _pin_runner_tmpdir(shlex.join(parts))
 
 
 def build_hook_settings(
@@ -2194,7 +2229,7 @@ def build_hook_settings(
     # Claude owns command-hook stderr, so it does not reach the runner logs.
     # Persist it for the forwarder to relay with the Omnigent session id.
     observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
-    command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
+    command = f"{_python_hook_command(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
     framework_context_parts = [
         python,
@@ -2207,7 +2242,7 @@ def build_hook_settings(
     ]
     framework_context_hook = {
         "type": "command",
-        "command": f"{shlex.join(framework_context_parts)} 2>> {observer_stderr}",
+        "command": f"{_python_hook_command(framework_context_parts)} 2>> {observer_stderr}",
     }
     session_start_hook = {
         "type": "command",
@@ -2229,6 +2264,7 @@ def build_hook_settings(
     }
     hooks: dict[str, list[_JsonObject]] = {
         "SessionStart": [{"hooks": [session_start_hook]}],
+        "SessionEnd": [{"hooks": [hook]}],
         "Stop": [{"hooks": [hook]}],
         "StopFailure": [{"hooks": [hook]}],
         # ``UserPromptSubmit`` is the symmetric counterpart to
@@ -2279,9 +2315,9 @@ def build_hook_settings(
     }
     from omnigent.native.tool_observer_hook import hook_settings
 
-    hooks["PostToolUse"].append(
-        {"hooks": [hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")]}
-    )
+    observer_hook = hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")
+    observer_hook["command"] = _pin_runner_tmpdir(cast(str, observer_hook["command"]))
+    hooks["PostToolUse"].append({"hooks": [observer_hook]})
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
     if ap_server_url:
@@ -2312,7 +2348,7 @@ def build_hook_settings(
         ]
         permission_hook: _JsonObject = {
             "type": "command",
-            "command": shlex.join(permission_command_parts),
+            "command": _python_hook_command(permission_command_parts),
             # Wait up to a day for the verdict. Claude Code's default
             # command-hook timeout (~60s) would otherwise kill the hook
             # subprocess long before the user answers, putting the
@@ -2336,7 +2372,7 @@ def build_hook_settings(
         # path and the phase-aware fail-closed contract — exactly the
         # pre-curl behavior.
         relay_env_quoted = shlex.quote(str(bridge_dir / _TOOL_RELAY_ENV_FILE))
-        evaluate_policy_python = shlex.join(
+        evaluate_policy_python = _python_hook_command(
             [
                 python,
                 "-I",
@@ -2401,7 +2437,7 @@ def build_hook_settings(
 
         router_hook: _JsonObject = {
             "type": "command",
-            "command": shlex.join(router_command_parts),
+            "command": _python_hook_command(router_command_parts),
             # Outermost hop of the routing timeout budget documented in
             # ``omnigent.runner.subagent_routing``: derived from the hook
             # script's own request budget so it always exceeds it and the
@@ -2471,7 +2507,7 @@ def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
 
     return {
         "type": "command",
-        "command": shlex.join(
+        "command": _python_hook_command(
             [
                 python,
                 "-I",
@@ -3194,6 +3230,7 @@ def read_transcript_items_from_offset(
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
     include_sidechains: bool = False,
+    legacy_agent_messages: bool = False,
 ) -> TranscriptReadResult:
     """
     Read transcript items appended after a byte offset.
@@ -3222,6 +3259,8 @@ def read_transcript_items_from_offset(
         leave the sub-agent's child Omnigent conversation empty. The
         default ``False`` keeps the parent-transcript path
         unchanged.
+    :param legacy_agent_messages: Offline imports hide unproven historical
+        team envelopes; preserve assistant response identity across them.
     :returns: Parsed items plus updated line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
@@ -3255,6 +3294,7 @@ def read_transcript_items_from_offset(
                 TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
             )
             continue
+        previous_response_id = active_response_id
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -3264,6 +3304,8 @@ def read_transcript_items_from_offset(
             settled_response_id=active_settled_id,
             include_sidechains=include_sidechains,
         )
+        if legacy_agent_messages and any(item.agent_message_candidate for item in parsed):
+            active_response_id = previous_response_id
         items.extend(parsed)
         # Post-compaction output continues the SAME turn: a batch holding
         # the compact summary AND the resumed output must not parse the
@@ -3559,9 +3601,9 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     Return whether Claude reported a stop event after a hook cursor.
 
     Only counts stop events from the parent Claude process — subagent
-    stop events (whose ``transcript_path`` contains a ``subagents/``
-    component) are ignored so a finishing subagent does not
-    prematurely signal the parent turn as complete.
+    stop events (carrying an ``agent_id``, or whose ``transcript_path``
+    contains a ``subagents/`` component) are ignored so a finishing
+    subagent does not prematurely signal the parent turn as complete.
 
     :param bridge_dir: Bridge directory path.
     :param start_event_count: Hook record count captured before a
@@ -3586,6 +3628,8 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
                         payload.get("transcript_path") if isinstance(payload, dict) else None
                     )
                     if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                        continue
+                    if isinstance(payload, dict) and payload.get("agent_id"):
                         continue
                     return True
     except FileNotFoundError:
@@ -3667,6 +3711,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     raw_recorded_at = envelope.get("recorded_at") if isinstance(envelope, dict) else None
     raw_claude_session_id = payload.get("session_id") if isinstance(payload, dict) else None
     raw_transcript_path = payload.get("transcript_path") if isinstance(payload, dict) else None
+    raw_agent_id = payload.get("agent_id") if isinstance(payload, dict) else None
     raw_previous_claude_session_id = (
         payload.get("omnigent_previous_claude_session_id") if isinstance(payload, dict) else None
     )
@@ -3749,12 +3794,18 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             background_tasks = details or None
     failure_category: str | None = None
     failure_message: str | None = None
+    failure_context: FailureContext | None = None
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
         # The CLI renders this text for its own error, so it reads like the
         # mirrored API-error message.
         raw_message = _bounded_hook_text(
             payload.get("last_assistant_message"), _FAILURE_MESSAGE_MAX_CHARS
+        )
+        original_message = payload.get("last_assistant_message")
+        failure_context = claude_failure_context(
+            payload,
+            error_text=original_message if isinstance(original_message, str) else None,
         )
         failure_message = (
             _display_text(raw_message, is_api_error=True) if raw_message is not None else None
@@ -3777,6 +3828,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             if isinstance(raw_transcript_path, str) and raw_transcript_path
             else None
         ),
+        agent_id=raw_agent_id if isinstance(raw_agent_id, str) and raw_agent_id else None,
         previous_claude_session_id=(
             raw_previous_claude_session_id
             if isinstance(raw_previous_claude_session_id, str) and raw_previous_claude_session_id
@@ -3804,6 +3856,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         background_tasks=background_tasks,
         failure_category=failure_category,
         failure_message=failure_message,
+        failure_context=failure_context,
     )
 
 
@@ -3936,6 +3989,9 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+@delivery_diagnostics.trace_delivery(
+    session_id_reader=read_active_session_id, cancelled_error=ClaudeInjectionCancelled
+)
 @_serialize_bridge_injection
 def inject_user_message(
     bridge_dir: Path,
@@ -4001,7 +4057,9 @@ def inject_user_message(
         invocation fails, or if the draft never leaves the input box
         after repeated submit Enters (message not delivered).
     """
+    delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
@@ -4009,6 +4067,7 @@ def inject_user_message(
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
+    delivery_diagnostics.set_stage("waiting_for_prompt")
     _wait_for_claude_prompt_ready(
         info["socket_path"],
         info["tmux_target"],
@@ -4094,19 +4153,17 @@ def _paste_and_submit(
     :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
         never leaves the input box after repeated submit Enters.
     """
+    delivery_diagnostics.start_attempt()
+    delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
-    # Clear any leftover text in Claude's input field before typing.
-    # After Escape-cancel, Claude Code re-populates the prompt area
-    # with the previous input for re-editing. Without this clear,
-    # the new message appends to the stale buffer (e.g.
-    # "old promptnew prompt" with no separator).
-    # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
-    # Ctrl-U only clears backwards from cursor.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    delivery_diagnostics.set_stage("pasting")
+    # Clear stale text first: raw controls can otherwise become pasted text.
+    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4144,20 +4201,41 @@ def _paste_and_submit(
     # when the draft never becomes identifiable (e.g. whitespace-only
     # first line, custom statusline containing the glyph), fall through
     # after the timeout and submit blind, matching the old behavior.
+    delivery_diagnostics.set_stage("waiting_for_draft")
     draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    pane = ""
+    polls = 0
+    empty_captures = 0
+    paste_wait_started = time.monotonic()
+    deadline = paste_wait_started + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+        pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
+        empty_captures += not pane.strip()
+        if _draft_in_input_box(pane, needle):
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    delivery_diagnostics.record_draft(
+        pane=pane,
+        needle=needle,
+        prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+        draft_seen=draft_seen,
+        start=paste_wait_started,
+        polls=polls,
+        empty_captures=empty_captures,
+    )
     time.sleep(_PASTE_SETTLE_S)
+    delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
+    delivery_diagnostics.set_stage("submitting")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
+        delivery_diagnostics.record_details(verification="unverified")
         # The draft was never observed, so its absence proves nothing —
         # verification would trivially "pass". Submit blind as before.
         return
@@ -4167,6 +4245,7 @@ def _paste_and_submit(
     # after the burst, so it submits). Each Enter only fires while the
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
+    delivery_diagnostics.set_stage("verifying_submit")
     if _verify_submit_accepted(
         socket_path,
         tmux_target,
@@ -4214,10 +4293,23 @@ def _verify_submit_accepted(
     last_enter = start
     retry_interval = _SUBMIT_RETRY_INTERVAL_S
     warned = False
+    retries = 0
+    polls = 0
+    pane = ""
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
         if not _draft_in_input_box(pane, needle):
+            delivery_diagnostics.record_verification(
+                draft_still_present=False,
+                pane=pane,
+                needle=needle,
+                prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+                start=start,
+                retries=retries,
+                polls=polls,
+            )
             if warned:
                 _logger.info(
                     "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -4238,8 +4330,19 @@ def _verify_submit_accepted(
         if now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            retries += 1
+            delivery_diagnostics.record_details(retries=retries)
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
+    delivery_diagnostics.record_verification(
+        draft_still_present=True,
+        pane=pane,
+        needle=needle,
+        prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+        start=start,
+        retries=retries,
+        polls=polls,
+    )
     return False
 
 
@@ -7765,10 +7868,30 @@ def _attachment_transcript_items_from_entry(
         return current_response_id, []
     if attachment.get("type") != "queued_command":
         return current_response_id, []
-    if attachment.get("commandMode") != "prompt":
-        return current_response_id, []
     prompt = attachment.get("prompt")
     if not isinstance(prompt, str) or not prompt:
+        return current_response_id, []
+    return_id = _subagent_handback_id(attachment.get("origin"))
+    if return_id is not None or _is_task_completion_text(prompt):
+        source_key = _transcript_source_key(entry, line_number, record_offset)
+        return current_response_id, [
+            ClaudeTranscriptItem(
+                source_id=_source_id(source_key, 0, "message"),
+                item_type="message",
+                data={
+                    "role": "user",
+                    "is_meta": True,
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+                response_id=_response_id_from_source(source_key),
+                subagent_return_id=return_id,
+            )
+        ]
+    if attachment.get("commandMode") != "prompt":
+        return current_response_id, []
+    if attachment.get("isMeta") is True:
+        return current_response_id, []
+    if _is_trusted_agent_notification_text(prompt, origin=attachment.get("origin")):
         return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
     item = ClaudeTranscriptItem(
@@ -7779,6 +7902,9 @@ def _attachment_transcript_items_from_entry(
             "content": [{"type": "input_text", "text": _unwrap_pasted_content_markers(prompt)}],
         },
         response_id=_response_id_from_source(source_key),
+        agent_message_candidate=_is_agent_notification_text(
+            _unwrap_pasted_content_markers(prompt)
+        ),
     )
     return None, [item]
 
@@ -7845,6 +7971,20 @@ _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
     "<task-notification>",
     "<task-id>",
     "</task-notification>",
+)
+_TEAMMATE_MESSAGE_RE = re.compile(
+    r'(?:<teammate-message\s+[^>]*\bteammate_id="[^"]+"[^>]*>.*?</teammate-message>'
+    r'|<agent-message\s+[^>]*\bfrom="[^"]+"[^>]*>.*?</agent-message>)',
+    re.DOTALL,
+)
+_TEAMMATE_MESSAGE_PREFIXES = (
+    "Another Claude session sent a message:\n",
+    "Another Claude session sent a message while you were working:\n",
+    "A peer session sent a message while you were working:\n",
+)
+_TEAMMATE_DELIVERY_GUIDANCE = (
+    "This came from another Claude session — not typed by your user,",
+    'That "other Claude session" is an agent working inside this same session —',
 )
 
 # Substrings Claude Code writes to a ``/compact`` command's
@@ -8130,10 +8270,55 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
 
 
-def _is_task_notification_text(text: str) -> bool:
+def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> bool:
+    """Honor native peer provenance and the existing task-notification boundary."""
+    if isinstance(origin, dict) and origin.get("kind") == "peer":
+        return True
     stripped = text.lstrip()
     return stripped.startswith("<task-notification>") and all(
         marker in stripped for marker in _TASK_NOTIFICATION_REQUIRED_MARKERS
+    )
+
+
+def _is_agent_notification_text(text: str) -> bool:
+    """Recognize possible agent context; text alone does not prove its origin."""
+    if _is_trusted_agent_notification_text(text):
+        return True
+    stripped = text.lstrip()
+    wrapped = False
+    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix) :].lstrip()
+            wrapped = True
+            break
+    if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
+        return False
+    while match := _TEAMMATE_MESSAGE_RE.match(stripped):
+        stripped = stripped[match.end() :].lstrip()
+        if not stripped:
+            return True
+    # Wrapped peer messages can append Claude's own explanatory guidance.
+    return wrapped and stripped.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
+
+
+def _subagent_handback_id(origin: object) -> str | None:
+    """Read Claude's explicit returned-result provenance, excluding teammate chatter."""
+    if (
+        not isinstance(origin, dict)
+        or origin.get("kind") != "peer"
+        or origin.get("handback") is not True
+    ):
+        return None
+    task_id = origin.get("senderTaskId")
+    return task_id if isinstance(task_id, str) and task_id else None
+
+
+def _is_task_completion_text(text: str) -> bool:
+    return (
+        text.lstrip().startswith("<task-notification>")
+        and _is_agent_notification_text(text)
+        and re.search(r"<status>\s*(?:completed|failed|cancelled|killed)\s*</status>", text)
+        is not None
     )
 
 
@@ -8288,12 +8473,27 @@ def _user_transcript_items_from_entry(
     :returns: Updated active response id and parsed user/tool-result
         items.
     """
-    # ``isMeta=true`` carries CLI scaffolding like
-    # ``<local-command-caveat>``; no user-visible content.
-    if entry.get("isMeta") is True:
-        return current_response_id, []
     message = entry["message"]
     content = message.get("content") if isinstance(message, dict) else None
+    return_id = _subagent_handback_id(entry.get("origin"))
+    notification_texts = (
+        [content]
+        if isinstance(content, str)
+        else [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    # Keep hidden completion provenance so the parent can link the returned child.
+    if (
+        entry.get("isMeta") is True
+        and return_id is None
+        and not any(_is_task_completion_text(text) for text in notification_texts)
+    ):
+        return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
     fallback_response_id = _response_id_from_source(source_key)
 
@@ -8330,6 +8530,28 @@ def _user_transcript_items_from_entry(
     if isinstance(content, str):
         if not content:
             return current_response_id, []
+        if entry.get("isMeta") is True or _is_trusted_agent_notification_text(
+            content, origin=entry.get("origin")
+        ):
+            items.append(
+                ClaudeTranscriptItem(
+                    source_id=_source_id(source_key, 0, "message"),
+                    item_type="message",
+                    data={
+                        "role": "user",
+                        "is_meta": True,
+                        "content": [{"type": "input_text", "text": content}],
+                    },
+                    response_id=fallback_response_id,
+                    subagent_return_id=return_id,
+                )
+            )
+            return (
+                None
+                if content.lstrip().startswith("<task-notification>")
+                else current_response_id,
+                items,
+            )
         stripped = content.lstrip()
         # Skill invocations with args ship the tag order
         # ``<command-message>…<command-name>…<command-args>…`` — i.e.
@@ -8385,20 +8607,6 @@ def _user_transcript_items_from_entry(
         # of leaking as user bubbles.
         if any(stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS):
             return current_response_id, []
-        if _is_task_notification_text(content):
-            items.append(
-                ClaudeTranscriptItem(
-                    source_id=_source_id(source_key, 0, "message"),
-                    item_type="message",
-                    data={
-                        "role": "user",
-                        "is_meta": True,
-                        "content": [{"type": "input_text", "text": content}],
-                    },
-                    response_id=fallback_response_id,
-                )
-            )
-            return None, items
         items.append(
             ClaudeTranscriptItem(
                 source_id=_source_id(source_key, 0, "message"),
@@ -8410,6 +8618,9 @@ def _user_transcript_items_from_entry(
                     ],
                 },
                 response_id=fallback_response_id,
+                agent_message_candidate=_is_agent_notification_text(
+                    _unwrap_pasted_content_markers(content)
+                ),
             )
         )
         return None, items
@@ -8428,19 +8639,9 @@ def _user_transcript_items_from_entry(
             text = block.get("text")
             if not isinstance(text, str) or not text:
                 continue
-            # Defensively guard against slash-command markup or other
-            # CLI-scaffolding markers ever arriving in list-form
-            # content. Today these only ship in string content (the
-            # branch above), but Claude Code's JSONL format is not
-            # under our control — without this filter, a format
-            # change would regress to rendering ``<command-name>…``
-            # markup as a user bubble.
-            stripped = text.lstrip()
-            if "<command-name>" in stripped or any(
-                stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
+            if entry.get("isMeta") is True or _is_trusted_agent_notification_text(
+                text, origin=entry.get("origin")
             ):
-                continue
-            if _is_task_notification_text(text):
                 items.append(
                     ClaudeTranscriptItem(
                         source_id=_source_id(source_key, item_index, "message"),
@@ -8451,10 +8652,18 @@ def _user_transcript_items_from_entry(
                             "content": [{"type": "input_text", "text": text}],
                         },
                         response_id=fallback_response_id,
+                        subagent_return_id=return_id,
                     )
                 )
                 item_index += 1
-                saw_user_text = True
+                saw_user_text = saw_user_text or text.lstrip().startswith("<task-notification>")
+                continue
+            # Claude may emit CLI scaffolding as text blocks; never render it
+            # as user input when the transcript shape changes.
+            stripped = text.lstrip()
+            if "<command-name>" in stripped or any(
+                stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
+            ):
                 continue
             user_blocks.append(
                 {"type": "input_text", "text": _unwrap_pasted_content_markers(text)}
@@ -8478,6 +8687,7 @@ def _user_transcript_items_from_entry(
                     "output": _tool_result_output(entry, block),
                 },
                 response_id=response_id,
+                subagent_return_id=_completed_subagent_tool_id(entry),
             )
         )
         item_index += 1
@@ -8493,6 +8703,11 @@ def _user_transcript_items_from_entry(
                     "content": user_blocks,
                 },
                 response_id=fallback_response_id,
+                agent_message_candidate=all(
+                    isinstance(text := block.get("text"), str)
+                    and _is_agent_notification_text(text)
+                    for block in user_blocks
+                ),
             ),
         )
     return (None if saw_user_text else current_response_id), items
@@ -8549,6 +8764,9 @@ def _assistant_transcript_items_from_entry(
                     response_id=response_id,
                     text=content,
                     is_api_error=is_api_error,
+                    failure_context=(
+                        claude_failure_context(entry, error_text=content) if is_api_error else None
+                    ),
                 )
             )
         if waking:
@@ -8577,6 +8795,11 @@ def _assistant_transcript_items_from_entry(
                         response_id=response_id,
                         text=text,
                         is_api_error=is_api_error,
+                        failure_context=(
+                            claude_failure_context(entry, error_text=text)
+                            if is_api_error
+                            else None
+                        ),
                     )
                 )
             continue
@@ -8750,6 +8973,7 @@ def _assistant_message_item(
     response_id: str,
     text: str,
     is_api_error: bool = False,
+    failure_context: FailureContext | None = None,
 ) -> ClaudeTranscriptItem:
     """
     Build an assistant message item from one Claude text block.
@@ -8763,6 +8987,7 @@ def _assistant_message_item(
         own API error (see :func:`_is_api_error_entry`). Gates the
         ``/login`` guidance append, which is safe only on CLI-authored
         text.
+    :param failure_context: Original error fields before display-text rewriting.
     :returns: Parsed transcript item.
     """
     return ClaudeTranscriptItem(
@@ -8776,6 +9001,7 @@ def _assistant_message_item(
             ],
         },
         response_id=response_id,
+        failure_context=failure_context,
     )
 
 
@@ -8841,6 +9067,15 @@ def _strip_inline_image_data(value: object) -> object:
             return {"type": "text", "text": _stripped_image_placeholder(source)}
         return {key: _strip_inline_image_data(val) for key, val in value.items()}
     return value
+
+
+def _completed_subagent_tool_id(entry: _JsonObject) -> str | None:
+    """Read a synchronous Agent result's native identity, excluding launch handles."""
+    result = entry.get("toolUseResult")
+    if not isinstance(result, dict) or result.get("status") != "completed":
+        return None
+    agent_id = result.get("agentId")
+    return agent_id if isinstance(agent_id, str) and agent_id else None
 
 
 def _tool_result_output(entry: _JsonObject, block: _JsonObject) -> str:
