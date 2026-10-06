@@ -243,6 +243,11 @@ class ChatSessionContract:
     event_ack: dict[str, Any] = field(
         default_factory=lambda: {"queued": True, "item_id": "browser-queued-item"}
     )
+    # A terminal-less native session recovers its pane before applying a
+    # configuration change; the ``retry_session`` event answers that recovery.
+    retry_ack: dict[str, Any] = field(
+        default_factory=lambda: {"recovered": True, "recovery": "native_terminal_ready"}
+    )
     reject_uploads: bool = True
     _stream_generation: int = 0
 
@@ -554,11 +559,14 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
         if route.request.method != "POST":
             route.fallback()
             return
-        handle.event_posts.append(_request_record(route.request))
+        record = _request_record(route.request)
+        handle.event_posts.append(record)
+        body = record["body"]
+        is_retry = isinstance(body, dict) and body.get("type") == "retry_session"
         route.fulfill(
             status=200,
             content_type="application/json",
-            body=json.dumps(handle.event_ack),
+            body=json.dumps(handle.retry_ack if is_retry else handle.event_ack),
         )
 
     contract.route(matcher(f"{session_api}/events"), post_event)
