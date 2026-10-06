@@ -18,7 +18,9 @@ from omnigent.harnesses.claude_native.bridge import (
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
     ClaudeSignInPending,
+    ClaudeTerminalDialog,
     ClaudeTerminalExited,
+    ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
     cancellable_injection,
     inject_slash_command,
@@ -288,6 +290,25 @@ class ClaudeNativeExecutor(Executor):
                 remediation=exc.remediation,
                 undelivered=True,
             )
+            return
+        except ClaudeTerminalDialog as exc:
+            # The person answers the dialog in the embedded terminal and
+            # resends; reaping the pane would destroy it. The message never
+            # reached Claude Code, so mark the turn undelivered.
+            _logger.warning(
+                "claude-native: terminal dialog blocked message delivery",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except ClaudeUserPromptPending as exc:
+            # A pending question or permission prompt must be answered before
+            # injection; the message was never delivered.
+            _logger.warning(
+                "claude-native: pending user prompt blocked message delivery",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
             return
         except RuntimeError as exc:
             _logger.exception(
