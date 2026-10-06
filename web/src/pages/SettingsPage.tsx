@@ -46,9 +46,11 @@ import {
 } from "react";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
+  ArchiveIcon,
   ArchiveRestoreIcon,
   AlertTriangleIcon,
   BotIcon,
+  ChevronDownIcon,
   DownloadIcon,
   FileDiffIcon,
   FilesIcon,
@@ -84,9 +86,15 @@ import { SettingsLabel } from "@/components/SettingsLabel";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
-import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
+import { CardRadioGroup, themeCardClass } from "@/components/theme/CardRadioGroup";
 import { IconSegmentedControl } from "@/components/theme/IconSegmentedControl";
-import { PaletteChip, PaletteSwatchPreview } from "@/components/theme/AppearancePreviews";
+import {
+  DARK_MODE_PREVIEW,
+  LIGHT_MODE_PREVIEW,
+  PaletteChip,
+  PaletteSwatchPreview,
+  SwipeActionPreview,
+} from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -97,6 +105,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogClose,
@@ -275,6 +290,15 @@ import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   notifyHiddenPickerAgentsChanged,
 } from "@/lib/pickerEntryVisibility";
+import {
+  DEFAULT_SWIPE_ACTIONS,
+  isSwipeAction,
+  type SwipeAction,
+  swipeActions as swipeActionOptions,
+  type SwipeDirection,
+  useSwipeActions,
+  writeSwipeActions,
+} from "@/lib/swipeActionPreferences";
 import {
   applyThemePalette,
   DEFAULT_PALETTE,
@@ -500,6 +524,20 @@ function iconButtonBody(Icon: ComponentType<{ className?: string }>, label: stri
   return (
     <>
       <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+      <span className="text-ui font-normal md:font-medium">{label}</span>
+    </>
+  );
+}
+
+/** Centered icon + label body for the swipe-action cards. */
+function iconCardBody(
+  Icon: ComponentType<{ className?: string }>,
+  label: string,
+  iconClassName?: string,
+) {
+  return (
+    <>
+      <Icon aria-hidden="true" className={cn("size-6 text-muted-foreground", iconClassName)} />
       <span className="text-ui font-normal md:font-medium">{label}</span>
     </>
   );
@@ -1118,6 +1156,128 @@ function SessionRowQuickActionsControl() {
   );
 }
 
+const SWIPE_ACTION_LABELS: Record<SwipeAction, string> = {
+  archive: "Archive",
+  delete: "Delete",
+  none: "None",
+};
+
+/**
+ * Archive is always blue and Delete always red, whatever the colour palette. These
+ * shades keep AA contrast on every built-in palette's card, hover, open and menu surfaces.
+ */
+const SWIPE_ACTION_TONES: Record<SwipeAction, string | undefined> = {
+  archive: "text-blue-700 dark:text-blue-300",
+  delete: "text-red-800 dark:text-red-200",
+  none: undefined,
+};
+
+// Menu items reset highlighted text to foreground; keep the tone on the checked item.
+const SWIPE_ACTION_FOCUS_TONES: Record<SwipeAction, string | undefined> = {
+  archive: "focus:text-blue-700 dark:focus:text-blue-300",
+  delete: "focus:text-red-800 dark:focus:text-red-200",
+  none: undefined,
+};
+
+const SWIPE_ACTION_ICONS: Record<SwipeAction, ComponentType<{ className?: string }>> = {
+  archive: ArchiveIcon,
+  delete: Trash2Icon,
+  none: MinusIcon,
+};
+
+/**
+ * Per-device swipe actions for sidebar session rows on touch devices. One
+ * card per direction, laid out like the Default transcript view cards; each
+ * opens a menu of Archive / Delete / None. Delete stays behind the row's
+ * confirm dialog; None makes that direction inert.
+ */
+function SwipeActionsControl() {
+  // Live subscription so the cards reflect writes from anywhere (other tabs,
+  // and the shared source every session row reads). writeSwipeActions notifies.
+  const actions = useSwipeActions();
+  const swatch = useResolvedThemeMode() === "dark" ? DARK_MODE_PREVIEW : LIGHT_MODE_PREVIEW;
+  const [openDirection, setOpenDirection] = useState<SwipeDirection | null>(null);
+  const labelId = useId();
+
+  const choose = useCallback(
+    (direction: SwipeDirection, next: SwipeAction) => {
+      writeSwipeActions({ ...actions, [direction]: next });
+    },
+    [actions],
+  );
+
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Swipe actions"
+      helper="Choose what swiping a session in the sidebar does. Delete always asks first."
+    >
+      <div role="group" aria-labelledby={labelId} className="grid grid-cols-2 gap-3">
+        {(["right", "left"] as const).map((direction) => {
+          const action = actions[direction];
+          const tone = SWIPE_ACTION_TONES[action];
+          const open = openDirection === direction;
+          return (
+            <DropdownMenu
+              key={direction}
+              open={open}
+              onOpenChange={(next) => setOpenDirection(next ? direction : null)}
+            >
+              <DropdownMenuTrigger asChild>
+                {/* The border shows "selected" only while this card's menu is open. */}
+                <button
+                  type="button"
+                  aria-label={`Swipe ${direction}: ${SWIPE_ACTION_LABELS[action]}`}
+                  data-testid={`swipe-action-${direction}`}
+                  className={themeCardClass(open, false, "items-center gap-2 p-4")}
+                >
+                  {iconCardBody(SWIPE_ACTION_ICONS[action], `Swipe ${direction}`, tone)}
+                  <span
+                    data-testid={`swipe-action-${direction}-label`}
+                    className={cn("flex items-center gap-1 text-sm text-muted-foreground", tone)}
+                  >
+                    {SWIPE_ACTION_LABELS[action]}
+                    <ChevronDownIcon aria-hidden="true" className="size-4 text-muted-foreground" />
+                  </span>
+                </button>
+              </DropdownMenuTrigger>
+              {/* Radix names the menu after its card, e.g. "Swipe right: Archive". */}
+              <DropdownMenuContent className="min-w-(--radix-dropdown-menu-trigger-width)">
+                <DropdownMenuRadioGroup
+                  value={action}
+                  onValueChange={(next) => {
+                    if (isSwipeAction(next)) choose(direction, next);
+                  }}
+                >
+                  {swipeActionOptions.map((option) => (
+                    <DropdownMenuRadioItem
+                      key={option}
+                      value={option}
+                      data-testid={`swipe-action-${direction}-${option}`}
+                      className={cn(
+                        "gap-3 [&_svg]:text-current",
+                        option === action && [
+                          SWIPE_ACTION_TONES[option],
+                          SWIPE_ACTION_FOCUS_TONES[option],
+                        ],
+                      )}
+                    >
+                      <span className="w-24 shrink-0">
+                        <SwipeActionPreview swatch={swatch} direction={direction} action={option} />
+                      </span>
+                      {SWIPE_ACTION_LABELS[option]}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          );
+        })}
+      </div>
+    </ThemeSubsection>
+  );
+}
+
 function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
@@ -1151,6 +1311,8 @@ function AppearanceSection() {
     writeProjectFolderPageSize(PROJECT_FOLDER_PAGE_SIZE);
     writeSessionRowQuickActions(DEFAULT_SESSION_ROW_QUICK_ACTIONS);
 
+    writeSwipeActions(DEFAULT_SWIPE_ACTIONS);
+
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
@@ -1182,6 +1344,7 @@ function AppearanceSection() {
           PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
           SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
           HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+          "omnigent:swipe-actions",
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -1281,7 +1444,6 @@ function AppearanceSection() {
             </div>
           </SettingsGroup>
 
-
           <SettingsGroup title="Code typography" testId="settings-group-code-type">
             <UiCodeFontSizeControl />
             <div className="mt-4 border-t border-border pt-4">
@@ -1292,16 +1454,9 @@ function AppearanceSection() {
             </div>
           </SettingsGroup>
 
-          <SettingsGroup
-            title="Touch & mobile"
-            description="Settings for phones, tablets and other touch screens."
-            descriptionClassName="text-sm"
-          >
-            <div className="flex flex-col gap-8">
-              <SwipeActionsControl />
-            </div>
+          <SettingsGroup title="Touch & mobile" testId="settings-group-touch">
+            <SwipeActionsControl />
           </SettingsGroup>
-        </div>
         </div>
 
         <SettingsGroup title="Settings data" testId="settings-group-data">

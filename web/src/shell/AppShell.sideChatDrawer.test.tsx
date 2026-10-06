@@ -70,9 +70,12 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     <div data-testid="side-chat-pane-stub">{childId}</div>
   ),
 }));
+vi.mock("@/lib/breakpoints", async (importOriginal) => ({
+  ...(await importOriginal<typeof BreakpointsModule>()),
+  isMobileViewport: vi.fn(() => false),
+}));
 vi.mock("./Sidebar", () => ({
   Sidebar: () => <div data-testid="sidebar" />,
-  isMobileViewport: vi.fn(() => false),
 }));
 vi.mock("./PullRequestPanel", () => ({
   selectPullRequestInPanel: vi.fn(),
@@ -95,7 +98,8 @@ vi.mock("./TerminalsPanel", () => ({
 }));
 
 import { AppShell } from "./AppShell";
-import { isMobileViewport } from "./Sidebar";
+import type * as BreakpointsModule from "@/lib/breakpoints";
+import { isMobileViewport } from "@/lib/breakpoints";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import { useConversations } from "@/hooks/useConversations";
 import { useSession } from "@/hooks/useSession";
