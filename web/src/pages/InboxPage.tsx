@@ -29,9 +29,15 @@
  * comments panel is open on its file; the "Open file" link deep-links
  * to exactly that (`?file=` + `?comment=` auto-opens the panel).
  *
- * Deliberately NOT here for approvals: read/unread state, dismiss,
- * mentions — none of those exist as server concepts. Resolving (or
- * the prompt timing out) is what clears an approval.
+ * After those come sessions with unseen agent output — the same
+ * read-state behind the sidebar's unread dot — as compact rows previewing
+ * the latest reply. Opening the session or "Mark as read" clears a row.
+ * Tabs narrow the list to "Unread" (comments + unread sessions) or
+ * "Awaiting response" (approvals); the pick persists per device.
+ *
+ * Deliberately NOT here: dismissing approvals and mentions — neither
+ * exists as a server concept. Resolving (or the prompt timing out) is
+ * what clears an approval.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -39,7 +45,10 @@ import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
   ArrowRightIcon,
+  CheckIcon,
   ChevronDownIcon,
+  CircleAlertIcon,
+  CircleCheckIcon,
   InboxIcon,
   Loader2Icon,
 } from "lucide-react";
@@ -47,12 +56,31 @@ import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/Approva
 import { PageScroll } from "@/components/PageScroll";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useSidebarData } from "@/hooks/useSidebarData";
-import { collectInboxItems, type InboxItem, type InboxSource } from "@/lib/inbox";
+import {
+  isConversationUnseen,
+  markConversationRead,
+  useUnseenTick,
+} from "@/hooks/useUnseenConversations";
+import {
+  collectInboxItems,
+  collectUnreadInboxItems,
+  type InboxItem,
+  type InboxSource,
+  type UnreadInboxItem,
+} from "@/lib/inbox";
+import {
+  isInboxFilter,
+  readInboxFilter,
+  writeInboxFilter,
+  type InboxFilter,
+} from "@/lib/inboxFilterPreferences";
+import { latestOutputPreview } from "@/lib/lastAssistantText";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { approve, getSession } from "@/lib/sessionsApi";
+import { approve, fetchSessionItemsPage, getSession } from "@/lib/sessionsApi";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
@@ -67,6 +95,31 @@ type RespondedMap = Record<
   }
 >;
 
+const INBOX_TABS: { value: InboxFilter; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "unread", label: "Unread" },
+  { value: "awaiting", label: "Awaiting response" },
+];
+
+const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
+  all: {
+    title: "Nothing waiting on you",
+    body: "When an agent replies or needs your input, or someone comments on a file, it will show up here.",
+  },
+  unread: {
+    title: "You’re all caught up",
+    body: "New agent replies and unseen file comments will show up here.",
+  },
+  awaiting: {
+    title: "No approvals waiting",
+    body: "When an agent needs your input, it will show up here.",
+  },
+};
+
+// Enough trailing items to step past a tool call or two after the final reply.
+const PREVIEW_SCAN_ITEMS = 12;
+const PREVIEW_MAX_CHARS = 280;
+
 export function InboxPage() {
   const queryClient = useQueryClient();
   const { trackClick } = useOmnigentAnalytics();
@@ -75,12 +128,15 @@ export function InboxPage() {
     inboxRows: allRows,
     comments: commentInbox,
   } = useSidebarData();
+  const [filter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const [responded, setResponded] = useState<RespondedMap>({});
   // Manual expand/collapse toggles keyed by elicitation id. Anything
   // not in the map falls back to the default: expanded only for the
   // first (newest) item. Keying by id (not index) keeps a user's
   // explicit toggles stable when new items shift positions.
   const [expandedOverrides, setExpandedOverrides] = useState<Record<string, boolean>>({});
+  // Unread rows start collapsed; toggles are keyed by session id.
+  const [expandedUnread, setExpandedUnread] = useState<Record<string, boolean>>({});
 
   const { hasNextPage, isFetchingNextPage, fetchNextPage } = conversationsQuery;
   const rows = allRows.filter((c) => (c.pending_elicitations_count ?? 0) > 0);
@@ -105,6 +161,43 @@ export function InboxPage() {
     if (snapshot) sources.push({ row, pendingElicitations: snapshot.pendingElicitations ?? [] });
   });
   const items = collectInboxItems(sources);
+
+  // Subscribed to the read-state mirror so "Mark as read" (here or in the
+  // sidebar) drops the row immediately instead of on the next list poll.
+  useUnseenTick();
+  const unreadItems = collectUnreadInboxItems(allRows, isConversationUnseen);
+  const showApprovals = filter !== "unread";
+  const showUnread = filter !== "awaiting";
+
+  // Latest-output preview per unread session. `updated_at` in the key
+  // refetches after a new turn; a failed fetch just leaves the row bare.
+  const previewQueries = useQueries({
+    queries: unreadItems.map(({ row }) => ({
+      queryKey: ["inbox-unread-preview", row.id, row.updated_at],
+      queryFn: async () => {
+        const page = await fetchSessionItemsPage(row.id, { limit: PREVIEW_SCAN_ITEMS });
+        return latestOutputPreview(page.items, PREVIEW_MAX_CHARS) ?? null;
+      },
+      enabled: showUnread,
+      staleTime: Infinity,
+      retry: 1,
+    })),
+  });
+  const previewBySession = new Map(
+    unreadItems.map(({ row }, i) => [row.id, previewQueries[i]?.data ?? undefined]),
+  );
+
+  const visibleApprovals = showApprovals ? items : [];
+  const visibleComments = showUnread ? commentInbox.items : [];
+  const visibleUnread = showUnread ? unreadItems : [];
+  const visibleCount = visibleApprovals.length + visibleComments.length + visibleUnread.length;
+  const summary = [
+    items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
+    commentInbox.items.length > 0 &&
+      (commentInbox.items.length === 1 ? "1 comment" : `${commentInbox.items.length} comments`),
+    unreadItems.length > 0 && `${unreadItems.length} unread`,
+  ].filter(Boolean);
+  const emptyState = EMPTY_STATES[filter];
 
   // Clear stale optimistic verdicts when snapshot data refreshes.
   // If a hook retry re-parks the same elicitation id after the user
@@ -180,23 +273,31 @@ export function InboxPage() {
 
   return (
     <PageScroll contentClassName="px-4 md:px-6">
-      <div className="mb-6 flex items-center justify-between">
+      <div className="mb-4 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Inbox</h1>
-        {(items.length > 0 || commentInbox.items.length > 0) && (
-          <span className="text-ui text-muted-foreground">
-            {[
-              items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
-              commentInbox.items.length > 0 &&
-                (commentInbox.items.length === 1
-                  ? "1 comment"
-                  : `${commentInbox.items.length} comments`),
-            ]
-              .filter(Boolean)
-              .join(" · ")}{" "}
-            waiting
-          </span>
+        {summary.length > 0 && (
+          <span className="text-ui text-muted-foreground">{summary.join(" · ")}</span>
         )}
       </div>
+
+      <Tabs
+        value={filter}
+        onValueChange={(value) => {
+          if (!isInboxFilter(value)) return;
+          setFilter(value);
+          writeInboxFilter(value);
+        }}
+        componentId="inbox.filter"
+        className="mb-4"
+      >
+        <TabsList variant="pill" aria-label="Inbox filter" className="gap-1">
+          {INBOX_TABS.map(({ value, label }) => (
+            <TabsTrigger key={value} value={value} className="h-7 flex-none px-2.5">
+              {label}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+      </Tabs>
 
       {failedSessionCount > 0 && (
         <div
@@ -223,30 +324,25 @@ export function InboxPage() {
         </div>
       )}
 
-      {assembling && items.length === 0 && commentInbox.items.length === 0 && (
+      {assembling && visibleCount === 0 && (
         <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           Loading inbox…
         </div>
       )}
 
-      {!assembling &&
-        failedSessionCount === 0 &&
-        items.length === 0 &&
-        commentInbox.items.length === 0 && (
-          <div className="flex flex-col items-center gap-2 py-16 text-center">
-            <InboxIcon className="size-8 text-muted-foreground/50" />
-            <p className="text-ui font-medium">
-              {hasNextPage ? "Nothing waiting in these sessions" : "Nothing waiting on you"}
-            </p>
-            <p className="text-sm text-muted-foreground">
-              When an agent needs your input or someone comments on a file, it will show up here.
-            </p>
-          </div>
-        )}
+      {!assembling && failedSessionCount === 0 && visibleCount === 0 && (
+        <div className="flex flex-col items-center gap-2 py-16 text-center">
+          <InboxIcon className="size-8 text-muted-foreground/50" />
+          <p className="text-ui font-medium">
+            {hasNextPage ? "Nothing waiting in these sessions" : emptyState.title}
+          </p>
+          <p className="text-sm text-muted-foreground">{emptyState.body}</p>
+        </div>
+      )}
 
       <div className="flex flex-col gap-4">
-        {items.map((item, index) => {
+        {visibleApprovals.map((item, index) => {
           const elicitationId = item.elicitation.elicitationId;
           const verdict = responded[elicitationId];
           const expanded = expandedOverrides[elicitationId] ?? index === 0;
@@ -334,7 +430,7 @@ export function InboxPage() {
             </div>
           );
         })}
-        {commentInbox.items.map((item) => {
+        {visibleComments.map((item) => {
           const comment = item.comment;
           // Single-user mode stores no author; mirror CommentsPanel's
           // "You" fallback (the only human in that mode is the viewer).
@@ -395,7 +491,28 @@ export function InboxPage() {
             </div>
           );
         })}
-        {assembling && (items.length > 0 || commentInbox.items.length > 0) && (
+        {visibleUnread.map((item) => {
+          const sessionId = item.row.id;
+          const expanded = expandedUnread[sessionId] ?? false;
+          return (
+            <UnreadInboxRow
+              key={sessionId}
+              item={item}
+              preview={previewBySession.get(sessionId)}
+              expanded={expanded}
+              onToggle={() => {
+                trackClick("inbox.unread.toggle_expanded", "button");
+                setExpandedUnread((prev) => ({ ...prev, [sessionId]: !expanded }));
+              }}
+              onMarkRead={() => {
+                // Drop the toggle so a later reply re-surfaces the row collapsed.
+                setExpandedUnread(({ [sessionId]: _cleared, ...rest }) => rest);
+                markConversationRead(sessionId, item.row.updated_at);
+              }}
+            />
+          );
+        })}
+        {assembling && visibleCount > 0 && (
           <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
             <Loader2Icon className="size-3.5 animate-spin" />
             Checking remaining sessions…
@@ -413,5 +530,97 @@ export function InboxPage() {
         </Button>
       )}
     </PageScroll>
+  );
+}
+
+/**
+ * One session with unseen agent output: a compact row (kind, title, a
+ * one-line preview of the latest reply) that expands to the fuller
+ * preview plus "Mark as read" / "Open session" — both mark the session read.
+ */
+function UnreadInboxRow({
+  item,
+  preview,
+  expanded,
+  onToggle,
+  onMarkRead,
+}: {
+  item: UnreadInboxItem;
+  preview: string | undefined;
+  expanded: boolean;
+  onToggle: () => void;
+  onMarkRead: () => void;
+}) {
+  const isError = item.kind === "error";
+  const KindIcon = isError ? CircleAlertIcon : CircleCheckIcon;
+  return (
+    <div
+      data-testid="inbox-unread"
+      data-kind={item.kind}
+      data-expanded={expanded}
+      className="flex flex-col gap-3 rounded-xl border border-border bg-card px-4 py-3"
+    >
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={onToggle}
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 text-left"
+        >
+          <span
+            aria-hidden
+            className={cn(
+              "flex size-7 shrink-0 items-center justify-center rounded-md",
+              isError ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground",
+            )}
+          >
+            <KindIcon className="size-4" />
+          </span>
+          <span className="w-12 shrink-0 text-sm text-muted-foreground">
+            {isError ? "Error" : "Done"}
+          </span>
+          <span className="min-w-0 truncate text-ui">
+            <span className="font-medium">{conversationDisplayLabel(item.row)}</span>
+            {!expanded && preview && <span className="text-muted-foreground"> — {preview}</span>}
+          </span>
+        </button>
+        <span className="flex shrink-0 items-center gap-3">
+          <span className="text-sm text-muted-foreground">
+            {/* Server timestamps are epoch seconds; relativeTime takes ms. */}
+            {relativeTime(item.row.updated_at * 1000)}
+          </span>
+          {/* Same brand-pink dot as the sidebar's unread indicator. */}
+          <span role="img" aria-label="Unread" className="size-1.5 rounded-full bg-brand-accent" />
+        </span>
+      </div>
+      {expanded && (
+        <div className="flex flex-col gap-3 pl-10">
+          {preview && <p className="text-ui break-words whitespace-pre-wrap">{preview}</p>}
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onMarkRead}
+              componentId="inbox.unread.mark_read"
+            >
+              <CheckIcon className="mr-1 size-3.5" />
+              Mark as read
+            </Button>
+            <Button asChild variant="outline" size="sm">
+              {/* Opening is reading. Mark it here: a freshly mounted chat keeps an
+                  explicit "Mark as unread" override, so it wouldn't clear this row. */}
+              <Link
+                to={`/c/${item.row.id}`}
+                onClick={onMarkRead}
+                componentId="inbox.unread.open_session"
+              >
+                Open session
+                <ArrowRightIcon className="ml-1 size-3.5" />
+              </Link>
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

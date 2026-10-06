@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -436,6 +437,64 @@ async def test_cancelling_waiter_preserves_shared_initialization() -> None:
     assert len(client.calls) == 1
 
 
+class _Agents:
+    """Agent store stub whose ``get`` finds only the given ids."""
+
+    def __init__(self, *ids: str) -> None:
+        self.ids = set(ids)
+
+    def get(self, agent_id: str) -> object | None:
+        return object() if agent_id in self.ids else None
+
+
+@pytest.mark.asyncio
+async def test_initializer_skips_a_session_whose_agent_was_removed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The runner could only reject it: no POST, one warning line, and a response
+    callers recognize. An agent that still exists initializes as before."""
+    from omnigent.server.runner_session_init import is_session_agent_removed
+
+    client = _Client()
+    client.release.set()
+    conversation = _conversation()
+    removed = RunnerSessionInitializer(  # type: ignore[arg-type]
+        _Registry(), server_version="test", agent_store=_Agents()
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.runner_session_init"):
+        response = await removed.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
+
+    assert is_session_agent_removed(response)
+    assert client.calls == []
+    records = [r for r in caplog.records if r.name == "omnigent.server.runner_session_init"]
+    assert [(r.levelname, r.exc_info) for r in records] == [("WARNING", None)]
+
+    present = RunnerSessionInitializer(  # type: ignore[arg-type]
+        _Registry(), server_version="test", agent_store=_Agents(conversation.agent_id)
+    )
+    response = await present.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
+    assert response.status_code == 201
+    assert not is_session_agent_removed(response)
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_callers_arriving_during_the_agent_check_share_one_init() -> None:
+    """The agent lookup yields, so a caller arriving meanwhile joins the first
+    caller's initialization instead of sending the runner another."""
+    client = _Client()
+    client.release.set()
+    conversation = _conversation()
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        _Registry(), server_version="test", agent_store=_Agents(conversation.agent_id)
+    )
+    responses = await asyncio.gather(
+        *(initializer.initialize(conversation, client, timeout=1) for _ in range(2))  # type: ignore[arg-type]
+    )
+    assert [response.status_code for response in responses] == [201, 201]
+    assert len(client.calls) == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalidate", ["runner", "session"])
 @pytest.mark.parametrize("cancel_caller", [False, True])
@@ -568,3 +627,39 @@ async def test_delayed_initialization_cannot_follow_a_replacement_tunnel() -> No
             await asyncio.gather(init, return_exceptions=True)
     assert not new.in_flight
     assert new.outbound_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_handshake_for_a_removed_agent_forwards_or_says_so() -> None:
+    """A message forward goes ahead (the runner answers it); a caller that needs
+    the runner ready gets the removed-agent error, not "runner unavailable"."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _ensure_runner_session_initialized,
+    )
+
+    conversation = _conversation()
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        _Registry(), server_version="test", agent_store=_Agents()
+    )
+    client = _Client()
+    client.release.set()
+
+    forwarded = await _ensure_runner_session_initialized(
+        conversation.id,
+        conversation,
+        client,
+        Mock(),
+        initializer,  # type: ignore[arg-type]
+    )
+    assert forwarded is False
+    with pytest.raises(OmnigentError) as raised:
+        await _ensure_runner_session_initialized(
+            conversation.id,
+            conversation,
+            client,
+            Mock(),
+            initializer,
+            require_success=True,  # type: ignore[arg-type]
+        )
+    assert raised.value.code == ErrorCode.SESSION_AGENT_MISSING
+    assert client.calls == []

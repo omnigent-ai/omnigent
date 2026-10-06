@@ -12,11 +12,12 @@ import httpx
 
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
-from omnigent.errors import ErrorCategory
+from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory, ErrorCode
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.conversation_store import ConversationStore
     from omnigent.stores.file_store import FileStore
 
@@ -34,6 +35,25 @@ def runner_inference_verified(conversation: Conversation, response: httpx.Respon
     return isinstance(payload, dict) and payload.get("inference_config_verified") is True
 
 
+def is_session_agent_removed(response: httpx.Response) -> bool:
+    """
+    Whether *response* is the initializer skipping a session whose agent was removed.
+
+    The runner could only reject that session, and it says so itself on the
+    session's next message, so callers treat this as expected, not a failure.
+
+    :param response: A response from :meth:`RunnerSessionInitializer.initialize`.
+    :returns: ``True`` for the removed-agent response.
+    """
+    if response.status_code != 410:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("error") == ErrorCode.SESSION_AGENT_MISSING
+
+
 _logger = logging.getLogger(__name__)
 
 
@@ -47,11 +67,13 @@ class RunnerSessionInitializer:
         server_version: str,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
+        agent_store: AgentStore | None = None,
     ) -> None:
         self._registry = registry
         self._server_version = server_version
         self._conversation_store = conversation_store
         self._file_store = file_store
+        self._agent_store = agent_store
         self._tasks: dict[
             tuple[str, int, str, str, str | None, bool],
             asyncio.Task[httpx.Response],
@@ -98,6 +120,28 @@ class RunnerSessionInitializer:
             resume_interrupted_turn,
         )
         task = self._tasks.get(key)
+        if task is None and self._agent_store is not None:
+            async with store_slots or nullcontext():
+                agent = await asyncio.to_thread(self._agent_store.get, agent_id)
+            if agent is None:
+                # The user removed the agent (`omnigent agent remove`). The runner
+                # could only reject this init; the session reports the removal on
+                # its next message, so this is expected and not worth a failure.
+                _logger.warning(
+                    "Not initializing session %s on its runner: its agent %s was removed",
+                    conversation.id,
+                    agent_id,
+                )
+                return httpx.Response(
+                    410,
+                    json={
+                        "error": ErrorCode.SESSION_AGENT_MISSING,
+                        "detail": SESSION_AGENT_MISSING_MESSAGE,
+                    },
+                    request=httpx.Request("POST", "/v1/sessions"),
+                )
+            # Another caller may have started this initialization during the lookup.
+            task = self._tasks.get(key)
         if task is None:
             recovery_id = (
                 self._recovery_ids.setdefault(key, uuid4().hex)
