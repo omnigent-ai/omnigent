@@ -1875,10 +1875,9 @@ function UiFontFamilyControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      {/* Take the remaining width (and let the longer description wrap within
-          this column) so the input stays inline instead of dropping to its own
-          row — matches the font-size row's alignment. */}
-      <div className="flex min-w-0 flex-1 flex-col">
+      {/* Grow from a real flex-basis: with basis 0 this column collapses to a
+          sliver at phone widths instead of wrapping the control onto its own line. */}
+      <div className="flex min-w-0 grow basis-48 flex-col">
         <span className="text-ui font-medium">Font family</span>
         <span className="text-sm text-muted-foreground">
           Use any font installed on this device. Leave blank for the system default.
@@ -2039,7 +2038,9 @@ function UiCodeFontFamilyControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <div className="flex min-w-0 flex-1 flex-col">
+      {/* Same grow + real flex-basis as the Font family row: a basis-0 column
+          collapses to a sliver on phone widths instead of letting the row wrap. */}
+      <div className="flex min-w-0 grow basis-48 flex-col">
         <span className="text-ui font-medium">Code font family</span>
         <span className="text-sm text-muted-foreground">
           Font for the code editor and terminal. Leave blank for the default.
