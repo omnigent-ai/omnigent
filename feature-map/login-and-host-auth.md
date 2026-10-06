@@ -55,7 +55,9 @@ session whose host went offline offers reconnect (see [sessions](./sessions.md))
 
 **Desktop:** Connect on the setup screen (or the server selector) to an OIDC
 server; relaunching the app, New Window, deep links, and switching servers on a
-signed-in server; the app's sign-out in Settings.
+signed-in server; the app's sign-out in Settings, **Server → Sign Out of Server**
+in the native menu, and **Sign out of <server>** in the sidebar server picker (Databricks and OIDC servers; the next Connect opens
+the browser, which is how a user switches accounts).
 
 **Embedded API:** construct `create_app(auth_provider=...)` with the embedding
 application's provider and stores, then use its authenticated REST client to
@@ -105,6 +107,14 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `web/electron/test/oidc-auth.test.js`, `oidc-credentials.test.js`, and the
   "OIDC system-browser sign-in wiring" suite in `main.test.js`; server flow:
   `tests/server/integration/test_oidc_native_login.py`.
+- **Desktop sign-out (Server menu and sidebar picker):** connect the desktop to an
+  OIDC server or a Databricks workspace, choose **Server → Sign Out of Server**,
+  and confirm every window on it shows "You're signed out of …" and the next
+  Connect opens the browser. The sidebar picker's **Sign out of <server>** needs a
+  server serving this checkout's web build. Component tests: the
+  "signs a workspace out…", "Server → Sign Out of Server…", and "holds a
+  connection that starts during sign-out…" cases in `web/electron/test/main.test.js`,
+  and `web/src/shell/SidebarServerPicker.test.tsx`.
 
 ## Gotchas
 

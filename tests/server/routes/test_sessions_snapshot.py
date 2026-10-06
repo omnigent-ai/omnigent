@@ -301,6 +301,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
                     "name": "advisor-row",
                     "bundle_location": "bundle",
                     "session_id": None,
+                    "operator_authored": True,
                 },
             )()
 
@@ -406,6 +407,7 @@ async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
                     "name": "advisor-row",
                     "bundle_location": "bundle",
                     "session_id": None,
+                    "operator_authored": True,
                 },
             )()
 

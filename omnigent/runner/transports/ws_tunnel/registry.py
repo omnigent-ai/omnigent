@@ -38,6 +38,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
+from itertools import count
 from typing import Protocol
 
 import httpx
@@ -54,6 +55,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 
 _logger = logging.getLogger(__name__)
+_connection_generations = count(1)
 
 
 class WebSocketLike(Protocol):
@@ -94,6 +96,7 @@ class RunnerSession:
         disabled (single-user mode). Used to enforce runner
         ownership: only the owner (or an admin) may bind sessions
         to this runner.
+    :param generation: Process-unique connection generation for initialization readiness.
     :param in_flight: Per-req_id reassembly state. Each entry holds
         a head Future + body queue + end Event so the transport can
         await heads, iterate body chunks, and detect end.
@@ -110,6 +113,7 @@ class RunnerSession:
     connected_at: float
     last_frame_at: float
     owner: str | None
+    generation: int = field(default_factory=lambda: next(_connection_generations))
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
@@ -553,10 +557,13 @@ class TunnelRegistry:
 
     # ── Per-request lifecycle ────────────────────────────
 
-    def open_request(self, runner_id: str, req_id: str) -> RequestState:
+    def open_request(
+        self, runner_id: str, req_id: str, *, generation: int | None = None
+    ) -> RequestState:
         """Allocate reassembly state for a new outgoing request.
 
         :raises KeyError: If the runner isn't online.
+        :raises ConnectionError: If the requested connection has been replaced.
         :raises ValueError: If a request with this ``req_id`` is
             already in flight on this runner. req_ids must be unique
             per session.
@@ -566,6 +573,8 @@ class TunnelRegistry:
             session = self._sessions.get(runner_id)
             if session is None:
                 raise KeyError(runner_id)
+            if generation is not None and session.generation != generation:
+                raise ConnectionError("runner tunnel changed before request was sent")
             if req_id in session.in_flight:
                 raise ValueError(f"req_id {req_id!r} already in flight on runner {runner_id!r}")
             state = RequestState(

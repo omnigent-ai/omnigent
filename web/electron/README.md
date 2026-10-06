@@ -140,10 +140,13 @@ tries silent renewal. Missing credentials, failed renewal, unavailable OAuth,
 and cancellation lead to the shell's connect/retry screen—not embedded workspace
 SSO. Failed connections stay blocked through the selector handoff so a late login
 redirect cannot replace it. Connect reuses stored credentials and opens the
-system browser only when they can't sign in; **Sign in with a different account**
-under Connect always opens it. Saved-server launches, additional windows, server
-switches, and deep links use stored credentials without opening a browser
-automatically.
+system browser only when they can't sign in. To use another account, choose
+**Server → Sign Out of Server** (or **Sign out of <workspace>** in the server
+picker at the bottom of the sidebar, on servers whose web app includes it): it
+forgets the stored OAuth token, clears DBAUTH, and returns every window on that
+workspace to the connect screen, so the next Connect signs in through the
+browser. Saved-server launches, additional windows, server switches, and deep
+links use stored credentials without opening a browser automatically.
 
 When the workspace is briefly unreachable (a VPN reconnecting after wake, an IP
 access list refusing this network, or HTTP 5xx/429), the window keeps its page
@@ -280,9 +283,10 @@ browser sign-in:
 - **While connected,** the shell renews the cookie before it expires and when it
   is removed. The web app's own redirect to `/auth/login` is stopped before it
   can reach the IdP; the shell renews and reloads the page you were on.
-- **Sign out** (the web app's `/auth/logout`) is handled by the shell: it
-  revokes the refresh grant, clears the session cookie, and shows the connect
-  screen for every window on that server. Your browser stays signed in to the
+- **Sign out** (the web app's `/auth/logout`, **Server → Sign Out of Server**,
+  or **Sign out of <server>** in the sidebar server picker) is handled by the shell: it revokes the refresh
+  grant, clears the session cookie, and shows the connect screen for every
+  window on that server. Your browser stays signed in to the
   IdP, so the next Connect may finish without a prompt.
 - **Cancel** (the × beside **Authenticating…**) stops the attempt and the
   loopback listener. A browser tab that finishes later reaches nothing.

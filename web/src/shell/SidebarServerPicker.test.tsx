@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 
@@ -9,11 +10,13 @@ import { SidebarServerPicker } from "./SidebarServerPicker";
 const getServerPicker = vi.fn();
 const switchServer = vi.fn();
 const openServerSetup = vi.fn();
+const signOutOfServer = vi.fn();
 
 vi.mock("@/lib/nativeBridge", () => ({
   getServerPicker: () => getServerPicker(),
   switchServer: (url: string) => switchServer(url),
   openServerSetup: () => openServerSetup(),
+  signOutOfServer: () => signOutOfServer(),
 }));
 
 function renderPicker() {
@@ -38,6 +41,7 @@ beforeEach(() => {
   getServerPicker.mockReset();
   switchServer.mockReset();
   openServerSetup.mockReset();
+  signOutOfServer.mockReset();
 });
 
 afterEach(cleanup);
@@ -311,6 +315,47 @@ describe("SidebarServerPicker", () => {
     renderPicker();
     expect(await screen.findByText("Engineering")).toBeInTheDocument();
     expect(screen.queryByText("Self-chosen")).toBeNull();
+  });
+
+  it("offers Sign out when the shell owns the server's sign-in", async () => {
+    signOutOfServer.mockResolvedValue(true);
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      recentServers: [],
+      canSignOut: true,
+    });
+    renderPicker();
+    await openMenu();
+    fireEvent.click(await screen.findByText("Sign out of omni.example"));
+    await waitFor(() => expect(signOutOfServer).toHaveBeenCalledOnce());
+  });
+
+  it("reports a sign-out the shell couldn't complete", async () => {
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "id");
+    signOutOfServer.mockResolvedValue(false);
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      recentServers: [],
+      canSignOut: true,
+    });
+    renderPicker();
+    await openMenu();
+    fireEvent.click(await screen.findByText("Sign out of omni.example"));
+    await waitFor(() =>
+      expect(errorToast).toHaveBeenCalledWith("Couldn't sign out of omni.example"),
+    );
+    errorToast.mockRestore();
+  });
+
+  it("hides Sign out when the shell can't sign the server out", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+    });
+    renderPicker();
+    await openMenu();
+    expect(await screen.findByText("Connect to new server…")).toBeInTheDocument();
+    expect(screen.queryByTestId("sidebar-server-sign-out")).toBeNull();
   });
 
   it("doesn't offer the workspace host it moved to as another server", async () => {
