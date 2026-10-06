@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from typing import TypedDict, cast
+
+_logger = logging.getLogger(__name__)
 
 _SAMPLE_INTERVAL_S = 5.0
 _SLOW_OPERATION_S = 1.0
@@ -73,10 +76,10 @@ class TunnelDiagnosticAttrs(TunnelKeepaliveSettings, total=False):
 
 @dataclass(frozen=True, slots=True)
 class OutboundFrame:
-    """An unchanged wire payload with local queue timing metadata."""
+    """An unchanged wire payload timestamped with its diagnostics' monotonic clock."""
 
     data: str
-    queued_at: float = field(default_factory=time.monotonic)
+    queued_at: float
     app_ping_ts: int | None = None
 
 
@@ -116,6 +119,7 @@ class TunnelDiagnostics:
     to distinguish an old delay from one near the disconnect.
 
     :param clock: Local monotonic clock, injectable for deterministic timing tests.
+        Queue timestamps must use this same clock.
     """
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
@@ -159,15 +163,21 @@ class TunnelDiagnostics:
             self._report = None
 
     async def _monitor(self) -> None:
-        while self._loop_due_at is not None:
-            await asyncio.sleep(max(0.0, self._loop_due_at - self._clock()))
-            now = self._clock()
-            lag = max(0.0, now - self._loop_due_at)
-            self._loop_lag.observe(lag, now)
-            self._loop_due_at = now + _SAMPLE_INTERVAL_S
-            oldest_send = min(self._active_sends.values(), default=now)
-            if max(lag, now - oldest_send) >= _SLOW_OPERATION_S:
-                self._maybe_report(now)
+        try:
+            while self._loop_due_at is not None:
+                await asyncio.sleep(max(0.0, self._loop_due_at - self._clock()))
+                now = self._clock()
+                lag = max(0.0, now - self._loop_due_at)
+                self._loop_lag.observe(lag, now)
+                self._loop_due_at = now + _SAMPLE_INTERVAL_S
+                oldest_send = min(self._active_sends.values(), default=now)
+                if max(lag, now - oldest_send) >= _SLOW_OPERATION_S:
+                    self._maybe_report(now)
+        except Exception:
+            # A dead sampler must not look like an ever-growing scheduling delay.
+            self._loop_due_at = None
+            with contextlib.suppress(Exception):
+                _logger.exception("Tunnel diagnostics monitor failed")
 
     def _maybe_report(self, now: float) -> None:
         if self._report is not None and self._frozen is None and now >= self._next_report_at:
@@ -193,7 +203,7 @@ class TunnelDiagnostics:
             self._ping_rtt.observe(now - sent_at, now)
 
     def enqueued(self, frame: OutboundFrame, depth: int, requested_at: float) -> None:
-        """Run after enqueue on the socket loop, including cross-loop handoff delay."""
+        """Record queue entry; both input timestamps must use this object's clock."""
         self._queue_depth = depth
         self._queue_high_water = max(self._queue_high_water or 0, depth)
         self._enqueue_delay.observe(frame.queued_at - requested_at, frame.queued_at)
@@ -265,9 +275,11 @@ class TunnelDiagnostics:
                 "diagnostics_age_s": round(max(0.0, self._clock() - self._frozen_at), 3),
             }
         now = self._clock()
+        loop_lag = self._loop_lag
         # A close callback may run before the overdue monitor gets its turn.
         if self._loop_due_at is not None and now > self._loop_due_at:
-            self._loop_lag.observe(now - self._loop_due_at, now)
+            loop_lag = replace(loop_lag)
+            loop_lag.observe(now - self._loop_due_at, now)
         attrs: dict[str, object] = {
             **self.settings,
             "diagnostics_age_s": 0.0,
@@ -284,7 +296,7 @@ class TunnelDiagnostics:
             "app_ping_samples_dropped": self._ping_samples_dropped,
         }
         for name, timing in (
-            ("loop_lag", self._loop_lag),
+            ("loop_lag", loop_lag),
             ("send_duration", self._send_duration),
             ("queue_wait", self._queue_wait),
             ("enqueue_delay", self._enqueue_delay),

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
@@ -2364,7 +2365,7 @@ async def test_sender_loop_swallows_send_after_close_race() -> None:
     session = SimpleNamespace(
         runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
     )
-    session.outbound_queue.put_nowait(OutboundFrame("frame"))
+    session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     await runner_tunnel._sender_loop(ws, session)  # returns without raising
 
 
@@ -2384,7 +2385,7 @@ async def test_sender_loop_reraises_send_failure_while_connected() -> None:
     session = SimpleNamespace(
         runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
     )
-    session.outbound_queue.put_nowait(OutboundFrame("frame"))
+    session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     with pytest.raises(RuntimeError):
         await runner_tunnel._sender_loop(ws, session)
 
@@ -2421,7 +2422,7 @@ async def test_sender_loop_ends_quietly_when_a_close_wins_mid_send() -> None:
     session = SimpleNamespace(
         runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
     )
-    session.outbound_queue.put_nowait(OutboundFrame("frame"))
+    session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     sender = asyncio.create_task(runner_tunnel._sender_loop(ws, session))
     await asyncio.wait_for(frame_in_transport.wait(), timeout=5)
     await ws.close(code=4000)

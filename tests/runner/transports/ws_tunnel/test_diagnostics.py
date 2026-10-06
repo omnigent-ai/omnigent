@@ -14,6 +14,7 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import (
     TunnelDiagnosticAttrs,
     TunnelDiagnostics,
 )
+from tests.budgets import budget
 
 
 @dataclass
@@ -63,10 +64,10 @@ async def test_waiting_send_leaves_event_loop_responsive(
         entered.set()
         await release.wait()
 
-    async with diagnostics.monitoring(lambda: reports.append(diagnostics.snapshot())):
-        task = asyncio.create_task(diagnostics.send(send, "not logged"))
-        try:
-            await asyncio.wait_for(entered.wait(), timeout=2)
+    task = asyncio.create_task(diagnostics.send(send, "not logged"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        async with diagnostics.monitoring(lambda: reports.append(diagnostics.snapshot())):
             await asyncio.sleep(0.08)
             snapshot = diagnostics.snapshot()
             assert snapshot["sends_in_flight"] == 1
@@ -80,9 +81,63 @@ async def test_waiting_send_leaves_event_loop_responsive(
             assert snapshot["sends_in_flight"] == 0
             assert snapshot["send_duration_s"] >= 0.06
             assert snapshot["last_send_outcome"] == "completed"
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_monitor_failure_is_logged_without_interrupting_sends(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = 100.0
+    fail_clock = False
+    failed = asyncio.Event()
+    error = RuntimeError("sampling clock failed")
+
+    def clock() -> float:
+        nonlocal fail_clock
+        if fail_clock:
+            fail_clock = False
+            failed.set()
+            raise error
+        return now
+
+    async def send(_data: str) -> None:
+        pass
+
+    diagnostics = TunnelDiagnostics(clock=clock)
+    async with diagnostics.monitoring(lambda: None):
+        fail_clock = True
+        await asyncio.wait_for(failed.wait(), timeout=budget(1))
+        records = [r for r in caplog.records if r.message == "Tunnel diagnostics monitor failed"]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is error
+        await diagnostics.send(send, "still connected")
+        now += 100
+        snapshot = diagnostics.snapshot()
+        assert snapshot["last_send_outcome"] == "completed"
+        assert snapshot["loop_lag_max_s"] is None
+    assert diagnostics.snapshot()["sends_in_flight"] == 0
+
+
+async def test_pending_lag_snapshots_do_not_change_sample_history() -> None:
+    clock = _Clock()
+    diagnostics = TunnelDiagnostics(clock=clock)
+    async with diagnostics.monitoring(lambda: None):
+        clock.advance(8)
+        assert diagnostics.snapshot()["loop_lag_max_s"] == 3.0
+        clock.advance(1)
+        assert diagnostics.snapshot()["loop_lag_max_s"] == 4.0
+        assert diagnostics._loop_lag.max_s is None
+
+        async with asyncio.timeout(budget(1)):
+            while diagnostics._loop_lag.max_s is None:
+                await asyncio.sleep(0)
+        clock.advance(2)
+        snapshot = diagnostics.snapshot()
+        assert snapshot["loop_lag_max_s"] == 4.0
+        assert snapshot["loop_lag_max_age_s"] == 2.0
 
 
 async def test_queue_handoff_send_and_ping_rtt_are_separate_timings() -> None:

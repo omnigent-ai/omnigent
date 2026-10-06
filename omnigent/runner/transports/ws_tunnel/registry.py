@@ -751,7 +751,9 @@ class TunnelRegistry:
                 if self._sessions.get(session.runner_id) is not session:
                     error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
                 else:
-                    frame = OutboundFrame(data, app_ping_ts=app_ping_ts)
+                    frame = OutboundFrame(
+                        data, queued_at=time.monotonic(), app_ping_ts=app_ping_ts
+                    )
                     session.outbound_queue.put_nowait(frame)
                     session.diagnostics.enqueued(
                         frame, session.outbound_queue.qsize(), requested_at

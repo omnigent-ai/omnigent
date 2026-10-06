@@ -169,6 +169,9 @@ send, or queue wait of at least one second, at most once per minute per
 connection. A sampler runs every five seconds; a pending send is visible even
 if it never completes. Ordinary heartbeats add no log rows.
 
+Unexpected sampler failures are logged with their traceback. Loop-lag sampling
+then stops; send and queue timing observations continue.
+
 Join on `connection_id` and compare `tunnel_side = server` with `runner`:
 
 | Fields | Meaning |
