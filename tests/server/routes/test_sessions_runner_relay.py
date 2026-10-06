@@ -2897,8 +2897,16 @@ async def test_offline_sweep_saved_subagent_turn_without_a_cached_edge(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mark_older_than_grace",
+    [
+        pytest.param(False, id="fresh-mark"),
+        pytest.param(True, id="mark-older-than-grace"),
+    ],
+)
 async def test_relay_does_not_fail_turn_during_server_shutdown(
     monkeypatch: pytest.MonkeyPatch,
+    mark_older_than_grace: bool,
 ) -> None:
     """
     A stream drop while THIS server is shutting down leaves the turn alone.
@@ -2906,23 +2914,32 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
     Shutdown closes the runner tunnels, which drops every relay stream; the
     runner itself is alive and reconnects to the replacement server. The
     give-up path must publish no ``failed`` status and persist no
-    ``runner_disconnected`` labels for that self-inflicted loss.
+    ``runner_disconnected`` labels for that self-inflicted loss, even when it
+    only decides a full disconnect grace after the shutdown mark was set.
     """
+    import time
+
     from omnigent.runtime import session_stream
     from omnigent.server import shutdown_state
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
 
-    monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
-        0.0,
-    )
+    # The production grace, read before it is patched to 0 for the test.
+    production_grace_s = orchestration.RUNNER_DISCONNECT_GRACE_S
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     fake_runner = _TunnelCloseRunnerClient(gate)
     store = _RecordingLabelStore(live_status="running")
     session_id = "5b1e2d7c9a4f4e0b8c3d2a1f6e7d8c9b"
     sessions_module._session_status_cache[session_id] = "running"
-    shutdown_state.mark_server_shutting_down()
+    if mark_older_than_grace:
+        # The tunnels closed a full production grace, plus slack, ago.
+        monkeypatch.setattr(
+            shutdown_state, "_marked_at", time.monotonic() - (production_grace_s + 5.0)
+        )
+    else:
+        shutdown_state.mark_server_shutting_down()
 
     try:
         handle = await sessions_module._ensure_runner_relay_ready(

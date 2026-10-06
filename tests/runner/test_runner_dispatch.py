@@ -3328,6 +3328,35 @@ async def test_runner_read_inbox_continues_after_malformed_terminal_idle_item() 
 
 
 @pytest.mark.asyncio
+async def test_runner_read_inbox_formats_valid_terminal_idle_item() -> None:
+    """A valid terminal-idle payload becomes a user-visible inbox notice."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    session_inbox.put_nowait(
+        {
+            "type": "terminal_idle",
+            "source": "bash",
+            "session": "main",
+            "content": {
+                "status": "idle",
+                "terminal": "bash",
+                "session": "main",
+            },
+        }
+    )
+
+    inbox_output = await execute_tool(
+        tool_name="sys_read_inbox",
+        arguments="{}",
+        session_inbox=session_inbox,
+    )
+
+    assert inbox_output == "[System: inbox item terminal_idle — terminal bash:main is idle]"
+    assert session_inbox.empty()
+
+
+@pytest.mark.asyncio
 async def test_async_inbox_dispatch_does_not_create_unused_harness_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6827,6 +6856,209 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_session_peek_rest_projects_tool_calls_and_unknown_items() -> None:
+    """REST history preserves tool-call/result items and unknown item types."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            # The API returns newest-first; the tool must reverse this order.
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "i3", "type": "response.error", "message": "ignored"},
+                        {
+                            "id": "i2",
+                            "type": "function_call_output",
+                            "output": {"matches": 2},
+                        },
+                        {
+                            "id": "i1",
+                            "type": "function_call",
+                            "name": "search",
+                            "arguments": '{"query":"auth"}',
+                        },
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "tail_items": 3}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["items"] == [
+        {
+            "type": "function_call",
+            "tool": "search",
+            "args": '{"query":"auth"}',
+        },
+        {"type": "function_call_output", "output": '{"matches": 2}'},
+        {"type": "response.error"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_handles_empty_and_mixed_message_content() -> None:
+    """REST history ignores non-text blocks and renders empty content safely."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i2",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "first"},
+                                {"type": "input_image", "detail": "low"},
+                                {"type": "output_text", "text": "second"},
+                            ],
+                        },
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": None,
+                        },
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "tail_items": 2}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["items"] == [
+        {"type": "message", "role": "assistant", "text": ""},
+        {"type": "message", "role": "assistant", "text": "first second"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_truncates_tool_call_and_result_windows() -> None:
+    """REST history applies offset/truncation to tool arguments and results."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i2",
+                            "type": "function_call_output",
+                            "output": "0123456789abcdef",
+                        },
+                        {
+                            "id": "i1",
+                            "type": "function_call",
+                            "name": "search",
+                            "arguments": "abcdefghijklmno",
+                        },
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps(
+                    {
+                        "conversation_id": "conv_target",
+                        "tail_items": 2,
+                        "content_max_chars": 5,
+                        "content_offset_chars": 3,
+                    }
+                ),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["items"] == [
+        {
+            "type": "function_call",
+            "tool": "search",
+            "args": "defgh [truncated]",
+        },
+        {
+            "type": "function_call_output",
+            "output": "34567 [truncated]",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_or_error", "expected_fragment"),
+    [
+        pytest.param(httpx.Response(500), "sys_session_get_history returned 500", id="500"),
+        pytest.param(
+            httpx.ReadError("connection reset"),
+            "sys_session_get_history failed: connection reset",
+            id="transport-error",
+        ),
+    ],
+)
+async def test_session_peek_rest_maps_server_and_transport_failures(
+    response_or_error: httpx.Response | Exception,
+    expected_fragment: str,
+) -> None:
+    """History failures become structured tool errors instead of escaping."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v1/sessions/conv_target/items"
+        if isinstance(response_or_error, Exception):
+            raise response_or_error
+        return response_or_error
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert expected_fragment in out["error"]
+
+
 _REST_HISTORY_CONTENT_SCENARIOS = [
     pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
     pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
@@ -9067,6 +9299,50 @@ def test_format_async_task_item_truncated_generic_task_keeps_plain_marker() -> N
     )
     assert "...[truncated 500 chars]" in line
     assert "sys_session_get_history" not in line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "subagent_args",
+    [
+        pytest.param(None, id="missing-args"),
+        pytest.param({}, id="empty-object"),
+        pytest.param({"input": 42}, id="non-string-input"),
+    ],
+)
+async def test_sys_session_send_rejects_malformed_message_before_server_call(
+    subagent_args: object,
+) -> None:
+    """Malformed message payloads fail before routing or child creation."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests_seen = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests_seen
+        requests_seen += 1
+        return httpx.Response(500, json={"error": str(request.url)})
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with _session_query_client(handler) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {
+                    "agent": "worker",
+                    "title": "malformed",
+                    "args": subagent_args,
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_parent_malformed",
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+            session_inbox=session_inbox,
+        )
+
+    assert output == "Error: sys_session_send requires non-empty args string or args.input string"
+    assert requests_seen == 0
+    assert session_inbox.empty()
 
 
 @pytest.mark.asyncio
