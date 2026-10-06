@@ -484,8 +484,12 @@ appear on the Design page next to decks.
   on the existing project order preference. The New design dialog offers
   "Make this my default"; the stored default replaces the localStorage
   default from phase 3 (recents stay local).
-- **Org kit:** an operator sets `design_kit:` in server config, pointing at
-  `{config_dir}/design-kit/` with a `kit.json` and its assets. It is validated
+- **Org kit:** an operator sets `design_kit: true` in the server config file
+  passed with `omnigent server -c <file>` and puts the kit in a `design-kit/`
+  folder next to that file: a `kit.json` with a `name`, plus its assets. The
+  value is only `true` and the folder is fixed, so a path such as `.` can never
+  expose the config file. Like branding, the setting is read only from a `-c`
+  config file. It is validated
   at startup with the branding asset checks (no path escape, no symlinks),
   2 MB per asset and 20 MB total, advertised in `GET /v1/info` as
   `design_kit: {name} | null`, and served to signed-in users from
