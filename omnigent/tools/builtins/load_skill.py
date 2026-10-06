@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 import omnigent
+from omnigent.errors import OmnigentError
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
+
+_log = logging.getLogger(__name__)
 
 _PACKAGE_DIR = Path(omnigent.__file__).resolve().parent
 
@@ -21,12 +25,18 @@ FRAMEWORK_SKILL_DIRS: tuple[Path, ...] = (
 
 
 def framework_skills() -> list[SkillSpec]:
-    """Parse the framework skills whose source dir exists."""
+    """Parse the framework skills whose source dir exists; skip and warn on a broken one."""
     from omnigent.spec.parser import _parse_skill
 
-    return [
-        _parse_skill(d / "SKILL.md") for d in FRAMEWORK_SKILL_DIRS if (d / "SKILL.md").is_file()
-    ]
+    skills: list[SkillSpec] = []
+    for d in FRAMEWORK_SKILL_DIRS:
+        if not d.is_dir():
+            continue
+        try:
+            skills.append(_parse_skill(d / "SKILL.md"))
+        except OmnigentError as exc:
+            _log.warning("Skipping broken framework skill %s: %s", d, exc)
+    return skills
 
 
 class LoadSkillTool(Tool):

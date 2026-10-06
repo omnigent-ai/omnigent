@@ -373,3 +373,28 @@ def test_missing_framework_skill_source_is_skipped(
 
     names = [s.name for s in LoadSkillTool([], skills_filter="none").skills]
     assert names == ["build-omnigent", "slide-decks"]
+
+
+@pytest.mark.parametrize("skill_md", [None, "no frontmatter here", "---\nname: [oops\n---\nBody."])
+def test_broken_framework_skill_is_skipped_with_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    skill_md: str | None,
+) -> None:
+    """A built-in skill with a missing or unparsable SKILL.md is skipped; the rest still load."""
+    from omnigent.tools.builtins import load_skill
+
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    if skill_md is not None:
+        (broken / "SKILL.md").write_text(skill_md)
+    real = load_skill.FRAMEWORK_SKILL_DIRS
+    monkeypatch.setattr(load_skill, "FRAMEWORK_SKILL_DIRS", (broken, *real))
+
+    with caplog.at_level("WARNING", logger=load_skill.__name__):
+        tool = LoadSkillTool([], skills_filter="none")
+
+    assert [s.name for s in tool.skills] == ["build-omnigent", "slide-decks"]
+    assert "slide-decks" in tool.get_schema()["function"]["description"]
+    assert str(broken) in caplog.text
