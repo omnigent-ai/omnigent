@@ -62,10 +62,13 @@ you remove them.
 
 **Archived view:** switch the sidebar to archived sessions and filter by project.
 
-**Reconnect:** in a session whose agent stopped, use the reconnect affordance
-in the chat; the dialog shows the command for this situation (for example
-`omnigent host` when the host is offline, or the harness's `--resume` command
-when a local session is stranded). In the desktop app, reconnect acts directly.
+**Reconnect:** in a session whose agent stopped, the composer is disabled and
+says "reconnect below"; the red "Host is offline — click to reconnect" pill (or
+"Agent disconnected — click to reconnect" for a stranded local session) sits
+directly under it, and the composer's host menu also offers "Reconnect host".
+The dialog shows the command for this situation (for example `omnigent host`
+when the host is offline, or the harness's `--resume` command when a local
+session is stranded). In the desktop app, reconnect acts directly.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -153,6 +156,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
+- **`reconnect`, host offline (own environment):**
+  `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_offline_host_keeps_name_and_pill_offers_reconnect_below`
 - **`stop`, `archive`, active sub-agents (own environment):**
   `tests/e2e/test_parent_stop_subagents_e2e.py::test_native_parent_teardown_preserves_child_outcome`
   drives real Claude and Codex parents, native children, a host daemon, and its

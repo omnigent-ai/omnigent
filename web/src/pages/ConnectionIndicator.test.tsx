@@ -92,23 +92,21 @@ describe("ConnectionIndicator", () => {
     expect(onShow).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the host-offline banner in the terminal-first TERMINAL view (no composer badge there)", () => {
-    // In the terminal view the PTY owns the surface — the composer's host
-    // badge isn't on screen, so the banner still carries the reconnect copy.
+  it("renders the host-offline reconnect pill in the terminal-first terminal view", () => {
     renderWithContext({ kind: "host_offline", isOwner: true }, makeCtx({ view: "terminal" }));
     const button = screen.getByTestId("disconnected-indicator");
     expect(button).toHaveTextContent(/host is offline/i);
   });
 
-  it("suppresses the host-offline banner in the chat view (composer badge owns it)", () => {
-    // The chat view shows the composer, whose host badge becomes the clickable
-    // reconnect affordance — so this band must not double up the banner.
-    const { container } = renderWithContext(
-      { kind: "host_offline", isOwner: true },
-      makeCtx({ view: "chat" }),
-    );
-    expect(screen.queryByTestId("disconnected-indicator")).toBeNull();
-    expect(container).toBeEmptyDOMElement();
+  it("renders the host-offline reconnect pill in the chat view too", () => {
+    // The composer host trigger is icon-only (reconnect sits in its menu), so
+    // the pill is the legible affordance the disabled composer points at.
+    const onShow = vi.fn();
+    renderWithContext({ kind: "host_offline", isOwner: true }, makeCtx({ view: "chat" }), onShow);
+    const button = screen.getByTestId("disconnected-indicator");
+    expect(button).toHaveTextContent(/host is offline — click to reconnect/i);
+    fireEvent.click(button);
+    expect(onShow).toHaveBeenCalledTimes(1);
   });
 
   it("renders NOTHING for a runner_asleep NON-terminal-first session — composer stays open", () => {
