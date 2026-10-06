@@ -28,6 +28,10 @@ The debug-log sink stores `event_name` separately and serializes non-null
   a non-zero status or fatal signal; the rule is one of `session_end_reason`,
   `exit_zero`, or `user_signal` (SIGINT/SIGHUP), or Claude's exit banner. The
   record carries no pane text.
+- `harness_stream_ended_by_voluntary_exit`: a turn stream was still open when
+  the person quit, so the release severed it. The turn ends with
+  `response.cancelled`, like a Stop, instead of `response.failed`
+  (`harness_stream_ended_by_terminal_exit`, the failure case).
 - `terminal_close_requested`: an informational record before the explicit
   terminal-close path runs. It does not assert who requested the close or that
   cleanup succeeded.

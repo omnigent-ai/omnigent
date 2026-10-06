@@ -193,7 +193,12 @@ from omnigent.runner.subagent_work import (
     unregister_child_session,
     unregister_subagent_work_for_session,
 )
-from omnigent.runner.terminal_exit import classify_terminal_exit, post_terminal_exit_notice
+from omnigent.runner.terminal_exit import (
+    TERMINAL_EXIT_NOTICE_CODE,
+    classify_terminal_exit,
+    post_terminal_exit_notice,
+    terminal_exit_notice,
+)
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
@@ -721,6 +726,33 @@ def _response_failed_payload(
         "response": {"status": "failed", "error": failure_error},
         "error": failure_error,
     }
+
+
+def _response_cancelled_payload(response_id: str | None) -> _JsonObject:
+    """
+    Build the terminal ``response.cancelled`` envelope for a turn the person ended.
+
+    The runner writes it when the harness can no longer report the end itself.
+
+    :param response_id: Id of the turn's response, or ``None`` when the stream
+        dropped before one was allocated.
+    :returns: A payload that validates as the server's ``CancelledEvent``.
+    """
+    return {
+        "type": "response.cancelled",
+        "response": {
+            "id": response_id or "",
+            "object": "response",
+            "status": "cancelled",
+            "model": "",
+            "created_at": int(time.time()),
+        },
+    }
+
+
+def _response_cancelled_event(payload: Mapping[str, object]) -> bytes:
+    """Encode one ``response.cancelled`` SSE frame from :func:`_response_cancelled_payload`."""
+    return f"event: response.cancelled\ndata: {json.dumps(payload)}\n\n".encode()
 
 
 def _response_failed_event(
@@ -1780,6 +1812,12 @@ def create_runner_app(
             # The person quit the agent themselves. Settle the session like a
             # stop, with a notice, rather than failing a turn nobody lost.
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            # A turn stream still open is severed by the release below; this
+            # ends it as cancelled instead of as the failed exit stored above.
+            _required_terminal_exit_errors[event.session_id] = {
+                "code": TERMINAL_EXIT_NOTICE_CODE,
+                "message": terminal_exit_notice(event.terminal_name),
+            }
             _notice_task = asyncio.create_task(
                 post_terminal_exit_notice(server_client, event.session_id, event.terminal_name),
                 name=f"terminal-exit-notice:{event.session_id}",
@@ -6031,6 +6069,28 @@ def create_runner_app(
 
             except (httpx.HTTPError, RuntimeError) as exc:
                 _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
+                if _exit_error is not None and _exit_error["code"] == TERMINAL_EXIT_NOTICE_CODE:
+                    # The person quit the agent mid-turn and the release severed this
+                    # stream: end the turn as cancelled, the way a Stop does.
+                    _logger.info(
+                        "harness stream for %s ended by the person quitting the agent: %s",
+                        conv_id,
+                        type(exc).__name__,
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "harness_stream_ended_by_voluntary_exit",
+                            "attributes": {
+                                "harness": harness_name,
+                                "response_id": _response_id,
+                                "exception_type": type(exc).__name__,
+                            },
+                        },
+                    )
+                    _cancelled = _response_cancelled_payload(_response_id)
+                    _publish_event(conv_id, _cancelled)
+                    _on_proxy_stream_end(conv_id, owner_response_id=_response_id)
+                    yield _response_cancelled_event(_cancelled)
+                    return
                 if _exit_error is not None:
                     # The runner ended this stream itself: the session's required
                     # terminal exited and its handler released the harness

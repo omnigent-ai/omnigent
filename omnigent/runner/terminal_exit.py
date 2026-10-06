@@ -149,6 +149,13 @@ def terminal_display_name(terminal_name: str) -> str:
     return agent.display_name if agent is not None else terminal_name
 
 
+def terminal_exit_notice(terminal_name: str) -> str:
+    """Return the sentence shown when the person quits the agent in its terminal."""
+    return (
+        f"{terminal_display_name(terminal_name)} exited in its terminal. Send a message to resume."
+    )
+
+
 async def post_terminal_exit_notice(
     server_client: httpx.AsyncClient, session_id: str, terminal_name: str
 ) -> None:
@@ -161,9 +168,7 @@ async def post_terminal_exit_notice(
     :param terminal_name: Terminal that exited, e.g. ``"claude"``.
     """
     # The headline carries the whole sentence: it is all the transcript shows until expanded.
-    notice = (
-        f"{terminal_display_name(terminal_name)} exited in its terminal. Send a message to resume."
-    )
+    notice = terminal_exit_notice(terminal_name)
     try:
         resp = await server_client.post(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",

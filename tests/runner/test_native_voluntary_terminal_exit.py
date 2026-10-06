@@ -3,30 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import create_runner_app, subagent_work
-from omnigent.runner.app import _session_event_queues_ref
+from omnigent.runner.app import _response_cancelled_payload, _session_event_queues_ref
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     TerminalExitEvent,
     TerminalLifecycle,
 )
+from omnigent.server.schemas import CancelledEvent
+from omnigent.spec.types import AgentSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
     _drain_session_event_queue,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
+    _sse,
 )
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -386,16 +392,252 @@ async def test_quitting_a_sub_agent_mid_task_wakes_the_parent_as_cancelled(
         assert item["conversation_id"] == event.session_id
 
 
+# --- a turn stream that is still open when the person quits -------------------
+
+_AGENT_ID = "965906f5d9fb596610dda599a80faaee"
+
+
+class _OpenTurnClient(_ScriptedHarnessClient):
+    """Harness client whose turn stream stays open until the runner releases the harness."""
+
+    def __init__(self, released: Callable[[], bool]) -> None:
+        super().__init__([_sse({"type": "response.created", "response": {"id": "resp_live"}})])
+        self._released = released
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        frames, released = self._sse_frames, self._released
+
+        class _Handle:
+            status_code = 200
+
+            async def aiter_text(self) -> AsyncIterator[str]:
+                for frame in frames:
+                    yield frame
+                # Releasing the harness is what severs the stream the runner reads.
+                while not released():
+                    await asyncio.sleep(0)
+                raise httpx.ReadError("harness released")
+
+        class _Context:
+            status_code = 200
+
+            async def __aenter__(self) -> _Handle:
+                return _Handle()
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _Context()
+
+
+async def _plain_spec(agent_id: str, session_id: str | None = None) -> AgentSpec:
+    del agent_id, session_id
+    return AgentSpec(spec_version=1, name="plain-agent")
+
+
+async def _stream_turn(app: Any, conv_id: str) -> list[dict[str, Any]]:
+    """POST one streamed turn to the runner and return the SSE events it produced."""
+    body = ""
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        async with client.stream(
+            "POST",
+            f"/v1/sessions/{conv_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": _AGENT_ID,
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+            },
+        ) as resp:
+            assert resp.status_code == 200, resp.status_code
+            async for chunk in resp.aiter_text():
+                body += chunk
+    return [
+        json.loads(line[len("data:") :].strip())
+        for block in body.split("\n\n")
+        for line in block.splitlines()
+        if line.startswith("data:")
+    ]
+
+
+async def _wait_for_live_turn(app: Any, conv_id: str) -> None:
+    for _ in range(2000):
+        if conv_id in app.state.live_response_id:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("the turn stream never went live")
+
+
+@dataclass
+class _LiveTurnOutcome:
+    stream_events: list[dict[str, Any]]
+    published: list[dict[str, Any]]
+    notices: list[dict[str, Any]]
+    released: list[str]
+    live_markers_left: bool
+    records: list[logging.LogRecord]
+
+    def types(self, events: list[dict[str, Any]]) -> list[str]:
+        return [str(event.get("type")) for event in events]
+
+    def statuses(self) -> list[str]:
+        return [
+            str(event.get("status"))
+            for event in self.published
+            if event["type"] == "session.status"
+        ]
+
+    def failed_errors(self) -> list[dict[str, Any]]:
+        return [
+            event["error"]
+            for event in self.published
+            if event["type"] == "session.status" and event.get("status") == "failed"
+        ]
+
+    def logged(self, event_name: str) -> list[logging.LogRecord]:
+        return [r for r in self.records if getattr(r, "event_name", None) == event_name]
+
+
+async def _quit_during_live_turn(
+    event: TerminalExitEvent, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> _LiveTurnOutcome:
+    """Publish *event* while a streamed turn is open, then let the release sever the stream."""
+    monkeypatch.setattr("omnigent.runner.app._TERMINAL_EXIT_RELEASE_GRACE_S", 0.05)
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    conv_id = event.session_id
+    released: list[str] = []
+    process_manager = _FakeProcessManager(_OpenTurnClient(lambda: bool(process_manager.released)))
+    process_manager._sessions.add(conv_id)
+    server = _RecordingServerClient()
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        spec_resolver=_plain_spec,
+        server_client=server,  # type: ignore[arg-type]
+    )
+    _session_event_queues_ref.pop(conv_id, None)
+    try:
+        turn = asyncio.create_task(_stream_turn(app, conv_id))
+        await _wait_for_live_turn(app, conv_id)
+        app.state.session_resource_registry._terminal_exit_publisher(event)
+        stream_events = await asyncio.wait_for(turn, timeout=10)
+        for _ in range(50):
+            await asyncio.sleep(0)
+        published = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        live_markers_left = (
+            conv_id in app.state.live_response_id or conv_id in app.state.active_turns
+        )
+        released = list(process_manager.released)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+    return _LiveTurnOutcome(
+        stream_events=stream_events,
+        published=published,
+        notices=server.notices,
+        released=released,
+        live_markers_left=live_markers_left,
+        records=list(caplog.records),
+    )
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [
+        pytest.param(_exit_event("claude", exit_signal="SIGINT"), id="ctrl-c"),
+        pytest.param(
+            _exit_event("claude", session_end_reason="prompt_input_exit"), id="prompt-input-exit"
+        ),
+        pytest.param(_exit_event("pi", exit_status=0), id="pi-exit-0"),
+    ],
+)
+async def test_quitting_during_a_live_turn_stream_ends_it_cancelled_not_failed(
+    event: TerminalExitEvent, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outcome = await _quit_during_live_turn(event, caplog, monkeypatch)
+
+    # The stream the caller reads ends the way a stopped turn's does: cancelled.
+    assert outcome.types(outcome.stream_events)[-1] == "response.cancelled"
+    assert "response.failed" not in outcome.types(outcome.stream_events)
+    [cancelled] = [e for e in outcome.stream_events if e["type"] == "response.cancelled"]
+    assert CancelledEvent.model_validate(cancelled).response.id == "resp_live"
+    # Nothing that would read as a failure reaches the server relay.
+    assert "response.failed" not in outcome.types(outcome.published)
+    assert outcome.types(outcome.published).count("response.cancelled") == 1
+    assert "failed" not in outcome.statuses()
+    assert "idle" in outcome.statuses()
+    assert outcome.logged("runner_turn_failed") == []
+    assert outcome.logged("harness_stream_ended_by_terminal_exit") == []
+    [ended] = outcome.logged("harness_stream_ended_by_voluntary_exit")
+    assert ended.attributes["exception_type"] == "ReadError"
+    # The only transcript item is the notice: no synthetic "[System: interrupted]" message.
+    assert [notice["code"] for notice in outcome.notices] == ["native_terminal_exited"]
+    assert outcome.released == [event.session_id]
+    assert not outcome.live_markers_left
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [
+        pytest.param(_exit_event("claude", exit_signal="SIGKILL"), id="sigkill"),
+        pytest.param(_exit_event("claude", exit_signal="SIGSEGV"), id="sigsegv"),
+        pytest.param(_exit_event("pi", exit_status=1), id="pi-exit-1"),
+        pytest.param(_exit_event("claude", exit_status=0, interactive=False), id="launch-time"),
+    ],
+)
+async def test_crash_during_a_live_turn_stream_still_fails_the_turn(
+    event: TerminalExitEvent, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outcome = await _quit_during_live_turn(event, caplog, monkeypatch)
+
+    [failed] = [e for e in outcome.stream_events if e["type"] == "response.failed"]
+    assert failed["error"]["code"] == "required_terminal_exited"
+    assert "response.cancelled" not in outcome.types(outcome.stream_events)
+    assert "response.cancelled" not in outcome.types(outcome.published)
+    # The exit handler and the stream end each publish the failed edge; both name the exit.
+    assert {error["code"] for error in outcome.failed_errors()} == {"required_terminal_exited"}
+    assert "idle" not in outcome.statuses()
+    assert len(outcome.logged("runner_turn_failed")) == 1
+    assert len(outcome.logged("harness_stream_ended_by_terminal_exit")) == 1
+    assert outcome.logged("harness_stream_ended_by_voluntary_exit") == []
+    assert outcome.notices == []
+    assert not outcome.live_markers_left
+
+
+@pytest.mark.parametrize("response_id", ["resp_live", None])
+def test_cancelled_envelope_validates_as_the_servers_cancelled_event(
+    response_id: str | None,
+) -> None:
+    payload = _response_cancelled_payload(response_id)
+
+    event = CancelledEvent.model_validate(payload)
+
+    assert event.response.status == "cancelled"
+    assert event.response.id == (response_id or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_turn", [False, True], ids=["idle-session", "live-turn-stream"])
 async def test_next_message_after_a_voluntary_exit_cold_resumes_the_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    live_turn: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The person's quit must leave the session resumable exactly like a failed exit.
 
     The exit goes through the real watcher wiring (composer seen, pane dies,
-    exit 0), then the ensure route a message triggers re-launches Claude with
-    ``--resume`` on the session's prior Claude id.
+    exit 0), with or without a turn stream open at that moment. The ensure route
+    a message triggers then re-launches Claude with ``--resume`` on the session's
+    prior Claude id.
     """
+    monkeypatch.setattr("omnigent.runner.app._TERMINAL_EXIT_RELEASE_GRACE_S", 0.05)
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
     session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
     prior_claude_sid = "3d10247d-c3c0-4689-8cbd-862d7453bf70"
@@ -438,7 +680,7 @@ async def test_next_message_after_a_voluntary_exit_cold_resumes_the_session(
             payload: dict[str, Any] = (
                 {"labels": {}}
                 if url.endswith("/labels")
-                else {"external_session_id": prior_claude_sid}
+                else {"external_session_id": prior_claude_sid, "agent_id": _AGENT_ID}
             )
 
             class _Response(NullServerClient._Response):
@@ -457,10 +699,11 @@ async def test_next_message_after_a_voluntary_exit_cold_resumes_the_session(
         callbacks.update(kwargs)
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
-    process_manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    process_manager = _FakeProcessManager(_OpenTurnClient(lambda: bool(process_manager.released)))
     process_manager._sessions.add(session_id)
     app = create_runner_app(
         process_manager=process_manager,  # type: ignore[arg-type]
+        spec_resolver=_plain_spec,
         server_client=server,  # type: ignore[arg-type]
         terminal_registry=terminals,
     )
@@ -472,6 +715,10 @@ async def test_next_message_after_a_voluntary_exit_cold_resumes_the_session(
     )
 
     try:
+        turn = None
+        if live_turn:
+            turn = asyncio.create_task(_stream_turn(app, session_id))
+            await _wait_for_live_turn(app, session_id)
         # The composer appears, then the person types /exit and the pane dies with status 0.
         instance._remember_pane_snapshot(_COMPOSER_PANE)
         callbacks["on_tick"]()
@@ -480,12 +727,17 @@ async def test_next_message_after_a_voluntary_exit_cold_resumes_the_session(
         instance.running = False
         callbacks["on_exit"]()
         await asyncio.wait_for(resources.wait_for_terminal_exit_cleanup(), timeout=2)
+        stream_events = await asyncio.wait_for(turn, timeout=10) if turn is not None else []
         for _ in range(50):
             await asyncio.sleep(0)
         exit_events = _drain_session_event_queue(_session_event_queues_ref.get(session_id))
 
         assert {"type": "session.status", "status": "idle"} in exit_events
         assert not [e for e in exit_events if e.get("status") == "failed"]
+        assert not [e for e in exit_events if e.get("type") == "response.failed"]
+        if live_turn:
+            assert stream_events[-1]["type"] == "response.cancelled"
+            assert "response.failed" not in [e["type"] for e in stream_events]
         assert [notice["code"] for notice in server.notices] == ["native_terminal_exited"]
         assert terminals.get(session_id, "claude", "main") is None
         assert process_manager.released == [session_id]
