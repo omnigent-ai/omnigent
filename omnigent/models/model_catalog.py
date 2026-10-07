@@ -302,7 +302,7 @@ def model_configuration_source(
     elif provider.kind == DATABRICKS_KIND:
         source.update(label="Workspace", name=provider.profile or "DEFAULT")
     elif provider.kind in {"gateway", "local"}:
-        source["label"] = "Unity Gateway" if provider.kind == "gateway" else "Local"
+        source["label"] = "AI Gateway" if provider.kind == "gateway" else "Local"
         name = provider.detail.removeprefix("provider '").removesuffix("'")
         if name:
             source["name"] = name

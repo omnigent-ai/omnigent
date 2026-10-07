@@ -96,7 +96,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   transient_upstream_error:
     "The model service hit a temporary error mid-response; retrying usually continues the turn.",
   budget_exhausted:
-    "The Unity Gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
+    "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
   client_update_required:
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
 };

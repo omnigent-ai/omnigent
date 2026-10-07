@@ -249,7 +249,7 @@ _ENV_KEY_CONFIG_TOML = """\
 model_provider = "aigateway"
 
 [model_providers.aigateway]
-name = "Unity Gateway"
+name = "AI Gateway"
 base_url = "https://gateway.example.com/openai/v1"
 env_key = "OPENAI_EXAMPLE_GATEWAY_TOKEN"
 wire_api = "responses"

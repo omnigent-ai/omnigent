@@ -792,7 +792,7 @@ def managed_claude_gateway_signal() -> tuple[str | None, bool]:
     """Read the AI-Gateway backing Claude Code applies from managed settings.
 
     Managed settings win at Claude Code's actual launch, so an enterprise file
-    can pin all inference through a Unity Gateway even when omnigent's own
+    can pin all inference through an AI Gateway even when omnigent's own
     provider config resolves nothing (a ``subscription`` login). This reports
     that backing: the managed ``env.ANTHROPIC_BASE_URL`` and whether a
     credential is delivered, either through a top-level ``apiKeyHelper`` or a

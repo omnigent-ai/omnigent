@@ -240,7 +240,7 @@ def test_managed_claude_settings_require_gateway_and_credential(
             ),
             {
                 "kind": "gateway",
-                "label": "Unity Gateway",
+                "label": "AI Gateway",
                 "name": "production",
                 "host": "gateway.example.com",
             },
@@ -301,7 +301,7 @@ def test_managed_claude_settings_require_gateway_and_credential(
                 detail="provider 'production'",
                 base_url="https://[malformed/v1",
             ),
-            {"kind": "gateway", "label": "Unity Gateway", "name": "production"},
+            {"kind": "gateway", "label": "AI Gateway", "name": "production"},
             id="malformed-url",
         ),
     ],

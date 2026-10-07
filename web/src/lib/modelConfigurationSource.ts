@@ -22,7 +22,7 @@ export function modelConfigurationSourceRows(
       : source.kind === "databricks"
         ? ["Databricks", source.name ?? source.host].filter(Boolean).join(" · ")
         : source.kind === "gateway"
-          ? ["Unity Gateway", source.name ?? source.host].filter(Boolean).join(" · ")
+          ? ["AI Gateway", source.name ?? source.host].filter(Boolean).join(" · ")
           : source.kind === "bedrock"
             ? ["Bedrock", source.name ?? source.host].filter(Boolean).join(" · ")
             : source.kind === "key"

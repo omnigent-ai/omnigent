@@ -19,7 +19,7 @@ _ROOT_REFUSAL_OUTPUT = (
     "--dangerously-skip-permissions cannot be run with root privileges for security reasons"
 )
 
-# Claude Code's StopFailure text when the Unity Gateway cancels its upstream call.
+# Claude Code's StopFailure text when the AI gateway cancels its upstream call.
 _GATEWAY_499_OUTPUT = 'API Error: 499 {"error_code":"CANCELLED","message":""}'
 
 # Claude Code's StopFailure text when its version predates the selected model.
