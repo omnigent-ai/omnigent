@@ -479,7 +479,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   // requests key their slice off this map — so record the host before returning
   // the row, or those requests fall back to the modal and can miss the replica.
   setSessionHost(wire.id, wire.host_id);
-  setSessionParent(wire.id, wire.parent_session_id);
+  setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
     object: "conversation",
@@ -563,7 +563,7 @@ export async function fetchConversationsPage({
   // can't seed a stale value; a hostless row clears any prior mapping.
   for (const row of page.data) {
     setSessionHost(row.id, row.host_id);
-    setSessionParent(row.id, row.parent_session_id);
+    setSessionParent(row.id, row.parent_session_id, row.labels);
   }
   return applySessionTombstones(
     withRecentlyCreated(

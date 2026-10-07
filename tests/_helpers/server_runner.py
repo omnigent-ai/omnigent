@@ -15,6 +15,12 @@ import httpx
 
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+from tests._helpers.compat import (
+    compat_runner_cwd,
+    compat_runner_python,
+    compat_server_cwd,
+    compat_server_python,
+)
 from tests._helpers.live_server import find_free_port, local_server_env, terminate_process
 
 
@@ -97,8 +103,15 @@ class ServerRunner:
         cwd: Path | None = None,
     ) -> subprocess.Popen[bytes]:
         log = self._resources.enter_context(self.log_path(name).open("ab"))
+        pinned_python = compat_server_python() if name == "server" else compat_runner_python()
+        if pinned_python is not None:
+            # Neither the checkout cwd nor PYTHONPATH may shadow the pinned build.
+            env = {**env, "PYTHONPATH": None}
+            neutral_cwd = compat_server_cwd() if name == "server" else compat_runner_cwd()
+            assert neutral_cwd is not None
+            cwd = Path(neutral_cwd)
         proc = subprocess.Popen(
-            [sys.executable, *args],
+            [pinned_python or sys.executable, *args],
             env=_process_env(home, env, self._base_env),
             cwd=cwd,
             stdout=log,

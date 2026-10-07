@@ -17,6 +17,7 @@ from filelock import Timeout as FileLockTimeout
 from omnigent.runner import create_runner_app
 from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from omnigent.workspace_fs import WorkspaceReader
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
@@ -570,6 +571,52 @@ def test_context_reports_deleted_fork(
     )
     with pytest.raises(ValueError, match="head repository is no longer available"):
         github.github_file_diff(tracked, "main", "new.py", session_id="session", pr_url=B)
+
+
+@pytest.mark.parametrize("pr_url", [None, B])
+async def test_pr_reads_report_lock_contention_and_allow_retry(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, pr_url: str | None
+) -> None:
+    monkeypatch.setattr(github, "_gh", lambda *_a, **_kw: (0, '{"number": 42}', ""))
+    registry = SessionPrRegistry("session")
+    before = registry.path.read_bytes()
+    reader = WorkspaceReader(Path(tracked))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        with FileLock(str(registry.path) + ".lock"):
+            with pytest.raises(ValueError, match="PR tracking is busy; try again"):
+                reader.github_info(session_id="session", pr_url=pr_url)
+            response = await client.get(
+                "/v1/sessions/session/resources/github",
+                params={"pr_url": pr_url} if pr_url else {},
+            )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "PR tracking is busy; try again."
+        assert registry.path.read_bytes() == before
+        response = await client.get(
+            "/v1/sessions/session/resources/github",
+            params={"pr_url": pr_url} if pr_url else {},
+        )
+    assert response.status_code == 200, response.text
+    assert {pr["url"] for pr in response.json()["prs"]} == {A, B}
+    assert reader.github_info(session_id="session", pr_url=pr_url)["pr"]["number"] == 42
+
+
+@pytest.mark.parametrize("operation", ["github_changes", "github_pr_diff", "github_file_diff"])
+def test_selected_pr_reads_report_lock_contention(tracked: str, operation: str) -> None:
+    registry = SessionPrRegistry("session")
+    reader = WorkspaceReader(Path(tracked))
+    kwargs = (
+        {"relative_path": "file.py", "base": "main"} if operation == "github_file_diff" else {}
+    )
+    with FileLock(str(registry.path) + ".lock"):
+        with pytest.raises(ValueError, match="PR tracking is busy; try again"):
+            getattr(reader, operation)(session_id="session", pr_url=B, **kwargs)
 
 
 @pytest.mark.parametrize("action", ["attach", "remove"])

@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
+import * as sessionsApi from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
@@ -1034,6 +1036,36 @@ describe("WorkspacePanel mobile side chats", () => {
       openSideChats: ["conv_side_a", "conv_side_b"],
       selectedSideChatId: "conv_side_b",
     });
+
+  it.each([false, true])(
+    "keeps a side chat and draft when close fails (mobile=%s)",
+    async (mobile) => {
+      isMobileMock.mockReturnValue(mobile);
+      openTabs();
+      const stop = vi.spyOn(sessionsApi, "stopSession").mockRejectedValueOnce(new Error("offline"));
+      useChatStore.setState({ sideChatDrafts: { conv_side_b: "Keep this question" } });
+      renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+      const surface = mobile
+        ? screen.getByTestId("side-chats-panel-drawer")
+        : screen.getByRole("complementary", { name: "Workspace" });
+      fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+
+      await waitFor(() =>
+        expect(toast.error).toHaveBeenCalledWith("Couldn't close side chat. Try again."),
+      );
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+      expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBe("Keep this question");
+
+      stop.mockResolvedValueOnce({ queued: false });
+      fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+      await waitFor(() =>
+        expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
+      );
+      expect(stop.mock.calls).toEqual([["conv_side_b"], ["conv_side_b"]]);
+      expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBeUndefined();
+      stop.mockRestore();
+    },
+  );
 
   it("shows the selected side chat in the drawer, not the hidden rail", () => {
     isMobileMock.mockReturnValue(true);
