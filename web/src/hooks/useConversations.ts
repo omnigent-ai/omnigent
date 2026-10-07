@@ -1953,18 +1953,21 @@ export function useTogglePinnedConversation() {
       const labels: Record<string, string> = pinned
         ? { ...base, [PINNED_LABEL_KEY]: String(pinnedAt ?? Date.now()) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
-      bumpPinWriteVersion(id);
+      const version = bumpPinWriteVersion(id);
       patch(id, labels, pinned);
-      return { prevPinned };
+      return { prevPinned, version };
     },
-    onError: (_err, _vars, ctx) => {
+    onError: (_err, { id }, ctx) => {
       // Restore the pinned section; the label overlays on the other caches are
-      // cosmetic and self-heal on the next reconcile.
+      // cosmetic and self-heal on the next reconcile. A newer pin write on this
+      // session owns its state, so a stale failure leaves it alone.
+      if (ctx && pinWriteVersions.get(id) !== ctx.version) return;
       if (ctx?.prevPinned !== undefined) {
         queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, ctx.prevPinned);
       }
     },
-    onSuccess: (updated, { pinned }) => {
+    onSuccess: (updated, { id, pinned }, ctx) => {
+      if (ctx && pinWriteVersions.get(id) !== ctx.version) return;
       // No `markConversationSeen` here: a pin PATCH writes only the label row,
       // never conversations.updated_at (unlike rename/archive/move, which bump
       // it and need the anchor to suppress that self-bump). Anchoring here would

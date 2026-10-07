@@ -1769,6 +1769,54 @@ describe("useReorderPinnedConversations then unpin", () => {
   );
 });
 
+describe("useTogglePinnedConversation then reorder", () => {
+  it("does not let the older pin response undo the newer drag", async () => {
+    const resolvers: ((r: Response) => void)[] = [];
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+    const pinResponse = (value: string) =>
+      mockResponse({ id: "conv_c", object: "conversation", labels: { [PINNED_LABEL_KEY]: value } });
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_c" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(
+      () => ({ toggle: useTogglePinnedConversation(), reorder: useReorderPinnedConversations() }),
+      { wrapper },
+    );
+    const values = () => [
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
+        ?.pages.flatMap((p) => p.data)
+        .find((c) => c.id === "conv_c")?.labels?.[PINNED_LABEL_KEY],
+      queryClient
+        .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+        ?.conversations.find((c) => c.id === "conv_c")?.labels?.[PINNED_LABEL_KEY],
+    ];
+
+    act(() => result.current.toggle.mutate({ id: "conv_c", pinned: true, pinnedAt: 5000 }));
+    act(() => result.current.reorder.mutate([{ id: "conv_c", pinnedAt: 999 }]));
+    expect(values()).toEqual(["999", "999"]);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    // The pin lands while the drag's PATCH is still queued behind it.
+    resolvers[0](pinResponse("5000"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(values()).toEqual(["999", "999"]);
+
+    resolvers[1](pinResponse("999"));
+    await waitFor(() => expect(result.current.reorder.isSuccess).toBe(true));
+    expect(values()).toEqual(["999", "999"]);
+  });
+});
+
 describe("useTogglePinnedConversation old-server fallback", () => {
   // When the server can't store pins (`filterHonored` is false — a pre-upgrade
   // server that ignores `?pinned=true`), a PATCH would persist a bare

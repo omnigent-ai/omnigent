@@ -1635,7 +1635,7 @@ function ConversationList({
   const dragOrigin = useRef<{ left: number; top: number; width: number } | undefined>(undefined);
   const [overProject, setOverProject] = useState<string | null>(null);
   const [overPin, setOverPin] = useState<string | null>(null);
-  const { mutate: pinAt } = useTogglePinnedConversation();
+  const { mutateAsync: pinAt } = useTogglePinnedConversation();
   const { mutate: reorderPins } = useReorderPinnedConversations();
   const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
     if (saveOrder.isPending) return;
@@ -2010,11 +2010,14 @@ function ConversationList({
         const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
         const pin = writes.find((w) => w.id === dragged.id);
         const rest = writes.filter((w) => w.id !== dragged.id);
+        // Chain on this call's own promise: per-call mutate callbacks are dropped
+        // when a later drop calls the mutation again.
         if (pin) {
-          pinAt(
-            { id: pin.id, pinned: true, pinnedAt: pin.pinnedAt },
-            { onSuccess: () => rest.length > 0 && reorderPins(rest) },
-          );
+          pinAt({ id: pin.id, pinned: true, pinnedAt: pin.pinnedAt })
+            .then(() => {
+              if (rest.length > 0) reorderPins(rest);
+            })
+            .catch(() => {});
         }
         return;
       }

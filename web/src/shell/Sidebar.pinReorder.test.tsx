@@ -1,21 +1,23 @@
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
-import { act, cleanup, fireEvent, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
 // Dropping an unpinned row onto a pinned row pins it into that slot. With no
 // gap between the pins every value is renumbered: the new pin goes through the
-// pin toggle and the existing pins through the batch reorder.
+// pin toggle and, once it's accepted, the existing pins through the batch
+// reorder. The toggle is a real mutation so per-call callback behaviour holds.
 const mocks = vi.hoisted(() => ({
   pinned: [] as ReturnType<typeof conv>[],
-  pinAt: vi.fn(),
+  pinFn: vi.fn(),
   reorderPins: vi.fn(),
 }));
 
 vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  const { useMutation } = await import("@tanstack/react-query");
   return {
     ...conversationHooksMock(),
     useProjects: vi.fn(() => ({ data: [] })),
@@ -23,7 +25,8 @@ vi.mock("@/hooks/useConversations", async () => {
       data: { conversations: mocks.pinned, filterHonored: true },
       isSuccess: true,
     }),
-    useTogglePinnedConversation: () => ({ mutate: mocks.pinAt }),
+    useTogglePinnedConversation: () =>
+      useMutation({ mutationFn: (vars: unknown) => mocks.pinFn(vars) }),
     useReorderPinnedConversations: () => ({ mutate: mocks.reorderPins }),
   };
 });
@@ -52,12 +55,30 @@ function rowCenter(id: string) {
   return { clientX: 50, clientY: index * ROW_HEIGHT + ROW_HEIGHT / 2 };
 }
 
+async function dropOnto(sourceId: string, targetId: string) {
+  const source = screen.getByRole("link", { name: sourceId }).closest("li")!;
+  const start = rowCenter(sourceId);
+  const target = rowCenter(targetId);
+  fireEvent.mouseDown(source, { button: 0, ...start });
+  fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+  await act(async () => {
+    fireEvent.mouseMove(document, target);
+  });
+  expect(screen.getByTestId("pin-order-insertion")).toBeInTheDocument();
+  await act(async () => {
+    fireEvent.mouseUp(document, target);
+  });
+}
+
 beforeEach(() => {
   mocks.pinned = [
     conv("conv_a", { labels: { "omnigent.pinned": "1000" } }),
     conv("conv_b", { labels: { "omnigent.pinned": "1000" } }),
   ];
-  vi.mocked(useConversations).mockImplementation(() => conversationPage([conv("conv_c")]));
+  vi.mocked(useConversations).mockImplementation(() =>
+    conversationPage([conv("conv_c"), conv("conv_d")]),
+  );
+  stubRowRects();
 });
 
 afterEach(async () => {
@@ -72,54 +93,60 @@ afterEach(async () => {
 
 describe("dropping an unpinned session onto a pinned row", () => {
   it("pins it into that slot and renumbers the existing pins", async () => {
-    mocks.pinAt.mockImplementation((_vars, options?: { onSuccess?: () => void }) =>
-      options?.onSuccess?.(),
-    );
-    stubRowRects();
+    mocks.pinFn.mockResolvedValue({});
     renderSidebar();
-    const source = screen.getByRole("link", { name: "conv_c" }).closest("li")!;
-    const start = rowCenter("conv_c");
-    const target = rowCenter("conv_b");
 
-    fireEvent.mouseDown(source, { button: 0, ...start });
-    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
-    await act(async () => {
-      fireEvent.mouseMove(document, target);
-    });
-    expect(screen.getByTestId("pin-order-insertion")).toBeInTheDocument();
-    await act(async () => {
-      fireEvent.mouseUp(document, target);
-    });
+    await dropOnto("conv_c", "conv_b");
 
-    expect(mocks.pinAt).toHaveBeenCalledExactlyOnceWith(
-      { id: "conv_c", pinned: true, pinnedAt: 1001 },
-      expect.anything(),
+    expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({
+      id: "conv_c",
+      pinned: true,
+      pinnedAt: 1001,
+    });
+    await waitFor(() =>
+      expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([
+        { id: "conv_a", pinnedAt: 1000 },
+        { id: "conv_b", pinnedAt: 1002 },
+      ]),
     );
-    expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([
-      { id: "conv_a", pinnedAt: 1000 },
-      { id: "conv_b", pinnedAt: 1002 },
-    ]);
   });
 
   it("leaves the existing pins alone when the new pin is rejected (e.g. at the pin cap)", async () => {
-    // A rejected pin never calls the mutate-level onSuccess.
-    mocks.pinAt.mockImplementation(() => undefined);
-    stubRowRects();
+    mocks.pinFn.mockRejectedValue(new Error("You can pin up to 30 sessions."));
     renderSidebar();
-    const source = screen.getByRole("link", { name: "conv_c" }).closest("li")!;
-    const start = rowCenter("conv_c");
-    const target = rowCenter("conv_b");
 
-    fireEvent.mouseDown(source, { button: 0, ...start });
-    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
-    await act(async () => {
-      fireEvent.mouseMove(document, target);
-    });
-    await act(async () => {
-      fireEvent.mouseUp(document, target);
-    });
+    await dropOnto("conv_c", "conv_b");
 
-    expect(mocks.pinAt).toHaveBeenCalledOnce();
+    await waitFor(() => expect(mocks.pinFn).toHaveBeenCalledOnce());
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
     expect(mocks.reorderPins).not.toHaveBeenCalled();
+  });
+
+  it("preserves the first insertion's renumber writes when a second pin starts before it settles", async () => {
+    const resolvers: (() => void)[] = [];
+    mocks.pinFn.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+    renderSidebar();
+
+    await dropOnto("conv_c", "conv_b");
+    await dropOnto("conv_d", "conv_a");
+    expect(mocks.pinFn).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      for (const resolve of resolvers) resolve();
+    });
+
+    await waitFor(() =>
+      expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([
+        { id: "conv_a", pinnedAt: 1000 },
+        { id: "conv_b", pinnedAt: 1002 },
+      ]),
+    );
   });
 });
