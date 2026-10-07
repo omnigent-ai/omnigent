@@ -24,7 +24,7 @@
 // These helpers are pure (no React) so they unit-test in isolation.
 
 import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
-import { findTag, walkHtmlTags } from "./htmlTagScan";
+import { findTag, tagAt, walkHtmlTags } from "./htmlTagScan";
 
 /** Protocol version  -  bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
@@ -692,18 +692,16 @@ export function injectCommentBridge(html: string, nonce: string): string {
   return appendCommentBridge(prepareHtmlPreviewDoc(html), nonce);
 }
 
-/** Index of the matching `</section>` for a `<section` that opens at `openAt`. */
-function sectionCloseEnd(html: string, openAt: number, limit: number = html.length): number {
-  const openTag = /^<section\b[^>]*>/i.exec(html.slice(openAt));
-  if (!openTag) return openAt;
+/** Index past the matching `</section>` for a section whose open tag ended at `afterOpen`. */
+function sectionCloseEnd(html: string, afterOpen: number, limit: number = html.length): number {
   let depth = 1;
-  let end = openAt + openTag[0].length;
-  walkHtmlTags(html, end, limit, (kind, name, _tagStart, tagEnd, selfClosing) => {
-    if (kind === "open" && name === "section" && !selfClosing) depth += 1;
-    if (kind === "close" && name === "section") {
+  let end = afterOpen;
+  walkHtmlTags(html, afterOpen, limit, (tag) => {
+    if (tag.kind === "open" && tag.name === "section" && !tag.selfClosing) depth += 1;
+    if (tag.kind === "close" && tag.name === "section") {
       depth -= 1;
       if (depth === 0) {
-        end = tagEnd;
+        end = tag.end;
         return limit; // stop walk
       }
     }
@@ -723,47 +721,47 @@ export function topLevelSectionRanges(html: string): { start: number; end: numbe
   let inBody = false;
   let sawBodyOpen = false;
   let depth = 0;
-  walkHtmlTags(html, 0, html.length, (kind, name, tagStart, tagEnd, selfClosing) => {
+  walkHtmlTags(html, 0, html.length, (tag) => {
     if (!inBody) {
-      if (kind === "open" && name === "body" && !selfClosing) {
+      if (tag.kind === "open" && tag.name === "body" && !tag.selfClosing) {
         sawBodyOpen = true;
         inBody = true;
         depth = 0;
-        return tagEnd;
+        return tag.end;
       }
       return null;
     }
-    if (kind === "close" && name === "body") {
+    if (tag.kind === "close" && tag.name === "body") {
       inBody = false;
       return html.length; // stop walk at real </body>
     }
-    if (kind === "close") {
+    if (tag.kind === "close") {
       if (depth > 0) depth -= 1;
       return null;
     }
     // open
-    if (depth === 0 && name === "section" && !selfClosing) {
-      const end = sectionCloseEnd(html, tagStart, html.length);
-      ranges.push({ start: tagStart, end });
+    if (depth === 0 && tag.name === "section" && !tag.selfClosing) {
+      const end = sectionCloseEnd(html, tag.end, html.length);
+      ranges.push({ start: tag.start, end });
       return end;
     }
-    if (!selfClosing) depth += 1;
+    if (!tag.selfClosing) depth += 1;
     return null;
   });
   // Fragments with no <body> still scan the whole document (legacy behavior).
   if (!sawBodyOpen) {
     depth = 0;
-    walkHtmlTags(html, 0, html.length, (kind, name, tagStart, _tagEnd, selfClosing) => {
-      if (kind === "close") {
+    walkHtmlTags(html, 0, html.length, (tag) => {
+      if (tag.kind === "close") {
         if (depth > 0) depth -= 1;
         return null;
       }
-      if (depth === 0 && name === "section" && !selfClosing) {
-        const end = sectionCloseEnd(html, tagStart, html.length);
-        ranges.push({ start: tagStart, end });
+      if (depth === 0 && tag.name === "section" && !tag.selfClosing) {
+        const end = sectionCloseEnd(html, tag.end, html.length);
+        ranges.push({ start: tag.start, end });
         return end;
       }
-      if (!selfClosing) depth += 1;
+      if (!tag.selfClosing) depth += 1;
       return null;
     });
   }
@@ -781,6 +779,15 @@ export function slideIndexForSourceOffset(html: string, offset: number): number 
   return ranges.length - 1;
 }
 
+/** `data-screen` value from a section open tag bounded by the scanner. */
+function dataScreenId(openTagText: string): string | null {
+  const m =
+    /\bdata-screen\s*=\s*"([^"]*)"/i.exec(openTagText) ||
+    /\bdata-screen\s*=\s*'([^']*)'/i.exec(openTagText) ||
+    /\bdata-screen\s*=\s*([^\s>]+)/i.exec(openTagText);
+  return m ? m[1].trim() : null;
+}
+
 /**
  * `data-screen` id of the wireframe section containing `offset`, or null when
  * the file has no screen sections.
@@ -789,10 +796,10 @@ export function wireframeScreenIdForSourceOffset(html: string, offset: number): 
   const ranges = topLevelSectionRanges(html);
   for (const range of ranges) {
     if (offset < range.start || offset >= range.end) continue;
-    const open = /^<section\b[^>]*>/i.exec(html.slice(range.start));
-    if (!open) continue;
-    const id = /\bdata-screen\s*=\s*["']([^"']+)["']/i.exec(open[0]);
-    if (id) return id[1].trim();
+    const open = tagAt(html, range.start);
+    if (!open || open.kind !== "open" || open.name !== "section") continue;
+    const id = dataScreenId(html.slice(open.start, open.end));
+    if (id) return id;
   }
   return null;
 }

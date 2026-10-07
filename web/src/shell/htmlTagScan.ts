@@ -1,11 +1,13 @@
 // Raw-text-aware HTML tag walk shared by comment-to-slide mapping and preview
-// markup injection. Skips comments and script/style/textarea/title contents so
-// tag-like strings inside them are never mistaken for real structure.
+// markup injection. Tag ends follow the HTML tokenizer (first `>` outside a
+// quoted attribute value). Skips comments and script/style/textarea/title
+// contents so tag-like strings inside them are never mistaken for structure.
 
 /** Tags whose contents are raw text (not parsed as HTML) until their close tag. */
 export const RAW_TEXT_TAGS = new Set(["script", "style", "textarea", "title"]);
 
-const VOID_TAGS = new Set([
+/** Void elements: only these are empty from a start tag (HTML ignores `/>` elsewhere). */
+export const VOID_TAGS = new Set([
   "area",
   "base",
   "br",
@@ -21,6 +23,16 @@ const VOID_TAGS = new Set([
   "track",
   "wbr",
 ]);
+
+/** One tag token from the scanner. */
+export interface HtmlTag {
+  kind: "open" | "close";
+  name: string;
+  start: number;
+  end: number;
+  /** True only for void elements; `/>` on non-void tags is ignored per HTML. */
+  selfClosing: boolean;
+}
 
 /** Whitespace as the HTML tokenizer defines it. */
 const TOKENIZER_SPACE = " \t\n\f\r";
@@ -40,9 +52,10 @@ function hasTagAt(html: string, at: number, name: string): boolean {
 
 /**
  * Index just past the `>` that ends the tag whose name ends at `from`, or -1 when
- * the tag is still open at end of input.
+ * the tag is still open at end of input. `>` inside single- or double-quoted
+ * attribute values is ignored; an unquoted value ends at whitespace or `>`.
  */
-function tagEnd(html: string, from: number): number {
+export function tagEnd(html: string, from: number): number {
   let state: "name" | "beforeValue" | "unquoted" = "name";
   for (let i = from; i < html.length; i++) {
     const c = html.charAt(i);
@@ -120,16 +133,13 @@ function skipHtmlComment(html: string, i: number, limit: number): number {
 
 /**
  * Advance past a raw-text element whose open tag starts at `openAt`. Contents
- * are not scanned for nested tags.
+ * are not scanned for nested tags. Per HTML, `/>` does not close script/style/
+ * textarea/title - raw text runs until the matching end tag (or EOF).
  */
 function skipRawTextElement(html: string, openAt: number, name: string, limit: number): number {
   if (!hasTagAt(html, openAt, `<${name}`)) return Math.min(openAt + 1, limit);
   const openEnd = tagEnd(html, openAt + 1 + name.length);
   if (openEnd === -1 || openEnd > limit) return limit;
-  // Self-closing raw-text tags are unusual but terminate at the open tag.
-  if (html.slice(openAt, openEnd).includes("/>") || VOID_TAGS.has(name)) {
-    return openEnd;
-  }
   if (name === "script") {
     const close = scriptEnd(html, openEnd);
     return close === -1 || close > limit ? limit : close;
@@ -150,6 +160,29 @@ function readTagName(html: string, nameAt: number): string | null {
   return html.slice(nameAt, j).toLowerCase();
 }
 
+/** Parse the single tag that starts at `at`, or null if none. */
+export function tagAt(html: string, at: number): HtmlTag | null {
+  if (html.charAt(at) !== "<") return null;
+  if (html.startsWith("</", at)) {
+    const name = readTagName(html, at + 2);
+    if (!name || !hasTagAt(html, at, `</${name}`)) return null;
+    const end = tagEnd(html, at + 2 + name.length);
+    if (end === -1) return null;
+    return { kind: "close", name, start: at, end, selfClosing: false };
+  }
+  const name = readTagName(html, at + 1);
+  if (!name || !hasTagAt(html, at, `<${name}`)) return null;
+  const end = tagEnd(html, at + 1 + name.length);
+  if (end === -1) return null;
+  return {
+    kind: "open",
+    name,
+    start: at,
+    end,
+    selfClosing: VOID_TAGS.has(name),
+  };
+}
+
 /**
  * Walk HTML from `start`, skipping comments and raw-text element contents.
  * Invokes `onTag` for each real open/close tag; return a number to jump `i`,
@@ -160,13 +193,7 @@ export function walkHtmlTags(
   html: string,
   start: number,
   limit: number,
-  onTag: (
-    kind: "open" | "close",
-    name: string,
-    tagStart: number,
-    tagStop: number,
-    selfClosing: boolean,
-  ) => number | null,
+  onTag: (tag: HtmlTag) => number | null,
 ): void {
   let i = start;
   while (i < limit) {
@@ -184,10 +211,17 @@ export function walkHtmlTags(
         i += 1;
         continue;
       }
-      const stop = tagEnd(html, i + 2 + name.length);
-      if (stop === -1) return;
-      const jump = onTag("close", name, i, stop, false);
-      i = jump ?? stop;
+      const end = tagEnd(html, i + 2 + name.length);
+      // Incomplete end tag: the tokenizer drops the rest of the document.
+      if (end === -1) return;
+      const jump = onTag({
+        kind: "close",
+        name,
+        start: i,
+        end,
+        selfClosing: false,
+      });
+      i = jump ?? end;
       continue;
     }
     const name = readTagName(html, i + 1);
@@ -195,15 +229,21 @@ export function walkHtmlTags(
       i += 1;
       continue;
     }
-    const stop = tagEnd(html, i + 1 + name.length);
-    if (stop === -1) return;
+    const end = tagEnd(html, i + 1 + name.length);
+    // Incomplete start tag swallows the rest, as in the HTML parser.
+    if (end === -1) return;
     if (RAW_TEXT_TAGS.has(name)) {
       i = skipRawTextElement(html, i, name, limit);
       continue;
     }
-    const selfClosing = /\/>$/.test(html.slice(i, stop)) || VOID_TAGS.has(name);
-    const jump = onTag("open", name, i, stop, selfClosing);
-    i = jump ?? stop;
+    const jump = onTag({
+      kind: "open",
+      name,
+      start: i,
+      end,
+      selfClosing: VOID_TAGS.has(name),
+    });
+    i = jump ?? end;
   }
 }
 
@@ -216,12 +256,12 @@ export function findTag(
   name: string,
   kind: "open" | "close",
   options?: { last?: boolean },
-): { start: number; end: number } | null {
+): HtmlTag | null {
   const want = name.toLowerCase();
-  let found: { start: number; end: number } | null = null;
-  walkHtmlTags(html, 0, html.length, (k, n, tagStart, tagStop) => {
-    if (k === kind && n === want) {
-      found = { start: tagStart, end: tagStop };
+  let found: HtmlTag | null = null;
+  walkHtmlTags(html, 0, html.length, (tag) => {
+    if (tag.kind === kind && tag.name === want) {
+      found = tag;
       if (!options?.last) return html.length;
     }
     return null;
