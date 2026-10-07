@@ -1171,8 +1171,10 @@ class BenchEnvironment:
                             running.set()
                         elif status == "failed":
                             outcome["failed"] = "turn failed"
+                            idle.set()  # signal now; closing the stream isn't timed
                             return
                         elif status == "idle" and running.is_set():
+                            idle.set()
                             return
                     outcome["error"] = "stream ended before the turn settled"
             except httpx.HTTPError as exc:

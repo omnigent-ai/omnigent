@@ -508,6 +508,44 @@ async def test_gated_turn_fails_promptly_when_the_turn_settles_before_the_gate()
 
 
 @pytest.mark.asyncio
+async def test_interrupt_sample_ends_at_idle_not_after_stream_cleanup() -> None:
+    """Closing the session stream after ``idle`` must not count toward the sample."""
+    interrupted, release = asyncio.Event(), asyncio.Event()
+
+    class _SlowCloseStream(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[override]
+            yield _status_line("running")
+            await interrupted.wait()
+            yield _status_line("idle")
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            await release.wait()  # response cleanup blocks until released
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, stream=_SlowCloseStream())
+        if b'"interrupt"' in request.content:
+            interrupted.set()
+        return httpx.Response(202)
+
+    env = _gated_env([], asyncio.Event())
+    assert env.client is not None
+    await env.client.aclose()
+    env.client = httpx.AsyncClient(
+        base_url="http://bench", transport=httpx.MockTransport(_handler)
+    )
+    try:
+        turn = await env.start_gated_turn("s1", timeout=5)
+        await asyncio.wait_for(env.interrupt_gated_turn(turn, timeout=5), timeout=2)
+        release.set()
+        await env.finish_gated_turn(turn)
+    finally:
+        release.set()
+        await env.client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_close_cli_startup_terminates_the_stashed_child_once() -> None:
     terminated: list[bool] = []
 
