@@ -4,6 +4,7 @@ import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   AGENT_BROWSER_TAB_ID,
+  browserViewConversationId,
   browserViewId,
   openAgentBrowserTab,
   useBrowserTabs,
@@ -16,6 +17,16 @@ afterEach(() => {
 });
 
 describe("browser soft tabs", () => {
+  it("maps agent and user tab view ids back to the owning session", () => {
+    const tabId = "4c1d6a1e-9d2b-4f84-8c2e-0f1b7a3c9d55";
+    expect(browserViewConversationId(browserViewId("session-a", AGENT_BROWSER_TAB_ID))).toBe(
+      "session-a",
+    );
+    expect(browserViewConversationId(browserViewId("session:a/b", tabId))).toBe("session:a/b");
+    expect(browserViewConversationId("browser-tab:session-a:tab:1:2")).toBe("session-a");
+    expect(browserViewConversationId("browser-tab:%E0%A4%A:tab")).toBe("browser-tab:%E0%A4%A:tab");
+  });
+
   it("persists a pending close even if the workspace unmounts", async () => {
     let finishClose!: (value: { ok: boolean }) => void;
     const browserClose = vi.fn(

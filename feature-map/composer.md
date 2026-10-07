@@ -34,7 +34,9 @@ and steers messages while the agent is busy.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
-  and always-steer preference, keeping their element screenshots.
+  and always-steer preference, keeping their element screenshots. States: sent
+  from the agent/link tab or a user-opened Browser tab; rejected after switching
+  to another session.
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.

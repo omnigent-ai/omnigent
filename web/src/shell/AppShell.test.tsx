@@ -27,7 +27,7 @@ import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { AGENT_BROWSER_TAB_ID } from "@/hooks/useBrowserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/hooks/useBrowserTabs";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
@@ -5037,11 +5037,16 @@ describe("AppShell design-mode submission", () => {
     restoreGetState();
   });
 
-  function submitInstruction(prompt = "Use a week picker.") {
+  // The agent/link tab's native view is keyed by the session id; a tab opened
+  // via "Open new" -> "Browser" is keyed by tab id.
+  const userTabViewId = browserViewId("conv_design", "4c1d6a1e-9d2b-4f84-8c2e-0f1b7a3c9d55");
+  const viewIdFor = (tab: "agent" | "user") => (tab === "agent" ? "conv_design" : userTabViewId);
+
+  function submitInstruction(prompt = "Use a week picker.", viewId = "conv_design") {
     act(() => {
-      select({ conversationId: "conv_design", screenshot: "data:image/png;base64,AQID" });
+      select({ conversationId: viewId, screenshot: "data:image/png;base64,AQID" });
       submit({
-        conversationId: "conv_design",
+        conversationId: viewId,
         id: 1,
         element: { tag: "input", id: "#period" },
         prompt,
@@ -5050,40 +5055,47 @@ describe("AppShell design-mode submission", () => {
   }
 
   it.each([
-    { preference: null, busy: true, backlog: false, queued: true },
-    { preference: "false", busy: true, backlog: false, queued: true },
-    { preference: "true", busy: true, backlog: false, queued: false },
-    { preference: "true", busy: true, backlog: true, queued: true },
-    { preference: null, busy: false, backlog: false, queued: false },
-  ])("routes with $preference always-steer, busy=$busy, backlog=$backlog", async (test) => {
-    if (test.preference !== null) localStorage.setItem("omnigent:always-steer", test.preference);
-    Object.assign(chat, {
-      status: test.busy ? "streaming" : "idle",
-      sessionStatus: test.busy ? "running" : "idle",
-      queuedMessages: test.backlog
-        ? [{ queueId: "earlier", conversationId: "conv_design", text: "Earlier change" }]
-        : [],
-    });
-    renderShell("/c/conv_design");
-    submitInstruction();
+    { tab: "agent", preference: null, busy: true, backlog: false, queued: true },
+    { tab: "agent", preference: "false", busy: true, backlog: false, queued: true },
+    { tab: "agent", preference: "true", busy: true, backlog: false, queued: false },
+    { tab: "agent", preference: "true", busy: true, backlog: true, queued: true },
+    { tab: "agent", preference: null, busy: false, backlog: false, queued: false },
+    { tab: "user", preference: null, busy: true, backlog: false, queued: true },
+    { tab: "user", preference: "true", busy: true, backlog: false, queued: false },
+    { tab: "user", preference: "true", busy: true, backlog: true, queued: true },
+  ] as const)(
+    "routes the $tab tab with $preference always-steer, busy=$busy, backlog=$backlog",
+    async (test) => {
+      if (test.preference !== null) localStorage.setItem("omnigent:always-steer", test.preference);
+      Object.assign(chat, {
+        status: test.busy ? "streaming" : "idle",
+        sessionStatus: test.busy ? "running" : "idle",
+        queuedMessages: test.backlog
+          ? [{ queueId: "earlier", conversationId: "conv_design", text: "Earlier change" }]
+          : [],
+      });
+      renderShell("/c/conv_design");
+      const viewId = viewIdFor(test.tab);
+      submitInstruction("Use a week picker.", viewId);
 
-    const dispatched = test.queued ? enqueueMessage : send;
-    expect(dispatched).toHaveBeenCalledTimes(1);
-    expect(test.queued ? send : enqueueMessage).not.toHaveBeenCalled();
-    const args = dispatched.mock.calls[0];
-    expect(args[0]).toContain("Use a week picker.");
-    expect(args[0]).toContain("CSS selector: #period");
-    const files = args[test.queued ? 1 : 2] as File[];
-    expect(files).toHaveLength(1);
-    expect(files[0]).toMatchObject({ name: "design-element-1.png", type: "image/png", size: 3 });
-    await waitFor(() =>
-      expect(signal).toHaveBeenCalledWith("conv_design", {
-        id: 1,
-        ok: true,
-        message: test.queued ? "Queued for agent." : "Sent to agent.",
-      }),
-    );
-  });
+      const dispatched = test.queued ? enqueueMessage : send;
+      expect(dispatched).toHaveBeenCalledTimes(1);
+      expect(test.queued ? send : enqueueMessage).not.toHaveBeenCalled();
+      const args = dispatched.mock.calls[0];
+      expect(args[0]).toContain("Use a week picker.");
+      expect(args[0]).toContain("CSS selector: #period");
+      const files = args[test.queued ? 1 : 2] as File[];
+      expect(files).toHaveLength(1);
+      expect(files[0]).toMatchObject({ name: "design-element-1.png", type: "image/png", size: 3 });
+      await waitFor(() =>
+        expect(signal).toHaveBeenCalledWith(viewId, {
+          id: 1,
+          ok: true,
+          message: test.queued ? "Queued for agent." : "Sent to agent.",
+        }),
+      );
+    },
+  );
 
   it("reads a changed always-steer preference at submission without remounting", () => {
     localStorage.setItem("omnigent:always-steer", "true");
@@ -5115,25 +5127,34 @@ describe("AppShell design-mode submission", () => {
     renderShell("/c/conv_design");
     chat.conversationId = "conv_other";
     submitInstruction();
+    submitInstruction("Use a week picker.", userTabViewId);
     expect(enqueueMessage).not.toHaveBeenCalled();
     expect(send).not.toHaveBeenCalled();
-    expect(signal).toHaveBeenCalledWith("conv_design", {
-      id: 1,
-      ok: false,
-      message: "Return to this session before sending.",
-    });
-    chat.conversationId = "conv_design";
-    act(() => {
-      submit({
-        conversationId: "conv_design",
-        id: 2,
-        element: { tag: "input", id: "#period" },
-        prompt: "A later instruction without a new screenshot",
+    for (const viewId of ["conv_design", userTabViewId]) {
+      expect(signal).toHaveBeenCalledWith(viewId, {
+        id: 1,
+        ok: false,
+        message: "Return to this session before sending.",
       });
-    });
-    expect(enqueueMessage).toHaveBeenCalledWith(
-      expect.stringContaining("A later instruction without a new screenshot"),
-      undefined,
-    );
+    }
+    chat.conversationId = "conv_design";
+    for (const [id, viewId] of [
+      [2, "conv_design"],
+      [3, userTabViewId],
+    ] as const) {
+      act(() => {
+        submit({
+          conversationId: viewId,
+          id,
+          element: { tag: "input", id: "#period" },
+          prompt: "A later instruction without a new screenshot",
+        });
+      });
+      expect(enqueueMessage).toHaveBeenLastCalledWith(
+        expect.stringContaining("A later instruction without a new screenshot"),
+        undefined,
+      );
+      expect(signal).toHaveBeenCalledWith(viewId, { id, ok: true, message: "Queued for agent." });
+    }
   });
 });
