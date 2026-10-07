@@ -11,14 +11,21 @@ is covered without paying the server-boot cost.
 from __future__ import annotations
 
 import argparse
+import asyncio
 from pathlib import Path
 from typing import cast
 
 import httpx
 import pytest
 
+from dev.benchmarks.omnigent import journeys as bench_journeys
 from dev.benchmarks.omnigent import run as bench_run
-from dev.benchmarks.omnigent.environment import BenchEnvironment, _sse_session_status
+from dev.benchmarks.omnigent.environment import (
+    BenchEnvironment,
+    GatedTurn,
+    _close_reader,
+    _sse_session_status,
+)
 from dev.benchmarks.omnigent.journeys import ALL_JOURNEYS, Journey, run_latency, run_throughput
 from dev.benchmarks.omnigent.measure import RunResult, aggregate, check_thresholds
 from dev.benchmarks.omnigent.schema import SCHEMA_VERSION, build_report
@@ -347,6 +354,139 @@ async def test_latency_prepare_runs_before_warmup_and_timed_operations() -> None
         "measure",
         "teardown",
     ]
+
+
+@pytest.mark.asyncio
+async def test_latency_max_warmup_clamps_requested_warmup() -> None:
+    """``max_warmup`` lowers ``--warmup`` for journeys where repeats warm nothing."""
+    calls: list[str] = []
+
+    async def _measure(_env: BenchEnvironment, _ctx: object) -> None:
+        calls.append("measure")
+
+    journey = Journey(name="cold", kind="latency", measure=_measure, max_warmup=1)
+    result = await run_latency(journey, cast(BenchEnvironment, object()), iterations=3, warmup=10)
+
+    assert result.n_success == 3
+    assert len(calls) == 4  # 1 warmup + 3 timed
+
+
+@pytest.mark.asyncio
+async def test_latency_validate_runs_off_the_clock() -> None:
+    """Slow per-sample cleanup in ``validate`` (e.g. killing a CLI) is not timed."""
+
+    async def _measure(_env: BenchEnvironment, _ctx: object) -> None:
+        return None
+
+    async def _validate(_env: BenchEnvironment, _ctx: object) -> None:
+        await asyncio.sleep(0.2)
+
+    journey = Journey(name="cleanup", kind="latency", measure=_measure, validate=_validate)
+    result = await run_latency(journey, cast(BenchEnvironment, object()), iterations=2, warmup=0)
+
+    assert result.n_success == 2
+    assert max(result.latencies_ms) < 100
+
+
+@pytest.mark.asyncio
+async def test_turn_session_rotates_every_n_samples() -> None:
+    """Turn journeys move to a fresh warmed session so history stays bounded."""
+    created: list[str] = []
+    warmed: list[str] = []
+
+    class _Env:
+        async def create_bound_session(self, agent_id: str) -> str:
+            created.append(agent_id)
+            return f"s{len(created)}"
+
+        async def drive_turn(self, session_id: str, _text: str) -> None:
+            warmed.append(session_id)
+
+    ctx = bench_journeys._TurnSession(agent_id="a", session_id="s0")
+    every = bench_journeys._TURN_SESSION_SAMPLES
+    for _ in range(2 * every + 1):
+        await bench_journeys._rotate_turn_session(cast(BenchEnvironment, _Env()), ctx)
+
+    assert created == ["a", "a"]
+    assert warmed == ["s1", "s2"]  # each fresh session gets its warm-up turn
+    assert ctx.session_id == "s2"
+    assert ctx.samples == 1
+
+
+@pytest.mark.asyncio
+async def test_interrupt_refuses_a_turn_that_already_settled() -> None:
+    """Timing an interrupt on a settled turn would measure nothing; it must fail."""
+    posted: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        posted.append(request.url.path)
+        return httpx.Response(202)
+
+    env = BenchEnvironment(with_runner=True)
+    env.client = httpx.AsyncClient(
+        base_url="http://bench", transport=httpx.MockTransport(_handler)
+    )
+    idle = asyncio.Event()
+    idle.set()
+    turn = GatedTurn("s1", asyncio.create_task(asyncio.sleep(0)), idle, {})
+    try:
+        with pytest.raises(RuntimeError, match="settled before the interrupt"):
+            await env.interrupt_gated_turn(turn)
+    finally:
+        await env.client.aclose()
+        await turn.reader
+
+    assert posted == []
+
+
+@pytest.mark.asyncio
+async def test_interrupt_returns_when_the_gated_turn_settles() -> None:
+    idle = asyncio.Event()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/s1/events"
+        idle.set()  # the stream reader would see the turn go idle
+        return httpx.Response(202)
+
+    env = BenchEnvironment(with_runner=True)
+    env.client = httpx.AsyncClient(
+        base_url="http://bench", transport=httpx.MockTransport(_handler)
+    )
+    turn = GatedTurn("s1", asyncio.create_task(asyncio.sleep(0)), idle, {})
+    try:
+        await env.interrupt_gated_turn(turn, timeout=5)
+    finally:
+        await env.client.aclose()
+        await turn.reader
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finished", [True, False])
+async def test_close_reader_lets_a_finished_reader_close_its_stream(finished: bool) -> None:
+    """Cancelling a reader mid-close leaked a pooled connection per turn."""
+    saw_terminal = asyncio.Event()
+    closed: list[bool] = []
+
+    async def _reader() -> None:
+        try:
+            if not finished:
+                await asyncio.Event().wait()  # still waiting on the stream
+            saw_terminal.set()
+            await asyncio.sleep(0.01)  # stands in for ``response.aclose()``
+            closed.append(True)
+        except asyncio.CancelledError:
+            closed.append(False)
+            raise
+
+    reader = asyncio.create_task(_reader())
+    if finished:
+        await saw_terminal.wait()
+    else:
+        await asyncio.sleep(0)
+    await _close_reader(reader, finished=finished)
+
+    assert reader.done()
+    assert closed == [finished]
 
 
 def _http_status_error(status_code: int) -> httpx.HTTPStatusError:

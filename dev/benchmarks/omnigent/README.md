@@ -89,13 +89,18 @@ These drive a real agent turn end-to-end — `POST …/events` → server → **
 → in-process executor → mock LLM → stream back → `idle`. Selecting any of them
 boots `BenchEnvironment(with_runner=True)` automatically.
 
-Each turn costs ~1 s+ (vs. the millisecond HTTP journeys), so these journeys
-cap their latency iterations (`Journey.max_iterations`, currently 5) — a large
-`--iterations` tuned for the HTTP journeys is clamped down for them so the run
-stays within the CI time budget, with `--runs` providing the repeats. The cap
-only lowers the count, never raises it. A cold start never deletes its session,
-so sessions accumulate across a run; keeping the count small also keeps that
-drift negligible (~2 ms/turn).
+These journeys cap their latency iterations (`Journey.max_iterations`) and,
+where repeats warm nothing, their warmups (`Journey.max_warmup`), so a large
+`--iterations` / `--warmup` tuned for the HTTP journeys is clamped down and the
+run stays within the CI time budget. Caps only lower a count, never raise it.
+
+- `warm_turn`, `time_to_first_token`, `interrupt`: up to 50 samples per run.
+  Each turn's LLM request grows with session history, so they move to a fresh
+  warmed session every 10 samples to keep samples at a similar history depth.
+- `session_cold_start`, `session_cold_restart`: 1 warmup and up to 14 samples.
+  Every op launches a fresh runner, so one warmup absorbs the first-launch
+  costs; a run launches at most 15 runners.
+- `cli_startup`: no warmup, up to 3 samples.
 
 | Journey | Operation timed |
 | --- | --- |
@@ -103,7 +108,7 @@ drift negligible (~2 ms/turn).
 | `session_cold_restart` | With an existing session's runner stopped before the sample, post a user message and time the automatic runner relaunch to first token |
 | `warm_turn` | Drive a turn on an already-warm session — steady-state dispatch overhead |
 | `time_to_first_token` | Post a turn; time to the first streamed `output_text` delta |
-| `interrupt` | Interrupt a running (gated) turn; time to cancellation |
+| `interrupt` | With a turn parked on the mock's gate before the sample, time `POST interrupt` → the turn going `idle` (the cancel path only) |
 | `read_runner_file` | `GET .../environments/default/filesystem/{path}` — server → runner filesystem read proxy |
 
 The two cold journeys use a real `omni host` daemon. `session_cold_start`

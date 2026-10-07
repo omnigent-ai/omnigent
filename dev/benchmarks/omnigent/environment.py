@@ -56,6 +56,8 @@ _MOCK_SERVER = _REPO_ROOT / "tests" / "server" / "integration" / "mock_llm_serve
 _HEALTH_TIMEOUT_S = 90.0
 _MOCK_TIMEOUT_S = 15.0
 _POLL_INTERVAL_S = 0.2
+# Untimed setup poll for the interrupt journey; short so each sample starts promptly.
+_GATE_POLL_INTERVAL_S = 0.02
 _TURN_TIMEOUT_S = 180.0
 # Budget for the host daemon (host-backed cold journeys) to connect its tunnel
 # and register in the hosts table after being spawned. Covers
@@ -103,6 +105,20 @@ class ServerRequestSnapshot(NamedTuple):
 
     total: int
     routes: dict[str, int]
+
+
+class GatedTurn(NamedTuple):
+    """A turn parked on the mock LLM's gate, with its SSE stream attached.
+
+    Built by :meth:`BenchEnvironment.start_gated_turn`. ``idle`` fires when the
+    stream reports the turn settled; ``outcome`` carries a stream error or
+    failed status for the caller to raise.
+    """
+
+    session_id: str
+    reader: asyncio.Task[None]
+    idle: asyncio.Event
+    outcome: dict[str, str]
 
 
 def _sse_session_status(data: str) -> str | None:
@@ -937,7 +953,7 @@ class BenchEnvironment:
                 last_error = snap.json().get("last_task_error") if snap.is_success else None
                 raise RuntimeError(f"turn failed: {last_error}")
         finally:
-            reader.cancel()
+            await _close_reader(reader, finished=settled.is_set())
 
     async def _wait_idle(self, session_id: str, *, timeout: float = _TURN_TIMEOUT_S) -> None:
         """Poll until the session is ``idle`` (a prior turn has settled)."""
@@ -1062,7 +1078,7 @@ class BenchEnvironment:
                     f"(session {session_id})"
                 )
         finally:
-            reader.cancel()
+            await _close_reader(reader, finished=first_delta.is_set() or first_response.is_set())
 
     async def time_to_first_delta(
         self, session_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
@@ -1115,55 +1131,155 @@ class BenchEnvironment:
             session_id, text, wait_idle_first=False, timeout=timeout
         )
 
-    async def drive_and_interrupt(
+    async def start_gated_turn(
         self, session_id: str, *, timeout: float = _TURN_TIMEOUT_S
-    ) -> None:
-        """Drive a gated turn, interrupt it mid-flight, return when cancelled.
+    ) -> GatedTurn:
+        """Post a turn and return once its LLM call is parked on the mock's gate.
 
-        The caller configures a ``block=True`` mock response first (see
-        :meth:`configure_mock`), so the turn parks in ``running`` on the
-        executor's LLM call. We post an ``interrupt`` once running, wait for the
-        server's cancellation marker, then release the gate so the runner
-        unwinds cleanly. Times the server → runner → executor cancel path.
+        Queues one ``block=True`` mock response, attaches the session's SSE
+        stream, posts the message, and waits until the mock holds the turn's LLM
+        request at the gate. ``running`` alone is too early: a turn reports it
+        before calling the LLM, and an interrupt landing then would leave the
+        gated response queued for the next turn. :meth:`interrupt_gated_turn`
+        then times only the cancel path. Always pair with
+        :meth:`finish_gated_turn`.
 
-        :raises RuntimeError: If not in runner mode, or the interrupt is not
-            honored within *timeout*.
+        :raises RuntimeError: If not in runner mode, or the turn fails or does
+            not start within *timeout*.
         """
         assert self.client is not None
         if not self.with_runner:
-            raise RuntimeError("drive_and_interrupt requires with_runner=True")
-        body = {
-            "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": "Interrupt me."}]},
-        }
-        posted = await self.client.post(f"/v1/sessions/{session_id}/events", json=body)
-        posted.raise_for_status()
+            raise RuntimeError("start_gated_turn requires with_runner=True")
+        await self.configure_mock([{"text": "Interrupted before this reply.", "block": True}])
 
-        deadline = time.monotonic() + timeout
-        interrupted = False
+        connected = asyncio.Event()
+        running = asyncio.Event()
+        idle = asyncio.Event()
+        outcome: dict[str, str] = {}
+
+        async def _read_stream() -> None:
+            try:
+                async with self.client.stream(  # type: ignore[union-attr]
+                    "GET", f"/v1/sessions/{session_id}/stream", timeout=timeout
+                ) as resp:
+                    connected.set()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        status = _sse_session_status(line[len("data:") :].strip())
+                        if status in ("running", "waiting"):
+                            running.set()
+                        elif status == "failed":
+                            outcome["failed"] = "turn failed"
+                            return
+                        elif status == "idle" and running.is_set():
+                            return
+            except httpx.HTTPError as exc:
+                outcome["error"] = repr(exc)
+            finally:
+                connected.set()
+                running.set()
+                idle.set()
+
+        turn = GatedTurn(session_id, asyncio.create_task(_read_stream()), idle, outcome)
         try:
+            await asyncio.wait_for(connected.wait(), timeout=timeout)
+            body = {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Interrupt me."}],
+                },
+            }
+            posted = await self.client.post(f"/v1/sessions/{session_id}/events", json=body)
+            posted.raise_for_status()
+            await asyncio.wait_for(running.wait(), timeout=timeout)
+            await self._wait_gate_pending(timeout=timeout)
+            if idle.is_set():
+                raise RuntimeError(f"gated turn settled before it was interrupted: {outcome}")
+        except BaseException:
+            await self.finish_gated_turn(turn)
+            raise
+        return turn
+
+    async def interrupt_gated_turn(
+        self, turn: GatedTurn, *, timeout: float = _TURN_TIMEOUT_S
+    ) -> None:
+        """Interrupt a :meth:`start_gated_turn` turn; return when it settles.
+
+        Times the server → runner → executor cancel path: ``POST interrupt``
+        until the stream reports the session ``idle``.
+
+        :raises RuntimeError: If the turn already settled, or it fails or does
+            not settle within *timeout*.
+        """
+        assert self.client is not None
+        if turn.idle.is_set():
+            raise RuntimeError(f"gated turn settled before the interrupt: {turn.outcome}")
+        posted = await self.client.post(
+            f"/v1/sessions/{turn.session_id}/events", json={"type": "interrupt"}
+        )
+        posted.raise_for_status()
+        try:
+            await asyncio.wait_for(turn.idle.wait(), timeout=timeout)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"interrupt not honored within {timeout}s (session {turn.session_id})"
+            ) from exc
+        if turn.outcome:
+            raise RuntimeError(f"interrupted turn did not settle cleanly: {turn.outcome}")
+
+    async def finish_gated_turn(self, turn: GatedTurn) -> None:
+        """Release the mock's gate, drop any unused gated reply, and close the stream."""
+        with contextlib.suppress(httpx.HTTPError):
+            await self._mock_post("/gate/release", {})
+            await self.configure_mock([])
+        await _close_reader(turn.reader, finished=turn.idle.is_set())
+
+    async def _wait_gate_pending(self, *, timeout: float) -> None:
+        """Poll the mock until an LLM request is held at its gate."""
+        deadline = time.monotonic() + timeout
+        async with httpx.AsyncClient(base_url=self.mock_url, timeout=10.0) as mock:
             while time.monotonic() < deadline:
-                snap = (await self.client.get(f"/v1/sessions/{session_id}")).json()
-                status = snap.get("status")
-                items = snap.get("items", [])
-                if status in ("running", "waiting") and not interrupted:
-                    await self.client.post(
-                        f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
-                    )
-                    interrupted = True
-                if _has_cancellation_marker(items):
+                resp = await mock.get("/gate/pending")
+                resp.raise_for_status()
+                if resp.json().get("pending"):
                     return
-                if status == "idle" and interrupted:
-                    if _has_cancellation_marker(items):
-                        return
-                    raise RuntimeError("turn settled without a cancellation marker")
-                await asyncio.sleep(_POLL_INTERVAL_S)
-            raise RuntimeError(f"interrupt not honored within {timeout}s (session {session_id})")
-        finally:
-            # Always release the gate so the blocked runner turn unwinds and
-            # teardown doesn't hang, even if the interrupt path errored above.
-            with contextlib.suppress(httpx.HTTPError):
-                await self._mock_post("/gate/release", {})
+                await asyncio.sleep(_GATE_POLL_INTERVAL_S)
+        raise RuntimeError(f"no LLM request reached the mock's gate within {timeout}s")
+
+    async def cancellation_markers(self, session_id: str) -> int:
+        """Count the session's "interrupted" markers (one per cancelled turn)."""
+        assert self.client is not None
+        snap = await self.client.get(f"/v1/sessions/{session_id}")
+        snap.raise_for_status()
+        return sum(1 for item in snap.json().get("items", []) if _has_cancellation_marker([item]))
+
+    async def wait_cancellation_markers(
+        self, session_id: str, count: int, *, timeout: float = _RUNNER_OFFLINE_TIMEOUT_S
+    ) -> None:
+        """Poll until the session holds at least *count* cancellation markers."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if await self.cancellation_markers(session_id) >= count:
+                return
+            await asyncio.sleep(_POLL_INTERVAL_S)
+        raise RuntimeError(
+            f"no cancellation marker within {timeout}s (session {session_id}, want {count})"
+        )
+
+
+async def _close_reader(reader: asyncio.Task[None], *, finished: bool) -> None:
+    """Await an SSE reader task, cancelling it only if it is still waiting.
+
+    A reader that already saw its terminal event is closing its response;
+    cancelling it then interrupts the close and leaks the pooled connection,
+    which exhausts the client's pool after ~100 turns.
+    """
+    if not finished:
+        reader.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await reader
 
 
 def _has_cancellation_marker(items: list[dict[str, object]]) -> bool:
