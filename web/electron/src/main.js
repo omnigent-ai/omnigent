@@ -2073,11 +2073,13 @@ async function loadServerUrl(
           target = serverUrl;
           pinWindow(win, resolvedOrigin, attempt);
           setWindowServerUrl(win, serverUrl);
-          if (interactive && !windows.get(win)?.ephemeral) {
-            const settings = loadSettings();
-            settings.server_url = serverUrl;
-            saveSettings(settings);
+          const settings = loadSettings();
+          if (interactive && !windows.get(win)?.ephemeral) settings.server_url = serverUrl;
+          // The onboarding runner was recorded for the entered host; hand it to this one.
+          if (settings.onboarding_runner?.origin === entered.origin) {
+            settings.onboarding_runner.origin = resolvedOrigin;
           }
+          saveSettings(settings);
         }
         await auth.attach(win, serverUrl, target);
       } catch (error) {
