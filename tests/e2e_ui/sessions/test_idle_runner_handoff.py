@@ -132,14 +132,20 @@ def test_idle_session_stays_healthy_after_unreadable_replica_handoff(
 
         rig._poll_until(
             lambda: (
-                f"Runner disconnect for session={session_id}:" in stack.process_log.read_text()
+                f"liveness lookup failed for session={session_id}" in stack.process_log.read_text()
             ),
             timeout=110,
             what="the old replica's disconnect decision after its real grace period",
         )
-        log = stack.process_log.read_text()
-        assert f"live-status read failed for session={session_id}" in log
-        assert f"liveness lookup failed for session={session_id}" in log
+        # The runner-keyed fallback still sees the runner live on replica B.
+        rig._poll_until(
+            lambda: (
+                f"Relay: runner transport lost for session={session_id} (live_elsewhere)"
+                in stack.process_log.read_text()
+            ),
+            timeout=10,
+            what="the old replica deciding the runner is live on replica B",
+        )
         assert replica.runner_online()
 
         # A browser request can return to A once its backend reads recover.
@@ -156,7 +162,7 @@ def test_idle_session_stays_healthy_after_unreadable_replica_handoff(
         ).to_have_count(0)
         assert snapshot["status"] == "idle"
         assert snapshot.get("last_task_error") is None
-        assert not rig._FAILURE_SIGNATURE.search(log)
+        assert not rig._FAILURE_SIGNATURE.search(stack.process_log.read_text())
     finally:
         if stack.conversation_read_fault is not None:
             stack.conversation_read_fault.unlink(missing_ok=True)
