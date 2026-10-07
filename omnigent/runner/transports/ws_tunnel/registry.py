@@ -843,7 +843,9 @@ class TunnelRegistry:
                             return
                         try:
                             frame = OutboundFrame(
-                                data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
+                                data,
+                                queued_at=session.diagnostics.timestamp(),
+                                app_ping_ts=app_ping_ts,
                             )
                             session.outbound_queue.put_nowait(frame)
                             # Recording or logging failures cannot undo an accepted frame.
@@ -860,6 +862,9 @@ class TunnelRegistry:
                                     )
                         except asyncio.QueueFull:
                             pass
+                        except Exception as error:  # noqa: BLE001 — forward owner-loop failures
+                            _resolve(error)
+                            return
                         else:
                             enqueued = True
                             _resolve(None)
