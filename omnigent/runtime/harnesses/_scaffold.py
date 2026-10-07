@@ -144,25 +144,36 @@ _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S
 _WEDGED_TURN_RECOVERY_RETRIES = 1
 
 # Set by the harness subprocess entrypoint. Executors import their SDKs lazily
-# on the first turn, so that graph is only static once the first turn ends.
+# on the first turn, so that graph is only static once a turn has completed.
 _freeze_gc_after_first_turn = False
 
 
 def arm_gc_freeze_after_first_turn() -> None:
-    """Freeze GC-tracked objects once, when this process's first turn ends.
+    """Collect and freeze GC-tracked objects once, after this process's first completed turn.
 
-    Only the harness subprocess arms this: freezing moves every live object
-    out of future collections, which an embedding process should not do.
+    Only the harness subprocess arms this; an embedding process keeps normal
+    GC. A failed or cancelled turn leaves the freeze armed, so a later turn
+    still freezes the lazily imported SDK.
     """
     global _freeze_gc_after_first_turn
     _freeze_gc_after_first_turn = True
 
 
-def _freeze_gc_if_armed() -> None:
+def _freeze_gc_if_armed(run_task: asyncio.Task[None]) -> None:
+    """Run the armed freeze once *run_task* has completed without error.
+
+    Called after the turn's terminal event is sent and its state torn down, so
+    the one-time collection (~25 ms) is off the turn's path and frees the
+    turn's cycles instead of pinning them.
+    """
     global _freeze_gc_after_first_turn
-    if _freeze_gc_after_first_turn:
-        _freeze_gc_after_first_turn = False
-        gc.freeze()
+    if not _freeze_gc_after_first_turn or not run_task.done() or run_task.cancelled():
+        return
+    if run_task.exception() is not None:
+        return
+    _freeze_gc_after_first_turn = False
+    gc.collect()
+    gc.freeze()
 
 
 @dataclass(frozen=True)
@@ -1448,6 +1459,7 @@ class HarnessApp:
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
+            _freeze_gc_if_armed(run_task)
 
     def _initial_envelope_events(
         self, ctx: TurnContext, model: str, start_seq: int
@@ -1737,7 +1749,6 @@ class HarnessApp:
             # Sentinel that tells ``_stream_turn`` to stop reading
             # the queue and emit the terminal event.
             ctx._event_queue.put_nowait(None)
-            _freeze_gc_if_armed()
 
     async def _prepare_turn_retry(self) -> bool:
         """Confirm abandoned work is stopped before replaying a no-progress turn.

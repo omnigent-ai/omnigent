@@ -957,17 +957,29 @@ def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIC
 
 
 def _is_plain_json(value: object) -> bool:
-    """Return whether *value* is built only from JSON scalars, lists, and str-keyed dicts."""
-    stack = [value]
+    """Return whether *value* is acyclic JSON: scalars, lists, and str-keyed dicts.
+
+    A cycle returns ``False``, so the caller falls back to the client's normal
+    path; a node shared by two parents is fine, as it is for ``json.dumps``.
+    """
+    on_path: set[int] = set()
+    stack: list[tuple[object, bool]] = [(value, False)]
     while stack:
-        node = stack.pop()
-        if isinstance(node, dict):
-            for key, item in node.items():
-                if not isinstance(key, str):
+        node, leaving = stack.pop()
+        if leaving:
+            on_path.discard(id(node))
+            continue
+        if isinstance(node, (dict, list)):
+            if id(node) in on_path:
+                return False
+            on_path.add(id(node))
+            stack.append((node, True))
+            if isinstance(node, dict):
+                if not all(isinstance(key, str) for key in node):
                     return False
-                stack.append(item)
-        elif isinstance(node, list):
-            stack.extend(node)
+                stack.extend((item, False) for item in node.values())
+            else:
+                stack.extend((item, False) for item in node)
         elif node is not None and not isinstance(node, (str, int, float, bool)):
             return False
     return True

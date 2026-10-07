@@ -434,7 +434,31 @@ _HISTORY = [
     },
     {"type": "function_call", "call_id": "c1", "name": "grep", "arguments": '{"q": "x"}'},
     {"type": "function_call_output", "call_id": "c1", "output": "found"},
+    {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": "Thinking."}],
+        "encrypted_content": "opaque",
+    },
+    {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"},
+            {
+                "type": "input_file",
+                "filename": "a.txt",
+                "file_data": "data:text/plain;base64,aGk=",
+            },
+        ],
+    },
 ] * 5
+
+
+def _cyclic_item() -> dict:
+    item: dict = {"type": "message", "role": "user", "content": []}
+    item["content"].append(item)
+    return item
 
 
 def test_history_via_extra_body_moves_plain_history() -> None:
@@ -445,6 +469,10 @@ def test_history_via_extra_body_moves_plain_history() -> None:
     merged = _history_via_extra_body({"input": _HISTORY, "extra_body": {"seed": 1}}, "input")
     assert merged["extra_body"] == {"seed": 1, "input": _HISTORY}
 
+    shared = {"type": "input_text", "text": "same block"}
+    dag = [{"type": "message", "role": "user", "content": [shared, shared]}]
+    assert _history_via_extra_body({"input": dag}, "input")["extra_body"] == {"input": dag}
+
 
 @pytest.mark.parametrize(
     "kwargs",
@@ -453,6 +481,7 @@ def test_history_via_extra_body_moves_plain_history() -> None:
         {"input": []},
         {"input": [{"type": "message", "content": object()}]},
         {"input": [{1: "non-str key"}]},
+        {"input": [_cyclic_item()]},
         {"input": _HISTORY, "extra_body": {"input": ["caller wins"]}},
         {"input": _HISTORY, "extra_body": "not a mapping"},
     ],
@@ -509,14 +538,17 @@ def test_skip_history_transform_sends_identical_request_json() -> None:
     async def _send(client: AsyncOpenAI, path: str) -> dict:
         bodies.clear()
         kwargs = {"model": "m", "input": _HISTORY, "stream": True, "extra_body": {"seed": 7}}
-        if path == "streaming":
-            async with client.responses.with_streaming_response.create(**kwargs) as resp:
-                await resp.read()
-        elif path == "create":
-            stream = await client.responses.create(**kwargs)
-            await stream.close()
-        else:
-            await client.chat.completions.create(model="m", messages=messages)
+        try:
+            if path == "streaming":
+                async with client.responses.with_streaming_response.create(**kwargs) as resp:
+                    await resp.read()
+            elif path == "create":
+                stream = await client.responses.create(**kwargs)
+                await stream.close()
+            else:
+                await client.chat.completions.create(model="m", messages=messages)
+        finally:
+            await client.close()
         return bodies[-1]
 
     for path in ("streaming", "create", "chat"):
@@ -532,13 +564,64 @@ def test_executor_skips_history_transform_only_on_its_own_client() -> None:
         "omnigent.inner.openai_agents_sdk_executor._get_openai_async_client",
         return_value=owned,
     ):
-        OpenAIAgentsSDKExecutor()
+        owning = OpenAIAgentsSDKExecutor()
     assert getattr(owned.responses.create, "_skips_history_transform", False)
     assert getattr(owned.chat.completions.create, "_skips_history_transform", False)
+    _run(owning.close())
 
     injected = AsyncOpenAI(api_key="k", base_url="http://bench/v1")
     OpenAIAgentsSDKExecutor(client=injected)
     assert not getattr(injected.responses.create, "_skips_history_transform", False)
+    _run(injected.close())
+
+
+def _transform_annotations(param_type: object) -> list[str]:
+    """Return every ``PropertyInfo`` alias/format reachable from *param_type*."""
+    import typing_extensions
+    from openai._utils._transform import PropertyInfo
+
+    found: list[str] = []
+    seen: set[int] = set()
+    stack = [param_type]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        for meta in getattr(node, "__metadata__", ()):
+            if isinstance(meta, PropertyInfo) and (meta.alias or meta.format):
+                found.append(f"{meta.alias or meta.format} in {node}")
+        if typing_extensions.is_typeddict(node):
+            stack.extend(typing_extensions.get_type_hints(node, include_extras=True).values())
+        stack.extend(typing_extensions.get_args(node))
+        origin = typing_extensions.get_origin(node)
+        if origin is not None:
+            stack.append(origin)
+    return found
+
+
+def test_create_param_types_have_no_transform_annotations() -> None:
+    """The history bypass is only lossless while the param types rename/format nothing.
+
+    If an ``openai`` upgrade adds an alias or format anywhere under these
+    types, the client's transform would change the body and the bypass would
+    skip that change; this fails first.
+    """
+    from typing import Annotated, TypedDict
+
+    from openai._utils._transform import PropertyInfo
+    from openai.types.chat import completion_create_params
+    from openai.types.responses import response_create_params
+
+    class _Inner(TypedDict):
+        name: Annotated[str, PropertyInfo(alias="Name")]
+
+    class _Outer(TypedDict):
+        items: list[_Inner] | str
+
+    assert _transform_annotations(_Outer), "walker must see a nested alias"
+    assert _transform_annotations(response_create_params.ResponseCreateParamsStreaming) == []
+    assert _transform_annotations(completion_create_params.CompletionCreateParamsStreaming) == []
 
 
 class TestOpenAIAgentsSDKExecutor(unittest.TestCase):

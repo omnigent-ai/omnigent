@@ -145,30 +145,36 @@ async def test_stale_continuation_without_model_is_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_turn_end_freezes_gc_once_only_when_armed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The subprocess freezes the lazily imported SDK graph after its first turn, once."""
+    """After its first completed turn's stream ends, the subprocess collects then freezes, once."""
     from omnigent.runtime.harnesses import _scaffold
 
-    freezes: list[int] = []
-    monkeypatch.setattr(_scaffold.gc, "freeze", lambda: freezes.append(1))
+    gc_calls: list[str] = []
+    monkeypatch.setattr(_scaffold.gc, "collect", lambda: gc_calls.append("collect") or 0)
+    monkeypatch.setattr(_scaffold.gc, "freeze", lambda: gc_calls.append("freeze"))
     monkeypatch.setattr(_scaffold, "_freeze_gc_after_first_turn", False)
+    outcomes: list[str] = []
 
     class _App(HarnessApp):
         async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
-            return None
+            if outcomes.pop(0) == "fail":
+                raise RuntimeError("turn failed")
 
     app = _App()
     request = CreateResponseRequest(model="test-agent", input="hi")
 
-    async def _turn() -> None:
-        await app._guarded_run_turn(request, TurnContext("resp", asyncio.Queue(), asyncio.Event()))
+    async def _turn(outcome: str) -> list[str]:
+        outcomes.append(outcome)
+        ctx = TurnContext(f"resp_{len(gc_calls)}", asyncio.Queue(), asyncio.Event())
+        frames = [frame async for frame in app._stream_turn(request, ctx, model="test-agent")]
+        assert frames, "the turn must stream its events"
+        return gc_calls[:]
 
-    await _turn()
-    assert freezes == []  # an embedding process never arms it
+    assert await _turn("ok") == []  # an embedding process never arms it
 
     _scaffold.arm_gc_freeze_after_first_turn()
-    await _turn()
-    await _turn()
-    assert freezes == [1]
+    assert await _turn("fail") == []  # a failed turn keeps it armed
+    assert await _turn("ok") == ["collect", "freeze"]
+    assert await _turn("ok") == ["collect", "freeze"]  # one-shot
 
 
 @pytest.mark.asyncio
