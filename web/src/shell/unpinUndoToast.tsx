@@ -43,6 +43,6 @@ export function unpinWithUndo(
         testId: "unpin-undo-toast-item",
       });
     })
-    // The toggle's own onError already rolls the row back.
+    // The toggle's own onError already rolls the row back and reports it.
     .catch(() => {});
 }
