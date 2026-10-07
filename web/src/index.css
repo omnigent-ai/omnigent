@@ -796,12 +796,10 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-electron-mac] .conversations-sidebar [data-testid="sidebar-header-actions"] {
     display: none;
   }
-  /* With both the wordmark and the cluster gone, the 3rem row is empty — it
-   * would leave the same dead band this change set out to reclaim. Collapse it
-   * to the title-bar strip's height so the session list starts right below the
-   * window furniture instead of 3rem down. */
+  /* Reserve the full drag strip so the session list starts below the
+   * window furniture and stays outside the drag region. */
   [data-electron-mac] .sidebar-header-row {
-    height: 2.25rem;
+    height: 3rem;
     padding: 0;
   }
   /* The chat header's own open-sidebar button is redundant here: the title-bar
@@ -812,22 +810,13 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-electron-mac] .chat-header-sidebar-toggle {
     display: none;
   }
-  /* The peek card floats at inset-2 (8px from the top), which on this shell puts
-   * its first row level with the traffic lights and the title-bar cluster — the
-   * card slides up UNDER the window controls and collides with them. Drop its
-   * top edge below the 2.25rem strip so it floats in beneath the controls
-   * instead, keeping the same 0.5rem breathing room the other edges use.
-   * The docked sidebar is unaffected: only the floating card is offset. */
+  /* Float the peek card below the 3rem drag strip, with the same 0.5rem
+   * breathing room as its other edges. The docked sidebar is unaffected. */
   [data-electron-mac] .conversations-sidebar.is-peek {
-    top: 2.75rem;
+    top: 3.5rem;
   }
-  /* ...and once it floats down there, the header row it still carries is dead
-   * space. That row exists to reserve the title-bar strip for the lights and the
-   * icon cluster, which only applies to the DOCKED sidebar starting at y=0 — the
-   * peek card is already clear of all of it, so on mac the row is 2.25rem of
-   * empty canvas above the first entry (both the wordmark and the cluster inside
-   * it are hidden here). Drop it so the card's content lines up against its own
-   * top padding. */
+  /* The peek card already clears the drag strip, so it needs no reserved
+   * header row above its content. */
   [data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row {
     display: none;
   }
@@ -835,7 +824,7 @@ aside[aria-label="Workspace"][data-maximized] {
    * sit under the traffic lights. Push it below them — it has no cluster to
    * align beside the lights, so it clears them vertically instead. */
   [data-electron-mac] .settings-sidebar-header {
-    padding-top: 2.75rem;
+    padding-top: 3.5rem;
   }
 }
 /* Match the full desktop header; controls opt out of dragging below. */
@@ -845,18 +834,9 @@ aside[aria-label="Workspace"][data-maximized] {
   height: 3rem;
   -webkit-app-region: drag;
 }
-/* The title-bar cluster (Search/Settings/toggle), pinned beside the traffic
- * lights and independent of the sidebar — that independence is the point: it
- * holds this exact spot whether the sidebar is open, collapsed, or peeking.
- *
- * Sits ABOVE the drag strip in source order so it wins the same stacking
- * context; the blanket no-drag rule below keeps its buttons clickable inside the
- * drag band. Ordered Collapse, Search, Settings reading outward from the window
- * controls, while the DOM keeps Search → Settings → toggle (tab order follows
- * importance), so the toggle is reordered visually rather than in the markup.
- *
- * Geometry: left 5.5rem clears the lights; a 0.75rem top inset centers
- * the 1.5rem buttons in the 3rem title bar, level with the lights. */
+/* Pin the cluster beside the lights independently of the sidebar. The top
+ * inset centers 1.5rem buttons in the 3rem bar; visually reorder the toggle
+ * without changing the Search → Settings → toggle tab order. */
 [data-electron-mac] .electron-sidebar-header-actions {
   position: absolute;
   top: 0.75rem;
@@ -912,9 +892,18 @@ aside[aria-label="Workspace"][data-maximized] {
     input,
     textarea,
     select,
+    label,
+    summary,
     [role="button"],
+    [role="link"],
     [role="tab"],
     [role="separator"],
+    [role="menuitem"],
+    [role="menuitemcheckbox"],
+    [role="menuitemradio"],
+    [role="combobox"],
+    [role="option"],
+    [role="radio"],
     [contenteditable="true"]
   ) {
   -webkit-app-region: no-drag;

@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { transform } from "lightningcss";
 import { type ComponentProps, createElement } from "react";
 import { cleanup, render } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "./components/ui/tooltip";
 import type * as UseTerminalsModule from "./hooks/useTerminals";
@@ -959,12 +959,17 @@ describe("index.css mobile settings title", () => {
 describe("index.css electron-mac window drag region", () => {
   const dragRule = cssBlocks
     .map(([block]) => block)
-    .find((block) => selectorOf(block) === "[data-electron-mac] .electron-drag-strip")!;
+    .find((block) => selectorOf(block) === "[data-electron-mac] .electron-drag-strip");
   const controlsRule = cssBlocks
     .map(([block]) => block)
-    .find((block) =>
-      selectorOf(block).replace(/\s+/g, " ").startsWith("[data-electron-mac] :is("),
-    )!;
+    .find((block) => selectorOf(block).replace(/\s+/g, " ").startsWith("[data-electron-mac] :is("));
+
+  beforeAll(() => {
+    expect(dragRule, "expected the macOS window drag-strip rule").toBeDefined();
+    expect(controlsRule, "expected the macOS interactive-control exclusions").toBeDefined();
+  });
+
+  afterEach(cleanup);
 
   it("covers the full width and height of the desktop header", () => {
     expect(dragRule).toContain("inset: 0 0 auto 0");
@@ -978,19 +983,29 @@ describe("index.css electron-mac window drag region", () => {
     ["input", {}],
     ["textarea", {}],
     ["select", {}],
+    ["label", {}],
+    ["summary", {}],
     ["div", { role: "button" }],
+    ["div", { role: "link" }],
     ["div", { role: "tab" }],
     ["div", { role: "separator" }],
+    ["div", { role: "menuitem" }],
+    ["div", { role: "menuitemcheckbox" }],
+    ["div", { role: "menuitemradio" }],
+    ["div", { role: "combobox" }],
+    ["div", { role: "option" }],
+    ["div", { role: "radio" }],
     ["div", { contentEditable: true }],
   ])("keeps %s %j interactive inside the drag band", (tag, props) => {
     const { container } = render(
       createElement("div", { "data-electron-mac": "true" }, createElement(tag, props)),
     );
-    expect(container.firstElementChild!.firstElementChild!.matches(selectorOf(controlsRule))).toBe(
-      true,
-    );
+    const shell = container.firstElementChild!;
+    const control = shell.firstElementChild!;
+    expect(control.matches(selectorOf(controlsRule ?? ""))).toBe(true);
     expect(controlsRule).toContain("-webkit-app-region: no-drag");
-    cleanup();
+    shell.removeAttribute("data-electron-mac");
+    expect(control.matches(selectorOf(controlsRule ?? ""))).toBe(false);
   });
 
   it("leaves noninteractive title-bar space draggable and other platforms unchanged", () => {
@@ -1004,11 +1019,10 @@ describe("index.css electron-mac window drag region", () => {
     );
     const shell = container.firstElementChild!;
     const strip = shell.firstElementChild!;
-    expect(strip.matches(selectorOf(dragRule))).toBe(true);
-    expect(shell.lastElementChild!.matches(selectorOf(controlsRule))).toBe(false);
+    expect(strip.matches(selectorOf(dragRule ?? ""))).toBe(true);
+    expect(shell.lastElementChild!.matches(selectorOf(controlsRule ?? ""))).toBe(false);
     shell.removeAttribute("data-electron-mac");
-    expect(strip.matches(selectorOf(dragRule))).toBe(false);
-    cleanup();
+    expect(strip.matches(selectorOf(dragRule ?? ""))).toBe(false);
   });
 });
 
@@ -1056,10 +1070,8 @@ describe("index.css electron-mac sidebar header", () => {
     expect(brandRule).toContain("display: none");
   });
 
-  it("collapses the emptied header row instead of leaving a dead band", () => {
-    // Both the wordmark and the cluster are gone from this row on mac, so a
-    // 3rem row would reintroduce the empty strip this change set out to remove.
-    expect(headerRowRule).toContain("height: 2.25rem");
+  it("reserves the entire drag band before the sidebar content", () => {
+    expect(headerRowRule).toContain("height: 3rem");
   });
 
   it("hides the sidebar's own cluster in favour of the title-bar copy", () => {
@@ -1099,18 +1111,12 @@ describe("index.css electron-mac sidebar header", () => {
   });
 
   it("floats the peek card below the title-bar controls", () => {
-    // The card's own inset-2 would put its first row level with the lights and
-    // the icon cluster, so it slides up UNDER the window controls. Its top edge
-    // must clear the 2.25rem strip (2.75rem = strip + the same 0.5rem gap the
-    // card's other edges use).
-    expect(peekCardRule).toContain("top: 2.75rem");
+    expect(peekCardRule).toContain("top: 3.5rem");
   });
 
   it("drops the header row inside the peek card", () => {
-    // The row reserves the title-bar strip for the lights and cluster, which
-    // only applies to the docked sidebar starting at y=0. The peek card already
-    // floats clear of all of it, so the row is 2.25rem of empty canvas above the
-    // first entry — the content should line up against the card's own padding.
+    // The peek card already clears the title bar, so its content starts
+    // against its own top padding without another reserved header row.
     expect(peekHeaderRowRule).toContain("display: none");
   });
 
@@ -1123,7 +1129,7 @@ describe("index.css electron-mac sidebar header", () => {
   it("pushes the settings sidebar's Back row below the lights", () => {
     // /settings swaps the header row out entirely; without this its Back row
     // would sit underneath the window controls.
-    expect(settingsHeaderRule).toContain("padding-top: 2.75rem");
+    expect(settingsHeaderRule).toContain("padding-top: 3.5rem");
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {

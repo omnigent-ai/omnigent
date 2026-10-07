@@ -66,12 +66,16 @@ async function harness(
 it("provides a full-width 48px window drag region and a clickable settings gear", async (t) => {
   const { document } = await harness(t);
   const style = document.querySelector("style").textContent;
-  const dragRule = style.match(/\.drag-strip\s*\{[^}]*\}/)[0];
+  const dragMatch = style.match(/\.drag-strip\s*\{[^}]*\}/);
+  assert.ok(dragMatch, "expected a .drag-strip rule in the setup page styles");
+  const dragRule = dragMatch[0];
   assert.match(dragRule, /height:\s*48px/);
   assert.match(dragRule, /left:\s*0/);
   assert.match(dragRule, /right:\s*0/);
   assert.match(dragRule, /-webkit-app-region:\s*drag/);
-  const gearRule = style.match(/\.gear-btn\s*\{[^}]*\}/)[0];
+  const gearMatch = style.match(/\.gear-btn\s*\{[^}]*\}/);
+  assert.ok(gearMatch, "expected a .gear-btn rule in the setup page styles");
+  const gearRule = gearMatch[0];
   assert.match(gearRule, /-webkit-app-region:\s*no-drag/);
 });
 
