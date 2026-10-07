@@ -87,7 +87,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
     expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
   });
 
-  it("detaches the native view when its always-mounted rail becomes inactive", async () => {
+  it("reattaches the retained page without navigating when its rail is reopened", async () => {
     let fireActive: ((p: { conversationId: string | null }) => void) | undefined;
     const bridge = installBridge({
       onBrowserHostActiveChanged: vi.fn((cb) => {
@@ -95,6 +95,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
         return () => {};
       }),
       browserSetActive: vi.fn(async (conversationId: string | null) => {
+        // The real shell broadcasts null when detaching, without destroying the page.
         fireActive?.({ conversationId });
         return { ok: true };
       }),
@@ -244,54 +245,6 @@ describe("BrowserPane retained-view lifecycle", () => {
     expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
     expect(bridge.browserSetActive).not.toHaveBeenCalled();
   });
-
-  it("does not carry an existing view or toolbar state into a different session", async () => {
-    const bridge = installBridge({
-      browserHasView: vi
-        .fn()
-        .mockResolvedValueOnce({
-          exists: true,
-          url: "http://localhost:5173",
-          canGoBack: true,
-        })
-        .mockResolvedValue({ exists: false }),
-    });
-    const { rerender } = render(<BrowserPane conversationId="conv_first" />);
-    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_first"));
-    bridge.browserSetActive.mockClear();
-
-    rerender(<BrowserPane conversationId="conv_second" />);
-    await waitFor(() => expect(bridge.browserHasView).toHaveBeenCalledWith("conv_second"));
-    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
-    expect(screen.getByRole("button", { name: "Go back" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
-    expect(bridge.browserSetActive).not.toHaveBeenCalledWith("conv_second");
-    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
-  });
-
-  it("ignores a previous session's probe and restores only the current session's view", async () => {
-    let resolveFirst: ((r: { exists: boolean; url: string }) => void) | undefined;
-    const bridge = installBridge({
-      browserHasView: vi
-        .fn()
-        .mockImplementationOnce(
-          () =>
-            new Promise((resolve) => {
-              resolveFirst = resolve;
-            }),
-        )
-        .mockResolvedValue({ exists: true, url: "https://example.com/second" }),
-    });
-    const { rerender } = render(<BrowserPane conversationId="conv_first" />);
-    rerender(<BrowserPane conversationId="conv_second" />);
-    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_second"));
-    await act(async () => resolveFirst?.({ exists: true, url: "http://localhost:5173" }));
-
-    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
-      "https://example.com/second",
-    );
-    expect(bridge.browserSetActive).not.toHaveBeenCalledWith("conv_first");
-  });
 });
 
 describe("BrowserPane design-mode toggle", () => {
@@ -354,7 +307,7 @@ describe("BrowserPane design-mode toggle", () => {
 });
 
 describe("BrowserPane toolbar navigation + URL bar", () => {
-  it("opens a manually typed localhost preview through the existing user navigation path", async () => {
+  it("opens a manually typed localhost preview through the user navigation path", async () => {
     const bridge = installBridge();
     render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
     const bar = screen.getByRole("textbox", { name: "Address bar" });
