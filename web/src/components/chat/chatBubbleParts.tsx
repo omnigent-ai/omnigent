@@ -43,10 +43,12 @@ import {
 } from "@/components/blocks/BlockRenderer";
 import {
   CompactionMarker,
+  CONTINUE_TURN_ERROR_CODES,
   ErrorBanner,
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
+import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
@@ -62,7 +64,8 @@ import {
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
+import { QueryClientContext } from "@tanstack/react-query";
+import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -71,7 +74,6 @@ import {
   useScopedConversationId,
 } from "@/components/chat/conversationScope";
 import { useStickToBottomContext } from "use-stick-to-bottom";
-import { UserMessageNav } from "@/components/UserMessageNav";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
@@ -90,6 +92,13 @@ import {
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+
+const COLLAPSE_THRESHOLD = 12000;
+
+// Slice a string by threshold and remove corrupted symbols
+function sliceByCodePoint(str: string, limit: number): string {
+  return str.slice(0, limit).replace(/[\uD800-\uDBFF]$/, "");
+}
 
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
@@ -157,6 +166,7 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
+const MERMAID_FENCE_RE = /^ {0,3}(?:`{3,}|~{3,})mermaid(?:\s|$)/im;
 
 function isMarkdownTableRow(line: string): boolean {
   return line.trim().includes("|");
@@ -179,6 +189,10 @@ export function containsMarkdownTable(items: RenderItem[]): boolean {
 
 export function containsDisplayMath(items: RenderItem[]): boolean {
   return items.some((item) => item.kind === "text" && DISPLAY_MATH_RE.test(item.text));
+}
+
+export function containsMermaidDiagram(items: RenderItem[]): boolean {
+  return items.some((item) => item.kind === "text" && MERMAID_FENCE_RE.test(item.text));
 }
 
 /**
@@ -340,6 +354,7 @@ export function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
   if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
+  if (bubble.kind === "subagent_activity") return `subagent_activity:${bubble.itemId}`;
   return `assistant:${bubble.stableId}`;
 }
 
@@ -383,10 +398,14 @@ export function isBackgroundTasksOnly(
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
  * a local send in flight.
  */
+export function computeIsTurnActive(sessionStatus: SessionStatus, localSending: boolean): boolean {
+  return computeIsWorking(sessionStatus) || localSending;
+}
+
 function useAgentTurnActive(): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const localSending = useChatStore((s) => s.status === "streaming");
-  return computeIsWorking(sessionStatus) || localSending;
+  return computeIsTurnActive(sessionStatus, localSending);
 }
 
 /**
@@ -407,9 +426,16 @@ export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null)
 }
 
 export function WorkingIndicator() {
-  const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const blockedOn = useChatStore((s) => s.blockedOn);
-  const agentWorking = useAgentTurnActive();
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const scopedState = useConversationEntryState(scopedConversationId);
+  const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
+  const rootBlockedOn = useChatStore((s) => s.blockedOn);
+  const rootAgentWorking = useAgentTurnActive();
+  const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
+  const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
+  const agentWorking = scopedConversationId
+    ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
+    : rootAgentWorking;
   const tick = useWorkingLabelTick();
   // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
   // the state and the shimmer stays off (it would misread as the agent still
@@ -528,17 +554,23 @@ export const BubbleView = memo(
     isLastAssistant = false,
     showsWorking = false,
     actionsPersistent = false,
+    recoveryDisabled = false,
   }: {
     bubble: Bubble;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
     actionsPersistent?: boolean;
+    /** Hide retry/recovery controls when the surrounding session is sealed. */
+    recoveryDisabled?: boolean;
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
+    if (bubble.kind === "subagent_activity") {
+      return <SubagentActivityMessage data={bubble.data} />;
+    }
     if (bubble.kind === "routing_decision") {
       return (
         <RoutingDecisionCard
@@ -556,6 +588,7 @@ export const BubbleView = memo(
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
         actionsPersistent={actionsPersistent}
+        recoveryDisabled={recoveryDisabled}
       />
     );
   },
@@ -563,6 +596,7 @@ export const BubbleView = memo(
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     (prev.actionsPersistent ?? false) === (next.actionsPersistent ?? false) &&
+    (prev.recoveryDisabled ?? false) === (next.recoveryDisabled ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -692,6 +726,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
+  // Collapse long prompts by default to avoid expensive Markdown parsing and
+  // a large DOM for text the user hasn't asked to read yet.
+  const isLong = text.length > COLLAPSE_THRESHOLD;
+  const [isCollapsed, setIsCollapsed] = useState(isLong);
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
@@ -709,7 +747,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-role="user"
       data-user-message-id={bubble.itemId}
       data-message-id={bubble.itemId}
-      className="max-w-[640px]"
+      className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
@@ -821,15 +859,37 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
             {/* Render user text as markdown, matching the assistant bubble.
               `breaks` keeps single newlines as line breaks. Empty text renders
-              nothing rather than an empty markdown block. */}
+              nothing rather than an empty markdown block.
+              For long prompts, only the visible slice is passed to the renderer
+              so the Markdown parser never processes hidden text. */}
             {text && (
-              <FilePathAwareMessageResponse
-                breaks
-                mode="static"
-                remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-              >
-                {text}
-              </FilePathAwareMessageResponse>
+              <>
+                <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
+                  <FilePathAwareMessageResponse
+                    breaks
+                    mode="static"
+                    remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                  >
+                    {isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text}
+                  </FilePathAwareMessageResponse>
+                  {/* Gradient fade at the bottom of collapsed prompts to signal
+                      there is more content below. */}
+                  {isCollapsed && isLong && (
+                    <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
+                  )}
+                </div>
+                {isLong && (
+                  <button
+                    type="button"
+                    onClick={() => setIsCollapsed((c) => !c)}
+                    className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    {isCollapsed
+                      ? `Show full prompt (${text.length.toLocaleString()} chars)`
+                      : "Collapse prompt"}
+                  </button>
+                )}
+              </>
             )}
           </MessageContent>
         </div>
@@ -875,11 +935,13 @@ function AssistantBubble({
   isLastAssistant = false,
   showsWorking = false,
   actionsPersistent = false,
+  recoveryDisabled = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
   actionsPersistent?: boolean;
+  recoveryDisabled?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
@@ -909,10 +971,11 @@ function AssistantBubble({
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const queryClient = useContext(QueryClientContext);
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
       if (!conversationId) throw new Error("Session is not available");
-      if (item.code === "rate_limit_exceeded") {
+      if (CONTINUE_TURN_ERROR_CODES.has(item.code)) {
         // Read a FRESH snapshot of the target conversation at click time: the
         // scoped child's own entry in a side chat, else the root store. The
         // child tab is fixed, so only the main chat guards against the user
@@ -935,15 +998,23 @@ function AssistantBubble({
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
-        await retryRateLimitedTurn(conversationId);
+        await continueFailedTurn(conversationId);
         return;
       }
-      const result = await retrySession(conversationId);
-      if (!result.recovered) {
-        throw new Error("The session is already connected; no recovery was performed");
+      try {
+        const result = await retrySession(conversationId);
+        if (!result.recovered) {
+          throw new Error("The session is already connected; no recovery was performed");
+        }
+      } catch (error) {
+        // Resume can seal a lost side chat; refresh its read-only state immediately.
+        if (error instanceof ApiError && error.code === "conflict") {
+          void queryClient?.invalidateQueries({ queryKey: ["session", conversationId] });
+        }
+        throw error;
       }
     },
-    [conversationId, scopedConversationId, isLastAssistant],
+    [conversationId, scopedConversationId, isLastAssistant, queryClient],
   );
 
   if (bubble.items.length === 0) return null;
@@ -967,7 +1038,10 @@ function AssistantBubble({
   // Elicitation cards want full chat-column width to match the composer.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide =
-    hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
+    hasElicitation ||
+    containsMarkdownTable(bubble.items) ||
+    containsDisplayMath(bubble.items) ||
+    containsMermaidDiagram(bubble.items);
   // An error banner's dashed rule spans the full chat column.
   const hasError = bubble.items.some((it) => it.kind === "error");
   // A bubble carrying an error but no prose stands alone as a thread-level
@@ -1006,7 +1080,7 @@ function AssistantBubble({
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
             defaultExpanded={bubble.defaultExpanded}
-            onRetryError={handleRetryError}
+            onRetryError={recoveryDisabled ? undefined : handleRetryError}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
@@ -1086,18 +1160,6 @@ function AssistantBubble({
 // ---------------------------------------------------------------------------
 // Scroll helpers — rendered inside <Conversation> / as its siblings.
 // ---------------------------------------------------------------------------
-
-export function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageNav>) {
-  const { isAtBottom } = useStickToBottomContext();
-  return (
-    <UserMessageNav
-      {...props}
-      // Mobile-only: the TurnRail replaces these buttons on desktop. Hidden at
-      // the bottom on mobile too. Keyboard ⌘⌥↑↓ still works on all sizes.
-      className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
-    />
-  );
-}
 
 /**
  * Forces the conversation back to the bottom when this client submits a new
@@ -1957,7 +2019,7 @@ export function JumpToTopButton({
       // the safe-area inset, so add --omnigent-inset-top (0px off-shell).
       style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
       className={cn(
-        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150",
+        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150 max-md:hidden",
         visible ? "opacity-100" : "opacity-0",
       )}
     >

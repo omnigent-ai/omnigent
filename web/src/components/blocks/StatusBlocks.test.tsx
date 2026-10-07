@@ -1,9 +1,12 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyText } from "@/lib/clipboard";
+import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/sessionsApi", () => ({ getSessionSignInLink: vi.fn() }));
 
 afterEach(cleanup);
 
@@ -243,6 +246,201 @@ describe("ErrorBanner", () => {
     expect(screen.getByTestId("error-message-content")).toHaveTextContent(
       "Try this: Run the host as a non-root user (uid != 0).",
     );
+    expect(screen.queryByRole("button", { name: "Copy recovery command" })).toBeNull();
+  });
+
+  it("copies structured provider recovery commands without diagnostics", async () => {
+    const remediation = "ucode configure";
+    render(
+      <ErrorBanner
+        message="Provider authentication required."
+        source="harness"
+        code="PROVIDER_AUTH_REQUIRED"
+        title="Databricks authentication required"
+        cause="Databricks authentication is missing or expired."
+        remediation={remediation}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Databricks authentication required/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy recovery command" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Recovery command copied" })).toBeTruthy(),
+    );
+    expect(copyText).toHaveBeenLastCalledWith(remediation);
+  });
+
+  it.each([
+    ["databricks_sign_in_pending", "The agent is waiting for a Databricks sign-in."],
+    ["agent_startup_pending", "The agent is still starting in the session terminal."],
+    ["codex_thread_not_started", "Codex stopped before it could start, so this turn never ran."],
+    [
+      "transient_upstream_error",
+      "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+    ],
+    [
+      "client_update_required",
+      "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+    ],
+  ])("describes a %s failure in plain English", (code, sentence) => {
+    render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
+    expect(screen.getByText(sentence)).toBeInTheDocument();
+  });
+
+  it("names both versions and the update command on a client_update_required card", () => {
+    render(
+      <ErrorBanner
+        message={`API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; version 2.1.280 or newer is required."}`}
+        source="execution"
+        code="client_update_required"
+        title="Claude Code needs an update"
+        cause="Claude Code 2.1.217 on the host doesn't support this model; version 2.1.280 or newer is required."
+        remediation="Run `claude update` on the host, then start a new session."
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Claude Code needs an update")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code needs an update/i }));
+    const content = screen.getByTestId("error-message-content");
+    expect(content).toHaveTextContent("Claude Code 2.1.217 on the host");
+    expect(content).toHaveTextContent("version 2.1.280 or newer is required");
+    expect(content).toHaveTextContent("Try this: Run `claude update` on the host");
+    // The running CLI keeps its old version, so neither turn retry nor resume applies.
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+  });
+
+  const SIGN_IN_REMEDIATION =
+    "Open the sign-in link and sign in. " +
+    "Codex continues on its own once the sign-in completes; then send your message again.";
+
+  function renderSignInCard() {
+    render(
+      <ErrorBanner
+        message="Codex is waiting for a sign-in in this session's terminal."
+        source="harness"
+        code="databricks_sign_in_pending"
+        title="Codex can't start until you sign in to Databricks"
+        remediation={SIGN_IN_REMEDIATION}
+      />,
+    );
+  }
+
+  it("offers the sign-in action by failure code, with no stored link or code", () => {
+    // The card text carries no address: the link is a one-time URL bound to the
+    // launcher process, so the button fetches the live one from the host.
+    useChatStore.setState({ conversationId: null });
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    renderSignInCard();
+    expect(screen.getByRole("button", { name: "Open sign-in link" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Copy code/ })).not.toBeInTheDocument();
+    // Without a live session there is nothing to fetch, and nothing to open.
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    expect(open).not.toHaveBeenCalled();
+    expect(screen.getByTestId("error-sign-in-note")).toHaveTextContent(
+      "Open this session to fetch the current sign-in link.",
+    );
+    // The actions sit on the collapsed face and must not toggle the pill open.
+    expect(screen.queryByText("Message")).not.toBeInTheDocument();
+    open.mockRestore();
+  });
+
+  it("asks the host for the live sign-in link before opening it", async () => {
+    // The saved link belongs to the launcher process that printed it and goes
+    // stale once that process moves on, so the click fetches the current one.
+    useChatStore.setState({ conversationId: "conv_live" });
+    const tab = { location: { href: "" }, close: vi.fn(), opener: window as Window | null };
+    const open = vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    vi.mocked(getSessionSignInLink).mockResolvedValue({
+      pending: true,
+      url: "https://signin.example.com/device?fresh=1",
+      code: "ZZ99-FRSH",
+    });
+    renderSignInCard();
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await waitFor(() =>
+      expect(tab.location.href).toBe("https://signin.example.com/device?fresh=1"),
+    );
+    // The sign-in page must not be able to navigate this tab.
+    expect(tab.opener).toBeNull();
+    expect(getSessionSignInLink).toHaveBeenCalledWith("conv_live");
+    // The tab was pre-opened in the click, so the navigation is not a popup.
+    expect(open).toHaveBeenCalledWith("", "_blank");
+    expect(screen.getByRole("button", { name: "Copy code ZZ99-FRSH" })).toBeInTheDocument();
+    open.mockRestore();
+    useChatStore.setState({ conversationId: null });
+  });
+
+  it("shows a completed sign-in notice's line without expanding it", () => {
+    render(
+      <ErrorBanner
+        message="Codex is ready. Send your message again."
+        source="harness"
+        code="databricks_sign_in_completed"
+        title="Signed in to Databricks"
+        level="info"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("Signed in to Databricks");
+    expect(screen.getByTestId("error-notice-body")).toHaveTextContent(
+      "Codex is ready. Send your message again.",
+    );
+    expect(screen.queryByRole("button", { name: "Open sign-in link" })).toBeNull();
+  });
+
+  it("explains when no sign-in is pending any more instead of opening a dead link", async () => {
+    useChatStore.setState({ conversationId: "conv_live" });
+    const tab = { location: { href: "" }, close: vi.fn() };
+    const open = vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    // A first click found a prompt with a code; the sign-in then completed.
+    vi.mocked(getSessionSignInLink).mockResolvedValueOnce({
+      pending: true,
+      url: "https://signin.example.com/device?fresh=1",
+      code: "ZZ99-FRSH",
+    });
+    renderSignInCard();
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await screen.findByRole("button", { name: "Copy code ZZ99-FRSH" });
+    tab.location.href = "";
+    vi.mocked(getSessionSignInLink).mockResolvedValue({ pending: false, url: null, code: null });
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await waitFor(() => expect(tab.close).toHaveBeenCalled());
+    // The obsolete code is gone along with the prompt.
+    expect(screen.queryByRole("button", { name: "Copy code ZZ99-FRSH" })).toBeNull();
+    expect(screen.getByTestId("error-sign-in-note")).toHaveTextContent(
+      "No sign-in is pending in the terminal any more. Try sending your message again.",
+    );
+    expect(tab.location.href).toBe("");
+    open.mockRestore();
+    useChatStore.setState({ conversationId: null });
+  });
+
+  it("links addresses inside the expanded remediation text", () => {
+    render(
+      <ErrorBanner
+        message="raw diagnostics"
+        source="harness"
+        code="databricks_sign_in_pending"
+        remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD."
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /waiting for a Databricks sign-in/i }));
+    const content = screen.getByTestId("error-message-content");
+    expect(within(content).getByRole("link")).toHaveAttribute(
+      "href",
+      "https://signin.example.com/device",
+    );
+  });
+
+  it("shows no sign-in actions for failures that are not a pending sign-in", () => {
+    render(
+      <ErrorBanner
+        message="raw diagnostics"
+        source="harness"
+        code="agent_startup_pending"
+        remediation="Finish any sign-in shown in the session terminal, then send your message again."
+      />,
+    );
+    expect(screen.queryByTestId("error-remediation-actions")).not.toBeInTheDocument();
   });
 
   it("separates terminal diagnostics and last output into tabs", () => {
@@ -295,6 +493,19 @@ describe("ErrorBanner", () => {
     fireEvent.click(screen.getByRole("button", { name: /Something went wrong/ }));
     expect(screen.getByTestId("error-message-content")).toHaveTextContent("mystery_failure");
     expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
+  });
+
+  it("names an undelivered native web message in the headline", () => {
+    render(
+      <ErrorBanner
+        message="Claude Code never recorded this message in its transcript before accepting a later one, so it was not delivered."
+        source="execution"
+        code="native_prompt_not_recorded"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "Message not delivered. Try sending it again.",
+    );
   });
 
   it("dismisses only the visible banner", () => {
@@ -510,6 +721,26 @@ describe("ErrorBanner", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
+  it("offers turn retry for a transient upstream failure", async () => {
+    const onRetry = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ErrorBanner
+        message="API Error: Server error mid-response. The response above may be incomplete."
+        source="llm"
+        code="transient_upstream_error"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+    );
+    // Turn retry, not a runner resume — the session itself is healthy.
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledTimes(1));
+  });
+
   it.each(["native_turn_error", "codex_turn_error", "codex_reauth_required", "unauthorized"])(
     "does not infer rate-limit retry from the message for code %s",
     (code) => {
@@ -526,9 +757,29 @@ describe("ErrorBanner", () => {
       render(
         <ErrorBanner message="The turn failed." source="execution" code={code} onRetry={vi.fn()} />,
       );
-      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
     },
   );
+
+  it("offers Retry (not Resume session) for a connection_error", async () => {
+    const onRetry = vi.fn(async () => {});
+    render(
+      <ErrorBanner
+        itemId="conn-err-1"
+        message="peer closed connection without sending complete message body (incomplete chunked read)"
+        source="harness"
+        code="connection_error"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    const retryButton = screen.getByRole("button", { name: "Retry" });
+    fireEvent.click(retryButton);
+    await waitFor(() =>
+      expect(onRetry).toHaveBeenCalledWith(expect.objectContaining({ code: "connection_error" })),
+    );
+  });
 
   it("suppresses the runner's unavailable last-output diagnostics tab", () => {
     render(

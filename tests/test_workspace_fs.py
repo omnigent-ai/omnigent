@@ -88,6 +88,20 @@ def test_read_text_file_returns_utf8_content(tmp_path: Path) -> None:
     assert result["content"] == "# Title\nbody\n"
 
 
+def test_read_text_file_has_no_agent_line_cap(tmp_path: Path) -> None:
+    """Host fallback serves the full file even when it exceeds 2,000 lines."""
+    content = "".join(f"# line {i}: café\n" for i in range(1, 3_001))
+    (tmp_path / "large.py").write_text(content, encoding="utf-8")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("large.py")
+
+    assert result["truncated"] is False
+    assert result["encoding"] == "utf-8"
+    assert result["content"] == content
+    assert result["bytes"] == len(content.encode("utf-8"))
+
+
 def test_read_binary_file_returns_base64(tmp_path: Path) -> None:
     """Reading a non-UTF-8 file returns base64-encoded content.
 

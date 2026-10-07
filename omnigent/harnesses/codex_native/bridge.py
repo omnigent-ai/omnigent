@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import math
 import os
 import secrets
@@ -12,14 +13,20 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import tomllib
 
 from omnigent.native import native_bridge_common
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
+
+_logger = logging.getLogger(__name__)
 
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
@@ -51,6 +58,9 @@ _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
 _STARTUP_TIMEOUT_FILE = "startup_timeout.json"
+# Applied model/effort that config.toml failed to record, for every reader of it.
+_UNMIRRORED_SETTINGS_FILE = "unmirrored_settings.json"
+_UNMIRRORED_SETTINGS_LOCK_FILE = "unmirrored_settings.lock"
 _STARTUP_TIMEOUT_MAX_BYTES = 256
 # Per-MCP-server startup state mirrored from Codex's
 # ``mcpServer/startupStatus/updated`` notifications. Written by the
@@ -125,6 +135,37 @@ def bridge_root() -> Path:
         ``Path("~/.omnigent/codex-native")``.
     """
     return _BRIDGE_ROOT
+
+
+@dataclass(frozen=True)
+class CodexStartupFailure:
+    """
+    Why a native Codex app-server has not started its thread.
+
+    :param message: Human-readable cause, e.g. ``"Codex is waiting for a
+        sign-in in this session's terminal."``.
+    :param code: Semantic failure code for the turn error, e.g.
+        ``"databricks_sign_in_pending"``; ``None`` for records written
+        without one.
+    :param title: Short headline for the error card, or ``None``.
+    :param remediation: Concrete next step, e.g. the sign-in link and
+        code, or ``None``.
+    """
+
+    message: str
+    code: str | None = None
+    title: str | None = None
+    remediation: str | None = None
+
+
+#: What a turn reports when its session's app-server is gone, and the record
+#: :func:`record_app_server_stopped` leaves so the next terminal ensure replaces the pane.
+CODEX_APP_SERVER_STOPPED = CodexStartupFailure(
+    message="Codex's app-server for this session stopped, so this message was not delivered.",
+    code="codex_app_server_stopped",
+    title="Codex stopped unexpectedly",
+    remediation="Send your message again. If it keeps failing, start a new session.",
+)
 
 
 @dataclass(frozen=True)
@@ -455,6 +496,92 @@ def codex_home_for_bridge_dir(bridge_dir: Path) -> Path:
     return bridge_dir / "codex-home"
 
 
+def bridge_dir_for_codex_home(codex_home: Path) -> Path:
+    """Invert :func:`codex_home_for_bridge_dir` for a private session home."""
+    return codex_home.parent
+
+
+def write_unmirrored_codex_settings(
+    bridge_dir: Path,
+    settings: Mapping[str, str],
+    *,
+    revision: tuple[int, int] | None = None,
+) -> None:
+    """Record applied settings that ``config.toml`` lacks, against a config revision.
+
+    An empty mapping clears the record. Readers trust it only until another writer,
+    such as an in-terminal ``/model``, replaces the config.
+
+    :param revision: The revision the caller's own writes left, or ``None`` for the
+        current one.
+    """
+    path = bridge_dir / _UNMIRRORED_SETTINGS_FILE
+    if revision is None:
+        revision = codex_config_revision(bridge_dir)
+    # Without a readable config there is no revision a later rewrite could change.
+    if not settings or revision is None:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        return
+    payload = {"settings": dict(settings), "config_revision": list(revision)}
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f"{_UNMIRRORED_SETTINGS_FILE}.", dir=str(bridge_dir)
+        )
+        try:
+            try:
+                handle = os.fdopen(fd, "w", encoding="utf-8")
+            except OSError:
+                os.close(fd)
+                raise
+            with handle:
+                json.dump(payload, handle, sort_keys=True)
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError:
+        _logger.warning(
+            "Could not record unmirrored Codex settings in %s", bridge_dir, exc_info=True
+        )
+
+
+def read_unmirrored_codex_settings(bridge_dir: Path) -> dict[str, str]:
+    """Return applied settings ``config.toml`` still lacks, or ``{}`` once it was replaced."""
+    try:
+        payload = json.loads((bridge_dir / _UNMIRRORED_SETTINGS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    revision = codex_config_revision(bridge_dir)
+    settings = payload.get("settings")
+    if (
+        revision is None
+        or payload.get("config_revision") != list(revision)
+        or not isinstance(settings, dict)
+    ):
+        return {}
+    return {
+        key: value
+        for key, value in settings.items()
+        if key in ("model", "effort") and isinstance(value, str) and value
+    }
+
+
+def codex_config_revision(bridge_dir: Path) -> tuple[int, int] | None:
+    """Return the session ``config.toml``'s inode and mtime, or ``None`` when unreadable.
+
+    Config writers replace the file atomically, so any rewrite changes the revision
+    even when it keeps every value.
+    """
+    try:
+        config_stat = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").stat()
+    except OSError:
+        return None
+    return config_stat.st_ino, config_stat.st_mtime_ns
+
+
 def read_codex_config_model(bridge_dir: Path) -> str | None:
     """
     Read the active model from this session's Codex ``config.toml``.
@@ -747,6 +874,36 @@ def write_codex_config_effort(bridge_dir: Path, effort: str) -> bool:
     )
 
 
+def mirror_applied_codex_settings(bridge_dir: Path, applied: Mapping[str, str]) -> dict[str, str]:
+    """Write a model and effort Codex applied into ``config.toml``, recording any that fail.
+
+    The model is written first, since that write clamps a stale effort. Settings
+    recorded earlier that *applied* does not replace stay recorded.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :param applied: Applied values keyed ``"model"`` / ``"effort"``.
+    :returns: The values whose write failed.
+    """
+    writers = {"model": write_codex_config_model, "effort": write_codex_config_effort}
+    failed: dict[str, str] = {}
+    # The runner, hook, and executor run in separate processes; one must not stamp
+    # another's superseded record against the config revision it just wrote.
+    with _bridge_state_lock(bridge_dir, _UNMIRRORED_SETTINGS_LOCK_FILE):
+        expected = codex_config_revision(bridge_dir)
+        pending = read_unmirrored_codex_settings(bridge_dir)
+        for key, write in writers.items():
+            if key in applied:
+                pending.pop(key, None)
+                if write(bridge_dir, applied[key]):
+                    expected = codex_config_revision(bridge_dir)
+                else:
+                    failed[key] = applied[key]
+        # Codex rewrites config.toml without this lock, so stamp the revision our own
+        # writes left; any rewrite after them then supersedes the record.
+        write_unmirrored_codex_settings(bridge_dir, {**pending, **failed}, revision=expected)
+    return failed
+
+
 def _upsert_top_level_config_key(
     config_path: Path,
     key: str,
@@ -811,11 +968,12 @@ def _upsert_top_level_config_key(
 
 
 @contextlib.contextmanager
-def _bridge_state_lock(bridge_dir: Path) -> Iterator[None]:
+def _bridge_state_lock(bridge_dir: Path, lock_file: str = _STATE_LOCK_FILE) -> Iterator[None]:
     """
     Serialize bridge-state read/modify/write cycles across local processes.
 
     :param bridge_dir: Native Codex bridge directory.
+    :param lock_file: Lock file name, so unrelated cycles do not contend.
     :returns: Context manager holding the bridge's process lock.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -825,7 +983,7 @@ def _bridge_state_lock(bridge_dir: Path) -> Iterator[None]:
         yield
         return
     fd = os.open(
-        bridge_dir / _STATE_LOCK_FILE,
+        bridge_dir / lock_file,
         os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
         0o600,
     )
@@ -967,21 +1125,45 @@ def clear_bridge_state(bridge_dir: Path) -> None:
                 continue
 
 
-def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
+def write_bridge_startup_error(
+    bridge_dir: Path,
+    message: str,
+    *,
+    code: str | None = None,
+    title: str | None = None,
+    remediation: str | None = None,
+) -> None:
     """
-    Record why a native Codex app-server never started its thread (issue #59).
+    Record why a native Codex app-server has not started its thread (issue #59).
+
+    The record is either a hard failure (the TUI exited, the event stream
+    ended) or a still-pending startup (the pane is alive but waiting, e.g.
+    on a sign-in prompt). Chat turns read it to fail fast with the cause.
 
     :param bridge_dir: Native Codex bridge directory.
     :param message: Human-readable failure cause.
+    :param code: Semantic failure code the turn error should carry, e.g.
+        ``"databricks_sign_in_pending"``. ``None`` leaves the turn's
+        generic code in place.
+    :param title: Short headline for the error card, e.g. ``"Codex is
+        waiting for a sign-in"``.
+    :param remediation: Concrete next step, e.g. the sign-in link and code.
     :returns: None.
     """
+    record: dict[str, str] = {"message": message}
+    if code:
+        record["code"] = code
+    if title:
+        record["title"] = title
+    if remediation:
+        record["remediation"] = remediation
     try:
         bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = bridge_dir / _STARTUP_ERROR_FILE
         fd, tmp_name = tempfile.mkstemp(prefix=f"{_STARTUP_ERROR_FILE}.", dir=str(bridge_dir))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"message": message}, handle, sort_keys=True)
+                json.dump(record, handle, sort_keys=True)
                 handle.write("\n")
             os.replace(tmp_name, path)
         finally:
@@ -1006,12 +1188,13 @@ def clear_bridge_startup_error(bridge_dir: Path) -> None:
         (bridge_dir / _STARTUP_ERROR_FILE).unlink()
 
 
-def read_bridge_startup_error(bridge_dir: Path) -> str | None:
+def read_bridge_startup_failure(bridge_dir: Path) -> CodexStartupFailure | None:
     """
-    Read a recorded native Codex startup-failure message, if any.
+    Read the recorded native Codex startup failure, if any.
 
     :param bridge_dir: Native Codex bridge directory.
-    :returns: The recorded failure cause, or ``None`` if absent/unreadable.
+    :returns: The recorded failure with its optional semantic code, title
+        and remediation, or ``None`` if absent/unreadable.
     """
     path = bridge_dir / _STARTUP_ERROR_FILE
     if not path.is_file():
@@ -1023,7 +1206,53 @@ def read_bridge_startup_error(bridge_dir: Path) -> str | None:
     if not isinstance(raw, dict):
         return None
     message = raw.get("message")
-    return message if isinstance(message, str) and message else None
+    if not isinstance(message, str) or not message:
+        return None
+
+    def _optional(key: str) -> str | None:
+        value = raw.get(key)
+        return value if isinstance(value, str) and value else None
+
+    return CodexStartupFailure(
+        message=message,
+        code=_optional("code"),
+        title=_optional("title"),
+        remediation=_optional("remediation"),
+    )
+
+
+def read_bridge_startup_error(bridge_dir: Path) -> str | None:
+    """
+    Read a recorded native Codex startup-failure message, if any.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The recorded failure cause, or ``None`` if absent/unreadable.
+    """
+    failure = read_bridge_startup_failure(bridge_dir)
+    return failure.message if failure is not None else None
+
+
+def record_app_server_stopped(bridge_dir: Path) -> None:
+    """
+    Record that a session's app-server is gone, unless a cause is already recorded.
+
+    A runner-owned Codex pane whose app-server is gone and whose bridge carries a
+    startup record is not reusable: the next terminal ensure replaces it with a
+    fresh app-server, instead of keeping a pane every turn would fail against.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: None.
+    """
+    if not bridge_dir.is_dir() or read_bridge_startup_error(bridge_dir) is not None:
+        return
+    failure = CODEX_APP_SERVER_STOPPED
+    write_bridge_startup_error(
+        bridge_dir,
+        failure.message,
+        code=failure.code,
+        title=failure.title,
+        remediation=failure.remediation,
+    )
 
 
 def read_mcp_startup(bridge_dir: Path) -> dict[str, dict[str, str | None]]:
@@ -1230,6 +1459,25 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
         active_turn_id=parsed_active_turn_id,
         cwd=cwd if isinstance(cwd, str) and cwd else None,
     )
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: the app-server thread is bound to *session_id*.
+
+    The runner writes bridge state only after the TUI's thread is known (fresh
+    discovery, known-thread resume, or a thread switch that moved the terminal
+    to a new session), which is when web turns can be routed into it.
+
+    :param session_id: Omnigent conversation id currently owning the terminal.
+    :param instance: The live Codex terminal; its ``CODEX_HOME`` locates the
+        bridge directory (see :func:`codex_home_for_bridge_dir`).
+    :returns: Whether bridge state names a thread for *session_id*.
+    """
+    codex_home = instance.env.get("CODEX_HOME")
+    if not codex_home:
+        return False
+    state = read_bridge_state(bridge_dir_for_codex_home(Path(codex_home)))
+    return state is not None and state.session_id == session_id
 
 
 def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:

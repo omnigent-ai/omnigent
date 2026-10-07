@@ -531,9 +531,60 @@
   padding: 1px;
 }
 
-/* Compact icon-only buttons use the full 16px glyph inside that box. */
-.button-standard-icons[data-size="icon-xs"] svg:not([data-icon-size]) {
+/* Small and standard icon buttons use the full 16px glyph. */
+.button-standard-icons:is([data-size="icon-xs"], [data-size="icon-sm"], [data-size="icon"])
+  svg:not([data-icon-size]) {
   padding: 0;
+}
+
+/* Large icon buttons step up to a 24px glyph. */
+.button-standard-icons[data-size="icon-lg"] svg:not([data-icon-size]) {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+}
+
+/* The desktop workspace rail stays mounted through its exit so its content
+   can fade and slide as one stable sibling of the session surface. */
+.workspace-panel-motion {
+  min-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateX(12px);
+  pointer-events: none;
+}
+
+.workspace-panel-motion[data-animate-visibility] {
+  transition:
+    width 300ms ease-in-out,
+    opacity 300ms ease-in-out,
+    transform 300ms ease-in-out;
+}
+
+.workspace-panel-motion[data-state="open"] {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+.workspace-panel-motion[data-resizing] {
+  transition: none;
+}
+
+[data-workspace-panel-animate] .chat-header {
+  transition: right 300ms ease-in-out;
+}
+
+[data-workspace-panel-resizing] .chat-header {
+  transition: none;
+}
+
+@starting-style {
+  .workspace-panel-motion[data-state="open"][data-animate-visibility] {
+    width: 0 !important;
+    opacity: 0;
+    transform: translateX(12px);
+  }
 }
 
 /* The transparent <main> shows the palette canvas through. */
@@ -575,22 +626,29 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   }
 }
 
-/* Chat scroll fade: the ChatHeader overlay paints no background (a flat
- * fill can't track the .app-shell canvas gradient, and a copy of the
- * gradient can't stay aligned — the header resizes when the sidebar
- * opens), so instead of occluding scrolled-under text at the header, the
- * conversation's scroll viewport masks its own top edge: content
- * dissolves into the canvas before it reaches the header's control row
- * (on mobile, message text used to render straight through the icons).
- * Geometry is tied to the header chrome — fully transparent through 48px
- * (the h-14 bar is 56px tall; its 32px controls end at 44px), ramping to
- * full opacity at 80px, the chat column's pt-20 clearance line, so
- * at-rest content is never faded. Stops are px from the top so the fade
- * is independent of viewport height, and the mask sits on the viewport
- * box (not the scrolling content) so it stays pinned while text moves. */
+/* Fade scrolling content before it reaches the transparent header or composer.
+ * Both ramps are 32px; the header's control band occupies the first 48px. */
 .chat-scroll-fade {
-  mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
-  -webkit-mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 48px,
+    black 80px,
+    black calc(100% - 32px),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 48px,
+    black 80px,
+    black calc(100% - 32px),
+    transparent 100%
+  );
+}
+
+/* A pinned plan already clears the header, so only fade into the composer. */
+.chat-scroll-composer-fade {
+  mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
 }
 
 /* Snap target for the "Worked for" fold row (scrollIntoView block:"start").
@@ -884,8 +942,8 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 
 /* The iOS WKWebView runs full-screen under the keyboard at every responsive
- * width. Lock the shell to the visual viewport published by
- * useIOSViewportLock so flow content, including the composer, stays visible. */
+ * width. useIOSViewportLock publishes the area above the docked keyboard so
+ * flow content stays visible without shrinking for floating iPad controls. */
 [data-ios-native].app-shell {
   height: 100lvh;
   height: var(--omnigent-viewport-height, 100lvh);
@@ -903,6 +961,41 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 :is([data-ios-native], [data-android-native]) .chat-plan-accordion {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
+}
+
+/* Settings titles join the mobile header row beside the sidebar control. */
+@media (width < 48rem) {
+  .settings-mobile-header::before {
+    position: absolute;
+    top: 0;
+    right: 0;
+    left: 0;
+    height: 80px;
+    pointer-events: none;
+    content: "";
+    background: linear-gradient(to bottom, var(--background) 0 48px, transparent 80px);
+  }
+
+  .settings-page-title {
+    position: fixed;
+    top: 0;
+    right: 4rem;
+    left: 4rem;
+    z-index: 30;
+    height: var(--omnigent-header-height);
+    margin: 0;
+    overflow: hidden;
+    font-size: var(--text-ui);
+    line-height: var(--omnigent-header-height);
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+
+  :is([data-ios-native], [data-android-native]) .settings-page-title {
+    top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  }
 }
 
 /* Remaining native-shell adjustments are specific to the mobile layout. */
@@ -942,6 +1035,10 @@ aside[aria-label="Workspace"][data-maximized] {
     font-size: 16px;
   }
 
+  [data-ios-native] .composer-input-text {
+    font-size: var(--text-ui);
+  }
+
   [data-ios-native] .chat-conversation-content,
   [data-android-native] .chat-conversation-content {
     /* header band + 1.5rem breathing room + OS safe area, sourced from the
@@ -958,12 +1055,16 @@ aside[aria-label="Workspace"][data-maximized] {
     mask-image: linear-gradient(
       to bottom,
       transparent calc(48px + var(--omnigent-inset-top)),
-      black calc(80px + var(--omnigent-inset-top))
+      black calc(80px + var(--omnigent-inset-top)),
+      black calc(100% - 32px),
+      transparent 100%
     );
     -webkit-mask-image: linear-gradient(
       to bottom,
       transparent calc(48px + var(--omnigent-inset-top)),
-      black calc(80px + var(--omnigent-inset-top))
+      black calc(80px + var(--omnigent-inset-top)),
+      black calc(100% - 32px),
+      transparent 100%
     );
   }
 
@@ -982,12 +1083,16 @@ aside[aria-label="Workspace"][data-maximized] {
     mask-image: linear-gradient(
       to bottom,
       transparent var(--fade-start),
-      black calc(var(--fade-start) + 32px)
+      black calc(var(--fade-start) + 32px),
+      black calc(100% - 32px),
+      transparent 100%
     );
     -webkit-mask-image: linear-gradient(
       to bottom,
       transparent var(--fade-start),
-      black calc(var(--fade-start) + 32px)
+      black calc(var(--fade-start) + 32px),
+      black calc(100% - 32px),
+      transparent 100%
     );
   }
 
@@ -1020,61 +1125,26 @@ aside[aria-label="Workspace"][data-maximized] {
   padding-right: min(var(--omnigent-safe-right), var(--omnigent-lateral-inset-cap));
 }
 
+/* At phone widths the open drawer's Search bubble pairs with the chat
+ * header's overflow bubble in the exposed chat strip beside it. The chat
+ * header sits at safe-top - 0.5rem (rule above), so mirror that offset here
+ * or the paired bubbles drift 0.5rem apart. Keeps the specificity of the
+ * padding rule above and follows it in source order so it wins the tie. */
+@media (width < 48rem) {
+  :is([data-ios-native], [data-android-native])
+    aside.conversations-sidebar:not(aside[aria-label="Workspace"] *):not([data-collapsed]):not(
+      .is-peek
+    ) {
+    padding-top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  }
+}
+
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
   [data-ios-native] .conversations-sidebar {
     transition-duration: 1ms;
   }
 }
 
-/* Liquid glass for the mobile sidebar's two floating chips (Search at the top
- * of the header row, Settings over the bottom of the session list) — the iOS
- * control idiom.
- *
- * The rim, the specular top edge, and the drop shadow do the work, not the
- * blur: the surface behind these chips is the sidebar's own near-flat card, so
- * blurring it alone would leave nothing to see. The blur earns its keep on the
- * Settings chip, which floats over the scrolling session list and frosts the
- * row titles passing under it.
- *
- * Scoped to `width < 48rem` so the class is inert on desktop, where the same
- * two icons are flat ghost buttons in the header row. Both chips share it so
- * they can't drift apart again.
- *
- * Backdrop sampling stops at the sidebar: the `.conversations-sidebar` carries
- * a translate for its slide, which makes it a backdrop root, so the chips frost
- * the drawer's own content rather than the chat behind it — which is what we
- * want. If WebKit drops the filter (it does, once a Radix popper opens — see
- * `max-md:bg-card-solid` on the sidebar), the fill and rim still read as a
- * chip. */
-@media (width < 48rem) {
-  .sidebar-glass-chip {
-    /* Opaque --card-solid base UNDER the glass tint: WebKit drops
-     * backdrop-filter on mobile once a Radix popper opens, and a purely
-     * translucent fill then shows the scrolling session rows straight through,
-     * so the chip reads as transparent. The solid base keeps it a chip no
-     * matter what the filter does; the tint + blur just add frost on top.
-     *
-     * -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
-     * build) collapses the pair and keeps only the last declaration. */
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
-    backdrop-filter: blur(20px) saturate(180%);
-    background-color: var(--card-solid);
-    background-image: linear-gradient(rgba(255, 255, 255, 0.6), rgba(255, 255, 255, 0.6));
-    border: 1px solid rgba(0, 0, 0, 0.06);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.8),
-      0 1px 2px rgba(0, 0, 0, 0.05),
-      0 6px 16px rgba(0, 0, 0, 0.07);
-  }
-
-  .dark .sidebar-glass-chip {
-    background-image: linear-gradient(rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.1));
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.12),
-      0 2px 10px rgba(0, 0, 0, 0.45);
-  }
-}
 /* Share button — glassy pink effect (both modes). The vertical
  * gradient alone does the embossed work (lighter top = light catch,
  * darker bottom = shadow, simulating a convex surface lit from above);
@@ -1182,24 +1252,25 @@ aside[aria-label="Workspace"][data-maximized] {
   }
 }
 
-/* Mobile-specific sidebar geometry. The root remains at the global 16px so
- * rem-based typography and controls keep the same scale across viewports. */
+/* Mobile typography and sidebar geometry. The root remains at the global 16px
+ * so rem-based controls and spacing keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile keeps its own touch-friendly base (14px at the default 13px
-   * preference) but scales it off the Appearance value, so the setting
-   * applies on phones instead of being a dead store. The 14/13 factor maps
-   * the default preference exactly onto the historical 14px mobile base. */
+  /* Mobile defaults to 14px when no preference is saved. An inline value from
+   * the Appearance setting overrides this directly, without rescaling. */
   :root {
-    --mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (14 / 13));
+    --desktop-ui-font-size: 14px;
+    --mobile-ui-font-size: var(--desktop-ui-font-size);
+    --ui-ramp-anchor: var(--mobile-ui-font-size);
     --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
     --text-ui: var(--mobile-ui-font-size);
+    --text-base: var(--mobile-ui-font-size);
+    --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
+    --text-xl: calc(var(--ui-ramp-anchor) * 1.25);
+    --text-2xl: calc(var(--ui-ramp-anchor) * 1.5);
   }
 
-  /* Keep draft text and its mirrors above Safari's input-focus zoom threshold.
-   * Native inputs must also preserve larger Appearance sizes. */
-  .composer-input-text,
-  [data-ios-native] textarea.composer-input-text {
-    font-size: max(16px, var(--text-ui));
+  body {
+    font-size: var(--mobile-ui-font-size);
   }
 
   /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
@@ -1232,6 +1303,15 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 [data-streamdown="code-block-body"] {
   font-size: 0.875em;
+}
+/* Fallback mono fonts (e.g. JetBrains Mono) ship ligatures that can visually
+ * swallow spaces in CLI flags like `-c --markdown`; code must render literally. */
+[data-streamdown="inline-code"],
+[data-streamdown="code-block-body"] {
+  font-variant-ligatures: none;
+  font-feature-settings:
+    "liga" 0,
+    "calt" 0;
 }
 
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
@@ -1305,6 +1385,19 @@ aside[aria-label="Workspace"][data-maximized] {
  * The fullscreen overlay sits outside the Mermaid block's 1px border. */
 .chat-mermaid [data-streamdown="mermaid-block-actions"] {
   margin-right: calc(2rem - 1px);
+}
+
+/* Streamdown centers the SVG in a shrink-to-fit flex child. Give that child
+ * the diagram area's width so Mermaid's width="100%" does not collapse. */
+[data-streamdown="mermaid-block"] div:has(> svg[aria-roledescription]) {
+  width: 100%;
+}
+
+/* Keep Mermaid's canvas transparent so the diagram follows the surrounding
+ * chat or file surface in either theme. The SVG itself has no canvas fill. */
+[data-streamdown="mermaid-block"],
+[data-streamdown="mermaid-block"] > div:last-child {
+  background-color: transparent;
 }
 
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can
@@ -1391,6 +1484,56 @@ aside[aria-label="Workspace"][data-maximized] {
 
 .dark .animate-message-highlight {
   --message-highlight: color-mix(in oklch, var(--warning) 24%, transparent);
+}
+
+@keyframes user-message-enter {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-user-message-enter {
+  animation: user-message-enter 300ms ease-out both;
+}
+
+/* File-tree children fade without animating geometry. Height or position
+   transitions fight the virtualizer and make long lists visibly drift. */
+@keyframes file-tree-row-expand {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes file-tree-row-collapse {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.file-tree-row-enter,
+.file-tree-row-exit {
+  overflow: hidden;
+  will-change: opacity;
+}
+
+.file-tree-row-enter {
+  animation: file-tree-row-expand 180ms cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
+.file-tree-row-exit {
+  pointer-events: none;
+  animation: file-tree-row-collapse 180ms cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 
 /* Workspace navigation keeps its compact outline highlight. */

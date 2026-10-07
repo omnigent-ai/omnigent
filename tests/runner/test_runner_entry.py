@@ -2200,6 +2200,40 @@ async def test_install_signal_handlers_records_signal_reason() -> None:
     assert reasons == ["received SIGTERM"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGTERM") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_marks_shutting_down() -> None:
+    """A shutdown signal marks the runner shutting-down state before teardown.
+
+    ``_publish_terminal_exit`` reads this state to tell an intentional stop
+    (SIGTERM/SIGINT, whose teardown races the terminal watcher) from a real
+    terminal crash — it must be set as soon as the signal is handled, not
+    after any teardown. Delivers a real SIGTERM to this process.
+
+    :returns: None.
+    """
+    from omnigent.runner._entry import _install_signal_handlers
+
+    stop_event = asyncio.Event()
+    marked: list[bool] = []
+    _install_signal_handlers(
+        stop_event,
+        mark_shutting_down=lambda: marked.append(True),
+    )
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+    finally:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+
+    assert marked == [True]
+
+
 def test_install_crash_logging_is_idempotent() -> None:
     """Installing the crash hook twice does not stack wrappers.
 
@@ -2425,66 +2459,56 @@ async def test_resolve_agent_spec_from_server_returns_none_for_404(
 
 
 @pytest.mark.asyncio
-async def test_resolve_agent_spec_from_server_caches_success_by_agent_version(
+async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     tmp_path: Path,
 ) -> None:
-    """A successful bundle fetch is cached under agent id and version.
+    """An unchanged bundle reuses its extracted directory; another bundle under the
+    same version (an agent removed and added again restarts at 1) gets its own.
 
     :param tmp_path: Temporary spec cache root.
     :returns: None.
     """
-    config_bytes = (
-        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
-    )
-    bundle_buf = io.BytesIO()
-    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config_bytes)
-        tf.addfile(info, io.BytesIO(config_bytes))
 
+    def _bundle(name: str) -> bytes:
+        config = f"spec_version: 1\nname: {name}\nexecutor:\n  config:\n    harness: claude-sdk\n"
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            info = tarfile.TarInfo(name="config.yaml")
+            info.size = len(config)
+            tf.addfile(info, io.BytesIO(config.encode()))
+        return buf.getvalue()
+
+    original = _bundle("cached-agent")
+    served = [original, original, _bundle("re-added")]
     requested_paths: list[str] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """
-        Return a valid bundle once, then invalid bytes for the cached version.
-
-        :param request: Incoming mocked HTTP request.
-        :returns: A mocked successful bundle response.
-        """
         requested_paths.append(request.url.path)
-        if len(requested_paths) == 1:
-            content = bundle_buf.getvalue()
-        else:
-            content = b"not a tarball"
-        return httpx.Response(
-            200,
-            content=content,
-            headers={"X-Agent-Version": "7"},
-        )
+        return httpx.Response(200, content=served.pop(0), headers={"X-Agent-Version": "1"})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_handler),
         base_url="http://server.test",
     ) as client:
-        first = await _resolve_agent_spec_from_server(
-            client, tmp_path, "ag_cached", session_id="conv_test"
-        )
-        second = await _resolve_agent_spec_from_server(
-            client, tmp_path, "ag_cached", session_id="conv_test"
-        )
+        resolved = [
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_cached", session_id="conv_test"
+            )
+            for _ in range(3)
+        ]
 
-    assert first is not None
-    assert second is not None
-    assert first.name == "cached-agent"
-    assert second.name == "cached-agent"
-    assert requested_paths == [
-        "/v1/sessions/conv_test/agent/contents",
-        "/v1/sessions/conv_test/agent/contents",
+    assert [spec.name for spec in resolved if spec is not None] == [
+        "cached-agent",
+        "cached-agent",
+        "re-added",
     ]
-    cache_dir = tmp_path / "ag_cached-v7"
-    assert cache_dir.is_dir()
-    assert (cache_dir / "config.yaml").read_text() == config_bytes.decode()
-    assert [path.name for path in tmp_path.iterdir()] == ["ag_cached-v7"]
+    assert requested_paths == ["/v1/sessions/conv_test/agent/contents"] * 3
+    assert resolved[0] is not None and resolved[1] is not None
+    assert resolved[0].workdir == resolved[1].workdir
+    assert sorted(path.name.startswith("ag_cached-v1-") for path in tmp_path.iterdir()) == [
+        True,
+        True,
+    ]
 
 
 @pytest.mark.asyncio

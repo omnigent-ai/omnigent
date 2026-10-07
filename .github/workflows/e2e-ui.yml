@@ -18,7 +18,19 @@ on:
     # Security Gate via rerun-security-gate.yml, so label churn need not re-run
     # the heavy Playwright suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['CHANGELOG.md']
+    paths-ignore:
+      - 'docs/**'
+      - 'designs/**'
+      - 'CHANGELOG.md'
+      - 'tests/scripts/**'
+      - 'tests/github/**'
+      - 'tests/onboarding/**'
+      - 'tests/llms/**'
+      - 'tests/deploy/**'
+      - 'tests/entities/**'
+      - '.github/scripts/polly-review-*.py'
+      - '.github/workflows/polly-review*.yml'
+      - '.github/workflows/*.js'
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
@@ -133,6 +145,82 @@ jobs:
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
           if-no-files-found: error
           retention-days: 1
+
+  browser-contract:
+    name: Browser Contract UI
+    # Keep this as a separately visible required-style check. It deliberately
+    # omits the server, runner, harness CLIs, bubblewrap, tmux, and sidecar.
+    needs: setup
+    if: needs.setup.outputs.matrix != '{"include":[]}'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Install uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+
+      - name: Cache virtualenv
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install project + test dependencies
+        run: uv sync --locked --extra all --group test
+
+      # ci.yml skips UI-only changes, so check here that the verify-omnigent
+      # feature map still names tests that exist after UI test renames.
+      - name: Check verify-omnigent feature map
+        run: uv run pytest tests/dev/test_verify_omnigent_feature_map.py -q
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+
+      - name: Build web SPA
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          pnpm install --frozen-lockfile --filter web
+          pnpm --filter web run build
+
+      - name: Run browser-contract tests
+        run: |
+          time uv run pytest tests/browser_ui \
+            -v --tb=long --showlocals -r a \
+            --durations=25 --durations-min=0.5 \
+            --browser-ui-skip-build \
+            --tracing=retain-on-failure \
+            --screenshot=only-on-failure \
+            --video=retain-on-failure
+
+      - name: Upload Playwright artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: browser-contract-playwright-${{ github.run_id }}
+          path: test-results/
+          retention-days: 3
+          if-no-files-found: ignore
 
   e2e-ui:
     name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})

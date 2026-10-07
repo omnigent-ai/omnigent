@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import stat
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from omnigent.harnesses.diagnostics import (
     DIAGNOSTIC_TAIL_BYTES,
     bounded_diagnostic_tail,
 )
+from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
 from omnigent.process_logging import harness_stderr_capture_enabled
 
 CLAUDE_DEBUG_LOG_MARKER = "claude-debug-active.json"
@@ -138,6 +140,51 @@ class ClaudeDebugLogFollower:
         self._pending = bytearray()
         self._dropping = False
         self._closed = False
+        self._marker_present: bool | None = None
+        self._file_present: bool | None = None
+        self._last_read_at: float | None = None
+        self._last_read_offset: int | None = None
+        self._lines_omitted = 0
+        self._bytes_omitted = 0
+        self._truncated = False
+        self._health: FailureContext = {
+            "diagnostic_capture_enabled": True,
+            "diagnostic_capture_state": "not_polled",
+        }
+
+    def health_snapshot(self) -> FailureContext:
+        """Return the last completed poll's metadata without reading files or taking its lock."""
+        if not harness_stderr_capture_enabled():
+            return {"diagnostic_capture_enabled": False, "diagnostic_capture_state": "disabled"}
+        return dict(self._health)
+
+    def _update_health(self, error: Exception | None = None) -> None:
+        state = (
+            "read_error"
+            if error is not None
+            else "missing_marker"
+            if not self._marker_present
+            else "invalid_marker"
+            if self._capture is None
+            else "missing_file"
+            if not self._file_present
+            else "ready"
+        )
+        self._health = normalize_failure_context(
+            {
+                "diagnostic_capture_enabled": True,
+                "diagnostic_capture_state": state,
+                "diagnostic_marker_present": self._marker_present,
+                "diagnostic_file_present": self._file_present,
+                "diagnostic_last_read_at": self._last_read_at,
+                "diagnostic_read_offset": self._last_read_offset,
+                "diagnostic_read_error_kind": type(error).__name__ if error is not None else None,
+                "diagnostic_lines_omitted": self._lines_omitted,
+                "diagnostic_bytes_omitted": self._bytes_omitted,
+                "diagnostic_truncated": self._truncated,
+                "diagnostic_launch_id": self._capture.launch_id if self._capture else None,
+            }
+        )
 
     def _reset_file(self) -> None:
         if self._fd is not None:
@@ -153,10 +200,20 @@ class ClaudeDebugLogFollower:
         candidate: int | None = None
         omitted_bytes = 0
         try:
+            try:
+                os.stat(CLAUDE_DEBUG_LOG_MARKER, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                self._marker_present = False
+            else:
+                self._marker_present = True
             capture = _read_capture(directory_fd)
             if capture != self._capture:
                 self._reset_file()
                 self._capture = capture
+                self._last_read_at = None
+                self._last_read_offset = None
+                self._lines_omitted = self._bytes_omitted = 0
+                self._truncated = False
                 # Count the known predecessor only on attachment to this launch;
                 # later rotations are handled through the already-open inode.
                 if capture is not None:
@@ -170,6 +227,7 @@ class ClaudeDebugLogFollower:
                 return b"", [], omitted_bytes
             with contextlib.suppress(FileNotFoundError):
                 candidate = _open_file(directory_fd, capture.filename)
+            self._file_present = candidate is not None
             if self._fd is None:
                 self._fd, candidate = candidate, None
             if self._fd is None:
@@ -191,6 +249,8 @@ class ClaudeDebugLogFollower:
                     self._fd, candidate = candidate, None
                     raw = os.read(self._fd, _READ_BYTES)
                     self._offset = len(raw)
+            self._last_read_at = time.time()
+            self._last_read_offset = self._offset
             return raw, records, omitted_bytes
         finally:
             if candidate is not None:
@@ -270,6 +330,9 @@ class ClaudeDebugLogFollower:
         text = snapshot["tail"]
         total_lines_omitted = cast("int", snapshot["lines_omitted"]) + omitted_lines
         total_bytes_omitted = cast("int", snapshot["bytes_omitted"]) + omitted_bytes
+        self._lines_omitted += total_lines_omitted
+        self._bytes_omitted += total_bytes_omitted
+        self._truncated |= bool(snapshot["truncated"] or omitted_lines or omitted_bytes)
         _logger.info(
             "Claude diagnostic output; session=%s launch=%s offset=%d "
             "lines_omitted=%d bytes_omitted=%d\n%s",
@@ -298,14 +361,17 @@ class ClaudeDebugLogFollower:
         """Export newly completed records without blocking on a pipe or unbounded input."""
         if self._closed or not harness_stderr_capture_enabled():
             return
+        self._marker_present = self._file_present = None
         try:
             raw, previous, predecessor_bytes = self._read()
             records, omitted_lines, omitted_bytes = self._feed(raw)
             self._emit(
                 session_id, [*previous, *records], omitted_lines, omitted_bytes + predecessor_bytes
             )
-        except Exception:  # noqa: BLE001 — diagnostics cannot stop transcript forwarding
-            pass
+        except Exception as exc:  # noqa: BLE001 — diagnostics cannot stop transcript forwarding
+            self._update_health(exc)
+        else:
+            self._update_health()
 
     def close(self, session_id: str) -> None:
         """Drain a bounded final batch and flush a partial record only at the observed EOF."""
@@ -324,8 +390,10 @@ class ClaudeDebugLogFollower:
                         )
                     else:
                         self._emit(session_id, self._finish_record())
-        except Exception:  # noqa: BLE001 — cleanup must not replace the terminal's outcome
-            pass
+                if self._health.get("diagnostic_capture_state") != "read_error":
+                    self._update_health()
+        except Exception as exc:  # noqa: BLE001 — cleanup must not replace the terminal's outcome
+            self._update_health(exc)
         finally:
             with contextlib.suppress(OSError):
                 self._reset_file()

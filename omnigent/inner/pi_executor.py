@@ -46,7 +46,7 @@ import tempfile
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, NotRequired, TypeAlias, TypedDict, cast
+from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
 from omnigent.harnesses.pi_native.credentials import (
@@ -126,13 +126,18 @@ def _fetch_shell_command_token(command: str) -> str | None:
     return token
 
 
-# Tool-server callback provided by ``Session._wire_sdk_executor``. Invoked
-# with a tool name and argument dict; may return the result dict directly
-# or a coroutine/future yielding one.
-ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
-    [str, dict[str, Any]],
-    Awaitable[dict[str, Any]] | dict[str, Any],
-]
+class ToolExecutor(Protocol):
+    """Tool bridge callback carrying Pi's ID independently of stdout event order."""
+
+    def __call__(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+        /,
+        *,
+        call_id: str | None = None,
+    ) -> Awaitable[dict[str, Any]] | dict[str, Any]: ...
+
 
 # Native-tool policy gate wired by :class:`PiExecutor`. Invoked with a native
 # (non-bridged) tool name + argument dict; returns ``{"block": bool, "reason":
@@ -294,7 +299,9 @@ class _ToolServer:
                     verdict = await self._evaluate_policy(raw_tool_name, tool_args)
                     response = {"id": raw_req_id, "verdict": verdict}
                 else:
-                    response = await self._execute(raw_tool_name, tool_args)
+                    raw_call_id = request.get("call_id")
+                    call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id else None
+                    response = await self._execute(raw_tool_name, tool_args, call_id=call_id)
                     response["id"] = raw_req_id
                 # Serialize defensively: a tool result may carry a value
                 # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
@@ -327,11 +334,17 @@ class _ToolServer:
         self,
         name: str,
         args: dict[str, Any],
+        *,
+        call_id: str | None = None,
     ) -> dict[str, Any]:
         if self._tool_executor is None:
             return {"error": f"No tool executor for '{name}'"}
         try:
-            raw = self._tool_executor(name, args)
+            raw = (
+                self._tool_executor(name, args, call_id=call_id)
+                if call_id is not None
+                else self._tool_executor(name, args)
+            )
             resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
             if not isinstance(resolved, dict):
                 resolved = {"result": resolved}
@@ -460,7 +473,7 @@ const PORT = {port};
 const TOKEN = {token_json};
 
 /** Send a tool call request over TCP and return the result. */
-function callTool(toolName, args) {{
+function callTool(toolName, args, callId) {{
   return new Promise((resolve) => {{
     // Idempotent settle: a tool call must resolve exactly once. Route every
     // resolve through finish() so a late "close" after a real "data" response
@@ -474,7 +487,8 @@ function callTool(toolName, args) {{
     }});
     const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
       const id = Math.random().toString(36).slice(2);
-      const req = JSON.stringify({{ id, token: TOKEN, tool: toolName, args }}) + "\\n";
+      const frame = {{ id, token: TOKEN, tool: toolName, args, call_id: callId }};
+      const req = JSON.stringify(frame) + "\\n";
       let buf = "";
       client.on("data", (chunk) => {{
         buf += chunk.toString();
@@ -573,8 +587,8 @@ module.exports = function(pi) {{
       description: tool.description,
       promptSnippet: tool.promptSnippet || tool.description,
       parameters: tool.parameters || {{ type: "object", properties: {{}} }},
-      async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {{
-        return callTool(tool.name, _params);
+      async execute(toolCallId, _params, _signal, _onUpdate, _ctx) {{
+        return callTool(tool.name, _params, toolCallId);
       }},
     }});
   }}
@@ -736,11 +750,7 @@ def _build_models_json(
     mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
     is_databricks_openai_gateway = bool(
-        raw_openai_base_url
-        and (
-            "/ai-gateway/" in raw_openai_base_url
-            or _is_databricks_ai_gateway_url(raw_openai_base_url)
-        )
+        raw_openai_base_url and _is_databricks_gateway_base_url(raw_openai_base_url)
     )
     # Databricks Codex URLs only accept Responses; Chat uses the workspace.
     if raw_openai_base_url and is_databricks_openai_gateway:
@@ -863,6 +873,7 @@ def _build_models_json(
                 model,
                 wire_catalog.get(model.lower()),
                 generic_openai_wire_api=generic_openai_wire_api,
+                only_family=_only_configured_family(base_urls),
             )
         ]
         if not any(entry.get("id") == model for entry in provider["models"]):
@@ -910,15 +921,80 @@ def _pi_needs_responses_api(
     return "gpt" in lower
 
 
+def _is_databricks_gateway_base_url(base_url: str) -> bool:
+    """Return whether a family base URL fronts a Databricks AI Gateway.
+
+    The one generic-provider vs. Databricks-gateway distinction this module
+    makes: a workspace-hosted ``/ai-gateway/`` path or a canonical gateway
+    host (:func:`_is_databricks_ai_gateway_url`). Shared by the openai-family
+    wire selection and by :func:`_only_configured_family` so that model
+    registration and the launch selector reach the same answer.
+
+    :param base_url: A provider family's configured base URL.
+    :returns: ``True`` for a Databricks gateway URL, ``False`` for a generic
+        (OpenAI-compatible / Anthropic-compatible) vendor URL.
+    """
+    return "/ai-gateway/" in base_url or _is_databricks_ai_gateway_url(base_url)
+
+
+def _only_configured_family(base_urls: Mapping[str, str] | None) -> str | None:
+    """Return the lone family key when a generic provider configures exactly one.
+
+    An empty URL counts as unconfigured — the reading
+    :func:`_build_models_json` itself gives the dict — so a lone family with
+    an empty URL is not "configured" and never pins routing.
+
+    A lone *Databricks gateway* URL never pins either: one serialized family
+    does not mean one served surface there. The cli-config path emits only
+    the gateway's Anthropic surface (``{"claude": ".../ai-gateway/anthropic"}``)
+    while the same workspace serves GPT / Gemini / OSS models on the sibling
+    ``/ai-gateway/codex/v1``, ``/ai-gateway/mlflow/v1`` and
+    ``/serving-endpoints`` surfaces :func:`_build_models_json` derives, so an
+    explicit GPT override must keep its Responses routing.
+
+    :param base_urls: Provider base URLs keyed by family (``"claude"`` /
+        ``"openai"``), from ucode state or a provider entry.
+    :returns: The single configured family of a generic provider, or
+        ``None`` when both families (or neither) carry a URL or the lone URL
+        is a Databricks gateway.
+    """
+    configured = {family: url for family, url in (base_urls or {}).items() if url}
+    if len(configured) != 1:
+        return None
+    ((family, url),) = configured.items()
+    if _is_databricks_gateway_base_url(url):
+        return None
+    return family
+
+
 def _pi_provider_for_model(
     model: str,
     wire_apis: frozenset[ModelWireAPI] | None = None,
     *,
     generic_openai_wire_api: str | None = None,
+    only_family: str | None = None,
 ) -> str:
-    """Return the Pi provider name to use for a given Databricks model."""
+    """Return the Pi provider name to use for a given Databricks model.
+
+    :param model: Model id to route.
+    :param wire_apis: Catalog-reported wire surfaces, when known.
+    :param generic_openai_wire_api: Configured wire for a generic
+        (non-Databricks) OpenAI-compatible provider.
+    :param only_family: The lone family a *generic* provider entry
+        configures, from :func:`_only_configured_family` (``None`` for a
+        Databricks gateway, whose sibling surfaces are real). A one-family
+        generic provider has no other real endpoint, so every
+        dynamically-registered model routes to that family's surface
+        regardless of name tokens; name heuristics would otherwise pick a
+        provider whose base URL was fabricated for the Databricks workspace
+        host and 404 at the vendor.
+    """
     lower = model.lower()
-    if "claude" in lower:
+    if "claude" in lower and only_family != "openai":
+        return "databricks-anthropic"
+    # A claude-only provider fronts non-Claude-named ids (e.g. moonshot
+    # serving kimi) on its anthropic wire, so they route there too.
+    if only_family == "claude":
         return "databricks-anthropic"
     if generic_openai_wire_api is not None:
         if generic_openai_wire_api == RESPONSES_WIRE_API:
@@ -1016,6 +1092,7 @@ class _PiRpcSession:
         cwd: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        system_prompt_mode: str = "append",
         thinking: str | None = None,
         extra_args: list[str] | None = None,
     ) -> None:
@@ -1034,8 +1111,10 @@ class _PiRpcSession:
         :param model: Pi model selector, e.g.
             ``"databricks-anthropic/gateway-model-id"``.
             ``None`` lets Pi pick its default.
-        :param system_prompt: Text appended to Pi's default system
-            prompt via ``--append-system-prompt``. ``None`` skips it.
+        :param system_prompt: Omnigent's composed instructions. ``None`` skips
+            injection in append mode; replace mode requires non-empty text.
+        :param system_prompt_mode: Append instructions to Pi's base prompt,
+            or replace it using ``--system-prompt``.
         :param thinking: Pi thinking level in Pi's own vocabulary
             (``off``/``minimal``/.../``max``), passed as ``--thinking``.
             ``None`` omits the flag so Pi's model default applies.
@@ -1055,11 +1134,13 @@ class _PiRpcSession:
             )
         if thinking:
             args.extend(["--thinking", thinking])
-        if system_prompt:
-            # Use --append-system-prompt instead of --system-prompt so Pi
-            # keeps its default prompt (which includes tool descriptions from
-            # promptSnippet and guidelines).  Using --system-prompt would
-            # replace the default prompt entirely, stripping tool awareness.
+        if system_prompt_mode == "replace":
+            if not system_prompt or not system_prompt.strip():
+                raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
+            # An explicit empty append input suppresses APPEND_SYSTEM.md discovery.
+            args.extend(["--system-prompt", system_prompt, "--append-system-prompt", ""])
+        elif system_prompt:
+            # Keep Pi's tool snippets and default guidance in append mode.
             args.extend(["--append-system-prompt", system_prompt])
         if extra_args:
             args.extend(extra_args)
@@ -1729,11 +1810,17 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        context_files: bool = True,
+        system_prompt_mode: str = "append",
         preserve_model_ids: bool = False,
     ) -> None:
         """Create a PiExecutor.
 
         :param cwd: Working directory for the Pi subprocess.
+        :param context_files: Allow Pi to automatically load context files such
+            as AGENTS.md and CLAUDE.md. Explicit agent instructions are unaffected.
+        :param system_prompt_mode: ``append`` retains Pi's base prompt;
+            ``replace`` uses Omnigent's composed instructions as the base.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
@@ -1789,6 +1876,9 @@ class PiExecutor(Executor):
             ``--skill`` for each named bundle skill — names not
             present in the bundle are silently skipped.
         """
+        if system_prompt_mode not in ("append", "replace"):
+            raise ValueError("system_prompt_mode must be 'append' or 'replace'")
+        self._system_prompt_mode = system_prompt_mode
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
             raise ImportError(
@@ -1833,6 +1923,8 @@ class PiExecutor(Executor):
         from omnigent.harnesses.pi_native.main import pi_supports_approve
 
         self._extra_args: list[str] = ["--no-tools"]
+        if not context_files:
+            self._extra_args.append("--no-context-files")
         if pi_supports_approve(self._pi_path):
             # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
             # blocking TUI prompt on first launch in a directory with .pi/
@@ -2035,12 +2127,8 @@ class PiExecutor(Executor):
     def _generic_openai_wire_api(self) -> str | None:
         """Return the configured wire only for a non-Databricks gateway."""
         openai_base_url = (self._base_urls_override or {}).get("openai")
-        if openai_base_url:
-            is_databricks_gateway = (
-                "/ai-gateway/" in openai_base_url or _is_databricks_ai_gateway_url(openai_base_url)
-            )
-            if not is_databricks_gateway:
-                return self._openai_wire_api or CHAT_WIRE_API
+        if openai_base_url and not _is_databricks_gateway_base_url(openai_base_url):
+            return self._openai_wire_api or CHAT_WIRE_API
         return None
 
     def _gateway_model_service_workspace_url(self) -> str | None:
@@ -2377,6 +2465,7 @@ class PiExecutor(Executor):
                 effective_model,
                 wire_catalog.get(effective_model.lower()),
                 generic_openai_wire_api=self._generic_openai_wire_api(),
+                only_family=_only_configured_family(self._base_urls_override),
             )
             pi_model = f"{provider}/{effective_model}"
         else:
@@ -2388,6 +2477,7 @@ class PiExecutor(Executor):
             cwd=self._cwd,
             model=pi_model or None,
             system_prompt=system_prompt or None,
+            system_prompt_mode=self._system_prompt_mode,
             thinking=thinking,
             extra_args=extra_args or None,
         )
@@ -2573,13 +2663,22 @@ class PiExecutor(Executor):
                         yield ReasoningChunk(delta=raw_delta, event_type="reasoning_text")
                 continue
 
-            # Tool execution events.
+            # Both lifecycle events must retain the same Pi-owned correlation ID.
+            call_id = event.get("toolCallId")
+            if event_type in {"tool_execution_start", "tool_execution_end"}:
+                if not isinstance(call_id, str) or not call_id:
+                    continue
+
             if event_type == "tool_execution_start":
                 tool_name = event.get("toolName", "unknown")
                 args = event.get("args", {})
                 yield ToolCallRequest(
                     name=tool_name,
                     args=args if isinstance(args, dict) else {},
+                    metadata={
+                        "call_id": call_id,
+                        "internally_executed": not any(t.get("name") == tool_name for t in tools),
+                    },
                 )
                 continue
 
@@ -2653,6 +2752,7 @@ class PiExecutor(Executor):
                     status=status,
                     result=result,
                     error=result_str if (is_error or is_blocked) else "",
+                    metadata={"call_id": call_id},
                 )
                 continue
 

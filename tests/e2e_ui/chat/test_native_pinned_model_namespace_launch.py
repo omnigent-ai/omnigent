@@ -44,7 +44,6 @@ fixed path the terminal resource registers even without a usable login.
 from __future__ import annotations
 
 import contextlib
-import io
 import json
 import os
 import secrets
@@ -53,8 +52,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tarfile
-import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -63,6 +60,8 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.native_session import create_native_session
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -363,48 +362,13 @@ def _create_unbound_native_session(base_url: str, harness: str) -> str:
     :param harness: ``"codex"`` or ``"claude"``.
     :returns: The new session/conversation id.
     """
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        CODEX_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    created = create_native_session(
+        _client,
+        base_url,
+        harness=harness,
+        metadata={"workspace": str(_REPO_ROOT)},
     )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        if harness == "codex":
-            from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
-
-            spec_path = _materialize_codex_agent_spec(Path(tmp), model=None)
-            wrapper_value = CODEX_NATIVE_WRAPPER_VALUE
-        else:
-            from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
-
-            spec_path = _materialize_claude_agent_spec(Path(tmp))
-            wrapper_value = CLAUDE_NATIVE_WRAPPER_VALUE
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname -> omnigent compat translator (the spec has
-        # no spec_version), matching the conftest native session factories.
-        info = tarfile.TarInfo(f"{harness}-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE, WRAPPER_LABEL_KEY: wrapper_value}
-    # Codex terminals hard-require a workspace; the repo root matches the
-    # conftest factories and is a valid dir on the runner's filesystem.
-    metadata = {"labels": labels, "workspace": str(_REPO_ROOT)}
-    create = _client.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": (f"{harness}-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    return str(create.json()["session_id"])
+    return str(created["session_id"])
 
 
 def _session_terminal_exists(base_url: str, session_id: str) -> bool:

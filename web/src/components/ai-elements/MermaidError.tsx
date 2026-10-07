@@ -1,6 +1,17 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { mermaid } from "@streamdown/mermaid";
 import type { MermaidErrorComponentProps, MermaidOptions } from "streamdown";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import type { ResolvedThemeMode } from "@/components/theme/themeMode";
+
+const MERMAID_THEMES = {
+  light: { theme: "default" },
+  dark: { theme: "dark" },
+} as const;
+
+export function mermaidOptionsForTheme(mode: ResolvedThemeMode): MermaidOptions {
+  return { config: MERMAID_THEMES[mode], errorComponent: MermaidError };
+}
 
 // Mermaid's parsers open every syntax error with this line.
 const ERROR_LINE_RE = /^(?:Parse|Lexical) error on line (\d+)/;
@@ -196,6 +207,7 @@ type EscapedRender =
 // uses. Only the error path pays for this: a diagram that parsed first time
 // never reaches this component.
 function useEscapedRender(escaped: EscapedSemicolons | null): EscapedRender {
+  const mode = useResolvedThemeMode();
   const [state, setState] = useState<EscapedRender>({ status: escaped ? "rendering" : "skipped" });
   useEffect(() => {
     if (!escaped) {
@@ -206,7 +218,7 @@ function useEscapedRender(escaped: EscapedSemicolons | null): EscapedRender {
     setState({ status: "rendering" });
     const id = `mermaid-escaped-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     mermaid
-      .getMermaid()
+      .getMermaid(MERMAID_THEMES[mode])
       .render(id, escaped.text)
       .then(({ svg }) => {
         if (cancelled) return;
@@ -218,7 +230,7 @@ function useEscapedRender(escaped: EscapedSemicolons | null): EscapedRender {
     return () => {
       cancelled = true;
     };
-  }, [escaped]);
+  }, [escaped, mode]);
   return state;
 }
 
@@ -297,5 +309,3 @@ export function MermaidError({ chart, error }: MermaidErrorComponentProps) {
     </div>
   );
 }
-
-export const MERMAID_STREAMDOWN_OPTIONS: MermaidOptions = { errorComponent: MermaidError };

@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import logging
-import math
 import os
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
+
+from websockets.exceptions import WebSocketException
 
 from omnigent.debug_logging import debug_event
 from omnigent.harnesses.codex_native import side_chat
@@ -19,22 +21,29 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
     client_for_transport,
+    is_stale_active_turn_error,
+    resolve_codex_effort_for_model,
 )
 from omnigent.harnesses.codex_native.bridge import (
+    CODEX_APP_SERVER_STOPPED,
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     CodexNativeBridgeState,
+    CodexStartupFailure,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
     mcp_startup_waiting_detail,
+    mirror_applied_codex_settings,
     read_bridge_startup_error,
+    read_bridge_startup_failure,
     read_bridge_startup_timeout,
     read_bridge_state,
+    read_codex_config_effort,
+    read_codex_config_model,
     read_mcp_startup,
+    read_unmirrored_codex_settings,
     update_active_turn_id,
-    write_codex_config_effort,
-    write_codex_config_model,
 )
 from omnigent.inner.codex_goal_command import (
     goal_objective_from_content,
@@ -59,6 +68,7 @@ from omnigent.inner.native_attachments import (
     requires_filesystem,
     unresolved_attachment_marker,
 )
+from omnigent.process_logging import log_once
 from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     effort_for_model_switch,
@@ -67,54 +77,99 @@ from omnigent.util.reasoning_effort import (
 
 _logger = logging.getLogger(__name__)
 
-_NO_ACTIVE_TURN_ERROR_CODE = -32600
-_NO_ACTIVE_TURN_ERROR_MESSAGE = "no active turn to steer"
-_ACTIVE_TURN_MISMATCH_MARKERS = ("expected active turn id", "but found")
-_LEGACY_BRIDGE_STATE_POLL_COUNT = 60
+_LEGACY_BRIDGE_STATE_WAIT_SECONDS = 60.0
+_BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
+_BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
+_BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 
 
-def _bridge_state_wait_poll_count(bridge_dir: Path) -> int:
-    """Return 60 legacy polls or the advertised configured-command budget."""
+async def _wait_for_bridge_state(
+    bridge_dir: Path,
+    *,
+    waited_seconds: float,
+    max_wait_seconds: float,
+    startup_timeout_observed: bool,
+) -> tuple[CodexNativeBridgeState | None, float, float, bool]:
+    """Poll startup files quickly at first, then back off to a modest cadence."""
+    state = read_bridge_state(bridge_dir)
+    while state is None and waited_seconds < max_wait_seconds:
+        if read_bridge_startup_error(bridge_dir) is not None:
+            break
+        poll_interval = (
+            _BRIDGE_STATE_FAST_POLL_SECONDS
+            if waited_seconds < _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS
+            else _BRIDGE_STATE_SLOW_POLL_SECONDS
+        )
+        sleep_seconds = min(poll_interval, max_wait_seconds - waited_seconds)
+        await asyncio.sleep(sleep_seconds)
+        waited_seconds += sleep_seconds
+        state = read_bridge_state(bridge_dir)
+        if state is not None:
+            break
+        if not startup_timeout_observed:
+            advertised_wait_seconds = _bridge_state_wait_seconds(bridge_dir)
+            if advertised_wait_seconds > _LEGACY_BRIDGE_STATE_WAIT_SECONDS:
+                extended_wait_seconds = max(
+                    max_wait_seconds,
+                    waited_seconds + advertised_wait_seconds,
+                )
+                _logger.debug(
+                    "Codex bridge-state wait extended from %.2f to %.2f seconds by startup marker",
+                    max_wait_seconds,
+                    extended_wait_seconds,
+                )
+                max_wait_seconds = extended_wait_seconds
+                startup_timeout_observed = True
+    return state, waited_seconds, max_wait_seconds, startup_timeout_observed
+
+
+def _bridge_state_wait_seconds(bridge_dir: Path) -> float:
+    """Return the legacy wait or the advertised configured-command budget."""
     configured_timeout = read_bridge_startup_timeout(bridge_dir)
     if configured_timeout is None:
-        return _LEGACY_BRIDGE_STATE_POLL_COUNT
+        return _LEGACY_BRIDGE_STATE_WAIT_SECONDS
     return max(
-        _LEGACY_BRIDGE_STATE_POLL_COUNT,
-        math.ceil(configured_timeout + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS),
+        _LEGACY_BRIDGE_STATE_WAIT_SECONDS,
+        configured_timeout + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     )
 
 
-def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
-    """Return whether Codex explicitly rejected a steer because the turn ended."""
-    return (
-        error.code == _NO_ACTIVE_TURN_ERROR_CODE
-        and error.message is not None
-        and error.message.strip().casefold() == _NO_ACTIVE_TURN_ERROR_MESSAGE
+async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServerClient | None:
+    """
+    Connect to the bridge's app-server, or return ``None`` when it is unreachable.
+
+    Only a failure to connect counts, a socket error or a websocket handshake
+    failure such as an accept-then-close: nothing has been sent, so the turn is
+    provably undelivered. An error once the connection is up is the caller's.
+    Any other exit, a cancel included, closes the half-open client first.
+
+    :param state: Bridge state naming the app-server transport.
+    :returns: A connected client, or ``None`` when the connection was refused or lost.
+    """
+    client = client_for_transport(
+        state.socket_path,
+        client_name="omnigent-codex-native",
     )
-
-
-def _is_active_turn_mismatch(error: CodexAppServerResponseError) -> bool:
-    """Return whether a newer turn replaced the one we recorded.
-
-    The app-server rejects a steer/interrupt with ``expected active turn id `X`
-    but found `Y``` (also code -32600) when a turn started after we read the
-    bridge's ``active_turn_id``. Match on the phrasing, not the ids, since the
-    message quotes them and the backtick formatting varies across builds.
-    """
-    if error.code != _NO_ACTIVE_TURN_ERROR_CODE or error.message is None:
-        return False
-    message = error.message.casefold()
-    return all(marker in message for marker in _ACTIVE_TURN_MISMATCH_MARKERS)
-
-
-def _is_stale_active_turn(error: CodexAppServerResponseError) -> bool:
-    """Return whether our recorded active turn is no longer the thread's active one.
-
-    Covers both -32600 shapes: the turn ended ("no active turn to steer") and a
-    newer turn replaced it ("expected active turn id X but found Y"). Both call
-    for the same recovery — re-read bridge state and retarget the live turn.
-    """
-    return _is_no_active_turn_to_steer(error) or _is_active_turn_mismatch(error)
+    connected = False
+    try:
+        await client.connect()
+        connected = True
+        return client
+    except (OSError, WebSocketException):
+        _logger.exception(
+            "Codex native app-server unreachable: socket=%s",
+            state.socket_path,
+            extra=debug_event(
+                "codex_app_server_unreachable",
+                session_id=state.session_id,
+                thread_id=state.thread_id,
+            ),
+        )
+        return None
+    finally:
+        if not connected:
+            with contextlib.suppress(Exception):
+                await client.close()
 
 
 async def _start_codex_turn(
@@ -126,6 +181,32 @@ async def _start_codex_turn(
     settings_overrides: Mapping[str, object],
 ) -> None:
     """Apply optional settings and start one Codex turn on an idle thread."""
+    settings_overrides = dict(settings_overrides)
+    # Settings applied while their config write failed are recorded beside the config.
+    unmirrored = await asyncio.to_thread(read_unmirrored_codex_settings, bridge_dir)
+    model = (
+        settings_overrides.get("model")
+        or unmirrored.get("model")
+        or await asyncio.to_thread(read_codex_config_model, bridge_dir)
+    )
+    effort = (
+        settings_overrides.get("effort")
+        or unmirrored.get("effort")
+        or await asyncio.to_thread(read_codex_config_effort, bridge_dir)
+    )
+    if isinstance(model, str) and isinstance(effort, str):
+        resolved_effort = await resolve_codex_effort_for_model(
+            client, effort, model, transport=state.socket_path
+        )
+        if resolved_effort != effort:
+            settings_overrides["effort"] = resolved_effort
+    elif isinstance(effort, str):
+        log_once(
+            _logger,
+            logging.INFO,
+            "Codex effort %s has no known model; skipping capability validation",
+            effort,
+        )
     if settings_overrides:
         await client.request(
             "thread/settings/update",
@@ -134,26 +215,17 @@ async def _start_codex_turn(
                 **settings_overrides,
             },
         )
-        switched_model = settings_overrides.get("model")
-        if isinstance(switched_model, str) and switched_model:
-            if not write_codex_config_model(bridge_dir, switched_model):
-                _logger.warning(
-                    "Failed to mirror codex model switch into config.toml: model=%s",
-                    switched_model,
-                )
-        # Mirror an applied effort the same way (after the model write, whose
-        # clamp may have rewritten the stale effort line): the forwarder's
-        # effort mirror treats config.toml as the source of truth, and a fresh
-        # forwarder state (thread resume / reconnect) re-reads it — without
-        # this write it would revert a composer-picked effort to the stale
-        # launch value.
-        switched_effort = settings_overrides.get("effort")
-        if isinstance(switched_effort, str) and switched_effort:
-            if not write_codex_config_effort(bridge_dir, switched_effort):
-                _logger.warning(
-                    "Failed to mirror codex effort switch into config.toml: effort=%s",
-                    switched_effort,
-                )
+        # The forwarder and a fresh forwarder state (thread resume / reconnect)
+        # re-read config.toml, so mirror what applied; without it they would
+        # revert a composer pick to the stale launch value.
+        switched = {
+            key: value
+            for key in ("model", "effort")
+            if isinstance(value := settings_overrides.get(key), str) and value
+        }
+        failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, switched)
+        for key, value in failed.items():
+            _logger.warning("Failed to mirror codex %s switch into config.toml: %s", key, value)
     response = await client.request(
         "turn/start",
         {
@@ -228,7 +300,7 @@ async def _inject_codex_turn(
         )
         return
     except CodexAppServerResponseError as error:
-        if not _is_stale_active_turn(error):
+        if not is_stale_active_turn_error(error):
             raise
 
     # Codex authoritatively says A is no longer the active turn (it ended, or a
@@ -393,7 +465,7 @@ class CodexNativeExecutor(Executor):
                     # The recorded turn already ended or was replaced by a
                     # newer one, so there is nothing left to interrupt — not a
                     # failure. The local cancel map was already flipped above.
-                    if not _is_stale_active_turn(error):
+                    if not is_stale_active_turn_error(error):
                         raise
                     # Drop the stale record unless a newer turn/started already
                     # replaced it.
@@ -449,56 +521,40 @@ class CodexNativeExecutor(Executor):
         if not input_items:
             yield ExecutorError(message="Codex native turn had no user input to send")
             return
-        # Wait for the bridge to boot OUTSIDE the injection lock: this is a
-        # one-time poll for the state file to appear (first turn, app-server
-        # starting), with no shared-state mutation, so holding the lock
-        # across its bounded startup wait would needlessly block concurrent
-        # steering (enqueue_session_message). Once the state exists, the
-        # decision/RPC/write below runs under the lock — re-reading state so
-        # it's atomic with respect to a steer that landed during the wait.
+        # Wait for the bridge to boot OUTSIDE the injection lock. Poll quickly
+        # during the expected startup window, then back off. Once state exists,
+        # the decision/RPC/write below runs under the lock — re-reading state
+        # so it's atomic with respect to a steer that landed during the wait.
         state = read_bridge_state(self._bridge_dir)
-        poll_count = 0
-        max_poll_count = _LEGACY_BRIDGE_STATE_POLL_COUNT
+        waited_seconds = 0.0
+        max_wait_seconds = _LEGACY_BRIDGE_STATE_WAIT_SECONDS
         startup_timeout_observed = False
         if state is None:
-            max_poll_count = _bridge_state_wait_poll_count(self._bridge_dir)
-            startup_timeout_observed = max_poll_count > _LEGACY_BRIDGE_STATE_POLL_COUNT
+            max_wait_seconds = _bridge_state_wait_seconds(self._bridge_dir)
+            startup_timeout_observed = max_wait_seconds > _LEGACY_BRIDGE_STATE_WAIT_SECONDS
             if startup_timeout_observed:
                 _logger.debug(
-                    "Codex bridge-state wait extended from %d to %d polls by startup marker",
-                    _LEGACY_BRIDGE_STATE_POLL_COUNT,
-                    max_poll_count,
+                    "Codex bridge-state wait extended from %.2f to %.2f seconds by startup marker",
+                    _LEGACY_BRIDGE_STATE_WAIT_SECONDS,
+                    max_wait_seconds,
                 )
 
         error_msg: str | None = None
+        startup_failure: CodexStartupFailure | None = None
+        undelivered = False
         while True:
-            while state is None and poll_count < max_poll_count:
-                # Startup already failed; the runner recorded the cause — stop waiting.
-                if read_bridge_startup_error(self._bridge_dir) is not None:
-                    break
-                await asyncio.sleep(1.0)
-                poll_count += 1
-                state = read_bridge_state(self._bridge_dir)
-                if state is not None:
-                    break
-                # The runner may publish the configured-command marker after
-                # this first-turn wait begins. Grant its full bounded allowance
-                # once from when it is first observed.
-                if not startup_timeout_observed:
-                    advertised_poll_count = _bridge_state_wait_poll_count(self._bridge_dir)
-                    if advertised_poll_count > _LEGACY_BRIDGE_STATE_POLL_COUNT:
-                        extended_poll_count = max(
-                            max_poll_count,
-                            poll_count + advertised_poll_count,
-                        )
-                        _logger.debug(
-                            "Codex bridge-state wait extended from %d to %d polls "
-                            "by startup marker",
-                            max_poll_count,
-                            extended_poll_count,
-                        )
-                        max_poll_count = extended_poll_count
-                        startup_timeout_observed = True
+            if state is None:
+                (
+                    state,
+                    waited_seconds,
+                    max_wait_seconds,
+                    startup_timeout_observed,
+                ) = await _wait_for_bridge_state(
+                    self._bridge_dir,
+                    waited_seconds=waited_seconds,
+                    max_wait_seconds=max_wait_seconds,
+                    startup_timeout_observed=startup_timeout_observed,
+                )
 
             # No client-side wait for Codex MCP startup: the app-server accepts
             # ``turn/start`` mid-startup and defers execution until the round
@@ -521,34 +577,45 @@ class CodexNativeExecutor(Executor):
                         # bounded wait — the allowance is still granted at
                         # most once — so the executor keeps outwaiting a
                         # forwarder healthily inside its advertised budget.
-                        advertised_poll_count = _bridge_state_wait_poll_count(self._bridge_dir)
-                        if advertised_poll_count > _LEGACY_BRIDGE_STATE_POLL_COUNT:
-                            extended_poll_count = max(
-                                max_poll_count,
-                                poll_count + advertised_poll_count,
+                        advertised_wait_seconds = _bridge_state_wait_seconds(self._bridge_dir)
+                        if advertised_wait_seconds > _LEGACY_BRIDGE_STATE_WAIT_SECONDS:
+                            extended_wait_seconds = max(
+                                max_wait_seconds,
+                                waited_seconds + advertised_wait_seconds,
                             )
                             _logger.debug(
-                                "Codex bridge-state wait extended from %d to %d "
-                                "polls by startup marker",
-                                max_poll_count,
-                                extended_poll_count,
+                                "Codex bridge-state wait extended from %.2f to %.2f "
+                                "seconds by startup marker",
+                                max_wait_seconds,
+                                extended_wait_seconds,
                             )
-                            max_poll_count = extended_poll_count
+                            max_wait_seconds = extended_wait_seconds
                             startup_timeout_observed = True
                             continue
+                    # A record with a semantic code is user-facing as written: the
+                    # runner already phrased the cause and the next step.
+                    startup_failure = (
+                        read_bridge_startup_failure(self._bridge_dir) if startup_error else None
+                    )
+                    if startup_failure is not None and not startup_failure.code:
+                        startup_failure = None
                     error_msg = (
-                        f"Codex native thread never started: {startup_error}"
+                        startup_failure.message
+                        if startup_failure is not None
+                        else f"Codex native thread never started: {startup_error}"
                         if startup_error
                         else "Codex native bridge state is missing"
                     )
+                    undelivered = True
                 elif not _session_is_active(state.session_id, self._request_session_id):
                     error_msg = "Codex native session is no longer active"
+                    undelivered = True
+                elif (client := await _connect_to_app_server(state)) is None:
+                    # Nothing reached the app-server, so the sender's copy is the only record.
+                    startup_failure = CODEX_APP_SERVER_STOPPED
+                    error_msg = startup_failure.message
+                    undelivered = True
                 else:
-                    client = client_for_transport(
-                        state.socket_path,
-                        client_name="omnigent-codex-native",
-                    )
-                    await client.connect()
                     try:
                         side_question = side_chat.side_chat_question(input_items)
                         if side_question is not None:
@@ -600,7 +667,15 @@ class CodexNativeExecutor(Executor):
                         await client.close()
             break
         if error_msg is not None:
-            yield ExecutorError(message=error_msg)
+            yield ExecutorError(
+                message=error_msg,
+                code=startup_failure.code if startup_failure is not None else None,
+                title=startup_failure.title if startup_failure is not None else None,
+                remediation=startup_failure.remediation if startup_failure is not None else None,
+                # A failure once the app-server was asked to start the turn is
+                # ambiguous: Codex may have accepted the message.
+                undelivered=undelivered,
+            )
         else:
             yield TurnComplete(response=None)
 
