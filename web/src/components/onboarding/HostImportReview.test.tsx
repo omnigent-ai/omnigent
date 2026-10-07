@@ -1,7 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
@@ -11,7 +10,7 @@ const authenticatedFetchMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: authenticatedFetchMock }));
 vi.mock("@/lib/nativeBridge", () => ({ isIOSShell: () => false }));
 
-import { ImportReviewGate } from "./HostImportReview";
+import { ImportReviewGate, ReviewImportsPanel } from "./HostImportReview";
 
 function host(id: string, overrides: Partial<Host> = {}): Host {
   return {
@@ -49,14 +48,7 @@ function serve(
 
 function renderWithClient(ui: ReactNode) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return {
-    client,
-    ...render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter>{ui}</MemoryRouter>
-      </QueryClientProvider>,
-    ),
-  };
+  return { client, ...render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>) };
 }
 
 function skillRequestsFor(hostId: string) {
@@ -182,5 +174,22 @@ describe("ImportReviewGate with a requested host", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     // With the request cleared, the gate falls back to unreviewed hosts.
     expect(await screen.findByText("/o")).toBeTruthy();
+  });
+});
+
+describe("ReviewImportsPanel", () => {
+  it("reopens the modal for a reviewed host", async () => {
+    window.localStorage.setItem("omnigent:imports-reviewed:a", "x");
+    serve([host("a")], { a: ["review"] });
+    renderWithClient(<ReviewImportsPanel />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Review imports on a-machine" }));
+    expect(await screen.findByText("/review")).toBeTruthy();
+  });
+
+  it("explains when no machine is online", async () => {
+    serve([host("a", { status: "offline" })], {});
+    renderWithClient(<ReviewImportsPanel />);
+    expect(await screen.findByText(/None of your machines are online/)).toBeTruthy();
   });
 });

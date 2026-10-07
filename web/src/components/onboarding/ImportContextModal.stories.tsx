@@ -1,6 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { fn } from "storybook/test";
-import { MemoryRouter } from "react-router-dom";
 import { MOCK_IMPORT_CONTEXT } from "./importContextMock";
 import { ImportContextModal } from "./ImportContextModal";
 import type { ImportContext } from "./ImportContextModal";
@@ -8,13 +7,6 @@ import type { ImportContext } from "./ImportContextModal";
 const meta = {
   title: "Components/Onboarding/ImportContextModal",
   component: ImportContextModal,
-  decorators: [
-    (Story) => (
-      <MemoryRouter>
-        <Story />
-      </MemoryRouter>
-    ),
-  ],
   args: {
     open: true,
     context: MOCK_IMPORT_CONTEXT,
