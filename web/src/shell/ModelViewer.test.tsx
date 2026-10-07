@@ -67,6 +67,7 @@ let lastParsedObject: { rotation: { x: number } } | null = null;
 let rotationAtBounds: number | null = null;
 interface ControlsRecord {
   kind: "orbit" | "trackball";
+  instance: { rotateSpeed: number };
   camera: unknown;
   element: HTMLElement;
   cameraPositionOnConstruction: { x: number; y: number; z: number };
@@ -143,6 +144,7 @@ vi.mock("three/examples/jsm/loaders/OBJLoader.js", () => ({ OBJLoader: loaderStu
 
 function controlsStub(kind: "orbit" | "trackball") {
   return class {
+    rotateSpeed = 1;
     constructor(camera: unknown, element: HTMLElement) {
       if (kind === "trackball" && behavior.trackballThrows) {
         throw new Error("controls init failed");
@@ -150,6 +152,7 @@ function controlsStub(kind: "orbit" | "trackball") {
       const position = (camera as { position: { x: number; y: number; z: number } }).position;
       lastControls = {
         kind,
+        instance: this,
         camera,
         element,
         cameraPositionOnConstruction: { x: position.x, y: position.y, z: position.z },
@@ -550,6 +553,13 @@ describe("ModelViewer trackball controls and headlight", () => {
       "controls.handleResize",
     ]);
     expect(controls.handleResizeCalls).toBe(1);
+  });
+
+  it("turns the model about once per canvas width of drag", async () => {
+    render(<ModelViewer data={makeData()} path="part.stl" />);
+    await waitFor(() => expect(lastControls).not.toBeNull());
+    // TrackballControls rotate rotateSpeed radians per half canvas width.
+    expect(lastControls?.instance.rotateSpeed).toBe(Math.PI);
   });
 
   it("disposes its controls on teardown", async () => {
