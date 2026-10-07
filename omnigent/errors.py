@@ -609,16 +609,23 @@ _TRANSPORT_EXC_NAMES = frozenset(
 )
 
 
+# grpc-core's shutdown detail for cancelled in-flight calls; the real-grpcio
+# lease-release e2e pins it.
+_GOAWAY_CANCELLED_DETAILS = "Cancelling all calls"
+
+
 def is_cancelled_rpc_error(exc: BaseException) -> bool:
-    """Whether *exc* is a gRPC call terminated by its peer with ``CANCELLED``.
+    """Whether *exc* is a gRPC call cancelled by its peer or endpoint teardown.
 
     Matched structurally — an ``RpcError`` ancestor by class name plus a
-    ``code()`` whose status is named ``CANCELLED`` — so a vendored copy of
-    grpc (a different class identity than pypi grpcio) still matches and this
-    module imports no grpc.
+    ``code()`` whose status is named ``CANCELLED``, or ``UNAVAILABLE`` whose
+    details are the GOAWAY text ``Cancelling all calls`` that an endpoint
+    teardown (e.g. a released channel lease) sends to in-flight calls — so a
+    vendored copy of grpc (a different class identity than pypi grpcio) still
+    matches and this module imports no grpc.
 
     :param exc: The exception to inspect.
-    :returns: ``True`` only for a peer-cancelled RPC error.
+    :returns: ``True`` only for a cancellation-shaped RPC error.
     """
     if not any(klass.__name__ == "RpcError" for klass in type(exc).__mro__):
         return False
@@ -629,7 +636,17 @@ def is_cancelled_rpc_error(exc: BaseException) -> bool:
         status = code()
     except Exception:  # noqa: BLE001 — a status reader that itself fails is not a cancellation
         return False
-    return getattr(status, "name", None) == "CANCELLED"
+    status_name = getattr(status, "name", None)
+    if status_name == "CANCELLED":
+        return True
+    if status_name != "UNAVAILABLE":
+        return False
+    try:
+        details = getattr(exc, "details", None)
+        text = details() if callable(details) else None
+    except Exception:  # noqa: BLE001 — a details reader that itself fails is not a cancellation
+        return False
+    return isinstance(text, str) and text == _GOAWAY_CANCELLED_DETAILS
 
 
 # EDQUOT is POSIX-only; Windows reports a full disk as ENOSPC.
