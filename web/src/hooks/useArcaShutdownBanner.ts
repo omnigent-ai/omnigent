@@ -1,7 +1,7 @@
 import { useEffect, useReducer } from "react";
 import { toast } from "sonner";
 import { useHosts } from "@/hooks/useHosts";
-import { useNow } from "@/hooks/useNow";
+import { useNowSelector } from "@/hooks/useNow";
 import { isArcaHost, readArcaHostId } from "@/lib/arcaHost";
 import {
   ARCA_WARNING_PREFERENCES_CHANGED,
@@ -12,28 +12,32 @@ import {
   isOptedOut,
   isWarningWindow,
   markWarnedToday,
+  offersWorkweek,
   optOut,
 } from "@/lib/arcaShutdownWarning";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 
-export function useMarkArcaBannerWhenVisible(now: Date) {
+export function useMarkArcaBannerWhenVisible(day: string) {
   useEffect(() => {
     const markIfVisible = () => {
       if (document.visibilityState !== "visible") return;
-      markWarnedToday(now);
-      toast.dismiss(`arca-shutdown:${dateKey(now)}`);
+      markWarnedToday(new Date());
+      toast.dismiss(`arca-shutdown:${day}`);
     };
     markIfVisible();
     document.addEventListener("visibilitychange", markIfVisible);
     return () => document.removeEventListener("visibilitychange", markIfVisible);
-  }, [now]);
+  }, [day]);
 }
 
 export function useArcaShutdownBanner() {
   const enabled = isFeatureEnabled(useServerInfo(), "arca_shutdown_warnings");
   const { data: hosts } = useHosts({ enabled });
-  const now = useNow();
+  const warningDay = useNowSelector(
+    (now) => (isWarningWindow(now) ? `${dateKey(now)}:${offersWorkweek(now) ? "1" : "0"}` : ""),
+    { enabled },
+  );
   const [, refresh] = useReducer((value: number) => value + 1, 0);
   const storedId = readArcaHostId();
 
@@ -55,17 +59,18 @@ export function useArcaShutdownBanner() {
       return Boolean(
         enabled &&
         hostId &&
-        isWarningWindow(now) &&
+        warningDay &&
         !isOptedOut() &&
-        !isDismissedToday(now) &&
+        !isDismissedToday(new Date()) &&
         hosts?.some(
           (host) =>
             host.host_id === hostId && host.status === "online" && isArcaHost(host, storedId),
         ),
       );
     },
-    dismissToday: () => dismissToday(now),
+    dismissToday: () => dismissToday(new Date()),
     optOut,
-    now,
+    day: warningDay.slice(0, 10),
+    showWorkweek: warningDay.endsWith(":1"),
   };
 }

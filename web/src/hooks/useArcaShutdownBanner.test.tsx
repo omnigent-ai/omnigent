@@ -18,11 +18,16 @@ vi.mock("@/hooks/useHosts", () => ({
     return { data: state.hosts };
   },
 }));
-vi.mock("@/hooks/useNow", () => ({ useNow: () => state.now }));
+vi.mock("@/hooks/useNow", () => ({
+  useNowSelector: (select: (now: Date) => string, { enabled }: { enabled: boolean }) =>
+    enabled ? select(state.now) : "",
+}));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({}) }));
 vi.mock("@/lib/capabilities", () => ({ isFeatureEnabled: () => state.enabled }));
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(MON_5PM);
   localStorage.clear();
   resetArcaWarningStorageForTests();
   state.enabled = true;
@@ -32,6 +37,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("useArcaShutdownBanner", () => {
@@ -52,6 +58,7 @@ describe("useArcaShutdownBanner", () => {
     act(() => view.result.current.dismissToday());
     expect(view.result.current.showForHost("arca")).toBe(false);
     state.now = TUE_5PM;
+    vi.setSystemTime(TUE_5PM);
     view.rerender();
     expect(view.result.current.showForHost("arca")).toBe(true);
   });
@@ -60,6 +67,7 @@ describe("useArcaShutdownBanner", () => {
     const view = renderHook(() => useArcaShutdownBanner());
     act(() => view.result.current.optOut());
     state.now = TUE_5PM;
+    vi.setSystemTime(TUE_5PM);
     view.rerender();
     expect(view.result.current.showForHost("arca")).toBe(false);
   });

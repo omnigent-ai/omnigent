@@ -18,7 +18,10 @@ const state = vi.hoisted(() => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: state.hosts }),
 }));
-vi.mock("@/hooks/useNow", () => ({ useNow: () => state.now }));
+vi.mock("@/hooks/useNow", () => ({
+  useNowSelector: (select: (now: Date) => string, { enabled }: { enabled: boolean }) =>
+    enabled ? select(state.now) : "",
+}));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({}) }));
 vi.mock("@/lib/capabilities", () => ({ isFeatureEnabled: () => state.enabled }));
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn() }));
@@ -30,6 +33,8 @@ function Banner({ hostId = "arca" }: { hostId?: string }) {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(MON_5PM);
   localStorage.clear();
   resetArcaWarningStorageForTests();
   state.enabled = true;
@@ -41,6 +46,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("ArcaShutdownBanner", () => {
@@ -55,9 +61,11 @@ describe("ArcaShutdownBanner", () => {
 
   it("shows workweek on Wednesday and hides it Thursday", () => {
     state.now = WED_5PM;
+    vi.setSystemTime(WED_5PM);
     const view = render(<Banner />);
     expect(screen.getByText("arca extend workweek")).toBeTruthy();
     state.now = THU_5PM;
+    vi.setSystemTime(THU_5PM);
     view.rerender(<Banner />);
     expect(screen.queryByText("arca extend workweek")).toBeNull();
   });

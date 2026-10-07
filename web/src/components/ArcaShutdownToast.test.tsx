@@ -27,7 +27,11 @@ vi.mock("@/hooks/useHosts", () => ({
     return { data: state.hosts };
   },
 }));
-vi.mock("@/hooks/useNow", () => ({ useNow: () => state.now }));
+vi.mock("@/hooks/useNow", () => ({
+  useNow: () => state.now,
+  useNowSelector: (select: (now: Date) => string, { enabled }: { enabled: boolean }) =>
+    enabled ? select(state.now) : "",
+}));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({}) }));
 vi.mock("@/lib/capabilities", () => ({ isFeatureEnabled: () => state.enabled }));
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn() }));
@@ -57,6 +61,8 @@ function BannerOnArcaHost() {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(MON_5PM);
   localStorage.clear();
   resetArcaWarningStorageForTests();
   state.enabled = true;
@@ -71,6 +77,7 @@ afterEach(() => {
   toast.dismiss();
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("ArcaShutdownToast", () => {
