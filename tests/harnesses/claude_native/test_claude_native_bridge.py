@@ -11279,20 +11279,18 @@ class _ScriptedPolicyClient:
         )
 
 
-def _fast_evaluate_retries(monkeypatch: pytest.MonkeyPatch, *, budget_s: float) -> None:
-    """Shrink the relay's transient retry budget so a test spends milliseconds."""
-    from omnigent.native import native_policy_hook
+@pytest.fixture
+def _policy_retry_clock(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Advance relay retry time without changing asyncio's real clock."""
+    clock = Mock(wraps=time)
+    clock.monotonic.return_value = 0.0
 
-    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", budget_s)
-    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S", 0.01)
-    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_MAX_BACKOFF_S", 0.01)
+    def advance(seconds: float) -> None:
+        clock.monotonic.return_value += seconds
 
-
-def _resolver_connect_error() -> httpx.ConnectError:
-    """The error httpx raises when the server hostname does not resolve."""
-    err = httpx.ConnectError("[Errno -2] Name or service not known")
-    err.__cause__ = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
-    return err
+    clock.sleep.side_effect = advance
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    return clock
 
 
 def _hook_relay(tmp_path, monkeypatch, client):
@@ -11390,7 +11388,6 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
-    _fast_evaluate_retries(monkeypatch, budget_s=0.0)
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -11402,9 +11399,6 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
         )
         output = json.loads(body)
         assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
-        reason = output["hookSpecificOutput"]["permissionDecisionReason"]
-        assert "could not connect to the Omnigent server" in reason, reason
-        assert "scripted transport failure" not in reason, reason
 
         post_body = await asyncio.to_thread(
             _relay_request_raw,
@@ -11418,21 +11412,18 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
+        httpx.ConnectTimeout("connect timed out"),
+    ],
+)
 async def test_hook_evaluate_endpoint_retries_connect_failures_within_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock, error: Exception
 ) -> None:
-    """A server lookup that fails briefly and then recovers yields the real verdict.
-
-    The prompt must not be dropped while the transient budget still has time
-    left, however many quick attempts the blip swallows.
-    """
-    _fast_evaluate_retries(monkeypatch, budget_s=5.0)
-    client = _ScriptedPolicyClient(
-        _resolver_connect_error(),
-        _resolver_connect_error(),
-        _resolver_connect_error(),
-        {"result": "POLICY_ACTION_ALLOW"},
-    )
+    """A prompt survives a connection failure lasting beyond three attempts."""
+    client = _ScriptedPolicyClient(error, error, error, {"result": "POLICY_ACTION_ALLOW"})
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
         body = await asyncio.to_thread(
@@ -11443,212 +11434,67 @@ async def test_hook_evaluate_endpoint_retries_connect_failures_within_budget(
         )
         assert body == "", f"recovered lookup must let the prompt through, got {body!r}"
         assert client.calls == 4
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [1, 2, 4]
+        assert len({body["_omnigent_elicitation_id"] for body in client.bodies if body}) == 1
     finally:
         relay.close()
 
 
 @pytest.mark.asyncio
-async def test_hook_evaluate_endpoint_names_resolver_failure_without_errno(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("hook_event", ["UserPromptSubmit", "PreToolUse", "PostToolUse"])
+async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock, hook_event: str
 ) -> None:
-    """A sustained resolver failure blocks the prompt with a readable reason.
-
-    The block reason names the condition and the retry instead of the raw
-    ``[Errno ...]`` text the transport error stringifies to.
-    """
-    _fast_evaluate_retries(monkeypatch, budget_s=0.0)
-    client = _ScriptedPolicyClient(_resolver_connect_error())
+    """A sustained resolver failure retains each event's enforcement behavior."""
+    client = _ScriptedPolicyClient(
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known")
+    )
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
         body = await asyncio.to_thread(
             _relay_request_raw,
             bridge_dir,
             "/hook/claude/evaluate-policy",
-            _USER_PROMPT_SUBMIT_PAYLOAD,
+            {
+                **_PRE_TOOL_USE_PAYLOAD,
+                **_USER_PROMPT_SUBMIT_PAYLOAD,
+                "hook_event_name": hook_event,
+                "tool_response": "done",
+            },
         )
-        output = json.loads(body)
-        assert output["decision"] == "block"
-        reason = output["reason"]
-        assert "failing closed for this request" in reason, reason
-        assert "could not resolve the Omnigent server hostname" in reason, reason
-        assert "retried for" in reason, reason
-        assert "[Errno" not in reason, reason
+        if hook_event == "UserPromptSubmit":
+            output = json.loads(body)
+            assert output["decision"] == "block"
+            assert "failing closed for this request" in output["reason"]
+        elif hook_event == "PreToolUse":
+            assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "ask"
+        else:
+            assert body == "", "PostToolUse must still fail open"
+        assert client.calls == 6
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [
+            1,
+            2,
+            4,
+            8,
+            10,
+        ]
     finally:
         relay.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "payload",
-    [
-        pytest.param(_PRE_TOOL_USE_PAYLOAD, id="pre-tool-use"),
-        pytest.param(_USER_PROMPT_SUBMIT_PAYLOAD, id="user-prompt-submit"),
-    ],
+    "failure",
+    [401, 504, httpx.RequestError("no auth token"), httpx.ReadError("torn poll")],
 )
-@pytest.mark.parametrize(
-    "sever",
-    [
-        pytest.param(504, id="held-504"),
-        pytest.param(httpx.ReadError("torn poll"), id="torn-connection"),
-    ],
-)
-async def test_hook_evaluate_endpoint_reparks_a_held_poll_the_gateway_severed(
+async def test_hook_evaluate_endpoint_preserves_non_connect_retries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    sever: int | BaseException,
-    payload: dict[str, object],
+    _policy_retry_clock: Mock,
+    failure: int | Exception,
 ) -> None:
-    """A held 5xx or torn connection re-POSTs the same id without spending budget.
-
-    The server parks a held ASK gate for both blocking phases it can elicit on
-    (``PreToolUse`` and ``UserPromptSubmit``), so a gateway-severed poll on
-    either must re-attach the same elicitation and recover the allow rather
-    than drop the prompt.
-    """
-    from omnigent.native import native_policy_hook
-
-    _fast_evaluate_retries(monkeypatch, budget_s=0.0)
-    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_HELD_POLL_FLOOR_S", 0.0)
-    client = _ScriptedPolicyClient(sever, {"result": "POLICY_ACTION_ALLOW"})
-    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
-    try:
-        body = await asyncio.to_thread(
-            _relay_request_raw,
-            bridge_dir,
-            "/hook/claude/evaluate-policy",
-            payload,
-        )
-        assert body == "", f"re-parked poll must answer the verdict, got {body!r}"
-        assert client.calls == 2
-        first_id = client.bodies[0]["_omnigent_elicitation_id"]
-        assert first_id and client.bodies[1]["_omnigent_elicitation_id"] == first_id, (
-            "a re-parked poll must re-POST the same elicitation id so the server "
-            f"re-attaches the parked ask instead of raising a second card: {client.bodies!r}"
-        )
-    finally:
-        relay.close()
-
-
-@pytest.mark.asyncio
-async def test_hook_evaluate_endpoint_does_not_repark_an_observational_event(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An observational event never re-parks: a held 5xx fails open within budget.
-
-    The server parks a held ask only for the blocking phases it can elicit on.
-    PostToolUse is observational (the tool already ran), so a held 5xx past the
-    floor must fail open once the budget is spent rather than re-POST without
-    bound.
-    """
-    from omnigent.native import native_policy_hook
-
-    _fast_evaluate_retries(monkeypatch, budget_s=0.0)
-    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_HELD_POLL_FLOOR_S", 0.0)
-    client = _ScriptedPolicyClient(503)
-    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
-    try:
-        body = await asyncio.to_thread(
-            _relay_request_raw,
-            bridge_dir,
-            "/hook/claude/evaluate-policy",
-            {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
-        )
-        assert body == "", f"PostToolUse must fail open (tool already ran), got {body!r}"
-        assert client.calls == 1, (
-            f"an observational event must not re-park, saw {client.calls} POSTs"
-        )
-    finally:
-        relay.close()
-
-
-@pytest.mark.asyncio
-async def test_hook_evaluate_endpoint_treats_a_non_held_read_timeout_as_final(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A read timeout that is not a held poll is final: it fails closed in one POST.
-
-    A ReadTimeout is a mid-stream failure, not a connect-phase blip, and when it
-    arrives well inside the held-poll floor it is not a severed parked poll
-    either. The relay must stop at once rather than retry a timeout that will
-    not clear.
-    """
-    _fast_evaluate_retries(monkeypatch, budget_s=5.0)
-    client = _ScriptedPolicyClient(httpx.ReadTimeout("slow body"))
-    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
-    try:
-        body = await asyncio.to_thread(
-            _relay_request_raw,
-            bridge_dir,
-            "/hook/claude/evaluate-policy",
-            _USER_PROMPT_SUBMIT_PAYLOAD,
-        )
-        output = json.loads(body)
-        assert output["decision"] == "block", output
-        assert client.calls == 1, f"a non-held read timeout is final, saw {client.calls} POSTs"
-    finally:
-        relay.close()
-
-
-@pytest.mark.asyncio
-async def test_hook_evaluate_endpoint_recovers_from_fast_5xx(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Fast 5xx responses retry within the budget and recover to the real verdict.
-
-    A 5xx that returns well inside the held-poll floor is an ordinary server
-    hiccup, not a severed poll: the loop retries over the transient budget and
-    the recovered allow lets the prompt through.
-    """
-    _fast_evaluate_retries(monkeypatch, budget_s=5.0)
-    client = _ScriptedPolicyClient(500, 500, {"result": "POLICY_ACTION_ALLOW"})
-    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
-    try:
-        body = await asyncio.to_thread(
-            _relay_request_raw,
-            bridge_dir,
-            "/hook/claude/evaluate-policy",
-            _USER_PROMPT_SUBMIT_PAYLOAD,
-        )
-        assert body == "", f"a recovered 5xx must let the prompt through, got {body!r}"
-        assert client.calls == 3
-    finally:
-        relay.close()
-
-
-@pytest.mark.asyncio
-async def test_hook_evaluate_endpoint_treats_malformed_200_as_final(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A 200 with an unparseable body fails closed at once, with no retry.
-
-    A malformed success body will not become valid on retry, so the relay
-    stops immediately and fails closed with a readable reason.
-    """
-    _fast_evaluate_retries(monkeypatch, budget_s=5.0)
-    client = _ScriptedPolicyClient(200)
-    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
-    try:
-        body = await asyncio.to_thread(
-            _relay_request_raw,
-            bridge_dir,
-            "/hook/claude/evaluate-policy",
-            _USER_PROMPT_SUBMIT_PAYLOAD,
-        )
-        output = json.loads(body)
-        assert output["decision"] == "block", output
-        assert "malformed EvaluationResponse body" in output["reason"], output
-        assert client.calls == 1, f"a malformed 200 is final, saw {client.calls} POSTs"
-    finally:
-        relay.close()
-
-
-@pytest.mark.asyncio
-async def test_hook_evaluate_endpoint_treats_4xx_as_final(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A client error will not succeed on retry, so it fails closed at once."""
-    _fast_evaluate_retries(monkeypatch, budget_s=5.0)
-    client = _ScriptedPolicyClient(404)
+    """HTTP, auth, and held-poll failures retain the existing three attempts."""
+    client = _ScriptedPolicyClient(failure)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
         body = await asyncio.to_thread(
@@ -11659,8 +11505,8 @@ async def test_hook_evaluate_endpoint_treats_4xx_as_final(
         )
         output = json.loads(body)
         assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
-        assert "HTTP 404" in output["hookSpecificOutput"]["permissionDecisionReason"]
-        assert client.calls == 1
+        assert client.calls == 3
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [0.4, 0.4]
     finally:
         relay.close()
 

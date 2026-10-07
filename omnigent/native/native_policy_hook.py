@@ -24,7 +24,6 @@ import json
 import os
 import secrets
 import shlex
-import socket
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -582,120 +581,6 @@ def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str
     return fail_closed_hook_output(hook_event, detail)
 
 
-class EvaluateRetryBudget:
-    """
-    Transient-retry clock shared by the evaluate POST callers.
-
-    Fast failures (connect errors, 5xx) retry with doubling backoff until
-    :data:`_EVALUATE_POLICY_RETRY_BUDGET_S` is spent. A poll the server held
-    past :data:`_EVALUATE_POLICY_HELD_POLL_FLOOR_S` and then lost is a gateway
-    severing a parked ASK, not a fault: it re-POSTs at once on a fresh budget.
-    Callers decide what counts as a failure; this owns only the timing.
-    """
-
-    def __init__(self) -> None:
-        self.reset()
-
-    def reset(self) -> None:
-        """Start a fresh budget with the initial backoff."""
-        self._deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
-        self._backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
-
-    @staticmethod
-    def held_poll_severed(attempt_started: float, exc: BaseException | None = None) -> bool:
-        """
-        Classify a failed attempt as a gateway sever of a held poll.
-
-        :param attempt_started: ``time.monotonic()`` when the POST began.
-        :param exc: Transport error that ended the attempt, or ``None`` for a
-            5xx response.
-        :returns: ``True`` when the POST was held at least the floor and ended
-            in a 5xx or a torn connection.
-        """
-        if exc is not None and not isinstance(exc, _HELD_POLL_SEVER_ERRORS):
-            return False
-        return time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
-
-    def repark(self) -> None:
-        """Restart the budget and wait the initial backoff before re-POSTing."""
-        self.reset()
-        time.sleep(self._backoff_s)
-
-    def wait(self) -> bool:
-        """
-        Sleep before the next attempt, doubling the backoff.
-
-        :returns: ``False`` without sleeping once the budget is exhausted.
-        """
-        if time.monotonic() + self._backoff_s >= self._deadline:
-            return False
-        # Two-step backoff; not worth a retry library in this dependency-light hook.
-        time.sleep(self._backoff_s)
-        self._backoff_s = min(self._backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
-        return True
-
-
-def event_long_polls_ask(hook_event: str) -> bool:
-    """
-    Whether the server parks an interactive ASK long-poll for *hook_event*.
-
-    The server holds a native ASK gate open for the blocking phases it can
-    elicit on: ``PreToolUse`` (``TOOL_CALL``) and ``UserPromptSubmit``
-    (``REQUEST``). Either POST can therefore be severed mid-poll by the
-    gateway's request ceiling and must re-park the same elicitation rather than
-    drop the prompt. ``PostToolUse`` (``TOOL_RESULT``) is observational and is
-    never parked, so a late failure there must fail within the transient budget
-    rather than re-park unbounded.
-    """
-    return hook_event in (_PRE_TOOL_USE, _USER_PROMPT_SUBMIT)
-
-
-def is_transient_connect_error(exc: BaseException) -> bool:
-    """
-    Whether *exc* means the server was never cleanly reached, so a retry may help.
-
-    :param exc: Exception raised by an evaluate POST.
-    :returns: ``True`` for httpx connect errors and timeouts, a refused
-        connection, and the raw :class:`socket.gaierror` a non-httpx client may
-        surface. Broader :class:`OSError` kinds (a mid-stream reset, a
-        :class:`TimeoutError`, a :class:`PermissionError`) are not connect-phase
-        failures and are treated as final, matching the direct-hook path.
-    """
-    return isinstance(
-        exc,
-        (httpx.ConnectError, httpx.ConnectTimeout, ConnectionRefusedError, socket.gaierror),
-    )
-
-
-def transport_failure_detail(exc: BaseException) -> str:
-    """
-    Describe a failed evaluate POST for the deny/block reason shown to the user.
-
-    Transport errors stringify as raw OS text (``[Errno 8] nodename nor
-    servname provided, or not known``), which tells the user nothing; name the
-    condition from the cause chain instead and leave the errno to logs.
-
-    :param exc: Exception raised by an evaluate POST.
-    :returns: Short human-readable description of what failed.
-    """
-    chain: list[BaseException] = []
-    cause: BaseException | None = exc
-    while cause is not None and cause not in chain and len(chain) < 8:
-        chain.append(cause)
-        cause = cause.__cause__ or cause.__context__
-    if any(isinstance(err, socket.gaierror) for err in chain):
-        return "could not resolve the Omnigent server hostname"
-    if any(isinstance(err, ConnectionRefusedError) for err in chain):
-        return "the Omnigent server refused the connection"
-    if isinstance(exc, httpx.ConnectTimeout):
-        return "timed out connecting to the Omnigent server"
-    if isinstance(exc, (httpx.ConnectError, OSError)):
-        return "could not connect to the Omnigent server"
-    if isinstance(exc, httpx.TimeoutException):
-        return "the Omnigent server did not answer in time"
-    return f"request to the Omnigent server failed ({type(exc).__name__})"
-
-
 def post_evaluate_with_retry(
     url: str,
     headers: dict[str, str],
@@ -762,7 +647,8 @@ def post_evaluate_with_retry(
     # server-side by ``_EVALUATE_HOOK_ELICITATION_ID_RE``.
     elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
     request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
-    budget = EvaluateRetryBudget()
+    deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+    backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
     reauthed = False
     last_error: str = "unknown error"
@@ -827,7 +713,9 @@ def post_evaluate_with_retry(
                     file=sys.stderr,
                 )
                 return None, last_error
-            held_poll_severed = budget.held_poll_severed(attempt_started)
+            held_poll_severed = (
+                time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+            )
             print(
                 f"omnigent {hook_label}: Omnigent returned {status}"
                 + (
@@ -838,7 +726,7 @@ def post_evaluate_with_retry(
                 file=sys.stderr,
             )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            last_error = f"connection error: {transport_failure_detail(exc)}"
+            last_error = f"connection error: {exc}"
             print(
                 f"omnigent {hook_label}: Omnigent request failed; retrying: {exc}",
                 file=sys.stderr,
@@ -848,7 +736,10 @@ def post_evaluate_with_retry(
             # A connection the gateway tore down after holding the poll is a
             # sever: the same id re-parks the elicitation. Anything else
             # mid-stream (a ReadTimeout means the ask itself timed out) is final.
-            held_poll_severed = budget.held_poll_severed(attempt_started, exc)
+            held_poll_severed = (
+                isinstance(exc, _HELD_POLL_SEVER_ERRORS)
+                and time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+            )
             if not held_poll_severed:
                 print(
                     f"omnigent {hook_label}: Omnigent request failed: {exc}",
@@ -863,12 +754,17 @@ def post_evaluate_with_retry(
             # The re-park mechanism working as intended, not a transient fault:
             # the budget and backoff are for fast failures, and the accepted
             # poll re-arms the one-shot re-mint for the next token lapse.
+            deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+            backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             reauthed = False
-            budget.repark()
+            time.sleep(backoff_s)
             continue
-        if not budget.wait():
+        if time.monotonic() + backoff_s >= deadline:
             print(
                 f"omnigent {hook_label}: retry budget exhausted",
                 file=sys.stderr,
             )
             return None, f"retry budget exhausted (last error: {last_error})"
+        # Two-step backoff; not worth a retry library in this dependency-light hook.
+        time.sleep(backoff_s)
+        backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)

@@ -6605,14 +6605,15 @@ def _tool_relay_handler_factory(
             # Heavy policy imports stay off this module's import path (hook
             # subprocesses import it); the relay runs inside the runner
             # process where these modules are already loaded.
+            import httpx
+
             from omnigent.native.native_policy_hook import (
-                EvaluateRetryBudget,
+                _EVALUATE_POLICY_RETRY_BUDGET_S,
+                _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
+                _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S,
                 evaluation_response_to_hook_output,
-                event_long_polls_ask,
                 fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
-                is_transient_connect_error,
-                transport_failure_detail,
             )
 
             raw_event = payload.get("hook_event_name")
@@ -6641,60 +6642,49 @@ def _tool_relay_handler_factory(
             url = f"/v1/sessions/{_up.quote(session_id, safe='')}/policies/evaluate"
             verdict: object = None
             last_error: str | None = None
-            last_exc: BaseException | None = None
             attempts = 0
-            started = time.monotonic()
-            # Same transient budget as the direct hook path: a resolver blip
-            # that clears within seconds must not drop the prompt, and a
-            # severed held ASK poll re-parks (see event_long_polls_ask).
-            budget = EvaluateRetryBudget()
-            can_repark = event_long_polls_ask(hook_event)
-            while True:
+            non_connect_failures = 0
+            deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+            backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
+            retry_delay = 0.4
+            while non_connect_failures < 3:
+                if attempts:
+                    time.sleep(retry_delay)
                 attempts += 1
-                attempt_started = time.monotonic()
+                retry_delay = 0.4
                 future = asyncio.run_coroutine_threadsafe(
                     policy_client.post(url, json=request_body), loop
                 )
                 try:
                     resp = future.result(timeout=86400.0)
                 except Exception as exc:  # noqa: BLE001 — shaped fail-closed below
-                    last_exc = exc
-                    last_error = transport_failure_detail(exc)
-                    severed = can_repark and budget.held_poll_severed(attempt_started, exc)
-                    if not severed and not is_transient_connect_error(exc):
-                        break
-                else:
-                    last_exc = None
-                    if resp.status_code == HTTPStatus.OK:
-                        try:
-                            verdict = json.loads(resp.content)
-                        except (ValueError, TypeError) as parse_exc:
-                            last_exc = parse_exc
-                            last_error = "malformed EvaluationResponse body"
-                        break
-                    last_error = f"server returned HTTP {resp.status_code}"
-                    if resp.status_code < 500:
-                        break
-                    severed = can_repark and budget.held_poll_severed(attempt_started)
-                if severed:
-                    budget.repark()
-                    # A re-park starts a fresh budget; measure "retried for"
-                    # from here so the parked wait is not counted as retry time.
-                    started = time.monotonic()
+                    last_error = str(exc).strip() or type(exc).__name__
+                    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+                        # Resolver failures can outlast three quick attempts.
+                        if time.monotonic() + backoff_s >= deadline:
+                            break
+                        retry_delay = backoff_s
+                        backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
+                    else:
+                        non_connect_failures += 1
                     continue
-                if not budget.wait():
-                    elapsed = time.monotonic() - started
-                    last_error = f"{last_error} (retried for {elapsed:.0f}s)"
-                    break
+                if resp.status_code != HTTPStatus.OK:
+                    last_error = f"server returned HTTP {resp.status_code}"
+                    non_connect_failures += 1
+                    continue
+                try:
+                    verdict = json.loads(resp.content)
+                except (ValueError, TypeError):
+                    last_error = "malformed EvaluationResponse body"
+                break
             if not isinstance(verdict, dict) or not verdict.get("result"):
                 _logger.warning(
                     "policy_eval_relay_failure: session=%s hook_event=%s "
-                    "attempts=%d last_error=%r cause=%r; falling back to fail-closed",
+                    "attempts=%d last_error=%r; falling back to fail-closed",
                     session_id,
                     hook_event,
                     attempts,
                     last_error,
-                    last_exc,
                     extra={"session_id": session_id},
                 )
                 self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))

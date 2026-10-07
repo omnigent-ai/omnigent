@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import socket
-
 import httpx
 import pytest
 
@@ -15,7 +13,6 @@ from omnigent.native.native_policy_hook import (
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
     post_evaluate_with_retry,
-    transport_failure_detail,
 )
 
 
@@ -904,105 +901,3 @@ def test_documented_tool_response_takes_precedence() -> None:
     )
     assert result is not None
     assert result["event"]["data"]["result"] == "actual result"
-
-
-def _chained(exc: BaseException, cause: BaseException) -> BaseException:
-    """Attach *cause* the way httpx chains the transport error it wraps."""
-    exc.__cause__ = cause
-    return exc
-
-
-@pytest.mark.parametrize(
-    ("exc", "expected"),
-    [
-        pytest.param(
-            _chained(
-                httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
-                socket.gaierror(8, "nodename nor servname provided, or not known"),
-            ),
-            "could not resolve the Omnigent server hostname",
-            id="resolver",
-        ),
-        pytest.param(
-            _chained(
-                httpx.ConnectError("All connection attempts failed"),
-                _chained(
-                    OSError("All connection attempts failed"),
-                    ConnectionRefusedError(111, "Connect call failed"),
-                ),
-            ),
-            "the Omnigent server refused the connection",
-            id="refused",
-        ),
-        pytest.param(
-            httpx.ConnectTimeout("timed out"),
-            "timed out connecting to the Omnigent server",
-            id="connect-timeout",
-        ),
-        pytest.param(
-            httpx.ConnectError("boom"),
-            "could not connect to the Omnigent server",
-            id="connect",
-        ),
-        pytest.param(
-            httpx.ReadTimeout("slow"),
-            "the Omnigent server did not answer in time",
-            id="read-timeout",
-        ),
-        pytest.param(
-            RuntimeError("Event loop is closed"),
-            "request to the Omnigent server failed (RuntimeError)",
-            id="other",
-        ),
-    ],
-)
-def test_transport_failure_detail_names_the_condition(exc: BaseException, expected: str) -> None:
-    """The user-facing detail names what failed, never the raw OS errno text."""
-    detail = transport_failure_detail(exc)
-    assert detail == expected
-    assert "[Errno" not in detail
-
-
-def test_post_evaluate_with_retry_connect_error_detail_names_the_condition(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A resolver failure that outlasts the budget fails closed without the errno."""
-    clock = {"t": 0.0}
-    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
-    monkeypatch.setattr(
-        native_policy_hook.time,
-        "sleep",
-        lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
-    )
-
-    class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
-            del headers, timeout
-
-        def __enter__(self) -> _Client:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            del args
-
-        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
-            del json
-            raise _chained(
-                httpx.ConnectError(
-                    "[Errno 8] nodename nor servname provided, or not known",
-                    request=httpx.Request("POST", url),
-                ),
-                socket.gaierror(8, "nodename nor servname provided, or not known"),
-            )
-
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
-
-    resp, error = post_evaluate_with_retry(
-        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
-    )
-
-    assert resp is None
-    assert error == (
-        "retry budget exhausted (last error: connection error: "
-        "could not resolve the Omnigent server hostname)"
-    )
