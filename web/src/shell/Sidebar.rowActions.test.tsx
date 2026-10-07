@@ -131,6 +131,11 @@ vi.mock("@/hooks/useConversations", async () => {
     useTogglePinnedConversation: () => ({
       mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
         mocks.pinnedStore.toggle(id, pinned),
+      // Unpin goes through mutateAsync so the Undo pill waits for the write.
+      mutateAsync: ({ id, pinned }: { id: string; pinned: boolean }) => {
+        mocks.pinnedStore.toggle(id, pinned);
+        return Promise.resolve({});
+      },
     }),
     useRenameConversation: () => mocks.rename,
     useLeaveSession: () => mocks.leave,
