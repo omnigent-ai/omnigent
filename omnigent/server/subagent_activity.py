@@ -15,6 +15,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     ResourceEventData,
+    SlashCommandData,
 )
 from omnigent.harness_aliases import is_native_harness
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
@@ -135,6 +136,28 @@ async def _recorded_completion_status(
     return None
 
 
+def _native_request_id(child_id: str, turn_id: str, store: ConversationStore) -> str | None:
+    """Find the request preceding this response, skipping native context turns."""
+    after: str | None = None
+    found_response = False
+    while True:
+        page = store.list_items(child_id, order="desc", limit=100, after=after)
+        for row in page.data:
+            found_response = found_response or row.response_id == turn_id
+            if found_response and (
+                isinstance(row.data, SlashCommandData)
+                or (
+                    isinstance(row.data, MessageData)
+                    and row.data.role == "user"
+                    and not row.data.is_meta
+                )
+            ):
+                return row.id
+        if not page.has_more or page.last_id is None:
+            return None
+        after = page.last_id
+
+
 async def record_subagent_activity(
     child_id: str,
     phase: Literal["delegated", "returned"],
@@ -158,13 +181,15 @@ async def record_subagent_activity(
         if parent_id is not None and child.parent_conversation_id != parent_id:
             return
         parent_id = child.parent_conversation_id
-        if phase == "returned" and status == "completed" and from_runner:
+        native_completion = False
+        if phase == "returned" and status == "completed":
             from omnigent.server.routes._sessions.orchestration import _native_pane_harness
 
             # Native runner completion acknowledges prompt delivery; the
             # forwarder confirms when the child actually finishes.
             harness = await asyncio.to_thread(_native_pane_harness, child)
-            if is_native_harness(harness):
+            native_completion = is_native_harness(harness)
+            if native_completion and from_runner:
                 return
         if (
             phase == "delegated"
@@ -194,6 +219,11 @@ async def record_subagent_activity(
                     return
                 # A runner can die before producing any transcript for its first turn.
                 turn_id = child.id
+        if native_completion and turn_id is not None:
+            # Native notifications can finish new responses for the same request.
+            request_id = await asyncio.to_thread(_native_request_id, child.id, turn_id, store)
+            if request_id is not None:
+                turn_id = request_id
         key = f"{child.id}:{phase}:{turn_id or ''}"
         stable_id = hashlib.sha256(key.encode()).hexdigest()[:32]
         item = NewConversationItem(

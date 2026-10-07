@@ -16,7 +16,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from omnigent.entities import MessageData, NewConversationItem
+from omnigent.entities import MessageData, NewConversationItem, SlashCommandData
 from omnigent.errors import OmnigentError
 from omnigent.runtime import session_stream
 from omnigent.server import session_live_state, session_metadata_logging
@@ -554,6 +554,102 @@ async def test_claude_child_idle_observations_do_not_complete_new_response_ids(
         assert all(item.data.event_type == "session.subagent.returned" for item in notices)
         assert all(item.data.resource_id == route.child_id for item in notices)
         assert all(item.data.resource["status"] == "completed" for item in notices)
+
+
+@pytest.mark.parametrize(
+    ("harness", "wrapper"),
+    [
+        ("claude-native", None),
+        ("codex-native", None),
+        ("auto", "claude-code-native-ui"),
+    ],
+)
+@pytest.mark.parametrize("request_type", ["message", "slash_command"])
+async def test_native_completion_notices_share_the_initiating_request(
+    status_route: _StatusRoute, harness: str, wrapper: str | None, request_type: str
+) -> None:
+    """Native notification turns finish the same request; a real follow-up starts another."""
+    route = status_route
+    route.store.update_conversation(route.child_id, harness_override=harness)
+    if wrapper is not None:
+        route.store.set_labels(route.child_id, {"omnigent.wrapper": wrapper})
+
+    def append_turn(response_id: str, *, is_meta: bool = False) -> None:
+        request = NewConversationItem(
+            type="message",
+            response_id=f"input-{response_id}",
+            data=MessageData(
+                role="user",
+                is_meta=is_meta,
+                content=[
+                    {
+                        "type": "input_text",
+                        "text": "Native task update" if is_meta else "Audit this change",
+                    }
+                ],
+            ),
+        )
+        if request_type == "slash_command" and not is_meta:
+            request = NewConversationItem(
+                type="slash_command",
+                response_id=f"input-{response_id}",
+                data=SlashCommandData(
+                    agent="native", kind="skill", name="review", arguments="Audit this change"
+                ),
+            )
+        route.store.append(
+            route.child_id,
+            [
+                request,
+                NewConversationItem(
+                    type="message",
+                    response_id=response_id,
+                    data=MessageData(
+                        role="assistant",
+                        agent="native",
+                        content=[{"type": "output_text", "text": "Done"}],
+                    ),
+                ),
+            ],
+        )
+
+    async def complete(response_id: str) -> None:
+        response = await route.client.post(
+            f"/v1/sessions/{route.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "response_id": response_id,
+                    "turn_completed": True,
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+
+    append_turn("native-first")
+    await complete("native-first")
+    first_notice = route.store.list_items(route.parent_id).data[0]
+    for index in range(112):
+        response_id = f"native-notification-{index}"
+        append_turn(response_id, is_meta=True)
+        if index in (0, 1, 111):
+            await complete(response_id)
+            assert [item.id for item in route.store.list_items(route.parent_id).data] == [
+                first_notice.id
+            ]
+
+    append_turn("native-follow-up")
+    # A delayed status retry must still belong to the earlier request.
+    await complete("native-first")
+    assert len(route.store.list_items(route.parent_id).data) == 1
+    await complete("native-follow-up")
+    await complete("native-follow-up")
+    notices = route.store.list_items(route.parent_id).data
+    assert len(notices) == 2
+    assert notices[0].id == first_notice.id
+    assert all(item.data.event_type == "session.subagent.returned" for item in notices)
+    assert all(item.data.resource["status"] == "completed" for item in notices)
 
 
 @pytest.mark.parametrize(
