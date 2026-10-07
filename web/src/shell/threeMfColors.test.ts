@@ -190,6 +190,7 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     ]) {
       const input = archive({ "3D/Objects/unused.model": model(resource, "") });
       expect(applyThreeMfColors(input)).toBe(input);
+      check(input, ["ffffff", "ffffff"]);
     }
     const bases =
       '<basematerials id="88"><base name="red" displaycolor="#FF0000"/></basematerials>';
@@ -269,6 +270,31 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     ).toEqual([null, null]);
   });
 
+  it("inherits direct-part appearance despite nested cross-file id collisions", () => {
+    for (const subtype of ["normal_part", "modifier_part"]) {
+      const input = archive({
+        "3D/root.model": model(
+          mesh(20, 2) +
+            mesh(30, 3) +
+            composite(
+              100,
+              component(10, 3, "Objects/nested.model") + component(20, 10) + component(30, 20),
+            ),
+        ),
+        "3D/Objects/nested.model": model(composite(10, component(11, 0, "deeper.model")), ""),
+        "3D/Objects/deeper.model": model(composite(11, component(20, 0, "leaf.model")), ""),
+        "3D/Objects/leaf.model": model(mesh(20), ""),
+        "Metadata/model_settings.config": `<config>${config(part(10, 1) + part(20, 2, subtype) + part(30, 4))}</config>`,
+      });
+      check(
+        input,
+        ["f53b9d", subtype === "normal_part" ? "4dc5a0" : "ffffff", "ff7a18"],
+        [3, 10, 20],
+        [1, 2, 3],
+      );
+    }
+  });
+
   it("retains non-normal geometry without counting or colouring it", () => {
     const subtypes = [
       "modifier_part",
@@ -295,6 +321,7 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       "Metadata/model_settings.config": `<config>${config(part(1, 1) + part(2, 2, "modifier_part"))}</config>`,
     });
     expect(applyThreeMfColors(input)).toBe(input);
+    check(input, ["ffffff", "ffffff"]);
   });
 
   it("bounds selected work, rejects cycles and never inflates G-code", () => {
@@ -334,11 +361,18 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
         ),
       },
       { "3D/unused.model": model(composite(8, component(1).repeat(10001)), "") },
+      // Whitespace has no model root, so the stock loader cannot render this byte-limit input.
       { "3D/oversized.model": " ".repeat(32 * 1024 * 1024 + 1) },
     ];
-    for (const overrides of cases) {
+    for (const [index, overrides] of cases.entries()) {
       const input = archive(overrides);
       expect(applyThreeMfColors(input)).toBe(input);
+      if (index === 2) {
+        check(input, ["ffffff"], [0], [1]);
+      } else if (index !== 5) {
+        // The stock loader rejects cycles, missing targets/meshes and malformed model XML.
+        expect(() => rendered(input)).toThrow();
+      }
     }
   });
 });
