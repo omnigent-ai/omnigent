@@ -354,6 +354,8 @@ def test_azure_canvas_link_uses_provider_identity(
     base_url, session_id = seeded_session
     _stub_azure(page)
     _stub_server_info(page, canvas=True)
+    # Keep live session updates from replacing the mocked Canvas branch.
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
     page.route(
         "**/v1/sessions?*",
         _serve_list([_session(session_id, "Azure session", 1, git_branch="feature/widget")]),
