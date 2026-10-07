@@ -68,6 +68,7 @@ const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
+const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
@@ -304,12 +305,24 @@ function databricksInternalFeaturesEnabled() {
  * a repeat connect while one is in flight re-focuses the existing console and
  * shares its outcome, so a refreshed SPA can always get back to it.
  */
+const arcaIdentities = createArcaIdentityStore();
+
+function startArcaHostConnect(serverUrl, deps) {
+  const finish = arcaIdentities.begin(serverUrl);
+  const run = arca.startArcaConnect(serverUrl, {
+    ...deps,
+    onIdentityUnavailable: (reason) =>
+      console.log(`[omnigent] Arca daemon identity unavailable: ${reason}`),
+  });
+  return { ...run, promise: run.promise.then(finish) };
+}
+
 const arcaConnectFlow = createArcaConnectFlow({
   BrowserWindow,
   ipcMain,
   pagePath: path.join(__dirname, "..", "arca-connect", "index.html"),
   preloadPath: path.join(__dirname, "arca_connect_preload.js"),
-  startConnect: (serverUrl, onOutput) => arca.startArcaConnect(serverUrl, { onOutput }),
+  startConnect: (serverUrl, onOutput) => startArcaHostConnect(serverUrl, { onOutput }),
   startLogin: (serverUrl) => arca.startArcaLogin(serverUrl),
   loginCommandLine: (serverUrl) => {
     try {
@@ -390,7 +403,7 @@ const arcaAutoConnect = createArcaAutoConnect({
     isDatabricksManagedServerUrl(serverUrl) &&
     cachedArcaBinary() !== null,
   startConnect: (serverUrl, onOutput) =>
-    arca.startArcaConnect(serverUrl, { onOutput, resolveArcaPath: cachedArcaBinary }),
+    startArcaHostConnect(serverUrl, { onOutput, resolveArcaPath: cachedArcaBinary }),
   commandLine: (serverUrl) => {
     try {
       return `arca ${arca.buildConnectArgs(serverUrl).join(" ")}`;
@@ -1340,7 +1353,13 @@ function pinWindow(win, origin, attemptToKeep) {
  */
 function setWindowServerUrl(win, serverUrl) {
   const state = windows.get(win);
-  if (state) state.serverUrl = serverUrl;
+  if (state) {
+    if (state.serverUrl && arcaTarget(state.serverUrl) !== arcaTarget(serverUrl)) {
+      // Same-origin workspace/mount switches bypass pinWindow's origin teardown.
+      state.browserRegistry?.closeAll("server-changed");
+    }
+    state.serverUrl = serverUrl;
+  }
 }
 
 /**
@@ -3597,6 +3616,16 @@ function createBrowserRegistryForWindow(win) {
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
+    isArcaAgentContext: (context) => {
+      const target = windowArcaServerUrl(win);
+      return isArcaAgentContext(arcaIdentities.get(target), context, {
+        enabled: !win.isDestroyed() && !!pinnedOrigin(win) && databricksInternalFeaturesEnabled(),
+        managed:
+          isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
+          isDatabricksManagedServerUrl(target),
+        serverTarget: target,
+      });
+    },
     createBoundsController: createBrowserViewBoundsController,
     attachToHost: (view) => {
       win.contentView.addChildView(view);
@@ -4587,7 +4616,7 @@ function registerIpc() {
         return arcaConnectFlow.run(win, arcaServerUrl);
       }
       return status.state === "online"
-        ? { ok: true, alreadyRunning: status.alreadyRunning === true }
+        ? { ok: true, alreadyRunning: status.alreadyRunning === true, identity: status.identity }
         : {
             ok: false,
             error: status.error,
@@ -4609,6 +4638,34 @@ function registerIpc() {
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
+    getAgentContextForEvent: (event, sourceHostId) => ({
+      serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
+      sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
+    }),
+    getAgentNavigationHintForEvent: (event, url) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const target = windowArcaServerUrl(win);
+      if (
+        !databricksInternalFeaturesEnabled() ||
+        !isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) ||
+        !isDatabricksManagedServerUrl(target) ||
+        arcaIdentities.get(target)
+      ) {
+        return null;
+      }
+      try {
+        const parsed = new URL(url);
+        if (
+          ["http:", "https:"].includes(parsed.protocol) &&
+          ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
+        ) {
+          return "If this session runs on Arca, open New session > Host > Reconnect to Arca (Run on Arca if not remembered), complete the connect flow, then return to this session and retry. Other hosts remain ineligible.";
+        }
+      } catch {
+        // Invalid URLs keep the policy's original error.
+      }
+      return null;
+    },
   });
 }
 
