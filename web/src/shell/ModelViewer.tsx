@@ -78,7 +78,8 @@ function parseModel(
 
 /**
  * Frame `object` in `camera`: center it at the origin and pull the camera back
- * far enough that the whole bounding sphere is visible.
+ * far enough that the whole bounding sphere is visible. TrackballControls must
+ * be constructed afterward so reset restores this fitted camera position.
  *
  * The caller has already validated that the object's bounding box is non-empty
  * and finite, so `box` here is always usable.

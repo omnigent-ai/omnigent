@@ -68,12 +68,17 @@ let rotationAtBounds: number | null = null;
 interface ControlsRecord {
   kind: "orbit" | "trackball";
   camera: unknown;
+  element: HTMLElement;
+  cameraPositionOnConstruction: { x: number; y: number; z: number };
   handleResizeCalls: number;
   updateCalls: number;
   disposeCalls: number;
 }
 let lastControls: ControlsRecord | null = null;
-let lastCamera: { children: unknown[] } | null = null;
+let lastCamera: {
+  children: unknown[];
+  position: { x: number; y: number; z: number };
+} | null = null;
 let lastKeyTarget: { parent: unknown; position: { x: number; y: number; z: number } } | null = null;
 let resizeControls: (() => void) | null = null;
 let rotationWrites = 0;
@@ -137,11 +142,21 @@ vi.mock("three/examples/jsm/loaders/OBJLoader.js", () => ({ OBJLoader: loaderStu
 
 function controlsStub(kind: "orbit" | "trackball") {
   return class {
-    constructor(camera: unknown) {
+    constructor(camera: unknown, element: HTMLElement) {
       if (kind === "trackball" && behavior.trackballThrows) {
         throw new Error("controls init failed");
       }
-      lastControls = { kind, camera, handleResizeCalls: 0, updateCalls: 0, disposeCalls: 0 };
+      const position = (camera as { position: { x: number; y: number; z: number } }).position;
+      element.style.touchAction = "none";
+      lastControls = {
+        kind,
+        camera,
+        element,
+        cameraPositionOnConstruction: { x: position.x, y: position.y, z: position.z },
+        handleResizeCalls: 0,
+        updateCalls: 0,
+        disposeCalls: 0,
+      };
     }
     handleResize() {
       if (lastControls) lastControls.handleResizeCalls += 1;
@@ -208,7 +223,7 @@ vi.mock("three", () => {
     position = new Vector3();
     children: unknown[] = [];
     constructor() {
-      lastCamera = { children: this.children };
+      lastCamera = { children: this.children, position: this.position };
     }
     add(...objects: { parent?: unknown }[]) {
       for (const object of objects) {
@@ -485,7 +500,7 @@ describe("ModelViewer print orientation", () => {
 });
 
 describe("ModelViewer trackball controls and headlight", () => {
-  it("keeps a resizable trackball and its directional light with the camera", async () => {
+  it("fits the camera before creating trackball controls and keeps touch-action disabled", async () => {
     render(<ModelViewer data={makeData()} path="part.stl" />);
     await waitFor(() => expect(lastControls).not.toBeNull());
     const controls = lastControls;
@@ -493,6 +508,9 @@ describe("ModelViewer trackball controls and headlight", () => {
 
     expect(controls.kind).toBe("trackball");
     expect((controls.camera as { children: unknown[] }).children).toBe(lastCamera?.children);
+    expect(controls.cameraPositionOnConstruction).toEqual(lastCamera?.position);
+    expect(controls.cameraPositionOnConstruction).not.toEqual({ x: 0, y: 0, z: 0 });
+    expect(controls.element.style.touchAction).toBe("none");
     expect(controls.updateCalls).toBeGreaterThanOrEqual(1);
     expect(
       lastCamera?.children.some(
