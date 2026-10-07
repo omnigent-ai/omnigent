@@ -72,6 +72,7 @@ def _result_parts(result: object, depth: int = 0) -> list[dict[str, object] | st
         "data",
         "pull_request",
         "stdout",
+        "stderr",
         "output",
         "aggregatedOutput",
         "metadata",

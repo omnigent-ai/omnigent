@@ -41,12 +41,12 @@ def offline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     reset_for_tests()
 
 
-def shell(command: str, stdout: object = URL, **status: object):
+def shell(command: str, stdout: object = URL, *, stream: str = "output", **status: object):
     return extract_prs(
         "exec_command",
         {"cmd": command},
         {
-            "output": stdout if isinstance(stdout, str) else json.dumps(stdout),
+            stream: stdout if isinstance(stdout, str) else json.dumps(stdout),
             "exit_code": 0,
             **status,
         },
@@ -69,16 +69,18 @@ def push_output(url: str = URL) -> str:
     ],
 )
 @pytest.mark.parametrize("url", [URL, PRIVATE_URL])
-def test_push_options_track_server_reported_mr_across_worktrees(command, url):
-    refs, created = shell(command, push_output(url))
+@pytest.mark.parametrize("stream", ["output", "stdout", "stderr"])
+def test_push_options_track_server_reported_mr_across_worktrees(command, url, stream):
+    refs, created = shell(command, push_output(url), stream=stream)
     assert [ref.url for ref in refs] == [url] and created
 
 
-def test_push_options_track_update_and_preserve_removal(monkeypatch):
+@pytest.mark.parametrize("stream", ["output", "stdout", "stderr"])
+def test_push_options_track_update_and_preserve_removal(stream):
     command = "git push -o merge_request.title=Updated origin HEAD"
-    refs, created = shell(command, push_output())
+    refs, created = shell(command, push_output(), stream=stream)
     assert [ref.url for ref in refs] == [URL] and not created
-    result = {"output": push_output(), "exit_code": 0}
+    result = {stream: push_output(), "exit_code": 0}
     observe_tool_completion(
         "push-session",
         tool_name="shell",
@@ -118,8 +120,9 @@ def test_push_options_track_update_and_preserve_removal(monkeypatch):
         "git push -o merge_request.create origin HEAD; git push other HEAD",
     ],
 )
-def test_non_mutating_or_ambiguous_push_does_not_track(command):
-    assert shell(command, push_output())[0] == []
+@pytest.mark.parametrize("stream", ["output", "stdout", "stderr"])
+def test_non_mutating_or_ambiguous_push_does_not_track(command, stream):
+    assert shell(command, push_output(), stream=stream)[0] == []
 
 
 @pytest.mark.parametrize(
@@ -133,19 +136,44 @@ def test_non_mutating_or_ambiguous_push_does_not_track(command):
         push_output().replace(URL, URL + "/diffs"),
     ],
 )
-def test_push_tracks_only_successful_gitlab_mr_banner(output):
-    assert shell("git push -o merge_request.create", output)[0] == []
+@pytest.mark.parametrize("stream", ["output", "stdout", "stderr"])
+def test_push_tracks_only_successful_gitlab_mr_banner(output, stream):
+    assert shell("git push -o merge_request.create", output, stream=stream)[0] == []
 
 
-def test_failed_or_background_push_does_not_track():
+@pytest.mark.parametrize("stream", ["output", "stdout", "stderr"])
+def test_failed_or_background_push_does_not_track(stream):
     command = "git push -o merge_request.create"
-    assert shell(command, push_output(), exit_code=1) == ([], False)
-    assert shell(command, push_output(), exit_code=None, session_id=12) == ([], False)
+    assert shell(command, push_output(), stream=stream, exit_code=1) == ([], False)
+    assert shell(command, push_output(), stream=stream, exit_code=None, session_id=12) == (
+        [],
+        False,
+    )
 
 
 def test_normal_push_before_github_creation_still_tracks():
     refs, created = shell("git push -u origin HEAD && gh pr create --title T --body B", GH_URL)
     assert [ref.url for ref in refs] == [GH_URL] and created
+
+
+@pytest.mark.parametrize(
+    "command,status,expected",
+    [
+        ("gh pr create --title T --body B", {"exit_code": 0}, [GH_URL]),
+        ("gh pr create --title T --body B", {"exit_code": 1}, []),
+        ("gh pr create --title T --body B", {"interrupted": True}, []),
+        ("gh pr view 8", {"exit_code": 0}, []),
+        ("gh pr comment 8 --body T", {"exit_code": 0}, []),
+        ("gh pr diff 8; gh pr create", {"exit_code": 0}, []),
+    ],
+)
+def test_gitlab_stderr_does_not_change_github_attribution(command, status, expected):
+    refs, _ = extract_prs(
+        "exec_command",
+        {"cmd": command},
+        {"stdout": GH_URL, "stderr": push_output(), **status},
+    )
+    assert [ref.url for ref in refs] == expected
 
 
 @pytest.mark.parametrize(

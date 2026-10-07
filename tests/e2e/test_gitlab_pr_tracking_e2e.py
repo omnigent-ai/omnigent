@@ -30,8 +30,9 @@ def _isolated_registry() -> Iterator[None]:
 
 
 @pytest.mark.parametrize("harness", ["claude_native", "codex_native"])
+@pytest.mark.parametrize("operation", ["glab-create", "push-stderr"])
 async def test_native_hook_tracks_gitlab_mr_without_observer_io(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str, operation: str
 ) -> None:
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
@@ -80,18 +81,33 @@ async def test_native_hook_tracks_gitlab_mr_without_observer_io(
             ]
         )
     )
-    output = subprocess.check_output(
-        [str(glab), "mr", "create", "-R", "team/sub/project"], text=True, cwd=workspace
+    if operation == "push-stderr":
+        push = tmp_path / "git-push-fixture"
+        banner = f"remote: \nremote: View merge request for feature:\nremote:   {URL}\nremote: \n"
+        push.write_text(f"#!{sys.executable}\nimport sys\nprint({banner!r}, file=sys.stderr)\n")
+        push.chmod(0o755)
+        operation_args = [str(push), "push", "origin", "HEAD", "-o", "merge_request.create"]
+        shell_command = "git -C /another/worktree push origin HEAD -o merge_request.create"
+    else:
+        operation_args = [str(glab), "mr", "create", "-R", "team/sub/project"]
+        shell_command = "glab mr create -R team/sub/project"
+    output = subprocess.run(
+        operation_args, text=True, capture_output=True, check=True, cwd=workspace
     )
+    argument_key = "command" if harness == "claude_native" else "cmd"
     payload = {
         "hook_event_name": "PostToolUse",
         "session_id": "untrusted-provider-session",
         "tool_use_id": "gitlab-create",
-        "tool_name": "Bash",
-        "tool_input": {"command": "glab mr create -R team/sub/project"},
-        "tool_response": {"stdout": output, "exit_code": 0},
+        "tool_name": "Bash" if harness == "claude_native" else "exec_command",
+        "tool_input": {argument_key: shell_command},
+        "tool_response": {
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "exit_code": output.returncode,
+        },
     }
-    before = calls.read_text()
+    before = calls.read_text() if calls.exists() else ""
     try:
         for invocation in (
             payload,
@@ -99,7 +115,7 @@ async def test_native_hook_tracks_gitlab_mr_without_observer_io(
             {
                 **payload,
                 "tool_use_id": "gitlab-read",
-                "tool_input": {"command": "glab mr view 7 --comments"},
+                "tool_input": {argument_key: "glab mr view 7 --comments"},
             },
         ):
             completed = await asyncio.to_thread(
@@ -114,7 +130,9 @@ async def test_native_hook_tracks_gitlab_mr_without_observer_io(
             assert completed.stdout == ""
         [entry] = SessionPrRegistry("gitlab-owned").list()
         assert entry.url == URL and entry.relationship == "created" and entry.number == 7
-        assert calls.read_text() == before, "the observer invoked the GitLab CLI"
+        assert (calls.read_text() if calls.exists() else "") == before, (
+            "the observer invoked the GitLab CLI"
+        )
         assert SessionPrRegistry("untrusted-provider-session").list() == []
     finally:
         relay.close()

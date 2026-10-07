@@ -52,7 +52,8 @@ responses; they exercise the actual shared UI without contacting GitLab.
 - `native-hook` (own environment):
   `tests/e2e/test_gitlab_pr_tracking_e2e.py::test_native_hook_tracks_gitlab_mr_without_observer_io`
   runs Claude/Codex hook subprocesses through a local relay, persists the MR,
-  and reads it through session resources. The CLI is a deterministic fixture;
+  and reads it through session resources. Covers `glab mr create` on stdout
+  and GitLab push-option banners on separate stderr. The CLI is a deterministic fixture;
   its call log proves the observer made no CLI request.
 - Live auth, fork context, and removal persistence: follow
   [the manual verification steps](../docs/GITLAB.md#limits-and-verification)

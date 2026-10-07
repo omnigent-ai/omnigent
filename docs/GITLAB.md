@@ -75,7 +75,8 @@ Successful `glab mr` mutations and `glab api` MR writes are tracked from their
 explicit target or result. Supported GitLab MCP mutation tools are tracked too.
 GitLab push options such as `git push -o merge_request.create` or
 `-o merge_request.title=...` track the MR reported in GitLab's successful push
-output. Dry runs, failed pushes, and ordinary pushes do not create associations.
+output, including banners delivered separately on stderr. Dry runs, failed
+pushes, and ordinary pushes do not create associations.
 These agent operations work from another repository or worktree; branch discovery
 only covers the session workspace. Native agents retain the host's `GLAB_CONFIG_DIR`
 (and GitHub's `GH_CONFIG_DIR`) so their CLI tools use the same login.
