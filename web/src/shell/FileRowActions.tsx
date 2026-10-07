@@ -191,6 +191,10 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
       </ContextMenuTrigger>
       <ContextMenuContent
         aria-label={actionLabel}
+        onContextMenu={(event) => {
+          // Firefox may dispatch its native menu after Shift+F10 opens ours.
+          event.preventDefault();
+        }}
         onEscapeKeyDown={(event) => event.stopPropagation()}
         onCloseAutoFocus={restoreFocusAfterMenuClose}
       >
