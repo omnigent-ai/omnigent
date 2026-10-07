@@ -185,7 +185,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
               childId,
               parts,
               effectiveSlot,
-              parts.get(childId) ?? assigned,
+              depth === 0 ? (parts.get(childId) ?? assigned) : assigned,
               recolor,
               depth + 1,
             ),
