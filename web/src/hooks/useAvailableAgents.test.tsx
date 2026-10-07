@@ -641,6 +641,46 @@ describe("useAvailableAgents", () => {
     ]);
   });
 
+  it("preserves custom native account agents without collapsing or overriding display names", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_codex", name: "codex-native-ui", harness: "codex-native", builtin: true },
+          { id: "ag_agy", name: "antigravity-native-ui", harness: "antigravity-native", builtin: true },
+          { id: "ag_c1", name: "conductor-codex-1", harness: "codex-native", builtin: false },
+          { id: "ag_c2", name: "conductor-codex-2", harness: "codex-native", builtin: false },
+          { id: "ag_c3", name: "conductor-codex-3", harness: "codex-native", builtin: false },
+          { id: "ag_a1", name: "agy-acc1", harness: "antigravity-native", builtin: false },
+          { id: "ag_a2", name: "agy-acc2", harness: "antigravity-native", builtin: false },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: EMPTY_MINE,
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    const names = result.current.data?.map((a) => ({
+      name: a.name,
+      display_name: a.display_name,
+    }));
+
+    expect(names).toEqual([
+      { name: "codex-native-ui", display_name: "Codex" },
+      { name: "antigravity-native-ui", display_name: "Antigravity" },
+      { name: "conductor-codex-1", display_name: "Conductor-codex-1" },
+      { name: "conductor-codex-2", display_name: "Conductor-codex-2" },
+      { name: "conductor-codex-3", display_name: "Conductor-codex-3" },
+      { name: "agy-acc1", display_name: "Agy-acc1" },
+      { name: "agy-acc2", display_name: "Agy-acc2" },
+    ]);
+  });
+
   it("collapses same-named custom agents with distinct agent_ids to the newest agent row", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),

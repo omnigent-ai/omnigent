@@ -3691,7 +3691,7 @@ conversationRegistry.subscribe((id) => {
   if (state !== undefined) rootSetState(state as Parameters<typeof rootSetState>[0]);
 });
 
-type NativeModelFamily = "claude" | "codex";
+type NativeModelFamily = "claude" | "codex" | "antigravity";
 
 /**
  * Resolve the native model family from a session snapshot.
@@ -3702,7 +3702,7 @@ type NativeModelFamily = "claude" | "codex";
  * codex-native session keeps its reported model in the composer label.
  *
  * :param session: Session snapshot from the API.
- * :returns: ``"claude"`` / ``"codex"`` for native sessions, else ``null``.
+ * :returns: ``"claude"`` / ``"codex"`` / ``"antigravity"`` for native sessions, else ``null``.
  */
 function nativeModelFamilyForSession(
   session: Pick<Session, "labels" | "harness">,
@@ -3713,8 +3713,14 @@ function nativeModelFamilyForSession(
       return "claude";
     case "codex-native-ui":
       return "codex";
+    case "antigravity-native-ui":
+      return "antigravity";
     default:
-      return wrapper == null && session.harness === "codex-native" ? "codex" : null;
+      if (wrapper == null) {
+        if (session.harness === "codex-native") return "codex";
+        if (session.harness === "antigravity-native") return "antigravity";
+      }
+      return null;
   }
 }
 

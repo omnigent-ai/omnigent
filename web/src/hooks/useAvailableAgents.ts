@@ -60,18 +60,22 @@ const DISPLAY_NAMES: Record<string, string> = {
 };
 
 function displayNameForAgent(name: string, harness?: string | null): string {
-  return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
-    nativeCodingAgentForAgentName(name)?.displayName ??
-    DISPLAY_NAMES[name] ??
-    capitalizeAgentName(name)
-  );
+  const nativeAgent = nativeCodingAgentForAgentName(name);
+  if (nativeAgent) return nativeAgent.displayName;
+  if (harness != null && harness === name) {
+    return nativeCodingAgentForHarness(harness)?.displayName ?? DISPLAY_NAMES[name] ?? capitalizeAgentName(name);
+  }
+  return DISPLAY_NAMES[name] ?? capitalizeAgentName(name);
 }
 
 function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
   const result: AvailableAgent[] = [];
   const nativeIndex = new Map<string, number>();
   for (const agent of agents) {
+    if (agent.builtin === false) {
+      result.push(agent);
+      continue;
+    }
     const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
     if (nativeAgent === undefined) {
       result.push(agent);
@@ -134,7 +138,10 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
   return rows.map((a) => ({
     id: a.id,
     name: a.name,
-    display_name: displayNameForAgent(a.name, a.harness),
+    display_name:
+      a.builtin === false
+        ? (DISPLAY_NAMES[a.name] ?? capitalizeAgentName(a.name))
+        : displayNameForAgent(a.name, a.harness),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],

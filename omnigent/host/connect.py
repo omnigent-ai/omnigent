@@ -3439,6 +3439,20 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=with_source(devin_models),
+        if harness in ("antigravity-native", "antigravity"):
+            agy_models = [
+                {"id": "gemini-3.8-flash", "model": "gemini-3.8-flash", "displayName": "Gemini 3.8 Flash", "isDefault": True},
+                {"id": "gemini-3.7-flash", "model": "gemini-3.7-flash", "displayName": "Gemini 3.7 Flash"},
+                {"id": "gemini-3.6-flash", "model": "gemini-3.6-flash", "displayName": "Gemini 3.6 Flash"},
+                {"id": "gemini-3.1-pro", "model": "gemini-3.1-pro", "displayName": "Gemini 3.1 Pro"},
+                {"id": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "displayName": "Claude Sonnet 4.6 (Thinking)"},
+                {"id": "claude-opus-4-6-thinking", "model": "claude-opus-4-6-thinking", "displayName": "Claude Opus 4.6 (Thinking)"},
+                {"id": "gpt-oss-120b-medium", "model": "gpt-oss-120b-medium", "displayName": "GPT-OSS 120B (Medium)"},
+            ]
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(agy_models),
             )
 
         if is_claude_sdk_harness_name(harness):

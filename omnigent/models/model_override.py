@@ -189,14 +189,22 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
             "claude_code worker for Claude models or the pi / openai-agents "
             "worker for any other gateway model."
         )
-    if canon in _ANTIGRAVITY_FAMILY_HARNESSES and (
-        is_claude or is_gpt or lower.startswith(_DATABRICKS_GATEWAY_PREFIX)
-    ):
-        return (
-            f"harness {canon!r} is Gemini-native and cannot run Claude/GPT or "
-            f"Databricks-gateway models; got {model!r}. Use a Gemini id "
-            "or the claude_code / codex / pi worker for those families."
-        )
+    if canon in _ANTIGRAVITY_FAMILY_HARNESSES:
+        if lower.startswith(_DATABRICKS_GATEWAY_PREFIX):
+            return (
+                f"harness {canon!r} is Gemini-native and cannot run Claude/GPT or "
+                f"Databricks-gateway models; got {model!r}. Use a Gemini id "
+                "or the claude_code / codex / pi worker for those families."
+            )
+        _agy_supported = {"claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"}
+        if lower in _agy_supported or lower.startswith("gemini-") or "gemini" in lower:
+            return None
+        if is_claude or is_gpt:
+            return (
+                f"harness {canon!r} is Gemini-native and cannot run Claude/GPT or "
+                f"Databricks-gateway models; got {model!r}. Use a Gemini id "
+                "or the claude_code / codex / pi worker for those families."
+            )
     return None
 
 

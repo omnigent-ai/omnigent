@@ -80,9 +80,12 @@ describe("nativeCodingAgentForHarness", () => {
   // latter would emit `--permission-mode <mode>`, a flag agy does not accept.
   it("gives antigravity-native the skipPermissions capability, not permissionMode", () => {
     const agy = nativeCodingAgentForHarness("antigravity-native");
-    expect(agy?.capabilities).toEqual(["skipPermissions"]);
+    expect(agy?.capabilities).toEqual(["skipPermissions", "modelPicker"]);
     expect(
       nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "skipPermissions"),
+    ).toBe(true);
+    expect(
+      nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "modelPicker"),
     ).toBe(true);
     expect(
       nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "permissionMode"),

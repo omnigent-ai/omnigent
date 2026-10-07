@@ -614,6 +614,7 @@ class _CodexNativeLaunchConfig:
     routing_enabled: bool = False
     turn_routing: bool = False
     reasoning_effort: str | None = None
+    codex_home_override: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1336,6 +1337,7 @@ async def _codex_native_launch_config(
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
     bypass_sandbox = False
+    codex_home_override: str | None = None
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -1346,6 +1348,9 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        _cho = labels.get("omnigent.codex.codex_home") or labels.get("codex_home")
+        if isinstance(_cho, str) and _cho:
+            codex_home_override = _cho
     # One derivation of the session's Smart Routing class, shared with the SDK
     # codex path, so "pinned" and "auto-harness" mean the same on both.
     routing_class = routing_class_from_snapshot(
@@ -1367,6 +1372,7 @@ async def _codex_native_launch_config(
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
         reasoning_effort=reasoning_effort,
+        codex_home_override=codex_home_override,
     )
 
 
@@ -5175,11 +5181,16 @@ async def _auto_create_codex_terminal(
         # Native Codex honors $CODEX_HOME; seed skills from that resolved home
         # (not a hardcoded ~/.codex) so the terminal and the web menu list the
         # same host skills.
+        _source_codex_home = (
+            Path(launch_config.codex_home_override).expanduser().resolve()
+            if launch_config.codex_home_override
+            else _codex_home_config_source_from_env()
+        )
         populate_codex_skills_from_bundle(
             codex_home,
             bundle_dir,
             skills_filter,
-            source_codex_home=_codex_home_config_source_from_env(),
+            source_codex_home=_source_codex_home,
         )
     except OSError:
         _logger.warning(
@@ -6384,6 +6395,21 @@ async def _auto_create_antigravity_terminal(
     # ``--gemini_dir``; seeding the real ``~/.gemini`` marker as well would write
     # the user's tree for a file this launch never reads.
 
+    # Forward reasoning effort (--effort) when set and model is not Claude.
+    reasoning_effort = snapshot.get("reasoning_effort")
+    if reasoning_effort and isinstance(reasoning_effort, str):
+        is_claude = bool(model and (model.startswith("claude-") or "claude" in model.lower()))
+        if not is_claude:
+            if not any(a == "--effort" or a.startswith("--effort=") for a in terminal_launch_args):
+                terminal_launch_args = (*terminal_launch_args, "--effort", reasoning_effort)
+
+    # Custom gemini_dir from agent config / session labels.
+    source_gemini_dir: str | None = None
+    if isinstance(labels, dict):
+        source_gemini_dir = labels.get("omnigent.antigravity.gemini_dir") or labels.get(
+            "gemini_dir"
+        )
+
     argv, env_overrides = build_agy_launch(
         conversation_id=external_session_id if resume else None,
         model=model,
@@ -6417,6 +6443,7 @@ async def _auto_create_antigravity_terminal(
             seed_isolated_agy_home,
             bridge_dir,
             trusted_workspace=workspace,
+            source_gemini_dir=source_gemini_dir,
         ),
     }
     # agy's periodic feedback survey shares its "esc to cancel" footer with the

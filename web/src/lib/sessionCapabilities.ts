@@ -5,6 +5,8 @@ const CODEX_NATIVE_WRAPPER = "codex-native-ui";
 const PI_NATIVE_WRAPPER = "pi-native-ui";
 const DEVIN_NATIVE_WRAPPER = "devin-native-ui";
 
+const ANTIGRAVITY_NATIVE_WRAPPER = "antigravity-native-ui";
+
 /**
  * Fail-closed gate for Web UI reasoning-effort controls.
  *
@@ -33,6 +35,8 @@ export function supportsEffortControl(
     // Devin has no --effort flag: effort is a model-variant suffix the executor
     // recombines and re-applies via /model, so the in-chat effort dial is live.
     wrapper === DEVIN_NATIVE_WRAPPER ||
-    (wrapper == null && session?.harness === "codex-native")
+    wrapper === ANTIGRAVITY_NATIVE_WRAPPER ||
+    (wrapper == null && session?.harness === "codex-native") ||
+    (wrapper == null && session?.harness === "antigravity-native")
   );
 }

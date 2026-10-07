@@ -536,6 +536,7 @@ def seed_isolated_agy_home(
     bridge_dir: Path,
     *,
     trusted_workspace: Path | str | None = None,
+    source_gemini_dir: Path | str | None = None,
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
@@ -557,10 +558,16 @@ def seed_isolated_agy_home(
         "Do you trust this project?" TUI gate for host-spawned sessions, mirroring
         ``ensure_claude_workspace_trusted`` while keeping trust scoped to this
         bridge-owned ``--gemini_dir``.
+    :param source_gemini_dir: Optional custom source .gemini directory to copy/seed
+        from instead of the default ``~/.gemini``.
     :returns: Env overrides to layer onto the agy launch environment. Currently
         empty because ``HOME`` must stay real for platform auth.
     """
-    real_home = Path.home()
+    source_gemini = (
+        Path(source_gemini_dir).expanduser().resolve()
+        if source_gemini_dir
+        else (Path.home() / ".gemini")
+    )
     iso_gemini = agy_gemini_dir(bridge_dir)
     (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)
     (iso_gemini / _MCP_CONFIG_DIR).mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -568,7 +575,7 @@ def seed_isolated_agy_home(
     # Copy the auth token + installation id (best-effort: a missing token only
     # means agy re-auths this session; the real files are never touched).
     for rel in _AGY_SEED_FILES:
-        src = real_home / ".gemini" / rel
+        src = source_gemini / rel
         if not src.is_file():
             continue
         dst = iso_gemini / rel
@@ -577,17 +584,17 @@ def seed_isolated_agy_home(
             dst.write_bytes(src.read_bytes())
             os.chmod(dst, 0o600)
 
-    _seed_isolated_agy_settings(real_home, iso_gemini)
-    _seed_isolated_agy_onboarding_marker(real_home, iso_gemini)
+    _seed_isolated_agy_settings(source_gemini, iso_gemini)
+    _seed_isolated_agy_onboarding_marker(source_gemini, iso_gemini)
 
     # Seed the migration marker so agy does not churn a from-scratch migration on
     # first launch under the fresh Gemini dir (cosmetic; agy creates it itself otherwise).
     with contextlib.suppress(OSError):
         (iso_gemini / _MCP_CONFIG_DIR / ".migrated").touch()
 
-    _seed_isolated_agy_plugins(real_home, iso_gemini)
-    _seed_isolated_agy_skills(real_home, iso_gemini)
-    _seed_isolated_agy_hooks(real_home, iso_gemini)
+    _seed_isolated_agy_plugins(source_gemini, iso_gemini)
+    _seed_isolated_agy_skills(source_gemini, iso_gemini)
+    _seed_isolated_agy_hooks(source_gemini, iso_gemini)
 
     if trusted_workspace is not None:
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
@@ -595,7 +602,7 @@ def seed_isolated_agy_home(
     return {}
 
 
-def _seed_isolated_agy_settings(real_home: Path, iso_gemini: Path) -> None:
+def _seed_isolated_agy_settings(source_gemini: Path, iso_gemini: Path) -> None:
     """Seed the user's real ``settings.json`` as the base of the isolated one.
 
     The real settings carry backend config agy needs at turn time — notably the
@@ -605,18 +612,18 @@ def _seed_isolated_agy_settings(real_home: Path, iso_gemini: Path) -> None:
     (the trust / survey seeders then merge their keys on top). Best-effort: a
     failed copy only means agy runs without the user's settings.
 
-    :param real_home: The user's real home directory.
+    :param source_gemini: The source .gemini directory.
     :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
     """
-    real_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
+    source_settings = source_gemini / "antigravity-cli" / "settings.json"
     iso_settings = iso_gemini / "antigravity-cli" / "settings.json"
-    if real_settings.is_file() and not iso_settings.exists():
+    if source_settings.is_file() and not iso_settings.exists():
         with contextlib.suppress(OSError):
-            iso_settings.write_bytes(real_settings.read_bytes())
+            iso_settings.write_bytes(source_settings.read_bytes())
             os.chmod(iso_settings, 0o600)
 
 
-def _seed_isolated_agy_onboarding_marker(real_home: Path, iso_gemini: Path) -> None:
+def _seed_isolated_agy_onboarding_marker(source_gemini: Path, iso_gemini: Path) -> None:
     """Seed the onboarding-complete marker so the first-run wizard never blocks.
 
     The user's real marker is preferred: it carries auth-flow state the
@@ -632,14 +639,14 @@ def _seed_isolated_agy_onboarding_marker(real_home: Path, iso_gemini: Path) -> N
     an unhookable wizard on a headless launch, and ``enterpriseOnboardingComplete:
     false`` verifiably re-triggers the wizard for enterprise/GCP accounts.
 
-    :param real_home: The user's real home directory.
+    :param source_gemini: The source .gemini directory.
     :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
     """
     onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
-    real_onboarding = real_home / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json"
+    source_onboarding = source_gemini / "antigravity-cli" / "cache" / "onboarding.json"
     with contextlib.suppress(OSError):
-        if real_onboarding.is_file():
-            onboarding.write_bytes(real_onboarding.read_bytes())
+        if source_onboarding.is_file():
+            onboarding.write_bytes(source_onboarding.read_bytes())
         else:
             onboarding.write_text(
                 json.dumps(
@@ -655,7 +662,7 @@ def _seed_isolated_agy_onboarding_marker(real_home: Path, iso_gemini: Path) -> N
             )
 
 
-def _seed_isolated_agy_plugins(real_home: Path, iso_gemini: Path) -> None:
+def _seed_isolated_agy_plugins(source_gemini: Path, iso_gemini: Path) -> None:
     """Expose the user's imported agy plugins under the isolated Gemini dir.
 
     Links ``config/plugins`` to the real tree and copies ``import_manifest.json``
@@ -666,21 +673,21 @@ def _seed_isolated_agy_plugins(real_home: Path, iso_gemini: Path) -> None:
     Best-effort: a user with no plugins, or a platform that refuses symlinks,
     simply gets a session without them rather than a failed launch.
 
-    :param real_home: The user's real home directory.
+    :param source_gemini: The source .gemini directory.
     :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
     """
-    real_config = real_home / ".gemini" / _MCP_CONFIG_DIR
+    source_config = source_gemini / _MCP_CONFIG_DIR
     iso_config = iso_gemini / _MCP_CONFIG_DIR
 
-    _link_into_isolated_gemini_dir(real_config / _AGY_PLUGINS_DIR, iso_config / _AGY_PLUGINS_DIR)
+    _link_into_isolated_gemini_dir(source_config / _AGY_PLUGINS_DIR, iso_config / _AGY_PLUGINS_DIR)
 
-    real_manifest = real_config / _AGY_IMPORT_MANIFEST
-    if real_manifest.is_file():
+    source_manifest = source_config / _AGY_IMPORT_MANIFEST
+    if source_manifest.is_file():
         with contextlib.suppress(OSError):
-            (iso_config / _AGY_IMPORT_MANIFEST).write_bytes(real_manifest.read_bytes())
+            (iso_config / _AGY_IMPORT_MANIFEST).write_bytes(source_manifest.read_bytes())
 
 
-def _seed_isolated_agy_skills(real_home: Path, iso_gemini: Path) -> None:
+def _seed_isolated_agy_skills(source_gemini: Path, iso_gemini: Path) -> None:
     """Expose the user's Global and Shared agy skills under the isolated Gemini dir.
 
     Links the trees in :data:`_AGY_SKILL_DIRS` back to the real home so the
@@ -690,16 +697,16 @@ def _seed_isolated_agy_skills(real_home: Path, iso_gemini: Path) -> None:
     Best-effort, like the plugin seed: a user with neither tree, or a platform
     that refuses symlinks, gets a session without them rather than a failed launch.
 
-    :param real_home: The user's real home directory.
+    :param source_gemini: The source .gemini directory.
     :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
     """
     for rel in _AGY_SKILL_DIRS:
-        _link_into_isolated_gemini_dir(real_home / ".gemini" / rel, iso_gemini / rel)
+        _link_into_isolated_gemini_dir(source_gemini / rel, iso_gemini / rel)
 
 
-def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
+def _seed_isolated_agy_hooks(source_gemini: Path, iso_gemini: Path) -> None:
     """Refresh session hooks while preserving each command's original working directory."""
-    real_hooks = real_home / ".gemini" / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
+    source_hooks = source_gemini / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
     iso_hooks = iso_gemini / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
 
     def preserve_cwd(value: dict[str, object]) -> dict[str, object]:
@@ -707,13 +714,13 @@ def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
         if isinstance(command, str) and command and value.get("type", "command") == "command":
             # agy runs hook commands from the directory containing hooks.json.
             value["command"] = (
-                f"cd {shlex.quote(str(real_hooks.parent))} && exec sh -c {shlex.quote(command)}"
+                f"cd {shlex.quote(str(source_hooks.parent))} && exec sh -c {shlex.quote(command)}"
             )
         return value
 
     try:
         try:
-            content = real_hooks.read_text(encoding="utf-8")
+            content = source_hooks.read_text(encoding="utf-8")
         except FileNotFoundError:
             iso_hooks.unlink(missing_ok=True)
             return

@@ -10611,6 +10611,35 @@ async def _create_session_from_existing_agent(
         if repl_labels:
             initial_labels.update(repl_labels)
 
+    # Forward custom codex_home or gemini_dir from agent spec config/labels
+    # so runner terminals isolate correctly.
+    spec_for_env = sub_spec or own_spec or selection_spec
+    if spec_for_env is not None:
+        exec_cfg = getattr(spec_for_env.executor, "config", None)
+        if isinstance(exec_cfg, dict):
+            if "codex_home" in exec_cfg and "omnigent.codex.codex_home" not in initial_labels:
+                initial_labels["omnigent.codex.codex_home"] = str(exec_cfg["codex_home"])
+            if (
+                "gemini_dir" in exec_cfg
+                and "omnigent.antigravity.gemini_dir" not in initial_labels
+            ):
+                initial_labels["omnigent.antigravity.gemini_dir"] = str(exec_cfg["gemini_dir"])
+        guardrails_spec = getattr(spec_for_env, "guardrails", None)
+        if guardrails_spec is not None and getattr(guardrails_spec, "labels", None):
+            glabels = guardrails_spec.labels
+            if isinstance(glabels, dict):
+                if "codex_home" in glabels and "omnigent.codex.codex_home" not in initial_labels:
+                    val = getattr(glabels["codex_home"], "initial", None)
+                    if val:
+                        initial_labels["omnigent.codex.codex_home"] = str(val)
+                if (
+                    "gemini_dir" in glabels
+                    and "omnigent.antigravity.gemini_dir" not in initial_labels
+                ):
+                    val = getattr(glabels["gemini_dir"], "initial", None)
+                    if val:
+                        initial_labels["omnigent.antigravity.gemini_dir"] = str(val)
+
     if harness_override == "auto" or _native_smart_routing:
         from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
 

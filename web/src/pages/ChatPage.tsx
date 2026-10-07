@@ -2184,6 +2184,7 @@ export function composerHarnessLabel(
   if (nativeSubagent) return nativeSubagent.displayName;
   if (modelPickerKind === "claude") return "Claude";
   if (modelPickerKind === "codex") return "Codex";
+  if (modelPickerKind === "antigravity") return "Antigravity";
   if (modelPickerKind === "cursor") return "Cursor";
   if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
@@ -4296,7 +4297,16 @@ const PI_NATIVE_EFFORT_LEVELS = [
 ] as const;
 
 type NativeModelPickerKind =
-  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
+  | "claude"
+  | "codex"
+  | "cursor"
+  | "kiro"
+  | "opencode"
+  | "pi"
+  | "devin"
+  | "antigravity"
+  | "acp"
+  | "configured";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4406,6 +4416,9 @@ export function effortLevelsForConv(
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
+    case "antigravity-native-ui":
+      if (currentModel?.startsWith("claude-")) return [];
+      return ["low", "medium", "high"];
     default:
       return EFFORT_LEVELS;
   }
@@ -4457,6 +4470,8 @@ export function modelPickerKindForConv(
       // ``/model`` picks back to ``model_override`` via the extension's
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
+    case "antigravity-native-ui":
+      return "antigravity";
     default:
       if (conv?.inferenceConfigured) return "configured";
       // Generic ACP sessions carry no wrapper label; the server canonicalizes
@@ -4730,6 +4745,12 @@ function SessionHarnessPicker({
         modelPickerKind === "codex" &&
         selectedEffort !== null &&
         !codexEffortLevelsForModel(codexModelOptions, modelId).includes(selectedEffort)
+      )
+        await store.setEffort(null);
+      if (
+        modelPickerKind === "antigravity" &&
+        selectedEffort !== null &&
+        modelId?.startsWith("claude-")
       )
         await store.setEffort(null);
       if (
@@ -5037,6 +5058,7 @@ function useResolvedComposerModel(
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode" ||
     modelPickerKind === "devin" ||
+    modelPickerKind === "antigravity" ||
     modelPickerKind === "acp" ||
     modelPickerKind === "configured";
   const modelOptions: readonly {
@@ -5087,7 +5109,7 @@ function useResolvedComposerModel(
     : nativeVendorOwnsModel
       ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
         ? sessionModelOverride
-        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
+        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin" || modelPickerKind === "antigravity"
           ? (sessionModelOverride ?? llmModel)
           : null
       : isReportedModelPicker

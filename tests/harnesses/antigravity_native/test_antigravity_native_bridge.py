@@ -2198,9 +2198,37 @@ def test_seeding_and_mcp_config_never_mutate_real_gemini_dir(
     assert (agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json").is_file()
 
 
+def test_seed_isolated_agy_home_uses_custom_source_gemini_dir(
+    tmp_path: Path,
+) -> None:
+    """When source_gemini_dir is specified, seed from that custom path instead of ~/.gemini."""
+    custom_gemini = tmp_path / "custom_profile" / ".gemini"
+    custom_gemini.mkdir(parents=True)
+    (custom_gemini / "antigravity-cli").mkdir(parents=True)
+    (custom_gemini / "antigravity-cli" / "installation_id").write_text(
+        "custom-install-id", encoding="utf-8"
+    )
+    (custom_gemini / "oauth_creds.json").write_text(
+        '{"access_token":"custom-token"}', encoding="utf-8"
+    )
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir, source_gemini_dir=custom_gemini)
+
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    assert (
+        iso_gemini / "antigravity-cli" / "installation_id"
+    ).read_text(encoding="utf-8") == "custom-install-id"
+    assert (
+        iso_gemini / "oauth_creds.json"
+    ).read_text(encoding="utf-8") == '{"access_token":"custom-token"}'
+
+
 # ---------------------------------------------------------------------------
 # Interaction-prompt TUI delivery (send_interaction_keys_via_tui) — #1200
 # ---------------------------------------------------------------------------
+
 
 
 def test_send_interaction_keys_via_tui_sends_one_send_keys_invocation(
