@@ -153,7 +153,12 @@ def test_claude_agents_skill_args_without_portable_skills_skips_native_reads(
 
 @pytest.mark.parametrize(
     "skills_filter,expected",
-    [("all", {"portable", "hidden"}), ("none", set()), (["portable"], {"portable"})],
+    [
+        ("all", {"portable", "hidden"}),
+        ("none", set()),
+        (["portable"], {"portable"}),
+        (["label-portable"], {"portable"}),
+    ],
 )
 def test_claude_agents_skill_args(
     tmp_path: Path,

@@ -237,6 +237,24 @@ def test_claude_provider_invokes_skills_by_directory_name(
     ]
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "claude-sdk"])
+@pytest.mark.parametrize("configured", ["review", "code-review"])
+def test_claude_provider_filter_accepts_directory_or_frontmatter_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str, configured: str
+) -> None:
+    """A ``skills:`` list naming the frontmatter ``name`` still selects the skill."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    skill = home / ".claude" / "skills" / "review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: code-review\ndescription: Review\n---\nbody\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home, skills_filter=[configured]), harness)
+    assert [(s.name, s.display_name) for s in out] == [("review", "code-review")]
+
+
 def test_claude_provider_sources_user_skills_from_config_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -800,6 +800,50 @@ def test_parse_skill_name_comes_from_directory(agent_dir: Path) -> None:
     assert skill.display_name == "Simplified Technical English (ASD-STE100)"
 
 
+def _write_loadable_config(agent_dir: Path) -> None:
+    """Give *agent_dir* the executor that validated ``load()`` requires."""
+    config = {
+        "spec_version": 1,
+        "name": "test-agent",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    }
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+
+
+def test_load_keeps_frontmatter_name_when_skill_directory_is_invalid(agent_dir: Path) -> None:
+    """A bundle that validated on its frontmatter name still loads under that name."""
+    from omnigent.spec import load
+
+    _write_loadable_config(agent_dir)
+
+    for directory, name in (("Code_Review", "code-review"), ("review", "code-review")):
+        skill_dir = agent_dir / "skills" / directory
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Review code.\n---\nBody."
+        )
+
+    skills = load(agent_dir).skills
+    assert [(s.name, s.display_name) for s in skills] == [
+        ("code-review", None),
+        ("review", "code-review"),
+    ]
+
+
+def test_load_rejects_skill_without_any_valid_name(agent_dir: Path) -> None:
+    """The legacy fallback only applies when the frontmatter name is itself valid."""
+    from omnigent.spec import load
+
+    _write_loadable_config(agent_dir)
+
+    skill_dir = agent_dir / "skills" / "Code_Review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: Code Review\ndescription: x\n---\nBody.")
+
+    with pytest.raises(OmnigentError, match="skill directory name must match"):
+        load(agent_dir)
+
+
 def test_parse_skill_user_invocable_false(agent_dir: Path) -> None:
     """``user-invocable: false`` frontmatter parses to ``user_invocable=False``."""
     skill_dir = agent_dir / "skills" / "internal-hook"
