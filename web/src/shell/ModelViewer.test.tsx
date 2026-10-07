@@ -81,6 +81,7 @@ let lastCamera: {
 } | null = null;
 let lastKeyTarget: { parent: unknown; position: { x: number; y: number; z: number } } | null = null;
 let resizeControls: (() => void) | null = null;
+const resizeCallOrder: string[] = [];
 let rotationWrites = 0;
 
 function makeRotation() {
@@ -147,7 +148,6 @@ function controlsStub(kind: "orbit" | "trackball") {
         throw new Error("controls init failed");
       }
       const position = (camera as { position: { x: number; y: number; z: number } }).position;
-      element.style.touchAction = "none";
       lastControls = {
         kind,
         camera,
@@ -159,6 +159,7 @@ function controlsStub(kind: "orbit" | "trackball") {
       };
     }
     handleResize() {
+      resizeCallOrder.push("controls.handleResize");
       if (lastControls) lastControls.handleResizeCalls += 1;
     }
     update() {
@@ -242,7 +243,9 @@ vi.mock("three", () => {
       lastRenderer = this.record;
     }
     setPixelRatio() {}
-    setSize() {}
+    setSize(width: number, height: number) {
+      resizeCallOrder.push(`renderer.setSize:${width}x${height}`);
+    }
     setClearColor(_color: number, alpha = 1) {
       this.record.clearAlpha = alpha;
     }
@@ -377,6 +380,7 @@ beforeEach(() => {
   lastCamera = null;
   lastKeyTarget = null;
   resizeControls = null;
+  resizeCallOrder.length = 0;
   rotationWrites = 0;
   themeState.resolvedTheme = "light";
   vi.stubGlobal(
@@ -500,8 +504,20 @@ describe("ModelViewer print orientation", () => {
 });
 
 describe("ModelViewer trackball controls and headlight", () => {
-  it("fits the camera before creating trackball controls and keeps touch-action disabled", async () => {
+  it("fits before creating trackball controls and resizes controls after the renderer", async () => {
     render(<ModelViewer data={makeData()} path="part.stl" />);
+    const container = screen.getByLabelText("3D preview of part.stl");
+    vi.spyOn(container, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 400,
+      bottom: 900,
+      width: 400,
+      height: 900,
+      toJSON: () => ({}),
+    } as DOMRect);
     await waitFor(() => expect(lastControls).not.toBeNull());
     const controls = lastControls;
     if (!controls) throw new Error("TrackballControls were not initialized");
@@ -510,7 +526,6 @@ describe("ModelViewer trackball controls and headlight", () => {
     expect((controls.camera as { children: unknown[] }).children).toBe(lastCamera?.children);
     expect(controls.cameraPositionOnConstruction).toEqual(lastCamera?.position);
     expect(controls.cameraPositionOnConstruction).not.toEqual({ x: 0, y: 0, z: 0 });
-    expect(controls.element.style.touchAction).toBe("none");
     expect(controls.updateCalls).toBeGreaterThanOrEqual(1);
     expect(
       lastCamera?.children.some(
@@ -528,7 +543,12 @@ describe("ModelViewer trackball controls and headlight", () => {
     expect(lastScene?.background).toBeNull();
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
 
+    const resizeStart = resizeCallOrder.length;
     resizeControls?.();
+    expect(resizeCallOrder.slice(resizeStart)).toEqual([
+      "renderer.setSize:400x900",
+      "controls.handleResize",
+    ]);
     expect(controls.handleResizeCalls).toBe(1);
   });
 
