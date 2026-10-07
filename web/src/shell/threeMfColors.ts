@@ -4,6 +4,7 @@ const CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 const MAX_SELECTED_BYTES = 32 * 1024 * 1024;
+const MAX_EMITTED_BYTES = 32 * 1024 * 1024;
 const MAX_OBJECTS = 10_000;
 const MAX_COMPONENTS = 10_000;
 const MAX_COMPONENT_DEPTH = 64;
@@ -59,19 +60,39 @@ function zipPath(path: string, containing = ""): string {
 
 export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
   try {
-    let selectedBytes = 0;
-    const select = (size: number) => {
-      selectedBytes += size;
-      if (selectedBytes > MAX_SELECTED_BYTES) throw new Error("3MF byte limit");
-      return true;
-    };
     const bytes = new Uint8Array(buffer);
-    const configs = unzipSync(bytes, {
-      filter: (entry) =>
-        (entry.name === "Metadata/model_settings.config" ||
-          entry.name === "Metadata/project_settings.config") &&
-        select(entry.originalSize),
-    });
+    let selectedBytes = 0;
+    let extractedBytes = 0;
+    const extract = (needed: (name: string) => boolean) => {
+      const sizes = new Map<string, number>();
+      const entries = unzipSync(bytes, {
+        filter: (entry) => {
+          if (!needed(entry.name)) return false;
+          if (
+            !Number.isSafeInteger(entry.size) ||
+            !Number.isSafeInteger(entry.originalSize) ||
+            entry.size < 0 ||
+            entry.originalSize < 0 ||
+            (entry.compression === 0 && entry.size !== entry.originalSize)
+          )
+            throw new Error("Invalid ZIP size");
+          selectedBytes += entry.originalSize;
+          if (selectedBytes > MAX_SELECTED_BYTES) throw new Error("3MF byte limit");
+          sizes.set(entry.name, entry.originalSize);
+          return true;
+        },
+      });
+      for (const [name, data] of Object.entries(entries)) {
+        extractedBytes += data.byteLength;
+        if (data.byteLength !== sizes.get(name) || extractedBytes > MAX_SELECTED_BYTES)
+          throw new Error("3MF extracted byte limit");
+      }
+      return entries;
+    };
+    const configs = extract(
+      (name) =>
+        name === "Metadata/model_settings.config" || name === "Metadata/project_settings.config",
+    );
     if (!configs["Metadata/model_settings.config"] || !configs["Metadata/project_settings.config"])
       return buffer;
     const palette: unknown = JSON.parse(
@@ -100,11 +121,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     }
     if (candidateColors.size < 2) return buffer;
 
-    const entries = unzipSync(bytes, {
-      filter: (entry) =>
-        (entry.name.endsWith(".model") || entry.name === "_rels/.rels") &&
-        select(entry.originalSize),
-    });
+    const entries = extract((name) => name.endsWith(".model") || name === "_rels/.rels");
     const rootRelationship = Array.from(
       xml(entries["_rels/.rels"]).getElementsByTagName("Relationship"),
     ).find((relationship) => relationship.getAttribute("Type") === MODEL_RELATIONSHIP);
@@ -151,9 +168,19 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     outputModel.append(resources);
     const colors: string[] = [];
     const memo = new Map<string, string>();
+    const sourceSizes = new Map<string, number>();
+    let emittedBytes = 0;
+    const reserve = (source: Element, key: string) => {
+      let size = sourceSizes.get(key);
+      if (size === undefined) {
+        size = strToU8(new XMLSerializer().serializeToString(source)).byteLength;
+        sourceSizes.set(key, size);
+      }
+      emittedBytes += size;
+      if (emittedBytes > MAX_EMITTED_BYTES) throw new Error("3MF emitted byte limit");
+    };
     const visiting = new Set<string>();
     let nextId = 2;
-    let visits = 0;
     const clone = (
       path: string,
       id: string,
@@ -163,17 +190,25 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       enabled: boolean,
       depth: number,
     ): string => {
-      if (depth > MAX_COMPONENT_DEPTH || ++visits > MAX_COMPONENTS)
-        throw new Error("3MF component limit");
+      if (depth > MAX_COMPONENT_DEPTH) throw new Error("3MF component depth limit");
       const sourceKey = JSON.stringify([path, id]);
       const source = objects.get(sourceKey);
       if (!source || visiting.has(sourceKey)) throw new Error("Invalid component graph");
-      visiting.add(sourceKey);
       const effectiveSlot = slot(assigned, inherited);
       const recolor = enabled && (!assigned || normal(assigned));
-      const object = output.importNode(source, true);
-      const mesh = children(object, "mesh")[0];
+      const mesh = children(source, "mesh")[0];
       const effectiveColor = mesh && assigned && recolor ? color(effectiveSlot) : null;
+      const key = JSON.stringify(
+        mesh
+          ? [sourceKey, effectiveColor]
+          : [sourceKey, effectiveSlot, recolor, Boolean(assigned), depth === 0],
+      );
+      const previous = memo.get(key);
+      if (previous) return previous;
+      if (memo.size >= MAX_OBJECTS) throw new Error("3MF emitted object limit");
+      reserve(source, sourceKey);
+      visiting.add(sourceKey);
+      const object = output.importNode(source, true);
       for (const components of children(object, "components")) {
         for (const child of children(components, "component")) {
           const childId = child.getAttribute("objectid") ?? "";
@@ -194,13 +229,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         }
       }
       visiting.delete(sourceKey);
-      const key = JSON.stringify([
-        sourceKey,
-        effectiveColor,
-        mesh ? null : new XMLSerializer().serializeToString(object),
-      ]);
-      const previous = memo.get(key);
-      if (previous) return previous;
+      if (memo.size >= MAX_OBJECTS) throw new Error("3MF emitted object limit");
       const newId = String(nextId++);
       memo.set(key, newId);
       object.setAttribute("id", newId);
@@ -222,17 +251,31 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     };
     const sourceBuild = children(root.documentElement, "build")[0];
     if (!sourceBuild) return buffer;
+    reserve(sourceBuild, "build");
     const build = output.importNode(sourceBuild, true);
     for (const item of children(build, "item")) {
       const id = item.getAttribute("objectid") ?? "";
+      const targetPath = item.getAttributeNS(PRODUCTION, "path");
+      const path = targetPath ? zipPath(targetPath, rootPath) : rootPath;
+      const source = objects.get(JSON.stringify([path, id]));
+      if (!source) return buffer;
       const config = objectConfigs.get(id);
       const parts = new Map(
         config ? children(config, "part").map((part) => [part.getAttribute("id"), part]) : [],
       );
       item.setAttribute(
         "objectid",
-        clone(rootPath, id, parts, slot(config, 1), parts.get(id), true, 0),
+        clone(
+          path,
+          id,
+          parts,
+          slot(config, 1),
+          children(source, "mesh").length ? parts.get(id) : undefined,
+          true,
+          0,
+        ),
       );
+      item.removeAttributeNS(PRODUCTION, "path");
     }
     if (colors.length < 2) return buffer;
     outputModel.append(build);
