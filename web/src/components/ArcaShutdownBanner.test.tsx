@@ -39,6 +39,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function mountToastDescription(index = state.toast.mock.calls.length - 1) {
+  return render(state.toast.mock.calls[index][1].description);
+}
+
 describe("ArcaShutdownBanner", () => {
   it("renders nothing when the flag is off or host is offline", () => {
     state.enabled = false;
@@ -83,6 +87,16 @@ describe("ArcaShutdownBanner", () => {
     view.rerender(<ArcaShutdownBanner hostId="arca" />);
     expect(screen.queryByText("arca extend workweek")).toBeNull();
   });
+
+  it("marks a background banner only after its tab becomes visible", () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    render(<ArcaShutdownBanner hostId="arca" />);
+    expect(screen.getByText(/Your Arca will shut down/)).toBeTruthy();
+    expect(isToastedToday(state.now)).toBe(false);
+    visibility.mockReturnValue("visible");
+    fireEvent(document, new Event("visibilitychange"));
+    expect(isToastedToday(state.now)).toBe(true);
+  });
 });
 
 describe("Arca toast", () => {
@@ -102,28 +116,32 @@ describe("Arca toast", () => {
         }),
       }),
     );
-    const description = state.toast.mock.calls[0][1].description;
-    const descriptionView = render(description);
+    expect(isToastedToday(state.now)).toBe(false);
+    const descriptionView = mountToastDescription();
     expect(descriptionView.container.querySelector("code")?.textContent).toBe(
       "arca extend overnight",
     );
+    expect(isToastedToday(state.now)).toBe(true);
     state.now = new Date(2026, 9, 6, 17, 0);
     first.rerender();
     second.rerender();
     expect(state.toast).toHaveBeenCalledTimes(2);
   });
 
-  it("records today without a toast when the active Arca banner is visible", () => {
+  it("records today only after the active Arca banner mounts", () => {
     renderHook(() => useArcaShutdownWarning(true, "arca"));
     expect(state.toast).not.toHaveBeenCalled();
-    expect(isToastedToday(state.now)).toBe(true);
+    expect(isToastedToday(state.now)).toBe(false);
     render(<ArcaShutdownBanner hostId="arca" />);
     expect(screen.getByText(/Your Arca will shut down/)).toBeTruthy();
+    expect(isToastedToday(state.now)).toBe(true);
   });
 
   it("still toasts on a non-Arca page", () => {
     renderHook(() => useArcaShutdownWarning(true, "other-host"));
     expect(state.toast).toHaveBeenCalledTimes(1);
+    expect(isToastedToday(state.now)).toBe(false);
+    mountToastDescription();
     expect(isToastedToday(state.now)).toBe(true);
   });
 
@@ -136,6 +154,52 @@ describe("Arca toast", () => {
     expect(isToastedToday(state.now)).toBe(false);
     view.rerender({ loading: false, hostId: "arca" });
     expect(state.toast).not.toHaveBeenCalled();
+    expect(isToastedToday(state.now)).toBe(false);
+    render(<ArcaShutdownBanner hostId="arca" />);
+    expect(isToastedToday(state.now)).toBe(true);
+  });
+
+  it("toasts when a transient Arca host resolves to no host on a non-Arca page", () => {
+    const view = renderHook(({ hostId }) => useArcaShutdownWarning(true, hostId), {
+      initialProps: { hostId: "arca" as string | null },
+    });
+    expect(state.toast).not.toHaveBeenCalled();
+    expect(isToastedToday(state.now)).toBe(false);
+    view.rerender({ hostId: null });
+    expect(state.toast).toHaveBeenCalledTimes(1);
+    mountToastDescription();
+    expect(isToastedToday(state.now)).toBe(true);
+  });
+
+  it("does not toast after Not now in the active Arca session", () => {
+    localStorage.setItem("omnigent:arca-shutdown:dismissed", "2026-10-05");
+    renderHook(() => useArcaShutdownWarning(true, "arca"));
+    render(<ArcaShutdownBanner hostId="arca" />);
+    expect(state.toast).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Your Arca will shut down/)).toBeNull();
+  });
+
+  it("waits for a hidden tab to become visible before calling toast", () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    renderHook(() => useArcaShutdownWarning(true));
+    expect(state.toast).not.toHaveBeenCalled();
+    expect(isToastedToday(state.now)).toBe(false);
+    visibility.mockReturnValue("visible");
+    fireEvent(document, new Event("visibilitychange"));
+    expect(state.toast).toHaveBeenCalledTimes(1);
+    mountToastDescription();
+    expect(isToastedToday(state.now)).toBe(true);
+  });
+
+  it("does not mark toast content hidden before it mounted", () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    renderHook(() => useArcaShutdownWarning(true));
+    expect(state.toast).toHaveBeenCalledTimes(1);
+    visibility.mockReturnValue("hidden");
+    mountToastDescription();
+    expect(isToastedToday(state.now)).toBe(false);
+    visibility.mockReturnValue("visible");
+    fireEvent(document, new Event("visibilitychange"));
     expect(isToastedToday(state.now)).toBe(true);
   });
 
@@ -172,12 +236,26 @@ describe("Arca toast", () => {
     expect(screen.queryByText(/Your Arca will shut down/)).toBeNull();
   });
 
+  it("retries next tick if a toast was never mounted by Toaster", () => {
+    const view = renderHook(() => useArcaShutdownWarning(true));
+    expect(state.toast).toHaveBeenCalledTimes(1);
+    expect(isToastedToday(state.now)).toBe(false);
+    state.now = new Date(2026, 9, 5, 17, 30);
+    view.rerender();
+    expect(state.toast).toHaveBeenCalledTimes(2);
+    mountToastDescription();
+    state.now = new Date(2026, 9, 5, 18, 0);
+    view.rerender();
+    expect(state.toast).toHaveBeenCalledTimes(2);
+  });
+
   it("does not repeat on the next clock tick when storage rejects writes", () => {
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("storage unavailable");
     });
     const view = renderHook(() => useArcaShutdownWarning(true));
     expect(state.toast).toHaveBeenCalledTimes(1);
+    mountToastDescription();
     state.now = new Date(2026, 9, 5, 17, 30);
     view.rerender();
     expect(state.toast).toHaveBeenCalledTimes(1);

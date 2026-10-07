@@ -19,6 +19,30 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 
 const OVERNIGHT_COMMAND = "arca extend overnight";
+const pendingToastTicks = new WeakSet<Date>();
+
+export function useMarkArcaWarningWhenVisible(now: Date) {
+  useEffect(() => {
+    const markIfVisible = () => {
+      if (document.visibilityState === "visible") markToastedToday(now);
+    };
+    markIfVisible();
+    document.addEventListener("visibilitychange", markIfVisible);
+    return () => document.removeEventListener("visibilitychange", markIfVisible);
+  }, [now]);
+}
+
+function ToastDescription({ now }: { now: Date }) {
+  useMarkArcaWarningWhenVisible(now);
+
+  return createElement(
+    "span",
+    null,
+    "Run ",
+    createElement("code", null, OVERNIGHT_COMMAND),
+    " on your laptop to keep it running.",
+  );
+}
 
 export function useArcaShutdownWarning(
   showToast = false,
@@ -29,7 +53,7 @@ export function useArcaShutdownWarning(
   const enabled = isFeatureEnabled(info, "arca_shutdown_warnings");
   const { data: hosts } = useHosts({ enabled });
   const now = useNow();
-  const [, refresh] = useReducer((value: number) => value + 1, 0);
+  const [refreshTick, refresh] = useReducer((value: number) => value + 1, 0);
   const storedId = readArcaHostId();
   const onlineArcaHosts = hosts?.filter(
     (host) => host.status === "online" && isArcaHost(host, storedId),
@@ -38,20 +62,23 @@ export function useArcaShutdownWarning(
   const activeArcaHostOnline = onlineArcaHosts?.some((host) => host.host_id === activeHostId);
 
   useEffect(() => {
-    if (!showToast || !enabled || activeHostLoading || !isWarningWindow(now) || !hasOnlineArcaHost)
+    if (
+      !showToast ||
+      !enabled ||
+      activeHostLoading ||
+      document.visibilityState !== "visible" ||
+      !isWarningWindow(now) ||
+      !hasOnlineArcaHost
+    )
       return;
-    if (isOptedOut() || isToastedToday(now)) return;
-    markToastedToday(now);
-    if (!isDismissedToday(now) && activeArcaHostOnline) return;
+    if (isOptedOut() || isDismissedToday(now) || isToastedToday(now) || activeArcaHostOnline)
+      return;
+    const day = dateKey(now);
+    if (pendingToastTicks.has(now)) return;
+    pendingToastTicks.add(now);
     toast("Arca shuts down at about 6 PM", {
-      id: `arca-shutdown:${dateKey(now)}`,
-      description: createElement(
-        "span",
-        null,
-        "Run ",
-        createElement("code", null, OVERNIGHT_COMMAND),
-        " on your laptop to keep it running.",
-      ),
+      id: `arca-shutdown:${day}`,
+      description: createElement(ToastDescription, { now }),
       duration: Infinity,
       closeButton: true,
       classNames: {
@@ -71,14 +98,24 @@ export function useArcaShutdownWarning(
       },
       cancel: { label: "Not now", onClick: () => storeDismissToday(now) },
     });
-  }, [showToast, enabled, now, hasOnlineArcaHost, activeArcaHostOnline, activeHostLoading]);
+  }, [
+    showToast,
+    enabled,
+    now,
+    hasOnlineArcaHost,
+    activeArcaHostOnline,
+    activeHostLoading,
+    refreshTick,
+  ]);
 
   useEffect(() => {
     window.addEventListener(ARCA_WARNING_PREFERENCES_CHANGED, refresh);
     window.addEventListener("storage", refresh);
+    document.addEventListener("visibilitychange", refresh);
     return () => {
       window.removeEventListener(ARCA_WARNING_PREFERENCES_CHANGED, refresh);
       window.removeEventListener("storage", refresh);
+      document.removeEventListener("visibilitychange", refresh);
     };
   }, []);
 
