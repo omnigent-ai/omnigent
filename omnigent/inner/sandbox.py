@@ -21,7 +21,13 @@ from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 from omnigent.util.json_types import JsonValue
 
 from .agent_env import DESKTOP_SESSION_ENV_VARS
-from .datamodel import CredentialProxySpec, CredentialSourceSpec, OSEnvSandboxSpec, OSEnvSpec
+from .datamodel import (
+    CredentialProxySpec,
+    CredentialSourceSpec,
+    GitSshBinding,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +185,7 @@ class SandboxPolicy:
     spawn_env_allowlist: list[str] | None = None
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
+    git_ssh_socket_path: str | None = None
     deny_unix_socket_paths: list[Path] | None = None
     credential_source_paths: list[Path] | None = None
     # Parent-side only: the resolved credential-proxy policy. Read in
@@ -188,6 +195,7 @@ class SandboxPolicy:
     # non-secret synthetic payload over the config FD, and resolved
     # secrets never touch the policy that serialises into logs / dumps.
     credential_proxy: CredentialProxySpec | None = None
+    git_ssh: list[GitSshBinding] | None = None
     # Parent-side only: write roots the dotfile / escaping-symlink mask
     # scan must NOT walk. Framework code adds the sandbox's own runtime
     # scaffolding to ``write_roots`` via
@@ -241,6 +249,7 @@ class SandboxPolicy:
             ),
             "egress_relay_port": self.egress_relay_port,
             "egress_socket_path": self.egress_socket_path,
+            "git_ssh_socket_path": self.git_ssh_socket_path,
             "deny_unix_socket_paths": (
                 _json_string_list(self.deny_unix_socket_paths)
                 if self.deny_unix_socket_paths is not None
@@ -301,6 +310,10 @@ class SandboxPolicy:
         egress_socket_path: str | None = (
             str(egress_socket_path_raw) if egress_socket_path_raw is not None else None
         )
+        git_ssh_socket_path_raw = data.get("git_ssh_socket_path")
+        git_ssh_socket_path = (
+            str(git_ssh_socket_path_raw) if git_ssh_socket_path_raw is not None else None
+        )
         deny_unix_socket_paths_data = data.get("deny_unix_socket_paths")
         deny_unix_socket_paths: list[Path] | None = None
         if isinstance(deny_unix_socket_paths_data, list):
@@ -338,6 +351,7 @@ class SandboxPolicy:
             spawn_env_allowlist=spawn_env_allowlist,
             egress_relay_port=egress_relay_port,
             egress_socket_path=egress_socket_path,
+            git_ssh_socket_path=git_ssh_socket_path,
             deny_unix_socket_paths=deny_unix_socket_paths,
             credential_source_paths=credential_source_paths,
         )
@@ -495,6 +509,15 @@ def _resolve_grant_root(cwd: Path, root: str) -> Path:
 
 def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
     sandbox_spec = spec.sandbox or _default_sandbox_for_platform()
+    if sandbox_spec.git_ssh:
+        if sandbox_spec.type not in ("linux_bwrap", "darwin_seatbelt"):
+            raise ValueError("git_ssh requires linux_bwrap or darwin_seatbelt")
+        from .git_ssh import normalize_git_ssh_bindings
+
+        sandbox_spec = replace(
+            sandbox_spec, git_ssh=normalize_git_ssh_bindings(sandbox_spec.git_ssh)
+        )
+        spec = replace(spec, sandbox=sandbox_spec)
     if sandbox_spec.type != "linux_bwrap" and any(
         grant.copy_on_write for grant in sandbox_spec.write_path_specs
     ):
@@ -537,6 +560,12 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
                 or entry.source.refresh_interval_seconds is not None
             ):
                 protect_credential_source(entry.source, policy, cwd=cwd)
+    if policy.git_ssh:
+        for binding in policy.git_ssh:
+            for path in (binding.identity_file, binding.known_hosts_file):
+                protect_credential_source(
+                    CredentialSourceSpec(kind="file", path=path), policy, cwd=cwd
+                )
     if policy.copy_on_write_roots:
         from omnigent.sandbox.copy_on_write import attach_shared_environment
 
@@ -817,6 +846,7 @@ def _clone_policy_with(
         ),
         egress_relay_port=policy.egress_relay_port,
         egress_socket_path=policy.egress_socket_path,
+        git_ssh_socket_path=policy.git_ssh_socket_path,
         deny_unix_socket_paths=(
             list(policy.deny_unix_socket_paths)
             if policy.deny_unix_socket_paths is not None
@@ -832,6 +862,7 @@ def _clone_policy_with(
         # ``_start_locked``, so dropping it here would silently disable
         # the feature.
         credential_proxy=policy.credential_proxy,
+        git_ssh=policy.git_ssh,
         # Preserve (or, when a helper is extending it, override) the set
         # of framework write roots excluded from the mask scan. ``None``
         # from a caller means "keep whatever the source policy carried".

@@ -512,6 +512,53 @@ os_env:
 Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
+### Git over SSH from a sandbox
+
+`sandbox.git_ssh` grants one Git repository and one SSH operation at a time.
+The trusted parent runs OpenSSH with the private key. The sandbox receives a
+Git transport helper and a private Unix socket; it cannot read the key or
+connect directly to the SSH host. Use a read-only deploy key for `fetch` when
+the server supports one.
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto # resolves to linux_bwrap or darwin_seatbelt
+    git_ssh:
+      - host: github.com
+        port: 22
+        username: git
+        repository: my-org/my-repo.git
+        operations: [fetch]
+        identity_file: /home/runner/.ssh/my-repo-deploy-key
+        known_hosts_file: /home/runner/.ssh/github-pinned-host-key
+```
+
+The `known_hosts_file` must contain one exact host key entry for `host`, for
+example `github.com ssh-ed25519 <public-key>`. Record the expected key through
+a trusted channel; do not accept an unverified `ssh-keyscan` result. Keep both
+files outside sandbox read and write paths. The same binding can be used from
+`sys_os_shell` and sandboxed terminals. Run `git clone
+git@github.com:my-org/my-repo.git` or `git fetch` as usual. Add `push` to
+`operations` only for a write-capable key, and add separate bindings for
+submodules or other repositories.
+
+DNS names are resolved by the parent for each connection, and every returned
+address must be allowed. Public addresses need no extra setting. For a private
+SSH server, set `allowed_cidrs` on that binding to the narrow network range
+that contains its addresses. The parent pins the chosen address for the SSH
+connection and verifies the SSH host key against the configured name.
+Loopback remains blocked unless a local development binding uses a loopback IP
+literal, its exact `/32` CIDR, and `allow_loopback: true` together. Do not use
+that option for a shared or production SSH server.
+
+This grant covers Git's `git-upload-pack` and, when explicitly allowed,
+`git-receive-pack`. It does not grant a shell, arbitrary SSH commands, or Git
+LFS HTTP authentication. Local `linux_bwrap` and `darwin_seatbelt` sandboxes
+support it; other backends reject the setting.
+
 ### Refreshing proxy credentials
 
 File and Unix socket credential sources can opt into renewal with

@@ -23,6 +23,7 @@ import pytest
 import pytest_asyncio
 
 from tests import _model_pools
+from tests.inner.git_ssh_fixture import ssh_git_server as ssh_git_server
 
 
 @pytest.fixture
