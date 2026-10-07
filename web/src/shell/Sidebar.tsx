@@ -215,6 +215,7 @@ import {
   dedupeConversationsById,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
   orderByPinnedTimestamp,
+  pinOrderWrites,
   readPinnedConversationIds,
   resolveSidebarDrop,
   type SidebarDropTarget,
@@ -290,6 +291,13 @@ const RowActivationContext = createContext<
 // leaves the list while typing, and a reorder then would shuffle rows around
 // the open input (and can even blur it mid-edit, committing a half-typed
 // title). See the order-freeze block in ConversationList.
+// Set only around the Pinned section, so its rows become drag-to-reorder targets.
+// `draggingId` is the pinned session being dragged; `overId` the row it's over.
+const PinOrderContext = createContext<{
+  ids: string[];
+  draggingId: string | null;
+  overId: string | null;
+} | null>(null);
 const RowEditHoldContext = createContext<(id: string, editing: boolean) => void>(() => {});
 
 // Stable callback identity that always runs the latest `fn` — keeps the row
@@ -1620,6 +1628,8 @@ function ConversationList({
   const [draggedProject, setDraggedProject] = useState<string | null>(null);
   const dragOrigin = useRef<{ left: number; top: number; width: number } | undefined>(undefined);
   const [overProject, setOverProject] = useState<string | null>(null);
+  const [overPin, setOverPin] = useState<string | null>(null);
+  const reorderPin = useTogglePinnedConversation();
   const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
     if (saveOrder.isPending) return;
     const from = projects.findIndex((p) => p.name === name);
@@ -1965,6 +1975,7 @@ function ConversationList({
       }
       const dragged = activeDrag;
       setActiveDrag(null);
+      setOverPin(null);
       if (!dragged) return;
       const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
       const action = resolveSidebarDrop(
@@ -1978,6 +1989,12 @@ function ConversationList({
         if (action.unpin) onTogglePinned(dragged.id);
         // Open the (possibly brand-new) folder so the session is visible in it.
         expandProject(action.project);
+        return;
+      }
+      if (action.kind === "reorder-pin") {
+        for (const write of pinOrderWrites(sections.pinned, dragged.id, action.targetId)) {
+          reorderPin.mutate({ id: write.id, pinned: true, pinnedAt: write.pinnedAt });
+        }
         return;
       }
       if (action.kind === "pin" || action.kind === "unpin") {
@@ -1994,7 +2011,16 @@ function ConversationList({
         if (action.unpin) onTogglePinned(dragged.id);
       }
     },
-    [activeDrag, moveToProject, expandProject, onTogglePinned, projects, saveOrder],
+    [
+      activeDrag,
+      moveToProject,
+      expandProject,
+      onTogglePinned,
+      projects,
+      saveOrder,
+      sections.pinned,
+      reorderPin,
+    ],
   );
 
   const expandAllProjects = useCallback((allNames: string[]) => {
@@ -2144,6 +2170,14 @@ function ConversationList({
     [sections.pinned, collapsedSections],
   );
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
+  const pinOrder = useMemo(
+    () => ({
+      ids: sections.pinned.map((c) => c.id),
+      draggingId: activeDrag?.isPinned ? activeDrag.id : null,
+      overId: overPin,
+    }),
+    [sections.pinned, activeDrag, overPin],
+  );
 
   // Pinned membership is server-authoritative (the `omnigent.pinned` label),
   // so there's no client-side list to normalize against the loaded window —
@@ -2227,15 +2261,14 @@ function ConversationList({
         measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
-        onDragOver={(event) =>
-          setOverProject(
-            event.over?.data.current?.type === "project-order"
-              ? (event.over.data.current.name as string)
-              : null,
-          )
-        }
+        onDragOver={(event) => {
+          const over = event.over?.data.current;
+          setOverProject(over?.type === "project-order" ? (over.name as string) : null);
+          setOverPin(over?.type === "pin-order" ? (over.id as string) : null);
+        }}
         onDragCancel={() => {
           setActiveDrag(null);
+          setOverPin(null);
           setDraggedProject(null);
           setOverProject(null);
         }}
@@ -2285,20 +2318,22 @@ function ConversationList({
                   // out of any project into this section. Active only while dragging
                   // an unpinned session; outline-only highlight.
                   <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
-                    <ConversationSection
-                      title="Pinned"
-                      conversations={sections.pinned}
-                      activeConversationId={displayedActiveId}
-                      pinnedConversationIds={pinnedConversationIds}
-                      collapsed={effectiveCollapsedSections.includes("Pinned")}
-                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
-                      onRowClick={onRowClick}
-                      onTogglePinned={onTogglePinned}
-                      selectionMode={false}
-                      selectedIds={selectedIds}
-                      onToggleSelected={onToggleSelected}
-                      onProjectAssigned={expandProject}
-                    />
+                    <PinOrderContext.Provider value={pinOrder}>
+                      <ConversationSection
+                        title="Pinned"
+                        conversations={sections.pinned}
+                        activeConversationId={displayedActiveId}
+                        pinnedConversationIds={pinnedConversationIds}
+                        collapsed={effectiveCollapsedSections.includes("Pinned")}
+                        onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
+                        onRowClick={onRowClick}
+                        onTogglePinned={onTogglePinned}
+                        selectionMode={false}
+                        selectedIds={selectedIds}
+                        onToggleSelected={onToggleSelected}
+                        onProjectAssigned={expandProject}
+                      />
+                    </PinOrderContext.Provider>
                   </PinDropZone>
                 )}
                 {/* Projects: a "Projects" group header, with each project rendered as
@@ -3942,13 +3977,27 @@ function ConversationRowImpl({
     }, 0);
     return () => clearTimeout(timer);
   }, [isDragging]);
-  // Merge the drag node ref with the row ref used for scroll-into-view.
+  // In the Pinned section each row is also a reorder target for other pins.
+  const pinOrder = useContext(PinOrderContext);
+  const { setNodeRef: setPinOrderNodeRef } = useDroppable({
+    id: `pin-order:${conversation.id}`,
+    data: { type: "pin-order", id: conversation.id },
+    disabled: !pinOrder || !isPinned,
+  });
+  const pinInsertion =
+    pinOrder?.draggingId && pinOrder.overId === conversation.id
+      ? pinOrder.ids.indexOf(pinOrder.draggingId) < pinOrder.ids.indexOf(conversation.id)
+        ? "after"
+        : "before"
+      : undefined;
+  // Merge the drag/drop node refs with the row ref used for scroll-into-view.
   const setRowRef = useCallback(
     (node: HTMLLIElement | null) => {
       rowRef.current = node;
       setDragNodeRef(node);
+      setPinOrderNodeRef(node);
     },
-    [setDragNodeRef],
+    [setDragNodeRef, setPinOrderNodeRef],
   );
   // Timestamps of the last two clicks this row received, for the dblclick
   // rename guard: the list can reorder between the two clicks of a
@@ -4208,6 +4257,13 @@ function ConversationRowImpl({
       }}
       className={cn("group relative", isDragging && "opacity-40")}
     >
+      {pinInsertion && pinOrder?.draggingId !== conversation.id && (
+        <span
+          data-testid="pin-order-insertion"
+          className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-primary"
+          style={pinInsertion === "before" ? { top: 0 } : { bottom: 0 }}
+        />
+      )}
       {/* Right-click anywhere on the row opens the same actions as the kebab.
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the

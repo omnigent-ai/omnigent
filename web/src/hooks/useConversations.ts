@@ -1877,7 +1877,8 @@ export function useTogglePinnedConversation() {
   };
 
   return useMutation({
-    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) => {
+    // `pinnedAt` overrides the pin's sort value; the Pinned section's drag-to-reorder sets it.
+    mutationFn: ({ id, pinned, pinnedAt }: { id: string; pinned: boolean; pinnedAt?: number }) => {
       // Against an old server, persist the pin locally instead of PATCHing a
       // bare key it would store but the upgraded server would drop on read.
       if (!serverCanStorePins()) {
@@ -1890,13 +1891,13 @@ export function useTogglePinnedConversation() {
         const labels = pinned ? { [PINNED_LABEL_KEY]: String(Date.now()) } : {};
         return Promise.resolve({ id, object: "conversation", labels } as Conversation);
       }
-      return setConversationPinned(id, pinned);
+      return setConversationPinned(id, pinned, pinnedAt);
     },
     // Move the row immediately — don't wait for the PATCH round-trip. Without
     // this the row lingers in its project folder (or the flat list) until the
     // network resolves, which reads as lag. Snapshot the pinned cache so a
     // failed PATCH rolls back.
-    onMutate: ({ id, pinned }) => {
+    onMutate: ({ id, pinned, pinnedAt }) => {
       const existing = findRow(id);
       if (
         pinned &&
@@ -1927,7 +1928,7 @@ export function useTogglePinnedConversation() {
         queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
       const base = findRow(id)?.labels ?? {};
       const labels: Record<string, string> = pinned
-        ? { ...base, [PINNED_LABEL_KEY]: String(Date.now()) }
+        ? { ...base, [PINNED_LABEL_KEY]: String(pinnedAt ?? Date.now()) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
       patch(id, labels, pinned);
       return { prevPinned };

@@ -325,6 +325,47 @@ export function orderByPinnedTimestamp(conversations: readonly Conversation[]): 
   return [...conversations].sort((a, b) => pinnedAt(a) - pinnedAt(b));
 }
 
+/** A pin label rewrite: the new `omnigent.pinned` sort value for one session. */
+export interface PinOrderWrite {
+  id: string;
+  pinnedAt: number;
+}
+
+/**
+ * The pin label writes that move `fromId` into `toId`'s slot of the (already
+ * pin-ordered) Pinned list. The label value is the list's sort key, so a move
+ * normally rewrites only the moved session, to a value between its new
+ * neighbours. When there's no room between them (equal or missing values), every
+ * pin is renumbered from the lowest existing value. Returns `[]` for a no-op.
+ */
+export function pinOrderWrites(
+  pinned: readonly Conversation[],
+  fromId: string,
+  toId: string,
+): PinOrderWrite[] {
+  const from = pinned.findIndex((c) => c.id === fromId);
+  const to = pinned.findIndex((c) => c.id === toId);
+  if (from < 0 || to < 0 || from === to) return [];
+  const moved = [...pinned];
+  const [row] = moved.splice(from, 1);
+  moved.splice(to, 0, row);
+  const value = (c: Conversation | undefined): number => Number(c?.labels?.[PINNED_LABEL_KEY]);
+  const prev = value(moved[to - 1]);
+  const next = value(moved[to + 1]);
+  const pinnedAt =
+    to === 0 ? next - 1 : to === moved.length - 1 ? prev + 1 : prev + (next - prev) / 2;
+  if (
+    Number.isFinite(pinnedAt) &&
+    (to === 0 || pinnedAt > prev) &&
+    (to === moved.length - 1 || pinnedAt < next)
+  ) {
+    return [{ id: fromId, pinnedAt }];
+  }
+  const finite = pinned.map(value).filter(Number.isFinite);
+  const base = finite.length > 0 ? Math.min(...finite) : Date.now();
+  return moved.map((c, index) => ({ id: c.id, pinnedAt: base + index }));
+}
+
 // ── Drag-and-drop ────────────────────────────────────────────────────────────
 
 /** The session being dragged: its id, the project it's currently filed under
@@ -342,7 +383,11 @@ export interface SidebarDragSource {
     drop that landed on nothing droppable (e.g. "Shared with me", which is
     never a target — sessions can't be filed there). */
 export type SidebarDropTarget =
-  { type: "project"; name: string } | { type: "ungroup" } | { type: "pin" } | null;
+  | { type: "project"; name: string }
+  | { type: "ungroup" }
+  | { type: "pin" }
+  | { type: "pin-order"; id: string }
+  | null;
 
 /** The action a drop resolves to. `move` files the session into a project;
     `ungroup` removes it from its current project (the caller still confirms
@@ -360,6 +405,7 @@ export type SidebarDropAction =
   | { kind: "ungroup"; project: string; unpin: boolean }
   | { kind: "pin" }
   | { kind: "unpin" }
+  | { kind: "reorder-pin"; targetId: string }
   | { kind: "none" };
 
 /**
@@ -375,6 +421,7 @@ export type SidebarDropAction =
  * - Dropped on the ungroup zone while unfiled → `unpin` if pinned, else `none`.
  * - Dropped on the pin zone while not already pinned → `pin`.
  * - Dropped on the pin zone while already pinned → `none`.
+ * - Dropped on another pinned row while pinned → `reorder-pin`; while unpinned → `pin`.
  * - Dropped on nothing → `none`.
  */
 export function resolveSidebarDrop(
@@ -393,6 +440,12 @@ export function resolveSidebarDrop(
     // Pinning an already-pinned session is a no-op; otherwise pin it (the list
     // floats pinned sessions out of their project into the Pinned section).
     return source.isPinned ? { kind: "none" } : { kind: "pin" };
+  }
+  if (target.type === "pin-order") {
+    if (!source.isPinned) return { kind: "pin" };
+    return target.id === source.id
+      ? { kind: "none" }
+      : { kind: "reorder-pin", targetId: target.id };
   }
   // Ungroup (dropped on "Chats" / the fallback strip): land it in the flat list.
   if (source.project) return { kind: "ungroup", project: source.project, unpin: source.isPinned };

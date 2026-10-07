@@ -12,6 +12,7 @@ import {
   getConversationAgentType,
   migratePinnedConversationIds,
   orderByPinnedTimestamp,
+  pinOrderWrites,
   resolveSidebarDrop,
 } from "./sidebarNav";
 
@@ -190,6 +191,65 @@ describe("orderByPinnedTimestamp", () => {
     const input = [convA, convB];
     orderByPinnedTimestamp(input);
     expect(input.map((c) => c.id)).toEqual(["conv_a", "conv_b"]);
+  });
+});
+
+describe("pinOrderWrites", () => {
+  const pins = (...values: (number | undefined)[]) =>
+    values.map((value, index) =>
+      conversation(`conv_${index}`, null, new Date(2026, 4, 14, 8), {
+        labels: value === undefined ? {} : { "omnigent.pinned": String(value) },
+      }),
+    );
+
+  it("rewrites only the moved pin, between its new neighbours", () => {
+    expect(pinOrderWrites(pins(1000, 2000, 3000), "conv_2", "conv_1")).toEqual([
+      { id: "conv_2", pinnedAt: 1500 },
+    ]);
+    expect(pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1")).toEqual([
+      { id: "conv_0", pinnedAt: 2500 },
+    ]);
+  });
+
+  it("moves to the top or bottom just past the end value", () => {
+    expect(pinOrderWrites(pins(1000, 2000, 3000), "conv_2", "conv_0")).toEqual([
+      { id: "conv_2", pinnedAt: 999 },
+    ]);
+    expect(pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_2")).toEqual([
+      { id: "conv_0", pinnedAt: 3001 },
+    ]);
+  });
+
+  it("renumbers every pin when there's no room between the neighbours", () => {
+    expect(pinOrderWrites(pins(1000, 1000, 1000), "conv_2", "conv_1")).toEqual([
+      { id: "conv_0", pinnedAt: 1000 },
+      { id: "conv_2", pinnedAt: 1001 },
+      { id: "conv_1", pinnedAt: 1002 },
+    ]);
+    expect(pinOrderWrites(pins(1000, undefined, undefined), "conv_0", "conv_1")).toEqual([
+      { id: "conv_1", pinnedAt: 1000 },
+      { id: "conv_0", pinnedAt: 1001 },
+      { id: "conv_2", pinnedAt: 1002 },
+    ]);
+  });
+
+  it("is a no-op for a drop on itself or an unknown row", () => {
+    expect(pinOrderWrites(pins(1000, 2000), "conv_0", "conv_0")).toEqual([]);
+    expect(pinOrderWrites(pins(1000, 2000), "conv_0", "missing")).toEqual([]);
+  });
+
+  it("produces values that orderByPinnedTimestamp sorts into the dragged order", () => {
+    const rows = pins(1000, 2000, 3000, 4000);
+    const writes = new Map(pinOrderWrites(rows, "conv_3", "conv_1").map((w) => [w.id, w.pinnedAt]));
+    const next = rows.map((c) =>
+      writes.has(c.id) ? { ...c, labels: { "omnigent.pinned": String(writes.get(c.id)) } } : c,
+    );
+    expect(orderByPinnedTimestamp(next).map((c) => c.id)).toEqual([
+      "conv_0",
+      "conv_3",
+      "conv_1",
+      "conv_2",
+    ]);
   });
 });
 
@@ -555,6 +615,20 @@ describe("resolveSidebarDrop", () => {
     expect(resolveSidebarDrop(src({ isPinned: true }), { type: "ungroup" })).toEqual({
       kind: "unpin",
     });
+  });
+
+  it("reorders a pinned session dropped on another pinned row", () => {
+    expect(resolveSidebarDrop(src({ isPinned: true }), { type: "pin-order", id: "c2" })).toEqual({
+      kind: "reorder-pin",
+      targetId: "c2",
+    });
+    expect(resolveSidebarDrop(src({ isPinned: true }), { type: "pin-order", id: "c1" })).toEqual({
+      kind: "none",
+    });
+  });
+
+  it("pins an unpinned session dropped on a pinned row", () => {
+    expect(resolveSidebarDrop(src(), { type: "pin-order", id: "c2" })).toEqual({ kind: "pin" });
   });
 
   it("is a no-op when dropped on nothing droppable (e.g. Shared with me)", () => {

@@ -227,3 +227,67 @@ def test_pinned_section_orders_by_pin_time_not_update_time(
     assert order_after.index(f"/c/{session_a}") < order_after.index(f"/c/{session_b}"), (
         f"pinned order must follow pin time, not the bumped updated_at, got {order_after}"
     )
+
+
+def test_drag_reorders_pinned_sessions(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Dragging a pinned row onto another pinned row reorders the Pinned section.
+
+    Pins ``a`` then ``b`` (so ``b`` starts below ``a``), drags ``b`` onto
+    ``a``, and asserts ``b`` now sits on top. A reload proves the new order
+    is persisted in the pin labels rather than held only in the client cache.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session_pair: ``(base_url, session_a, session_b)`` — two
+        runner-bound sessions in the same server.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    _set_title(base_url, session_a, f"e2e-drag-A-{uuid.uuid4().hex[:8]}")
+    _set_title(base_url, session_b, f"e2e-drag-B-{uuid.uuid4().hex[:8]}")
+    page.goto(f"{base_url}/c/{session_a}")
+
+    for session_id in (session_a, session_b):
+        row = _row(page, session_id)
+        expect(row).to_be_visible()
+        row.hover()
+        row.get_by_test_id("quick-pin-conversation").click()
+        expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+
+    order = _pinned_session_order(page)
+    assert order.index(f"/c/{session_a}") < order.index(f"/c/{session_b}"), order
+
+    # dnd-kit's mouse sensor needs a real press-move-release past its 5px threshold.
+    source = (
+        _section(page, "Pinned")
+        .locator("li")
+        .filter(has=page.locator(f'a[href="/c/{session_b}"]'))
+    )
+    target = (
+        _section(page, "Pinned")
+        .locator("li")
+        .filter(has=page.locator(f'a[href="/c/{session_a}"]'))
+    )
+    source_box = source.bounding_box()
+    target_box = target.bounding_box()
+    assert source_box and target_box
+    page.mouse.move(source_box["x"] + 20, source_box["y"] + source_box["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(target_box["x"] + 20, target_box["y"] + target_box["height"] / 2, steps=10)
+    expect(page.get_by_test_id("pin-order-insertion")).to_be_visible()
+    page.mouse.up()
+
+    def b_above_a() -> bool:
+        current = _pinned_session_order(page)
+        return current.index(f"/c/{session_b}") < current.index(f"/c/{session_a}")
+
+    deadline = time.monotonic() + 5.0
+    while not b_above_a() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert b_above_a(), _pinned_session_order(page)
+
+    page.reload()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
+    assert b_above_a(), f"reorder should persist across reload, got {_pinned_session_order(page)}"
