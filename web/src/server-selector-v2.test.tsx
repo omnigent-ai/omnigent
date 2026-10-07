@@ -20,7 +20,7 @@ function stubBridge(over: Record<string, unknown>) {
   };
 }
 
-it("provides a full-width 48px window drag region", async () => {
+it("reserves a full-width 48px desktop title-bar band", async () => {
   stubBridge({});
   const { container } = render(<BridgeSetupApp />);
   await screen.findByRole("button", { name: /open omnigent/i });

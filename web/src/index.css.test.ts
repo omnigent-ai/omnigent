@@ -962,7 +962,11 @@ describe("index.css electron-mac window drag region", () => {
     .find((block) => selectorOf(block) === "[data-electron-mac] .electron-drag-strip");
   const controlsRule = cssBlocks
     .map(([block]) => block)
-    .find((block) => selectorOf(block).replace(/\s+/g, " ").startsWith("[data-electron-mac] :is("));
+    .find(
+      (block) =>
+        selectorOf(block).replace(/\s+/g, " ").startsWith("[data-electron-mac] :is(") &&
+        block.includes("-webkit-app-region: no-drag"),
+    );
 
   beforeAll(() => {
     expect(dragRule, "expected the macOS window drag-strip rule").toBeDefined();
@@ -985,6 +989,9 @@ describe("index.css electron-mac window drag region", () => {
     ["select", {}],
     ["label", {}],
     ["summary", {}],
+    ["div", { tabIndex: 0 }],
+    ["span", { tabIndex: 1 }],
+    ["div", { className: "no-drag" }],
     ["div", { role: "button" }],
     ["div", { role: "link" }],
     ["div", { role: "tab" }],
@@ -995,6 +1002,13 @@ describe("index.css electron-mac window drag region", () => {
     ["div", { role: "combobox" }],
     ["div", { role: "option" }],
     ["div", { role: "radio" }],
+    ["div", { role: "checkbox" }],
+    ["div", { role: "switch" }],
+    ["div", { role: "slider" }],
+    ["div", { role: "listbox" }],
+    ["div", { role: "textbox" }],
+    ["div", { role: "searchbox" }],
+    ["div", { role: "spinbutton" }],
     ["div", { contentEditable: true }],
   ])("keeps %s %j interactive inside the drag band", (tag, props) => {
     const { container } = render(
@@ -1006,6 +1020,31 @@ describe("index.css electron-mac window drag region", () => {
     expect(controlsRule).toContain("-webkit-app-region: no-drag");
     shell.removeAttribute("data-electron-mac");
     expect(control.matches(selectorOf(controlsRule ?? ""))).toBe(false);
+  });
+
+  it.each(["", "plaintext-only"])("excludes contenteditable=%j from dragging", (value) => {
+    const { container } = render(
+      createElement("div", { "data-electron-mac": "true" }, createElement("div")),
+    );
+    const control = container.firstElementChild!.firstElementChild!;
+    control.setAttribute("contenteditable", value);
+    expect(control.matches(selectorOf(controlsRule ?? ""))).toBe(true);
+  });
+
+  it("keeps unfocusable and noneditable content draggable unless explicitly opted out", () => {
+    const { container } = render(
+      createElement(
+        "div",
+        { "data-electron-mac": "true" },
+        createElement("span", { tabIndex: -1 }),
+        createElement("span", { contentEditable: false }),
+      ),
+    );
+    const shell = container.firstElementChild!;
+    expect(shell.firstElementChild!.matches(selectorOf(controlsRule ?? ""))).toBe(false);
+    expect(shell.lastElementChild!.matches(selectorOf(controlsRule ?? ""))).toBe(false);
+    shell.firstElementChild!.classList.add("no-drag");
+    expect(shell.firstElementChild!.matches(selectorOf(controlsRule ?? ""))).toBe(true);
   });
 
   it("leaves noninteractive title-bar space draggable and other platforms unchanged", () => {

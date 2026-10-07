@@ -894,6 +894,8 @@ aside[aria-label="Workspace"][data-maximized] {
     select,
     label,
     summary,
+    [tabindex]:not([tabindex="-1"]),
+    .no-drag,
     [role="button"],
     [role="link"],
     [role="tab"],
@@ -904,6 +906,15 @@ aside[aria-label="Workspace"][data-maximized] {
     [role="combobox"],
     [role="option"],
     [role="radio"],
+    [role="checkbox"],
+    [role="switch"],
+    [role="slider"],
+    [role="listbox"],
+    [role="textbox"],
+    [role="searchbox"],
+    [role="spinbutton"],
+    [contenteditable=""],
+    [contenteditable="plaintext-only"],
     [contenteditable="true"]
   ) {
   -webkit-app-region: no-drag;
