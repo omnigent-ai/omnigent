@@ -1,29 +1,38 @@
-import type { Host } from "@/hooks/useHosts";
+import { ARCA_HOST_ID_STORAGE_KEY } from "./arcaHost";
 
 const DISMISSED_KEY = "omnigent:arca-shutdown:dismissed";
-const TOASTED_KEY = "omnigent:arca-shutdown:toasted";
+const WARNED_KEY = "omnigent:arca-shutdown:warned";
 const OPTED_OUT_KEY = "omnigent:arca-shutdown:opted-out";
 export const ARCA_WARNING_PREFERENCES_CHANGED = "omnigent:arca-shutdown:preferences-changed";
 const unavailableStorage = new Map<string, string>();
+const WARNING_START_HOUR = 17;
+const FIRST_WEEKDAY = 1;
+const LAST_WEEKDAY = 5;
+const LAST_WORKWEEK_OFFER_DAY = 3;
 
-export function isArcaHost(
-  host: Pick<Host, "host_id" | "name">,
-  storedArcaHostId: string | null,
-): boolean {
+export function isArcaWarningStorageKey(key: string | null): boolean {
   return (
-    host.name.endsWith("'s arca") ||
-    (storedArcaHostId !== null && host.host_id === storedArcaHostId)
+    key === null ||
+    key === DISMISSED_KEY ||
+    key === WARNED_KEY ||
+    key === OPTED_OUT_KEY ||
+    key === ARCA_HOST_ID_STORAGE_KEY
   );
+}
+
+export function resetArcaWarningStorageForTests(): void {
+  unavailableStorage.clear();
 }
 
 export function isWarningWindow(now: Date): boolean {
   const day = now.getDay();
-  return day >= 1 && day <= 5 && now.getHours() >= 17;
+  return day >= FIRST_WEEKDAY && day <= LAST_WEEKDAY && now.getHours() >= WARNING_START_HOUR;
 }
 
 export function offersWorkweek(now: Date): boolean {
   const day = now.getDay();
-  return day >= 1 && day <= 3;
+  // Thursday and Friday have no useful workweek extension before Friday shutdown.
+  return day >= FIRST_WEEKDAY && day <= LAST_WORKWEEK_OFFER_DAY;
 }
 
 export function dateKey(now: Date): string {
@@ -58,12 +67,12 @@ export function dismissToday(now: Date): void {
   }
 }
 
-export function isToastedToday(now: Date): boolean {
-  return read(TOASTED_KEY) === dateKey(now);
+export function isWarnedToday(now: Date): boolean {
+  return read(WARNED_KEY) === dateKey(now);
 }
 
-export function markToastedToday(now: Date): void {
-  write(TOASTED_KEY, dateKey(now));
+export function markWarnedToday(now: Date): void {
+  write(WARNED_KEY, dateKey(now));
 }
 
 export function isOptedOut(): boolean {

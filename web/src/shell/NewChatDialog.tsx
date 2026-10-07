@@ -4862,9 +4862,8 @@ export function NewChatLandingScreen() {
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
-  // The Arca box's row in the host list, known only from the host id stored
-  // when Run on Arca connected it (a host's name is its machine hostname —
-  // no reliable relationship to the arca instance name, so no matching).
+  // Run on Arca stores a host id, and isaac seeds "<user>'s arca" as the host
+  // name. This picker uses the stored id so a renamed host stays recognized.
   // While that host is online the Arca option disappears entirely; otherwise
   // one click connects (starting a stopped instance along the way — the
   // connect console shows what's happening, so no status needs pre-fetching).

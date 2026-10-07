@@ -26,6 +26,7 @@ import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
 import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
+import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
@@ -311,13 +312,16 @@ function TranscriptImpl({
   }, [nav]);
 
   const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  const arcaWarning = useArcaShutdownBanner();
+  const showArcaBanner = arcaWarning.showForHost(hostId);
+  const hasPinnedBanner = display.hasTasks || showArcaBanner;
   return (
     <>
       {/* Task tracker pinned above the thread. Sibling of the viewport (not an
       overlay) so it shrinks the scroll area rather than covering messages.
       Self-hides with no tasks. */}
       <ChatPlanAccordion className="mt-14 md:mt-12" />
-      <ArcaShutdownBanner hostId={hostId} hasTasks={display.hasTasks} />
+      {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
       conversation area without requiring Conversation to forward refs. */}
       <div
@@ -327,7 +331,7 @@ function TranscriptImpl({
       >
         <Conversation
           className={cn(
-            display.hasTasks ? "chat-scroll-composer-fade" : "chat-scroll-fade",
+            hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade",
             "flex-1",
           )}
         >
@@ -335,7 +339,8 @@ function TranscriptImpl({
             scrollClassName="transcript-hide-native-scrollbar"
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
-              display.hasTasks ? "pt-4" : "pt-20",
+              hasPinnedBanner ? "pt-4" : "pt-20",
+              showArcaBanner && "chat-content-under-arca-banner",
               CHAT_COLUMN_WIDTH,
             )}
           >

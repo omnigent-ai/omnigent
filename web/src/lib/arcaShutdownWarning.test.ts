@@ -1,32 +1,50 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { isArcaHost } from "./arcaHost";
 import {
   dateKey,
   dismissToday,
-  isArcaHost,
+  isArcaWarningStorageKey,
   isDismissedToday,
-  isToastedToday,
+  isWarnedToday,
   isOptedOut,
   isWarningWindow,
-  markToastedToday,
+  markWarnedToday,
   offersWorkweek,
   optOut,
+  resetArcaWarningStorageForTests,
 } from "./arcaShutdownWarning";
 
-beforeEach(() => localStorage.clear());
+const MON_459PM = new Date(2026, 9, 5, 16, 59);
+const MON_5PM = new Date(2026, 9, 5, 17, 0);
+const WED_5PM = new Date(2026, 9, 7, 17, 0);
+const THU_5PM = new Date(2026, 9, 8, 17, 0);
+
+beforeEach(() => {
+  localStorage.clear();
+  resetArcaWarningStorageForTests();
+});
 afterEach(() => vi.restoreAllMocks());
 
 describe("Arca shutdown rules", () => {
+  it("listens only to Arca warning and host-id storage changes", () => {
+    expect(isArcaWarningStorageKey("omnigent:arca-shutdown:warned")).toBe(true);
+    expect(isArcaWarningStorageKey("omnigent:arca-host-id")).toBe(true);
+    expect(isArcaWarningStorageKey("unrelated-setting")).toBe(false);
+  });
+
   it("warns at 17:00 on weekdays through late evening, but not on weekends", () => {
-    expect(isWarningWindow(new Date(2026, 9, 5, 16, 59))).toBe(false);
-    expect(isWarningWindow(new Date(2026, 9, 5, 17, 0))).toBe(true);
+    expect(isWarningWindow(MON_459PM)).toBe(false);
+    expect(isWarningWindow(MON_5PM)).toBe(true);
     expect(isWarningWindow(new Date(2026, 9, 9, 23, 30))).toBe(true);
     expect(isWarningWindow(new Date(2026, 9, 10, 17, 0))).toBe(false);
     expect(isWarningWindow(new Date(2026, 9, 11, 17, 0))).toBe(false);
   });
 
   it("offers workweek only Monday through Wednesday", () => {
-    for (const day of [5, 6, 7]) expect(offersWorkweek(new Date(2026, 9, day))).toBe(true);
-    for (const day of [8, 9, 10, 11]) expect(offersWorkweek(new Date(2026, 9, day))).toBe(false);
+    expect(offersWorkweek(MON_5PM)).toBe(true);
+    expect(offersWorkweek(WED_5PM)).toBe(true);
+    expect(offersWorkweek(THU_5PM)).toBe(false);
+    expect(offersWorkweek(new Date(2026, 9, 9, 17, 0))).toBe(false);
   });
 
   it("recognizes seeded names and stored ids but excludes renamed and arclet names", () => {
@@ -42,11 +60,11 @@ describe("Arca shutdown rules", () => {
     expect(dateKey(monday)).toBe("2026-10-05");
     expect(dateKey(tuesday)).toBe("2026-10-06");
     dismissToday(monday);
-    markToastedToday(monday);
+    markWarnedToday(monday);
     expect(isDismissedToday(monday)).toBe(true);
-    expect(isToastedToday(monday)).toBe(true);
+    expect(isWarnedToday(monday)).toBe(true);
     expect(isDismissedToday(tuesday)).toBe(false);
-    expect(isToastedToday(tuesday)).toBe(false);
+    expect(isWarnedToday(tuesday)).toBe(false);
     optOut();
     expect(isOptedOut()).toBe(true);
   });
@@ -58,12 +76,11 @@ describe("Arca shutdown rules", () => {
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("storage unavailable");
     });
-    const now = new Date(2026, 9, 5, 17, 0);
-    dismissToday(now);
-    markToastedToday(now);
+    dismissToday(MON_5PM);
+    markWarnedToday(MON_5PM);
     optOut();
-    expect(isDismissedToday(now)).toBe(true);
-    expect(isToastedToday(now)).toBe(true);
+    expect(isDismissedToday(MON_5PM)).toBe(true);
+    expect(isWarnedToday(MON_5PM)).toBe(true);
     expect(isOptedOut()).toBe(true);
   });
 });

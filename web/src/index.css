@@ -963,10 +963,6 @@ aside[aria-label="Workspace"][data-maximized] {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
 }
 
-.arca-shutdown-banner + [data-transcript-viewport] .chat-conversation-content {
-  padding-top: 1rem;
-}
-
 /* Settings titles join the mobile header row beside the sidebar control. */
 @media (width < 48rem) {
   .settings-mobile-header::before {
@@ -1048,6 +1044,11 @@ aside[aria-label="Workspace"][data-maximized] {
     /* header band + 1.5rem breathing room + OS safe area, sourced from the
        shared inset vars (was a hardcoded 5rem). */
     padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
+  }
+
+  :is([data-ios-native], [data-android-native])
+    .chat-conversation-content.chat-content-under-arca-banner {
+    padding-top: 1rem;
   }
 
   [data-ios-native] .main-terminal-view,
