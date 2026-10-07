@@ -379,13 +379,13 @@ async def test_latency_validate_runs_off_the_clock() -> None:
         return None
 
     async def _validate(_env: BenchEnvironment, _ctx: object) -> None:
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.5)
 
     journey = Journey(name="cleanup", kind="latency", measure=_measure, validate=_validate)
     result = await run_latency(journey, cast(BenchEnvironment, object()), iterations=2, warmup=0)
 
     assert result.n_success == 2
-    assert max(result.latencies_ms) < 100
+    assert max(result.latencies_ms) < 250  # timing validate's 0.5s sleep would exceed this
 
 
 @pytest.mark.asyncio
@@ -411,6 +411,37 @@ async def test_turn_session_rotates_every_n_samples() -> None:
     assert warmed == ["s1", "s2"]  # each fresh session gets its warm-up turn
     assert ctx.session_id == "s2"
     assert ctx.samples == 1
+
+
+@pytest.mark.asyncio
+async def test_interrupt_moves_to_a_fresh_session_after_a_failed_sample() -> None:
+    """A parked turn left by a failed op could land its marker on the next sample."""
+    calls: list[str] = []
+
+    class _Env:
+        async def finish_gated_turn(self, _turn: object) -> None:
+            calls.append("finish")
+
+        async def create_bound_session(self, _agent_id: str) -> str:
+            calls.append("create")
+            return "fresh"
+
+        async def drive_turn(self, _session_id: str, _text: str) -> None:
+            calls.append("warm")
+
+        async def cancellation_markers(self, session_id: str) -> int:
+            calls.append(f"markers:{session_id}")
+            return 0
+
+        async def start_gated_turn(self, session_id: str) -> str:
+            calls.append(f"gate:{session_id}")
+            return "turn"
+
+    ctx = bench_journeys._TurnSession(agent_id="a", session_id="old", samples=3)
+    ctx.gated = cast(GatedTurn, object())
+    await bench_journeys._prepare_interrupt(cast(BenchEnvironment, _Env()), ctx)
+
+    assert calls == ["finish", "create", "warm", "markers:fresh", "gate:fresh"]
 
 
 @pytest.mark.asyncio

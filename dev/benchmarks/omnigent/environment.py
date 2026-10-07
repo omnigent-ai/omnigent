@@ -1194,7 +1194,8 @@ class BenchEnvironment:
             posted = await self.client.post(f"/v1/sessions/{session_id}/events", json=body)
             posted.raise_for_status()
             await asyncio.wait_for(running.wait(), timeout=timeout)
-            await self._wait_gate_pending(timeout=timeout)
+            if not idle.is_set():
+                await self._wait_gate_pending(timeout=timeout)
             if idle.is_set():
                 raise RuntimeError(f"gated turn settled before it was interrupted: {outcome}")
         except BaseException:
@@ -1233,6 +1234,7 @@ class BenchEnvironment:
         """Release the mock's gate, drop any unused gated reply, and close the stream."""
         with contextlib.suppress(httpx.HTTPError):
             await self._mock_post("/gate/release", {})
+        with contextlib.suppress(httpx.HTTPError):
             await self.configure_mock([])
         await _close_reader(turn.reader, finished=turn.idle.is_set())
 

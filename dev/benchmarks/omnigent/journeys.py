@@ -541,10 +541,9 @@ async def _measure_add_comment(env: BenchEnvironment, ctx: JourneyContext) -> No
 _TURN_REPLY = "Hello there, this is a mock benchmark reply."
 _TURN_PROMPT = "Say hello."
 
-# Warm turns are cheap (~0.1–0.5s per op on CI), but each turn's LLM request
-# grows with session history, so these journeys move to a fresh warmed session
-# every _TURN_SESSION_SAMPLES ops to bound history depth. A fresh session costs
-# ~4s on CI (session init, harness spawn, warm-up turn), so rotate sparingly.
+# Warm turns are cheap (~0.1–0.5s on CI) but each turn's LLM request grows with
+# history, so rotate to a fresh warmed session every _TURN_SESSION_SAMPLES ops;
+# sparingly, since a fresh session costs ~4s (init, harness spawn, warm-up turn).
 _TURN_MAX_ITERATIONS = 50
 _TURN_SESSION_SAMPLES = 25
 
@@ -667,7 +666,9 @@ async def _rotate_turn_session(env: BenchEnvironment, ctx: JourneyContext) -> No
 async def _prepare_interrupt(env: BenchEnvironment, ctx: JourneyContext) -> None:
     """Park a fresh turn on the mock's gate so the op times only the cancel."""
     turns = cast(_TurnSession, ctx)
-    await _finish_gated_turn(env, turns)  # a failed op leaves its turn parked
+    if turns.gated is not None:  # a failed op left its turn parked
+        await _finish_gated_turn(env, turns)
+        turns.samples = _TURN_SESSION_SAMPLES  # rotate, so its late marker can't count
     await _rotate_turn_session(env, turns)
     turns.markers_before = await env.cancellation_markers(turns.session_id)
     turns.gated = await env.start_gated_turn(turns.session_id)
@@ -956,6 +957,12 @@ async def _close_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> None
         await asyncio.to_thread(child.terminate, True)  # type: ignore[attr-defined]
 
 
+async def _teardown_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Close a CLI left by an interrupted sample and reap the last sample's daemon."""
+    await _close_cli_startup(env, ctx)
+    await _prepare_cli_startup(env, ctx)
+
+
 # ── native hook spawn (no server involved) ───────────────────
 
 # Claude Code blocks its TUI on command hooks, so one hook subprocess's whole
@@ -1178,6 +1185,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             setup=_setup_cli_startup,
             prepare=_prepare_cli_startup,
             validate=_close_cli_startup,
+            teardown=_teardown_cli_startup,
             max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
             max_warmup=0,
             description=(
