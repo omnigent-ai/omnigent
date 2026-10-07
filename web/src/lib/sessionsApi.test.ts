@@ -556,7 +556,7 @@ describe("createSideChat", () => {
     agent_id: "agent_fork",
     status: "idle",
     created_at: 1704067200,
-    labels: { "omnigent.side_chat": "1", "omnigent.fork.source_id": source.id },
+    labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": source.id },
   };
 
   it.each(["worktree-from-another-machine", "main", null])(
@@ -613,25 +613,32 @@ describe("createSideChat", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("routes the initial runner bind through the source host without making the fork a sub-agent", async () => {
-    vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
-    fetchMock
-      .mockResolvedValueOnce(mockJsonResponse(source))
-      .mockResolvedValueOnce(mockJsonResponse(fork))
-      .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: source.runner_id }));
+  it.each(["omnigent.side_chat.source_id", "omnigent.fork.source_id"])(
+    "routes the initial runner bind using %s without making the fork a sub-agent",
+    async (sourceLabel) => {
+      vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+      const side = {
+        ...fork,
+        labels: { "omnigent.side_chat": "1", [sourceLabel]: source.id },
+      };
+      fetchMock
+        .mockResolvedValueOnce(mockJsonResponse(source))
+        .mockResolvedValueOnce(mockJsonResponse(side))
+        .mockResolvedValueOnce(mockJsonResponse({ ...side, runner_id: source.runner_id }));
 
-    await createSideChat(source.id);
+      await createSideChat(source.id);
 
-    const init = fetchMock.mock.calls[2][1] as RequestInit;
-    expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe(source.host_id);
-    expect(getSessionHost(fork.id)).toBe(source.host_id);
-    fetchMock.mockResolvedValueOnce(mockJsonResponse(fork));
-    expect(await getSession(fork.id)).toMatchObject({
-      hostId: null,
-      parentSessionId: null,
-      kind: "default",
-    });
-  });
+      const init = fetchMock.mock.calls[2][1] as RequestInit;
+      expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe(source.host_id);
+      expect(getSessionHost(side.id)).toBe(source.host_id);
+      fetchMock.mockResolvedValueOnce(mockJsonResponse(side));
+      expect(await getSession(side.id)).toMatchObject({
+        hostId: null,
+        parentSessionId: null,
+        kind: "default",
+      });
+    },
+  );
 
   it("wakes a resumable host and refreshes its placement before starting a side chat", async () => {
     fetchMock

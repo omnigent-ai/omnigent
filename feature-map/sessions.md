@@ -99,7 +99,8 @@ parent composer, or choose **Start a new side chat** from the composer's add
 tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
 side chats open in a drawer. A generic hosted parent can start a new side chat
 after stopping. Close a side chat with its tab's close button; the parent and
-sibling chats keep running.
+sibling chats keep running. A chat-only side chat can also send messages from
+its direct `/c/<child_id>` URL without choosing a workspace.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -220,6 +221,10 @@ plain `uv run pytest`, which starts a private server for the test.
   mobile side-chat drawer. Its stale-branch scenarios simulate an offline parent
   runner to exercise host-launch fallback; the hosted lifecycle test above
   proves live-parent reuse with actual runner processes.
+- **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
+  `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
+  opens a runnerless child directly and sends a message without a directory
+  picker. Session metadata and message dispatch are mocked.
 - **`side-chat-lifecycle`, native Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   drives a real Codex CLI and app-server with scripted model replies. It checks

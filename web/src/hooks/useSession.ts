@@ -30,6 +30,9 @@ import type { Session } from "@/lib/types";
  */
 const MAX_ROOT_WALK_HOPS = 8;
 
+// Bound cold host-routing lookups, including malformed acyclic ancestry.
+const MAX_HOST_CHAIN_READS = 16;
+
 interface UseSessionResult {
   session: Session | null;
   isLoading: boolean;
@@ -169,8 +172,8 @@ export function useActiveRootSessionId(
  *
  * Registered as identity's session-host resolver at the app entry
  * (``setSessionHostResolver``); the chat store's stream bind goes through the
- * same resolver. Best-effort: a hostless top-level session, an unknown id, or
- * a cycle ends the walk with whatever is known.
+ * same resolver. Best-effort: a hostless top-level session, an unknown id,
+ * a cycle, or an exhausted read budget ends the walk with whatever is known.
  *
  * @param queryClient - The app QueryClient holding the snapshot cache.
  * @param sessionId - Session whose routing host to resolve, e.g. ``"conv_child"``.
@@ -181,7 +184,12 @@ export async function prefetchSessionHostChain(
 ): Promise<void> {
   const visited = new Set<string>();
   let id: string | null = sessionId;
-  while (id !== null && !visited.has(id) && getSessionHost(sessionId) === null) {
+  while (
+    id !== null &&
+    visited.size < MAX_HOST_CHAIN_READS &&
+    !visited.has(id) &&
+    getSessionHost(sessionId) === null
+  ) {
     visited.add(id);
     const hopId: string = id;
     // Each hop's id comes from the previous snapshot, so the chain is serial.

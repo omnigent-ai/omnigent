@@ -44,9 +44,11 @@ export function setSessionParent(
   parentId: string | null | undefined,
   labels?: Record<string, string>,
 ): void {
-  // Generic side chats stay top-level but route through their fork source.
+  // The fork-source fallback supports side chats created by older servers.
   const routingParent =
-    parentId ?? (labels?.["omnigent.side_chat"] === "1" ? labels["omnigent.fork.source_id"] : null);
+    parentId ??
+    labels?.["omnigent.side_chat.source_id"] ??
+    (labels?.["omnigent.side_chat"] === "1" ? labels["omnigent.fork.source_id"] : null);
   if (routingParent && routingParent !== sessionId) {
     _sessionParents.set(sessionId, routingParent);
   } else {

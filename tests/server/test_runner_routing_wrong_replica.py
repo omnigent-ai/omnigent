@@ -6,7 +6,7 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError, make_tunnel_ws_factory
-from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY, SIDE_CHAT_LABEL_KEY
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 
 
 class MockHostRegistry:
@@ -152,7 +152,9 @@ def test_colocated_child_on_another_replica_is_not_reported_offline(surface, anc
         parent_conversation_id=None if side_chat else "parent",
         kind="default" if side_chat else "sub_agent",
         runner_id=parent.runner_id,
-        labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: parent.id} if side_chat else {},
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: parent.id}
+        if side_chat
+        else {},
     )
     conversations = [parent, child]
     if ancestry != "direct":
@@ -171,7 +173,7 @@ def test_colocated_child_on_another_replica_is_not_reported_offline(surface, anc
             parent_conversation_id=None if side_chat else parent.id,
             kind="default" if side_chat else "sub_agent",
             runner_id=parent.runner_id,
-            labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: parent.id}
+            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: parent.id}
             if side_chat
             else {},
         )
@@ -179,7 +181,7 @@ def test_colocated_child_on_another_replica_is_not_reported_offline(surface, anc
         parent.root_conversation_id = root.id
         parent.kind = "sub_agent"
         if side_chat:
-            child.labels[FORK_SOURCE_LABEL_KEY] = intermediate.id
+            child.labels[SIDE_CHAT_SOURCE_LABEL_KEY] = intermediate.id
         else:
             child.parent_conversation_id = intermediate.id
             child.root_conversation_id = root.id
@@ -224,7 +226,10 @@ def test_fork_source_only_routes_side_chats_sharing_the_source_runner(runner_id,
         updated_at=1,
         root_conversation_id="fork",
         runner_id=runner_id,
-        labels={FORK_SOURCE_LABEL_KEY: source.id, SIDE_CHAT_LABEL_KEY: "1" if side_chat else "0"},
+        labels={
+            SIDE_CHAT_SOURCE_LABEL_KEY: source.id,
+            SIDE_CHAT_LABEL_KEY: "1" if side_chat else "0",
+        },
     )
 
     host_id = routing_host_id(fork, MockConversationStore(source, fork))
@@ -253,7 +258,7 @@ def test_side_chat_routing_respects_read_budget_and_subagent_root_fallback(max_r
         updated_at=1,
         root_conversation_id="side",
         runner_id=source.runner_id,
-        labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: source.id},
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
     )
 
     assert routing_host_id(
@@ -267,17 +272,59 @@ def test_side_chat_routing_handles_cyclic_source_links():
         created_at=1,
         updated_at=1,
         root_conversation_id="side",
-        labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: "source"},
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "source"},
     )
     source = Conversation(
         id="source",
         created_at=1,
         updated_at=1,
         root_conversation_id="source",
-        labels={SIDE_CHAT_LABEL_KEY: "1", FORK_SOURCE_LABEL_KEY: side_chat.id},
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: side_chat.id},
     )
 
     assert routing_host_id(side_chat, MockConversationStore(side_chat, source)) is None
+
+
+def test_client_writable_fork_provenance_is_not_routing_authority():
+    child = Conversation(
+        id="child",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="child",
+        labels={SIDE_CHAT_LABEL_KEY: "1", "omnigent.fork.source_id": "private_source"},
+    )
+    store = MockConversationStore(child)
+
+    def reject_read(_session_id):
+        raise AssertionError("Client-supplied ancestry must not be dereferenced")
+
+    store.get_conversation = reject_read
+    assert routing_host_id(child, store) is None
+
+
+@pytest.mark.parametrize("depth", [16, 17])
+def test_default_routing_read_budget_bounds_acyclic_side_chat_chains(depth):
+    chain = [
+        Conversation(
+            id=str(index),
+            created_at=1,
+            updated_at=1,
+            root_conversation_id=str(index),
+            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: str(index + 1)},
+            host_id="host_root" if index == depth else None,
+        )
+        for index in range(depth + 1)
+    ]
+    store = MockConversationStore(*chain)
+    reads = []
+
+    def read(session_id):
+        reads.append(session_id)
+        return store.rows.get(session_id)
+
+    store.get_conversation = read
+    assert routing_host_id(chain[0], store) == ("host_root" if depth == 16 else None)
+    assert len(reads) == 16
 
 
 @pytest.mark.parametrize("root_host", [None, "host_root"])

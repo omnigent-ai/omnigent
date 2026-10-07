@@ -21,7 +21,7 @@ from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import telemetry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec import AgentSpec
-from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY, SIDE_CHAT_LABEL_KEY
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
@@ -73,7 +73,7 @@ def routing_host_id(
     conv: Conversation,
     conversation_store: ConversationStore,
     *,
-    max_ancestor_reads: int | None = None,
+    max_ancestor_reads: int = 16,
 ) -> str | None:
     """
     Return the host whose replica serves *conv*'s runner tunnel.
@@ -85,7 +85,7 @@ def routing_host_id(
 
     :param conv: Conversation whose runner is being routed.
     :param conversation_store: Store used to read the ancestor rows.
-    :param max_ancestor_reads: Optional read budget, including the root fallback.
+    :param max_ancestor_reads: Read budget, including the root fallback.
     :returns: The routing host id, or ``None`` when no host is bound anywhere
         in the chain or the read budget is exhausted.
     """
@@ -101,12 +101,12 @@ def routing_host_id(
             ancestor_id = current.parent_conversation_id
             root_id = current.root_conversation_id
         elif is_side_chat:
-            ancestor_id = current.labels.get(FORK_SOURCE_LABEL_KEY)
+            ancestor_id = current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
         else:
             break
         if ancestor_id is None or ancestor_id in visited:
             break
-        if max_ancestor_reads is not None and reads >= max_ancestor_reads:
+        if reads >= max_ancestor_reads:
             return None
         reads += 1
         visited.add(ancestor_id)
@@ -125,7 +125,7 @@ def routing_host_id(
 
     # Retain the root fallback when an intermediate parent is missing or cyclic.
     if root_id is not None and root_id not in visited:
-        if max_ancestor_reads is not None and reads >= max_ancestor_reads:
+        if reads >= max_ancestor_reads:
             return None
         root = conversation_store.get_conversation(root_id)
         if root is not None:
