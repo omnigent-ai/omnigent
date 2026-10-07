@@ -120,6 +120,30 @@ def test_graphql_alias_uses_its_response_identity() -> None:
     assert created
 
 
+@pytest.mark.parametrize("operation", ["createPullRequest", "addComment"])
+@pytest.mark.parametrize(
+    "body",
+    [
+        json.dumps('A "quoted" path: C:\\work\\repo.\ncreatePullRequest(input: {})'),
+        '"""A note about C:\\work\\repo.\nExample: createPullRequest(input: {})\n"""',
+        r'"""Code sample: \"""createPullRequest\""". Keep this text."""',
+    ],
+    ids=["quoted-string", "multiline-block", "escaped-block-quotes"],
+)
+def test_graphql_string_contents_do_not_change_operation(operation: str, body: str) -> None:
+    query = QUERY.replace('title: "A change"', f'title: "A change", body: {body}').replace(
+        "createPullRequest(input:", f"{operation}(input:", 1
+    )
+    references, created = extract_prs(
+        "shell",
+        {"command": command(query, projection=".data.createPullRequest.pullRequest")},
+        {"url": URL, "number": 42},
+    )
+    expected = operation == "createPullRequest"
+    assert [ref.url for ref in references] == ([URL] if expected else [])
+    assert created is expected
+
+
 def test_graphql_errors_do_not_supply_pr_identity() -> None:
     references, _ = extract_prs(
         "shell",
