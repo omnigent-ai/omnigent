@@ -225,6 +225,8 @@ function loadNavigationHarness({
   // The reconnect overlay's behavior is unit-tested in reconnect_overlay.test.js.
   const overlay = { hint: null, shows: [], hides: 0, raises: 0, cancel: null };
   const browserRegistryCalls = { setActive: [], closeAll: [] };
+  let browserRegistryDeps;
+  let browserIpcDeps;
   const permissionPromptCalls = { show: [], dismiss: [] };
   let currentUrl = serverUrl;
   const appEvents = new Map();
@@ -530,17 +532,24 @@ function loadNavigationHarness({
     "./browserViewRegistry": realBrowserRegistry
       ? require("../src/browserViewRegistry")
       : {
-          createBrowserViewRegistry: () => ({
-            closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
-            setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
-          }),
+          createBrowserViewRegistry: (deps) => {
+            browserRegistryDeps = deps;
+            return {
+              closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
+              setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+            };
+          },
         },
     "./browserViewBounds": realBrowserRegistry
       ? require("../src/browserViewBounds")
       : {
           createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
         },
-    "./browserIpc": { registerBrowserIpc: () => {} },
+    "./browserIpc": {
+      registerBrowserIpc: (deps) => {
+        browserIpcDeps = deps;
+      },
+    },
     "./session-expiry": require("../src/session-expiry"),
     "./popupPolicy": {
       decideWindowOpen: () => ({ kind: "ignore" }),
@@ -570,7 +579,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -616,6 +625,8 @@ function loadNavigationHarness({
     overlay,
     bannerCalls,
     browserRegistryCalls,
+    browserRegistryDeps: () => browserRegistryDeps,
+    browserIpcDeps: () => browserIpcDeps,
     permissionPromptCalls,
     electron,
     ipc,
@@ -3247,6 +3258,65 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
 // detach, so pinWindow must close the window's browser registry when the origin
 // changes — else the native WebContentsView dangles over the setup/welcome page.
 describe("browser-view teardown on server change (src/main.js)", () => {
+  it("offers conditional reconnect guidance only for missing identity on a gated managed target", async (t) => {
+    for (const [serverUrl, internalFeatures, expected] of [
+      ["https://account.databricks.com/omnigent?o=123", true, true],
+      ["https://account.databricks.com/omnigent?o=123", false, false],
+      ["https://public.example", true, false],
+    ]) {
+      const h = loadNavigationHarness({ serverUrl, internalFeatures });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
+      const event = { sender: h.webContents };
+      for (const url of ["http://localhost:5173", "https://127.0.0.1", "http://[::1]"]) {
+        if (expected) {
+          assert.match(hint(event, url), /If this session runs on Arca.*Reconnect to Arca/);
+        } else {
+          assert.equal(hint(event, url), null);
+        }
+      }
+      for (const url of ["https://example.com", "http://10.0.0.1", "file://localhost/x", "bad"]) {
+        assert.equal(hint(event, url), null);
+      }
+    }
+  });
+
+  it("uses captured Arca identity for the sender's workspace and revokes a changed context", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaResult: {
+        ok: true,
+        alreadyRunning: true,
+        identity: { serverUrl: arcaTarget(serverUrl), hostId },
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const registry = h.api.createBrowserRegistryForWindow(h.win);
+    h.api.windows.get(h.win).browserRegistry = registry;
+    const context = h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId);
+    const eligible = h.browserRegistryDeps().isArcaAgentContext;
+    const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
+    assert.equal(eligible(context), false);
+    assert.match(hint({ sender: h.webContents }, "http://localhost"), /Reconnect to Arca/);
+    await h.api.startArcaHostConnect(serverUrl).promise;
+    assert.equal(eligible(context), true);
+    assert.equal(hint({ sender: h.webContents }, "http://localhost"), null);
+    assert.equal(eligible({ ...context, sourceHostId: "b".repeat(32) }), false);
+    h.api.setWindowServerUrl(h.win, serverUrl.replace("123", "456"));
+    assert.deepEqual(h.browserRegistryCalls.closeAll, ["server-changed"]);
+    assert.equal(eligible(context), false);
+    assert.equal(
+      eligible(h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId)),
+      false,
+    );
+  });
+
   it("closes the window's browserRegistry when pinWindow changes origin", () => {
     assert.match(
       liveCode,
