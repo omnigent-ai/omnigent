@@ -2452,6 +2452,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert session_resp.json()["title"] == "/grill-me review this rollout"
 
 
+@pytest.mark.parametrize("in_sub_agent", [False, True])
 @pytest.mark.parametrize(
     ("available", "status", "expected_names"),
     [(["code-review"], 202, ["review", "code-review"]), (["other"], 400, ["review"])],
@@ -2462,11 +2463,13 @@ async def test_skill_slash_command_retries_frontmatter_name_on_older_runner(
     available: list[str],
     status: int,
     expected_names: list[str],
+    in_sub_agent: bool,
 ) -> None:
     """
     A runner from before directory-name invocation knows a bundled skill by
     its frontmatter name, so the server retries with that name once the
-    runner rejects the directory name and lists the frontmatter name.
+    runner rejects the directory name and lists the frontmatter name. A
+    declared sub-agent session takes the name from its own skills.
     """
     resolved: list[str] = []
 
@@ -2494,19 +2497,33 @@ async def test_skill_slash_command_retries_frontmatter_name_on_older_runner(
         base_url="http://runner",
     ) as fake_runner:
         _route_to_runner(monkeypatch, fake_runner)
+        skills = [
+            {
+                "dir": "review",
+                "name": "code-review",
+                "description": "Review changes.",
+                "content": "Look hard.",
+            }
+        ]
         agent = await create_test_agent(
             client,
             name="skill-agent",
-            skills=[
-                {
-                    "dir": "review",
-                    "name": "code-review",
-                    "description": "Review changes.",
-                    "content": "Look hard.",
-                }
-            ],
+            skills=None if in_sub_agent else skills,
+            sub_agents=[{"name": "worker", "skills": skills}] if in_sub_agent else None,
         )
         session = await _create_session(client, agent["id"])
+        if in_sub_agent:
+            child = await client.post(
+                "/v1/sessions",
+                json={
+                    "agent_id": agent["id"],
+                    "parent_session_id": session["id"],
+                    "sub_agent_name": "worker",
+                    "title": "worker:review",
+                },
+            )
+            assert child.status_code == 201, child.text
+            session = child.json()
 
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",

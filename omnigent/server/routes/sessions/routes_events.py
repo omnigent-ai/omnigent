@@ -2695,9 +2695,17 @@ def register_events_routes(
                     _agent.bundle_location,
                 )
                 _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
+                # A declared sub-agent session resolves skills from its own child spec.
+                _skill_spec = _loaded_agent.spec
+                if conv.sub_agent_name:
+                    from omnigent.runtime.workflow import _find_spec_by_name
+
+                    _skill_spec = (
+                        _find_spec_by_name(_skill_spec, conv.sub_agent_name) or _skill_spec
+                    )
                 _legacy_skill_names = {
                     skill.name: skill.display_name
-                    for skill in _loaded_agent.spec.skills
+                    for skill in _skill_spec.skills
                     if skill.display_name is not None
                 }
             except Exception:

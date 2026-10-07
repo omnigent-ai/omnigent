@@ -752,7 +752,9 @@ def build_agent_bundle(
     :param description: Optional description.
     :param sub_agents: Optional list of sub-agent config dicts.
         Each must have at least a ``"name"`` key, e.g.
-        ``[{"name": "researcher", "description": "..."}]``.
+        ``[{"name": "researcher", "description": "..."}]``. An optional
+        ``"skills"`` list, shaped like ``skills``, is bundled under the
+        sub-agent's directory.
     :param max_iterations: Optional override for
         ``executor.max_iterations`` — useful for tests that want
         to force an ``incomplete`` terminal state after a known
@@ -849,7 +851,12 @@ def build_agent_bundle(
             )
             sa_info.size = len(sa_bytes)
             tf.addfile(sa_info, io.BytesIO(sa_bytes))
-        for skill in skills or []:
+        bundled_skills = [("", skill) for skill in skills or []] + [
+            (f"agents/{sa['name']}/", skill)
+            for sa in sub_agents or []
+            for skill in sa.get("skills", [])
+        ]
+        for prefix, skill in bundled_skills:
             skill_doc = (
                 "---\n"
                 + yaml.dump(
@@ -864,7 +871,7 @@ def build_agent_bundle(
             )
             skill_bytes = skill_doc.encode()
             skill_info = tarfile.TarInfo(
-                name=f"skills/{skill.get('dir', skill['name'])}/SKILL.md",
+                name=f"{prefix}skills/{skill.get('dir', skill['name'])}/SKILL.md",
             )
             skill_info.size = len(skill_bytes)
             tf.addfile(skill_info, io.BytesIO(skill_bytes))

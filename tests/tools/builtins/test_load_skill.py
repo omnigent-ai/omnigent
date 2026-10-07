@@ -361,6 +361,17 @@ def test_find_skill_by_name_ambiguous_frontmatter_label_stays_unresolved() -> No
     assert find_skill_by_name([a, b], "code-review") is None
 
 
+def test_find_skill_by_name_label_and_namespace_aliases_are_ambiguous(tmp_path: Path) -> None:
+    """A label alias colliding with a plugin-namespace alias resolves neither."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    labelled = _labelled("review", "code-review")
+    assert find_skill_by_name([labelled, _spec("plugina:code-review")], "code-review") is None
+    plugin_labelled = _labelled("plugina:audit", "deploy")
+    bare = _plugin_skill(tmp_path, "plugina", "deploy")
+    assert find_skill_by_name([plugin_labelled, bare], "plugina:deploy") is None
+
+
 def test_find_skill_by_name_unknown_names_return_none() -> None:
     """Unknown bare and namespaced names still miss."""
     from omnigent.tools.builtins.load_skill import find_skill_by_name
