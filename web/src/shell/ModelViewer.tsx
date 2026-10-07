@@ -15,10 +15,10 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
-import { applyThreeMfColors } from "./threeMfColors";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { type FileContentResponse, fileContentToBlob } from "@/hooks/useFileContent";
+import { applyThreeMfColors } from "./threeMfColors";
 import {
   type ModelFormat,
   type ModelViewerTheme,

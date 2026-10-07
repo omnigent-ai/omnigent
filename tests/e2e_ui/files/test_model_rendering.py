@@ -230,6 +230,7 @@ def test_coloured_3mf_keeps_filament_hues_across_themes(
         f"{base_url}/v1/sessions/{session_id}"
         f"/resources/environments/default/filesystem/{file_path}"
     )
+    # A filesystem request initializes the session workspace before metadata is read.
     response = httpx.get(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem",
         timeout=10.0,
