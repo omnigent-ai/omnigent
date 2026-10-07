@@ -65,7 +65,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.server import presence
+from omnigent.server import presence, shutdown_attribution
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -147,7 +147,7 @@ from omnigent.server.routes._sessions.common import (
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
     _SUBAGENT_STATUS_TYPE,
-    _intentional_stop_sessions,
+    _intentional_runner_stop_locks,
     _interrupt_fenced_sessions,
     _logger,
     _pushed_model_options_cache,
@@ -1053,6 +1053,7 @@ def register_events_routes(
                 code=ErrorCode.CONFLICT,
             )
         if body.type == _RETRY_SESSION_TYPE:
+            await shutdown_attribution.advance_lifecycle(session_id, conversation_store)
             return await _retry_session_single_flight(
                 request=cast("Request", request),
                 session_id=session_id,
@@ -1426,104 +1427,123 @@ def register_events_routes(
             await _require_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
-            # Fence the cancelled turn, same as interrupt.
-            _interrupt_fenced_sessions.add(session_id)
-            # Harness-agnostic forward: the runner kills the external
-            # process for harnesses that have one (claude-native
-            # hard-kills its tmux pane) and 204s otherwise. Unlike the
-            # best-effort effort/model_change relay, a failed stop means
-            # the session is still alive — so this helper RAISES on a
-            # non-2xx / unreachable runner (503) rather than swallowing
-            # it, letting the web UI show the stop didn't land instead
-            # of closing the dialog as if it succeeded.
-            try:
-                stop_delivered = await _stop_session_via_runner(session_id, runner_router)
-            except Exception:
-                # Stop didn't land: the turn keeps running, so lift the
-                # fence or its remaining output is dropped forever.
-                _interrupt_fenced_sessions.discard(session_id)
-                raise
-            if not stop_delivered:
-                # No runner resolved: nothing else lifts the fence (same as interrupt).
-                _interrupt_fenced_sessions.discard(session_id)
-            # Host-spawned sessions run on a dedicated runner the host
-            # launched for this one session. Killing the pane (above) leaves
-            # that runner connected, so GET /health keeps reporting
-            # runner_online: true and the web UI never shows the session as
-            # disconnected — new messages hang on "working" against a dead
-            # pane. Stop the runner too so its tunnel drops and the web UI
-            # shows the same "Agent disconnected — click to show reconnect
-            # command" banner a CLI-launched session reaches on exit. Read
-            # host_id / runner_id from the owner-gated session row so we can
-            # only ever stop the runner bound to this session.
-            stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
-                await _stop_host_runner_intentionally(
-                    session_id,
-                    stop_conv.host_id,
-                    stop_conv.runner_id,
-                    getattr(request.app.state, "host_registry", None),
+            lock = _intentional_runner_stop_locks.setdefault(
+                conv.runner_id or session_id, asyncio.Lock()
+            )
+            async with lock:
+                host_registry = getattr(request.app.state, "host_registry", None)
+                (
+                    shutdown_intent,
+                    shutdown_evidence,
+                ) = await shutdown_attribution.prepare_session_stop(
+                    conv,
                     conversation_store,
+                    host_registry,
+                    user_id=user_id,
+                    reported_intent=body.data.get("shutdown_intent"),
                 )
-            if not stop_delivered:
-                # False-success backstop. The stop reached NO live runner
-                # (``_stop_session_via_runner`` returned False, so there was
-                # no tunnel to deliver to). That path treats "no runner bound"
-                # as a no-op success — correct for an already-idle session,
-                # but WRONG for an orphaned one whose persisted status is
-                # still running/waiting: the runner died (a server replica
-                # outlived it, a crashed host, a graceful disconnect
-                # mid-turn), so nothing is left to emit the terminal edge, and
-                # returning 2xx below would report a stop that never actually
-                # settled the session. Reconcile that exact case to idle so
-                # the success we return is honest. (A host-spawned session
-                # whose runner is still live hits ``stop_delivered=True``
-                # above and its tunnel-drop disconnect handler publishes the
-                # terminal edge, so it never reaches here.)
-                #
-                # Only fire when the runner is confirmed gone from every
-                # replica: no live tunnel here (that's WHY the stop couldn't
-                # be delivered) AND ``runner_last_seen`` stale past the TTL,
-                # so a runner merely mid-reconnect — or alive on another
-                # replica — inside the grace window is left untouched.
-                stop_connectivity = await asyncio.to_thread(
-                    conversation_store.get_session_connectivity, [session_id]
-                )
-                stop_conn = stop_connectivity.get(session_id)
-                if (
-                    stop_conn is not None
-                    and stop_conn.runner_id is not None
-                    and not runner_seen_is_fresh(stop_conn.runner_last_seen)
-                    and _session_status_from_cache(
-                        session_id,
-                        stop_conv.live_status if stop_conv is not None else None,
+                # Fence the cancelled turn, same as interrupt.
+                _interrupt_fenced_sessions.add(session_id)
+                # Harness-agnostic forward: the runner kills the external
+                # process for harnesses that have one (claude-native
+                # hard-kills its tmux pane) and 204s otherwise. Unlike the
+                # best-effort effort/model_change relay, a failed stop means
+                # the session is still alive — so this helper RAISES on a
+                # non-2xx / unreachable runner (503) rather than swallowing
+                # it, letting the web UI show the stop didn't land instead
+                # of closing the dialog as if it succeeded.
+                try:
+                    stop_delivered = await _stop_session_via_runner(session_id, runner_router)
+                except Exception:
+                    # Stop didn't land: the turn keeps running, so lift the
+                    # fence or its remaining output is dropped forever.
+                    _interrupt_fenced_sessions.discard(session_id)
+                    await shutdown_attribution.cancel_shutdown(
+                        shutdown_evidence, conversation_store
                     )
-                    == "running"
-                ):
-                    await asyncio.to_thread(
-                        reconcile_orphaned_running_status,
+                    raise
+                if not stop_delivered:
+                    # No runner resolved: nothing else lifts the fence (same as interrupt).
+                    _interrupt_fenced_sessions.discard(session_id)
+                # Host-spawned sessions run on a dedicated runner the host
+                # launched for this one session. Killing the pane (above) leaves
+                # that runner connected, so GET /health keeps reporting
+                # runner_online: true and the web UI never shows the session as
+                # disconnected — new messages hang on "working" against a dead
+                # pane. Stop the runner too so its tunnel drops and the web UI
+                # shows the same "Agent disconnected — click to show reconnect
+                # command" banner a CLI-launched session reaches on exit. Read
+                # host_id / runner_id from the owner-gated session row so we can
+                # only ever stop the runner bound to this session.
+                stop_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
+                    await _stop_host_runner_intentionally(
                         session_id,
+                        stop_conv.host_id,
+                        stop_conv.runner_id,
+                        host_registry,
                         conversation_store,
-                        int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                        shutdown_intent=shutdown_intent,
+                        shutdown_evidence=shutdown_evidence,
+                        lock_held=True,
                     )
-            # Stop is non-sticky: no persistent marker is written. The
-            # runner tunnel dropping above flips ``runner_online`` to false
-            # honestly, and the next message auto-relaunches the session on
-            # its (still-online) host via the normal message-dispatch
-            # relaunch path below.
-            try:
-                _srv_id = _get_installation_id()
-                _anon = _tel_anon_user_id(user_id, _srv_id)
-                _tel_emit(
-                    _TelSessionStoppedEvent(
-                        session_id=session_id,
-                        installation_id=_srv_id,
-                        anon_user_id=_anon,
+                if not stop_delivered:
+                    # False-success backstop. The stop reached NO live runner
+                    # (``_stop_session_via_runner`` returned False, so there was
+                    # no tunnel to deliver to). That path treats "no runner bound"
+                    # as a no-op success — correct for an already-idle session,
+                    # but WRONG for an orphaned one whose persisted status is
+                    # still running/waiting: the runner died (a server replica
+                    # outlived it, a crashed host, a graceful disconnect
+                    # mid-turn), so nothing is left to emit the terminal edge, and
+                    # returning 2xx below would report a stop that never actually
+                    # settled the session. Reconcile that exact case to idle so
+                    # the success we return is honest. (A host-spawned session
+                    # whose runner is still live hits ``stop_delivered=True``
+                    # above and its tunnel-drop disconnect handler publishes the
+                    # terminal edge, so it never reaches here.)
+                    #
+                    # Only fire when the runner is confirmed gone from every
+                    # replica: no live tunnel here (that's WHY the stop couldn't
+                    # be delivered) AND ``runner_last_seen`` stale past the TTL,
+                    # so a runner merely mid-reconnect — or alive on another
+                    # replica — inside the grace window is left untouched.
+                    stop_connectivity = await asyncio.to_thread(
+                        conversation_store.get_session_connectivity, [session_id]
                     )
-                )
-            except Exception:
-                pass
-            return {"queued": False}
+                    stop_conn = stop_connectivity.get(session_id)
+                    if (
+                        stop_conn is not None
+                        and stop_conn.runner_id is not None
+                        and not runner_seen_is_fresh(stop_conn.runner_last_seen)
+                        and _session_status_from_cache(
+                            session_id,
+                            stop_conv.live_status if stop_conv is not None else None,
+                        )
+                        == "running"
+                    ):
+                        await asyncio.to_thread(
+                            reconcile_orphaned_running_status,
+                            session_id,
+                            conversation_store,
+                            int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                        )
+                # A later message starts a new lifecycle and disarms this stop.
+                try:
+                    _srv_id = _get_installation_id()
+                    _anon = _tel_anon_user_id(user_id, _srv_id)
+                    _tel_emit(
+                        _TelSessionStoppedEvent(
+                            session_id=session_id,
+                            installation_id=_srv_id,
+                            anon_user_id=_anon,
+                        )
+                    )
+                except Exception:
+                    pass
+                return {"queued": False}
         if body.type == _APPROVAL_TYPE:
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
@@ -1865,6 +1885,11 @@ def register_events_routes(
                     agent_name=failed_agent_name,
                 )
             elif status == "running":
+                # PTY activity without a turn ID can resume within a pending Stop.
+                if response_id:
+                    await shutdown_attribution.advance_lifecycle(
+                        session_id, conversation_store, response_id
+                    )
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
             _publish_status(
                 session_id,
@@ -2723,6 +2748,7 @@ def register_events_routes(
                     agent_id=conv.agent_id,
                     sub_agent_name=conv.sub_agent_name,
                 )
+        await shutdown_attribution.advance_lifecycle(session_id, conversation_store)
         if body.type == _SLASH_COMMAND_TYPE:
             if _agent is None:
                 raise OmnigentError(
@@ -3104,7 +3130,8 @@ def register_events_routes(
             for blob_key in orphaned_blob_keys:
                 await asyncio.to_thread(artifact_store.delete, blob_key)
         _interrupt_fenced_sessions.discard(session_id)
-        _intentional_stop_sessions.pop(session_id, None)
+        shutdown_attribution.session_shutdowns.pop(session_id, None)
+        shutdown_attribution.session_scopes.pop(session_id, None)
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()

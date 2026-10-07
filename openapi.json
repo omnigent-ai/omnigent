@@ -8326,6 +8326,148 @@
         "title": "SetSharingRequest",
         "type": "object"
       },
+      "ShutdownIntent": {
+        "additionalProperties": false,
+        "description": "An observed command or signal; ownership does not identify a signal's sender.",
+        "properties": {
+          "action": {
+            "enum": [
+              "host_stop",
+              "host_disable",
+              "stop_session",
+              "archive",
+              "signal"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "daemon_only": {
+            "default": false,
+            "title": "Daemon Only",
+            "type": "boolean"
+          },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "host_connection_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Connection Id"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
+          "host_pid": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Pid"
+          },
+          "host_process_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Process Id"
+          },
+          "initiator": {
+            "enum": [
+              "local_cli",
+              "authenticated_user",
+              "unknown"
+            ],
+            "title": "Initiator",
+            "type": "string"
+          },
+          "initiator_user_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Initiator User Id"
+          },
+          "reason": {
+            "enum": [
+              "user_stopped_host",
+              "user_stopped_session",
+              "host_interrupted_sigint",
+              "unknown"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "requested_at_ms": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Requested At Ms",
+            "type": "integer"
+          },
+          "shutdown_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Shutdown Id",
+            "type": "string"
+          },
+          "signal_name": {
+            "anyOf": [
+              {
+                "enum": [
+                  "SIGINT",
+                  "SIGTERM",
+                  "SIGHUP"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Signal Name"
+          }
+        },
+        "required": [
+          "reason",
+          "action",
+          "initiator"
+        ],
+        "title": "ShutdownIntent",
+        "type": "object"
+      },
       "SkillContentResponse": {
         "properties": {
           "content": {
@@ -10953,6 +11095,63 @@
           }
         },
         "summary": "Launch Runner",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/shutdown": {
+      "post": {
+        "description": "Record an owner-requested local command before the host is terminated.",
+        "operationId": "record_shutdown_v1_hosts__host_id__shutdown_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShutdownIntent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Record Shutdown V1 Hosts  Host Id  Shutdown Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Shutdown",
         "tags": [
           "hosts"
         ]

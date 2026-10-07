@@ -538,6 +538,40 @@ class ConversationStore(ABC):
         """
         ...
 
+    def get_shutdown_state(self, conversation_id: str) -> dict[str, Any] | None:
+        """Read private shutdown metadata; unsupported backends fail closed."""
+        del conversation_id
+        return None
+
+    def compare_shutdown_state(
+        self,
+        conversation_id: str,
+        *,
+        runner_id: str | None,
+        expected_scope: str | None,
+        scope: str | None,
+        intent: str | None,
+        expected_intent: str | None = None,
+        settle: bool = False,
+        preserve_failure: bool = False,
+        intent_id: str | None = None,
+        intent_recorded_at_ms: int | None = None,
+    ) -> bool:
+        """Conditionally replace shutdown metadata and optionally settle this lifecycle."""
+        _ = (
+            conversation_id,
+            runner_id,
+            expected_scope,
+            scope,
+            intent,
+            expected_intent,
+            settle,
+            preserve_failure,
+            intent_id,
+            intent_recorded_at_ms,
+        )
+        return False
+
     @abstractmethod
     def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
         """Return the bound runner ID and heartbeat from the metadata database.
@@ -1459,7 +1493,13 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def set_session_live_status(self, conversation_id: str, status: str) -> None:
+    def set_session_live_status(
+        self,
+        conversation_id: str,
+        status: str,
+        *,
+        expected_shutdown_scope: str | None = None,
+    ) -> bool | None:
         """
         Persist the relay-observed turn status for one session.
 

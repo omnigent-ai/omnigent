@@ -30,6 +30,7 @@ from pydantic import ValidationError
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
+from omnigent.host.shutdown import ShutdownIntent
 from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
@@ -58,6 +59,7 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+CAP_SHUTDOWN_INTENT = "shutdown_intent"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -68,6 +70,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_TOOLS,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
+    CAP_SHUTDOWN_INTENT,
 ]
 
 
@@ -119,6 +122,8 @@ class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
     HELLO = "host.hello"
+    SHUTDOWN = "host.shutdown"
+    SHUTDOWN_ACK = "host.shutdown_ack"
     CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
     LAUNCH_RUNNER = "host.launch_runner"
@@ -218,6 +223,23 @@ class HostHelloFrame:
     telemetry_opt_out: bool = False
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
+    process_id: str | None = None
+    connection_id: str | None = None
+
+
+@dataclass
+class HostShutdownFrame:
+    """Host → server: evidence recorded before closing the tunnel or runners."""
+
+    intent: ShutdownIntent
+    runner_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class HostShutdownAckFrame:
+    """Server → host: scoped evidence was processed before teardown."""
+
+    shutdown_id: str
 
 
 @dataclass
@@ -323,6 +345,7 @@ class HostStopRunnerFrame:
 
     request_id: str
     runner_id: str
+    shutdown_intent: ShutdownIntent | None = None
 
 
 @dataclass
@@ -1251,6 +1274,8 @@ class HostImportLocalDoneFrame:
 
 HostFrame = (
     HostHelloFrame
+    | HostShutdownFrame
+    | HostShutdownAckFrame
     | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
@@ -1353,6 +1378,23 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
+                "process_id": frame.process_id,
+                "connection_id": frame.connection_id,
+            }
+        )
+    if isinstance(frame, HostShutdownFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SHUTDOWN.value,
+                "intent": frame.intent.model_dump(),
+                "runner_ids": frame.runner_ids,
+            }
+        )
+    if isinstance(frame, HostShutdownAckFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SHUTDOWN_ACK.value,
+                "shutdown_id": frame.shutdown_id,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1401,6 +1443,9 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.STOP_RUNNER.value,
                 "request_id": frame.request_id,
                 "runner_id": frame.runner_id,
+                "shutdown_intent": frame.shutdown_intent.model_dump()
+                if frame.shutdown_intent
+                else None,
             }
         )
     if isinstance(frame, HostStopRunnerResultFrame):
@@ -2075,6 +2120,13 @@ def _decode_known_host_frame(
     match kind:
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
+        case HostFrameKind.SHUTDOWN:
+            return HostShutdownFrame(
+                intent=ShutdownIntent.model_validate(msg.get("intent")),
+                runner_ids=_optional_str_list(msg, "runner_ids"),
+            )
+        case HostFrameKind.SHUTDOWN_ACK:
+            return HostShutdownAckFrame(shutdown_id=_required_str(msg, "shutdown_id"))
         case HostFrameKind.CONNECTION_ERROR:
             return HostConnectionErrorFrame(
                 stage=_required_str(msg, "stage"),
@@ -2237,6 +2289,8 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
+        process_id=_optional_nullable_str(msg, "process_id"),
+        connection_id=_optional_nullable_str(msg, "connection_id"),
     )
 
 
@@ -2303,6 +2357,11 @@ def _decode_stop_runner(msg: _JsonObject) -> HostStopRunnerFrame:
     return HostStopRunnerFrame(
         request_id=_required_str(msg, "request_id"),
         runner_id=_required_str(msg, "runner_id"),
+        shutdown_intent=(
+            ShutdownIntent.model_validate(msg["shutdown_intent"])
+            if msg.get("shutdown_intent") is not None
+            else None
+        ),
     )
 
 

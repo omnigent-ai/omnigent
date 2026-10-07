@@ -142,6 +142,25 @@ async def test_handle_async_request_returns_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_response_identity_does_not_follow_replacement_connection() -> None:
+    registry = TunnelRegistry()
+    old = registry.register("runner", _NoopWS(), _hello())
+    transport = WSTunnelTransport(registry, "runner")
+    task = asyncio.create_task(transport.handle_async_request(_make_request()))
+    await asyncio.sleep(0)
+    request_id = next(iter(old.in_flight))
+    registry.route_response_frame("runner", ResponseHeadFrame(id=request_id, status=200))
+    registry.route_response_frame("runner", ResponseEndFrame(id=request_id))
+    replacement = registry.register("runner", _NoopWS(), _hello())
+    response = await task
+    assert response.extensions["omnigent.runner_connection_id"] == old.connection_id
+    assert old.connection_id != replacement.connection_id
+    assert not transport.is_current_connection(old.connection_id)
+    assert transport.is_current_connection(replacement.connection_id)
+    await response.aclose()
+
+
+@pytest.mark.asyncio
 async def test_handle_async_request_with_body() -> None:
     """POST requests encode the body into the request frame."""
     reg = TunnelRegistry()

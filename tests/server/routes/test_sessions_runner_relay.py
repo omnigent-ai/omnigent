@@ -15,6 +15,8 @@ import httpx
 import pytest
 
 from omnigent.entities import Conversation
+from omnigent.host.shutdown import ShutdownIntent
+from omnigent.server import shutdown_attribution
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -26,6 +28,26 @@ from tests.server.helpers import start_session_stream_collector
 # runner, and a tight budget (1-2s) times out under CPU contention while a
 # passing test never waits this long.
 _TASK_TIMEOUT_S = 10.0
+
+
+async def _record_stop(
+    store: SqlAlchemyConversationStore, session_id: str, runner_id: str
+) -> shutdown_attribution.SessionShutdown:
+    scope = await shutdown_attribution.begin_connection(
+        session_id, runner_id, f"connection-{runner_id}", store
+    )
+    assert scope is not None
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    evidence = await shutdown_attribution.record_session_shutdown(
+        conv,
+        ShutdownIntent(
+            reason="user_stopped_session", action="stop_session", initiator="authenticated_user"
+        ),
+        store,
+    )
+    assert evidence is not None
+    return evidence
 
 
 class _HeartbeatStreamResponse:
@@ -964,6 +986,7 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
 @pytest.mark.asyncio
 async def test_relay_suppresses_disconnect_error_on_intentional_stop(
     caplog: pytest.LogCaptureFixture,
+    db_uri: str,
 ) -> None:
     """
     A user-initiated Stop drops the tunnel quietly, not as a failure.
@@ -971,7 +994,7 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
     Stopping a host-spawned session tears down its runner tunnel on
     purpose, which makes the relay hit the same ``ConnectionError`` path a
     genuine runner death takes. The Stop handler marks the session in
-    ``_intentional_stop_sessions`` first, so the relay must resolve to a
+    the current runner connection and lifecycle first, so the relay must resolve to a
     quiet ``idle`` (no ``runner_disconnected`` status, no persisted error
     labels) rather than rendering "Error · runner_disconnected".
     """
@@ -981,14 +1004,29 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     fake_runner = _TunnelCloseRunnerClient(gate)
-    store = _RecordingLabelStore()
+    store = SqlAlchemyConversationStore(db_uri)
     session_id = "b7c1e2d3f4a5968778695a4b3c2d1e0f"
 
     collector = None
     try:
         # Simulate the Stop handler: mark the intentional teardown before
         # the tunnel drops.
-        sessions_module._intentional_stop_sessions[session_id] = "runner_intentional_stop"
+        conv = store.create_conversation(
+            conversation_id=session_id, runner_id="runner_intentional_stop"
+        )
+        await shutdown_attribution.begin_connection(
+            session_id, conv.runner_id, "stop_connection", store
+        )
+        evidence = await shutdown_attribution.record_session_shutdown(
+            conv,
+            ShutdownIntent(
+                reason="user_stopped_session",
+                action="stop_session",
+                initiator="authenticated_user",
+            ),
+            store,
+        )
+        assert evidence is not None
 
         handle = await sessions_module._ensure_runner_relay_ready(
             session_id,
@@ -1008,8 +1046,8 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
         assert event.get("status") == "idle"
         assert event.get("error") is None
 
-        # The marker is one-shot: consumed by the disconnect handler.
-        assert session_id not in sessions_module._intentional_stop_sessions
+        # The settled scope cannot later persist another running edge.
+        assert store.get_shutdown_state(session_id)["settled"] is True
         record = next(
             r
             for r in caplog.records
@@ -1017,17 +1055,21 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
         )
         assert record.session_id == session_id
         assert record.attributes["intentional_stop"] is True
-        assert record.attributes["cached_session_status"] is None
+        assert record.attributes["cached_session_status"] == "idle"
         assert record.attributes["decision"] == "intentional_stop"
+        for key, value in evidence.log_attrs().items():
+            assert record.attributes[key] == value
+        assert record.attributes["lost_at_ms"] >= evidence.recorded_at_ms
 
         # No durable runner_disconnected label persists, so snapshots and
         # child summaries stay clean.
-        persisted = store.labels.get(session_id)
+        persisted = store.get_conversation(session_id).labels
         assert persisted is not None
         assert sessions_module._last_task_error_from_labels(persisted) is None
     finally:
         gate.set()
-        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        shutdown_attribution.session_shutdowns.pop(session_id, None)
+        shutdown_attribution.session_scopes.pop(session_id, None)
         if collector is not None:
             await collector.stop()
         handle = sessions_module._runner_relay_tasks.get(session_id)
@@ -1105,6 +1147,7 @@ class _ScriptedThenDropRunnerClient:
 @pytest.mark.parametrize("intentional", [False, True])
 async def test_relay_preserves_failure_reported_during_intentional_teardown(
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
     intentional: bool,
 ) -> None:
     """A failure arriving after stop intent keeps its status and durable details."""
@@ -1120,7 +1163,12 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
     event = {"type": "session.status", "status": "failed", "error": error}
     gate = asyncio.Event()
     runner = _ScriptedThenDropRunnerClient([f"data: {json.dumps(event)}\n\n"], gate)
-    store = _RecordingLabelStore(live_status="running")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.create_conversation(conversation_id=session_id, runner_id=runner_id)
+    store.set_session_live_status(session_id, "running")
+    await shutdown_attribution.begin_connection(
+        session_id, runner_id, f"connection-{runner_id}", store
+    )
     sessions_module._session_status_cache[session_id] = "running"
     collector = None
     try:
@@ -1133,7 +1181,7 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
         assert handle is not None
         collector = await start_session_stream_collector(session_id)
         if intentional:
-            sessions_module._intentional_stop_sessions[session_id] = runner_id
+            await _record_stop(store, session_id, runner_id)
         gate.set()
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
@@ -1142,11 +1190,13 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
         assert status["status"] == "failed"
         assert status["error"]["code"] == error["code"]
         assert sessions_module._session_status_cache.get(session_id) == "failed"
-        persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+        persisted = sessions_module._last_task_error_from_labels(
+            store.get_conversation(session_id).labels
+        )
         assert persisted is not None
         assert persisted["code"] == error["code"]
         assert persisted["message"] == error["message"]
-        assert session_id not in sessions_module._intentional_stop_sessions
+        assert session_id not in shutdown_attribution.session_shutdowns
     finally:
         gate.set()
         if collector is not None:
@@ -1156,7 +1206,8 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
-        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        shutdown_attribution.session_shutdowns.pop(session_id, None)
+        shutdown_attribution.session_scopes.pop(session_id, None)
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
 
@@ -1164,7 +1215,7 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mark_before_rebind", [True, False])
 async def test_relay_ignores_stop_intent_for_a_different_runner(
-    monkeypatch: pytest.MonkeyPatch, mark_before_rebind: bool
+    monkeypatch: pytest.MonkeyPatch, db_uri: str, mark_before_rebind: bool
 ) -> None:
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
@@ -1172,12 +1223,19 @@ async def test_relay_ignores_stop_intent_for_a_different_runner(
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
     )
-    session_id = "rebound-stop-session"
+    session_id = "29d2f3a4b5061728394a5b6c7d8e9f01"
     gate = asyncio.Event()
-    store = _RecordingLabelStore()
+    store = SqlAlchemyConversationStore(db_uri)
+    store.create_conversation(conversation_id=session_id, runner_id="runner-old")
+    store.set_session_live_status(session_id, "running")
     sessions_module._session_status_cache[session_id] = "running"
+    old_stop = await _record_stop(store, session_id, "runner-old")
+    store.replace_runner_id(session_id, "runner-new")
+    await shutdown_attribution.begin_connection(
+        session_id, "runner-new", "connection-runner-new", store
+    )
     if mark_before_rebind:
-        sessions_module._intentional_stop_sessions[session_id] = "runner-old"
+        shutdown_attribution.session_shutdowns[session_id] = old_stop
     handle = await sessions_module._ensure_runner_relay_ready(
         session_id,
         "runner-new",
@@ -1186,33 +1244,41 @@ async def test_relay_ignores_stop_intent_for_a_different_runner(
     )
     assert handle is not None
     try:
-        assert session_id not in sessions_module._intentional_stop_sessions
+        assert session_id not in shutdown_attribution.session_shutdowns
         if not mark_before_rebind:
             # A late old-runner teardown cannot apply to the new relay either.
-            sessions_module._intentional_stop_sessions[session_id] = "runner-old"
+            shutdown_attribution.session_shutdowns[session_id] = old_stop
         gate.set()
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         assert sessions_module._session_status_cache[session_id] == "failed"
-        error = sessions_module._last_task_error_from_labels(store.labels[session_id])
+        error = sessions_module._last_task_error_from_labels(
+            store.get_conversation(session_id).labels
+        )
         assert error is not None
         assert error["code"] == "runner_disconnected"
     finally:
         gate.set()
         handle.task.cancel()
         await asyncio.gather(handle.task, return_exceptions=True)
-        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        shutdown_attribution.session_shutdowns.pop(session_id, None)
+        shutdown_attribution.session_scopes.pop(session_id, None)
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
 
 
 @pytest.mark.asyncio
-async def test_cancelled_old_relay_preserves_replacement_runner_stop() -> None:
+async def test_cancelled_old_relay_preserves_replacement_runner_stop(db_uri: str) -> None:
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
-    session_id = "replacement-stop-session"
+    session_id = "39d2f3a4b5061728394a5b6c7d8e9f01"
     old_gate, new_gate = asyncio.Event(), asyncio.Event()
-    store = _RecordingLabelStore()
+    store = SqlAlchemyConversationStore(db_uri)
+    store.create_conversation(conversation_id=session_id, runner_id="runner-old")
+    store.set_session_live_status(session_id, "running")
+    await shutdown_attribution.begin_connection(
+        session_id, "runner-old", "connection-runner-old", store
+    )
     old_handle = await sessions_module._ensure_runner_relay_ready(
         session_id,
         "runner-old",
@@ -1220,6 +1286,10 @@ async def test_cancelled_old_relay_preserves_replacement_runner_stop() -> None:
         conversation_store=store,  # type: ignore[arg-type]
     )
     assert old_handle is not None
+    store.replace_runner_id(session_id, "runner-new")
+    await shutdown_attribution.begin_connection(
+        session_id, "runner-new", "connection-runner-new", store
+    )
     new_handle = sessions_module._ensure_runner_relay(
         session_id,
         "runner-new",
@@ -1227,22 +1297,26 @@ async def test_cancelled_old_relay_preserves_replacement_runner_stop() -> None:
         conversation_store=store,  # type: ignore[arg-type]
     )
     assert new_handle is not None
-    sessions_module._intentional_stop_sessions[session_id] = "runner-new"
+    await _record_stop(store, session_id, "runner-new")
     try:
         await asyncio.wait_for(
             asyncio.gather(old_handle.task, return_exceptions=True), timeout=_TASK_TIMEOUT_S
         )
-        assert sessions_module._intentional_stop_sessions.get(session_id) == "runner-new"
+        assert shutdown_attribution.has_local_intent(session_id, "runner-new")
         new_gate.set()
         await asyncio.wait_for(new_handle.task, timeout=_TASK_TIMEOUT_S)
         assert sessions_module._session_status_cache[session_id] == "idle"
-        assert sessions_module._last_task_error_from_labels(store.labels[session_id]) is None
+        assert (
+            sessions_module._last_task_error_from_labels(store.get_conversation(session_id).labels)
+            is None
+        )
     finally:
         old_gate.set()
         new_gate.set()
         new_handle.task.cancel()
         await asyncio.gather(new_handle.task, return_exceptions=True)
-        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        shutdown_attribution.session_shutdowns.pop(session_id, None)
+        shutdown_attribution.session_scopes.pop(session_id, None)
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
 
@@ -1251,6 +1325,7 @@ async def test_cancelled_old_relay_preserves_replacement_runner_stop() -> None:
 @pytest.mark.parametrize("live_status", ["waiting", "running", "idle"])
 async def test_relay_same_turn_running_preserves_intentional_stop(
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
     live_status: str,
 ) -> None:
     """Resuming work or PTY activity during teardown must keep stop intent."""
@@ -1260,13 +1335,15 @@ async def test_relay_same_turn_running_preserves_intentional_stop(
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
     )
-    session_id = "child-resuming-during-stop"
+    session_id = "49d2f3a4b5061728394a5b6c7d8e9f01"
     runner_id = "runner-intentional-stop"
     gate = asyncio.Event()
     frames = ['data: {"type": "session.status", "status": "running"}\n\n']
-    store = _RecordingLabelStore(live_status=live_status)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.create_conversation(conversation_id=session_id, runner_id=runner_id)
+    store.set_session_live_status(session_id, live_status)
     sessions_module._session_status_cache[session_id] = live_status
-    sessions_module._intentional_stop_sessions[session_id] = runner_id
+    await _record_stop(store, session_id, runner_id)
     collector = None
     handle = None
     try:
@@ -1287,8 +1364,11 @@ async def test_relay_same_turn_running_preserves_intentional_stop(
         assert not any(event.get("status") == "failed" for event in statuses), statuses
         assert statuses[-1].get("status") == "idle"
         assert sessions_module._session_status_cache[session_id] == "idle"
-        assert sessions_module._last_task_error_from_labels(store.labels[session_id]) is None
-        assert session_id not in sessions_module._intentional_stop_sessions
+        assert (
+            sessions_module._last_task_error_from_labels(store.get_conversation(session_id).labels)
+            is None
+        )
+        assert session_id not in shutdown_attribution.session_shutdowns
     finally:
         gate.set()
         if collector is not None:
@@ -1297,7 +1377,8 @@ async def test_relay_same_turn_running_preserves_intentional_stop(
             handle.task.cancel()
             await asyncio.gather(handle.task, return_exceptions=True)
         sessions_module._runner_relay_tasks.pop(session_id, None)
-        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        shutdown_attribution.session_shutdowns.pop(session_id, None)
+        shutdown_attribution.session_scopes.pop(session_id, None)
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
 
@@ -1329,7 +1410,10 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
     dispatched = asyncio.Event()
     acknowledgement = asyncio.Event()
 
-    async def stop_host(*_args: object, attempt: _HostRunnerStopAttempt) -> bool:
+    async def stop_host(
+        *_args: object, attempt: _HostRunnerStopAttempt, shutdown_intent: ShutdownIntent
+    ) -> bool:
+        assert shutdown_intent.reason == "user_stopped_session"
         attempt.dispatched = True
         dispatched.set()
         if outcome == "rejected_while_running":
@@ -1340,7 +1424,7 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
     monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
     monkeypatch.setattr(sessions_module, "_stop_session_host_runner", stop_host)
     store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
+    parent = store.create_conversation(host_id="a" * 32, workspace="/tmp")
     child = store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
     session_id = child.id
     runner_id = "runner-stop-after-terminal"
@@ -1348,8 +1432,12 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
         store.set_runner_id(row.id, runner_id)
         store.set_session_live_status(row.id, "waiting")
         sessions_module._session_status_cache[row.id] = "waiting"
+        await shutdown_attribution.begin_connection(
+            row.id, runner_id, f"connection-{runner_id}", store
+        )
+    old_stop = None
     if earlier_stop != "none":
-        sessions_module._intentional_stop_sessions[session_id] = runner_id
+        old_stop = await _record_stop(store, session_id, runner_id)
     gate = asyncio.Event()
     runner = _ScriptedThenDropRunnerClient([], gate)
     response = _ScriptedThenDropStreamResponse([], gate)
@@ -1362,10 +1450,11 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
         await gate.wait()
         yield 'data: {"type": "response.cancelled"}\n\n'
         if earlier_stop == "rolled_back":
-            sessions_module._intentional_stop_sessions.pop(session_id, None)
+            assert old_stop is not None
+            await shutdown_attribution.cancel_shutdown([(session_id, old_stop)], store)
         stop_task = asyncio.create_task(
             orchestration._stop_host_runner_intentionally(
-                parent.id, "host", runner_id, None, store
+                parent.id, parent.host_id, runner_id, None, store
             )
         )
         if outcome == "rejected_while_running":
@@ -1375,7 +1464,7 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
         acknowledged = await asyncio.wait_for(stop_task, timeout=_TASK_TIMEOUT_S)
         assert acknowledged is (outcome == "acknowledged")
         if outcome != "rejected_while_running":
-            assert sessions_module._intentional_stop_sessions.get(session_id) == runner_id
+            assert shutdown_attribution.has_local_intent(session_id, runner_id)
             yield 'data: {"type": "session.status", "status": "running"}\n\n'
         raise ConnectionError("intentional runner teardown")
 
@@ -1395,8 +1484,14 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
         gate.set()
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         statuses = []
-        while not collector.queue.empty():
-            statuses.append(collector.queue.get_nowait())
+        # The collector's pump can lag the final publish when the relay exits.
+        session_stream.publish(session_id, {"type": "_test_relay_finished"})
+        async with asyncio.timeout(_TASK_TIMEOUT_S):
+            while True:
+                event = await collector.next_event(timeout=_TASK_TIMEOUT_S)
+                if event.get("type") == "_test_relay_finished":
+                    break
+                statuses.append(event)
         persisted = store.get_conversation(session_id)
         assert persisted is not None
         error = sessions_module._last_task_error_from_labels(persisted.labels)
@@ -1409,6 +1504,7 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
             assert not failed, statuses
             assert any(event.get("status") == "idle" for event in statuses), statuses
             assert sessions_module._session_status_cache[session_id] == "idle"
+            assert persisted.live_status == "idle"
             assert error is None
     finally:
         gate.set()
@@ -1423,14 +1519,72 @@ async def test_relay_terminal_observation_tracks_stop_attempt(
             await asyncio.gather(stop_task, return_exceptions=True)
         sessions_module._runner_relay_tasks.pop(session_id, None)
         for row in (parent, child):
-            sessions_module._intentional_stop_sessions.pop(row.id, None)
+            shutdown_attribution.session_shutdowns.pop(row.id, None)
+            shutdown_attribution.session_scopes.pop(row.id, None)
             sessions_module._session_status_cache.pop(row.id, None)
             session_stream.close(row.id)
 
 
 @pytest.mark.asyncio
+async def test_running_observation_refreshes_lifecycle_started_on_another_replica(
+    monkeypatch: pytest.MonkeyPatch, db_uri: str
+) -> None:
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="remote-turn-runner")
+    store.set_session_live_status(conv.id, "running")
+    sessions_module._session_status_cache[conv.id] = "running"
+    previous = await _record_stop(store, conv.id, conv.runner_id)
+    gate = asyncio.Event()
+    runner = _ScriptedThenDropRunnerClient(
+        ['data: {"type": "session.status", "status": "running"}\n\n'], gate
+    )
+    handle = await sessions_module._ensure_runner_relay_ready(
+        conv.id, conv.runner_id, runner, conversation_store=store
+    )
+    assert handle is not None
+    try:
+        # A user message reaches another replica while this stream stays connected.
+        newer = previous.scope.model_copy(update={"lifecycle_id": "remote-new-turn"})
+        assert store.compare_shutdown_state(
+            conv.id,
+            runner_id=conv.runner_id,
+            expected_scope=previous.scope.model_dump_json(),
+            scope=newer.model_dump_json(),
+            intent=None,
+        )
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        assert shutdown_attribution.session_scopes[conv.id] == newer
+        assert sessions_module._session_status_cache[conv.id] == "failed"
+        error = sessions_module._last_task_error_from_labels(
+            store.get_conversation(conv.id).labels
+        )
+        assert error is not None and error["code"] == "runner_disconnected"
+        assert (
+            await shutdown_attribution.record_session_shutdown(conv, previous.intent, store)
+            is None
+        )
+    finally:
+        gate.set()
+        handle.task.cancel()
+        await asyncio.gather(handle.task, return_exceptions=True)
+        sessions_module._runner_relay_tasks.pop(conv.id, None)
+        sessions_module._session_status_cache.pop(conv.id, None)
+        shutdown_attribution.session_shutdowns.pop(conv.id, None)
+        shutdown_attribution.session_scopes.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 async def test_relay_running_edge_clears_stale_intentional_stop_marker(
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """
     A new turn after a Stop must not suppress a later genuine disconnect.
@@ -1460,7 +1614,7 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
         'data: {"type": "session.status", "status": "running"}\n\n',
     ]
     fake_runner = _ScriptedThenDropRunnerClient(frames, gate)
-    store = _RecordingLabelStore()
+    store = SqlAlchemyConversationStore(db_uri)
     session_id = "c9d2f3a4b5061728394a5b6c7d8e9f01"
 
     collector = None
@@ -1468,7 +1622,21 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
         # A prior Stop left both markers set (terminal event will clear the
         # fence; the marker must survive to the running edge, then clear).
         sessions_module._interrupt_fenced_sessions.add(session_id)
-        sessions_module._intentional_stop_sessions[session_id] = "runner_stale_marker"
+        conv = store.create_conversation(
+            conversation_id=session_id, runner_id="runner_stale_marker"
+        )
+        await shutdown_attribution.begin_connection(
+            session_id, conv.runner_id, "stale_connection", store
+        )
+        await shutdown_attribution.record_session_shutdown(
+            conv,
+            ShutdownIntent(
+                reason="user_stopped_session",
+                action="stop_session",
+                initiator="authenticated_user",
+            ),
+            store,
+        )
 
         handle = await sessions_module._ensure_runner_relay_ready(
             session_id,
@@ -1492,7 +1660,7 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
         assert failed[-1]["error"]["code"] == "runner_disconnected"
 
         # And the disconnect cause persisted as durable labels.
-        persisted = store.labels.get(session_id)
+        persisted = store.get_conversation(session_id).labels
         assert persisted is not None
         assert sessions_module._last_task_error_from_labels(persisted) == {
             "code": "runner_disconnected",
@@ -1501,7 +1669,8 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
     finally:
         gate.set()
         sessions_module._interrupt_fenced_sessions.discard(session_id)
-        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        shutdown_attribution.session_shutdowns.pop(session_id, None)
+        shutdown_attribution.session_scopes.pop(session_id, None)
         if collector is not None:
             await collector.stop()
         handle = sessions_module._runner_relay_tasks.get(session_id)
@@ -2780,7 +2949,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
     store = SqlAlchemyConversationStore(db_uri)
     parent_id = store.create_conversation().id if kind == "sub_agent" else None
     conv = store.create_conversation(
-        kind=kind, parent_conversation_id=parent_id, runner_id="runner-offline"
+        kind=kind, parent_conversation_id=parent_id, runner_id="offline_runner"
     )
     session_id = conv.id
     if live_status is not None:
@@ -2791,7 +2960,18 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
     if cached is not None:
         sessions_module._session_status_cache[session_id] = cached
     if intentional_stop:
-        sessions_module._intentional_stop_sessions[session_id] = "runner-offline"
+        await shutdown_attribution.begin_connection(
+            session_id, "offline_runner", "offline_connection", store
+        )
+        await shutdown_attribution.record_session_shutdown(
+            snapshot,
+            ShutdownIntent(
+                reason="user_stopped_session",
+                action="stop_session",
+                initiator="authenticated_user",
+            ),
+            store,
+        )
 
     try:
         await sessions_module._mark_runner_sessions_offline(
@@ -2818,12 +2998,13 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
         elif intentional_stop and (cached or live_status) in {"running", "waiting"}:
             assert status == "idle"
             assert persisted is None
-            assert session_id not in sessions_module._intentional_stop_sessions
+            assert session_id not in shutdown_attribution.session_shutdowns
         else:
-            assert status == cached
+            assert status == ("idle" if intentional_stop else cached)
             assert persisted is None
     finally:
-        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        shutdown_attribution.session_shutdowns.pop(session_id, None)
+        shutdown_attribution.session_scopes.pop(session_id, None)
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
 

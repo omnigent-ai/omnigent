@@ -76,7 +76,12 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server import (
+    managed_host_keepalive,
+    session_live_state,
+    shutdown_attribution,
+    shutdown_state,
+)
 from omnigent.server.auth import AuthProvider, SharingMode, auth_mode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -3324,7 +3329,11 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(
-        runner_id: str, reference_stamp: int | None
+        runner_id: str,
+        reference_stamp: int | None,
+        connection_id: str | None = None,
+        lost_at_ms: int | None = None,
+        disconnected_scopes: dict[str, shutdown_attribution.SessionScope] | None = None,
     ) -> None:
         """Reconcile a dropped runner's sessions once the liveness lease expires.
 
@@ -3424,6 +3433,9 @@ def create_app(
                 message="Runner disconnected unexpectedly.",
             ),
             conversation_store,
+            connection_id=connection_id,
+            lost_at_ms=lost_at_ms,
+            disconnected_scopes=disconnected_scopes,
         )
 
     async def _on_runner_disconnect(runner_id: str, connection: RunnerSession) -> None:
@@ -3450,6 +3462,17 @@ def create_app(
         :param connection: The closed tunnel whose generation scopes
             initialization cleanup.
         """
+        from omnigent.server.shutdown_attribution import forget_connection, session_scopes
+
+        connection_id = connection.connection_id
+        lost_at_ms = connection.lost_at_ms
+        disconnected_scopes = {
+            sid: scope
+            for sid, scope in session_scopes.items()
+            if scope.runner_id == runner_id and scope.runner_connection_id == connection_id
+        }
+        forget_connection(runner_id, connection_id)
+
         cancelled = runner_session_initializer.invalidate_runner(
             runner_id, generation=connection.generation
         )
@@ -3492,7 +3515,9 @@ def create_app(
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id, reference_stamp),
+            _mark_disconnected_runner_failed(
+                runner_id, reference_stamp, connection_id, lost_at_ms, disconnected_scopes
+            ),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task
@@ -3566,9 +3591,11 @@ def create_app(
             _publish_sandbox_status,
             prefetch_session_routing_catalogs,
         )
+        from omnigent.server.shutdown_attribution import begin_connection, runner_connections
 
         if tunnel_registry.get(runner_id) is not connection:
             return
+        runner_connections[runner_id] = connection.connection_id
         _logger.info(
             "Runner connected",
             extra=debug_event("runner_connected", runner_id=runner_id),
@@ -3613,6 +3640,15 @@ def create_app(
                     conv = current.get(snapshot.id)
                     if conv is None or conv.runner_id != runner_id:
                         continue
+                    await begin_connection(
+                        conv.id,
+                        runner_id,
+                        connection.connection_id,
+                        conversation_store,
+                        is_current=lambda: tunnel_registry.get(runner_id) is connection,
+                    )
+                    if tunnel_registry.get(runner_id) is not connection:
+                        return
                     with runner_log_scope(conv.id, runner_id):
                         _logger.info(
                             "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
@@ -3778,6 +3814,7 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
+                conversation_store=conversation_store,
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,

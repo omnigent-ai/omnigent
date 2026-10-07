@@ -4,33 +4,72 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
-from collections.abc import Iterator
-from types import SimpleNamespace
+from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock
 
 import pytest
 
 from omnigent.host.frames import HostHelloFrame, HostStopRunnerFrame, decode_host_frame
+from omnigent.host.shutdown import SHUTDOWN_INTENT_TTL_MS, ShutdownIntent
 from omnigent.runtime import session_stream
 from omnigent.server import session_live_state
+from omnigent.server import shutdown_attribution as attribution
 from omnigent.server.host_registry import HostRegistry, WebSocketLike
 from omnigent.server.routes import sessions
-from omnigent.server.routes._sessions import common, helpers, orchestration
+from omnigent.server.routes._sessions import helpers, orchestration
 from omnigent.server.schemas import ErrorDetail
-from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 _RUNNER = "runner-stopped"
+_HOST = "a" * 32
+
+
+def _markers() -> dict[str, str]:
+    """Inspect unconsumed local evidence, including stale binding hints."""
+    return {
+        session_id: evidence.scope.runner_id
+        for session_id, evidence in attribution.session_shutdowns.items()
+        if 0 <= attribution.timestamp_ms() - evidence.recorded_at_ms <= SHUTDOWN_INTENT_TTL_MS
+    }
+
+
+def _hint(session_id: str, runner_id: str) -> None:
+    """Represent another replica's binding hint without inventing persisted evidence."""
+    attribution.session_shutdowns[session_id] = attribution.SessionShutdown(
+        intent=ShutdownIntent(
+            reason="user_stopped_session", action="stop_session", initiator="authenticated_user"
+        ),
+        scope=attribution.SessionScope(
+            runner_id=runner_id, runner_connection_id=f"{runner_id}-connection"
+        ),
+        recorded_at_ms=attribution.timestamp_ms(),
+    )
+
+
+async def _mark(store: SqlAlchemyConversationStore, session_id: str, runner_id: str) -> None:
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    if conv.runner_id != runner_id:
+        _hint(session_id, runner_id)
+        return
+    await attribution.begin_connection(session_id, runner_id, f"{runner_id}-connection", store)
+    evidence = await attribution.record_session_shutdown(
+        conv,
+        ShutdownIntent(
+            reason="user_stopped_session", action="stop_session", initiator="authenticated_user"
+        ),
+        store,
+    )
+    assert evidence is not None
 
 
 @pytest.fixture
-def family(
+async def family(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[tuple[SqlAlchemyConversationStore, dict[str, str]]]:
-    monkeypatch.setattr(orchestration, "_RUNNER_STOP_STATUS_BATCH_SIZE", 2)
+) -> AsyncIterator[tuple[SqlAlchemyConversationStore, dict[str, str]]]:
+    monkeypatch.setattr(attribution, "_RUNNER_STOP_STATUS_BATCH_SIZE", 2)
     store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
+    parent = store.create_conversation(host_id=_HOST, workspace="/work/test")
     ids = {"parent": parent.id}
     store.set_runner_id(parent.id, _RUNNER)
     for name, status in (
@@ -51,14 +90,25 @@ def family(
         if name != "cold":
             sessions._session_status_cache[row.id] = status
     store.set_labels(ids["failed"], {"omnigent.last_task_error_code": "native_turn_error"})
+    for runner_id in (_RUNNER, "runner-other"):
+        attribution.runner_connections[runner_id] = f"{runner_id}-connection"
+    for name, session_id in ids.items():
+        if name != "cold":
+            runner_id = store.get_conversation(session_id).runner_id
+            await attribution.begin_connection(
+                session_id, runner_id, f"{runner_id}-connection", store
+            )
     try:
         yield store, ids
     finally:
         for session_id in ids.values():
-            sessions._intentional_stop_sessions.pop(session_id, None)
+            attribution.session_shutdowns.pop(session_id, None)
+            attribution.session_scopes.pop(session_id, None)
             sessions._session_status_cache.pop(session_id, None)
             sessions._runner_relay_tasks.pop(session_id, None)
             session_stream.close(session_id)
+        for runner_id in (_RUNNER, "runner-other", "runner-replacement"):
+            attribution.runner_connections.pop(runner_id, None)
 
 
 @pytest.mark.parametrize("outcome", ["delivered", "offline", "error", "cancelled"])
@@ -71,7 +121,7 @@ async def test_stop_marks_only_affected_active_sessions_and_rolls_back(
     expected = {ids[name] for name in ("parent", "active", "cold", "grandchild")}
 
     async def teardown(*_args, **_kwargs):
-        assert set(sessions._intentional_stop_sessions) == expected
+        assert set(_markers()) == expected
         if outcome == "error":
             raise RuntimeError("host stop failed")
         if outcome == "cancelled":
@@ -80,7 +130,7 @@ async def test_stop_marks_only_affected_active_sessions_and_rolls_back(
 
     monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
     call = orchestration._stop_host_runner_intentionally(
-        ids["parent"], "host", _RUNNER, None, store
+        ids["parent"], _HOST, _RUNNER, None, store
     )
     if outcome == "error":
         with pytest.raises(RuntimeError, match="host stop failed"):
@@ -90,9 +140,7 @@ async def test_stop_marks_only_affected_active_sessions_and_rolls_back(
             await call
     else:
         assert await call is (outcome == "delivered")
-    assert set(sessions._intentional_stop_sessions) == (
-        expected if outcome == "delivered" else set()
-    )
+    assert set(_markers()) == (expected if outcome == "delivered" else set())
     assert (
         store.get_conversation(ids["failed"]).labels["omnigent.last_task_error_code"]
         == "native_turn_error"
@@ -109,9 +157,9 @@ async def test_stop_intent_tracks_actual_host_frame_handoff(
     store, ids = family
     registry = HostRegistry()
     conn = registry.register(
-        "host",
+        _HOST,
         AsyncMock(spec=WebSocketLike),
-        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="host"),
+        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name=_HOST),
         owner=None,
     )
     if outcome == "timeout":
@@ -120,13 +168,13 @@ async def test_stop_intent_tracks_actual_host_frame_handoff(
         send = registry.send_text
 
         def reject_stale_connection(connection, frame):
-            registry.deregister("host")
+            registry.deregister(_HOST)
             send(connection, frame)
 
         monkeypatch.setattr(registry, "send_text", reject_stale_connection)
     stop = asyncio.create_task(
         orchestration._stop_host_runner_intentionally(
-            ids["parent"], "host", _RUNNER, registry, store
+            ids["parent"], _HOST, _RUNNER, registry, store
         )
     )
     try:
@@ -151,9 +199,7 @@ async def test_stop_intent_tracks_actual_host_frame_handoff(
             assert await asyncio.wait_for(stop, timeout=10) is (outcome == "stopped")
         expected_stop = outcome in {"cancelled", "timeout", "stopped"}
         expected_markers = {ids[name] for name in ("parent", "active", "cold", "grandchild")}
-        assert set(sessions._intentional_stop_sessions) == (
-            expected_markers if expected_stop else set()
-        )
+        assert set(_markers()) == (expected_markers if expected_stop else set())
         assert not conn.pending_stops
         error = ErrorDetail(code="runner_disconnected", message="Runner disappeared.")
         await sessions._mark_runner_sessions_offline(
@@ -174,7 +220,7 @@ async def test_stop_intent_tracks_actual_host_frame_handoff(
     finally:
         stop.cancel()
         await asyncio.gather(stop, return_exceptions=True)
-        registry.deregister("host")
+        registry.deregister(_HOST)
 
 
 async def test_disconnect_sweep_settles_children_without_relays_and_consumes_intent(
@@ -188,7 +234,7 @@ async def test_disconnect_sweep_settles_children_without_relays_and_consumes_int
 
     monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
     assert await orchestration._stop_host_runner_intentionally(
-        ids["parent"], "host", _RUNNER, None, store
+        ids["parent"], _HOST, _RUNNER, None, store
     )
     error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
     await sessions._mark_runner_sessions_offline(
@@ -199,11 +245,12 @@ async def test_disconnect_sweep_settles_children_without_relays_and_consumes_int
         assert (
             sessions._last_task_error_from_labels(store.get_conversation(ids[name]).labels) is None
         )
-    assert not set(sessions._intentional_stop_sessions)
+    assert not set(_markers())
     assert sessions._session_status_cache[ids["finished"]] == "idle"
     assert sessions._session_status_cache[ids["failed"]] == "failed"
 
     # A later active turn losing its runner must still report the genuine failure.
+    await attribution.advance_lifecycle(ids["active"], store)
     sessions._session_status_cache[ids["active"]] = "running"
     await sessions._mark_runner_sessions_offline(
         [store.get_conversation(ids["active"])], error, store
@@ -223,13 +270,13 @@ async def test_sweep_leaves_intent_for_a_matching_live_relay(
     gate = asyncio.Event()
     task = asyncio.create_task(gate.wait())
     sessions._runner_relay_tasks[child_id] = sessions._RelayHandle(_RUNNER, task, gate)
-    sessions._intentional_stop_sessions[child_id] = _RUNNER
+    await _mark(store, child_id, _RUNNER)
     error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
     try:
         await sessions._mark_runner_sessions_offline(
             [store.get_conversation(child_id)], error, store
         )
-        assert sessions._intentional_stop_sessions.get(child_id) == _RUNNER
+        assert _markers().get(child_id) == _RUNNER
         assert sessions._session_status_cache[child_id] == "running"
         assert (
             sessions._last_task_error_from_labels(store.get_conversation(child_id).labels) is None
@@ -239,7 +286,7 @@ async def test_sweep_leaves_intent_for_a_matching_live_relay(
         await sessions._mark_runner_sessions_offline(
             [store.get_conversation(child_id)], error, store
         )
-        assert child_id not in sessions._intentional_stop_sessions
+        assert child_id not in _markers()
         assert sessions._session_status_cache[child_id] == "idle"
     finally:
         gate.set()
@@ -275,18 +322,18 @@ async def test_stop_uses_live_relay_binding_when_row_lookup_fails(
         raise RuntimeError("store temporarily unavailable")
 
     async def teardown(*_args, **_kwargs):
-        assert set(sessions._intentional_stop_sessions) == expected
+        assert set(_markers()) == expected
         return delivered
 
     monkeypatch.setattr(store, "list_runner_session_statuses", unavailable)
     monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
     try:
         result = await orchestration._stop_host_runner_intentionally(
-            ids["parent"], "host", _RUNNER, None, store
+            ids["parent"], _HOST, _RUNNER, None, store
         )
         assert result is delivered
         assert cursors == ([None, first_page[-1][0]] if first_page_succeeds else [None])
-        assert set(sessions._intentional_stop_sessions) == (expected if delivered else set())
+        assert set(_markers()) == (expected if delivered else set())
     finally:
         gate.set()
         await task
@@ -307,7 +354,7 @@ async def test_child_turn_started_during_teardown_remains_a_reported_failure(
 
     monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
     stop = asyncio.create_task(
-        orchestration._stop_host_runner_intentionally(ids["parent"], "host", _RUNNER, None, store)
+        orchestration._stop_host_runner_intentionally(ids["parent"], _HOST, _RUNNER, None, store)
     )
     try:
         await asyncio.wait_for(entered.wait(), timeout=10)
@@ -338,24 +385,25 @@ async def test_stop_burst_does_not_evict_other_pending_stops(
     """Pending stop intent must survive large concurrent bursts."""
     store, ids = family
     pending = {f"pending-stop-{i}": "runner-previous-stop" for i in range(16384)}
-    sessions._intentional_stop_sessions.update(pending)
+    for session_id, runner_id in pending.items():
+        _hint(session_id, runner_id)
     expected = pending | {
         ids[name]: _RUNNER for name in ("parent", "active", "cold", "grandchild")
     }
 
     async def teardown(*_args, **_kwargs):
-        assert dict(sessions._intentional_stop_sessions.items()) == expected
+        assert dict(_markers().items()) == expected
         return True
 
     monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
     try:
         assert await orchestration._stop_host_runner_intentionally(
-            ids["parent"], "host", _RUNNER, None, store
+            ids["parent"], _HOST, _RUNNER, None, store
         )
-        assert dict(sessions._intentional_stop_sessions.items()) == expected
+        assert dict(_markers().items()) == expected
     finally:
         for session_id in pending:
-            sessions._intentional_stop_sessions.pop(session_id, None)
+            attribution.session_shutdowns.pop(session_id, None)
 
 
 async def test_unconsumed_stop_expires_before_a_later_disconnect(
@@ -363,21 +411,21 @@ async def test_unconsumed_stop_expires_before_a_later_disconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store, ids = family
-    now = time.monotonic()
-    monkeypatch.setattr(common, "time", SimpleNamespace(monotonic=lambda: now))
+    now = attribution.timestamp_ms()
+    monkeypatch.setattr(attribution, "timestamp_ms", lambda: now)
 
     async def teardown(*_args, **_kwargs):
         return True
 
     monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
     assert await orchestration._stop_host_runner_intentionally(
-        ids["parent"], "host", _RUNNER, None, store
+        ids["parent"], _HOST, _RUNNER, None, store
     )
     # No local relay or sweep consumes these markers after the runner moves away.
-    now += RUNNER_LIVENESS_TTL_S + 1
-    assert sessions._intentional_stop_sessions.get(ids["cold"]) == _RUNNER
-    now += RUNNER_LIVENESS_TTL_S
-    assert ids["cold"] not in sessions._intentional_stop_sessions
+    now += SHUTDOWN_INTENT_TTL_MS // 2 + 1
+    assert _markers().get(ids["cold"]) == _RUNNER
+    now += SHUTDOWN_INTENT_TTL_MS // 2
+    assert ids["cold"] not in _markers()
 
     error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
     await sessions._mark_runner_sessions_offline(
@@ -397,19 +445,19 @@ async def test_repeated_stop_renews_retained_intent(
     outcome: str,
 ) -> None:
     store, ids = family
-    now = time.monotonic()
-    monkeypatch.setattr(common, "time", SimpleNamespace(monotonic=lambda: now))
+    now = attribution.timestamp_ms()
+    monkeypatch.setattr(attribution, "timestamp_ms", lambda: now)
     monkeypatch.setattr(helpers, "_STOP_RUNNER_RESULT_TIMEOUT_S", 0.1)
     registry = HostRegistry()
     conn = registry.register(
-        "host",
+        _HOST,
         AsyncMock(spec=WebSocketLike),
-        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="host"),
+        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name=_HOST),
         owner=None,
     )
     first = asyncio.create_task(
         orchestration._stop_host_runner_intentionally(
-            ids["parent"], "host", _RUNNER, registry, store
+            ids["parent"], _HOST, _RUNNER, registry, store
         )
     )
     second: asyncio.Task[bool] | None = None
@@ -422,12 +470,12 @@ async def test_repeated_stop_renews_retained_intent(
         assert not await asyncio.wait_for(first, timeout=10)
         assert not conn.pending_stops
 
-        now += 2 * RUNNER_LIVENESS_TTL_S - 1
+        now += SHUTDOWN_INTENT_TTL_MS - 1
         if outcome == "stopped":
             monkeypatch.setattr(helpers, "_STOP_RUNNER_RESULT_TIMEOUT_S", 10.0)
         second = asyncio.create_task(
             orchestration._stop_host_runner_intentionally(
-                ids["parent"], "host", _RUNNER, registry, store
+                ids["parent"], _HOST, _RUNNER, registry, store
             )
         )
         encoded = await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)
@@ -457,17 +505,18 @@ async def test_repeated_stop_renews_retained_intent(
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-        registry.deregister("host")
+        registry.deregister(_HOST)
 
 
 @pytest.mark.parametrize("stopped_runner", [_RUNNER, "runner-replacement"])
-async def test_stop_arriving_during_status_lookup_matches_the_departed_runner(
+async def test_stop_arriving_after_loss_does_not_reclassify_the_departed_runner(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],
     monkeypatch: pytest.MonkeyPatch,
     stopped_runner: str,
 ) -> None:
     store, ids = family
     child_id = ids["cold"]
+    await attribution.begin_connection(child_id, _RUNNER, f"{_RUNNER}-connection", store)
     snapshot = store.get_conversation(child_id)
     read = store.get_conversation
     entered, release = threading.Event(), threading.Event()
@@ -478,16 +527,37 @@ async def test_stop_arriving_during_status_lookup_matches_the_departed_runner(
         return read(session_id)
 
     monkeypatch.setattr(store, "get_conversation", blocked_read)
+    lost_at_ms = attribution.timestamp_ms()
     task = asyncio.create_task(
-        orchestration._runner_disconnect_requires_failure(
-            child_id, store, origin="runner_offline_sweep", snapshot=snapshot
+        sessions._mark_runner_sessions_offline(
+            [snapshot],
+            ErrorDetail(code="runner_disconnected", message="Runner disappeared."),
+            store,
+            lost_at_ms=lost_at_ms,
         )
     )
     try:
         assert await asyncio.to_thread(entered.wait, 10)
-        sessions._intentional_stop_sessions[child_id] = stopped_runner
+        monkeypatch.setattr(attribution, "timestamp_ms", lambda: lost_at_ms + 1)
+        if stopped_runner == _RUNNER:
+            evidence = await attribution.record_session_shutdown(
+                snapshot,
+                ShutdownIntent(
+                    reason="user_stopped_session",
+                    action="stop_session",
+                    initiator="authenticated_user",
+                ),
+                store,
+            )
+            assert evidence is not None
+        else:
+            _hint(child_id, stopped_runner)
         release.set()
-        assert await asyncio.wait_for(task, timeout=10) is (stopped_runner != _RUNNER)
+        await asyncio.wait_for(task, timeout=10)
+        assert sessions._session_status_cache[child_id] == "failed"
+        assert sessions._last_task_error_from_labels(read(child_id).labels)["code"] == (
+            "runner_disconnected"
+        )
     finally:
         release.set()
         await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=10)
@@ -504,8 +574,8 @@ async def test_binding_lookup_failure_does_not_abort_offline_sweep(
     snapshot = store.get_conversation(child_id)
     if rebound:
         store.replace_runner_id(child_id, "runner-replacement")
-    sessions._intentional_stop_sessions[child_id] = "runner-replacement"
-    sessions._intentional_stop_sessions[ids["cold"]] = _RUNNER
+    await _mark(store, child_id, "runner-replacement")
+    await _mark(store, ids["cold"], _RUNNER)
     lookup = store.get_runner_liveness
     attempts = 0
 
@@ -522,11 +592,11 @@ async def test_binding_lookup_failure_does_not_abort_offline_sweep(
         store,
     )
     assert attempts == 3
-    assert sessions._intentional_stop_sessions[child_id] == "runner-replacement"
+    assert _markers()[child_id] == "runner-replacement"
     assert sessions._session_status_cache[child_id] == "running"
     assert store.get_conversation(child_id).live_status == "running"
     assert sessions._session_status_cache[ids["cold"]] == "idle"
-    assert ids["cold"] not in sessions._intentional_stop_sessions
+    assert ids["cold"] not in _markers()
     assert sessions._session_status_cache[ids["grandchild"]] == "failed"
     assert (
         sessions._last_task_error_from_labels(store.get_conversation(ids["grandchild"]).labels)[
@@ -539,10 +609,10 @@ async def test_binding_lookup_failure_does_not_abort_offline_sweep(
     await sessions._mark_runner_sessions_offline([snapshot], error, store)
     if rebound:
         assert sessions._session_status_cache[child_id] == "running"
-        assert sessions._intentional_stop_sessions[child_id] == "runner-replacement"
+        assert _markers()[child_id] == "runner-replacement"
     else:
         assert sessions._session_status_cache[child_id] == "failed"
-        assert child_id not in sessions._intentional_stop_sessions
+        assert child_id not in _markers()
 
 
 @pytest.mark.parametrize("stopped_runner", [_RUNNER, "runner-replacement"])
@@ -558,7 +628,7 @@ async def test_old_runner_sweep_preserves_rebound_session(
     store.replace_runner_id(child_id, "runner-replacement")
     replacement_error = {"omnigent.last_task_error_code": "replacement_error"}
     store.set_labels(child_id, replacement_error)
-    sessions._intentional_stop_sessions[child_id] = stopped_runner
+    await _mark(store, child_id, stopped_runner)
     gate = asyncio.Event()
     task = asyncio.create_task(gate.wait())
     if with_relay:
@@ -574,14 +644,14 @@ async def test_old_runner_sweep_preserves_rebound_session(
         assert after.live_status == "running"
         assert after.labels["omnigent.last_task_error_code"] == "replacement_error"
         if stopped_runner == _RUNNER:
-            assert child_id not in sessions._intentional_stop_sessions
+            assert child_id not in _markers()
             # The old stop must not suppress a real crash of the replacement.
             await sessions._mark_runner_sessions_offline(
                 [store.get_conversation(child_id)], error, store
             )
             assert sessions._session_status_cache[child_id] == "failed"
         else:
-            assert sessions._intentional_stop_sessions.get(child_id) == "runner-replacement"
+            assert _markers().get(child_id) == "runner-replacement"
     finally:
         gate.set()
         await task
@@ -598,8 +668,8 @@ async def test_offline_sweep_retries_a_transient_binding_read(
     snapshot = store.get_conversation(child_id)
     if rebound:
         store.replace_runner_id(child_id, "runner-replacement")
-    sessions._intentional_stop_sessions[child_id] = "runner-replacement"
-    sessions._intentional_stop_sessions[ids["cold"]] = _RUNNER
+    await _mark(store, child_id, "runner-replacement")
+    await _mark(store, ids["cold"], _RUNNER)
     lookup = store.get_runner_liveness
     attempts = 0
 
@@ -622,11 +692,11 @@ async def test_offline_sweep_retries_a_transient_binding_read(
     assert attempts == 2
     if rebound:
         assert sessions._session_status_cache[child_id] == "running"
-        assert sessions._intentional_stop_sessions[child_id] == "runner-replacement"
+        assert _markers()[child_id] == "runner-replacement"
         assert not sessions._last_task_error_from_labels(store.get_conversation(child_id).labels)
     else:
         assert sessions._session_status_cache[child_id] == "failed"
-        assert child_id not in sessions._intentional_stop_sessions
+        assert child_id not in _markers()
         assert (
             sessions._last_task_error_from_labels(store.get_conversation(child_id).labels)["code"]
             == "runner_disconnected"
@@ -642,17 +712,17 @@ async def test_offline_sweep_retries_a_transient_settlement_write(
     store, ids = family
     child_id = ids["active"]
     snapshot = store.get_conversation(child_id)
-    settle = store.settle_intentionally_stopped_session
+    settle = store.compare_shutdown_state
     failed = threading.Event()
-    sessions._intentional_stop_sessions[child_id] = _RUNNER
+    await _mark(store, child_id, _RUNNER)
 
-    def transient_failure(*args):
+    def transient_failure(*args, **kwargs):
         if not failed.is_set():
             failed.set()
             raise RuntimeError("metadata write temporarily unavailable")
-        return settle(*args)
+        return settle(*args, **kwargs)
 
-    monkeypatch.setattr(store, "settle_intentionally_stopped_session", transient_failure)
+    monkeypatch.setattr(store, "compare_shutdown_state", transient_failure)
     error = ErrorDetail(code="runner_disconnected", message="Runner disappeared.")
     sweep = asyncio.create_task(sessions._mark_runner_sessions_offline([snapshot], error, store))
     relay = None
@@ -677,9 +747,9 @@ async def test_offline_sweep_retries_a_transient_settlement_write(
         assert after.live_status == expected
         assert sessions._session_status_cache[child_id] == expected
         if recovery == "relay":
-            assert sessions._intentional_stop_sessions[child_id] == _RUNNER
+            assert _markers()[child_id] == _RUNNER
         else:
-            assert child_id not in sessions._intentional_stop_sessions
+            assert child_id not in _markers()
         if recovery in {"failed", "rebound"}:
             assert after.labels["omnigent.last_task_error_code"] == "preserved"
         if recovery == "rebound":
@@ -704,14 +774,14 @@ async def test_stop_settlement_is_ordered_and_checks_the_current_binding(
     entered, release = threading.Event(), threading.Event()
     write_status = store.set_session_live_status
 
-    def blocked_write(session_id, status):
+    def blocked_write(session_id, status, **kwargs):
         entered.set()
         assert release.wait(timeout=10), "test did not release the pending status write"
-        write_status(session_id, status)
+        write_status(session_id, status, **kwargs)
 
     monkeypatch.setattr(store, "set_session_live_status", blocked_write)
     session_live_state.configure(store)
-    sessions._intentional_stop_sessions[child_id] = _RUNNER
+    await _mark(store, child_id, _RUNNER)
     session_live_state.persist_live_status(child_id, "running")
     sweep = None
     relay = None
@@ -736,7 +806,7 @@ async def test_stop_settlement_is_ordered_and_checks_the_current_binding(
         await asyncio.wait_for(sweep, timeout=10)
         if relay is not None:
             assert sessions._session_status_cache[child_id] == "running"
-            assert sessions._intentional_stop_sessions.get(child_id) == _RUNNER
+            assert _markers().get(child_id) == _RUNNER
             relay_gate.set()
             await asyncio.wait_for(relay, timeout=10)
             await sessions._mark_runner_sessions_offline([old_row], error, store)
@@ -747,6 +817,7 @@ async def test_stop_settlement_is_ordered_and_checks_the_current_binding(
             assert after.labels["omnigent.last_task_error_code"] == "replacement_error"
         else:
             # Settlement must not deduplicate away the next real running edge.
+            await attribution.advance_lifecycle(child_id, store)
             session_live_state.persist_live_status(child_id, "running")
             await asyncio.wait_for(
                 asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None)),
@@ -776,24 +847,24 @@ async def test_failed_stop_settlement_preserves_intent_for_safe_reconciliation(
     store, ids = family
     child_id = ids["active"]
     old_row = store.get_conversation(child_id)
-    settle = store.settle_intentionally_stopped_session
-    sessions._intentional_stop_sessions[child_id] = _RUNNER
+    settle = store.compare_shutdown_state
+    await _mark(store, child_id, _RUNNER)
     attempts = 0
 
-    def unavailable(*_args):
+    def unavailable(*_args, **_kwargs):
         nonlocal attempts
         attempts += 1
         raise RuntimeError("metadata write temporarily unavailable")
 
-    monkeypatch.setattr(store, "settle_intentionally_stopped_session", unavailable)
+    monkeypatch.setattr(store, "compare_shutdown_state", unavailable)
     error = ErrorDetail(code="runner_disconnected", message="Runner disappeared.")
     await sessions._mark_runner_sessions_offline([old_row], error, store)
     assert attempts == 3
-    assert sessions._intentional_stop_sessions.get(child_id) == _RUNNER
+    assert _markers().get(child_id) == _RUNNER
     assert sessions._session_status_cache[child_id] == "running"
     assert store.get_conversation(child_id).live_status == "running"
 
-    monkeypatch.setattr(store, "settle_intentionally_stopped_session", settle)
+    monkeypatch.setattr(store, "compare_shutdown_state", settle)
     if recovery == "failed":
         store.set_session_live_status(child_id, "failed")
         sessions._session_status_cache[child_id] = "failed"
@@ -806,7 +877,7 @@ async def test_failed_stop_settlement_preserves_intent_for_safe_reconciliation(
     after = store.get_conversation(child_id)
     assert after.live_status == ("running" if recovery == "rebound" else recovery)
     assert sessions._session_status_cache[child_id] == after.live_status
-    assert child_id not in sessions._intentional_stop_sessions
+    assert child_id not in _markers()
     if recovery != "idle":
         assert after.labels["omnigent.last_task_error_code"] == "preserved"
     if recovery == "rebound":
@@ -836,15 +907,13 @@ async def test_overlapping_stop_failure_preserves_successful_stop(
 
     monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
     first = asyncio.create_task(
-        orchestration._stop_host_runner_intentionally(ids["parent"], "host", _RUNNER, None, store)
+        orchestration._stop_host_runner_intentionally(ids["parent"], _HOST, _RUNNER, None, store)
     )
     await asyncio.wait_for(first_entered.wait(), timeout=10)
     second_id = ids["parent"] if same_runner else ids["elsewhere"]
     second_runner = _RUNNER if same_runner else "runner-other"
     second = asyncio.create_task(
-        orchestration._stop_host_runner_intentionally(
-            second_id, "host", second_runner, None, store
-        )
+        orchestration._stop_host_runner_intentionally(second_id, _HOST, second_runner, None, store)
     )
     try:
         # Let an independent stop finish while the first delivery is held open.

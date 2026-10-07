@@ -118,6 +118,7 @@ from omnigent.stores.conversation_store.overrides import (
 _logger = logging.getLogger(__name__)
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
+_SHUTDOWN_STATE_KEY = "_omnigent_shutdown_v1"
 
 
 def _decode_session_state(
@@ -128,6 +129,7 @@ def _decode_session_state(
     if not isinstance(state, dict):
         raise TypeError("session_state must decode to an object")
     raw_todos = state.pop(_SESSION_TODOS_STATE_KEY, None)
+    state.pop(_SHUTDOWN_STATE_KEY, None)
     todos: list[dict[str, Any]] = []
     if raw_todos is not None:
         with suppress(TypeError, ValueError):
@@ -138,10 +140,14 @@ def _decode_session_state(
 def _encode_session_state(
     state: dict[str, Any],
     todos: list[dict[str, Any]] | None,
+    shutdown: object = None,
 ) -> str:
     """Serialize policy state while preserving an optional Plan snapshot."""
     payload = dict(state)
     payload.pop(_SESSION_TODOS_STATE_KEY, None)
+    payload.pop(_SHUTDOWN_STATE_KEY, None)
+    if shutdown is not None:
+        payload[_SHUTDOWN_STATE_KEY] = shutdown
     if todos:
         payload[_SESSION_TODOS_STATE_KEY] = todos
     return json.dumps(payload, separators=(",", ":"))
@@ -1514,7 +1520,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.scalars(q).first()
             if meta is not None:
                 _, todos = _decode_session_state(meta.session_state)
-                meta.session_state = _encode_session_state(state, todos)
+                shutdown = json.loads(meta.session_state or "{}").get(_SHUTDOWN_STATE_KEY)
+                meta.session_state = _encode_session_state(state, todos, shutdown)
 
         run_write_transaction(self._session_immediate, "set_session_state", write)
 
@@ -1574,7 +1581,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             if meta is None:
                 return False
             state, _ = _decode_session_state(meta.session_state)
-            meta.session_state = _encode_session_state(state, validated)
+            shutdown = json.loads(meta.session_state or "{}").get(_SHUTDOWN_STATE_KEY)
+            meta.session_state = _encode_session_state(state, validated, shutdown)
             return True
 
         return run_write_transaction(self._session_immediate, "set_session_todos", write)
@@ -3731,7 +3739,116 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "clear_runner_liveness", write)
 
-    def set_session_live_status(self, conversation_id: str, status: str) -> None:
+    def get_shutdown_state(self, conversation_id: str) -> dict[str, Any] | None:
+        """Read one session's private lifecycle from the metadata database only."""
+        with self._session("get_shutdown_state") as session:
+            row = session.execute(
+                select(
+                    SqlConversationMetadata.runner_id,
+                    SqlConversationMetadata.live_status,
+                    SqlConversationMetadata.session_state,
+                ).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+            ).one_or_none()
+        if row is None:
+            return None
+        shutdown = json.loads(row.session_state or "{}").get(_SHUTDOWN_STATE_KEY, {})
+        return {
+            **shutdown,
+            "runner_id": row.runner_id,
+            "live_status": decode_session_live_status(row.live_status)
+            if row.live_status is not None
+            else None,
+        }
+
+    def compare_shutdown_state(
+        self,
+        conversation_id: str,
+        *,
+        runner_id: str | None,
+        expected_scope: str | None,
+        scope: str | None,
+        intent: str | None,
+        expected_intent: str | None = None,
+        settle: bool = False,
+        preserve_failure: bool = False,
+        intent_id: str | None = None,
+        intent_recorded_at_ms: int | None = None,
+    ) -> bool:
+        """Compare scope and binding under the same row lock as the idle update."""
+        import hashlib
+
+        from omnigent.host.shutdown import (
+            SHUTDOWN_CLOCK_SKEW_MS,
+            SHUTDOWN_INTENT_TTL_MS,
+            timestamp_ms,
+        )
+
+        payload = {"scope": scope, "intent": intent, "settled": settle}
+        if len(json.dumps(payload).encode()) > 8192:
+            raise ValueError("shutdown metadata exceeds 8192 bytes")
+
+        def write(session: Session) -> bool:
+            shutdown: dict[str, Any] = dict(payload)
+            query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                query = query.with_for_update()
+            meta = session.scalars(query).first()
+            if meta is None or meta.runner_id != runner_id:
+                return False
+            state = json.loads(meta.session_state or "{}")
+            previous = state.get(_SHUTDOWN_STATE_KEY, {})
+            if previous.get("scope") != expected_scope:
+                return False
+            if expected_intent is not None and previous.get("intent") != expected_intent:
+                return False
+            retention = SHUTDOWN_INTENT_TTL_MS + 2 * SHUTDOWN_CLOCK_SKEW_MS
+            seen = {
+                key: entry
+                for key, entry in previous.get("observed_shutdowns", {}).items()
+                if timestamp_ms() - entry["at_ms"] <= retention
+            }
+            if intent_id is not None and intent_recorded_at_ms is not None:
+                scope_digest = hashlib.sha256((scope or "").encode()).hexdigest()
+                prior = seen.get(intent_id)
+                if prior is not None and prior["scope"] != scope_digest:
+                    return False
+                if prior is None:
+                    if len(seen) >= 32:
+                        return False
+                    seen[intent_id] = {"scope": scope_digest, "at_ms": intent_recorded_at_ms}
+            shutdown["observed_shutdowns"] = seen
+            if len(json.dumps(shutdown).encode()) > 8192:
+                return False
+            if previous.get("scope") == scope and previous.get("intent") == intent:
+                shutdown["settled"] = settle or previous.get("settled", False)
+            if settle:
+                if not preserve_failure and meta.live_status in (
+                    None,
+                    *(
+                        encode_session_live_status(value)
+                        for value in ("idle", "running", "waiting")
+                    ),
+                ):
+                    meta.live_status = encode_session_live_status("idle")
+            state[_SHUTDOWN_STATE_KEY] = shutdown
+            meta.session_state = json.dumps(state, separators=(",", ":"))
+            return True
+
+        return run_write_transaction(self._session_immediate, "compare_shutdown_state", write)
+
+    def set_session_live_status(
+        self,
+        conversation_id: str,
+        status: str,
+        *,
+        expected_shutdown_scope: str | None = None,
+    ) -> bool:
         """
         Persist the relay-observed turn status for one session.
 
@@ -3745,7 +3862,28 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         encoded_status = encode_session_live_status(status)
 
-        def write(session: Session) -> None:
+        def write(session: Session) -> bool:
+            if expected_shutdown_scope is not None:
+                query = select(SqlConversationMetadata).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                if self._meta_supports_for_update:
+                    query = query.with_for_update()
+                meta = session.scalars(query).first()
+                if meta is None:
+                    return False
+                shutdown = json.loads(meta.session_state or "{}").get(_SHUTDOWN_STATE_KEY, {})
+                if shutdown.get(
+                    "scope"
+                ) != expected_shutdown_scope or meta.runner_id != json.loads(
+                    expected_shutdown_scope
+                ).get("runner_id"):
+                    return False
+                if shutdown.get("settled") and status != "failed":
+                    return False
+                meta.live_status = encoded_status
+                return True
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -3754,8 +3892,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .values(live_status=encoded_status)
             )
+            return True
 
-        run_write_transaction(self._session_immediate, "set_session_live_status", write)
+        return run_write_transaction(self._session_immediate, "set_session_live_status", write)
 
     def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
         """Settle stop intent without overwriting a replacement runner or failure."""

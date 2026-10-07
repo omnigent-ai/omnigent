@@ -548,6 +548,7 @@ def create_runner_tunnel_router(
                     version=frame.runner_version,
                     connection_id=frame.connection_id,
                     **session.diagnostics.snapshot(),
+                    runner_connection_id=session.connection_id,
                 ),
             )
 
@@ -597,6 +598,7 @@ def create_runner_tunnel_router(
                     {sender_task, ping_task, receive_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                session.lost_at_ms = time.time_ns() // 1_000_000
                 # Every helper that had finished, by role: a server-declared
                 # ping timeout may or may not already carry the peer's close.
                 ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
@@ -678,6 +680,8 @@ def create_runner_tunnel_router(
                 extra=debug_event("runner_tunnel", phase="error", **_connection_attrs()),
             )
         finally:
+            if session is not None and session.lost_at_ms is None:
+                session.lost_at_ms = time.time_ns() // 1_000_000
             for task in owned:
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)

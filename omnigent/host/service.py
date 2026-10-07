@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import plistlib
@@ -10,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -301,9 +302,37 @@ def enable_user_host_service(
     return service
 
 
-def disable_user_host_service() -> HostService:
+def _service_pid(service: HostService) -> int | None:
+    """Resolve the service manager's current process, independently of other hosts."""
+    command = (
+        ["launchctl", "print", f"gui/{os.getuid()}/{service.label}"]
+        if service.kind == "launchd"
+        else ["systemctl", "--user", "show", "--property=MainPID", "--value", service.label]
+    )
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=2, check=False)
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip()
+        if service.kind == "launchd":
+            match = re.search(r"(?m)^\s*pid = (\d+)\s*$", value)
+            value = match.group(1) if match else "0"
+        pid = int(value)
+        return pid if pid > 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def disable_user_host_service(*, before_stop: Callable[[int], None] | None = None) -> HostService:
     """Stop, disable, and remove the current user's host service."""
     service = _service_for_current_platform()
+    if before_stop is not None and (pid := _service_pid(service)) is not None:
+        try:
+            before_stop(pid)
+        except Exception:  # noqa: BLE001 — instrumentation must not prevent service termination
+            logging.getLogger(__name__).warning(
+                "Could not record host shutdown intent", exc_info=True
+            )
     still_running = False
     if service.kind == "launchd":
         domain = f"gui/{os.getuid()}"

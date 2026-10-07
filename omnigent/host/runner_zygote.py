@@ -243,6 +243,8 @@ class ZygoteManager:
                 [self._python, "-P", "-m", "omnigent.runner._zygote"],
                 env=env,
                 pass_fds=pass_fds,
+                # The host records Ctrl+C intent before stopping the zygote's runners.
+                start_new_session=True,
                 stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,

@@ -9,7 +9,9 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from omnigent.host.shutdown import ShutdownIntent
 from omnigent.runtime import session_stream
+from omnigent.server import shutdown_attribution
 from omnigent.server.routes._sessions import orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import start_session_stream_collector
@@ -184,8 +186,30 @@ async def test_natural_eof_matches_intent_to_the_relay_runner(
     session_id = conversation.id
     store.set_session_live_status(session_id, "running")
     orchestration._session_status_cache[session_id] = "running"
+    await shutdown_attribution.begin_connection(session_id, runner_id, "current-connection", store)
     if stopped_runner is not None:
-        orchestration._intentional_stop_sessions[session_id] = stopped_runner
+        if stopped_runner != runner_id:
+            store.replace_runner_id(session_id, stopped_runner)
+        await shutdown_attribution.begin_connection(
+            session_id, stopped_runner, f"connection-{stopped_runner}", store
+        )
+        evidence = await shutdown_attribution.record_session_shutdown(
+            store.get_conversation(session_id),
+            ShutdownIntent(
+                reason="user_stopped_session",
+                action="stop_session",
+                initiator="authenticated_user",
+            ),
+            store,
+        )
+        assert evidence is not None
+        if stopped_runner != runner_id:
+            store.replace_runner_id(session_id, runner_id)
+            await shutdown_attribution.begin_connection(
+                session_id, runner_id, "current-connection", store
+            )
+            # A late local hint must not authorize a different runner's loss.
+            shutdown_attribution.session_shutdowns[session_id] = evidence
     monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
 
     def respond(_request: httpx.Request) -> httpx.Response:
@@ -210,11 +234,12 @@ async def test_natural_eof_matches_intent_to_the_relay_runner(
         error = orchestration._last_task_error_from_labels(persisted.labels)
         if intentional:
             assert error is None
-            assert session_id not in orchestration._intentional_stop_sessions
+            assert session_id not in shutdown_attribution.session_shutdowns
         else:
             assert error is not None and error["code"] == "runner_disconnected"
     finally:
-        orchestration._intentional_stop_sessions.pop(session_id, None)
+        shutdown_attribution.session_shutdowns.pop(session_id, None)
+        shutdown_attribution.session_scopes.pop(session_id, None)
         orchestration._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
 

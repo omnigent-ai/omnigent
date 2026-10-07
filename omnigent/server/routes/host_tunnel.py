@@ -55,6 +55,8 @@ from omnigent.host.frames import (
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostShutdownAckFrame,
+    HostShutdownFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
     HostStatResultFrame,
@@ -77,6 +79,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
@@ -139,6 +142,7 @@ def create_host_tunnel_router(
     on_runner_exited: RunnerExitedCallback | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -403,6 +407,7 @@ def create_host_tunnel_router(
                     runner_exit_reports,
                     on_runner_exited,
                     on_host_update,
+                    conversation_store,
                 ),
                 name=f"host-receive:{host_id}",
             )
@@ -443,6 +448,10 @@ def create_host_tunnel_router(
                     heartbeat_task,
                     return_exceptions=True,
                 )
+                if conn.shutdown_task is not None:
+                    conn.shutdown_task.cancel()
+                    await asyncio.gather(conn.shutdown_task, return_exceptions=True)
+                    conn.shutdown_task = None
                 # If the host already reconnected, this handler's connection
                 # was replaced; only the current one may mark it offline.
                 if host_registry.deregister(host_id, conn=conn):
@@ -580,6 +589,24 @@ def _import_session_queue_payload(total: int, session: HostImportedLocalSession)
     }
 
 
+async def _record_shutdown_frame(
+    conn: HostConnection,
+    frame: HostShutdownFrame,
+    registry: HostRegistry,
+    store: ConversationStore,
+) -> None:
+    """Acknowledge scoped persistence without holding the connection's receive loop."""
+    from omnigent.server.shutdown_attribution import record_host_shutdown
+
+    try:
+        if await record_host_shutdown(conn, frame.intent, frame.runner_ids, registry, store):
+            registry.send_text(
+                conn, encode_host_frame(HostShutdownAckFrame(frame.intent.shutdown_id))
+            )
+    except Exception:  # noqa: BLE001 — evidence failure must not retire the host tunnel
+        _logger.warning("Host shutdown evidence could not be acknowledged", exc_info=True)
+
+
 async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
@@ -589,6 +616,7 @@ async def _receive_loop(
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: RunnerExitedCallback | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
+    conversation_store: ConversationStore | None = None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -661,6 +689,18 @@ async def _receive_loop(
             )
             continue
 
+        if isinstance(frame, HostShutdownFrame):
+            # One bounded slot per connection; persistence must not block pongs
+            # or control replies. The worker acknowledges only persisted evidence.
+            if conversation_store is not None and (
+                conn.shutdown_task is None or conn.shutdown_task.done()
+            ):
+                conn.shutdown_task = asyncio.create_task(
+                    _record_shutdown_frame(conn, frame, host_registry, conversation_store),
+                    name=f"host-shutdown:{host_id}",
+                )
+            continue
+
         if isinstance(frame, HostHarnessReadinessFrame):
             await asyncio.to_thread(
                 host_store.update_harness_readiness,
@@ -680,6 +720,8 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostLaunchRunnerResultFrame):
+            if frame.runner_id and frame.status != "failed":
+                conn.runner_ids.add(frame.runner_id)
             future = conn.pending_launches.pop(frame.request_id, None)
             if future is not None and not future.done():
                 future.set_result(
@@ -699,6 +741,7 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostRunnerExitedFrame):
+            conn.runner_ids.discard(frame.runner_id)
             # One-way report: a runner this host spawned died unexpectedly. Stash
             # the cause so the runner status endpoint can answer "offline, and
             # here is why" to the client still waiting for the runner to connect.

@@ -115,6 +115,11 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
         self._registry = registry
         self._runner_id = runner_id
 
+    def is_current_connection(self, connection_id: str) -> bool:
+        """Whether a response still belongs to this runner's live incarnation."""
+        session = self._registry.get(self._runner_id)
+        return session is not None and session.connection_id == connection_id
+
     async def wait_for_runner(self, timeout_s: float) -> bool:
         """
         Wait until this transport's runner has a live tunnel or the timeout expires.
@@ -191,6 +196,10 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             headers=[(k, v) for k, v in head.headers],
             stream=stream,
             request=request,
+            extensions={
+                "omnigent.runner_id": state.session.runner_id,
+                "omnigent.runner_connection_id": state.session.connection_id,
+            },
         )
 
     async def aclose(self) -> None:

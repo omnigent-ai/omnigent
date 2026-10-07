@@ -22,6 +22,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from types import FrameType, TracebackType
 from typing import IO, Literal
 
@@ -265,14 +266,17 @@ def host_asyncio_exception_handler(
     )
 
 
-def install_host_signal_handlers() -> Callable[[], None]:
+def install_host_signal_handlers(
+    *, before_exit: Callable[[int], None] | None = None
+) -> Callable[[], None]:
     """Log and flush before a stop signal ends the host, then die by that signal.
 
-    The handler keeps today's semantics: no graceful teardown. Runners notice
-    the daemon is gone through their parent-death watchdog. After logging, the
+    Runners notice the daemon is gone through their parent-death watchdog. After logging, the
     signal's default action is restored and re-raised, so supervisors still see
     a signal death. POSIX main thread only; elsewhere this is a no-op.
 
+    :param before_exit: Optional best-effort notification on the exit thread,
+        inside the hard exit deadline. Startup has no live tunnel to notify.
     :returns: A callable that restores the previous handlers.
     """
     if not IS_POSIX or threading.current_thread() is not threading.main_thread():
@@ -283,10 +287,13 @@ def install_host_signal_handlers() -> Callable[[], None]:
         if signum is None:
             continue
         try:
-            # An inherited ignore (e.g. SIGHUP under nohup) must stay ignored.
-            if signal.getsignal(signum) is signal.SIG_IGN:
+            # Native handlers cannot be restored through Python; nohup stays ignored.
+            saved = signal.getsignal(signum)
+            if saved is None or saved is signal.SIG_IGN:
                 continue
-            previous[signum] = signal.signal(signum, _on_stop_signal)
+            previous[signum] = signal.signal(
+                signum, partial(_on_stop_signal, before_exit=before_exit)
+            )
         except (OSError, ValueError):
             continue
 
@@ -334,7 +341,12 @@ def await_signal_exit() -> None:
         thread.join()
 
 
-def _on_stop_signal(signum: int, frame: FrameType | None) -> None:  # noqa: ARG001
+def _on_stop_signal(
+    signum: int,
+    frame: FrameType | None,  # noqa: ARG001
+    *,
+    before_exit: Callable[[int], None] | None = None,
+) -> None:
     """Hand the stop off to a thread; signal handlers must stay minimal."""
     global _signal_exit_thread, _owning_signal
     if _signal_exit_started.is_set():
@@ -346,7 +358,10 @@ def _on_stop_signal(signum: int, frame: FrameType | None) -> None:  # noqa: ARG0
     with contextlib.suppress(OSError, ValueError):
         signal.signal(signum, signal.SIG_DFL)
     thread = threading.Thread(
-        target=_exit_on_signal, args=(signum,), name="host-signal-exit", daemon=True
+        target=_exit_on_signal,
+        args=(signum, before_exit),
+        name="host-signal-exit",
+        daemon=True,
     )
     try:
         thread.start()
@@ -359,7 +374,7 @@ def _on_stop_signal(signum: int, frame: FrameType | None) -> None:  # noqa: ARG0
     _signal_exit_thread = thread
 
 
-def _exit_on_signal(signum: int) -> None:
+def _exit_on_signal(signum: int, before_exit: Callable[[int], None] | None = None) -> None:
     """Report the exit, drain the debug sink, then die by *signum*."""
     exit_code = 128 + signum
     # If logging or a flush wedges, still die by the signal, not a plain exit.
@@ -372,6 +387,9 @@ def _exit_on_signal(signum: int) -> None:
         _die_by_signal(signum)
     try:
         report_host_exit("signal", exit_code=exit_code, signal=signal.Signals(signum).name)
+        if before_exit is not None:
+            with contextlib.suppress(Exception):
+                before_exit(signum)
         drain_debug_sink()
         for handler in logging.getLogger().handlers:
             with contextlib.suppress(Exception):

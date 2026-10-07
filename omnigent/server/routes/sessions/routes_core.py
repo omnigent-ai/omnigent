@@ -629,6 +629,7 @@ def register_core_routes(
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
+        conn.runner_ids.add(runner_id)
         if workspace is None:  # pragma: no cover — schema guards
             raise OmnigentError(
                 "session has host_id but no workspace; "

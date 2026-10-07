@@ -117,10 +117,9 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
 async def test_do_not_restore_excluded_children(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, exclusion: str
 ) -> None:
-    from omnigent.server.routes._sessions.common import (
-        _intentional_stop_sessions,
-        _interrupt_fenced_sessions,
-    )
+    from omnigent.host.shutdown import ShutdownIntent
+    from omnigent.server import shutdown_attribution
+    from omnigent.server.routes._sessions.common import _interrupt_fenced_sessions
 
     store, parent, child, relay, _, initializer = recovery_tree
     row = child()
@@ -129,7 +128,18 @@ async def test_do_not_restore_excluded_children(
     elif exclusion == "archived":
         store.update_conversation(row.id, archived=True)
     elif exclusion == "stopped":
-        _intentional_stop_sessions[row.id] = "old"
+        await shutdown_attribution.begin_connection(
+            row.id, row.runner_id, "stopped_connection", store
+        )
+        await shutdown_attribution.record_session_shutdown(
+            row,
+            ShutdownIntent(
+                reason="user_stopped_session",
+                action="stop_session",
+                initiator="authenticated_user",
+            ),
+            store,
+        )
     elif exclusion == "fenced":
         _interrupt_fenced_sessions.add(row.id)
     elif exclusion == "hosted":
@@ -148,17 +158,31 @@ async def test_do_not_restore_excluded_children(
         assert store.get_conversation(row.id).runner_id == "old"
         relay.assert_not_called()
     finally:
-        _intentional_stop_sessions.pop(row.id, None)
+        shutdown_attribution.session_shutdowns.pop(row.id, None)
+        shutdown_attribution.session_scopes.pop(row.id, None)
         _interrupt_fenced_sessions.discard(row.id)
 
 
 @pytest.mark.asyncio
 async def test_child_stop_for_an_older_runner_does_not_block_recovery(recovery_tree: Any) -> None:
-    from omnigent.server.routes._sessions.common import _intentional_stop_sessions
+    from omnigent.host.shutdown import ShutdownIntent
+    from omnigent.server import shutdown_attribution
 
     store, parent, child, relay, _, initializer = recovery_tree
     row = child()
-    _intentional_stop_sessions[row.id] = "previously-stopped"
+    store.replace_runner_id(row.id, "previously-stopped")
+    await shutdown_attribution.begin_connection(
+        row.id, "previously-stopped", "previous-connection", store
+    )
+    evidence = await shutdown_attribution.record_session_shutdown(
+        store.get_conversation(row.id),
+        ShutdownIntent(
+            reason="user_stopped_session", action="stop_session", initiator="authenticated_user"
+        ),
+        store,
+    )
+    assert evidence is not None
+    store.replace_runner_id(row.id, row.runner_id)
     try:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(lambda _: httpx.Response(201)),
@@ -168,7 +192,8 @@ async def test_child_stop_for_an_older_runner_does_not_block_recovery(recovery_t
         assert store.get_conversation(row.id).runner_id == "new"
         relay.assert_called_once()
     finally:
-        _intentional_stop_sessions.pop(row.id, None)
+        shutdown_attribution.session_shutdowns.pop(row.id, None)
+        shutdown_attribution.session_scopes.pop(row.id, None)
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,7 @@ import logging
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -1315,6 +1316,7 @@ async def _stop_host_session(
     client: httpx.AsyncClient,
     comm: ApplicationCommunicator,
     session_id: str,
+    on_forward: Callable[[], None] | None = None,
 ) -> str:
     """Drive ``stop_session`` and serve the host's stop_runner round-trip.
 
@@ -1333,6 +1335,8 @@ async def _stop_host_session(
 
     def _runner_handler(request: httpx.Request) -> httpx.Response:
         """204 every runner POST (pane-kill forward) and snapshot GET."""
+        if request.method == "POST" and on_forward is not None:
+            on_forward()
         return httpx.Response(204)
 
     fake_runner = httpx.AsyncClient(
@@ -1385,6 +1389,104 @@ async def test_stop_session_stops_host_launched_runner(
         f"host should be told to stop the session's bound runner "
         f"{session['runner_id']!r}, got {stopped_runner_id!r}"
     )
+
+
+@pytest.mark.parametrize("prior_failure", [False, True])
+async def test_stop_records_shared_runner_evidence_before_forwarding_and_preserves_error(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    prior_failure: bool,
+) -> None:
+    from omnigent.server import session_live_state, shutdown_attribution
+    from omnigent.server.routes._sessions.helpers import (
+        _last_task_error_from_labels,
+        _persist_session_status_error_labels,
+        _publish_status,
+    )
+    from omnigent.server.routes._sessions.orchestration import _mark_runner_sessions_offline_impl
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.get_conversation(session["id"])
+    child = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        runner_id=parent.runner_id,
+    )
+    for conv in (parent, child):
+        await shutdown_attribution.begin_connection(conv.id, parent.runner_id, "stop-route", store)
+        _publish_status(conv.id, "running")
+    error = ErrorDetail(code="model_error", message="earlier failure")
+    if prior_failure:
+        _publish_status(parent.id, "failed", error)
+        await _persist_session_status_error_labels(parent.id, error, store)
+    await session_live_state.drain_pending_writes()
+    forwarded = []
+
+    def before_forward() -> None:
+        for conv in (parent, child):
+            state = store.get_shutdown_state(conv.id)
+            stop = shutdown_attribution.SessionShutdown.model_validate_json(state["intent"])
+            assert stop.scope.runner_connection_id == "stop-route"
+            assert stop.intent.reason == "user_stopped_session"
+        forwarded.append(True)
+
+    await _stop_host_session(client, comm, parent.id, on_forward=before_forward)
+    assert forwarded == [True]
+    await _mark_runner_sessions_offline_impl(
+        [store.get_conversation(parent.id), child],
+        ErrorDetail(code="runner_disconnected", message="stopped runner disconnected"),
+        store,
+        connection_id="stop-route",
+    )
+    await session_live_state.drain_pending_writes()
+    saved = store.get_conversation(parent.id)
+    assert saved.live_status == ("failed" if prior_failure else "idle")
+    assert _last_task_error_from_labels(saved.labels) == (
+        {"code": "model_error", "message": "earlier failure"} if prior_failure else None
+    )
+    assert store.get_conversation(child.id).live_status == "idle"
+    for conv in (parent, child):
+        shutdown_attribution.session_scopes.pop(conv.id, None)
+        shutdown_attribution.session_shutdowns.pop(conv.id, None)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["get_shutdown_state", "compare_shutdown_state", "list_runner_session_statuses"],
+)
+async def test_evidence_persistence_failure_does_not_prevent_stop_delivery(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    from omnigent.server import shutdown_attribution
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    store = SqlAlchemyConversationStore(db_uri)
+    await shutdown_attribution.begin_connection(
+        session["id"], session["runner_id"], "stop-route", store
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("shutdown evidence store unavailable")
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, operation, unavailable)
+    forwarded = []
+    stopped = await _stop_host_session(
+        client, comm, session["id"], on_forward=lambda: forwarded.append(True)
+    )
+    assert forwarded == [True]
+    assert stopped == session["runner_id"]
+    shutdown_attribution.session_scopes.pop(session["id"], None)
 
 
 async def test_stopped_host_session_writes_no_label_and_host_stays_online(

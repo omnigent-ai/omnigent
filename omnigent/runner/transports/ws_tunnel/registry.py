@@ -35,6 +35,7 @@ import contextlib
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -124,6 +125,8 @@ class RunnerSession:
     close_code: int | None = None
     close_reason: str | None = None
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
+    connection_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    lost_at_ms: int | None = None
 
 
 @dataclass

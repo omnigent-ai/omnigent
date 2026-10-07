@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -109,6 +110,7 @@ if TYPE_CHECKING:
 
     import httpx
 
+    from omnigent.host.shutdown import ShutdownIntent
     from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
     from omnigent.server.smart_routing import LLMRoutingClient
@@ -2819,6 +2821,8 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
     host_id = raw.get("host_id")
     resolved_server_url = raw.get("resolved_server_url")
     config_sig = raw.get("config_sig")
+    process_id = raw.get("process_id")
+    connection_id = raw.get("connection_id")
     return _HostDaemonRecord(
         pid=pid,
         target=target,
@@ -2833,6 +2837,16 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
             else None
         ),
         config_sig=config_sig if isinstance(config_sig, str) and config_sig else None,
+        process_id=(
+            process_id
+            if isinstance(process_id, str) and re.fullmatch(r"[0-9a-f]{32}", process_id)
+            else None
+        ),
+        connection_id=(
+            connection_id
+            if isinstance(connection_id, str) and re.fullmatch(r"[0-9a-f]{32}", connection_id)
+            else None
+        ),
     )
 
 
@@ -10301,10 +10315,24 @@ def host_disable() -> None:
     """Stop and remove the current user's host system service."""
     from omnigent.host.service import HostServiceError, disable_user_host_service
 
+    shutdown_paths: list[Path] = []
+
+    def _before_stop(pid: int) -> None:
+        for record in _list_daemon_records():
+            if record.pid == pid:
+                intent = _daemon_shutdown_intent(record, action="host_disable")
+                path = _prepare_daemon_shutdown(record, intent)
+                if path is not None:
+                    shutdown_paths.append(path)
+
     try:
-        service = disable_user_host_service()
+        service = disable_user_host_service(before_stop=_before_stop)
     except HostServiceError as exc:
         raise click.ClickException(str(exc)) from exc
+    finally:
+        for path in shutdown_paths:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
     # Service managers stop with SIGTERM, which can leave the foreground
     # daemon's registry record behind after the process has exited.
     for record in _list_daemon_records():
@@ -10364,6 +10392,7 @@ def _stop_session_on_server(
     *,
     base_url: str,
     session_id: str,
+    shutdown_intent: dict[str, _HostJsonValue] | None = None,
 ) -> None:
     """
     Stop one Omnigent session via the server lifecycle event API.
@@ -10394,7 +10423,10 @@ def _stop_session_on_server(
         base_url=base_url,
         method="POST",
         path=f"/v1/sessions/{url_component(session_id)}/events",
-        json_body={"type": "stop_session", "data": {}},
+        json_body={
+            "type": "stop_session",
+            "data": ({"shutdown_intent": shutdown_intent} if shutdown_intent is not None else {}),
+        },
         host_id=host_id,
     )
     if result.status_code == 0:
@@ -10410,6 +10442,8 @@ def _stop_session_on_server(
 
 def _stop_daemon_sessions(
     record: _HostDaemonRecord,
+    *,
+    shutdown_intent: dict[str, _HostJsonValue] | None = None,
 ) -> int:
     """
     Stop active sessions owned by a daemon before terminating it.
@@ -10457,6 +10491,7 @@ def _stop_daemon_sessions(
                 _stop_session_on_server,
                 base_url=result.base_url,
                 session_id=session_id,
+                **({"shutdown_intent": shutdown_intent} if shutdown_intent is not None else {}),
             ): session_id
             for session_id in session_ids
         }
@@ -10478,6 +10513,79 @@ def _stop_daemon_sessions(
             "Retry, or use --force to stop the daemon immediately."
         )
     return stopped
+
+
+def _daemon_shutdown_intent(
+    record: _HostDaemonRecord,
+    *,
+    action: Literal["host_stop", "host_disable"] = "host_stop",
+    force: bool = False,
+    daemon_only: bool = False,
+) -> ShutdownIntent:
+    """Describe an explicit CLI command without guessing a signal's sender."""
+    from omnigent.host.shutdown import ShutdownIntent
+
+    return ShutdownIntent(
+        reason="user_stopped_host",
+        action=action,
+        initiator="local_cli",
+        host_id=record.host_id,
+        host_process_id=record.process_id,
+        host_connection_id=record.connection_id,
+        host_pid=record.pid,
+        force=force,
+        daemon_only=daemon_only,
+    )
+
+
+def _prepare_daemon_shutdown(record: _HostDaemonRecord, intent: ShutdownIntent) -> Path | None:
+    """Bound notification even for force, without asking the server for sessions."""
+    from omnigent.debug_logging import debug_event
+    from omnigent.host.shutdown import (
+        SHUTDOWN_NOTIFY_TIMEOUT_S,
+        write_shutdown_request,
+    )
+
+    if not _pid_is_recorded_daemon(record) or record.process_id is None:
+        return None
+    current = _read_daemon_record(_daemon_record_path(record.target))
+    if current is None or (current.pid, current.process_id) != (record.pid, record.process_id):
+        return None
+    intent = intent.model_copy(update={"host_connection_id": current.connection_id})
+    path = _daemon_record_path(record.target).with_name(f"shutdown-{record.process_id}.json")
+    try:
+        write_shutdown_request(path, intent)
+    except OSError:
+        path = None
+    logging.getLogger(__name__).info(
+        "Host shutdown requested",
+        extra=debug_event("host_shutdown_requested", **intent.log_attrs()),
+    )
+    base_url = current.resolved_server_url or current.server_url
+    if base_url and current.host_id and current.connection_id:
+        completed = threading.Event()
+
+        def _notify() -> None:
+            try:
+                _host_http_json(
+                    base_url=base_url,
+                    method="POST",
+                    path=f"/v1/hosts/{current.host_id}/shutdown",
+                    json_body=intent.model_dump(),
+                    timeout_s=SHUTDOWN_NOTIFY_TIMEOUT_S,
+                    host_id=current.host_id,
+                )
+            except Exception:  # noqa: BLE001 — best-effort notification runs in a daemon thread
+                logging.getLogger(__name__).debug(
+                    "Host shutdown notification failed", exc_info=True
+                )
+            finally:
+                completed.set()
+
+        # Credential discovery may block independently of the HTTP timeout.
+        threading.Thread(target=_notify, name="host-shutdown-notify", daemon=True).start()
+        completed.wait(SHUTDOWN_NOTIFY_TIMEOUT_S)
+    return path
 
 
 def _signal_daemon_pid(record: _HostDaemonRecord, sig: int) -> bool:
@@ -10607,9 +10715,22 @@ def host_stop(
         return
     for record in records:
         stopped = 0
+        intent = _daemon_shutdown_intent(record, force=force, daemon_only=daemon_only)
         if not daemon_only and not force:
-            stopped = _stop_daemon_sessions(record)
-        _terminate_daemon(record, force=force)
+            stopped = _stop_daemon_sessions(record, shutdown_intent=intent.model_dump())
+        shutdown_path = None
+        try:
+            shutdown_path = _prepare_daemon_shutdown(record, intent)
+        except Exception:  # noqa: BLE001 — attribution must not prevent an explicit stop
+            logging.getLogger(__name__).warning(
+                "Could not record host shutdown intent", exc_info=True
+            )
+        try:
+            _terminate_daemon(record, force=force)
+        finally:
+            if shutdown_path is not None:
+                with contextlib.suppress(OSError):
+                    shutdown_path.unlink(missing_ok=True)
         click.echo(
             f"Stopped {_host_display_url(record.target)} daemon "
             f"pid={record.pid}; sessions_stopped={stopped}."

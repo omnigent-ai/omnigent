@@ -9,12 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import re
-import time
 import weakref
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cachetools
 import httpx
@@ -56,7 +54,9 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
-from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+
+if TYPE_CHECKING:
+    from omnigent.server.shutdown_attribution import SessionScope
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -636,15 +636,6 @@ _read_explicit_unread: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCach
 _interrupt_fenced_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
-# Markers belong to one runner and expire after teardown plus disconnect grace.
-# Do not evict live markers under load: each one suppresses an expected drop.
-_intentional_stop_sessions: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
-    lambda: cachetools.TTLCache(
-        maxsize=math.inf, ttl=2 * RUNNER_LIVENESS_TTL_S, timer=lambda: time.monotonic()
-    )
-)
-
-
 _intentional_runner_stop_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
     weakref.WeakValueDictionary
 )
@@ -855,6 +846,8 @@ class _RelayHandle:
         current stop marker was pending; reset by each Stop request.
     :param running_event_count: Running notifications observed by this relay,
         used to preserve intervening activity when a Stop is rejected.
+    :param shutdown_scope: Latest lifecycle observed by this stream, including
+        activity recognized when a pending Stop is rejected.
     """
 
     runner_id: str
@@ -863,6 +856,7 @@ class _RelayHandle:
     status_snapshot: _RelayStatusSnapshot | None = None
     intentional_stop_turn_ended: bool = False
     running_event_count: int = 0
+    shutdown_scope: SessionScope | None = None
 
 
 _runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()
@@ -1208,7 +1202,6 @@ __all__ = [
     "_catalog_prefetch_tasks",
     "_deferred_elicitation_clear_tasks",
     "_intentional_runner_stop_locks",
-    "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
     "_llm_response_denied_turns",
     "_logger",

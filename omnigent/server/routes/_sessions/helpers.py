@@ -78,6 +78,7 @@ from omnigent.harness_plugins import (
     DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
+from omnigent.host.shutdown import ShutdownIntent
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.native_coding_agents import (
@@ -4965,6 +4966,9 @@ def _publish_status(
         # for <id>: <detail>" shape so existing detail-matching stays valid.
         origin = failure_origin or "unattributed"
         failure_code = error.code if error is not None else "none"
+        from omnigent.server.shutdown_attribution import session_scopes
+
+        failure_scope = session_scopes.get(session_id)
         _logger.error(
             "session turn failed for %s (origin=%s code=%s prev=%s): %s",
             session_id,
@@ -4979,6 +4983,7 @@ def _publish_status(
                 code=failure_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
+                **(failure_scope.model_dump(exclude={"response_id"}) if failure_scope else {}),
                 **failure_log_attributes(failure_context),
             ),
         )
@@ -6009,6 +6014,7 @@ async def _launch_runner_on_host_locked(
             asyncio.get_running_loop().create_future()
         )
         host_conn.pending_launches[request_id] = launch_future
+        host_conn.runner_ids.add(new_runner_id)
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -7003,6 +7009,7 @@ async def _stop_session_host_runner(
     *,
     expect_already_stopped: bool = False,
     attempt: _HostRunnerStopAttempt | None = None,
+    shutdown_intent: ShutdownIntent | None = None,
 ) -> bool:
     """
     Terminate the host-launched runner backing a host-spawned session.
@@ -7070,7 +7077,9 @@ async def _stop_session_host_runner(
     future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
     conn.pending_stops[request_id] = future
     stop_frame = encode_host_frame(
-        HostStopRunnerFrame(request_id=request_id, runner_id=runner_id),
+        HostStopRunnerFrame(
+            request_id=request_id, runner_id=runner_id, shutdown_intent=shutdown_intent
+        ),
     )
     try:
         try:

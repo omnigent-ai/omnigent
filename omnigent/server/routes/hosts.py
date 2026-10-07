@@ -51,6 +51,7 @@ from omnigent.host.frames import (
     optional_str_bool_map,
     workspace_missing_message,
 )
+from omnigent.host.shutdown import ShutdownIntent
 from omnigent.onboarding.harness_install import (
     ui_credential_configurable_harnesses,
     ui_install_key,
@@ -666,6 +667,38 @@ def create_hosts_router(
     flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
 
+    @router.post("/hosts/{host_id}/shutdown")
+    async def record_shutdown(
+        host_id: str,
+        body: ShutdownIntent,
+        request: Request,
+    ) -> dict[str, bool]:
+        """Record an owner-requested local command before the host is terminated."""
+        from omnigent.server.shutdown_attribution import record_host_shutdown
+
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        conn = host_registry.get(host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline on this replica")
+        if body.reason != "user_stopped_host" or not body.requested:
+            raise HTTPException(status_code=400, detail="explicit host command required")
+        accepted = await record_host_shutdown(
+            conn,
+            body,
+            list(conn.runner_ids),
+            host_registry,
+            conversation_store,
+            request_user_id=user_id,
+        )
+        if not accepted:
+            raise HTTPException(status_code=409, detail="host incarnation changed")
+        return {"recorded": True}
+
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
         """List all hosts owned by the authenticated user.
@@ -940,6 +973,7 @@ def create_hosts_router(
 
         async def _rollback_failed_launch() -> None:
             """Clear state created by a failed runner launch."""
+            conn.runner_ids.discard(runner_id)
             _logger.error(
                 "Runner launch failed; clearing binding",
                 extra=debug_event(
@@ -1108,6 +1142,7 @@ def create_hosts_router(
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
+        conn.runner_ids.add(runner_id)
 
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
@@ -1138,12 +1173,23 @@ def create_hosts_router(
                 future,
                 timeout=_LAUNCH_RESULT_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ConnectionError, asyncio.CancelledError) as exc:
             conn.pending_launches.pop(request_id, None)
-            await _rollback_failed_launch()
+            future.cancel()
+            conn.runner_ids.discard(runner_id)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            # After dispatch, cancellation/replacement does not prove the
+            # launch failed; a concurrent new binding must remain intact.
+            if isinstance(exc, asyncio.TimeoutError):
+                await _rollback_failed_launch()
             raise HTTPException(
-                status_code=504,
-                detail="host did not respond to launch request",
+                status_code=504 if isinstance(exc, asyncio.TimeoutError) else 409,
+                detail=(
+                    "host did not respond to launch request"
+                    if isinstance(exc, asyncio.TimeoutError)
+                    else "host connection was replaced"
+                ),
             ) from None
 
         if result.get("status") == "failed":

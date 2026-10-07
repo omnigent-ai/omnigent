@@ -2097,8 +2097,10 @@ def test_host_stop_failure_leaves_daemon_running(
         ),
     )
 
-    def _fake_stop(*, base_url: str, session_id: str) -> None:
-        del base_url
+    def _fake_stop(*, base_url: str, session_id: str, shutdown_intent: dict) -> None:
+        assert base_url == "https://server.example.com"
+        assert shutdown_intent["reason"] == "user_stopped_host"
+        assert shutdown_intent["action"] == "host_stop"
         if session_id == "conv_failed":
             raise click.ClickException("runner unavailable")
 

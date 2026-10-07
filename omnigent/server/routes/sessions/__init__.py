@@ -310,7 +310,6 @@ from omnigent.server.routes._sessions.common import (
     _browser_action_owners as _browser_action_owners,
     _browser_action_registry as _browser_action_registry,
     _deferred_elicitation_clear_tasks as _deferred_elicitation_clear_tasks,
-    _intentional_stop_sessions as _intentional_stop_sessions,
     _interrupt_fenced_sessions as _interrupt_fenced_sessions,
     _logger as _logger,
     _managed_launch_tasks as _managed_launch_tasks,

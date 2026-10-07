@@ -738,6 +738,86 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
     assert updated is not None
     assert updated.runner_id is None, "failed launch must unbind runner_id"
     assert updated.host_id is None, "failed launch must unbind host_id"
+    conn = registry.get(_HOST_ID)
+    assert conn is not None and not conn.runner_ids
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "replaced_send", "replaced_wait", "cancel"])
+async def test_failed_launch_removes_only_its_connection_inventory(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
+
+    app, registry, _host_store, store = host_api_app
+    comm = await _connect_host(app, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.runner_ids.add("unrelated-runner")
+    conv = store.create_conversation(agent_id=None)
+    sent = asyncio.Event()
+    launched = []
+    original_send = registry.send_text
+
+    def dispatch(current, raw):
+        frame = decode_host_frame(raw)
+        if not isinstance(frame, HostLaunchRunnerFrame):
+            original_send(current, raw)
+            return
+        runner_id = next(rid for rid in current.runner_ids if rid != "unrelated-runner")
+        launched.append(runner_id)
+        if outcome.startswith("replaced"):
+            replacement = registry.register(
+                _HOST_ID, current.ws, current.hello, owner=current.owner
+            )
+            replacement.runner_ids.add(runner_id)
+        sent.set()
+        if outcome == "replaced_send":
+            raise ConnectionError("host connection was replaced")
+        if outcome == "replaced_wait":
+            current.pending_launches[frame.request_id].set_exception(ConnectionError("retired"))
+
+    monkeypatch.setattr(registry, "send_text", dispatch)
+    if outcome == "timeout":
+        monkeypatch.setattr("omnigent.server.routes.hosts._LAUNCH_RESULT_TIMEOUT_S", 0.01)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            request = asyncio.create_task(
+                client.post(
+                    f"/v1/hosts/{_HOST_ID}/runners",
+                    json={"session_id": conv.id, "workspace": "/tmp/test-workspace"},
+                )
+            )
+            await asyncio.wait_for(sent.wait(), 5)
+            if outcome == "cancel":
+                store.replace_runner_id(conv.id, "replacement-runner")
+                conn.runner_ids.add("replacement-runner")
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+            else:
+                response = await request
+                assert response.status_code == (504 if outcome == "timeout" else 409)
+            expected_binding = (
+                "replacement-runner"
+                if outcome == "cancel"
+                else launched[0]
+                if outcome == "replaced_wait"
+                else None
+            )
+            assert store.get_conversation(conv.id).runner_id == expected_binding
+            assert conn.runner_ids == (
+                {"unrelated-runner", "replacement-runner"}
+                if outcome == "cancel"
+                else {"unrelated-runner"}
+            )
+            assert not conn.pending_launches
+            if outcome.startswith("replaced"):
+                assert registry.get(_HOST_ID).runner_ids == set(launched)
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=5)
 
 
 async def test_launch_runner_409_host_offline(

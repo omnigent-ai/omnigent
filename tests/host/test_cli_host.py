@@ -354,7 +354,8 @@ def test_host_disable_subcommand_removes_user_service(
     service_path = tmp_path / "omnigent-host.service"
     removed: list[bool] = []
 
-    def _disable() -> HostService:
+    def _disable(*, before_stop) -> HostService:
+        assert callable(before_stop)
         removed.append(True)
         return HostService(kind="systemd_user", path=service_path, label=service_path.name)
 

@@ -37,6 +37,7 @@ unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import time
@@ -71,6 +72,8 @@ _executor: ThreadPoolExecutor | None = None
 # already logged, so repeats of either are suppressed. Unbounded like the
 # in-memory caches these writes mirror; entries live for the process.
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+_last_status_scope: WorkspaceScopedCache[str, str | None] = WorkspaceScopedCache()
+_status_write_tokens: WorkspaceScopedCache[str, object] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 # This process's own last touch_runner_liveness() stamp per runner id.
@@ -96,6 +99,8 @@ def configure(
     _store = store
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
+    _last_status_scope.clear()
+    _status_write_tokens.clear()
     _last_pending.clear()
     _last_liveness_stamp.clear()
 
@@ -150,6 +155,12 @@ def submit(description: str, fn, *args, on_failure=None) -> Future[Any]:  # type
     return _executor.submit(ctx.run, _run)
 
 
+async def drain_pending_writes() -> None:
+    """Place shutdown settlement after already-observed local status edges."""
+    if _executor is not None:
+        await asyncio.wrap_future(_executor.submit(lambda: None))
+
+
 def persist_live_status(session_id: str, status: str) -> None:
     """
     Persist a relay-observed turn status transition.
@@ -177,9 +188,19 @@ def persist_live_status(session_id: str, status: str) -> None:
             )
         _last_status[session_id] = status
         return
-    if _last_status.get(session_id) == status:
+    from omnigent.server.shutdown_attribution import session_scopes
+
+    scope = session_scopes.get(session_id)
+    serialized_scope = scope.model_dump_json() if scope is not None else None
+    if (
+        _last_status.get(session_id) == status
+        and _last_status_scope.get(session_id) == serialized_scope
+    ):
         return
     _last_status[session_id] = status
+    _last_status_scope[session_id] = serialized_scope
+    token = object()
+    _status_write_tokens[session_id] = token
 
     def _evict() -> None:
         # A dropped write must not leave the dedupe cache asserting this
@@ -187,15 +208,29 @@ def persist_live_status(session_id: str, status: str) -> None:
         # swallowed and the row stays stale until a *different* status
         # arrives. Evict only if we still own the entry (a newer publish
         # may have overwritten it, and its write is the live one).
-        if _last_status.get(session_id) == status:
-            _last_status.pop(session_id, None)
+        if _status_write_tokens.get(session_id) is token:
+            forget_live_status(session_id)
 
-    submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+    store = _store
+
+    def _write() -> None:
+        if serialized_scope is None:
+            applied = store.set_session_live_status(session_id, status)
+        else:
+            applied = store.set_session_live_status(
+                session_id, status, expected_shutdown_scope=serialized_scope
+            )
+        if applied is False:
+            _evict()
+
+    submit("live_status", _write, on_failure=_evict)
 
 
 def forget_live_status(session_id: str) -> None:
     """Drop this process's dedupe state for a session handed to another replica."""
     _last_status.pop(session_id, None)
+    _last_status_scope.pop(session_id, None)
+    _status_write_tokens.pop(session_id, None)
 
 
 def persist_scheduled_run_completion(

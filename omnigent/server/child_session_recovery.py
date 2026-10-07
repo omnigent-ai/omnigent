@@ -81,15 +81,15 @@ def is_parent_owned_subagent(conv: Conversation) -> bool:
 
 def _restorable(conv: Conversation) -> bool:
     from omnigent.server.routes._sessions.common import (
-        _intentional_stop_sessions,
         _interrupt_fenced_sessions,
     )
+    from omnigent.server.shutdown_attribution import has_local_intent
 
     return (
         conv.agent_id is not None
         and not conv.archived
         and not is_session_closed(conv.labels, conv.title)
-        and (conv.runner_id is None or _intentional_stop_sessions.get(conv.id) != conv.runner_id)
+        and (conv.runner_id is None or not has_local_intent(conv.id, conv.runner_id))
         and conv.id not in _interrupt_fenced_sessions
     )
 

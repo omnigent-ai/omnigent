@@ -23,7 +23,8 @@ import hashlib
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass
+import uuid
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -64,6 +65,8 @@ class HostDaemonRecord:
     host_id: str | None = None
     resolved_server_url: str | None = None
     config_sig: str | None = None
+    process_id: str | None = field(default_factory=lambda: uuid.uuid4().hex)
+    connection_id: str | None = None
 
 
 def normalize_daemon_target(server_url: str | None) -> str:
@@ -222,6 +225,35 @@ class DaemonLifecycleLock:
     def target(self) -> str:
         """Return the daemon target this lock guards."""
         return self._target
+
+    def process_id(self) -> str | None:
+        """Read the incarnation of the process that still owns this record."""
+        try:
+            record = json.loads(self._record_path.read_text())
+            value = record.get("process_id")
+            if record.get("pid") == self._pid and isinstance(value, str):
+                return value
+        except (OSError, ValueError, TypeError):
+            pass
+        return None
+
+    def publish_connection(self, process_id: str, connection_id: str) -> None:
+        """Update this process's connection without replacing the locked inode."""
+        try:
+            with self._record_path.open("r+") as stream:
+                record = json.load(stream)
+                if record.get("pid") != self._pid or record.get("process_id") != process_id:
+                    return
+                record["connection_id"] = connection_id
+                stream.seek(0)
+                json.dump(record, stream)
+                stream.truncate()
+        except (OSError, ValueError, TypeError):
+            _logger.debug("Could not publish host connection identity", exc_info=True)
+
+    def shutdown_request_path(self, process_id: str) -> Path:
+        """Return the private command mailbox for this process incarnation."""
+        return self._record_path.with_name(f"shutdown-{process_id}.json")
 
     def acquire(self) -> bool:
         """Take the exclusive lifetime lock on the record file.
