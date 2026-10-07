@@ -4,30 +4,20 @@ import {
   useRef,
   useState,
   type ReactElement,
-  type ReactNode,
   type RefObject,
 } from "react";
-import { CopyIcon, DownloadIcon, FolderOpenIcon, InfoIcon, MoreHorizontalIcon } from "lucide-react";
+import { CopyIcon, DownloadIcon, FolderOpenIcon, InfoIcon } from "lucide-react";
 import { downloadWorkspaceFile } from "@/hooks/useFileContent";
 import type { WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
-import { cn } from "@/lib/utils";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { isAbsoluteComposerPath } from "@/lib/composerContext";
-import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
 
 export interface FileRowInfo {
@@ -48,9 +38,6 @@ interface FileRowActionItem {
   onSelect: () => void;
 }
 
-export const ROW_MENU_SLOT_CLASS = "w-20";
-export const ROW_MENU_SIZE_SLOT_CLASS = "w-20";
-
 export const FilesPanelFocusContext = createContext<RefObject<HTMLElement | null> | null>(null);
 
 export function canReceiveFocus(target: HTMLElement | null): target is HTMLElement {
@@ -70,24 +57,20 @@ interface FileRowActionsProps extends FileRowInfo {
   actionName?: string;
   onOpenInfo: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
   children: (
-    moreActions: ReactNode,
     rowRef: RefObject<HTMLDivElement | null>,
     primaryActionRef: RefObject<HTMLButtonElement | null>,
-    actionsOpen: boolean,
+    contextOpen: boolean,
   ) => ReactElement;
 }
 
 export function FileRowActions({ children, ...props }: FileRowActionsProps) {
   const rowRef = useRef<HTMLDivElement>(null);
   const primaryActionRef = useRef<HTMLButtonElement>(null);
-  const kebabRef = useRef<HTMLButtonElement>(null);
   const focusReturnRef = useRef<HTMLElement | null>(null);
   const contextFocusRef = useRef<HTMLElement | null>(null);
   const infoOpenedRef = useRef(false);
   const panelFocusRef = useContext(FilesPanelFocusContext);
   const [contextOpen, setContextOpen] = useState(false);
-  const [dropdownOpen, setDropdownOpen] = useState(false);
-  const isCoarsePointer = useIsCoarsePointer();
   const isDeleted = props.isDeleted ?? props.lastKnown ?? false;
   const revealTarget = useRevealTarget(isDeleted ? null : props.revealPath);
   const actionLabel = `More actions for ${props.actionName ?? props.name}`;
@@ -150,12 +133,12 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
     },
   });
 
-  const renderItems = (Item: typeof ContextMenuItem | typeof DropdownMenuItem) =>
+  const renderItems = () =>
     items.map(({ label, icon: Icon, onSelect }) => (
-      <Item key={label} onSelect={onSelect}>
+      <ContextMenuItem key={label} onSelect={onSelect}>
         <Icon className="size-4" />
         {label}
-      </Item>
+      </ContextMenuItem>
     ));
   const restoreFocusAfterMenuClose = (event: Event) => {
     event.preventDefault();
@@ -172,42 +155,6 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
     }
   };
 
-  const kebab = (
-    <DropdownMenu
-      onOpenChange={(open) => {
-        setDropdownOpen(open);
-        if (open) focusReturnRef.current = kebabRef.current;
-      }}
-    >
-      <DropdownMenuTrigger asChild>
-        <Button
-          ref={kebabRef}
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          aria-label={actionLabel}
-          onClick={(event) => event.stopPropagation()}
-          className={cn(
-            "size-[18px] shrink-0 rounded p-0.5 text-muted-foreground transition-opacity hover:bg-muted hover:text-foreground",
-            isCoarsePointer || contextOpen
-              ? "opacity-100"
-              : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100",
-            "pointer-coarse:size-6",
-          )}
-        >
-          <MoreHorizontalIcon className="size-3.5" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="end"
-        onEscapeKeyDown={(event) => event.stopPropagation()}
-        onCloseAutoFocus={restoreFocusAfterMenuClose}
-      >
-        {renderItems(DropdownMenuItem)}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-
   return (
     <ContextMenu
       onOpenChange={(open) => {
@@ -217,41 +164,47 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
           const target =
             contextFocusRef.current ??
             (active instanceof HTMLElement &&
-            active !== rowRef.current &&
             rowRef.current?.contains(active) &&
             canReceiveFocus(active)
               ? active
               : null);
           focusReturnRef.current = target
             ? target
-            : canReceiveFocus(primaryActionRef.current)
-              ? primaryActionRef.current
-              : kebabRef.current;
+            : canReceiveFocus(rowRef.current)
+              ? rowRef.current
+              : primaryActionRef.current;
           contextFocusRef.current = null;
         }
       }}
     >
       <ContextMenuTrigger
         asChild
+        onKeyDown={(event) => {
+          if (event.key === "F10" && event.shiftKey) {
+            event.preventDefault();
+            event.currentTarget.dispatchEvent(
+              new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+            );
+          }
+        }}
         onContextMenuCapture={() => {
           const active = document.activeElement;
           contextFocusRef.current =
             active instanceof HTMLElement &&
-            active !== rowRef.current &&
             rowRef.current?.contains(active) &&
             canReceiveFocus(active)
               ? active
               : null;
         }}
       >
-        {children(kebab, rowRef, primaryActionRef, contextOpen || dropdownOpen)}
+        {children(rowRef, primaryActionRef, contextOpen)}
       </ContextMenuTrigger>
       <ContextMenuContent
         aria-label={actionLabel}
         onEscapeKeyDown={(event) => event.stopPropagation()}
         onCloseAutoFocus={restoreFocusAfterMenuClose}
       >
-        {renderItems(ContextMenuItem)}
+        {renderItems()}
       </ContextMenuContent>
     </ContextMenu>
   );

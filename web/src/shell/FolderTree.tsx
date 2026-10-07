@@ -25,12 +25,7 @@ import {
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { RevealBaseContext } from "./RevealInFileManager";
-import {
-  FileRowActions,
-  ROW_MENU_SIZE_SLOT_CLASS,
-  ROW_MENU_SLOT_CLASS,
-  type FileRowInfo,
-} from "./FileRowActions";
+import { FileRowActions, type FileRowInfo } from "./FileRowActions";
 import { useCursorTooltip } from "./useCursorTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
@@ -1013,7 +1008,7 @@ function FileRowItem({
         linesRemoved={fileStatus?.lines_removed}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+        {(rowRef, primaryActionRef, actionsOpen) => (
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
@@ -1073,7 +1068,6 @@ function FileRowItem({
               className={cn(
                 "relative flex shrink-0 items-center justify-end",
                 ROW_META_SLOT_CLASS,
-                ROW_MENU_SIZE_SLOT_CLASS,
                 "pointer-coarse:justify-start",
               )}
             >
@@ -1094,7 +1088,6 @@ function FileRowItem({
                   <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
                 )}
                 <CopyPathButton path={canonicalPath} revealOnHover />
-                {moreActions}
               </span>
             </span>
           </div>
@@ -1194,7 +1187,7 @@ function SearchDirRow({
         onBrowse={() => (onNavigateDir ? onNavigateDir(file.path) : onRevealDir(file.path))}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+        {(rowRef, primaryActionRef, actionsOpen) => (
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
@@ -1213,16 +1206,11 @@ function SearchDirRow({
               </span>
             </button>
             <span
-              className={cn(
-                "relative flex shrink-0 items-center justify-end",
-                ROW_META_SLOT_CLASS,
-                ROW_MENU_SLOT_CLASS,
-              )}
+              className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
             >
               <span className="absolute inset-0 flex items-center justify-end gap-1">
                 <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
                 <CopyPathButton path={canonicalPath} label="Copy folder path" revealOnHover />
-                {moreActions}
               </span>
             </span>
           </div>
@@ -1349,7 +1337,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
       onBrowse={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
       onOpenInfo={onOpenInfo ?? (() => {})}
     >
-      {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+      {(rowRef, primaryActionRef, actionsOpen) => (
         <div
           ref={rowRef}
           data-actions-open={actionsOpen}
@@ -1397,20 +1385,14 @@ const TreeNodeRow = memo(function TreeNodeRow({
             )}
           </button>
           {/* The same trailing column as a file row. A folder has no size and
-          nothing to download, so the column shows only the copy button — with
-          the download's footprint reserved beside it so that button lands in
-          the same x as every file row's. */}
+          nothing to download, so the download footprint stays reserved beside
+          the copy button to keep it aligned with every file row. */}
           <span
-            className={cn(
-              "relative flex shrink-0 items-center justify-end",
-              ROW_META_SLOT_CLASS,
-              ROW_MENU_SLOT_CLASS,
-            )}
+            className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
           >
             <span className="absolute inset-0 flex items-center justify-end gap-1">
               <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
               <CopyPathButton path={canonicalPath} label="Copy folder path" revealOnHover />
-              {moreActions}
             </span>
           </span>
         </div>
