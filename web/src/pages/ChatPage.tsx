@@ -1108,7 +1108,7 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
-      hostId={activeSession?.hostId}
+      hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}

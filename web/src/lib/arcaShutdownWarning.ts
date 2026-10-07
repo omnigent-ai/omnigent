@@ -4,6 +4,7 @@ const DISMISSED_KEY = "omnigent:arca-shutdown:dismissed";
 const WARNED_KEY = "omnigent:arca-shutdown:warned";
 const OPTED_OUT_KEY = "omnigent:arca-shutdown:opted-out";
 export const ARCA_WARNING_PREFERENCES_CHANGED = "omnigent:arca-shutdown:preferences-changed";
+// Tab-local fallback keeps preferences usable when localStorage throws, as in private mode.
 const unavailableStorage = new Map<string, string>();
 const WARNING_START_HOUR = 17;
 const FIRST_WEEKDAY = 1;

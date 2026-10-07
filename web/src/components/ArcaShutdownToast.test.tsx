@@ -6,7 +6,12 @@ import type * as SonnerModule from "sonner";
 import { ArcaShutdownToast } from "./ArcaShutdownToast";
 import { ArcaShutdownBanner } from "./ArcaShutdownBanner";
 import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
-import { isWarnedToday, optOut, resetArcaWarningStorageForTests } from "@/lib/arcaShutdownWarning";
+import {
+  isDismissedToday,
+  isWarnedToday,
+  optOut,
+  resetArcaWarningStorageForTests,
+} from "@/lib/arcaShutdownWarning";
 import { copyText } from "@/lib/clipboard";
 
 const MON_459PM = new Date(2026, 9, 5, 16, 59);
@@ -152,6 +157,14 @@ describe("ArcaShutdownToast", () => {
     await waitFor(() =>
       expect(screen.queryByText("Arca shuts down at about 6 PM")).not.toBeInTheDocument(),
     );
+  });
+
+  it("dismisses the day of the click if Not now is pressed after midnight", async () => {
+    render(<ToastPage />);
+    const notNow = await screen.findByRole("button", { name: "Not now" });
+    vi.setSystemTime(TUE_MIDNIGHT);
+    fireEvent.click(notNow);
+    expect(isDismissedToday(TUE_MIDNIGHT)).toBe(true);
   });
 
   it("deduplicates across two instances through the warned storage key", () => {

@@ -90,7 +90,7 @@ export function ArcaShutdownToast() {
           );
         },
       },
-      cancel: { label: "Not now", onClick: () => dismissToday(now) },
+      cancel: { label: "Not now", onClick: () => dismissToday(new Date()) },
     });
   }, [now, hasOnlineArcaHost, optedOut, dismissedToday, visibility]);
 
