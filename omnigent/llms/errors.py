@@ -58,9 +58,7 @@ def is_context_length_exceeded(exc: BaseException) -> bool:
 # Databricks front-door rejection of an oversized request body; sizes are
 # bytes, not tokens. The request/limit pair is matched directly as one adjacent
 # group (no nested ``.*?`` wildcards) to stay linear-time on hostile input.
-_CONTENT_LENGTH_PHRASE = re.compile(
-    r"exceeds maximum allowed content length", re.IGNORECASE
-)
+_CONTENT_LENGTH_PHRASE = re.compile(r"exceeds maximum allowed content length", re.IGNORECASE)
 _REQUEST_LIMIT_PAIR = re.compile(
     r"RequestSize\(bytes\):\s*(\d+),\s*Limit\(bytes\):\s*(\d+)", re.IGNORECASE
 )
@@ -97,10 +95,10 @@ class RequestSizeOverflow:
 def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
     """Parse a content-length cap rejection from an error *message*.
 
-    Recognizes the Databricks front-door shape above. A transcript large
-    enough to hit the byte cap cannot fit the model's context window
-    either, so callers classify the failure as ``context_length_exceeded``
-    (recoverable by compaction) instead of an unknown permanent error.
+    Recognizes the Databricks front-door shape above. The byte cap and the
+    model's token context window are independent limits; callers still map
+    this rejection to ``context_length_exceeded`` because compaction shrinks
+    the request body, making it recoverable rather than permanent.
 
     :param message: Error text that may embed the rejection, e.g. a raw
         response body or a harness-reported failure string.

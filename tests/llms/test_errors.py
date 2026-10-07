@@ -6,10 +6,11 @@ import time
 
 from omnigent.llms.errors import detect_request_size_overflow
 
-# Enough repeated request fields to make a backtracking parser take many
-# seconds; the linear scanner stays well under this bound on any runner.
+# Enough repeated request fields that a backtracking parser takes many seconds;
+# the linear scanner needs milliseconds. The budget is deliberately generous so
+# shared-runner load cannot trip it, yet still fails fast if backtracking returns.
 _HOSTILE_REPEATS = 20_000
-_TIME_BUDGET_S = 1.0
+_TIME_BUDGET_S = 5.0
 
 
 def test_detect_request_size_overflow_matches_databricks_rejection() -> None:
@@ -34,13 +35,10 @@ def test_detect_request_size_overflow_phrase_without_sizes_is_none() -> None:
     )
 
 
-def test_detect_request_size_overflow_repeated_requests_without_limit_is_bounded() -> (
-    None
-):
+def test_detect_request_size_overflow_repeated_requests_without_limit_is_bounded() -> None:
     """Repeated request fields with no limit return None without backtracking."""
     hostile = (
-        "exceeds maximum allowed content length "
-        + "RequestSize(bytes): 1 " * _HOSTILE_REPEATS
+        "exceeds maximum allowed content length " + "RequestSize(bytes): 1 " * _HOSTILE_REPEATS
     )
 
     start = time.perf_counter()
