@@ -377,6 +377,10 @@ side gets its own checkout, venv, `HOME`, and copy of a corpus seeded at the
 baseline's schema. Dispatch it with `baseline_ref` == `candidate_ref` for an A/A
 noise check.
 
+`compare.py` (used by the release and PR gates) flags a regression on run-median
+P50 or P95. Journeys with fewer than 20 samples per run (the capped full-turn and
+`cli_startup` journeys) gate on P50 only, since their P95 is the slowest sample.
+
 Schema changes need no manual step: the seed always targets the current
 migrated schema (migrations run when the store is constructed), the reuse
 marker records the head read at seed time (so old corpora auto-reseed), and
