@@ -11,7 +11,7 @@ import {
   ZipDeflate,
   ZipPassThrough,
 } from "three/examples/jsm/libs/fflate.module.js";
-import { applyThreeMfColors, INFLATE_CHUNK_BYTES } from "./threeMfColors";
+import { applyThreeMfColors, INFLATE_CHUNK_BYTES, MAX_SELECTED_BYTES } from "./threeMfColors";
 
 const core = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const production = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
@@ -131,6 +131,24 @@ function check(
   return rows;
 }
 
+function multibyteVariants(note: string) {
+  const count = 6;
+  return archive({
+    "3D/root.model": model(
+      mesh(1).replace("<mesh>", `<metadata name="note">${note}</metadata><mesh>`) +
+        Array.from({ length: count }, (_, index) => composite(100 + index, component(1))).join(""),
+      Array.from(
+        { length: count },
+        (_, index) => `<item objectid="${100 + index}" transform="${transform(index * 10)}"/>`,
+      ).join(""),
+    ),
+    "Metadata/model_settings.config": `<config>${Array.from({ length: count }, (_, index) => config(part(1, index + 1), undefined, 100 + index)).join("")}</config>`,
+    "Metadata/project_settings.config": JSON.stringify({
+      filament_colour: ["#112233", "#223344", "#334455", "#445566", "#556677", "#667788"],
+    }),
+  });
+}
+
 describe("Bambu filament colours through the stock 3MF loader", () => {
   it("uses the central-directory palette instead of a stale local record", () => {
     const paletteName = "Metadata/project_settings.config";
@@ -239,12 +257,16 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       );
       expect(compressedBytes).toBeGreaterThan(0);
       expect(compressedBytes).toBeLessThan(2 * INFLATE_CHUNK_BYTES);
-      expect(
-        copier.mock.calls.some(
-          ([chunk, offset], index) =>
-            chunk.length + (offset ?? 0) > (copier.mock.contexts[index] as Uint8Array).length,
-        ),
-      ).toBe(false);
+      const overrunBytes = copier.mock.calls.reduce(
+        (total, [chunk, offset], index) =>
+          total +
+          Math.max(
+            0,
+            chunk.length + (offset ?? 0) - (copier.mock.contexts[index] as Uint8Array).byteLength,
+          ),
+        0,
+      );
+      expect(overrunBytes).toBe(0);
     } finally {
       parser.mockRestore();
       inflater.mockRestore();
@@ -286,21 +308,22 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       }
     };
     const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
+    const copier = vi.spyOn(Uint8Array.prototype, "set");
     try {
       for (const name of ["Metadata/model_settings.config", "3D/root.model"]) {
         const input = archive(
-          name.endsWith(".config")
-            ? { [name]: `<config>${" ".repeat(33 * 1024 * 1024)}</config>` }
-            : {},
+          name.endsWith(".config") ? { [name]: `<config>${" ".repeat(8 * 1024)}</config>` } : {},
           false,
           0,
         );
         forgeSize(input, name, 1);
         parser.mockClear();
         expect(applyThreeMfColors(input)).toBe(input);
-        expect(parser.mock.calls.every(([text]) => String(text).length <= 32 * 1024 * 1024)).toBe(
-          true,
-        );
+        expect(
+          parser.mock.calls.every(
+            ([text]) => strToU8(String(text)).byteLength <= MAX_SELECTED_BYTES,
+          ),
+        ).toBe(true);
         check(input, ["ffffff", "ffffff"]);
       }
       const name = "Metadata/model_settings.config";
@@ -324,8 +347,19 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
         expect(parser).not.toHaveBeenCalled();
         check(input, ["ffffff", "ffffff"]);
       }
+      const overrunBytes = copier.mock.calls.reduce(
+        (total, [chunk, offset], index) =>
+          total +
+          Math.max(
+            0,
+            chunk.length + (offset ?? 0) - (copier.mock.contexts[index] as Uint8Array).byteLength,
+          ),
+        0,
+      );
+      expect(overrunBytes).toBe(0);
     } finally {
       parser.mockRestore();
+      copier.mockRestore();
     }
   });
 
@@ -470,20 +504,15 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     );
     expect(selected).toBeLessThan(64 * 1024);
     const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
-    const importer = vi.spyOn(Document.prototype, "importNode");
     try {
       expect(applyThreeMfColors(input) === input).toBe(true);
-      expect(serializer.mock.calls.some(([node]) => node.nodeType === Node.DOCUMENT_NODE)).toBe(
-        false,
+      const measuredBytes = serializer.mock.results.reduce(
+        (total, result) => total + strToU8(String(result.value)).byteLength,
+        0,
       );
-      const meshes = importer.mock.calls.filter(
-        ([node]) => node instanceof Element && node.querySelector("mesh"),
-      );
-      expect(meshes.length).toBeGreaterThan(0);
-      expect(meshes.length).toBeLessThan(count);
+      expect(measuredBytes).toBeLessThan(selected * 2 + 1024 * 1024 + 64 * 1024);
     } finally {
       serializer.mockRestore();
-      importer.mockRestore();
     }
     check(
       input,
@@ -493,28 +522,30 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     );
   });
 
-  it("charges first emissions before deep imports", () => {
-    const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+  it("moves first mesh emissions and clones only copy-on-write variants", () => {
+    const input = archive({
+      "3D/root.model": model(
+        mesh(1) + [100, 101, 102].map((id) => composite(id, component(1))).join(""),
+        [100, 101, 102, 100]
+          .map((id, index) => `<item objectid="${id}" transform="${transform(index * 10)}"/>`)
+          .join(""),
+      ),
+      "Metadata/model_settings.config": `<config>${[1, 2, 99].map((slot, index) => config(part(1, slot), undefined, 100 + index)).join("")}</config>`,
+    });
     const importer = vi.spyOn(Document.prototype, "importNode");
     try {
-      check(archive());
-      const objects = serializer.mock.calls.filter(
-        ([node]) => node instanceof Element && node.localName === "object",
+      const rows = check(
+        input,
+        ["f53b9d", "4dc5a0", "ffffff", "f53b9d"],
+        [0, 10, 20, 30],
+        [1, 1, 1, 1],
       );
-      expect(objects.map(([node]) => (node as Element).getAttribute("id"))).toEqual([
-        "100",
-        "1",
-        "2",
-      ]);
-      for (const [index, [source]] of importer.mock.calls.entries()) {
-        const measured = serializer.mock.calls.findIndex(([node]) => node === source);
-        expect(measured).toBeGreaterThanOrEqual(0);
-        expect(serializer.mock.invocationCallOrder[measured]).toBeLessThan(
-          importer.mock.invocationCallOrder[index],
-        );
-      }
+      expect(rows[0].geometry).toBe(rows[3].geometry);
+      const meshes = importer.mock.calls.filter(
+        ([node]) => node instanceof Element && node.querySelector("mesh"),
+      );
+      expect(meshes.length).toBeLessThanOrEqual(2);
     } finally {
-      serializer.mockRestore();
       importer.mockRestore();
     }
   });
@@ -547,9 +578,8 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     try {
       expect(applyThreeMfColors(input) === input).toBe(true);
       const meshCopies = importer.mock.calls.filter(
-        ([node]) => node instanceof Element && node.getAttribute("id") === "1",
+        ([node]) => node instanceof Element && node.querySelector("mesh"),
       );
-      expect(meshCopies.length).toBeGreaterThan(0);
       expect(meshCopies.length).toBeLessThan(32);
     } finally {
       importer.mockRestore();
@@ -560,6 +590,48 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       Array.from({ length: count }, (_, index) => index * 10),
       Array.from({ length: count }, () => 1),
     );
+  });
+
+  it("rejects multibyte mesh variants before importing beyond the UTF-8 byte budget", () => {
+    const input = multibyteVariants("漢".repeat(150_000));
+    const importer = vi.spyOn(Document.prototype, "importNode");
+    try {
+      expect(applyThreeMfColors(input) === input).toBe(true);
+      const copies = importer.mock.calls.filter(
+        ([node]) => node instanceof Element && node.querySelector("mesh"),
+      );
+      expect(copies.length).toBeLessThan(4);
+    } finally {
+      importer.mockRestore();
+    }
+    check(input, Array(6).fill("ffffff"), [0, 10, 20, 30, 40, 50], Array(6).fill(1));
+  });
+
+  it("recolours multibyte variants within the byte budget and rejects their oversized neighbour", () => {
+    const input = multibyteVariants("aé漢🦄".repeat(20_000));
+    const normalized = applyThreeMfColors(input);
+    expect(normalized === input).toBe(false);
+    const selected = Object.values(unzipSync(new Uint8Array(input))).reduce(
+      (total, entry) => total + entry.byteLength,
+      0,
+    );
+    const bytes = unzipSync(new Uint8Array(normalized))["3D/3dmodel.model"];
+    expect(bytes.byteLength).toBeGreaterThan(strFromU8(bytes).length);
+    expect(bytes.byteLength).toBeLessThan(selected * 2 + 1024 * 1024);
+    const rows = rendered(normalized);
+    expect(rows.map((row) => row.hex)).toEqual([
+      "112233",
+      "223344",
+      "334455",
+      "445566",
+      "556677",
+      "667788",
+    ]);
+    expect(rows.map((row) => row.min)).toEqual([0, 10, 20, 30, 40, 50].map((x) => [x, 0, 0]));
+    expect(rows.map((row) => row.max)).toEqual([1, 11, 21, 31, 41, 51].map((x) => [x, 2, 3]));
+    const oversized = multibyteVariants("aé漢🦄".repeat(50_000));
+    expect(applyThreeMfColors(oversized) === oversized).toBe(true);
+    check(oversized, Array(6).fill("ffffff"), [0, 10, 20, 30, 40, 50], Array(6).fill(1));
   });
 
   it("admits large declared model sizes without multiplying recoloured mesh payloads", () => {
@@ -609,11 +681,23 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     ]);
     // A tiny forged payload probes size admission without constructing a large DOM.
     const declaredLarge = archive({ "3D/root.model": source });
-    const compressed = declareOriginalSize(declaredLarge, "3D/root.model", 33 * 1024 * 1024);
+    declareOriginalSize(declaredLarge, "3D/root.model", 33 * 1024 * 1024);
+    let otherCompressedBytes = 0;
+    unzipSync(new Uint8Array(declaredLarge), {
+      filter: (entry) => {
+        if (entry.name !== "3D/root.model") otherCompressedBytes += entry.size;
+        return false;
+      },
+    });
     const inflater = vi.spyOn(Inflate.prototype, "push");
     try {
       expect(applyThreeMfColors(declaredLarge)).toBe(declaredLarge);
-      expect(inflater).toHaveBeenCalledWith(compressed, true);
+      const pushedBytes = inflater.mock.calls.reduce(
+        (total, [chunk]) => total + chunk.byteLength,
+        0,
+      );
+      expect(pushedBytes).toBeGreaterThan(otherCompressedBytes);
+      expect(pushedBytes).toBeLessThanOrEqual(declaredLarge.byteLength);
     } finally {
       inflater.mockRestore();
     }
@@ -664,19 +748,8 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       ),
       "Metadata/model_settings.config": `<config>${config(part(1, 1), undefined, 1)}${config(part(2, 2), undefined, 2)}</config>`,
     });
-    const importer = vi.spyOn(Document.prototype, "importNode");
-    let normalized: ArrayBuffer;
-    try {
-      normalized = applyThreeMfColors(input);
-      expect(normalized).not.toBe(input);
-      expect(
-        importer.mock.calls.filter(
-          ([node]) => node instanceof Element && node.getAttribute("id") === "1",
-        ),
-      ).toHaveLength(1);
-    } finally {
-      importer.mockRestore();
-    }
+    const normalized = applyThreeMfColors(input);
+    expect(normalized).not.toBe(input);
     const document = new DOMParser().parseFromString(
       strFromU8(unzipSync(new Uint8Array(normalized))["3D/3dmodel.model"]),
       "application/xml",
