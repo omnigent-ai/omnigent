@@ -1,200 +1,139 @@
-"""The app maps backend gRPC permission denials to a handled 403.
-
-A store backend reached over gRPC (e.g. a workspace hierarchy service behind
-a channel proxy) can answer a request with ``PERMISSION_DENIED`` whose details
-read ``"Received http2 header with status: 403"``. Unhandled, that RpcError
-lands in the catch-all and the user gets a 500 ``internal_error`` (with a full
-traceback logged per client retry) instead of an actionable 403. These tests
-pin the mapping at the app layer: a permission denial becomes a handled 403
-naming the resource — for pypi grpcio's ``RpcError`` and for a vendored copy
-of grpc (a different class identity, matched structurally) alike — and every
-other gRPC status keeps the unhandled-500 contract.
-"""
+"""Backend permission denials are handled consistently across session APIs."""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.errors import ErrorCategory
-from omnigent.stores.conversation_store.sqlalchemy_store import (
-    SqlAlchemyConversationStore,
-)
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.server.helpers import create_test_session
 
-# The exact details string a proxied HTTP 403 surfaces as on the gRPC channel.
 _DENIAL_DETAILS = "Received http2 header with status: 403"
 
 
 @pytest.fixture
 async def catchall_client(
-    app: FastAPI,
-    client: httpx.AsyncClient,
+    app: FastAPI, client: httpx.AsyncClient
 ) -> AsyncIterator[httpx.AsyncClient]:
-    """A client that keeps the response the bare-``Exception`` handler sent.
-
-    Starlette re-raises an exception up the ASGI stack after that handler's
-    response is sent (a real server has already answered the client and only
-    logs it), so this transport must not turn the re-raise back into a test
-    error. Depends on ``client`` for the app's setup/teardown.
-
-    :param app: The FastAPI application under test.
-    :param client: The shared client fixture, for its lifecycle handling.
-    :yields: The non-raising client.
-    """
+    # Starlette re-raises after sending a catch-all response; preserve that response.
+    # The shared client fixture handles the app's setup and background-task cleanup.
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
 
 
-def _grpcio_rpc_error(status_name: str, details: str) -> Exception:
-    """A failed-call error from pypi grpcio, built only when grpcio is installed.
+def _rpc_error(status_name: str, implementation: str = "vendored") -> Exception:
+    if implementation == "grpcio":
+        grpc = pytest.importorskip("grpc")
+        base = grpc.RpcError
+        status = getattr(grpc.StatusCode, status_name)
+    else:
+        # A separately defined RpcError must match even without grpcio installed.
+        base = type("RpcError", (Exception,), {})
+        status = SimpleNamespace(name=status_name)
 
-    grpcio is not a base dependency: the cases that need a real ``grpc.RpcError``
-    skip without it, while the vendored case below still runs.
-
-    :param status_name: ``grpc.StatusCode`` member name the call failed with.
-    :param details: The failed call's details string.
-    :returns: The exception instance.
-    """
-    grpc = pytest.importorskip("grpc", reason="grpcio is required to build a real grpc.RpcError")
-    status = getattr(grpc.StatusCode, status_name)
-
-    class _BackendRpcError(grpc.RpcError):
-        """A gRPC error exposing the ``code()``/``details()`` of a failed call."""
-
+    class BackendRpcError(base):
         def code(self) -> object:
             return status
 
         def details(self) -> str:
-            return details
-
-    return _BackendRpcError()
-
-
-def _make_vendored_rpc_error() -> Exception:
-    """A permission-denied RPC error from a *vendored* grpc.
-
-    The deployed build vendors grpc, so the exception's class identity differs
-    from pypi grpcio's ``grpc.RpcError`` — only its shape (an ancestor named
-    ``RpcError`` plus the ``code()`` accessor) is shared. The mapping must
-    match that shape, not the pypi class.
-
-    :returns: The exception instance.
-    """
-
-    class _Status:
-        name = "PERMISSION_DENIED"
-
-    class RpcError(Exception):
-        def code(self) -> object:
-            return _Status()
-
-        def details(self) -> str:
             return _DENIAL_DETAILS
 
-    return RpcError("RPC terminated with PERMISSION_DENIED")
+    return BackendRpcError(_DENIAL_DETAILS)
 
 
-def _fail_listing_with(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
-    """Make every conversation listing raise *exc*.
-
-    Stands in for a workspace-hierarchy-backed store whose backend fails the
-    listing RPC: the error is raised from inside ``GET /v1/sessions``, the
-    funnel every sidebar session-list query goes through.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param exc: The exception the backend call raises.
-    """
-
-    def _raise(self: SqlAlchemyConversationStore, *args: object, **kwargs: object) -> object:
-        raise exc
-
-    monkeypatch.setattr(SqlAlchemyConversationStore, "list_conversations", _raise)
-
-
-def _app_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    """
-    :param caplog: The capture fixture.
-    :returns: The records the server's app logger emitted during the request.
-    """
-    return [r for r in caplog.records if r.name == "omnigent.server.app"]
-
-
+@pytest.mark.parametrize("implementation", ["vendored", "grpcio"])
 @pytest.mark.parametrize(
-    "make_error",
+    ("method", "suffix", "store_method"),
     [
-        pytest.param(lambda: _grpcio_rpc_error("PERMISSION_DENIED", _DENIAL_DETAILS), id="grpcio"),
-        pytest.param(_make_vendored_rpc_error, id="vendored"),
+        pytest.param("GET", "", "list_conversations", id="listing"),
+        pytest.param("GET", "/items", "_decode_item_data_batch", id="decrypt"),
+        pytest.param("POST", "/events", "_encode_item_data_batch", id="encrypt"),
     ],
 )
-async def test_grpc_permission_denied_maps_to_403(
+async def test_permission_denied_maps_to_403(
     catchall_client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    make_error: Callable[[], Exception],
+    implementation: str,
+    method: str,
+    suffix: str,
+    store_method: str,
 ) -> None:
-    """A backend ``PERMISSION_DENIED`` answers a handled 403, not a raw 500.
-
-    The denial is an expected upstream access outcome: it answers the coded
-    403 naming the resource and is logged exactly once at WARNING, with the
-    traceback and audit attributes, instead of an ERROR-level ``Unhandled
-    exception`` per client retry. The vendored shape must match as well: an
-    isinstance check against pypi grpcio's ``grpc.RpcError`` would never fire
-    for the vendored copy the deployed build ships.
-    """
-    _fail_listing_with(monkeypatch, make_error())
+    session = await create_test_session(catchall_client, name="denial-test")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_seed",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hello"}]),
+            )
+        ],
+    )
+    path = f"/v1/sessions/{session['id']}{suffix}" if suffix else "/v1/sessions"
+    # Replace only the external backend boundary, leaving routes and persistence real.
+    denied = Mock(side_effect=_rpc_error("PERMISSION_DENIED", implementation))
+    monkeypatch.setattr(SqlAlchemyConversationStore, store_method, denied)
+    kwargs = {}
+    if method == "POST":
+        kwargs["json"] = {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "denied"}],
+                },
+                "response_id": "resp_denied",
+            },
+        }
+    caplog.clear()
     with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
-        resp = await catchall_client.get("/v1/sessions", params={"limit": 30})
-    assert resp.status_code == 403
-    error = resp.json()["error"]
+        response = await catchall_client.request(method, path, **kwargs)
+
+    denied.assert_called()
+    assert response.status_code == 403, response.text
+    error = response.json()["error"]
     assert error["code"] == "upstream_permission_denied"
-    # The message names the denied resource so the user has something to act on.
-    assert "/v1/sessions" in error["message"]
-    records = _app_records(caplog)
-    assert len(records) == 1, [r.getMessage() for r in records]
-    (record,) = records
+    assert path in error["message"]
+    assert "ask an administrator" in error["message"]
+    (record,) = [r for r in caplog.records if r.name == "omnigent.server.app"]
     assert record.levelno == logging.WARNING
     assert record.getMessage().startswith("Upstream call denied by a backing service:")
     assert record.exc_info is not None
-    assert record.attributes["code"] == "upstream_permission_denied"
+    assert record.attributes["code"] == error["code"]
     assert record.attributes["http_status"] == "403"
     assert record.attributes["error_category"] == ErrorCategory.UPSTREAM.value
 
 
-@pytest.mark.parametrize(
-    ("status_name", "details"),
-    [
-        pytest.param("UNAVAILABLE", "connection refused", id="unavailable"),
-        pytest.param("UNAUTHENTICATED", "bad credentials", id="unauthenticated"),
-    ],
-)
-async def test_other_grpc_errors_keep_the_500_contract(
+@pytest.mark.parametrize("status_name", ["UNAVAILABLE", "UNAUTHENTICATED"])
+async def test_other_rpc_errors_remain_500(
     catchall_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     status_name: str,
-    details: str,
 ) -> None:
-    """A non-denial gRPC failure still surfaces as the standard 500 shape.
-
-    Only ``PERMISSION_DENIED`` (and, elsewhere, ``CANCELLED``) are expected
-    upstream outcomes. ``UNAUTHENTICATED`` is deliberately not mapped: broken
-    backend credentials would 401 every user, which is an operational fault,
-    not a caller access outcome. Both keep the ERROR-level unhandled signal
-    with its traceback.
-    """
-    _fail_listing_with(monkeypatch, _grpcio_rpc_error(status_name, details))
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "list_conversations",
+        Mock(side_effect=_rpc_error(status_name)),
+    )
     with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
-        resp = await catchall_client.get("/v1/sessions", params={"limit": 30})
-    assert resp.status_code == 500
-    assert resp.json()["error"]["code"] == "internal_error"
-    records = _app_records(caplog)
-    assert len(records) == 1, [r.getMessage() for r in records]
-    (record,) = records
+        response = await catchall_client.get("/v1/sessions")
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    (record,) = [r for r in caplog.records if r.name == "omnigent.server.app"]
     assert record.levelno == logging.ERROR
     assert record.getMessage().startswith("Unhandled exception:")
     assert record.exc_info is not None
