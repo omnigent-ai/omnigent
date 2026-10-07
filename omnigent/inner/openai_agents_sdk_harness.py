@@ -244,8 +244,8 @@ def _build_openai_agents_sdk_executor() -> Executor:
     prewarm = _sdk_prewarm()
     prewarm.join(timeout=_PREWARM_JOIN_TIMEOUT_S)
     if prewarm.is_alive():
-        # A stalled prewarm must not stall the turn; per-module import locks
-        # still serialize any module both threads are importing.
+        # Don't wait on a stalled prewarm forever. The turn can still block on
+        # the module lock of an import the prewarm is stuck in.
         _logger.warning(
             "openai-agents SDK prewarm still running after %.0fs; building the executor anyway",
             _PREWARM_JOIN_TIMEOUT_S,
