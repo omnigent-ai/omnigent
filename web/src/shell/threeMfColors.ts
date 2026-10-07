@@ -1,9 +1,17 @@
-import { strFromU8, strToU8, unzipSync, zipSync } from "three/examples/jsm/libs/fflate.module.js";
+import {
+  strFromU8,
+  strToU8,
+  unzipSync,
+  zipSync,
+  Unzip,
+  UnzipInflate,
+} from "three/examples/jsm/libs/fflate.module.js";
 
 const CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
-const MAX_SELECTED_BYTES = 256 * 1024 * 1024;
+const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
+const INFLATE_CHUNK_BYTES = 1024;
 const MAX_EMITTED_RATIO = 2;
 const MAX_EMITTED_OVERHEAD = 1024 * 1024;
 const MAX_OBJECTS = 10_000;
@@ -41,7 +49,26 @@ function slot(element: Element | undefined, inherited: number | null): number | 
 
 function xml(bytes: Uint8Array): Document {
   const text = strFromU8(bytes);
-  if (/<!DOCTYPE/i.test(text)) throw new Error("Unsupported XML doctype");
+  let offset = 0;
+  while (offset < text.length) {
+    if (/\s/.test(text[offset])) {
+      offset++;
+      continue;
+    }
+    const end = text.startsWith("<!--", offset)
+      ? "-->"
+      : text.startsWith("<?", offset)
+        ? "?>"
+        : null;
+    if (!end) {
+      if (text.slice(offset, offset + 9).toUpperCase() === "<!DOCTYPE")
+        throw new Error("Unsupported XML doctype");
+      break;
+    }
+    const next = text.indexOf(end, offset + 2);
+    if (next === -1) throw new Error("Invalid XML prolog");
+    offset = next + end.length;
+  }
   const document = new DOMParser().parseFromString(text, "application/xml");
   if (document.getElementsByTagName("parsererror").length) throw new Error("Invalid XML");
   return document;
@@ -67,8 +94,8 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     let selectedBytes = 0;
     let extractedBytes = 0;
     const extract = (needed: (name: string) => boolean) => {
-      const sizes = new Map<string, number>();
-      const entries = unzipSync(bytes, {
+      const sizes = new Map<string, { size: number; originalSize: number; compression: number }>();
+      unzipSync(bytes, {
         filter: (entry) => {
           if (!needed(entry.name)) return false;
           if (
@@ -81,15 +108,51 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
             throw new Error("Invalid ZIP size");
           selectedBytes += entry.originalSize;
           if (selectedBytes > MAX_SELECTED_BYTES) throw new Error("3MF byte limit");
-          sizes.set(entry.name, entry.originalSize);
-          return true;
+          if (sizes.has(entry.name)) throw new Error("Duplicate ZIP entry");
+          sizes.set(entry.name, entry);
+          return false;
         },
       });
-      for (const [name, data] of Object.entries(entries)) {
-        extractedBytes += data.byteLength;
-        if (data.byteLength !== sizes.get(name) || extractedBytes > MAX_SELECTED_BYTES)
-          throw new Error("3MF extracted byte limit");
+      const entries: Record<string, Uint8Array> = {};
+      const seen = new Set<string>();
+      let completed = 0;
+      const stream = new Unzip((file) => {
+        const declared = sizes.get(file.name);
+        if (!declared) return;
+        if (
+          seen.has(file.name) ||
+          file.compression !== declared.compression ||
+          (file.size !== undefined && file.size !== declared.size) ||
+          (file.originalSize !== undefined && file.originalSize !== declared.originalSize)
+        )
+          throw new Error("Inconsistent ZIP entry");
+        seen.add(file.name);
+        const entry = new Uint8Array(declared.originalSize);
+        let length = 0;
+        file.ondata = (error, data, final) => {
+          if (error) throw error;
+          length += data.byteLength;
+          extractedBytes += data.byteLength;
+          if (length > declared.originalSize || extractedBytes > MAX_SELECTED_BYTES)
+            throw new Error("3MF extracted byte limit");
+          entry.set(data, length - data.byteLength);
+          if (final) {
+            if (length !== declared.originalSize) throw new Error("Inconsistent ZIP size");
+            entries[file.name] = entry;
+            completed++;
+          }
+        };
+        file.start();
+      });
+      stream.register(UnzipInflate);
+      for (let offset = 0; offset < bytes.length; offset += INFLATE_CHUNK_BYTES) {
+        if (completed === sizes.size) break;
+        stream.push(
+          bytes.subarray(offset, offset + INFLATE_CHUNK_BYTES),
+          offset + INFLATE_CHUNK_BYTES >= bytes.length,
+        );
       }
+      if (completed !== sizes.size) throw new Error("Missing ZIP entries");
       return entries;
     };
     const configs = extract(
@@ -172,15 +235,19 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const colors: string[] = [];
     const memo = new Map<string, { id: string; height: number }>();
     const sourceSizes = new Map<string, number>();
-    let emittedBytes = 0;
+    let repeatedCharacters = 0;
     const reserve = (source: Element, key: string) => {
       let size = sourceSizes.get(key);
       if (size === undefined) {
-        size = strToU8(new XMLSerializer().serializeToString(source)).byteLength;
+        sourceSizes.set(key, 0);
+        return;
+      }
+      if (size === 0) {
+        size = new XMLSerializer().serializeToString(source).length;
         sourceSizes.set(key, size);
       }
-      emittedBytes += size;
-      if (emittedBytes > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD)
+      repeatedCharacters += size;
+      if (repeatedCharacters > selectedBytes * (MAX_EMITTED_RATIO - 1) + MAX_EMITTED_OVERHEAD)
         throw new Error("3MF emitted byte limit");
     };
     const visiting = new Set<string>();
