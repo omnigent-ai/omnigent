@@ -2005,12 +2005,17 @@ function ConversationList({
       }
       if (action.kind === "pin" && action.targetId) {
         // Pin into the dropped-on slot; the new pin goes through the pin toggle
-        // (cap / ownership checks), any renumbered neighbours through the batch.
+        // (cap / ownership checks), and only once it's accepted are any
+        // renumbered neighbours rewritten through the batch.
         const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
         const pin = writes.find((w) => w.id === dragged.id);
         const rest = writes.filter((w) => w.id !== dragged.id);
-        if (pin) pinAt({ id: pin.id, pinned: true, pinnedAt: pin.pinnedAt });
-        if (rest.length > 0) reorderPins(rest);
+        if (pin) {
+          pinAt(
+            { id: pin.id, pinned: true, pinnedAt: pin.pinnedAt },
+            { onSuccess: () => rest.length > 0 && reorderPins(rest) },
+          );
+        }
         return;
       }
       if (action.kind === "pin" || action.kind === "unpin") {

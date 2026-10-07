@@ -72,6 +72,9 @@ afterEach(async () => {
 
 describe("dropping an unpinned session onto a pinned row", () => {
   it("pins it into that slot and renumbers the existing pins", async () => {
+    mocks.pinAt.mockImplementation((_vars, options?: { onSuccess?: () => void }) =>
+      options?.onSuccess?.(),
+    );
     stubRowRects();
     renderSidebar();
     const source = screen.getByRole("link", { name: "conv_c" }).closest("li")!;
@@ -88,14 +91,35 @@ describe("dropping an unpinned session onto a pinned row", () => {
       fireEvent.mouseUp(document, target);
     });
 
-    expect(mocks.pinAt).toHaveBeenCalledExactlyOnceWith({
-      id: "conv_c",
-      pinned: true,
-      pinnedAt: 1001,
-    });
+    expect(mocks.pinAt).toHaveBeenCalledExactlyOnceWith(
+      { id: "conv_c", pinned: true, pinnedAt: 1001 },
+      expect.anything(),
+    );
     expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([
       { id: "conv_a", pinnedAt: 1000 },
       { id: "conv_b", pinnedAt: 1002 },
     ]);
+  });
+
+  it("leaves the existing pins alone when the new pin is rejected (e.g. at the pin cap)", async () => {
+    // A rejected pin never calls the mutate-level onSuccess.
+    mocks.pinAt.mockImplementation(() => undefined);
+    stubRowRects();
+    renderSidebar();
+    const source = screen.getByRole("link", { name: "conv_c" }).closest("li")!;
+    const start = rowCenter("conv_c");
+    const target = rowCenter("conv_b");
+
+    fireEvent.mouseDown(source, { button: 0, ...start });
+    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+    await act(async () => {
+      fireEvent.mouseMove(document, target);
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, target);
+    });
+
+    expect(mocks.pinAt).toHaveBeenCalledOnce();
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
   });
 });

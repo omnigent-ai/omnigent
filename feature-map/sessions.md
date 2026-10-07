@@ -49,6 +49,10 @@ the header menu), and each place is a separate entry point.
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, rename, archive or unarchive, and delete.
 
+**Pinned section drag:** drag a pinned row onto another pinned row to reorder
+the Pinned section, or drop an unpinned row onto a pinned row to pin it into
+that slot.
+
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (archive, unarchive, delete).
 

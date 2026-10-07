@@ -1704,6 +1704,71 @@ describe("useReorderPinnedConversations successive drags", () => {
   });
 });
 
+describe("useReorderPinnedConversations then unpin", () => {
+  it.each(["resolves", "rejects"])(
+    "keeps the session unpinned when the earlier reorder %s afterwards",
+    async (outcome) => {
+      const resolvers: ((r: Response) => void)[] = [];
+      fetchMock.mockImplementation(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolvers.push(resolve);
+          }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const row = conversation({ id: "conv_c", labels: { [PINNED_LABEL_KEY]: "3000" } });
+      queryClient.setQueryData(["conversations", "", false], infinitePage([row]));
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+        conversations: [row],
+        filterHonored: true,
+      });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(
+        () => ({ reorder: useReorderPinnedConversations(), toggle: useTogglePinnedConversation() }),
+        { wrapper },
+      );
+      const listLabel = () =>
+        queryClient
+          .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
+          ?.pages.flatMap((p) => p.data)
+          .find((c) => c.id === "conv_c")?.labels?.[PINNED_LABEL_KEY];
+      const pinnedIds = () =>
+        queryClient
+          .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+          ?.conversations.map((c) => c.id);
+      const sentValues = () =>
+        fetchMock.mock.calls.map(
+          ([, init]) => JSON.parse((init as RequestInit).body as string).labels[PINNED_LABEL_KEY],
+        );
+
+      act(() => result.current.reorder.mutate([{ id: "conv_c", pinnedAt: 999 }]));
+      act(() => result.current.toggle.mutate({ id: "conv_c", pinned: false }));
+      expect(pinnedIds()).toEqual([]);
+      await waitFor(() => expect(sentValues()).toEqual(["999"]));
+
+      resolvers[0](
+        outcome === "resolves"
+          ? mockResponse({
+              id: "conv_c",
+              object: "conversation",
+              labels: { [PINNED_LABEL_KEY]: "999" },
+            })
+          : mockResponse({}, { ok: false, status: 500 }),
+      );
+      // The unpin is sent only after the reorder settles, so it's the last write.
+      await waitFor(() => expect(sentValues()).toEqual(["999", ""]));
+      expect(pinnedIds()).toEqual([]);
+      expect(listLabel()).toBeUndefined();
+
+      resolvers[1](mockResponse({ id: "conv_c", object: "conversation", labels: {} }));
+      await waitFor(() => expect(result.current.toggle.isSuccess).toBe(true));
+      expect(pinnedIds()).toEqual([]);
+      expect(listLabel()).toBeUndefined();
+    },
+  );
+});
+
 describe("useTogglePinnedConversation old-server fallback", () => {
   // When the server can't store pins (`filterHonored` is false — a pre-upgrade
   // server that ignores `?pinned=true`), a PATCH would persist a bare

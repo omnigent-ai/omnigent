@@ -1779,6 +1779,17 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
   };
 }
 
+// Bumped by every pin, unpin, and reorder write, per session, so a reorder
+// that settles after a newer action on the same session leaves it alone.
+const pinWriteVersions = new Map<string, number>();
+// Pin, unpin, and reorder mutations run one at a time, in the order issued.
+const PIN_WRITE_SCOPE = "pin-writes";
+function bumpPinWriteVersion(id: string): number {
+  const version = (pinWriteVersions.get(id) ?? 0) + 1;
+  pinWriteVersions.set(id, version);
+  return version;
+}
+
 // Apply a pin/unpin to every cache that renders the row. `labels` is the
 // authoritative label map to write; membership in the Pinned section is
 // driven by the PINNED_CONVERSATIONS_KEY cache, so that patch is what makes
@@ -1887,6 +1898,8 @@ export function useTogglePinnedConversation() {
     patchPinnedCaches(queryClient, id, labels, pinned, includeShared, viewerId);
 
   return useMutation({
+    // Shares the reorder's scope so pin writes reach the server in the user's order.
+    scope: { id: PIN_WRITE_SCOPE },
     // `pinnedAt` overrides the pin's sort value; the Pinned section's drag-to-reorder sets it.
     mutationFn: ({ id, pinned, pinnedAt }: { id: string; pinned: boolean; pinnedAt?: number }) => {
       // Against an old server, persist the pin locally instead of PATCHing a
@@ -1940,6 +1953,7 @@ export function useTogglePinnedConversation() {
       const labels: Record<string, string> = pinned
         ? { ...base, [PINNED_LABEL_KEY]: String(pinnedAt ?? Date.now()) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
+      bumpPinWriteVersion(id);
       patch(id, labels, pinned);
       return { prevPinned };
     },
@@ -1989,9 +2003,9 @@ export function useReorderPinnedConversations() {
   const includeShared = pinsIncludeShared && sharedAvailable;
   const viewerId = getCurrentUserId();
   const queryClient = useQueryClient();
-  // Per row with a write still settling: the most recent value requested, and
-  // the last value the server confirmed (what a failed write falls back to).
-  const latest = useRef(new Map<string, number>());
+  // Per row with a reorder still settling: that write's version, and the last
+  // value the server confirmed (what a failed write falls back to).
+  const pending = useRef(new Map<string, number>());
   const confirmed = useRef(new Map<string, string | undefined>());
   const apply = (id: string, pinnedAt: string) => {
     const base = findCachedConversationRow(queryClient, id)?.labels ?? {};
@@ -2005,29 +2019,36 @@ export function useReorderPinnedConversations() {
     );
   };
   return useMutation({
-    scope: { id: "pinned-order" },
+    scope: { id: PIN_WRITE_SCOPE },
     mutationFn: (writes: { id: string; pinnedAt: number }[]) =>
       Promise.allSettled(writes.map((w) => setConversationPinned(w.id, true, w.pinnedAt))),
     onMutate: (writes) => {
-      for (const w of writes) {
-        if (!latest.current.has(w.id)) {
+      const versions = writes.map((w) => {
+        if (!pending.current.has(w.id)) {
           const cached = findCachedConversationRow(queryClient, w.id)?.labels?.[PINNED_LABEL_KEY];
           confirmed.current.set(w.id, cached);
         }
-        latest.current.set(w.id, w.pinnedAt);
+        const version = bumpPinWriteVersion(w.id);
+        pending.current.set(w.id, version);
         apply(w.id, String(w.pinnedAt));
-      }
+        return version;
+      });
+      return { versions };
     },
-    onSuccess: (results, writes) => {
+    onSuccess: (results, writes, ctx) => {
       results.forEach((result, index) => {
-        const { id, pinnedAt } = writes[index];
+        const { id } = writes[index];
+        const version = ctx?.versions[index];
         if (result.status === "fulfilled") {
           confirmed.current.set(id, result.value.labels[PINNED_LABEL_KEY]);
         }
-        if (latest.current.get(id) !== pinnedAt) return;
         const value = confirmed.current.get(id);
-        latest.current.delete(id);
-        confirmed.current.delete(id);
+        if (pending.current.get(id) === version) {
+          pending.current.delete(id);
+          confirmed.current.delete(id);
+        }
+        // A newer pin, unpin, or reorder of this row owns its cached state.
+        if (pinWriteVersions.get(id) !== version) return;
         if (value !== undefined) apply(id, value);
       });
       if (results.some((r) => r.status === "rejected")) {

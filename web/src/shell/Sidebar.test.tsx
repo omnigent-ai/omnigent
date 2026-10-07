@@ -98,7 +98,6 @@ vi.mock("@/hooks/useConversations", async () => {
         isSuccess: true,
       };
     },
-    useReorderPinnedConversations: () => ({ mutate: vi.fn() }),
     useTogglePinnedConversation: () => ({
       mutate: ({ id, pinned }: { id: string; pinned: boolean }) => {
         const ids = pinnedIdsRef.current;

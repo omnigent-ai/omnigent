@@ -43,7 +43,6 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
     ...actual,
     useProjects: () => ({ data: mocks.projects }),
     useTogglePinnedConversation: () => ({ mutate: mocks.togglePinned }),
-    useReorderPinnedConversations: () => ({ mutate: vi.fn() }),
     useRenameConversation: () => ({ mutate: mocks.rename, isPending: false }),
     useMoveToProject: () => ({ mutate: mocks.moveToProject }),
     useArchiveConversation: () => ({ mutate: mocks.archive }),
