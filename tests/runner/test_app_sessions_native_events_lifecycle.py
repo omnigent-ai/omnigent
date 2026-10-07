@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from unittest.mock import Mock
 
 import pytest
@@ -1346,6 +1347,10 @@ async def test_events_codex_native_settings_change_defers_without_a_bridge(
             {"request_error": ConnectionError("disconnected before responding")},
             id="dropped-after-send",
         ),
+        pytest.param(
+            {"connect_error": TimeoutError("connect timed out")},
+            id="connect-timeout",
+        ),
     ],
 )
 async def test_events_codex_native_settings_change_still_fails_when_a_live_app_server_errors(
@@ -1360,7 +1365,9 @@ async def test_events_codex_native_settings_change_still_fails_when_a_live_app_s
     Only a failure to connect defers; an answer or a drop once connected is a 503.
 
     A refusal from a live app-server, or an update that may have been sent, must
-    still surface and roll the pick back. The pane is left unmarked too.
+    still surface and roll the pick back. The pane is left unmarked too. A connect
+    that times out is not a refused connection: the app-server may be alive but
+    slow, and ``TimeoutError`` is an ``OSError``, so it must not defer.
     """
     del setting_keys
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
@@ -1410,6 +1417,205 @@ async def test_events_codex_native_plan_mode_change_is_not_deferred_when_app_ser
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"] == "codex_native_settings_update_failed"
     assert _deferred_settings_events(caplog) == []
+
+
+class _ReapedCodexSession(NamedTuple):
+    """A codex-native runner session whose app-server refuses connections, with its doubles."""
+
+    http: Any
+    conv_id: str
+    bridge_dir: Path
+    app_server: _FailingCodexAppServerClient
+    remembered_efforts: dict[str, str]
+
+
+@contextlib.asynccontextmanager
+async def _reaped_codex_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> AsyncIterator[_ReapedCodexSession]:
+    """
+    Run a codex-native session on ``gpt-5.4`` whose app-server refuses connections.
+
+    No pane is registered, like a session the idle reaper closed. The app-server's
+    catalog lists ``low`` through ``xhigh`` for the model, so a live update clamps a
+    higher effort; clearing ``app_server.connect_error`` brings the app-server back.
+
+    :param monkeypatch: Pytest monkeypatch isolating the bridge root and catalog cache.
+    :param tmp_path: Temporary directory for the bridge and the private Codex home.
+    :returns: The session's HTTP client, ids and doubles.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native_controls import NativeControls, build_native_controls
+
+    conv_id = uuid.uuid4().hex
+    transport = str(tmp_path / "codex.sock")
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        'model = "gpt-5.4"\nmodel_reasoning_effort = "medium"\n'
+    )
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=transport,
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    app_server = _FailingCodexAppServerClient(
+        transport,
+        "omnigent-codex-native-runner",
+        connect_error=ConnectionRefusedError(111, "Connect call failed"),
+    )
+    app_server.model_list_responses = [
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-5.4",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": level}
+                            for level in ("low", "medium", "high", "xhigh")
+                        ],
+                    }
+                ],
+                "nextCursor": None,
+            }
+        }
+    ]
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *a, **kw: app_server
+    )
+
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        # A launch would rewrite the bridge state this test controls.
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+    captured: dict[str, dict[str, str]] = {}
+
+    def capture_controls(**kwargs: Any) -> NativeControls:
+        captured["efforts"] = kwargs["_session_reasoning_effort"]
+        return build_native_controls(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", capture_controls)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-5.4"))
+    async with _runner_client(app) as http:
+        created = await http.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert created.status_code == 201, created.text
+        yield _ReapedCodexSession(http, conv_id, bridge_dir, app_server, captured["efforts"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "accepted_body", "setting_keys", "live_update"),
+    [
+        pytest.param(
+            {"type": "effort_change", "effort": "max", "rollback_on_refusal": True},
+            None,
+            "effort",
+            {"threadId": "thread_codex", "effort": "xhigh"},
+            id="effort_change",
+        ),
+        pytest.param(
+            {
+                "type": "model_change",
+                "model": "gpt-5.4",
+                "effort": "max",
+                "rollback_on_refusal": True,
+            },
+            {"codex_settings_applied": True},
+            "effort,model",
+            {"threadId": "thread_codex", "model": "gpt-5.4", "effort": "xhigh"},
+            id="model_and_effort_change",
+        ),
+    ],
+)
+async def test_codex_native_unsupported_effort_is_deferred_as_picked_then_clamped_once_live(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    event: dict[str, Any],
+    accepted_body: dict[str, Any] | None,
+    setting_keys: str,
+    live_update: dict[str, Any],
+) -> None:
+    """
+    An effort the model lacks is deferred as picked, and a live app-server clamps it.
+
+    The clamp reads the model catalog from the app-server, so a reaped pane cannot apply
+    it: the runner answers before any catalog read and keeps the pick for the next launch
+    or turn, which clamps it. The same update against a reachable app-server shows the clamp.
+    """
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    async with _reaped_codex_session(monkeypatch, tmp_path) as session:
+        url = f"/v1/sessions/{session.conv_id}/events"
+        deferred = await session.http.post(url, json=event)
+        requests_while_gone = list(session.app_server.requests)
+        effort_while_gone = codex_native_bridge.read_codex_config_effort(session.bridge_dir)
+        remembered_while_gone = session.remembered_efforts.get(session.conv_id)
+        session.app_server.connect_error = None  # The next launch brought it back.
+        live = await session.http.post(url, json=event)
+
+    for response in (deferred, live):
+        if accepted_body is None:
+            assert response.status_code == 204, response.text
+        else:
+            assert response.status_code == 200, response.text
+            assert response.json() == accepted_body
+    [row] = _deferred_settings_events(caplog)
+    assert row.attributes["reason"] == "pane_not_running"
+    assert row.attributes["setting_keys"] == setting_keys
+    # Deferred: nothing reached the app-server, so no catalog read and no clamp.
+    assert requests_while_gone == []
+    assert effort_while_gone == "medium"
+    assert remembered_while_gone == "max"
+    # Live: the catalog caps the model at xhigh, and the applied value is what sticks.
+    updates = [
+        params
+        for method, params in session.app_server.requests
+        if method == "thread/settings/update"
+    ]
+    assert updates == [live_update]
+    assert codex_native_bridge.read_codex_config_effort(session.bridge_dir) == "xhigh"
+    assert session.remembered_efforts[session.conv_id] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_codex_native_deferred_effort_reset_forgets_the_remembered_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A Default reset deferred for want of an app-server drops the runner's old effort.
+
+    Resolving the model's default needs the catalog, so the reset defers like any other
+    pick rather than failing on it. The session row then carries no effort, so a stale
+    remembered one would be sent as the next turn's effort and contradict the reset.
+    """
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    async with _reaped_codex_session(monkeypatch, tmp_path) as session:
+        session.remembered_efforts[session.conv_id] = "xhigh"
+        response = await session.http.post(
+            f"/v1/sessions/{session.conv_id}/events",
+            json={"type": "effort_change", "effort": None, "rollback_on_refusal": True},
+        )
+
+    assert response.status_code == 204, response.text
+    assert session.app_server.requests == []
+    assert session.conv_id not in session.remembered_efforts
+    [row] = _deferred_settings_events(caplog)
+    assert row.attributes["setting_keys"] == "effort"
 
 
 @pytest.mark.asyncio
