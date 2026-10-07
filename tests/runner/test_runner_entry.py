@@ -492,6 +492,104 @@ def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
     assert mint_calls == [1]
 
 
+def _refuse_mint(calls: list[str | None]) -> Any:
+    """Build a mint stand-in that records its proxy bearer and answers HTTP 400."""
+
+    def _mint(
+        mint_url: str, server_url: str, binding_token: str, *, proxy_bearer: str | None = None
+    ) -> tuple[str, float]:
+        del server_url, binding_token
+        calls.append(proxy_bearer)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "400", request=request, response=httpx.Response(400, request=request)
+        )
+
+    return _mint
+
+
+def test_delegated_refusal_is_not_reprobed_by_the_managed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that refused the delegated mint isn't asked again with the same token.
+
+    No-auth and header-mode servers answer the mint with a definitive 400. The
+    managed-sandbox fallback would resend the identical bare request.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _no_sdk(profile: str | None = None) -> tuple[Any, str]:
+        raise DatabricksAuthError("no Databricks credentials configured")
+
+    calls: list[str | None] = []
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse_mint(calls))
+
+    assert _make_auth_token_factory() is None
+    assert calls == [None]
+
+
+def test_managed_fallback_still_probes_after_a_proxy_bearer_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bare fallback is a different request when the delegated probe carried a bearer."""
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _no_sdk(profile: str | None = None) -> tuple[Any, str]:
+        raise DatabricksAuthError("no Databricks credentials configured")
+
+    calls: list[str | None] = []
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse_mint(calls))
+
+    factory = _make_auth_token_factory(_allow_initial_token=False, _proxy_bearer="host-bearer")
+
+    assert factory is None
+    assert calls == ["host-bearer", None]
+
+
+@pytest.mark.parametrize(("auth_resolved", "expected_resolutions"), [(True, 0), (False, 1)])
+def test_create_app_reuses_a_resolved_no_credential_result(
+    monkeypatch: pytest.MonkeyPatch, auth_resolved: bool, expected_resolutions: int
+) -> None:
+    """Boot hands its finished resolution to create_app, which must not redo it.
+
+    Re-resolving right after boot repeats the managed-mint probes and SDK
+    discovery for the same answer.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    class _FakeProcessManager:
+        instance_dir = Path("/tmp/omnigent-test/ap-test")
+
+    resolutions: list[int] = []
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.HarnessProcessManager", _FakeProcessManager
+    )
+    monkeypatch.setattr("omnigent.terminals.TerminalRegistry", _TrackingTerminalRegistry)
+    monkeypatch.setattr(entry_mod.httpx, "AsyncClient", _TrackingAsyncClient)
+    monkeypatch.setattr(entry_mod.httpx, "Client", _TrackingSyncClient)
+    monkeypatch.setattr(
+        entry_mod, "_make_auth_token_factory", lambda: resolutions.append(1) or None
+    )
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+
+    entry_mod.create_app(auth_token_factory=None, auth_resolved=auth_resolved)
+
+    assert len(resolutions) == expected_resolutions
+
+
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

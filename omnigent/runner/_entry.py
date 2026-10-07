@@ -661,12 +661,17 @@ def _make_auth_token_factory(
     # credentials stay out of the runner and credential discovery is skipped.
     delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
     binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
+    # A binding token the server just refused to mint for (bare request), so
+    # the managed fallback below doesn't resend the identical probe.
+    refused_binding_token: str | None = None
     if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
         delegated_factory = _make_managed_mint_factory(
             resolved_server_url, binding_token, proxy_bearer=_proxy_bearer
         )
         if delegated_factory is not None:
             return delegated_factory
+        if _proxy_bearer is None:
+            refused_binding_token = binding_token
 
     sdk_token_source: _ReusedDatabricksTokenSource | None = None
 
@@ -736,7 +741,7 @@ def _make_auth_token_factory(
             fallback_binding_token = _runner_tunnel_binding_token_from_env()
         except RuntimeError:
             fallback_binding_token = None
-        if fallback_binding_token is not None:
+        if fallback_binding_token is not None and fallback_binding_token != refused_binding_token:
             return _make_managed_mint_factory(resolved_server_url, fallback_binding_token)
     return None
 
@@ -1328,13 +1333,18 @@ async def _resolve_agent_spec_from_server(
 
 def create_app(
     auth_token_factory: Callable[[], str | None] | None = None,
+    *,
+    auth_resolved: bool = False,
 ) -> FastAPI:
     """Factory for the runner FastAPI app exposing the harness-contract subset.
 
     :param auth_token_factory: Pre-built server bearer factory to reuse for the
         HTTP client and native terminal helpers, e.g. the delegated factory
         ``_run_tunnel_from_env`` already built for the WS tunnel. When ``None``,
-        the app builds its own.
+        the app builds its own unless *auth_resolved* is set.
+    :param auth_resolved: Whether *auth_token_factory* is the caller's
+        finished credential resolution, so ``None`` means "no credentials"
+        rather than "resolve again" (which would re-probe the same endpoints).
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
     from omnigent.cli_auth import open_server_client
@@ -1382,7 +1392,7 @@ def create_app(
 
     # Reuse the caller's factory when given (shares one resolved SDK auth +
     # token cache); otherwise build our own.
-    if auth_token_factory is None:
+    if auth_token_factory is None and not auth_resolved:
         auth_token_factory = _make_auth_token_factory()
     binding_token = _runner_tunnel_binding_token_from_env()
     server_client = open_server_client(
@@ -1691,7 +1701,7 @@ async def _run_tunnel_from_env() -> None:
 
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
-    app = create_app(auth_token_factory=auth_token_factory)
+    app = create_app(auth_token_factory=auth_token_factory, auth_resolved=True)
     from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 
     event_dispatcher = RunnerEventDispatcher()
