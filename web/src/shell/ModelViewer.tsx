@@ -15,6 +15,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
+import { applyThreeMfColors } from "./threeMfColors";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { type FileContentResponse, fileContentToBlob } from "@/hooks/useFileContent";
@@ -64,7 +65,7 @@ function parseModel(
     return { object: new THREE.Mesh(geometry, material), stlMaterial: material };
   }
   if (format === "3mf") {
-    return { object: new ThreeMFLoader().parse(buffer), stlMaterial: null };
+    return { object: new ThreeMFLoader().parse(applyThreeMfColors(buffer)), stlMaterial: null };
   }
   // OBJ is ASCII text.
   const text = new TextDecoder().decode(buffer);
