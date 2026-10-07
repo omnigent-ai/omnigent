@@ -228,6 +228,8 @@ def facet(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[FakeGitLa
         pending = list(pr_resource._DISCOVERY_JOBS.values())
     for future in pending:
         future.result(timeout=budget(5))
+    with pr_resource._DISCOVERY_LOCK:
+        pr_resource._DISCOVERY_JOBS.clear()
     reset_for_tests()
 
 
@@ -659,12 +661,12 @@ def test_other_provider_warnings_do_not_override_a_successful_empty_lookup(
     assert any("discovery failed" in warning for warning in info["discovery_warnings"])
 
 
-@pytest.mark.parametrize("remove_during_discovery", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "removed", "failure"])
 def test_tracked_pr_does_not_wait_for_discovery_and_later_includes_its_result(
     facet: FakeGitLabFacet,
     repo: str,
     monkeypatch: pytest.MonkeyPatch,
-    remove_during_discovery: bool,
+    outcome: str,
 ) -> None:
     selected = "https://github.com/example/project/pull/42"
     registry = SessionPrRegistry("slow-discovery")
@@ -688,6 +690,8 @@ def test_tracked_pr_does_not_wait_for_discovery_and_later_includes_its_result(
         calls.append(root)
         started.set()
         assert release.wait(budget(5))
+        if outcome == "failure" and len(calls) == 1:
+            raise RuntimeError("Slow secondary provider failure")
         return original(root)
 
     facet.branch_pr = MR
@@ -706,7 +710,7 @@ def test_tracked_pr_does_not_wait_for_discovery_and_later_includes_its_result(
                 == selected
             )
             assert calls == [repo]
-            if remove_during_discovery:
+            if outcome == "removed":
                 registry.remove(MR)
         finally:
             release.set()
@@ -716,5 +720,13 @@ def test_tracked_pr_does_not_wait_for_discovery_and_later_includes_its_result(
     info = pr_resource.pr_info(repo, session_id="slow-discovery")
     assert info["selected_pr_url"] == selected
     assert {pr["url"] for pr in info["prs"]} == (
-        {selected} if remove_during_discovery else {selected, MR}
+        {selected, MR} if outcome == "success" else {selected}
     )
+    if outcome == "failure":
+        assert info["discovery_warnings"] == [
+            "gitlab pull request discovery failed. Refresh to retry."
+        ]
+        assert calls == [repo], "Collecting the late warning must not repeat the lookup"
+        recovered = pr_resource.pr_info(repo, session_id="slow-discovery")
+        assert {pr["url"] for pr in recovered["prs"]} == {selected, MR}
+        assert not recovered.get("discovery_warnings")

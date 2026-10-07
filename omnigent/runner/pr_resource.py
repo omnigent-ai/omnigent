@@ -53,6 +53,7 @@ _PROVIDER_CONFIG_KEY = "omnigent.gitprovider"
 _DISCOVERY_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-discovery")
 _DISCOVERY_LOCK = Lock()
 _DISCOVERY_JOBS: dict[tuple[str, str, str | None], Future[dict[str, Any]]] = {}
+_DISCOVERY_RESULT_LIMIT = 128
 
 
 @dataclass(frozen=True)
@@ -376,7 +377,7 @@ def _associate_discovered_pr(
 def _background_discovery(
     root: str, session_id: str, resolution: ProviderResolution
 ) -> Future[dict[str, Any]]:
-    """Share in-flight discovery across polls; persist results for the next poll."""
+    """Share discovery across polls until a request collects its result."""
     key = (root, session_id, resolution.provider)
 
     def discover() -> dict[str, Any]:
@@ -384,17 +385,18 @@ def _background_discovery(
         _associate_discovered_pr(root, SessionPrRegistry(session_id), candidate, time.time())
         return candidate
 
-    def finished(_future: Future[dict[str, Any]]) -> None:
-        with _DISCOVERY_LOCK:
-            _DISCOVERY_JOBS.pop(key, None)
-
     with _DISCOVERY_LOCK:
         existing = _DISCOVERY_JOBS.get(key)
         if existing is not None:
             return existing
+        # Bound completed results for sessions that are no longer polled.
+        for stale_key in list(_DISCOVERY_JOBS):
+            if len(_DISCOVERY_JOBS) < _DISCOVERY_RESULT_LIMIT:
+                break
+            if _DISCOVERY_JOBS[stale_key].done():
+                del _DISCOVERY_JOBS[stale_key]
         future = _DISCOVERY_POOL.submit(discover)
         _DISCOVERY_JOBS[key] = future
-    future.add_done_callback(finished)
     return future
 
 
@@ -435,13 +437,19 @@ def pr_info(
         assert reference is not None
         info = _reference_info(root, reference)
     elif reference is not None:
-        pending = [_background_discovery(root, session_id, value) for value in resolutions]
+        pending = [
+            (value, _background_discovery(root, session_id, value)) for value in resolutions
+        ]
         info = _reference_info(root, reference)
         # Collect quick results; slow forges will appear on a subsequent poll.
         deadline = time.monotonic() + 0.1
-        for future in pending:
+        for resolution, future in pending:
             with suppress(FutureTimeout):
                 discovered.append(future.result(timeout=max(0, deadline - time.monotonic())))
+                with _DISCOVERY_LOCK:
+                    key = (root, session_id, resolution.provider)
+                    if _DISCOVERY_JOBS.get(key) is future:
+                        del _DISCOVERY_JOBS[key]
     elif len(resolutions) == 1:
         discovered = [_discovery_info(root, resolutions[0])]
         info = discovered[0]
