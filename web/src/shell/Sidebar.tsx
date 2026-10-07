@@ -148,6 +148,7 @@ import {
   PROJECT_LABEL_KEY,
   PINNED_CONVERSATIONS_KEY,
   useTogglePinnedConversation,
+  useReorderPinnedConversations,
   setConversationPinned,
   useRenameConversation,
   useStopAndDeleteConversation,
@@ -286,18 +287,18 @@ const ServerInfoContext = createContext<ReturnType<typeof useServerInfo>>("loadi
 const RowActivationContext = createContext<
   (id: string, event: MouseEvent<HTMLAnchorElement>) => void
 >(() => {});
-// Rows report an in-progress inline-rename edit here so ConversationList can
-// hold the sort order for the edit's whole duration — the pointer often
-// leaves the list while typing, and a reorder then would shuffle rows around
-// the open input (and can even blur it mid-edit, committing a half-typed
-// title). See the order-freeze block in ConversationList.
 // Set only around the Pinned section, so its rows become drag-to-reorder targets.
-// `draggingId` is the pinned session being dragged; `overId` the row it's over.
+// `draggingId` is the session being dragged; `overId` the row it's over.
 const PinOrderContext = createContext<{
   ids: string[];
   draggingId: string | null;
   overId: string | null;
 } | null>(null);
+// Rows report an in-progress inline-rename edit here so ConversationList can
+// hold the sort order for the edit's whole duration — the pointer often
+// leaves the list while typing, and a reorder then would shuffle rows around
+// the open input (and can even blur it mid-edit, committing a half-typed
+// title). See the order-freeze block in ConversationList.
 const RowEditHoldContext = createContext<(id: string, editing: boolean) => void>(() => {});
 
 // Stable callback identity that always runs the latest `fn` — keeps the row
@@ -1255,6 +1256,7 @@ function SidebarImpl({
                     multiUser={multiUser}
                     pinnedConversationIds={pinnedConversationIds}
                     pinnedConversations={pinnedConversations}
+                    pinReorderEnabled={pinnedFilterHonored}
                     onTogglePinned={togglePinnedConversation}
                     onEnterSelectionMode={enterSelectionMode}
                     selectionMode={selectionMode}
@@ -1569,6 +1571,9 @@ interface ConversationListProps {
   // The server-authoritative pinned sessions, so a pinned session that sits
   // outside the loaded pagination window still renders in the Pinned section.
   pinnedConversations: Conversation[];
+  // False against a server that can't store pins (they live in localStorage,
+  // which has no order), so drag-to-reorder is off there.
+  pinReorderEnabled: boolean;
   onTogglePinned: (conversationId: string) => void;
   onEnterSelectionMode: (scope: SelectionScope) => void;
   selectionMode: boolean;
@@ -1591,6 +1596,7 @@ function ConversationList({
   multiUser,
   pinnedConversationIds,
   pinnedConversations,
+  pinReorderEnabled,
   onTogglePinned,
   onEnterSelectionMode,
   selectionMode,
@@ -1629,7 +1635,8 @@ function ConversationList({
   const dragOrigin = useRef<{ left: number; top: number; width: number } | undefined>(undefined);
   const [overProject, setOverProject] = useState<string | null>(null);
   const [overPin, setOverPin] = useState<string | null>(null);
-  const reorderPin = useTogglePinnedConversation();
+  const { mutate: pinAt } = useTogglePinnedConversation();
+  const { mutate: reorderPins } = useReorderPinnedConversations();
   const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
     if (saveOrder.isPending) return;
     const from = projects.findIndex((p) => p.name === name);
@@ -1992,9 +1999,18 @@ function ConversationList({
         return;
       }
       if (action.kind === "reorder-pin") {
-        for (const write of pinOrderWrites(sections.pinned, dragged.id, action.targetId)) {
-          reorderPin.mutate({ id: write.id, pinned: true, pinnedAt: write.pinnedAt });
-        }
+        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
+        if (writes.length > 0) reorderPins(writes);
+        return;
+      }
+      if (action.kind === "pin" && action.targetId) {
+        // Pin into the dropped-on slot; the new pin goes through the pin toggle
+        // (cap / ownership checks), any renumbered neighbours through the batch.
+        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
+        const pin = writes.find((w) => w.id === dragged.id);
+        const rest = writes.filter((w) => w.id !== dragged.id);
+        if (pin) pinAt({ id: pin.id, pinned: true, pinnedAt: pin.pinnedAt });
+        if (rest.length > 0) reorderPins(rest);
         return;
       }
       if (action.kind === "pin" || action.kind === "unpin") {
@@ -2019,7 +2035,8 @@ function ConversationList({
       projects,
       saveOrder,
       sections.pinned,
-      reorderPin,
+      pinAt,
+      reorderPins,
     ],
   );
 
@@ -2171,12 +2188,15 @@ function ConversationList({
   );
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
   const pinOrder = useMemo(
-    () => ({
-      ids: sections.pinned.map((c) => c.id),
-      draggingId: activeDrag?.isPinned ? activeDrag.id : null,
-      overId: overPin,
-    }),
-    [sections.pinned, activeDrag, overPin],
+    () =>
+      pinReorderEnabled
+        ? {
+            ids: sections.pinned.map((c) => c.id),
+            draggingId: activeDrag?.id ?? null,
+            overId: overPin,
+          }
+        : null,
+    [pinReorderEnabled, sections.pinned, activeDrag, overPin],
   );
 
   // Pinned membership is server-authoritative (the `omnigent.pinned` label),
@@ -3984,12 +4004,12 @@ function ConversationRowImpl({
     data: { type: "pin-order", id: conversation.id },
     disabled: !pinOrder || !isPinned,
   });
-  const pinInsertion =
-    pinOrder?.draggingId && pinOrder.overId === conversation.id
-      ? pinOrder.ids.indexOf(pinOrder.draggingId) < pinOrder.ids.indexOf(conversation.id)
-        ? "after"
-        : "before"
-      : undefined;
+  // A pin dragged down lands below this row; one dragged up, or a new pin, above it.
+  let pinInsertion: "before" | "after" | undefined;
+  if (pinOrder?.draggingId && pinOrder.overId === conversation.id) {
+    const from = pinOrder.ids.indexOf(pinOrder.draggingId);
+    pinInsertion = from >= 0 && from < pinOrder.ids.indexOf(conversation.id) ? "after" : "before";
+  }
   // Merge the drag/drop node refs with the row ref used for scroll-into-view.
   const setRowRef = useCallback(
     (node: HTMLLIElement | null) => {

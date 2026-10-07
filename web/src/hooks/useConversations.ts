@@ -1779,6 +1779,62 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
   };
 }
 
+// Apply a pin/unpin to every cache that renders the row. `labels` is the
+// authoritative label map to write; membership in the Pinned section is
+// driven by the PINNED_CONVERSATIONS_KEY cache, so that patch is what makes
+// the row visibly move.
+function patchPinnedCaches(
+  queryClient: QueryClient,
+  id: string,
+  labels: Record<string, string>,
+  pinned: boolean,
+  includeShared: boolean,
+  viewerId: string | null,
+) {
+  const existing = findCachedConversationRow(queryClient, id);
+  // The pin toggle only changes `labels`; overlay just that so it can't
+  // clobber other fields (e.g. blank `updated_at`) on the list rows.
+  const itemsById = new Map([[id, { id, labels } satisfies SessionListWireItem]]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    const { data: next } = mergeItemsIntoPages(
+      data,
+      itemsById,
+      filtersFromConversationQueryKey(key),
+      undefined,
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+    old ? { ...old, labels } : old,
+  );
+  queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
+  // Add the row on pin (its label carries the pin timestamp the sidebar sorts
+  // by) built from the existing row + labels; drop it on unpin.
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) => {
+    // Preserve the query's `filterHonored` flag; the toggle only mutates the
+    // list. If the query hasn't loaded yet, an optimistic patch implies the
+    // server can store pins, so treat it as honored.
+    const prev = old ?? { conversations: [], filterHonored: true };
+    const rest = prev.conversations.filter(
+      (c) => c.id !== id && (includeShared || sessionVisibility(c, viewerId) === "mine"),
+    );
+    if (!pinned) return { ...prev, conversations: rest };
+    // Prefer the full cached row (keeps title/updated_at); fall back to a
+    // minimal row when the session isn't in any loaded cache (rare — the pin
+    // affordance lives on a visible row). The pinned query refetch fills the
+    // rest in later.
+    const row: Conversation = existing
+      ? { ...existing, labels }
+      : ({ id, object: "conversation", labels } as Conversation);
+    if (!includeShared && (!existing || sessionVisibility(row, viewerId) !== "mine")) {
+      return { ...prev, conversations: rest };
+    }
+    return { ...prev, conversations: [...rest, row] };
+  });
+}
+
 /**
  * Pin / unpin a session via `PATCH /v1/sessions/{id}` (the `omnigent.pinned`
  * label). Overlays only the `labels` field onto cached rows and patches the
@@ -1827,54 +1883,8 @@ export function useTogglePinnedConversation() {
   const findRow = (id: string): Conversation | undefined =>
     findCachedConversationRow(queryClient, id);
 
-  // Apply a pin/unpin to every cache that renders the row. `labels` is the
-  // authoritative label map to write; membership in the Pinned section is
-  // driven by the PINNED_CONVERSATIONS_KEY cache, so that patch is what makes
-  // the row visibly move.
-  const patch = (id: string, labels: Record<string, string>, pinned: boolean) => {
-    const existing = findRow(id);
-    // The pin toggle only changes `labels`; overlay just that so it can't
-    // clobber other fields (e.g. blank `updated_at`) on the list rows.
-    const itemsById = new Map([[id, { id, labels } satisfies SessionListWireItem]]);
-    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-      queryKey: ["conversations"],
-    })) {
-      const { data: next } = mergeItemsIntoPages(
-        data,
-        itemsById,
-        filtersFromConversationQueryKey(key),
-        undefined,
-      );
-      if (next !== data) queryClient.setQueryData(key, next);
-    }
-    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-      old ? { ...old, labels } : old,
-    );
-    queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
-    // Add the row on pin (its label carries the pin timestamp the sidebar sorts
-    // by) built from the existing row + labels; drop it on unpin.
-    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) => {
-      // Preserve the query's `filterHonored` flag; the toggle only mutates the
-      // list. If the query hasn't loaded yet, an optimistic patch implies the
-      // server can store pins, so treat it as honored.
-      const prev = old ?? { conversations: [], filterHonored: true };
-      const rest = prev.conversations.filter(
-        (c) => c.id !== id && (includeShared || sessionVisibility(c, viewerId) === "mine"),
-      );
-      if (!pinned) return { ...prev, conversations: rest };
-      // Prefer the full cached row (keeps title/updated_at); fall back to a
-      // minimal row when the session isn't in any loaded cache (rare — the pin
-      // affordance lives on a visible row). The pinned query refetch fills the
-      // rest in later.
-      const row: Conversation = existing
-        ? { ...existing, labels }
-        : ({ id, object: "conversation", labels } as Conversation);
-      if (!includeShared && (!existing || sessionVisibility(row, viewerId) !== "mine")) {
-        return { ...prev, conversations: rest };
-      }
-      return { ...prev, conversations: [...rest, row] };
-    });
-  };
+  const patch = (id: string, labels: Record<string, string>, pinned: boolean) =>
+    patchPinnedCaches(queryClient, id, labels, pinned, includeShared, viewerId);
 
   return useMutation({
     // `pinnedAt` overrides the pin's sort value; the Pinned section's drag-to-reorder sets it.
@@ -1961,6 +1971,51 @@ export function useTogglePinnedConversation() {
         ? { ...base, ...(pinValue !== undefined ? { [PINNED_LABEL_KEY]: pinValue } : {}) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
       patch(updated.id, labels, pinned);
+    },
+  });
+}
+
+/**
+ * Rewrite the pin sort value of already-pinned sessions (drag-to-reorder in the
+ * Pinned section). One mutation for the whole batch, so the optimistic patch
+ * and its rollback share a single snapshot even when every pin is renumbered.
+ */
+export function useReorderPinnedConversations() {
+  const { pinsIncludeShared, sharedAvailable } = useContext(SidebarConfigContext);
+  const includeShared = pinsIncludeShared && sharedAvailable;
+  const viewerId = getCurrentUserId();
+  const queryClient = useQueryClient();
+  const apply = (id: string, pinnedAt: string) => {
+    const base = findCachedConversationRow(queryClient, id)?.labels ?? {};
+    patchPinnedCaches(
+      queryClient,
+      id,
+      { ...base, [PINNED_LABEL_KEY]: pinnedAt },
+      true,
+      includeShared,
+      viewerId,
+    );
+  };
+  return useMutation({
+    mutationFn: (writes: { id: string; pinnedAt: number }[]) =>
+      Promise.all(writes.map((w) => setConversationPinned(w.id, true, w.pinnedAt))),
+    onMutate: (writes) => {
+      const prevPinned =
+        queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+      for (const w of writes) apply(w.id, String(w.pinnedAt));
+      return { prevPinned };
+    },
+    onError: (_err, _writes, ctx) => {
+      if (ctx?.prevPinned !== undefined) {
+        queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, ctx.prevPinned);
+      }
+      showToast("Couldn't save the pinned order.");
+    },
+    onSuccess: (updated) => {
+      for (const row of updated) {
+        const value = row.labels[PINNED_LABEL_KEY];
+        if (value !== undefined) apply(row.id, value);
+      }
     },
   });
 }

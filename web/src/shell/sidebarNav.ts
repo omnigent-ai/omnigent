@@ -333,10 +333,11 @@ export interface PinOrderWrite {
 
 /**
  * The pin label writes that move `fromId` into `toId`'s slot of the (already
- * pin-ordered) Pinned list. The label value is the list's sort key, so a move
- * normally rewrites only the moved session, to a value between its new
- * neighbours. When there's no room between them (equal or missing values), every
- * pin is renumbered from the lowest existing value. Returns `[]` for a no-op.
+ * pin-ordered) Pinned list. A `fromId` that isn't pinned yet is inserted just
+ * above `toId`. The label value is the list's sort key, so a move normally
+ * rewrites only the moved session, to a value between its new neighbours. When
+ * there's no room between them (equal or missing values), every pin is
+ * renumbered from the lowest existing value. Returns `[]` for a no-op.
  */
 export function pinOrderWrites(
   pinned: readonly Conversation[],
@@ -345,15 +346,16 @@ export function pinOrderWrites(
 ): PinOrderWrite[] {
   const from = pinned.findIndex((c) => c.id === fromId);
   const to = pinned.findIndex((c) => c.id === toId);
-  if (from < 0 || to < 0 || from === to) return [];
+  if (to < 0 || from === to) return [];
   const moved = [...pinned];
-  const [row] = moved.splice(from, 1);
+  const [row] = from < 0 ? [{ id: fromId } as Conversation] : moved.splice(from, 1);
   moved.splice(to, 0, row);
   const value = (c: Conversation | undefined): number => Number(c?.labels?.[PINNED_LABEL_KEY]);
   const prev = value(moved[to - 1]);
   const next = value(moved[to + 1]);
-  const pinnedAt =
-    to === 0 ? next - 1 : to === moved.length - 1 ? prev + 1 : prev + (next - prev) / 2;
+  let pinnedAt = prev + (next - prev) / 2;
+  if (to === 0) pinnedAt = next - 1;
+  else if (to === moved.length - 1) pinnedAt = prev + 1;
   if (
     Number.isFinite(pinnedAt) &&
     (to === 0 || pinnedAt > prev) &&
@@ -403,7 +405,7 @@ export type SidebarDropTarget =
 export type SidebarDropAction =
   | { kind: "move"; project: string; unpin: boolean }
   | { kind: "ungroup"; project: string; unpin: boolean }
-  | { kind: "pin" }
+  | { kind: "pin"; targetId?: string }
   | { kind: "unpin" }
   | { kind: "reorder-pin"; targetId: string }
   | { kind: "none" };
@@ -421,7 +423,8 @@ export type SidebarDropAction =
  * - Dropped on the ungroup zone while unfiled → `unpin` if pinned, else `none`.
  * - Dropped on the pin zone while not already pinned → `pin`.
  * - Dropped on the pin zone while already pinned → `none`.
- * - Dropped on another pinned row while pinned → `reorder-pin`; while unpinned → `pin`.
+ * - Dropped on another pinned row while pinned → `reorder-pin`; while unpinned →
+ *   `pin` with that row as `targetId`, so it's pinned into that slot.
  * - Dropped on nothing → `none`.
  */
 export function resolveSidebarDrop(
@@ -442,7 +445,7 @@ export function resolveSidebarDrop(
     return source.isPinned ? { kind: "none" } : { kind: "pin" };
   }
   if (target.type === "pin-order") {
-    if (!source.isPinned) return { kind: "pin" };
+    if (!source.isPinned) return { kind: "pin", targetId: target.id };
     return target.id === source.id
       ? { kind: "none" }
       : { kind: "reorder-pin", targetId: target.id };

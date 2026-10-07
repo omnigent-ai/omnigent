@@ -233,6 +233,15 @@ describe("pinOrderWrites", () => {
     ]);
   });
 
+  it("inserts a not-yet-pinned session above the row it's dropped on", () => {
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_1")).toEqual([
+      { id: "new", pinnedAt: 1500 },
+    ]);
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_0")).toEqual([
+      { id: "new", pinnedAt: 999 },
+    ]);
+  });
+
   it("is a no-op for a drop on itself or an unknown row", () => {
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "conv_0")).toEqual([]);
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "missing")).toEqual([]);
@@ -628,7 +637,10 @@ describe("resolveSidebarDrop", () => {
   });
 
   it("pins an unpinned session dropped on a pinned row", () => {
-    expect(resolveSidebarDrop(src(), { type: "pin-order", id: "c2" })).toEqual({ kind: "pin" });
+    expect(resolveSidebarDrop(src(), { type: "pin-order", id: "c2" })).toEqual({
+      kind: "pin",
+      targetId: "c2",
+    });
   });
 
   it("is a no-op when dropped on nothing droppable (e.g. Shared with me)", () => {
