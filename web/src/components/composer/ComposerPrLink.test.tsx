@@ -64,7 +64,7 @@ describe("ComposerPrLink", () => {
     expect(screen.getByTestId("composer-pr-loading")).toHaveTextContent("Checking PR…");
     rerender(<ComposerPrLink state="unknown" prCount={1} prNumber={42} onOpen={() => {}} />);
     expect(screen.getByTestId("composer-pr-unknown")).toHaveTextContent("PR unavailable");
-    expect(screen.queryByText("#null")).toBeNull();
+    expect(screen.queryByTestId("composer-pr-link")).toBeNull();
   });
 
   it("falls back to a safe singular label when the association number is missing", () => {
