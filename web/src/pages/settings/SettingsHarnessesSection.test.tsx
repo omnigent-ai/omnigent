@@ -716,6 +716,10 @@ it("probes only the expanded server, showing its tools, count and status", () =>
   expect(mcpLookups).toContainEqual([ONLINE.host_id, "claude", "linear", "toolkit", true]);
   expect(mcpLookups.some((lookup) => lookup[2] === "github" && lookup[4])).toBe(false);
   expect(screen.getByText("read_docs")).toBeTruthy();
+  const toolDetails = screen.getByText("Read documentation").closest("details")!;
+  expect(toolDetails.open).toBe(false);
+  fireEvent.click(screen.getByText("read_docs"));
+  expect(toolDetails.open).toBe(true);
   expect(screen.getByText("· 1 tool")).toBeTruthy();
   expect(screen.getByRole("status").textContent).toBe("Connected");
   expect(screen.getByRole("status").firstElementChild).toHaveClass("bg-success");
