@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from pydantic import TypeAdapter
 
 from omnigent.runner import create_runner_app
+from omnigent.runner.app import _is_context_overflow_error
 from omnigent.server.schemas import FailedEvent, ServerStreamEvent
 from omnigent.spec.types import AgentSpec
 from tests.runner.conftest import (
@@ -200,6 +201,38 @@ async def test_content_length_cap_failure_is_normalized_to_context_overflow() ->
     error = await _assert_failure_on_both_streams(app, source="llm")
     assert error["code"] == "context_length_exceeded"
     assert error["type"] == "_ContextWindowOverflow"
-    # Byte sizes are expressed as approximate tokens; actual must stay
-    # above max (the generic numeric fallback would invert them).
-    assert f"{33967957 // 4} tokens > {33554432 // 4} max" in error["message"]
+    # The raw rejection — including its RequestSize/Limit bytes — survives
+    # normalization rather than being replaced by a token-count approximation,
+    # so the expandable detail still names the real cause.
+    # (_assert_failure_on_both_streams already checks the direct and queued
+    # failures are identical, so this retention holds on both streams.)
+    assert "exceeds maximum allowed content length" in error["message"]
+    assert "RequestSize(bytes): 33967957" in error["message"]
+    assert "Limit(bytes): 33554432" in error["message"]
+
+
+def _overflow_event(message: str) -> dict[str, Any]:
+    return {"type": "response.failed", "error": {"message": message}}
+
+
+def test_byte_cap_rejection_classifies_as_overflow_without_inversion() -> None:
+    """A byte-cap rejection reads actual > max despite reporting bytes."""
+    overflow = _is_context_overflow_error(
+        _overflow_event(
+            "Server received a request which exceeds maximum allowed content "
+            "length. RequestSize(bytes): 33967957, Limit(bytes): 33554432"
+        )
+    )
+    assert overflow is not None
+    max_tokens, actual_tokens = overflow
+    assert actual_tokens > max_tokens
+
+
+def test_content_length_phrase_without_sizes_is_not_overflow() -> None:
+    """A size-less content-length phrase stays generic, like the native path."""
+    assert (
+        _is_context_overflow_error(
+            _overflow_event("request exceeds maximum allowed content length")
+        )
+        is None
+    )

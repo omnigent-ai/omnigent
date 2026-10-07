@@ -697,11 +697,21 @@ class _ContextWindowOverflow(Exception):
 
     :param max_tokens: The model's context window.
     :param actual_tokens: The prompt size that overflowed.
+    :param detail_message: Original rejection text to surface verbatim in the
+        error detail (e.g. a deployment byte-cap message carrying its byte
+        sizes), kept instead of the token-count approximation when present.
     """
 
-    def __init__(self, max_tokens: int, actual_tokens: int) -> None:
+    def __init__(
+        self,
+        max_tokens: int,
+        actual_tokens: int,
+        *,
+        detail_message: str | None = None,
+    ) -> None:
         self.max_tokens = max_tokens
         self.actual_tokens = actual_tokens
+        self.detail_message = detail_message
         super().__init__(f"context window exceeded: {actual_tokens} > {max_tokens}")
 
 
@@ -710,9 +720,6 @@ _CONTEXT_OVERFLOW_PATTERNS = (
     "context window",
     "maximum context length",
     "prompt is too long",
-    # Deployment byte cap (e.g. the Databricks Apps front door) rejected a
-    # request carrying an oversized transcript before the model saw it.
-    "exceeds maximum allowed content length",
 )
 
 
@@ -727,14 +734,16 @@ def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
         return None
     error = cast(_JsonObject, event.get("error", {}))
     msg = str(error.get("message", "")).lower()
-    if not any(pat in msg for pat in _CONTEXT_OVERFLOW_PATTERNS):
-        return None
-    # Content-length cap rejections report bytes (request first, limit
-    # second) — parse them specifically so the generic numeric fallback
-    # below doesn't invert them, and express them as approximate tokens.
+    # A deployment byte-cap rejection (e.g. the Databricks Apps front door)
+    # reports bytes (request first, limit second). Parse them specifically,
+    # ahead of the generic pattern gate, so the request/limit pair isn't
+    # inverted by the numeric fallback below and a size-less content-length
+    # phrase stays generic like the native classifier. Express them as tokens.
     size_overflow = detect_request_size_overflow(msg)
     if size_overflow is not None:
         return size_overflow.approx_limit_tokens, size_overflow.approx_request_tokens
+    if not any(pat in msg for pat in _CONTEXT_OVERFLOW_PATTERNS):
+        return None
     actual_gt_max = re.search(r"(\d{4,})\D*>\D*(\d{4,})", msg)
     if actual_gt_max is not None:
         return int(actual_gt_max.group(2)), int(actual_gt_max.group(1))
@@ -5699,7 +5708,19 @@ def create_runner_app(
 
                                 _overflow = _is_context_overflow_error(event)
                                 if _overflow is not None:
-                                    raise _ContextWindowOverflow(*_overflow)
+                                    _ov_error = cast(_JsonObject, event.get("error", {}))
+                                    _ov_raw = str(_ov_error.get("message", ""))
+                                    # Keep a byte-cap's raw rejection text (with
+                                    # its RequestSize/Limit bytes) for the error
+                                    # detail; a token-shaped overflow has none.
+                                    _ov_detail = (
+                                        _ov_raw
+                                        if detect_request_size_overflow(_ov_raw)
+                                        else None
+                                    )
+                                    raise _ContextWindowOverflow(
+                                        *_overflow, detail_message=_ov_detail
+                                    )
 
                                 _evt_type = event.get("type")
                                 if (
@@ -6039,7 +6060,8 @@ def create_runner_app(
             except _ContextWindowOverflow as overflow:
                 _error = {
                     "code": "context_length_exceeded",
-                    "message": (
+                    "message": overflow.detail_message
+                    or (
                         f"Context window exceeded: {overflow.actual_tokens} tokens "
                         f"> {overflow.max_tokens} max"
                     ),
