@@ -51,12 +51,10 @@ def _families(stack: str) -> list[str]:
 
 
 def test_github_diff_text_tracks_interface_font_size(
-    request: pytest.FixtureRequest,
+    page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
     base_url, session_id = seeded_session
-    page: Page = request.getfixturevalue("page")
-    page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
     _stub_github(page)
 
     page.goto(f"{base_url}/c/{session_id}")
