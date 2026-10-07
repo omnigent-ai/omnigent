@@ -550,30 +550,86 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     }
   });
 
-  it("bounds cumulative colour-variant expansion before cloning meshes", () => {
-    const count = 35;
+  it("keeps original nested component links when moved IDs collide with source meshes", () => {
     const input = archive({
       "3D/root.model": model(
-        mesh(1).replace(
-          "<mesh>",
-          `<metadata name="large">${"x".repeat(1024 * 1024)}</metadata><mesh>`,
-        ) +
-          Array.from({ length: count }, (_, index) => composite(100 + index, component(1))).join(
-            "",
-          ),
-        Array.from(
-          { length: count },
-          (_, index) => `<item objectid="${100 + index}" transform="${transform(index * 10)}"/>`,
-        ).join(""),
+        mesh(1) +
+          mesh(2, 5) +
+          composite(10, component(1)) +
+          composite(100, component(10)) +
+          composite(200, component(10, 20)),
+        '<item objectid="100"/><item objectid="200"/>',
       ),
-      "Metadata/model_settings.config": `<config>${Array.from({ length: count }, (_, index) => config(part(1, index + 1), undefined, 100 + index)).join("")}</config>`,
-      "Metadata/project_settings.config": JSON.stringify({
-        filament_colour: Array.from(
-          { length: count },
-          (_, index) => `#${(index + 1).toString(16).padStart(6, "0")}`,
-        ),
-      }),
+      "Metadata/model_settings.config": `<config>${config(part(10, 1), undefined, 100)}${config(part(10, 2), undefined, 200)}</config>`,
     });
+    check(input, ["f53b9d", "4dc5a0"], [0, 20], [1, 1]);
+  });
+
+  it("bounds inherited namespace expansion before standalone subtree serialization", () => {
+    const namespace = `urn:${"x".repeat(8192)}`;
+    const fixture = (count: number) =>
+      archive({
+        "3D/root.model": model(
+          mesh(1).replace(
+            "</vertices>",
+            `${'<vertex x="0" y="0" z="0" x:note="a"/>'.repeat(count)}</vertices>`,
+          ) +
+            mesh(2, 2) +
+            composite(100, component(1) + component(2, 10)),
+        ).replace("<model ", `<model xmlns:x="${namespace}" `),
+      });
+    const admitted = fixture(2);
+    expect(applyThreeMfColors(admitted)).not.toBe(admitted);
+    check(admitted);
+    const input = fixture(180);
+    const selected = Object.values(unzipSync(new Uint8Array(input))).reduce(
+      (total, entry) => total + entry.byteLength,
+      0,
+    );
+    const budget = selected * 2 + 1024 * 1024;
+    const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+    try {
+      expect(applyThreeMfColors(input)).toBe(input);
+      for (const result of serializer.mock.results) {
+        expect(strToU8(String(result.value)).byteLength).toBeLessThanOrEqual(budget);
+      }
+    } finally {
+      serializer.mockRestore();
+    }
+    check(input, ["ffffff", "ffffff"]);
+  });
+
+  it("bounds cumulative colour-variant expansion before cloning meshes", () => {
+    const count = 35;
+    const fixture = (payload: string) =>
+      archive({
+        "3D/root.model": model(
+          mesh(1).replace("<mesh>", `<metadata name="large">${payload}</metadata><mesh>`) +
+            Array.from({ length: count }, (_, index) => composite(100 + index, component(1))).join(
+              "",
+            ),
+          Array.from(
+            { length: count },
+            (_, index) => `<item objectid="${100 + index}" transform="${transform(index * 10)}"/>`,
+          ).join(""),
+        ),
+        "Metadata/model_settings.config": `<config>${Array.from({ length: count }, (_, index) => config(part(1, index + 1), undefined, 100 + index)).join("")}</config>`,
+        "Metadata/project_settings.config": JSON.stringify({
+          filament_colour: Array.from(
+            { length: count },
+            (_, index) => `#${(index + 1).toString(16).padStart(6, "0")}`,
+          ),
+        }),
+      });
+    const admitted = fixture("x".repeat(1024));
+    expect(applyThreeMfColors(admitted)).not.toBe(admitted);
+    check(
+      admitted,
+      Array.from({ length: count }, (_, index) => (index + 1).toString(16).padStart(6, "0")),
+      Array.from({ length: count }, (_, index) => index * 10),
+      Array.from({ length: count }, () => 1),
+    );
+    const input = fixture("x".repeat(1024 * 1024));
     const importer = vi.spyOn(Document.prototype, "importNode");
     try {
       expect(applyThreeMfColors(input) === input).toBe(true);
@@ -593,6 +649,14 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
   });
 
   it("rejects multibyte mesh variants before importing beyond the UTF-8 byte budget", () => {
+    const admitted = multibyteVariants("漢".repeat(32));
+    expect(applyThreeMfColors(admitted)).not.toBe(admitted);
+    check(
+      admitted,
+      ["112233", "223344", "334455", "445566", "556677", "667788"],
+      [0, 10, 20, 30, 40, 50],
+      Array(6).fill(1),
+    );
     const input = multibyteVariants("漢".repeat(150_000));
     const importer = vi.spyOn(Document.prototype, "importNode");
     try {
