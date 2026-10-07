@@ -882,10 +882,9 @@ aside[aria-label="Workspace"][data-maximized] {
   .workspace-tab-strip {
   padding-left: 10.5rem;
 }
-/* Drag regions are geometric, not z-ordered: anything that overlaps the
- * strip (e.g. the mobile full-screen sidebar overlay) would lose clicks
- * without an explicit counter-region on interactive elements. */
-[data-electron-mac]
+/* Drag regions ignore z-order, so controls and overlays need counter-regions.
+ * Scope through html to cover portals outside AppShell on macOS only. */
+html:has([data-electron-mac])
   :is(
     a,
     button,
@@ -913,9 +912,12 @@ aside[aria-label="Workspace"][data-maximized] {
     [role="textbox"],
     [role="searchbox"],
     [role="spinbutton"],
-    [contenteditable=""],
-    [contenteditable="plaintext-only"],
-    [contenteditable="true"]
+    [role="menu"],
+    [role="dialog"],
+    [role="tooltip"],
+    [contenteditable="" i],
+    [contenteditable="plaintext-only" i],
+    [contenteditable="true" i]
   ) {
   -webkit-app-region: no-drag;
 }

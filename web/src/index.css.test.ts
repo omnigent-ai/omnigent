@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 // (resolved from its dependency tree, so we test the version the build uses).
 import { transform } from "lightningcss";
 import { type ComponentProps, createElement } from "react";
+import { createPortal } from "react-dom";
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -964,13 +965,17 @@ describe("index.css electron-mac window drag region", () => {
     .map(([block]) => block)
     .find(
       (block) =>
-        selectorOf(block).replace(/\s+/g, " ").startsWith("[data-electron-mac] :is(") &&
+        selectorOf(block).replace(/\s+/g, " ").startsWith("html:has([data-electron-mac]) :is(") &&
         block.includes("-webkit-app-region: no-drag"),
     );
+  let dragSelector: string;
+  let controlsSelector: string;
 
   beforeAll(() => {
     expect(dragRule, "expected the macOS window drag-strip rule").toBeDefined();
     expect(controlsRule, "expected the macOS interactive-control exclusions").toBeDefined();
+    dragSelector = selectorOf(dragRule!);
+    controlsSelector = selectorOf(controlsRule!);
   });
 
   afterEach(cleanup);
@@ -1009,6 +1014,9 @@ describe("index.css electron-mac window drag region", () => {
     ["div", { role: "textbox" }],
     ["div", { role: "searchbox" }],
     ["div", { role: "spinbutton" }],
+    ["div", { role: "menu" }],
+    ["div", { role: "dialog" }],
+    ["div", { role: "tooltip" }],
     ["div", { contentEditable: true }],
   ])("keeps %s %j interactive inside the drag band", (tag, props) => {
     const { container } = render(
@@ -1016,19 +1024,38 @@ describe("index.css electron-mac window drag region", () => {
     );
     const shell = container.firstElementChild!;
     const control = shell.firstElementChild!;
-    expect(control.matches(selectorOf(controlsRule ?? ""))).toBe(true);
+    expect(control.matches(controlsSelector)).toBe(true);
     expect(controlsRule).toContain("-webkit-app-region: no-drag");
     shell.removeAttribute("data-electron-mac");
-    expect(control.matches(selectorOf(controlsRule ?? ""))).toBe(false);
+    expect(control.matches(controlsSelector)).toBe(false);
   });
 
-  it.each(["", "plaintext-only"])("excludes contenteditable=%j from dragging", (value) => {
-    const { container } = render(
-      createElement("div", { "data-electron-mac": "true" }, createElement("div")),
+  it.each(["", "plaintext-only", "TRUE", "True", "PLAINTEXT-ONLY", "PlainText-Only"])(
+    "excludes contenteditable=%j from dragging",
+    (value) => {
+      const { container } = render(
+        createElement("div", { "data-electron-mac": "true" }, createElement("div")),
+      );
+      const control = container.firstElementChild!.firstElementChild!;
+      control.setAttribute("contenteditable", value);
+      expect(control.matches(controlsSelector)).toBe(true);
+    },
+  );
+
+  it.each(["menu", "dialog", "tooltip"])("excludes portaled %s containers", (role) => {
+    const { container, getByRole } = render(
+      createElement(
+        "div",
+        { "data-electron-mac": "true" },
+        createPortal(createElement("div", { role }), document.body),
+      ),
     );
-    const control = container.firstElementChild!.firstElementChild!;
-    control.setAttribute("contenteditable", value);
-    expect(control.matches(selectorOf(controlsRule ?? ""))).toBe(true);
+    const shell = container.firstElementChild!;
+    const overlay = getByRole(role);
+    expect(shell.contains(overlay)).toBe(false);
+    expect(overlay.matches(controlsSelector)).toBe(true);
+    shell.removeAttribute("data-electron-mac");
+    expect(overlay.matches(controlsSelector)).toBe(false);
   });
 
   it("keeps unfocusable and noneditable content draggable unless explicitly opted out", () => {
@@ -1041,10 +1068,10 @@ describe("index.css electron-mac window drag region", () => {
       ),
     );
     const shell = container.firstElementChild!;
-    expect(shell.firstElementChild!.matches(selectorOf(controlsRule ?? ""))).toBe(false);
-    expect(shell.lastElementChild!.matches(selectorOf(controlsRule ?? ""))).toBe(false);
+    expect(shell.firstElementChild!.matches(controlsSelector)).toBe(false);
+    expect(shell.lastElementChild!.matches(controlsSelector)).toBe(false);
     shell.firstElementChild!.classList.add("no-drag");
-    expect(shell.firstElementChild!.matches(selectorOf(controlsRule ?? ""))).toBe(true);
+    expect(shell.firstElementChild!.matches(controlsSelector)).toBe(true);
   });
 
   it("leaves noninteractive title-bar space draggable and other platforms unchanged", () => {
@@ -1058,10 +1085,10 @@ describe("index.css electron-mac window drag region", () => {
     );
     const shell = container.firstElementChild!;
     const strip = shell.firstElementChild!;
-    expect(strip.matches(selectorOf(dragRule ?? ""))).toBe(true);
-    expect(shell.lastElementChild!.matches(selectorOf(controlsRule ?? ""))).toBe(false);
+    expect(strip.matches(dragSelector)).toBe(true);
+    expect(shell.lastElementChild!.matches(controlsSelector)).toBe(false);
     shell.removeAttribute("data-electron-mac");
-    expect(strip.matches(selectorOf(dragRule ?? ""))).toBe(false);
+    expect(strip.matches(dragSelector)).toBe(false);
   });
 });
 
