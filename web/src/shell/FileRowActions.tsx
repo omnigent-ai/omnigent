@@ -133,13 +133,6 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
     },
   });
 
-  const renderItems = () =>
-    items.map(({ label, icon: Icon, onSelect }) => (
-      <ContextMenuItem key={label} onSelect={onSelect}>
-        <Icon className="size-4" />
-        {label}
-      </ContextMenuItem>
-    ));
   const restoreFocusAfterMenuClose = (event: Event) => {
     event.preventDefault();
     if (infoOpenedRef.current) {
@@ -168,11 +161,8 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
             canReceiveFocus(active)
               ? active
               : null);
-          focusReturnRef.current = target
-            ? target
-            : canReceiveFocus(rowRef.current)
-              ? rowRef.current
-              : primaryActionRef.current;
+          focusReturnRef.current =
+            target ?? (canReceiveFocus(rowRef.current) ? rowRef.current : primaryActionRef.current);
           contextFocusRef.current = null;
         }
       }}
@@ -210,7 +200,12 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
         onEscapeKeyDown={(event) => event.stopPropagation()}
         onCloseAutoFocus={restoreFocusAfterMenuClose}
       >
-        {renderItems()}
+        {items.map(({ label, icon: Icon, onSelect }) => (
+          <ContextMenuItem key={label} onSelect={onSelect}>
+            <Icon className="size-4" />
+            {label}
+          </ContextMenuItem>
+        ))}
       </ContextMenuContent>
     </ContextMenu>
   );
