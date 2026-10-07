@@ -5,7 +5,7 @@
  * server, make sure the user's Arca instance is connected to it as a host by
  * running the same idempotent `arca ssh … isaac omni host --background` as the
  * manual "Run on Arca" item — without the consent console, at most once per
- * server origin per app launch.
+ * server target (including the workspace selector) per app launch.
  *
  * The command exits once the remote daemon is up (or reports it was already
  * running), and the daemon then keeps its own outbound tunnel, so nothing here
@@ -16,6 +16,8 @@
  * Electron-free: every dependency is injected so the state machine is
  * unit-testable.
  */
+
+const { normalizeServerUrl } = require("./omnigent_cli");
 
 /** Keep the tail of the command output for failure diagnostics. */
 const OUTPUT_TAIL_CHARS = 8000;
@@ -39,7 +41,7 @@ const OUTPUT_TAIL_CHARS = 8000;
  *   startConnect: (serverUrl: string, onOutput: (text: string) => void) =>
  *     ReturnType<typeof import("./arca").startArcaConnect>,
  *   commandLine: (serverUrl: string) => string | null,
- *   onStatus?: (origin: string, status: ArcaStatus) => void,
+ *   onStatus?: (target: string, status: ArcaStatus) => void,
  *   now?: () => number,
  *   log?: (message: string) => void,
  * }} deps
@@ -53,11 +55,11 @@ function createArcaAutoConnect({
   log = () => {},
 }) {
   /** @type {Map<string, { status: ArcaStatus, run: Promise<ArcaStatus> | null }>} */
-  const byOrigin = new Map();
+  const byTarget = new Map();
 
-  function originOf(serverUrl) {
+  function targetOf(serverUrl) {
     try {
-      return new URL(serverUrl).origin;
+      return normalizeServerUrl(new URL(serverUrl).href);
     } catch {
       return null;
     }
@@ -68,11 +70,11 @@ function createArcaAutoConnect({
     return { state: "idle", command: commandLine(serverUrl) };
   }
 
-  function publish(origin, status) {
-    const entry = byOrigin.get(origin) ?? { status, run: null };
+  function publish(target, status) {
+    const entry = byTarget.get(target) ?? { status, run: null };
     entry.status = status;
-    byOrigin.set(origin, entry);
-    onStatus(origin, status);
+    byTarget.set(target, entry);
+    onStatus(target, status);
     return status;
   }
 
@@ -85,16 +87,16 @@ function createArcaAutoConnect({
    * @returns {ArcaStatus}
    */
   function getStatus(serverUrl) {
-    const origin = serverUrl ? originOf(serverUrl) : null;
-    if (!origin) return { state: "unavailable", command: null };
+    const target = serverUrl ? targetOf(serverUrl) : null;
+    if (!target) return { state: "unavailable", command: null };
     const base = baseStatus(serverUrl);
     if (base.state === "unavailable") return base;
-    const entry = byOrigin.get(origin);
+    const entry = byTarget.get(target);
     if (!entry) return base;
     return entry.status;
   }
 
-  function runConnect(serverUrl, origin, onOutput) {
+  function runConnect(serverUrl, target, onOutput) {
     const command = commandLine(serverUrl);
     let output = "";
     const status = {
@@ -102,11 +104,11 @@ function createArcaAutoConnect({
       command,
       startedAt: now(),
     };
-    publish(origin, status);
-    log(`arca auto-connect: running against ${origin}`);
+    publish(target, status);
+    log(`arca auto-connect: running against ${target}`);
     const connect = startConnect(serverUrl, (text) => {
       output = (output + text).slice(-OUTPUT_TAIL_CHARS);
-      const entry = byOrigin.get(origin);
+      const entry = byTarget.get(target);
       if (entry?.status.state === "starting") entry.status = { ...entry.status, output };
       // After the shared bookkeeping, so a throwing caller can't skip it.
       onOutput?.(text);
@@ -125,17 +127,17 @@ function createArcaAutoConnect({
             output,
           };
       log(`arca auto-connect: ${next.state}${next.errorKind ? ` (${next.errorKind})` : ""}`);
-      const entry = byOrigin.get(origin);
+      const entry = byTarget.get(target);
       if (entry) entry.run = null;
-      return publish(origin, next);
+      return publish(target, next);
     });
-    byOrigin.get(origin).run = run;
+    byTarget.get(target).run = run;
     return run;
   }
 
   /**
    * Launch-time entry point: connect Arca for `serverUrl` unless it isn't
-   * eligible or already ran for this origin this launch. A
+   * eligible or already ran for this target this launch. A
    * second window or a reload shares the in-flight run.
    *
    * @param {string | null | undefined} serverUrl
@@ -146,10 +148,10 @@ function createArcaAutoConnect({
   function ensure(serverUrl, onOutput) {
     const current = getStatus(serverUrl);
     if (current.state !== "idle") {
-      const entry = byOrigin.get(originOf(serverUrl));
+      const entry = byTarget.get(targetOf(serverUrl));
       return entry?.run ?? Promise.resolve(current);
     }
-    return runConnect(serverUrl, originOf(serverUrl), onOutput);
+    return runConnect(serverUrl, targetOf(serverUrl), onOutput);
   }
 
   /**
@@ -165,7 +167,7 @@ function createArcaAutoConnect({
     if (running) return running;
     const current = getStatus(serverUrl);
     if (current.state !== "failed") return Promise.resolve(current);
-    return runConnect(serverUrl, originOf(serverUrl), onOutput);
+    return runConnect(serverUrl, targetOf(serverUrl), onOutput);
   }
 
   /**
@@ -176,8 +178,8 @@ function createArcaAutoConnect({
    * @returns {Promise<ArcaStatus> | null}
    */
   function inFlight(serverUrl) {
-    const origin = serverUrl ? originOf(serverUrl) : null;
-    return (origin && byOrigin.get(origin)?.run) || null;
+    const target = serverUrl ? targetOf(serverUrl) : null;
+    return (target && byTarget.get(target)?.run) || null;
   }
 
   return { ensure, retry, getStatus, inFlight };

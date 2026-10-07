@@ -70,19 +70,19 @@ describe("ImportReviewGate", () => {
     serve([host("a")], { a: ["review"] });
     renderWithClient(<ImportReviewGate />);
 
-    expect(await screen.findByText("Your imports are ready")).toBeTruthy();
+    expect(await screen.findByText("Your setup is ready")).toBeTruthy();
     expect(screen.getByText("/review")).toBeTruthy();
     // A single host isn't named.
     expect(screen.queryByText(/on a-machine/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
 
-    await waitFor(() => expect(screen.queryByText("Your imports are ready")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("Your setup is ready")).toBeNull());
     expect(window.localStorage.getItem("omnigent:imports-reviewed:a")).not.toBeNull();
 
     cleanup();
     renderWithClient(<ImportReviewGate />);
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalled());
-    expect(screen.queryByText("Your imports are ready")).toBeNull();
+    expect(screen.queryByText("Your setup is ready")).toBeNull();
   });
 
   it("skips offline, reviewed, and empty hosts, and names the host among several", async () => {
@@ -96,7 +96,7 @@ describe("ImportReviewGate", () => {
     expect(await screen.findByText(/Found in your harnesses on fresh-machine\./)).toBeTruthy();
     expect(screen.getByText("/c")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    await waitFor(() => expect(screen.queryByText("Your imports are ready")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("Your setup is ready")).toBeNull());
     expect(window.localStorage.getItem("omnigent:imports-reviewed:fresh")).not.toBeNull();
     expect(window.localStorage.getItem("omnigent:imports-reviewed:empty")).toBeNull();
   });

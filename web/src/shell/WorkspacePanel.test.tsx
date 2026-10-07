@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -57,6 +57,14 @@ vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+// A side chat's pane is covered by its own suite; the stub just names its child.
+vi.mock("@/components/chat/SideChatPane", () => ({
+  SideChatPane: ({ childId }: { childId: string }) => (
+    <div data-testid="side-chat-pane-stub">{childId}</div>
+  ),
+}));
+const isMobileMock = vi.hoisted(() => vi.fn(() => false));
+vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => isMobileMock() }));
 
 const useTerminalsMock = vi.mocked(useTerminals);
 const useCreateTerminalMock = vi.mocked(useCreateTerminal);
@@ -66,6 +74,7 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   vi.clearAllMocks();
+  isMobileMock.mockReturnValue(false);
   Reflect.deleteProperty(window, "omnigentDesktop");
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
@@ -100,6 +109,7 @@ function renderWorkspace(
     animateVisibility?: boolean;
     resizing?: boolean;
     inert?: boolean;
+    mobileSideChatsOpen?: boolean;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -109,6 +119,7 @@ function renderWorkspace(
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
+  const onMobileSideChatsOpenChange = vi.fn();
   const view = render(
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
@@ -154,6 +165,8 @@ function renderWorkspace(
         onShowHiddenChange={vi.fn()}
         liveness={overrides.liveness}
         pending={overrides.pending}
+        mobileSideChatsOpen={overrides.mobileSideChatsOpen}
+        onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
       />
     </TooltipProvider>,
   );
@@ -165,6 +178,7 @@ function renderWorkspace(
     openTerminalTab,
     onCloseTerminal,
     onToggleMaximized,
+    onMobileSideChatsOpenChange,
     view,
   };
 }
@@ -998,5 +1012,55 @@ describe("WorkspacePanel browser tab", () => {
     await waitFor(() =>
       expect(toast.error).toHaveBeenCalledWith("Couldn't close browser tab. Try again."),
     );
+  });
+});
+
+describe("WorkspacePanel mobile side chats", () => {
+  const openTabs = () =>
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_a", "conv_side_b"],
+      selectedSideChatId: "conv_side_b",
+    });
+
+  it("shows the selected side chat in the drawer, not the hidden rail", () => {
+    isMobileMock.mockReturnValue(true);
+    openTabs();
+    const { onMobileSideChatsOpenChange } = renderWorkspace({
+      rightRailTab: "sidechat",
+      mobileSideChatsOpen: true,
+    });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(screen.getAllByTestId("side-chat-pane-stub").map((el) => el.textContent)).toEqual([
+      "conv_side_b",
+    ]);
+    expect(drawer).toContainElement(screen.getByTestId("side-chat-pane-stub"));
+
+    fireEvent.click(within(drawer).getByRole("tab", { name: "Side chat 1" }));
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a");
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    expect(onMobileSideChatsOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps the side chat mounted while the drawer is closed", () => {
+    // Dismissing the drawer must not unmount the pane: a seeded `/side`
+    // question still waiting on the child's agent binding has to go out, and
+    // unsent composer text has to survive — as behind a collapsed desktop rail.
+    isMobileMock.mockReturnValue(true);
+    openTabs();
+    renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: false });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+  });
+
+  it("keeps the side chat in the rail on desktop", () => {
+    openTabs();
+    renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+
+    expect(screen.queryByTestId("side-chats-panel-drawer")).toBeNull();
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
   });
 });

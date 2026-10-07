@@ -148,7 +148,11 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
         body_str, encoding = encode_body(body, content_type) if body else (None, "utf-8")
 
         try:
-            state = self._registry.open_request(self._runner_id, req_id)
+            state = self._registry.open_request(
+                self._runner_id,
+                req_id,
+                generation=request.extensions.get("runner_tunnel_generation"),
+            )
         except KeyError as exc:
             raise httpx.ConnectError(f"runner {self._runner_id!r} is offline") from exc
         try:

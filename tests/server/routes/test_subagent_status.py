@@ -22,7 +22,7 @@ from omnigent.server import session_live_state, session_metadata_logging
 from omnigent.server.routes import sessions
 from omnigent.server.routes._sessions import common
 from omnigent.server.routes.sessions import routes_events
-from omnigent.server.schemas import BackgroundTaskInfo
+from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
@@ -239,6 +239,59 @@ async def test_subagent_idle_publishes_status_without_completion(
         assert len(events) == 1
     assert route.forwarded == []
     route.telemetry.assert_not_called()
+
+
+@pytest.mark.parametrize("fail_idle_top_level", [False, True])
+async def test_offline_sweep_refreshes_child_status_after_idle_observation(
+    status_route: _StatusRoute, fail_idle_top_level: bool
+) -> None:
+    route = status_route
+    snapshot = route.store.get_conversation(route.child_id)
+    assert snapshot is not None and snapshot.live_status == "running"
+
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={"type": "subagent.status", "data": {"idle": True}},
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    # Another replica's sweep has an older row and no local turn edges.
+    common._session_status_cache.pop(route.child_id)
+    route.published.reset_mock()
+
+    with capture_debug_rows("server") as rows:
+        await sessions._mark_runner_sessions_offline(
+            [snapshot],
+            ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly."),
+            route.store,
+            fail_idle_top_level=fail_idle_top_level,
+        )
+        await _flush_live_state()
+
+    child = route.store.get_conversation(route.child_id)
+    assert child is not None and child.live_status == "idle"
+    assert sessions._last_task_error_from_labels(child.labels) is None
+    assert route.store.list_items(route.parent_id).data == []
+    route.published.assert_not_called()
+    assert route.forwarded == []
+
+    decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+    assert decision["session_id"] == route.child_id
+    assert decision["level"] == "WARNING"
+    assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+    assert (
+        decision["attributes"].items()
+        >= {
+            "origin": "runner_offline_sweep",
+            "decision": "idle_no_failure",
+            "status_source": "persisted",
+            "persisted_session_status": "idle",
+            "snapshot_session_status": "running",
+            "parent_session_id": route.parent_id,
+            "session_kind": "sub_agent",
+            "status_lookup": "found",
+        }.items()
+    )
 
 
 async def test_subagent_idle_preserves_failed_status(status_route: _StatusRoute) -> None:

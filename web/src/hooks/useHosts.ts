@@ -371,6 +371,15 @@ export interface HarnessStartup {
   resolved_path: string | null;
   command_source: "env" | "config" | "default";
   arg_count: number;
+  /** Null when an older host reports only the count. */
+  args?: string[] | null;
+  configured_command?: string | null;
+  configured_args?: string[] | null;
+  environment?: {
+    inherit: boolean;
+    variables: Record<string, string>;
+    unset: string[];
+  } | null;
 }
 
 export function useHarnessStartup(hostId: string, harness: string) {

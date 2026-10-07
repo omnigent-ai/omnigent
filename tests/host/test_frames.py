@@ -38,6 +38,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
+    HostMcpToolsFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
     HostPluginsFrame,
@@ -2367,3 +2369,39 @@ def test_skill_content_allow_list_and_correlated_malformed_result():
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostSkillContentResultFrame)
     assert (frame.request_id, frame.status, frame.skill) == ("s", "failed", None)
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostMcpToolsFrame("m", "claude", "odd/server", "toolkit"),
+        HostMcpToolsFrame("m", "claude", "odd/server", "toolkit", "a" * 64),
+        HostMcpToolsResultFrame(
+            "m", "ok", tools=[{"name": "read", "description": None}], connection="connected"
+        ),
+        HostMcpToolsResultFrame("m", "failed"),
+    ],
+)
+def test_mcp_tools_round_trip(frame):
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_mcp_tools_allow_list_and_correlated_malformed_result():
+    payload = {
+        "kind": "host.mcp_tools_result",
+        "request_id": "m",
+        "status": "ok",
+        "tools": [{"name": "read", "description": None, "inputSchema": {"secret": "value"}}],
+        "connection": "connected",
+        "truncated": False,
+        "env": {"TOKEN": "secret"},
+        "error": "private",
+    }
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostMcpToolsResultFrame)
+    assert frame.tools == [{"name": "read", "description": None}]
+    assert frame.error == "private"
+    payload["tools"] = "private"
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostMcpToolsResultFrame)
+    assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])

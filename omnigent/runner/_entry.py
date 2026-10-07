@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import functools
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from omnigent.version import VERSION
 if TYPE_CHECKING:
     from types import TracebackType
 
+    from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
     from omnigent.runner.native import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
     from omnigent.spec.types import AgentSpec
@@ -655,8 +657,6 @@ def _make_auth_token_factory(
         )
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
 
-    from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
-
     # Prefer the host-launched runner's owner-bound capability so user
     # credentials stay out of the runner and credential discovery is skipped.
     delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
@@ -668,9 +668,7 @@ def _make_auth_token_factory(
         if delegated_factory is not None:
             return delegated_factory
 
-    # Reuse the SDK token cache, but re-resolve auth if a mint fails after a
-    # CLI upgrade or other credential change.
-    sdk_token_source = _ReusedDatabricksTokenSource(resolved_server_url)
+    sdk_token_source: _ReusedDatabricksTokenSource | None = None
 
     def _factory() -> str | None:
         """Return a fresh auth token.
@@ -681,6 +679,7 @@ def _make_auth_token_factory(
         :returns: Bearer token string, or ``None`` if no credentials
             are configured.
         """
+        nonlocal sdk_token_source
         # Check stored OIDC token first.
         if resolved_server_url:
             from omnigent.cli_auth import (
@@ -711,6 +710,12 @@ def _make_auth_token_factory(
             still_valid = load_token(resolved_server_url)
             if still_valid:
                 return still_valid
+        if sdk_token_source is None:
+            # Optional SDK imports must not prevent delegated/OIDC recovery or
+            # bypass the managed-mint fallback when the executor cannot load.
+            from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
+
+            sdk_token_source = _ReusedDatabricksTokenSource(resolved_server_url)
         return sdk_token_source.current_token()
 
     # Probe once to check if a user credential is available.
@@ -1231,8 +1236,8 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     :param spec_cache_root: Runner-local cache root for extracted bundles,
         e.g. ``Path("/tmp/runner-specs-xyz")``.
     :param agent_id: Opaque agent identifier, e.g. ``"ag_abc123"``.
-    :param version: Bundle version from the ``X-Agent-Version`` header,
-        e.g. ``"3"`` (defaults to ``"0"`` when the header is absent).
+    :param version: Bundle revision: the ``X-Agent-Version`` header and a
+        content digest, e.g. ``"3-1f2e3d4c5b6a7980"``.
     :returns: The resolved cache directory, guaranteed inside
         *spec_cache_root*.
     :raises RuntimeError: If the computed path escapes *spec_cache_root*.
@@ -1300,11 +1305,12 @@ async def _resolve_agent_spec_from_server(
     # expansion). Only operator-authored template agents expand.
     session_scoped_header = resp.headers.get("X-Agent-Session-Scoped", "true").strip().lower()
     expand_env = session_scoped_header == "false"
-    # Cache key: agent id + version header. Re-extracting on
-    # every dispatch would be wasteful; keying by version means
-    # PUT-induced bundle bumps invalidate naturally.
+    # Cache key: agent id + version header + content digest. Re-extracting
+    # on every dispatch would be wasteful; the digest keeps an agent removed
+    # and added again (its version restarts at 1) off the old bundle's directory.
     version = resp.headers.get("X-Agent-Version", "0")
-    dest = _agent_cache_dest(spec_cache_root, agent_id, version)
+    digest = hashlib.sha256(resp.content).hexdigest()[:16]
+    dest = _agent_cache_dest(spec_cache_root, agent_id, f"{version}-{digest}")
     # prune_invalid_sub_agents: the server already validated this bundle
     # before serving it, so a sub-agent that fails validation *here* means
     # this runner is older than that server and can't run that sub-agent

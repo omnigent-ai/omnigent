@@ -57,6 +57,7 @@ CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
+CAP_MCP_TOOLS = "mcp_tools"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -64,6 +65,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
+    CAP_MCP_TOOLS,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
 ]
@@ -155,6 +157,8 @@ class HostFrameKind(str, Enum):
     PLUGINS_RESULT = "host.plugins_result"
     SKILL_CONTENT = "host.skill_content"
     SKILL_CONTENT_RESULT = "host.skill_content_result"
+    MCP_TOOLS = "host.mcp_tools"
+    MCP_TOOLS_RESULT = "host.mcp_tools_result"
     HARNESS_STARTUP = "host.harness_startup"
     HARNESS_STARTUP_RESULT = "host.harness_startup_result"
     MCP_SERVERS = "host.mcp_servers"
@@ -1099,6 +1103,29 @@ class HostSkillContentResultFrame:
 
 
 @dataclass
+class HostMcpToolsFrame:
+    """Server → host: probe one configured MCP server, only on demand."""
+
+    request_id: str
+    harness: str
+    server: str
+    plugin: str | None = None
+    source_id: str | None = None
+
+
+@dataclass
+class HostMcpToolsResultFrame:
+    """Host → server: tool names/descriptions and connection status, without config."""
+
+    request_id: str
+    status: str
+    tools: list[dict[str, str | None]] = field(default_factory=list)
+    connection: str = "unsupported"
+    truncated: bool = False
+    error: str | None = None
+
+
+@dataclass
 class HostImportedLocalSession:
     """One local transcript the host read, normalized for import.
 
@@ -1262,6 +1289,8 @@ HostFrame = (
     | HostPluginsResultFrame
     | HostSkillContentFrame
     | HostSkillContentResultFrame
+    | HostMcpToolsFrame
+    | HostMcpToolsResultFrame
     | HostHarnessStartupFrame
     | HostHarnessStartupResultFrame
     | HostMcpServersFrame
@@ -1710,6 +1739,29 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostMcpToolsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MCP_TOOLS.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+                "server": frame.server,
+                "plugin": frame.plugin,
+                "source_id": frame.source_id,
+            }
+        )
+    if isinstance(frame, HostMcpToolsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MCP_TOOLS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "tools": frame.tools,
+                "connection": frame.connection,
+                "truncated": frame.truncated,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostHarnessStartupFrame):
         return _encode_payload(
             {
@@ -2141,6 +2193,16 @@ def _decode_known_host_frame(
             )
         case HostFrameKind.SKILL_CONTENT_RESULT:
             return _decode_skill_content_result(msg)
+        case HostFrameKind.MCP_TOOLS:
+            return HostMcpToolsFrame(
+                request_id=_required_str(msg, "request_id"),
+                harness=_required_str(msg, "harness"),
+                server=_required_str(msg, "server"),
+                plugin=_optional_nullable_str(msg, "plugin"),
+                source_id=_optional_nullable_str(msg, "source_id"),
+            )
+        case HostFrameKind.MCP_TOOLS_RESULT:
+            return _decode_mcp_tools_result(msg)
         case HostFrameKind.IMPORT_LOCAL:
             return _decode_import_local(msg)
         case HostFrameKind.IMPORT_LOCAL_BY_ID:
@@ -2730,7 +2792,7 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
 
 
 _MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
-_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host")
+_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id")
 
 
 def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:
@@ -2818,6 +2880,36 @@ def _decode_skill_content_result(msg: _JsonObject) -> HostSkillContentResultFram
             request_id=request_id,
             status="failed",
             error="malformed skill content reply",
+        )
+
+
+def _decode_mcp_tools_result(msg: _JsonObject) -> HostMcpToolsResultFrame:
+    request_id = _required_str(msg, "request_id")
+    try:
+        raw = msg.get("tools")
+        if not isinstance(raw, list) or len(raw) > 500:
+            raise ValueError("invalid tool list")
+        tools: list[dict[str, str | None]] = []
+        for tool in raw:
+            if not isinstance(tool, dict):
+                raise ValueError("invalid tool")
+            tools.append(
+                {
+                    "name": _required_str(tool, "name"),
+                    "description": _optional_nullable_str(tool, "description"),
+                }
+            )
+        return HostMcpToolsResultFrame(
+            request_id=request_id,
+            status=_required_str(msg, "status"),
+            tools=tools,
+            connection=_required_str(msg, "connection"),
+            truncated=_required_bool(msg, "truncated"),
+            error=_optional_nullable_str(msg, "error"),
+        )
+    except ValueError:
+        return HostMcpToolsResultFrame(
+            request_id=request_id, status="failed", error="malformed MCP tools reply"
         )
 
 

@@ -81,6 +81,10 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.inner._subprocess_lifecycle import (
+    await_cleanup_task,
+    terminate_direct_subprocess,
+)
 from omnigent.native._native_resume_hint import echo_native_resume_hint
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
 from omnigent.native.native_terminal import (
@@ -113,6 +117,8 @@ _TERMINAL_NAME = "codex"
 _TERMINAL_SESSION_KEY = "main"
 _CODEX_TERMINAL_SCROLLBACK_LINES = 100_000
 _CODEX_THREAD_START_TIMEOUT_SECONDS = 15.0
+_DIRECT_TMUX_ATTACH_TERMINATE_TIMEOUT_S = 5.0
+_DIRECT_TMUX_ATTACH_KILL_TIMEOUT_S = 1.0
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
@@ -1645,9 +1651,21 @@ async def _attach_direct_tmux(socket_path: Path, tmux_target: str) -> None:
         tmux_target,
         env=env,
     )
-    record_startup_event("terminal_attach_started")
-    exit_code = await process.wait()
-    record_startup_event("terminal_attach_exited", exit_code=exit_code)
+    try:
+        record_startup_event("terminal_attach_started")
+        exit_code = await process.wait()
+        record_startup_event("terminal_attach_exited", exit_code=exit_code)
+    except BaseException:
+        cleanup = asyncio.create_task(
+            terminate_direct_subprocess(
+                process,
+                terminate_timeout=_DIRECT_TMUX_ATTACH_TERMINATE_TIMEOUT_S,
+                kill_timeout=_DIRECT_TMUX_ATTACH_KILL_TIMEOUT_S,
+            ),
+            name="direct-tmux-attach-cleanup",
+        )
+        await await_cleanup_task(cleanup)
+        raise
 
 
 async def _create_codex_session(

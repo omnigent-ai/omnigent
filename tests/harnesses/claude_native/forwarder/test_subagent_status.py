@@ -7,7 +7,6 @@ import contextlib
 import json
 import logging
 import time
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -24,8 +23,193 @@ from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _seed_subagent_on_disk,
     _start_recording_server,
-    _subagent_drop_row,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["502", "request_error", "read_timeout"])
+async def test_production_loop_recovers_child_after_prolonged_transient_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    """The live loop keeps a failed child item pending until AP recovers."""
+    caplog.set_level(logging.CRITICAL, logger=forwarder.__name__)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="main-loop-recovery",
+        agent_type="Explore",
+        description="main loop transient recovery",
+        tool_use_id="toolu_main_loop_recovery",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "main-loop-message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "recover me"}],
+                },
+            }
+        ],
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-main-loop",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    child_attempts = 0
+    failed_attempts = 0
+    delivered_source_ids: list[str] = []
+    prolonged_outage = asyncio.Event()
+    recovery_gate = asyncio.Event()
+    delivered = asyncio.Event()
+    recovery_scan = asyncio.Event()
+    second_scan = asyncio.Event()
+    outage = True
+    restart_phase = False
+    retry_gate_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal child_attempts, failed_attempts
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        is_batch = isinstance(body, list)
+        is_child_item = isinstance(body, dict) and body.get("type") == "external_conversation_item"
+        if is_batch or is_child_item:
+            child_attempts += 1
+            if outage:
+                failed_attempts += 1
+                if failed_attempts >= 30:
+                    prolonged_outage.set()
+                    await recovery_gate.wait()
+                if failure == "request_error":
+                    raise httpx.RequestError("AP unavailable", request=request)
+                if failure == "read_timeout":
+                    raise httpx.ReadTimeout("AP response lost", request=request)
+                return httpx.Response(502, text="bad gateway")
+            if is_batch:
+                delivered_source_ids.extend(row["data"]["source_id"] for row in body)
+            else:
+                delivered_source_ids.append(body["data"]["source_id"])
+            delivered.set()
+            if is_batch:
+                return httpx.Response(
+                    202,
+                    json=[{"queued": False, "item_id": row["data"]["source_id"]} for row in body],
+                )
+            return httpx.Response(202, json={"queued": False, "item_id": "recovered"})
+        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
+            return httpx.Response(202, json={"child_session_id": "conv_main_loop_child"})
+        return httpx.Response(202, json={})
+
+    original_retry_delay = forwarder._PostRetryTracker.retry_delay_s
+    original_pending_prefix = forwarder._PostRetryTracker.has_pending_retry_prefix
+
+    def release_child_backoff(self: forwarder._PostRetryTracker, key: str) -> float | None:
+        nonlocal retry_gate_calls
+        retry_gate_calls += 1
+        if key.startswith(("subagent_batch:", "subagent_item:")):
+            return None
+        return original_retry_delay(self, key)
+
+    def release_child_pending_prefix(self: forwarder._PostRetryTracker, prefix: str) -> bool:
+        if prefix.startswith(("subagent_batch:", "subagent_item:")):
+            return False
+        return original_pending_prefix(self, prefix)
+
+    monkeypatch.setattr(forwarder._PostRetryTracker, "retry_delay_s", release_child_backoff)
+    monkeypatch.setattr(
+        forwarder._PostRetryTracker,
+        "has_pending_retry_prefix",
+        release_child_pending_prefix,
+    )
+
+    async def skip_pane_signals(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(forwarder, "_forward_pane_signals", skip_pane_signals)
+
+    async def passthrough_state(**kwargs: Any) -> Any:
+        return kwargs["state"]
+
+    monkeypatch.setattr(forwarder, "_forward_available_deltas", passthrough_state)
+    monkeypatch.setattr(forwarder, "_forward_available_items", passthrough_state)
+    monkeypatch.setattr(forwarder, "_forward_available_status_events", passthrough_state)
+
+    async def skip_cost(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(forwarder, "_forward_session_cost", skip_cost)
+    monkeypatch.setattr(forwarder, "_forward_model_from_status", skip_cost)
+    original_scan = forwarder._forward_available_subagents
+
+    async def observe_scan(**kwargs: Any) -> forwarder.SubagentForwardState:
+        result = await original_scan(**kwargs)
+        if restart_phase:
+            second_scan.set()
+        elif delivered.is_set():
+            recovery_scan.set()
+        return result
+
+    monkeypatch.setattr(forwarder, "_forward_available_subagents", observe_scan)
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://ap"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+
+    async def run_forwarder() -> asyncio.Task[None]:
+        return asyncio.create_task(
+            forwarder.forward_claude_transcript_to_session(
+                base_url="http://ap",
+                headers={},
+                session_id="conv_main_loop_parent",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                start_at_end=False,
+                poll_interval_s=0.0,
+            )
+        )
+
+    task = await run_forwarder()
+    try:
+        try:
+            await asyncio.wait_for(prolonged_outage.wait(), timeout=30.0)
+        except TimeoutError as exc:
+            raise AssertionError(
+                f"child attempts={child_attempts}, retry gate calls={retry_gate_calls}"
+            ) from exc
+        outage = False
+        recovery_gate.set()
+        await asyncio.wait_for(delivered.wait(), timeout=10.0)
+        await asyncio.wait_for(recovery_scan.wait(), timeout=10.0)
+        assert failed_attempts >= 30
+        assert delivered_source_ids == ["main-loop-message:0:message"]
+
+        restart_phase = True
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        task = await run_forwarder()
+        await asyncio.wait_for(second_scan.wait(), timeout=10.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert delivered_source_ids == ["main-loop-message:0:message"]
 
 
 @pytest.mark.asyncio
@@ -694,30 +878,29 @@ async def test_subagent_idle_observation_retries_and_resumes_existing_checkpoint
 
 
 @pytest.mark.asyncio
-async def test_persistent_subagent_502_ends_as_explicit_failure(
+async def test_transient_subagent_502_stays_pending_past_batch_budget(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A child that exhausts 502 retries fails with recoverable dead letters."""
+    """A child item stays pending past twelve attempts and recovers."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
-    subagent_id = "persistent-502"
+    subagent_id = "recoverable-502"
     _seed_subagent_on_disk(
         transcript_path=transcript_path,
         subagent_id=subagent_id,
         agent_type="Explore",
-        description="persistent outage",
-        tool_use_id="toolu_persistent_502",
+        description="temporary outage",
+        tool_use_id="toolu_recoverable_502",
         transcript_records=[
             {
                 "isSidechain": True,
                 "type": "assistant",
-                "uuid": "persistent-message",
+                "uuid": "recoverable-message",
                 "message": {
                     "role": "assistant",
-                    "content": [{"type": "text", "text": "lost output"}],
+                    "content": [{"type": "text", "text": "recoverable output"}],
                 },
             }
         ],
@@ -726,28 +909,43 @@ async def test_persistent_subagent_502_ends_as_explicit_failure(
         subagents={
             subagent_id: forwarder.SubagentEntry(
                 subagent_id=subagent_id,
-                child_conversation_id="conv_persistent_502",
+                child_conversation_id="conv_recoverable_502",
             )
         }
     )
+    outage = True
+    batch_attempts = 0
+    item_attempts = 0
+    delivered: list[str] = []
     statuses: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal batch_attempts, item_attempts
         body = json.loads(request.content.decode("utf-8"))
         if isinstance(body, list):
-            return httpx.Response(502, text="bad gateway")
-        if body.get("type") == "external_session_status":
+            batch_attempts += 1
+            if outage:
+                return httpx.Response(502, text="bad gateway")
+            delivered.extend(row["data"]["source_id"] for row in body)
+            return httpx.Response(
+                202,
+                json=[{"queued": False, "item_id": row["data"]["source_id"]} for row in body],
+            )
+        if body.get("type") == "external_conversation_item":
+            item_attempts += 1
+            if outage:
+                return httpx.Response(502, text="bad gateway")
+            delivered.append(body["data"]["source_id"])
+            return httpx.Response(202, json={"queued": False, "item_id": "recovered"})
+        if body.get("type") in {"external_session_status", "subagent.status"}:
             statuses.append(body["data"])
         return httpx.Response(202, json={})
 
-    tracker = forwarder._PostRetryTracker(
-        base_delay_s=0.0,
-        max_transient_attempts=2,
-    )
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
-        for _ in range(2):
+        for _ in range(24):
             state = await forwarder._forward_available_subagents(
                 client=client,
                 parent_session_id="conv_parent",
@@ -759,41 +957,34 @@ async def test_persistent_subagent_502_ends_as_explicit_failure(
                 item_retry_tracker=tracker,
                 status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             )
-        failed_entry = replace(
-            state.subagents[subagent_id],
-            last_activity_ts=time.time() - forwarder._SUBAGENT_IDLE_THRESHOLD_S - 60,
-        )
+        assert batch_attempts == forwarder._SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS
+        assert item_attempts == 13
+        assert delivered == []
+        entry = state.subagents[subagent_id]
+        assert entry.byte_offset == 0
+        assert entry.seen_source_ids == ()
+        assert entry.delivery_error is None
+        assert not (bridge_dir / "dead_letter.jsonl").exists()
+        state = forwarder._read_subagent_forward_state(bridge_dir)
+        tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+        outage = False
         state = await forwarder._forward_available_subagents(
             client=client,
             parent_session_id="conv_parent",
             bridge_dir=bridge_dir,
             transcript_path=transcript_path,
-            state=forwarder.SubagentForwardState(subagents={subagent_id: failed_entry}),
+            state=state,
             agent_name="claude-native-ui",
             start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             item_retry_tracker=tracker,
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
         )
 
-    assert statuses == [{"status": "failed", "output": forwarder._SUBAGENT_DROPPED_ITEM_REASON}]
-    assert state.subagents[subagent_id].delivery_error == forwarder._SUBAGENT_DROPPED_ITEM_REASON
-    persisted = forwarder._read_subagent_forward_state(bridge_dir)
-    assert (
-        persisted.subagents[subagent_id].delivery_error == forwarder._SUBAGENT_DROPPED_ITEM_REASON
-    )
-    dead_letters = (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
-    assert len(dead_letters) == 1
-    assert json.loads(dead_letters[0])["http_status"] == 502
-
-    row = _subagent_drop_row(caplog)
-    assert row["session_id"] == "conv_persistent_502"
-    assert row["attributes"]["parent_session_id"] == "conv_parent"
-    assert row["attributes"]["drop_reason"] == "transient_retries_exhausted"
-    assert row["attributes"]["http_status"] == "502"
-    assert row["attributes"]["attempts"] == "2"
-    assert row["attributes"]["item_count"] == "1"
-    assert row["attributes"]["exception_type"] == "HTTPStatusError"
-    assert "lost output" not in json.dumps(row["attributes"])
+    assert delivered == ["recoverable-message:0:message"]
+    entry = state.subagents[subagent_id]
+    assert entry.seen_source_ids == ("recoverable-message:0:message",)
+    assert entry.delivery_error is None
+    assert all(status.get("status") != "failed" for status in statuses)
 
 
 @pytest.mark.asyncio

@@ -190,6 +190,13 @@ def test_real_builders_pass_ssh_auth_sock(monkeypatch):
         assert build().get("SSH_AUTH_SOCK") == sock, harness
 
 
+def test_real_builders_pass_browser(monkeypatch):
+    """The user's URL opener must survive filtering, or CLI logins open the wrong browser."""
+    monkeypatch.setattr("os.environ", {"BROWSER": "www-browser"})
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        assert build().get("BROWSER") == "www-browser", harness
+
+
 def test_real_builders_strip_desktop_session(monkeypatch):
     session_env = {
         "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
