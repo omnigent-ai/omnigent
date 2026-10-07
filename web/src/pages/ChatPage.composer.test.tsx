@@ -4143,6 +4143,16 @@ describe("Composer reply quotes", () => {
     });
   });
 
+  it("keeps the message in the composer when the queue refuses it", () => {
+    // A full queue refuses the message (onSend returns false); nothing typed may vanish.
+    const onSend = vi.fn(() => false);
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "one more" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(textarea()).toHaveValue("one more");
+  });
+
   it("does not clear a new identical draft after submitting an edited restored send", async () => {
     const stableId = "f".repeat(32);
     // Submit through the store: the queued path is what a mid-turn Enter takes.

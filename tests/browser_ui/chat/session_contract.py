@@ -562,6 +562,9 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
         )
 
     contract.route(matcher(f"{session_api}/events"), post_event)
+    # The composer publishes its queued follow-ups for other windows of the
+    # session; the tests here do not depend on the reply.
+    contract.response(f"{session_api}/queue", method="PUT")
 
     def upload(route: Route) -> None:
         if route.request.method != "POST":

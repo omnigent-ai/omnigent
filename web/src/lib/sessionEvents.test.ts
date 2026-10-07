@@ -7,7 +7,7 @@
 // just stops seeing the event). These tests fail loud when the wire
 // shape drifts.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
@@ -22,6 +22,7 @@ import type {
   SessionModelEvent,
   SessionPermissionModeEvent,
   SessionPresenceEvent,
+  SessionQueueEvent,
   SessionReasoningEffortEvent,
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
@@ -1730,5 +1731,97 @@ describe("session.model_options (FLAT envelope)", () => {
       type: "session.model_options",
     });
     expect(out).toEqual([]);
+  });
+});
+
+describe("session.queue (FLAT envelope)", () => {
+  it("lifts the merged queue with ownership, order, and attachments", () => {
+    const out = parse("session.queue", {
+      type: "session.queue",
+      conversation_id: "conv_abc",
+      messages: [
+        {
+          queue_id: "q_1",
+          client_id: "c_desktop",
+          seq: 1,
+          text: "desktop follow-up",
+          attachments: ["shot.png"],
+          stable_id: "s1",
+          created_by: "alice@example.com",
+          requires_retry: false,
+        },
+        {
+          queue_id: "q_1",
+          client_id: "c_browser",
+          seq: 2,
+          text: "browser follow-up",
+          attachments: [],
+          stable_id: null,
+          created_by: null,
+          requires_retry: true,
+        },
+      ],
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionQueueEvent;
+    expect(ev.type).toBe("session_queue");
+    expect(ev.conversationId).toBe("conv_abc");
+    // Content, not just shape: ownership and order decide which window's strip
+    // row is actionable and whose head flushes next.
+    expect(ev.messages).toEqual([
+      {
+        queueId: "q_1",
+        clientId: "c_desktop",
+        seq: 1,
+        text: "desktop follow-up",
+        attachments: ["shot.png"],
+        stableId: "s1",
+        createdBy: "alice@example.com",
+        requiresRetry: false,
+      },
+      {
+        queueId: "q_1",
+        clientId: "c_browser",
+        seq: 2,
+        text: "browser follow-up",
+        attachments: [],
+        requiresRetry: true,
+      },
+    ]);
+  });
+
+  it("parses an empty queue (every window drained)", () => {
+    const out = parse("session.queue", {
+      type: "session.queue",
+      conversation_id: "conv_abc",
+      messages: [],
+    });
+    expect(out).toHaveLength(1);
+    expect((out[0] as SessionQueueEvent).messages).toEqual([]);
+  });
+
+  it("drops a frame with a malformed entry rather than a partial list, and says so", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const malformed = [
+      { queue_id: 1, client_id: "c_desktop", seq: 1, text: "x" },
+      { queue_id: "q_1", client_id: "c_desktop", seq: Number.NaN, text: "x" },
+      { queue_id: "q_1", client_id: "c_desktop", seq: 1, text: "x", attachments: ["a.png", 3] },
+      "not an object",
+    ];
+    for (const entry of malformed) {
+      const out = parse("session.queue", {
+        type: "session.queue",
+        conversation_id: "conv_abc",
+        messages: [entry],
+      });
+      expect(out).toHaveLength(0);
+    }
+    // So is a frame whose top level drifted from the schema.
+    expect(
+      parse("session.queue", { type: "session.queue", conversation_id: "conv_abc", messages: "x" }),
+    ).toHaveLength(0);
+    // A dropped snapshot delays idle sends until the fallback: that must be diagnosable.
+    expect(warn).toHaveBeenCalledTimes(malformed.length + 1);
+    warn.mockRestore();
   });
 });

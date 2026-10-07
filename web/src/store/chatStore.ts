@@ -72,6 +72,8 @@ import {
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
+  putQueuedMessages,
+  type QueuedMessageShare,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
@@ -80,8 +82,11 @@ import type {
   McpServerStartup,
   SessionInputConsumedEvent,
   SessionViewer,
+  SharedQueuedMessage,
   StreamEvent,
 } from "@/lib/events";
+import { CLIENT_ID } from "@/lib/clientId";
+import { ownFlushHead } from "@/lib/messageQueue";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
@@ -127,7 +132,7 @@ import type {
   SessionStatus,
 } from "@/lib/types";
 import { uploadFile } from "@/lib/filesApi";
-import { attachmentKey } from "@/lib/attachments";
+import { attachmentFilename, attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
@@ -576,6 +581,16 @@ export interface QueuedMessage {
   stableId?: string;
   /** A failed send stays queued until the user explicitly retries or edits it. */
   requiresRetry?: boolean;
+  /**
+   * A follow-up ANOTHER client of the session holds (from `session.queue`).
+   * Never enters `queuedMessages`; rendered read-only and flushed behind.
+   */
+  remote?: {
+    clientId: string;
+    createdBy?: string;
+    /** Attachment filenames (the blobs stay in the owning client). */
+    attachments: string[];
+  };
 }
 
 /**
@@ -971,6 +986,22 @@ export interface ConversationState {
    */
   viewers: SessionViewer[];
   /**
+   * The session-wide queue of follow-ups every client holds, from the
+   * server's `session.queue` events (full state, seeded by the stream's
+   * snapshot-on-connect). Includes this client's own entries, matched by
+   * `CLIENT_ID`; `queuedMessages` stays authoritative for those, and this
+   * list supplies their order relative to other clients' entries.
+   */
+  sharedQueue: SharedQueuedMessage[];
+  /**
+   * True from a stream (re)connect attempt until that connection's
+   * `session.queue` snapshot lands: `sharedQueue` may be missing a follow-up
+   * another window holds, so an idle send queues and the flush waits (see
+   * `shouldQueueSend`). A stream that announces no queue snapshot (an older
+   * server) clears it on open; a bounded fallback clears it if none arrives.
+   */
+  sharedQueueStale: boolean;
+  /**
    * Managed-sandbox launch progress for the bound session. Seeded
    * from the session snapshot's `sandbox_status` field on bind and
    * updated by `session.sandbox_status` SSE events; a `ready` event
@@ -1128,8 +1159,10 @@ export interface ChatActions {
    * Queue a message client-side instead of POSTing it now, for a send made
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
+   * Returns false (after telling the user) when the conversation's queue is
+   * full (`QUEUED_MESSAGE_LIMIT`); the caller then keeps the message.
    */
-  enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => boolean;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1723,6 +1756,17 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
+  installQueueSharePublisher();
+  publishedQueueShares.clear();
+  pendingQueueSharePublishes.clear();
+  heldQueueShares.clear();
+  for (const timer of heldShareReleases.values()) clearTimeout(timer);
+  heldShareReleases.clear();
+  queueSharePublishInFlight.clear();
+  queueSharePublishDirty.clear();
+  for (const timer of queueShareRetryTimers.values()) clearTimeout(timer);
+  queueShareRetryTimers.clear();
+  queueShareRetryDelays.clear();
   // Drop every live conversation: their streams must not outlive the app (or,
   // in tests, leak into the next case).
   conversationRegistry.clear();
@@ -1734,6 +1778,220 @@ export function initChatStore(client: QueryClient): void {
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
   queryClient = client;
+}
+
+// ── Shared queue publication ─────────────────────────────────────────────────
+// Every change to this client's queue is published (`PUT /v1/sessions/{id}/queue`)
+// so other windows of the session list our follow-ups. Best-effort: the next
+// change republishes after a failure, as does a snapshot missing our entries.
+
+// The server caps a shared entry's text; the strip shows one truncated line anyway.
+const QUEUE_SHARE_TEXT_LIMIT = 4000;
+// Last share published per conversation (serialized), to skip no-op republishes.
+const publishedQueueShares = new Map<string, string>();
+const pendingQueueSharePublishes = new Set<string>();
+let queueSharePublishScheduled = false;
+let queueSharePublisherInstalled = false;
+// Shares frozen while a queued message is being sent, so other windows learn
+// the turn started before they learn the slot freed (one message per turn).
+const heldQueueShares = new Map<
+  string,
+  { share: QueuedMessageShare[]; holds: number; turnSeen: boolean }
+>();
+// A settled send whose turn the session has not yet been seen to start keeps
+// its share frozen until that edge arrives or this fallback elapses (a failed
+// send never starts one).
+export const HELD_SHARE_RELEASE_TIMEOUT_MS = 15_000;
+const heldShareReleases = new Map<string, ReturnType<typeof setTimeout>>();
+// A stream that announces a queue snapshot delivers it right after connecting;
+// past this, a snapshot that never came no longer holds idle sends.
+export const SHARED_QUEUE_SNAPSHOT_TIMEOUT_MS = 10_000;
+// The server's share bounds. A queue never grows past the message bound (the
+// composer refuses the next message), so every queued message keeps its own
+// ordering slot; attachment names beyond their bound are summarized.
+export const QUEUED_MESSAGE_LIMIT = 50;
+const QUEUE_SHARE_MAX_ATTACHMENTS = 32;
+const QUEUE_SHARE_ATTACHMENT_NAME_LIMIT = 255;
+// A publish that failed for a transient reason (network, 5xx) retries with
+// backoff; one the server rejected (older server, read-only caller, unknown
+// session) is not retried.
+export const QUEUE_SHARE_RETRY_MS = 2_000;
+const QUEUE_SHARE_RETRY_MAX_MS = 30_000;
+const queueShareRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const queueShareRetryDelays = new Map<string, number>();
+
+function boundedAttachmentNames(names: string[]): string[] {
+  const bounded = names.map((name) => name.slice(0, QUEUE_SHARE_ATTACHMENT_NAME_LIMIT));
+  if (bounded.length <= QUEUE_SHARE_MAX_ATTACHMENTS) return bounded;
+  const shown = bounded.slice(0, QUEUE_SHARE_MAX_ATTACHMENTS - 1);
+  return [...shown, `+${names.length - shown.length} more`];
+}
+
+function queueShareFor(conversationId: string): QueuedMessageShare[] {
+  return useChatStore
+    .getState()
+    .queuedMessages.filter((m) => m.conversationId === conversationId)
+    .map((m) => ({
+      queue_id: m.queueId,
+      text: m.text.slice(0, QUEUE_SHARE_TEXT_LIMIT),
+      attachments: boundedAttachmentNames((m.files ?? []).map(attachmentFilename)),
+      ...(m.stableId ? { stable_id: m.stableId } : {}),
+      requires_retry: m.requiresRetry === true,
+    }));
+}
+
+// One PUT in flight per conversation; a change during the flight publishes
+// after it, so a slow earlier PUT can never land after a newer one.
+const queueSharePublishInFlight = new Map<string, Promise<void>>();
+const queueSharePublishDirty = new Set<string>();
+
+/** Publish once per burst of changes; `force` republishes an unchanged share the server lost. */
+function scheduleQueueSharePublish(conversationId: string, opts?: { force?: boolean }): void {
+  if (isTempConvId(conversationId)) return;
+  if (opts?.force) publishedQueueShares.delete(conversationId);
+  pendingQueueSharePublishes.add(conversationId);
+  if (queueSharePublishScheduled) return;
+  queueSharePublishScheduled = true;
+  queueMicrotask(() => {
+    queueSharePublishScheduled = false;
+    const ids = [...pendingQueueSharePublishes];
+    pendingQueueSharePublishes.clear();
+    for (const id of ids) publishQueueShare(id);
+  });
+}
+
+function publishQueueShare(conversationId: string): void {
+  if (queueSharePublishInFlight.has(conversationId)) {
+    queueSharePublishDirty.add(conversationId);
+    return;
+  }
+  const share = heldQueueShares.get(conversationId)?.share ?? queueShareFor(conversationId);
+  const serialized = JSON.stringify(share);
+  if (publishedQueueShares.get(conversationId) === serialized) return;
+  publishedQueueShares.set(conversationId, serialized);
+  const flight = putQueuedMessages(conversationId, share)
+    .then(() => {
+      cancelQueueShareRetry(conversationId);
+      queueShareRetryDelays.delete(conversationId);
+    })
+    .catch((err: unknown) => {
+      publishedQueueShares.delete(conversationId);
+      if (!isRejectedQueueShare(err)) scheduleQueueShareRetry(conversationId);
+    })
+    .finally(() => {
+      queueSharePublishInFlight.delete(conversationId);
+      if (queueSharePublishDirty.delete(conversationId)) publishQueueShare(conversationId);
+    });
+  queueSharePublishInFlight.set(conversationId, flight);
+}
+
+/** The server will not take this share: an older server, a read-only caller or an unknown session. */
+function isRejectedQueueShare(err: unknown): boolean {
+  return err instanceof ApiError && [401, 403, 404, 405, 422].includes(err.status);
+}
+
+function scheduleQueueShareRetry(conversationId: string): void {
+  if (queueShareRetryTimers.has(conversationId)) return;
+  const delay = queueShareRetryDelays.get(conversationId) ?? QUEUE_SHARE_RETRY_MS;
+  queueShareRetryDelays.set(conversationId, Math.min(delay * 2, QUEUE_SHARE_RETRY_MAX_MS));
+  queueShareRetryTimers.set(
+    conversationId,
+    setTimeout(() => {
+      queueShareRetryTimers.delete(conversationId);
+      scheduleQueueSharePublish(conversationId, { force: true });
+    }, delay),
+  );
+}
+
+function cancelQueueShareRetry(conversationId: string): void {
+  const timer = queueShareRetryTimers.get(conversationId);
+  if (timer !== undefined) clearTimeout(timer);
+  queueShareRetryTimers.delete(conversationId);
+}
+
+/** Freeze the published share until the returned release runs; call before removing the entry being sent. */
+function holdQueueShare(conversationId: string): () => void {
+  const held = heldQueueShares.get(conversationId) ?? {
+    share: queueShareFor(conversationId),
+    holds: 0,
+    turnSeen: false,
+  };
+  held.holds += 1;
+  heldQueueShares.set(conversationId, held);
+  // A release fallback still pending from the previous send must not free the
+  // share under this hold.
+  const pending = heldShareReleases.get(conversationId);
+  if (pending !== undefined) {
+    clearTimeout(pending);
+    heldShareReleases.delete(conversationId);
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    held.holds -= 1;
+    if (held.holds > 0) return;
+    // POST acceptance is not the turn start other windows see (native
+    // harnesses report `running` from the terminal later), so wait for that
+    // edge — or the fallback — before the slot is shown as free.
+    if (held.turnSeen || setterForState(conversationId)?.sessionStatus === "running") {
+      releaseHeldQueueShare(conversationId);
+      return;
+    }
+    heldShareReleases.set(
+      conversationId,
+      setTimeout(() => releaseHeldQueueShare(conversationId), HELD_SHARE_RELEASE_TIMEOUT_MS),
+    );
+  };
+}
+
+function releaseHeldQueueShare(conversationId: string): void {
+  const timer = heldShareReleases.get(conversationId);
+  if (timer !== undefined) clearTimeout(timer);
+  heldShareReleases.delete(conversationId);
+  heldQueueShares.delete(conversationId);
+  scheduleQueueSharePublish(conversationId);
+}
+
+/**
+ * The session started a turn (`running`, or `waiting` when it parked before this
+ * window saw `running`) or failed to — including a send that failed client-side:
+ * a share held for a settled send can go.
+ */
+function noteTurnEdgeForHeldShare(conversationId: string): void {
+  const held = heldQueueShares.get(conversationId);
+  if (held === undefined) return;
+  held.turnSeen = true;
+  if (held.holds === 0) releaseHeldQueueShare(conversationId);
+}
+
+/** Whether the stream's snapshot-on-connect includes `session.queue` (an older server's does not). */
+function streamAnnouncesQueueSnapshot(res: Response): boolean {
+  const features = res.headers.get("x-omnigent-stream-features") ?? "";
+  return features.split(",").some((feature) => feature.trim() === "queue");
+}
+
+/**
+ * No queue snapshot is coming on this connection: drop the previous
+ * connection's view (nothing could remove its entries any more) and let held
+ * flushes proceed.
+ */
+function dropSharedQueueView(set: Setter): void {
+  set({ sharedQueueStale: false, sharedQueue: [] });
+  useChatStore.getState().flushBackgroundQueues();
+}
+
+/** Publish on every change to `queuedMessages`, for each conversation it touched. */
+function installQueueSharePublisher(): void {
+  if (queueSharePublisherInstalled) return;
+  queueSharePublisherInstalled = true;
+  useChatStore.subscribe((state, prev) => {
+    if (state.queuedMessages === prev.queuedMessages) return;
+    const touched = new Set<string>();
+    for (const m of prev.queuedMessages) touched.add(m.conversationId);
+    for (const m of state.queuedMessages) touched.add(m.conversationId);
+    for (const id of touched) scheduleQueueSharePublish(id);
+  });
 }
 
 function scheduleWorkspaceFilesystemInvalidation(sessionId: string): void {
@@ -1897,6 +2155,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   terminalPending: false,
   runnerLaunchedAt: null,
   viewers: [],
+  sharedQueue: [],
+  sharedQueueStale: false,
   sandboxStatus: null,
   mcpStartup: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
@@ -1904,8 +2164,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   historyGeneration: 0,
 
   enqueueMessage: (text, files, replyDraft) => {
-    const { conversationId, boundAgentId, sessionHarness } = get();
-    if (conversationId === null) return;
+    const { conversationId, boundAgentId, sessionHarness, queuedMessages } = get();
+    if (conversationId === null) return false;
+    // Every queued message holds its own slot in the session-wide order, so the
+    // queue stops at the share bound instead of hiding later messages from
+    // other windows.
+    const queuedHere = queuedMessages.filter((m) => m.conversationId === conversationId).length;
+    if (queuedHere >= QUEUED_MESSAGE_LIMIT) {
+      toast.error(
+        `The queue is full (${QUEUED_MESSAGE_LIMIT} messages): send or remove one first`,
+        {
+          richColors: true,
+        },
+      );
+      return false;
+    }
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
@@ -1934,6 +2207,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // to the queue but the turn had already ended) would otherwise wait for an
     // idle edge that never comes — flush now.
     get().maybeFlushQueuedHead();
+    return true;
   },
 
   dequeueMessage: (queueId) => {
@@ -1978,8 +2252,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (target === undefined || agentId === null) return;
     if (target.command === "compact" && rejectBusyCompact(target.conversationId)) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
+    const releaseShare = holdQueueShare(target.conversationId);
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
-    void s.send(target.text, agentId, target.files, queuedSendOptions(target));
+    void s
+      .send(target.text, agentId, target.files, queuedSendOptions(target))
+      .finally(releaseShare);
   },
 
   steerAllQueuedMessages: (conversationId) => {
@@ -2000,14 +2277,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (batch.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
     const batchOrder = new Map(batch.map((m, index) => [m.queueId, index]));
     // Remove BEFORE the POSTs so a concurrent flush can't also send one.
+    const releaseShare = holdQueueShare(conversationId);
     setActive({
       queuedMessages: s.queuedMessages.filter((m) => !batchOrder.has(m.queueId)),
     });
+    const sends: Promise<void>[] = [];
     for (const m of batch) {
       const agentId = m.agentId ?? s.boundAgentId;
       if (agentId === null) continue;
-      void s.send(m.text, agentId, m.files, queuedSendOptions(m, batchOrder));
+      sends.push(s.send(m.text, agentId, m.files, queuedSendOptions(m, batchOrder)));
     }
+    void Promise.allSettled(sends).then(releaseShare);
   },
 
   clearQueuedMessages: (conversationId) => {
@@ -2046,15 +2326,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Clear the latch on THIS conversation's entry only, alongside its status.
       setActive({ status: "idle", sendLatchedAt: null });
     }
-    // Flush the FIRST message OF THE BOUND CONVERSATION (FIFO within it), not
-    // the global array head. The queue is one flat array across conversations,
-    // so an undrained message from another conversation can sit at index 0; a
-    // head-only guard would let it block this conversation's messages forever.
-    const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined || head.requiresRetry) return;
+    // The queue is one flat array across conversations, so scope the head to
+    // this conversation. A follow-up another window holds ahead of ours (or a
+    // queue this connection has not seen yet) sends first: wait while it is there.
+    if (s.sharedQueueStale) return;
+    const head = ownFlushHead(s.queuedMessages, s.sharedQueue, s.conversationId);
+    if (head === null || head.requiresRetry) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
+    const releaseShare = holdQueueShare(s.conversationId);
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
-    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
+    void s
+      .send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head))
+      .finally(releaseShare);
   },
 
   flushBackgroundQueues: () => {
@@ -2112,21 +2395,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (backgroundFlushInFlight.has(conversationId)) continue;
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
-      const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      if (head === undefined || head.requiresRetry) continue;
+      if (local?.sharedQueueStale) continue;
+      const head = ownFlushHead(get().queuedMessages, local?.sharedQueue ?? [], conversationId);
+      if (head === null || head.requiresRetry) continue;
       const compactAgentId = head.agentId ?? local?.boundAgentId;
       if (head.command === "compact" && !compactAgentId) continue;
 
       // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
+      const releaseShare = holdQueueShare(conversationId);
       setActive((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
       if (head.command === "compact") {
         conversationRegistry.acquire(conversationId);
-        void s
-          .send(head.text, compactAgentId!, head.files, queuedSendOptions(head))
-          .finally(() => backgroundFlushInFlight.delete(conversationId));
+        void s.send(head.text, compactAgentId!, head.files, queuedSendOptions(head)).finally(() => {
+          backgroundFlushInFlight.delete(conversationId);
+          releaseShare();
+        });
         continue;
       }
       // Join the SAME send chain the foreground path uses for this
@@ -2182,6 +2468,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         })
         .finally(() => {
           backgroundFlushInFlight.delete(conversationId);
+          releaseShare();
           // Hand the chain to the next POST (foreground or background) so it
           // can start its own network work in submission order.
           releaseSend();
@@ -3424,6 +3711,9 @@ function queuedSendOptions(
           ],
         };
       });
+      // No turn will start: let other windows see the retry flag now, not
+      // after the fallback.
+      noteTurnEdgeForHeldShare(message.conversationId);
       setterFor(message.conversationId)((s) => ({
         blocks: [...s.blocks, makeClientErrorBlock(error, "")],
       }));
@@ -5395,6 +5685,24 @@ export async function startStreamPump(
     for (const timer of catchupTimers) window.clearTimeout(timer);
     catchupTimers = [];
   };
+  // Frees idle sends if the queue snapshot this connection announced never lands
+  // (or the stream never opens at all).
+  let snapshotFallback: ReturnType<typeof setTimeout> | null = null;
+  const clearSnapshotFallback = (): void => {
+    if (snapshotFallback !== null) clearTimeout(snapshotFallback);
+    snapshotFallback = null;
+  };
+  const armSnapshotFallback = (): void => {
+    clearSnapshotFallback();
+    snapshotFallback = setTimeout(() => {
+      snapshotFallback = null;
+      if (controller.signal.aborted || isConversationDisposed(id)) return;
+      if (get().sharedQueueStale) dropSharedQueueView(set);
+    }, SHARED_QUEUE_SNAPSHOT_TIMEOUT_MS);
+  };
+  // The first connection's snapshot is awaited from the first attempt (the
+  // composer opens before the stream does); a reconnect's only from its open.
+  let awaitingFirstSnapshot = true;
   // Consecutive 404s only — reset on any non-404 outcome (success or a
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
@@ -5439,6 +5747,13 @@ export async function startStreamPump(
       // an open that has hung past the stale window, not just a dead body.
       streamAttemptActivity.set(attempt, Date.now());
       try {
+        // Until this connection's `session.queue` snapshot lands, the shared
+        // queue may be missing another window's follow-up: idle sends queue.
+        if (awaitingFirstSnapshot) {
+          awaitingFirstSnapshot = false;
+          if (!get().sharedQueueStale) set({ sharedQueueStale: true });
+          armSnapshotFallback();
+        }
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
         try {
@@ -5550,6 +5865,14 @@ export async function startStreamPump(
           clearSseLog(id);
         }
         previousStreamEpoch = streamEpoch;
+        if (streamAnnouncesQueueSnapshot(streamRes)) {
+          if (!get().sharedQueueStale) set({ sharedQueueStale: true });
+          armSnapshotFallback();
+        } else {
+          // An older server: no queue snapshot is coming, nothing to wait for.
+          clearSnapshotFallback();
+          dropSharedQueueView(set);
+        }
         // Guard the byte stream with a silence watchdog: the server
         // heartbeats every 15 s, so a longer gap means a half-open socket
         // (laptop sleep, network path change, proxy reap). The guard ends
@@ -5610,6 +5933,10 @@ export async function startStreamPump(
         if (reason !== "dropped") break;
         if (!controller.signal.aborted && !isConversationDisposed(id)) {
           markLivePreviewsInterrupted(id, set);
+          // The dropped connection's view may already miss a follow-up another
+          // window queued: hold idle sends until the next snapshot or the fallback.
+          if (!get().sharedQueueStale) set({ sharedQueueStale: true });
+          if (snapshotFallback === null) armSnapshotFallback();
         }
       } finally {
         controller.signal.removeEventListener("abort", onOuterAbort);
@@ -5620,8 +5947,10 @@ export async function startStreamPump(
   } finally {
     if (statusReconcileTimer !== null) window.clearInterval(statusReconcileTimer);
     clearCatchupTimers();
+    clearSnapshotFallback();
     if (get().abortController === controller) {
-      set({ abortController: null });
+      // No stream: nothing more can be learned about other windows' queues.
+      set({ abortController: null, sharedQueueStale: false });
     }
   }
   /* eslint-enable no-await-in-loop */
@@ -7116,6 +7445,38 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // switched-away stream can't paint another session's viewers.
       applyToNamedConversation(event.conversationId, { viewers: event.viewers });
       return;
+    case "session_queue": {
+      // Full-state replacement, like presence. Own entries stay authoritative
+      // in `queuedMessages`; this list orders them against other windows'.
+      // The first one on a connection is its snapshot: the view is current.
+      applyToNamedConversation(event.conversationId, {
+        sharedQueue: event.messages,
+        sharedQueueStale: false,
+      });
+      // A list that disagrees with what this client published — in membership,
+      // order or content (the server dropped the share past its grace window,
+      // kept a stale one, or missed an update) — is republished.
+      const listed: QueuedMessageShare[] = event.messages
+        .filter((m) => m.clientId === CLIENT_ID)
+        .sort((a, b) => a.seq - b.seq)
+        .map((m) => ({
+          queue_id: m.queueId,
+          text: m.text,
+          attachments: m.attachments,
+          ...(m.stableId ? { stable_id: m.stableId } : {}),
+          requires_retry: m.requiresRetry,
+        }));
+      const expected =
+        heldQueueShares.get(event.conversationId)?.share ?? queueShareFor(event.conversationId);
+      if (JSON.stringify(listed) !== JSON.stringify(expected)) {
+        scheduleQueueSharePublish(event.conversationId, { force: true });
+      }
+      // A follow-up another window held ahead of ours may have just left the
+      // queue. The active conversation re-evaluates through the composer's
+      // effect; background conversations are driven from here.
+      useChatStore.getState().flushBackgroundQueues();
+      return;
+    }
     case "session_agent_changed":
       // The session's bound agent changed. Apply the binding the event itself carries immediately,
       // then re-derive the label-dependent state (most importantly
@@ -7197,6 +7558,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Captured BEFORE the patch below adopts event.responseId, so a
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
+      if (
+        event.conversationId === sourceConversationId &&
+        (event.status === "running" || event.status === "waiting" || event.status === "failed")
+      ) {
+        noteTurnEdgeForHeldShare(event.conversationId);
+      }
       // The status patch is conversation-scoped; the cache/query side effects
       // further down are deliberately NOT (they are keyed by explicit id, so a
       // sub-agent's status still refreshes its parent's rail).

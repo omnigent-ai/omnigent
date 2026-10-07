@@ -42,6 +42,8 @@ import type {
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
   SessionPresenceEvent,
+  SessionQueueEvent,
+  SharedQueuedMessage,
   SessionResource,
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
@@ -979,6 +981,48 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       viewers,
     } satisfies SessionPresenceEvent;
+  }
+  if (eventType === "session.queue") {
+    // A dropped snapshot holds idle sends until the fallback: say why.
+    const conversationId = data.conversation_id;
+    const rawMessages = data.messages;
+    if (typeof conversationId !== "string" || !conversationId || !Array.isArray(rawMessages)) {
+      console.warn("session.queue: dropping a malformed frame", data);
+      return null;
+    }
+    const messages: SharedQueuedMessage[] = [];
+    for (const raw of rawMessages) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        console.warn("session.queue: dropping a frame with a malformed entry", raw);
+        return null;
+      }
+      const entry = raw as Record<string, unknown>;
+      const rawAttachments = entry.attachments ?? [];
+      if (
+        typeof entry.queue_id !== "string" ||
+        typeof entry.client_id !== "string" ||
+        typeof entry.seq !== "number" ||
+        !Number.isFinite(entry.seq) ||
+        typeof entry.text !== "string" ||
+        !Array.isArray(rawAttachments) ||
+        rawAttachments.some((name) => typeof name !== "string")
+      ) {
+        console.warn("session.queue: dropping a frame with a malformed entry", entry);
+        return null;
+      }
+      const attachments = rawAttachments as string[];
+      messages.push({
+        queueId: entry.queue_id,
+        clientId: entry.client_id,
+        seq: entry.seq,
+        text: entry.text,
+        attachments,
+        ...(typeof entry.stable_id === "string" ? { stableId: entry.stable_id } : {}),
+        ...(typeof entry.created_by === "string" ? { createdBy: entry.created_by } : {}),
+        requiresRetry: entry.requires_retry === true,
+      });
+    }
+    return { type: "session_queue", conversationId, messages } satisfies SessionQueueEvent;
   }
 
   // Embedded-browser action request: asks the desktop relay to run the agent's

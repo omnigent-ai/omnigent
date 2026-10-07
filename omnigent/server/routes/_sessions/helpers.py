@@ -102,7 +102,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state, shutdown_state
+from omnigent.server import presence, queued_messages, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -9312,6 +9312,8 @@ async def _stream_live_events(
     viewer_user_id: str | None = None,
     viewer_idle: bool = False,
     presence_root_id: str | None = None,
+    queue_client_id: str | None = None,
+    queue_user_id: str | None = None,
 ) -> AsyncIterator[str]:
     """
     Yield SSE-formatted events from the conversation's live stream.
@@ -9375,6 +9377,13 @@ async def _stream_live_events(
         viewers of different agents/sub-agents in one session see
         each other. Required when *viewer_user_id* is set; ignored
         otherwise.
+    :param queue_client_id: The client instance id from the stream's
+        ``X-Omnigent-Client-Id`` header, e.g. ``"c_7f3a…"``. While this
+        stream is open, the client's published queued follow-ups for the
+        conversation stay visible to other clients; ``None`` (non-web
+        consumers) skips that tracking.
+    :param queue_user_id: Attribution identity owning *queue_client_id*'s
+        share (``None`` in single-user mode). Ignored without a client id.
     :returns: An async iterator of SSE message strings.
     :raises ValueError: If *viewer_user_id* is set without
         *presence_root_id* — a per-conversation presence scope would
@@ -9392,6 +9401,8 @@ async def _stream_live_events(
             presence_root_id, session_id, viewer_user_id, viewer_idle
         )
     try:
+        if queue_client_id is not None:
+            queued_messages.attach(session_id, client_id=queue_client_id, user_id=queue_user_id)
         # ``aclosing`` propagates outer ``aclose`` into ``subscribe``;
         # a bare ``async for`` would leave the subscriber slot until GC.
         async with contextlib.aclosing(
@@ -9430,14 +9441,22 @@ async def _stream_live_events(
         if not shutdown_state.server_shutting_down():
             yield "data: [DONE]\n\n"
     finally:
-        # The non-None checks besides presence_token's are type
-        # narrowing only: a minted token implies both were set above.
-        if (
-            presence_token is not None
-            and viewer_user_id is not None
-            and presence_root_id is not None
-        ):
-            presence.disconnect(presence_root_id, viewer_user_id, presence_token)
+        try:
+            # The non-None checks besides presence_token's are type
+            # narrowing only: a minted token implies both were set above.
+            if (
+                presence_token is not None
+                and viewer_user_id is not None
+                and presence_root_id is not None
+            ):
+                presence.disconnect(presence_root_id, viewer_user_id, presence_token)
+        finally:
+            # A failed presence cleanup must not skip this one: a share whose
+            # stream never detaches stays visible to every other client.
+            if queue_client_id is not None:
+                queued_messages.detach(
+                    session_id, client_id=queue_client_id, user_id=queue_user_id
+                )
 
 
 def _validate_terminal_launch_args(value: list[str] | None) -> list[str] | None:

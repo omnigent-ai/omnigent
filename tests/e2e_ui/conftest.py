@@ -634,6 +634,33 @@ def reset_mock_llm(mock_url: str) -> None:
     resp.raise_for_status()
 
 
+def wait_for_mock_gate(mock_url: str, *, timeout_s: float = 30.0) -> None:
+    """Block until a mock-LLM call is held on the gate (``GET /gate/pending``).
+
+    :param mock_url: Mock server base URL.
+    :param timeout_s: Max seconds to wait for a call to block.
+    :raises AssertionError: If no call blocks within the budget.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        resp = httpx.get(f"{mock_url}/gate/pending", timeout=5.0, trust_env=False)
+        if resp.json()["pending"]:
+            return
+        time.sleep(0.2)
+    raise AssertionError("no mock LLM call blocked on the gate in time")
+
+
+def release_mock_gate(mock_url: str) -> bool:
+    """Release the oldest mock-LLM call held on the gate (``POST /gate/release``).
+
+    :param mock_url: Mock server base URL.
+    :returns: Whether a held call was released.
+    """
+    resp = httpx.post(f"{mock_url}/gate/release", timeout=5.0, trust_env=False)
+    resp.raise_for_status()
+    return bool(resp.json()["released"])
+
+
 def seed_committed_items(session_id: str, items: list[Any]) -> None:
     """Append committed ``NewConversationItem``s straight into the store.
 

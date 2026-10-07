@@ -4478,6 +4478,59 @@
         "title": "QueuedEvent",
         "type": "object"
       },
+      "QueuedMessageInput": {
+        "description": "One follow-up a client holds in its queue for a session.\n\nThe message body stays in the client until it is POSTed as a\n`message` event; this is the display-and-ordering view other clients\nof the same session see in their queue strip.",
+        "properties": {
+          "attachments": {
+            "description": "Filenames of attachments queued with it.",
+            "items": {
+              "maxLength": 255,
+              "type": "string"
+            },
+            "maxItems": 32,
+            "title": "Attachments",
+            "type": "array"
+          },
+          "queue_id": {
+            "description": "The client's own id for the entry, e.g. `\"q_3\"`. Stable across republishes so reorders keep their slot.",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Queue Id",
+            "type": "string"
+          },
+          "requires_retry": {
+            "default": false,
+            "description": "The client's send failed and the entry waits for the user; other clients skip it when deciding whose head flushes next.",
+            "title": "Requires Retry",
+            "type": "boolean"
+          },
+          "stable_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Idempotency id the client will send with the POST.",
+            "title": "Stable Id"
+          },
+          "text": {
+            "description": "The message text, as shown in the strip.",
+            "maxLength": 4000,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "queue_id",
+          "text"
+        ],
+        "title": "QueuedMessageInput",
+        "type": "object"
+      },
       "ReadStatePutRequest": {
         "additionalProperties": false,
         "description": "Request body for `PUT /v1/sessions/{session_id}/read-state`.\n\nSets the *calling user's* read tracking for one session. Mirrors the\ntwo values the web client keeps per session: a \"last seen\" wall-clock\nbaseline (seconds since epoch) and an explicit \"marked unread\"\noverride. The unread dot shows when `updated_at > last_seen` and the\nsession is finished; `unread` separately pins the override so the\nthread the user is *viewing* (or a running one) still surfaces the dot\nwhere the automatic \"seen\" logic would otherwise suppress it.",
@@ -5388,6 +5441,7 @@
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
             "session.permission_mode": "#/components/schemas/SessionPermissionModeEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
+            "session.queue": "#/components/schemas/SessionQueueEvent",
             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
@@ -5466,6 +5520,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionPresenceEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionQueueEvent"
           },
           {
             "$ref": "#/components/schemas/SessionResourceCreatedEvent"
@@ -6871,6 +6928,150 @@
           "name"
         ],
         "title": "SessionProjectSummary",
+        "type": "object"
+      },
+      "SessionQueueEvent": {
+        "description": "The session's merged queue of client-held follow-ups changed \u2014 full state.\n\nEmitted on `GET /v1/sessions/{id}/stream` whenever any client\nreplaces its share via `PUT /v1/sessions/{id}/queue` or its share\nexpires after its streams close, and once to each newly-connected\nstream as a snapshot-on-connect. Every event carries the COMPLETE\nlist in flush order so clients replace their view wholesale. See\n`omnigent/server/queued_messages.py`.",
+        "properties": {
+          "conversation_id": {
+            "description": "The conversation whose queue this is.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "messages": {
+            "description": "Every client's queued follow-ups, head first, including the receiving client's own (it keeps its local copies authoritative and uses the list for ordering).",
+            "items": {
+              "$ref": "#/components/schemas/SessionQueueMessage"
+            },
+            "title": "Messages",
+            "type": "array"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.queue",
+            "description": "Always `\"session.queue\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "messages"
+        ],
+        "title": "SessionQueueEvent",
+        "type": "object"
+      },
+      "SessionQueueMessage": {
+        "description": "One queued follow-up in a session's merged queue.",
+        "properties": {
+          "attachments": {
+            "description": "Filenames of attachments queued with it.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Attachments",
+            "type": "array"
+          },
+          "client_id": {
+            "description": "The client instance that holds the message.",
+            "title": "Client Id",
+            "type": "string"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The publishing user's attribution identity, or `None` in single-user mode.",
+            "title": "Created By"
+          },
+          "queue_id": {
+            "description": "The owning client's id for the entry, e.g. `\"q_3\"`.",
+            "title": "Queue Id",
+            "type": "string"
+          },
+          "requires_retry": {
+            "default": false,
+            "description": "The owner's send failed; it waits for the user.",
+            "title": "Requires Retry",
+            "type": "boolean"
+          },
+          "seq": {
+            "description": "Session-wide ordering slot; lower flushes first.",
+            "format": "int64",
+            "title": "Seq",
+            "type": "integer"
+          },
+          "stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Idempotency id the owner will send with the POST.",
+            "title": "Stable Id"
+          },
+          "text": {
+            "description": "The message text, as shown in the strip.",
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "queue_id",
+          "client_id",
+          "seq",
+          "text"
+        ],
+        "title": "SessionQueueMessage",
+        "type": "object"
+      },
+      "SessionQueueSyncRequest": {
+        "description": "Body of `PUT /v1/sessions/{id}/queue`: one client's whole queue.\n\nReplaces the caller's previously published entries for the session;\nan empty list clears them. Other clients' entries are untouched.",
+        "properties": {
+          "client_id": {
+            "description": "Identity of the publishing client instance (one per page load), e.g. `\"c_7f3a\u2026\"`.",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Client Id",
+            "type": "string"
+          },
+          "messages": {
+            "description": "The client's queued follow-ups, head first.",
+            "items": {
+              "$ref": "#/components/schemas/QueuedMessageInput"
+            },
+            "maxItems": 50,
+            "title": "Messages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "client_id"
+        ],
+        "title": "SessionQueueSyncRequest",
         "type": "object"
       },
       "SessionReasoningEffortEvent": {
@@ -14228,6 +14429,53 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/queue": {
+      "put": {
+        "description": "Publish this client's queued follow-ups so other clients see them.\n\nThe web composer holds a message typed while the agent is busy in\na client-side queue until the turn ends. This replaces the calling\nclient's share of the session's queue (scoped by `client_id`, so\none window cannot drop another's entries) and broadcasts the\nmerged, flush-ordered list as `session.queue` to every stream of\nthe session. Requires edit access, like posting the message itself.\n\nA share lives while the client holds the session's SSE stream open\n(`X-Omnigent-Client-Id` on `GET /sessions/{id}/stream`) plus a\nshort grace window, so a closed window's entries disappear instead\nof blocking other clients' flushes.\n\n**Parameters**\n\n- `body` \u2014 The client's complete current queue for this session, head first; an empty list clears its share.\n\n**Returns:** `204 No Content`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists or the caller cannot see it; 403 if the caller can read the session but not edit it; 409 if the caller already holds the maximum populated shares for the session.",
+        "operationId": "replace_queued_messages_v1_sessions__session_id__queue_put",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionQueueSyncRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Replace Queued Messages",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/read-state": {
       "put": {
         "description": "Set the calling user's read-state for one session.\n\nRequires `LEVEL_READ` on the session in multi-user mode \u2014 you can\nonly track read-state for sessions you can see. Stores the values\nverbatim (the client enforces the baseline's monotonicity and the\nunread semantics); the server does not interpret them against\nsession status. Returns `204` \u2014 the client already has the\noptimistic state and re-reads the authoritative value on the next\n`GET /v1/sessions` poll.\n\n**Parameters**\n\n- `body` \u2014 The validated `ReadStatePutRequest`.\n\n**Returns:** An empty `204 No Content` response.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks read access.",
@@ -16030,7 +16278,7 @@
     },
     "/v1/sessions/{session_id}/stream": {
       "get": {
-        "description": "Subscribe to the session's live SSE event stream.\n\nDoes NOT replay history; clients reconcile via the snapshot\nendpoint. The generator emits `[DONE]` on normal completion\nand uses `finally` only for presence cleanup \u2014 see\n`_stream_live_events`.\n\nHolding this stream open registers the caller as a session\n*viewer* (presence): co-viewers' streams receive\n`session.presence` events on join/leave/idle edges, and\nthis stream's snapshot-on-connect includes the current\nviewer list. Presence is scoped to the session tree's root\nconversation, so viewers of different agents/sub-agents in\none session see each other. See\n`omnigent/server/presence.py`.\n\n**Returns:** An SSE `StreamingResponse`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
+        "description": "Subscribe to the session's live SSE event stream.\n\nDoes NOT replay history; clients reconcile via the snapshot\nendpoint. The generator emits `[DONE]` on normal completion\nand uses `finally` only for presence cleanup \u2014 see\n`_stream_live_events`.\n\nHolding this stream open registers the caller as a session\n*viewer* (presence): co-viewers' streams receive\n`session.presence` events on join/leave/idle edges, and\nthis stream's snapshot-on-connect includes the current\nviewer list. Presence is scoped to the session tree's root\nconversation, so viewers of different agents/sub-agents in\none session see each other. See\n`omnigent/server/presence.py`.\n\n**Parameters**\n\n- `client_id` \u2014 The web client instance's id, from the `X-Omnigent-Client-Id` header. While this stream is open, the follow-ups that client published via `PUT /sessions/{id}/queue` stay in the session's merged queue; they expire shortly after its last stream closes.\n\n**Returns:** An SSE `StreamingResponse`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
         "operationId": "stream_session_v1_sessions__session_id__stream_get",
         "parameters": [
           {
@@ -16052,6 +16300,22 @@
               "default": false,
               "title": "Idle",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Omnigent-Client-Id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Omnigent-Client-Id"
             }
           }
         ],

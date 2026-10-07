@@ -918,6 +918,35 @@ export interface SessionPresenceEvent {
   viewers: SessionViewer[];
 }
 
+/** One follow-up some client of the session holds queued (see {@link SessionQueueEvent}). */
+export interface SharedQueuedMessage {
+  /** The owning client's own id for the entry; unique per client only. */
+  queueId: string;
+  /** The SPA instance holding the message; `CLIENT_ID` for this one. */
+  clientId: string;
+  /** Session-wide flush order; lower sends first. */
+  seq: number;
+  text: string;
+  /** Filenames of attachments queued with it. */
+  attachments: string[];
+  stableId?: string;
+  /** The publishing user in multi-user sessions; absent single-user. */
+  createdBy?: string;
+  /** The owner's send failed and waits for them; it does not block other clients. */
+  requiresRetry: boolean;
+}
+
+/**
+ * `session.queue` — every client's queued follow-ups, in flush order. FULL
+ * state, not a delta: consumers replace their list wholesale. Includes this
+ * client's own entries, which stay authoritative locally.
+ */
+export interface SessionQueueEvent {
+  type: "session_queue";
+  conversationId: string;
+  messages: SharedQueuedMessage[];
+}
+
 /**
  * `session.superseded` — this conversation was superseded and the client
  * should follow to `targetConversationId`.
@@ -1031,5 +1060,6 @@ export type StreamEvent =
   | SessionTerminalActivityEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent
+  | SessionQueueEvent
   | SessionBtwSidechatEvent
   | BrowserActionRequestEvent;

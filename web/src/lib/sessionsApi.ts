@@ -14,6 +14,7 @@ import type { ConversationItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
+import { CLIENT_ID } from "@/lib/clientId";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
@@ -1405,6 +1406,31 @@ export async function postEvent(
   );
 }
 
+/** One queued follow-up as published to `PUT /v1/sessions/{id}/queue`. */
+export interface QueuedMessageShare {
+  queue_id: string;
+  text: string;
+  attachments: string[];
+  stable_id?: string;
+  requires_retry: boolean;
+}
+
+/**
+ * Publish this client's queued follow-ups so other windows of the session list
+ * them. Replaces the previous share (keyed by `CLIENT_ID`); `[]` clears it.
+ */
+export async function putQueuedMessages(
+  sessionId: string,
+  messages: QueuedMessageShare[],
+): Promise<void> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/queue`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ client_id: CLIENT_ID, messages }),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
 /**
  * Open the session live-tail SSE stream. Returns the raw fetch
  * `Response` so callers can pipe `res.body` through `parseSseStream`
@@ -1414,7 +1440,9 @@ export async function postEvent(
  * Holding this stream open registers the user as a session *viewer*
  * (presence circles). `opts.idle` is the connect-time presence idle
  * flag — the stream URL is the entire presence uplink, so an idle
- * flip mid-view arrives as a reconnect carrying the new value.
+ * flip mid-view arrives as a reconnect carrying the new value. The
+ * `X-Omnigent-Client-Id` header ties the queued follow-ups this client
+ * published (`putQueuedMessages`) to the stream's lifetime.
  *
  * The fetch itself throws only on network failure; HTTP errors
  * surface as `res.ok === false`. Callers must check `res.ok` before
@@ -1427,7 +1455,7 @@ export function openSessionStream(
 ): Promise<Response> {
   const query = opts?.idle ? "?idle=true" : "";
   return authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/stream${query}`, {
-    headers: { Accept: "text/event-stream" },
+    headers: { Accept: "text/event-stream", "X-Omnigent-Client-Id": CLIENT_ID },
     signal,
   });
 }

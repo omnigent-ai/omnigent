@@ -1307,6 +1307,51 @@ class SessionEventInput(BaseModel):
         return data
 
 
+class QueuedMessageInput(BaseModel):
+    """
+    One follow-up a client holds in its queue for a session.
+
+    The message body stays in the client until it is POSTed as a
+    ``message`` event; this is the display-and-ordering view other clients
+    of the same session see in their queue strip.
+
+    :param queue_id: The client's own id for the entry, e.g. ``"q_3"``.
+        Stable across republishes so reorders keep their slot.
+    :param text: The message text, as shown in the strip.
+    :param attachments: Filenames of attachments queued with it.
+    :param stable_id: Idempotency id the client will send with the POST.
+    :param requires_retry: The client's send failed and the entry waits
+        for the user; other clients skip it when deciding whose head
+        flushes next.
+    """
+
+    queue_id: str = Field(min_length=1, max_length=64)
+    text: str = Field(max_length=4000)
+    attachments: list[Annotated[str, Field(max_length=255)]] = Field(
+        default_factory=list, max_length=32
+    )
+    stable_id: str | None = Field(default=None, max_length=64)
+    requires_retry: bool = False
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class SessionQueueSyncRequest(BaseModel):
+    """
+    Body of ``PUT /v1/sessions/{id}/queue``: one client's whole queue.
+
+    Replaces the caller's previously published entries for the session;
+    an empty list clears them. Other clients' entries are untouched.
+
+    :param client_id: Identity of the publishing client instance (one per
+        page load), e.g. ``"c_7f3a…"``.
+    :param messages: The client's queued follow-ups, head first.
+    """
+
+    client_id: str = Field(min_length=1, max_length=64)
+    messages: list[QueuedMessageInput] = Field(default_factory=list, max_length=50)
+
+
 class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
@@ -4048,6 +4093,54 @@ class SessionPresenceEvent(_SSEEventBase):
     viewers: list[PresenceViewer]
 
 
+class SessionQueueMessage(BaseModel):
+    """
+    One queued follow-up in a session's merged queue.
+
+    :param queue_id: The owning client's id for the entry, e.g. ``"q_3"``.
+    :param client_id: The client instance that holds the message.
+    :param seq: Session-wide ordering slot; lower flushes first.
+    :param text: The message text, as shown in the strip.
+    :param attachments: Filenames of attachments queued with it.
+    :param stable_id: Idempotency id the owner will send with the POST.
+    :param created_by: The publishing user's attribution identity, or
+        ``None`` in single-user mode.
+    :param requires_retry: The owner's send failed; it waits for the user.
+    """
+
+    queue_id: str
+    client_id: str
+    seq: int
+    text: str
+    attachments: list[str] = Field(default_factory=list)
+    stable_id: str | None = None
+    created_by: str | None = None
+    requires_retry: bool = False
+
+
+class SessionQueueEvent(_SSEEventBase):
+    """
+    The session's merged queue of client-held follow-ups changed — full state.
+
+    Emitted on ``GET /v1/sessions/{id}/stream`` whenever any client
+    replaces its share via ``PUT /v1/sessions/{id}/queue`` or its share
+    expires after its streams close, and once to each newly-connected
+    stream as a snapshot-on-connect. Every event carries the COMPLETE
+    list in flush order so clients replace their view wholesale. See
+    ``omnigent/server/queued_messages.py``.
+
+    :param type: Always ``"session.queue"``.
+    :param conversation_id: The conversation whose queue this is.
+    :param messages: Every client's queued follow-ups, head first,
+        including the receiving client's own (it keeps its local copies
+        authoritative and uses the list for ordering).
+    """
+
+    type: Literal["session.queue"]
+    conversation_id: str
+    messages: list[SessionQueueMessage]
+
+
 class ElicitationRequestParams(BaseModel):
     """
     Inner ``params`` block of a :class:`ElicitationRequestEvent`.
@@ -4747,6 +4840,7 @@ ServerStreamEvent = Annotated[
     | SessionSupersededEvent
     | SessionBtwSidechatEvent
     | SessionPresenceEvent
+    | SessionQueueEvent
     # ── Transient (SSE-only) — session resource lifecycle ─────
     | SessionResourceCreatedEvent
     | SessionResourceDeletedEvent

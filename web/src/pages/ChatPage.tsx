@@ -113,7 +113,7 @@ import {
   supportsSideChat,
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
-import { shouldQueueSend } from "@/lib/messageQueue";
+import { mergeQueuedMessages, shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
@@ -908,9 +908,9 @@ export function ChatPage() {
 
   const onSend = useCallback(
     (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
-      if (!agentId) return;
+      if (!agentId) return undefined;
       // No server session yet (still creating) — nothing to POST to.
-      if (isTempConvId(urlConvId)) return;
+      if (isTempConvId(urlConvId)) return undefined;
       // An unbound coding clone (fork-source label) needs a directory before
       // it can run: open the picker and stash this message to replay after
       // the bind. Pin the prompt to THIS session so it replays here, never
@@ -919,12 +919,12 @@ export function ChatPage() {
       if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
         setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [], replyDraft });
         setResumeDirDialogOpen(true);
-        return;
+        return undefined;
       }
       // Recover the unreachable host before dispatching another turn.
       if (urlConvId && isUnreachable) {
         void reconnect();
-        return;
+        return undefined;
       }
       // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
       // FIFO immediately when genuinely idle, so nothing stalls. With the
@@ -945,10 +945,11 @@ export function ChatPage() {
           chat.queuedMessages,
           readAlwaysSteer(),
           opensSideChat,
+          chat.sharedQueue,
+          chat.sharedQueueStale,
         )
       ) {
-        chat.enqueueMessage(text, files, replyDraft);
-        return;
+        return chat.enqueueMessage(text, files, replyDraft);
       }
       void useChatStore.getState().send(text, agentId, files, {
         replyDraft,
@@ -960,6 +961,7 @@ export function ChatPage() {
           navigate(`/c/${newId}`, { replace: true });
         },
       });
+      return undefined;
     },
     [
       agentId,
@@ -1386,7 +1388,7 @@ interface MainAgentSurfaceProps {
   liveness: SessionLiveness;
   agentsError: unknown;
   disabled: boolean;
-  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => boolean | void;
   /**
    * Invoke a skill via the `slash_command` event path. Gated off inside
    * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
@@ -1691,7 +1693,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   const handleSend = useCallback(
     (...args: Parameters<MainAgentSurfaceProps["onSend"]>) => {
       setSendScrollNonce((n) => n + 1);
-      onSend(...args);
+      return onSend(...args);
     },
     [onSend],
   );
@@ -1965,7 +1967,7 @@ interface ComposerProps {
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
   disabled: boolean;
-  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => boolean | void;
   /**
    * Send a recognised skill as a `slash_command` event (the REPL's wire
    * shape) instead of plaintext. When present and the typed command names
@@ -2509,6 +2511,8 @@ function ComposerImpl(
   // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
+  const sharedQueue = useChatStore((s) => s.sharedQueue);
+  const sharedQueueStale = useChatStore((s) => s.sharedQueueStale);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const flushBoundAgentId = useChatStore((s) => s.boundAgentId);
   const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
@@ -2524,7 +2528,8 @@ function ComposerImpl(
   // re-fires this effect and drains. `boundAgentId` is a dep because the flush
   // needs it: on navigate-back the binding lands after the status settles, and
   // without this dep the effect wouldn't re-fire to drain a queue for the
-  // returned-to conversation.
+  // returned-to conversation. `sharedQueue`/`sharedQueueStale`: shared-queue
+  // updates can free the head without a local status change.
   useEffect(() => {
     if (unreachable) return;
     maybeFlushQueuedHead();
@@ -2532,6 +2537,8 @@ function ComposerImpl(
     status,
     sessionStatus,
     queuedMessages,
+    sharedQueue,
+    sharedQueueStale,
     conversationId,
     flushBoundAgentId,
     unreachable,
@@ -2572,8 +2579,14 @@ function ComposerImpl(
     workspace: composerWorkspace ?? null,
     creationBranch: composerSession?.gitBranch ?? composerBranch ?? null,
   });
-  const composerQueuedMessages = queuedMessages.filter(
-    (message) => message.conversationId === conversationId,
+  // This client's own queue for the conversation plus the follow-ups other
+  // windows of the same session hold, in session-wide flush order.
+  const composerQueuedMessages = useMemo(
+    () =>
+      conversationId === null
+        ? []
+        : mergeQueuedMessages(queuedMessages, sharedQueue, conversationId),
+    [queuedMessages, sharedQueue, conversationId],
   );
   const hasQueuedComposerMessages = composerQueuedMessages.length > 0;
   const composerContextWindow = useChatStore((s) => s.contextWindow);
@@ -3053,6 +3066,9 @@ function ComposerImpl(
             chat.sessionStatus,
             chat.queuedMessages,
             readAlwaysSteer(),
+            false,
+            chat.sharedQueue,
+            chat.sharedQueueStale,
           )
         ) {
           toast.error("Compact is disabled while a chat is in progress", { richColors: true });
@@ -3446,8 +3462,8 @@ function ComposerImpl(
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
-    if (trimmed) appendEntry(fullText, storedReplyDraft);
     const sendFiles = files.length > 0 ? files : undefined;
+    let taken: boolean | void;
     if (draft.quotes.length > 0) {
       // Preserve authored whitespace and quote provenance, including mention markers.
       const outgoing = {
@@ -3456,10 +3472,13 @@ function ComposerImpl(
           index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
         ),
       };
-      onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
+      taken = onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
-      onSend(mentionPreamble + trimmed, sendFiles);
+      taken = onSend(mentionPreamble + trimmed, sendFiles);
     }
+    // A message the queue refused (it is full) stays in the composer.
+    if (taken === false) return;
+    if (trimmed) appendEntry(fullText, storedReplyDraft);
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();
