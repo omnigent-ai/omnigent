@@ -456,7 +456,7 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
 
   it("shares inherited namespaces instead of redeclaring them on each mesh", () => {
     const count = 80;
-    const namespace = `https://example.test/${"n".repeat(64)}`;
+    const namespace = production;
     const input = archive({
       "3D/root.model": model(
         Array.from({ length: count }, (_, index) => mesh(index + 1, 1, 'x:note="a"')).join("") +
@@ -485,19 +485,26 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
   });
 
   it("bounds inherited namespace expansion on first mesh emissions", () => {
-    check(archive());
     const count = 80;
     const namespace = `https://example.test/${"n".repeat(16384)}`;
-    const input = archive({
-      "3D/root.model": model(
-        Array.from({ length: count }, (_, index) => mesh(index + 1, 1, 'x:note="a"')).join("") +
-          composite(
-            100,
-            Array.from({ length: count }, (_, index) => component(index + 1, index * 2)).join(""),
-          ),
-      ).replace("<model ", `<model xmlns:x="${namespace}" `),
-      "Metadata/model_settings.config": `<config>${config(Array.from({ length: count }, (_, index) => part(index + 1, (index % 2) + 1)).join(""))}</config>`,
-    });
+    const fixture = (uri: string) =>
+      archive({
+        "3D/root.model": model(
+          Array.from({ length: count }, (_, index) => mesh(index + 1, 1, 'x:note="a"')).join("") +
+            composite(
+              100,
+              Array.from({ length: count }, (_, index) => component(index + 1, index * 2)).join(""),
+            ),
+        ).replace("<model ", `<model xmlns:x="${uri}" `),
+        "Metadata/model_settings.config": `<config>${config(Array.from({ length: count }, (_, index) => part(index + 1, (index % 2) + 1)).join(""))}</config>`,
+      });
+    check(
+      fixture(production),
+      Array.from({ length: count }, (_, index) => (index % 2 ? "4dc5a0" : "f53b9d")),
+      Array.from({ length: count }, (_, index) => index * 2),
+      Array(count).fill(1),
+    );
+    const input = fixture(namespace);
     const selected = Object.values(unzipSync(new Uint8Array(input))).reduce(
       (total, entry) => total + entry.length,
       0,
@@ -565,9 +572,114 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     check(input, ["f53b9d", "4dc5a0"], [0, 20], [1, 1]);
   });
 
+  it("rejects prefix substitution before any oversized serialization", () => {
+    check(archive());
+    const prefix = "n".repeat(8192);
+    const input = archive({
+      "3D/root.model": model(
+        mesh(1, 1, `xmlns:${prefix}="urn:x"`).replace(
+          "</vertices>",
+          `${'<vertex x="0" y="0" z="0" a:note="a"/>'.repeat(180)}</vertices>`,
+        ) +
+          mesh(2, 2) +
+          composite(100, component(1) + component(2, 10)),
+      ).replace("<model ", '<model xmlns:a="urn:x" '),
+    });
+    const selected = Object.values(unzipSync(new Uint8Array(input))).reduce(
+      (total, entry) => total + entry.byteLength,
+      0,
+    );
+    const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+    try {
+      expect(applyThreeMfColors(input)).toBe(input);
+      for (const result of serializer.mock.results)
+        expect(strToU8(String(result.value)).byteLength).toBeLessThanOrEqual(
+          selected * 2 + 1024 * 1024,
+        );
+    } finally {
+      serializer.mockRestore();
+    }
+    check(input, ["ffffff", "ffffff"]);
+  });
+
+  it("admits slicer namespaces and passes unsupported namespace layouts through", () => {
+    const slicer = "http://schemas.bambulab.com/package/2021";
+    const admitted = archive({
+      "3D/root.model": model(
+        mesh(1, 1, 'p:UUID="one" BambuStudio:note="colour"') +
+          mesh(2, 2) +
+          composite(100, component(1) + component(2, 10)),
+      ).replace("<model ", `<model xmlns:BambuStudio="${slicer}" `),
+    });
+    const admittedSerializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+    try {
+      check(admitted);
+      expect(admittedSerializer.mock.calls.length).toBe(1);
+    } finally {
+      admittedSerializer.mockRestore();
+    }
+    const standard = model(mesh(1) + mesh(2, 2) + composite(100, component(1) + component(2, 10)));
+    const layouts: Record<string, string | null>[] = [
+      { "3D/root.model": standard.replace("<model ", '<model xmlns:q="urn:unknown" ') },
+      {
+        "3D/root.model": standard.replace(
+          "<model ",
+          `<model xmlns:${"q".repeat(13)}="${production}" `,
+        ),
+      },
+      {
+        "3D/root.model": standard.replace(
+          '<object id="1"',
+          `<object xmlns:q="${production}" id="1"`,
+        ),
+      },
+      {
+        "3D/root.model": standard.replace("<model ", `<model xmlns:q="${production}" `),
+        "3D/Objects/other.model": standard.replace("<model ", `<model xmlns:q="${slicer}" `),
+      },
+    ];
+    const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+    try {
+      for (const overrides of layouts) {
+        const input = archive(overrides);
+        serializer.mockClear();
+        expect(applyThreeMfColors(input)).toBe(input);
+        expect(serializer.mock.calls.length).toBe(0);
+        check(input, ["ffffff", "ffffff"]);
+      }
+    } finally {
+      serializer.mockRestore();
+    }
+  });
+
+  it("resolves config parts with linear inherited-slot work", () => {
+    const count = 512;
+    const input = archive({
+      "Metadata/model_settings.config": `<config>${config(Array.from({ length: count }, (_, index) => (index === 1 ? part(2, 2) : `<part id="${index + 1}"/>`)).join(""), 1)}</config>`,
+    });
+    const getter = Object.getOwnPropertyDescriptor(Element.prototype, "children")!.get!;
+    let visited = 0;
+    const childrenGetter = vi
+      .spyOn(Element.prototype, "children", "get")
+      .mockImplementation(function (this: Element) {
+        const result = getter.call(this) as HTMLCollection;
+        if (this.localName === "object" && this.parentElement?.localName === "config") {
+          visited += result.length;
+          if (visited > count * 8) throw new Error("Quadratic config rescanning");
+        }
+        return result;
+      });
+    try {
+      check(input);
+      expect(visited).toBeLessThan(count * 8);
+    } finally {
+      childrenGetter.mockRestore();
+    }
+  });
+
   it("bounds inherited namespace expansion before standalone subtree serialization", () => {
     const namespace = `urn:${"x".repeat(8192)}`;
-    const fixture = (count: number) =>
+    const fixture = (count: number, uri = namespace) =>
       archive({
         "3D/root.model": model(
           mesh(1).replace(
@@ -576,9 +688,9 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
           ) +
             mesh(2, 2) +
             composite(100, component(1) + component(2, 10)),
-        ).replace("<model ", `<model xmlns:x="${namespace}" `),
+        ).replace("<model ", `<model xmlns:x="${uri}" `),
       });
-    const admitted = fixture(2);
+    const admitted = fixture(2, production);
     expect(applyThreeMfColors(admitted)).not.toBe(admitted);
     check(admitted);
     const input = fixture(180);
