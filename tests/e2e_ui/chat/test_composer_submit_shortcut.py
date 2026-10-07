@@ -102,3 +102,42 @@ def test_submit_with_mod_enter_persists_and_is_the_only_send_gesture(
         "aria-checked", "true"
     )
     _screenshot(page)
+
+
+def test_alt_enter_inserts_newline_in_both_composers(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Alt/Option+Enter adds a line break like Shift+Enter; plain Enter still sends.
+
+    Chromium inserts nothing for Alt+Enter in a textarea, so this needs a real
+    browser: a component test can't tell a native insert from the composer's.
+    """
+    base_url, session_id = seeded_session
+    posts = _record_message_posts(page, session_id)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_label(_COMPOSER_LABEL)
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill("")
+    composer.press_sequentially("first line")
+    composer.press("Alt+Enter")
+    composer.press_sequentially("second line")
+    composer.press("Shift+Enter")
+    composer.press_sequentially("third line")
+    expect(composer).to_have_value("first line\nsecond line\nthird line")
+    page.wait_for_timeout(300)
+    assert posts == []
+
+    composer.press("Enter")
+    _wait_for_posts(page, posts, 1)
+    assert posts == ["first line\nsecond line\nthird line"]
+
+    page.goto(base_url)
+    landing = page.get_by_test_id("new-chat-landing-input")
+    expect(landing).to_be_visible(timeout=30_000)
+    landing.press_sequentially("plan")
+    landing.press("Alt+Enter")
+    landing.press_sequentially("then build")
+    expect(landing).to_have_value("plan\nthen build")
+    expect(page).to_have_url(f"{base_url}/")
