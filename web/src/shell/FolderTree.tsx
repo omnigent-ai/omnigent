@@ -1008,7 +1008,7 @@ function FileRowItem({
         linesRemoved={fileStatus?.lines_removed}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(rowRef, primaryActionRef, actionsOpen) => (
+        {(rowRef, actionsOpen) => (
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
@@ -1021,7 +1021,6 @@ function FileRowItem({
           >
             <IndentGuides depth={depth} />
             <button
-              ref={primaryActionRef}
               type="button"
               className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
               onClick={() => !isDeleted && onFileSelect(path)}
@@ -1183,7 +1182,7 @@ function SearchDirRow({
         onBrowse={() => (onNavigateDir ? onNavigateDir(file.path) : onRevealDir(file.path))}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(rowRef, primaryActionRef, actionsOpen) => (
+        {(rowRef, actionsOpen) => (
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
@@ -1191,7 +1190,6 @@ function SearchDirRow({
             className="group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted [-webkit-touch-callout:none]"
           >
             <button
-              ref={primaryActionRef}
               type="button"
               className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
               onClick={() => onRevealDir(file.path)}
@@ -1333,7 +1331,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
       onBrowse={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
       onOpenInfo={onOpenInfo ?? (() => {})}
     >
-      {(rowRef, primaryActionRef, actionsOpen) => (
+      {(rowRef, actionsOpen) => (
         <div
           ref={rowRef}
           data-actions-open={actionsOpen}
@@ -1348,7 +1346,6 @@ const TreeNodeRow = memo(function TreeNodeRow({
         >
           <IndentGuides depth={depth} />
           <button
-            ref={primaryActionRef}
             type="button"
             className="group/folder flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
             onClick={() => onTogglePath(node.path)}
