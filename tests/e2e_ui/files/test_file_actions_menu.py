@@ -34,6 +34,25 @@ def _row(panel: Locator) -> Locator:
     return row
 
 
+def _assert_menu_near_row(page: Page, row_box: dict[str, float] | None) -> None:
+    menu_box = page.get_by_role("menu", name=f"More actions for {_FILE_NAME}").bounding_box()
+    assert row_box is not None and menu_box is not None
+    assert row_box["y"] > 200, f"row should be partway down the list: {row_box}"
+    horizontal_gap = max(
+        0,
+        row_box["x"] - (menu_box["x"] + menu_box["width"]),
+        menu_box["x"] - (row_box["x"] + row_box["width"]),
+    )
+    vertical_gap = max(
+        0,
+        row_box["y"] - (menu_box["y"] + menu_box["height"]),
+        menu_box["y"] - (row_box["y"] + row_box["height"]),
+    )
+    assert horizontal_gap <= 100 and vertical_gap <= 100, (
+        f"menu should open near its focused row: row={row_box}, menu={menu_box}"
+    )
+
+
 def test_file_row_context_menu_keyboard_info_and_copy(
     page: Page,
     seeded_session: tuple[str, str],
@@ -84,6 +103,35 @@ def test_file_row_context_menu_keyboard_info_and_copy(
         arg=_FILE_NAME,
     )
     assert page.evaluate("() => navigator.clipboard.readText()") == _FILE_NAME
+
+
+@pytest.mark.parametrize("key", ["ContextMenu", "Shift+F10"])
+def test_keyboard_context_menu_opens_near_focused_row(
+    page: Page,
+    seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+    key: str,
+) -> None:
+    """Keyboard menu shortcuts position the menu at a focused row down the list."""
+    base_url, session_id = seeded_session
+    target = _seed_file(page, base_url, session_id, request)
+    for index in range(5):
+        filler = target.parent / f"a row action filler {index}.txt"
+        filler.write_text(f"filler {index}", encoding="utf-8")
+        request.addfinalizer(lambda path=filler: path.unlink(missing_ok=True))
+
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role("tab", name="Files").click()
+    row = _row(panel)
+    expect(row.get_by_role("button", name=re.compile("^More actions for"))).to_have_count(0)
+    row_box = row.bounding_box()
+    row.press(key)
+    expect(page.get_by_role("menu", name=f"More actions for {_FILE_NAME}")).to_be_visible()
+    _assert_menu_near_row(page, row_box)
+    page.keyboard.press("Escape")
+    expect(row).to_be_focused()
 
 
 def test_info_copy_tooltip_stays_within_dialog_at_desktop_and_mobile_widths(

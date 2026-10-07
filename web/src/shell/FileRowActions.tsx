@@ -182,8 +182,14 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
         onKeyDown={(event) => {
           if (event.key === "F10" && event.shiftKey) {
             event.preventDefault();
+            const rowBounds = event.currentTarget.getBoundingClientRect();
             event.currentTarget.dispatchEvent(
-              new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+              new MouseEvent("contextmenu", {
+                bubbles: true,
+                cancelable: true,
+                clientX: rowBounds.left,
+                clientY: rowBounds.bottom,
+              }),
             );
           }
         }}
