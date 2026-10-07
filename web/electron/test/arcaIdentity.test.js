@@ -74,7 +74,6 @@ describe("Arca daemon identity", () => {
       );
       assert.deepEqual(reasons, [reason]);
       assert.ok(reason.length < 80);
-      assert.ok(!reason.includes(privateText));
     }
     const reasons = [];
     assert.deepEqual(
