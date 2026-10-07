@@ -164,6 +164,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
@@ -805,10 +806,15 @@ function SidebarImpl({
   );
   // Stable identity (useStableCallback) so its changing deps don't defeat the row memo.
   const togglePinnedConversation = useStableCallback((conversationId: string) => {
-    togglePinnedMutation.mutate({
-      id: conversationId,
-      pinned: !pinnedIdSet.has(conversationId),
-    });
+    if (!pinnedIdSet.has(conversationId)) {
+      togglePinnedMutation.mutate({ id: conversationId, pinned: true });
+      return;
+    }
+    unpinWithUndo(
+      togglePinnedMutation.mutateAsync,
+      conversationId,
+      pinnedConversations.find((c) => c.id === conversationId),
+    );
   });
 
   // One-time migration: pins used to live only in localStorage. Push any
@@ -1998,8 +2004,9 @@ function ConversationList({
       if (action.kind === "move") {
         moveToProject.mutate({ id: dragged.id, project: action.project });
         // Unpin a pinned session so it actually drops into the folder instead of
-        // staying floated up in Pinned (pin outranks project membership).
-        if (action.unpin) onTogglePinned(dragged.id);
+        // staying floated up in Pinned (pin outranks project membership). No
+        // Undo pill: re-pinning would leave the session filed in the new folder.
+        if (action.unpin) pinAt({ id: dragged.id, pinned: false }).catch(() => {});
         // Open the (possibly brand-new) folder so the session is visible in it.
         expandProject(action.project);
         return;
@@ -2038,7 +2045,7 @@ function ConversationList({
         // Unfile silently — a first-class project persists when emptied, so
         // dragging out its last session deletes nothing. Mirrors the kebab flow.
         moveToProject.mutate({ id: dragged.id, project: "" });
-        if (action.unpin) onTogglePinned(dragged.id);
+        if (action.unpin) pinAt({ id: dragged.id, pinned: false }).catch(() => {});
       }
     },
     [
