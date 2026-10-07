@@ -351,12 +351,12 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         render();
 
         const onResize = () => {
-          controls.handleResize();
           const r = container.getBoundingClientRect();
           if (r.width === 0 || r.height === 0) return;
           camera.aspect = r.width / r.height;
           camera.updateProjectionMatrix();
           renderer.setSize(r.width, r.height);
+          controls.handleResize();
         };
         res.resizeObserver = new ResizeObserver(onResize);
         res.resizeObserver.observe(container);
