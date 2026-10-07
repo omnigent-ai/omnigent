@@ -27,6 +27,7 @@ const { execFile, execFileSync, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
 
 /**
  * Connecting may cold-start the EC2 instance, which takes minutes — give the
@@ -165,7 +166,30 @@ function buildArcaArgs(serverUrl, login = false) {
     // match); SAFE_URL_RE already bars `'`, so the quotes can't be broken out of.
     ...(login
       ? ["login", `'${url.toString()}'`]
-      : ["host", "--server", `'${url.toString()}'`, "--background", "--non-interactive"]),
+      : [
+          "host",
+          "--server",
+          `'${url.toString()}'`,
+          "--background",
+          "--non-interactive",
+          "&&",
+          "{",
+          "printf",
+          `'\\n${IDENTITY_START}\\n'`,
+          ";",
+          "isaac",
+          "omni",
+          "host",
+          "status",
+          "--server",
+          `'${url.toString()}'`,
+          "--json",
+          ";",
+          "printf",
+          `'\\n${IDENTITY_END}\\n'`,
+          ";",
+          "}",
+        ]),
   ];
 }
 
@@ -285,6 +309,7 @@ function lastLine(text) {
  *   promise: Promise<{
  *     ok: boolean,
  *     alreadyRunning?: boolean,
+ *     identity?: { serverUrl: string, hostId: string },
  *     error?: string,
  *     authError?: boolean,
  *     canceled?: boolean,
@@ -378,7 +403,12 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
       if (code === 0) {
         // `omni host --background` reuses a healthy daemon and says so — the
         // caller can then skip waiting for a host that was online all along.
-        settle({ ok: true, alreadyRunning: /already running/i.test(stdout + stderr) });
+        const identity = login ? null : readArcaIdentity(stdout, serverUrl);
+        settle({
+          ok: true,
+          alreadyRunning: /already running/i.test(stdout + stderr),
+          ...(identity ? { identity } : {}),
+        });
         return;
       }
       if (login) {

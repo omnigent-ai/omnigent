@@ -154,6 +154,22 @@ function flowHarness() {
 }
 
 describe("arca connect console flow", () => {
+  it("does not share another workspace's in-flight identity", async () => {
+    const { world, flow } = flowHarness();
+    const server = "https://account.databricks.com/omnigent?o=123";
+    const first = flow.run(null, server);
+    const win = world.windows[0];
+    world.sendFrom(win, "arca-connect:confirm");
+    const second = await flow.run(null, server.replace("123", "456"));
+    assert.equal(second.ok, false);
+    assert.equal(second.identity, undefined);
+    assert.equal(world.windows.length, 1);
+    assert.equal(world.connects.length, 1);
+    const identity = { serverUrl: server, hostId: "a".repeat(32) };
+    world.connects[0].finish({ ok: true, identity });
+    assert.deepEqual((await first).identity, identity);
+  });
+
   it("requires shell consent to sign in, then retries the identical target only once", async () => {
     const { world, flow } = flowHarness();
     const url = "https://account.databricks.com/omnigent?o=123";

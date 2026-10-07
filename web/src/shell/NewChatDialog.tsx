@@ -5097,6 +5097,12 @@ export function NewChatLandingScreen() {
         }
         return;
       }
+      if (res.identity) {
+        writeArcaHostId(res.identity.hostId);
+        await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+        selectHost(res.identity.hostId);
+        return;
+      }
       // The box's daemon was already connected — its host has been in the
       // list all along (just not recognized as Arca, e.g. enrolled before
       // this app remembered ids), so waiting for a NEW online host would

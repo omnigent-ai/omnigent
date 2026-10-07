@@ -3063,6 +3063,24 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
   });
 
+  it("selects the exact captured Arca host rather than racing newly online hosts", async () => {
+    vi.mocked(connectArcaHost).mockResolvedValue({
+      ok: true,
+      alreadyRunning: true,
+      identity: { serverUrl: "https://server.databricks.com/omnigent", hostId: "actual-arca" },
+    });
+    vi.mocked(fetchHosts).mockResolvedValue([
+      { host_id: "unrelated", name: "new-host", owner: "me", status: "online" },
+    ]);
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+    await waitFor(() =>
+      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("actual-arca"),
+    );
+    expect(localStorage.getItem("omnigent:arca-host-id")).toBe("actual-arca");
+  });
+
   it("selects the host that newly came online after a successful connect", async () => {
     vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
     // First post-connect poll already sees the freshly-registered Arca host.

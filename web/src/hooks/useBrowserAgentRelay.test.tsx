@@ -1,4 +1,6 @@
 import { renderHook } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // supportsBrowser gates the whole relay; force it true so the hook registers.
@@ -13,12 +15,23 @@ const authenticatedFetch = vi.fn();
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: (...args: unknown[]) => authenticatedFetch(...args),
 }));
+const prefetchSessionHostChain = vi.fn();
+vi.mock("@/hooks/useSession", () => ({
+  prefetchSessionHostChain: (...args: unknown[]) => prefetchSessionHostChain(...args),
+}));
+import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { useBrowserAgentRelay } from "./useBrowserAgentRelay";
 
 const CONV = "conv_relay";
+const renderRelay = (id = CONV) =>
+  renderHook(() => useBrowserAgentRelay(id), {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={new QueryClient()}>{children}</QueryClientProvider>
+    ),
+  });
 
 /** Build a `browser.action_request` event for the bus. */
 function actionEvent(
@@ -61,7 +74,7 @@ async function runAction(
   opts: { expectResult?: boolean; source?: string } = {},
 ): Promise<void> {
   const { expectResult = true, source = CONV } = opts;
-  renderHook(() => useBrowserAgentRelay(CONV));
+  renderRelay();
   emitBrowserActionRequest(evt, source);
   if (expectResult) {
     await vi.waitFor(() => {
@@ -96,6 +109,11 @@ function postedResult(): Record<string, unknown> {
 
 beforeEach(() => {
   authenticatedFetch.mockReset();
+  prefetchSessionHostChain.mockReset().mockResolvedValue(undefined);
+  for (const id of [CONV, "conv_visible_B", "conv_background_A", "parent"]) {
+    setSessionHost(id, null);
+    setSessionParent(id, null);
+  }
 });
 
 afterEach(() => {
@@ -167,7 +185,7 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     const bridge = installBridge();
     authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValueOnce(jsonResponse({}));
 
-    renderHook(() => useBrowserAgentRelay(VISIBLE));
+    renderRelay(VISIBLE);
     emitBrowserActionRequest(actionEvent("navigate", { url: "https://a" }), BACKGROUND);
 
     await vi.waitFor(() => {
@@ -202,6 +220,63 @@ describe("useBrowserAgentRelay — action dispatch", () => {
   beforeEach(() => {
     // Every dispatch test wins the claim, then a benign result POST.
     authenticatedFetch.mockResolvedValue(WON);
+  });
+  it("derives inherited provenance from the source session, never model args or visible host", async () => {
+    const bridge = installBridge();
+    setSessionHost(CONV, "local-host");
+    setSessionHost("parent", "arca-host");
+    setSessionParent("conv_background_A", "parent");
+    await runAction(
+      actionEvent("navigate", {
+        url: "http://localhost:5173",
+        sourceHostId: "forged",
+        isArca: true,
+      }),
+      { source: "conv_background_A" },
+    );
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_background_A",
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true, sourceHostId: "arca-host" },
+    );
+    expect(prefetchSessionHostChain).not.toHaveBeenCalled();
+  });
+
+  it("fetches missing source metadata and leaves failed/unknown resolution unprivileged", async () => {
+    const bridge = installBridge();
+    prefetchSessionHostChain.mockRejectedValue(new Error("unknown session"));
+    await runAction(actionEvent("navigate", { url: "http://localhost:5173", isArca: true }));
+    expect(prefetchSessionHostChain).toHaveBeenCalledWith(expect.any(QueryClient), CONV);
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      CONV,
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true },
+    );
+  });
+
+  it("does not dispatch a stale metadata resolution after the relay context changes", async () => {
+    const bridge = installBridge();
+    let resolve!: () => void;
+    prefetchSessionHostChain.mockImplementation(
+      () =>
+        new Promise<void>((r) => {
+          resolve = r;
+        }),
+    );
+    const hook = renderRelay();
+    emitBrowserActionRequest(actionEvent("navigate", { url: "http://localhost:5173" }), CONV);
+    await vi.waitFor(() => expect(prefetchSessionHostChain).toHaveBeenCalled());
+    hook.unmount();
+    resolve();
+    await vi.waitFor(() =>
+      expect(postedResult().result).toEqual({
+        ok: false,
+        error: "browser relay context changed",
+      }),
+    );
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
   });
 
   it("navigate: reports the final_url and marks it agent+force", async () => {
@@ -348,7 +423,7 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
       .mockResolvedValueOnce(WON)
       .mockRejectedValueOnce(new Error("result POST network error"));
 
-    renderHook(() => useBrowserAgentRelay(CONV));
+    renderRelay();
     emitBrowserActionRequest(actionEvent("screenshot"), CONV);
 
     await vi.waitFor(() => {
@@ -365,7 +440,7 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
     // absent — getBrowserDesktop() returns null, so the handler bails before claim.
     (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 
-    renderHook(() => useBrowserAgentRelay(CONV));
+    renderRelay();
     emitBrowserActionRequest(actionEvent("screenshot"), CONV);
     await Promise.resolve();
     await Promise.resolve();

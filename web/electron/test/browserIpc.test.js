@@ -42,6 +42,45 @@ function makeIpcMain() {
   };
 }
 
+describe("browser IPC Arca context", () => {
+  it("uses shell-derived context and ignores caller exception flags", () => {
+    const ipcMain = makeIpcMain();
+    const calls = [];
+    const context = { serverTarget: "current", sourceHostId: "actual-host" };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        openOrNavigate: (...args) => {
+          calls.push(args);
+          return { ok: true };
+        },
+      }),
+      getAgentContextForEvent: (_event, host) => {
+        assert.equal(host, "actual-host");
+        return context;
+      },
+    });
+    ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost",
+        opts: {
+          force: true,
+          agent: true,
+          sourceHostId: "actual-host",
+          allowLocalhost: true,
+          isArca: true,
+          agentContext: { serverTarget: "forged" },
+        },
+      },
+    );
+    assert.deepEqual(calls[0][3], { force: true, agent: true, agentContext: context });
+  });
+});
+
 /** A stub webContents with a navigationHistory (Electron 42) and toggleable
  *  devtools + recorded navigation calls. */
 function makeWebContents({ canBack = false, canForward = false } = {}) {

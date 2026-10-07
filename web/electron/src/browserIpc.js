@@ -256,7 +256,12 @@ function makeDesignModeInputHandler(gestureState) {
  *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
  *        Resolves the sender window's own browser-view registry.
  */
-function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent }) {
+function registerBrowserIpc({
+  ipcMain,
+  isPinnedOriginSender,
+  getRegistryForEvent,
+  getAgentContextForEvent = () => null,
+}) {
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
    * `{ registry }` on success or `{ error }` (a structured result, never a
@@ -291,7 +296,12 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const r = g.registry.openOrNavigate(conversationId, url, bounds, opts);
+    const r = g.registry.openOrNavigate(conversationId, url, bounds, {
+      force: !!opts?.force,
+      agent: !!opts?.agent,
+      // Context is shell-derived; never accept a renderer's exception flag.
+      agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
+    });
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
     if (r.ok && r.created && r.entry) {

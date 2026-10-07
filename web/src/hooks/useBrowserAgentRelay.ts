@@ -13,6 +13,9 @@ import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
+import { useQueryClient } from "@tanstack/react-query";
+import { prefetchSessionHostChain } from "@/hooks/useSession";
+import { getSessionHost } from "@/lib/sessionHost";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -22,7 +25,7 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: { force?: boolean; agent?: boolean; sourceHostId?: string },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
@@ -217,6 +220,7 @@ async function dispatch(
   action: string,
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
+  sourceHostId: string | null,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -231,6 +235,7 @@ async function dispatch(
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
+          ...(sourceHostId ? { sourceHostId } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         return { ok: true, data: { final_url: url } };
@@ -350,10 +355,12 @@ async function postResult(
  *   open. Routing uses the delivering conversation, not this.
  */
 export function useBrowserAgentRelay(conversationId: string | null | undefined): void {
+  const queryClient = useQueryClient();
   useEffect(() => {
     if (!conversationId) return;
     if (!supportsBrowser()) return;
 
+    let cancelled = false;
     const handler = async (evt: BrowserActionRequestEvent, sourceConversationId: string | null) => {
       if (!sourceConversationId) return; // no delivering session — nothing to target
       const desktop = getBrowserDesktop();
@@ -361,10 +368,29 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      const result = await dispatch(sourceConversationId, evt.action, evt.args, desktop);
+      if (evt.action === "navigate" && getSessionHost(sourceConversationId) === null) {
+        try {
+          await prefetchSessionHostChain(queryClient, sourceConversationId);
+        } catch {
+          // Unknown provenance stays denied for localhost; public browsing still works.
+        }
+      }
+      const result = cancelled
+        ? { ok: false, error: "browser relay context changed" }
+        : await dispatch(
+            sourceConversationId,
+            evt.action,
+            evt.args,
+            desktop,
+            getSessionHost(sourceConversationId),
+          );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 
-    return onBrowserActionRequest(handler);
-  }, [conversationId]);
+    const unsubscribe = onBrowserActionRequest(handler);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [conversationId, queryClient]);
 }

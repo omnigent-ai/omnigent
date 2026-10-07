@@ -494,13 +494,37 @@ Companion's forwarding and local port selection separately. Normal TLS, CORS,
 authentication, and local-network permission rules still apply. This pane is
 desktop-only; it is not available in the plain web UI.
 
-`browser_navigate` keeps its restrictions on localhost and private addresses,
-even after you open a page manually. A manually opened page in the session's
+For local or unrecognized hosts, `browser_navigate` keeps its restrictions on
+localhost and private addresses, even after you open a page manually.
+A manually opened page in the session's
 agent browser view remains available to existing agent inspection and
 interaction, including navigation caused by interacting with the page. Manual
 opening is therefore not a read-only boundary for that view. The user-created
 Browser tab opened through **+** > **Browser** is separate from the agent relay
 and is not targeted by the session's agent browser actions.
+
+### Agent previews on Arca
+
+On a Databricks-managed server with internal desktop features enabled, an
+Arca session's agent can open and inspect an app through Companion forwarding
+using the existing browser tools and tool approval or autoapproval policy.
+Provide the actual forwarded URL to the agent; its local port may differ from
+the app's remote port. Omnigent does not establish or verify forwarding or
+prove that the local endpoint belongs to the Arca host.
+
+The desktop captures the remote daemon's exact host ID during its existing
+Arca connect flow, including when the daemon is already running. Only a
+source session on that host, or a subagent inheriting that host, is eligible.
+An older CLI or an unrecognized, failed, or missing identity leaves localhost
+navigation denied; the remembered host-picker label alone does not grant it.
+Eligibility is scoped to the selected server/workspace, not all sessions on
+a Databricks server.
+
+The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
+redirects and links that would open a new window (which stay in the same pane).
+Other loopback addresses, private-network and metadata destinations, and
+non-web schemes remain restricted. Existing tool approvals are unchanged;
+whether a tool call asks for approval depends on the harness and its policy.
 
 ### Local network permission
 
