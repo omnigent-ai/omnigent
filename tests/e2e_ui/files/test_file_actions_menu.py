@@ -34,7 +34,7 @@ def _row(panel: Locator) -> Locator:
     return row
 
 
-def test_file_row_context_menu_kebab_info_and_copy(
+def test_file_row_context_menu_keyboard_info_and_copy(
     page: Page,
     seeded_session: tuple[str, str],
     request: pytest.FixtureRequest,
@@ -48,6 +48,7 @@ def test_file_row_context_menu_kebab_info_and_copy(
     panel = page.get_by_role("complementary", name="Workspace")
     panel.get_by_role("tab", name="Files").click()
     row = _row(panel)
+    expect(row.get_by_role("button", name=re.compile("^More actions for"))).to_have_count(0)
 
     row.click(button="right")
     expect(page.get_by_role("menuitem", name="Download")).to_be_visible()
@@ -66,23 +67,17 @@ def test_file_row_context_menu_kebab_info_and_copy(
     info.get_by_role("button", name="Close").click()
     expect(panel.get_by_role("button", name=_FILE_NAME, exact=True)).to_be_focused()
 
-    kebab = panel.get_by_role("button", name=f"More actions for {_FILE_NAME}")
-    kebab.focus()
-    kebab.press("ContextMenu")
-    expect(page.get_by_role("menuitem", name="File info")).to_be_visible()
+    row.press("ContextMenu")
+    expect(page.get_by_role("menu", name=f"More actions for {_FILE_NAME}")).to_be_visible()
     page.keyboard.press("Escape")
-    expect(kebab).to_be_focused()
+    expect(row).to_be_focused()
 
-    kebab.focus()
-    kebab.press("Enter")
-    expect(page.get_by_role("menuitem", name="Copy relative path")).to_be_visible()
+    row.press("Shift+F10")
+    expect(page.get_by_role("menu", name=f"More actions for {_FILE_NAME}")).to_be_visible()
     page.keyboard.press("Escape")
-    expect(kebab).to_be_focused()
-    kebab.click()
-    page.get_by_role("menuitem", name="File info").click()
-    info.get_by_role("button", name="Close").click()
-    expect(kebab).to_be_focused()
-    kebab.click()
+    expect(row).to_be_focused()
+
+    row.click(button="right")
     page.get_by_role("menuitem", name="Copy relative path").click()
     page.wait_for_function(
         "expected => navigator.clipboard.readText().then(text => text === expected)",
@@ -186,13 +181,14 @@ def test_size_does_not_overlap_actions_on_keyboard_focus_or_open_menu(
 
     def check_row(row: Locator) -> None:
         page.mouse.move(0, 0)
-        row.locator('button:not([aria-label^="More actions for"])').first.focus()
-        kebab = row.get_by_role("button", name=re.compile("^More actions for"))
-        _assert_size_does_not_overlap_kebab(row)
-        kebab.click()
-        page.mouse.move(0, 0)
+        expect(row.get_by_role("button", name=re.compile("^More actions for"))).to_have_count(0)
+        row.locator("button").first.focus()
+        page.keyboard.press("Tab")
+        assert row.evaluate("row => !!row.querySelector(':focus-visible')")
+        _assert_size_does_not_overlap_actions(row)
+        row.click(button="right")
         expect(page.get_by_role("menuitem", name="File info")).to_be_visible()
-        _assert_size_does_not_overlap_kebab(row)
+        _assert_size_does_not_overlap_actions(row)
         page.keyboard.press("Escape")
 
     row = page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_FILE_NAME).last
@@ -215,7 +211,7 @@ def test_size_does_not_overlap_actions_on_keyboard_focus_or_open_menu(
     check_row(changes_row)
 
 
-def test_fine_pointer_actions_slot_stays_stable_and_size_tracks_visible_actions(
+def test_fine_pointer_rows_hide_size_for_hover_actions_without_a_menu_button(
     page: Page,
     seeded_session: tuple[str, str],
     request: pytest.FixtureRequest,
@@ -229,44 +225,31 @@ def test_fine_pointer_actions_slot_stays_stable_and_size_tracks_visible_actions(
     panel.get_by_role("tab", name=re.compile("^Files")).click()
     row = page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_FILE_NAME).last
     expect(row).to_be_visible(timeout=30_000)
-    kebab = row.get_by_role("button", name=re.compile("^More actions for"))
+    expect(row.get_by_role("button", name=re.compile("^More actions for"))).to_have_count(0)
     size = row.locator("span.text-sm.text-muted-foreground").filter(
         has_text=re.compile(r"\d+(?:\.\d+)?\s+[KMGT]?B")
     )
-
-    def action_slot_width() -> float:
-        return row.evaluate(
-            """row => {
-              const kebab = row.querySelector('button[aria-label^="More actions for"]');
-              const slot = kebab?.closest('span.absolute')?.parentElement;
-              return slot?.getBoundingClientRect().width ?? -1;
-            }"""
-        )
+    download = row.get_by_role("button", name=re.compile(r"^Download "))
+    copy = row.get_by_role("button", name=re.compile(r"^Copy path:"))
 
     page.mouse.move(0, 0)
     expect(size).to_be_visible()
-    idle_width = action_slot_width()
     row.hover()
-    expect(kebab).to_have_css("opacity", "1")
+    expect(download).to_have_css("opacity", "1")
+    expect(copy).to_have_css("opacity", "1")
     expect(size).to_have_css("visibility", "hidden")
-    assert action_slot_width() == idle_width
 
     page.mouse.move(0, 0)
     row.locator("button").first.focus()
     expect(size).to_be_visible()
-    expect(kebab).to_have_css("opacity", "1")
-    assert action_slot_width() == idle_width
-    _assert_size_does_not_overlap_kebab(row)
-
     page.keyboard.press("Tab")
     assert row.evaluate("row => !!row.querySelector(':focus-visible')")
     expect(size).to_have_css("visibility", "hidden")
-    assert action_slot_width() == idle_width
+    _assert_size_does_not_overlap_actions(row)
 
-    kebab.click()
+    row.click(button="right")
     expect(page.get_by_role("menuitem", name="File info")).to_be_visible()
     expect(size).to_have_css("visibility", "hidden")
-    assert action_slot_width() == idle_width
     page.keyboard.press("Escape")
 
 
@@ -275,7 +258,7 @@ def test_fine_pointer_inline_action_controls_have_spacing(
     seeded_session: tuple[str, str],
     request: pytest.FixtureRequest,
 ) -> None:
-    """Download, Copy, and kebab controls keep clear spacing on fine pointers."""
+    """Download and Copy controls keep clear spacing on fine pointers."""
     base_url, session_id = seeded_session
     _seed_file(page, base_url, session_id, request)
     page.goto(f"{base_url}/c/{session_id}")
@@ -288,7 +271,6 @@ def test_fine_pointer_inline_action_controls_have_spacing(
     targets = [
         row.get_by_role("button", name=re.compile(r"^Download ")),
         row.get_by_role("button", name=re.compile(r"^Copy path:")),
-        row.get_by_role("button", name=f"More actions for {_FILE_NAME}"),
     ]
     boxes = [target.bounding_box() for target in targets]
     assert all(box is not None for box in boxes), "all file action targets should be rendered"
@@ -314,9 +296,6 @@ def test_fine_pointer_inline_action_controls_have_spacing(
 
     assert controls_have_spacing(measured[0], measured[1]), (
         f"Download and Copy inline controls lack spacing: {measured}"
-    )
-    assert controls_have_spacing(measured[1], measured[2]), (
-        f"Copy and kebab inline controls lack spacing: {measured}"
     )
 
 
@@ -378,6 +357,7 @@ def test_touch_long_press_opens_menu_without_opening_file(
 ) -> None:
     """A stationary hold opens actions without triggering the row click."""
     page, row = touch_files_page
+    expect(row.get_by_role("button", name=re.compile("^More actions for"))).to_have_count(0)
     cdp = page.context.new_cdp_session(page)
     point = _touch_point(row)
     _assert_touch_point_hits(row, point)
@@ -414,56 +394,52 @@ def test_touch_long_press_release_does_not_toggle_folder(
     assert folder.get_attribute("aria-expanded") == before
 
 
-def _assert_size_does_not_overlap_kebab(row: Locator) -> None:
-    expect(row.locator('button[aria-label^="More actions for"]')).to_have_css("opacity", "1")
+def _assert_size_does_not_overlap_actions(row: Locator) -> None:
     layout = row.evaluate(
         """row => {
-          const kebab = row.querySelector('button[aria-label^="More actions for"]');
+          const actions = [
+            ...row.querySelectorAll('button[aria-label^="Download "]'),
+            ...row.querySelectorAll('button[aria-label^="Copy path:"]'),
+          ];
           const sizes = [...row.querySelectorAll('span.text-sm.text-muted-foreground')];
           const size = sizes.find(element =>
             /\\d+(?:\\.\\d+)?\\s+[KMGT]?B/.test(element.textContent || '')
           );
-          if (!kebab || !size) return null;
+          if (!actions.length || !size) return null;
           const a = size.getBoundingClientRect();
-          const b = kebab.getBoundingClientRect();
+          const overlaps = actions.some(action => {
+            const b = action.getBoundingClientRect();
+            return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+          });
           return {
             visibility: getComputedStyle(size).visibility,
-            opacity: getComputedStyle(kebab).opacity,
-            overlap: a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top,
+            overlap: overlaps,
           };
         }"""
     )
-    assert layout is not None, "expected a size label and row kebab"
+    assert layout is not None, "expected a size label and hover actions"
     assert layout["visibility"] == "hidden" or not layout["overlap"], layout
 
 
-def test_coarse_pointer_idle_keeps_size_visible_beside_kebab(
+def test_coarse_pointer_rows_have_no_menu_button_and_keep_size_visible(
     touch_files_page: tuple[Page, Locator],
 ) -> None:
-    """At rest on a coarse pointer, the visible kebab has clear space."""
+    """At rest on a coarse pointer, file size stays visible without a menu button."""
     page, row = touch_files_page
     assert page.evaluate("() => matchMedia('(pointer: coarse)').matches")
+    expect(row.get_by_role("button", name=re.compile("^More actions for"))).to_have_count(0)
     layout = row.evaluate(
         """row => {
-          const kebab = row.querySelector('button[aria-label^="More actions for"]');
           const size = [...row.querySelectorAll('span.text-sm.text-muted-foreground')]
             .find(element => /\\d+(?:\\.\\d+)?\\s+[KMGT]?B/.test(element.textContent || ''));
-          if (!kebab || !size) return null;
-          const a = size.getBoundingClientRect();
-          const b = kebab.getBoundingClientRect();
+          if (!size) return null;
           return {
             visibility: getComputedStyle(size).visibility,
-            overlap: a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top,
-            width: b.width,
-            height: b.height,
-            leftTarget: document.elementFromPoint(b.left - 2, b.top + b.height / 2)?.tagName,
           };
         }"""
     )
-    assert layout is not None, "expected a size label and row kebab"
-    assert layout["visibility"] == "visible" and not layout["overlap"], layout
-    assert layout["width"] >= 24 and layout["height"] >= 24, layout
-    assert layout["leftTarget"] != "BUTTON", layout
+    assert layout is not None, "expected a size label"
+    assert layout["visibility"] == "visible", layout
 
 
 def test_touch_scroll_hold_does_not_open_menu(touch_files_page: tuple[Page, Locator]) -> None:
