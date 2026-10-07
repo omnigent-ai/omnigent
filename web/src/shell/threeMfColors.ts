@@ -4,13 +4,51 @@ const CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const XMLNS = "http://www.w3.org/2000/xmlns/";
 const PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
-const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
+export const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
 export const INFLATE_CHUNK_BYTES = 16 * 1024;
 const MAX_EMITTED_RATIO = 2;
 const MAX_EMITTED_OVERHEAD = 1024 * 1024;
 const MAX_OBJECTS = 10_000;
 const MAX_COMPONENTS = 10_000;
 const MAX_COMPONENT_DEPTH = 64;
+const ZIP_END = {
+  signature: 0x06054b50,
+  headerSize: 22,
+  diskNumbers: 4,
+  diskEntries: 8,
+  entries: 10,
+  directorySize: 12,
+  directoryOffset: 16,
+  commentLength: 20,
+};
+const ZIP_DIRECTORY = {
+  signature: 0x02014b50,
+  headerSize: 46,
+  flags: 8,
+  compression: 10,
+  compressedSize: 20,
+  originalSize: 24,
+  nameLength: 28,
+  extraLength: 30,
+  commentLength: 32,
+  diskNumber: 34,
+  localOffset: 42,
+};
+const ZIP_LOCAL = {
+  signature: 0x04034b50,
+  headerSize: 30,
+  flags: 6,
+  compression: 8,
+  compressedSize: 18,
+  originalSize: 22,
+  nameLength: 26,
+  extraLength: 28,
+};
+const ZIP_FLAGS = { allowed: 0x080e, utf8: 0x0800, descriptor: 0x0008 };
+const ZIP_MAX_16BIT = 0xffff;
+const ZIP64_SIZE = 0xffffffff;
+const ZIP_STORED = 0;
+const ZIP_DEFLATED = 8;
 const APPEARANCE = new Set([
   "basematerials",
   "colorgroup",
@@ -39,6 +77,21 @@ function slot(element: Element | undefined, inherited: number | null): number | 
   const number = Number(value);
   if (number === 0) return inherited;
   return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+function utf8Length(text: string): number {
+  let bytes = text.length;
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code >= 0x800) {
+      bytes += 2;
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = text.charCodeAt(index + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) index++;
+      }
+    } else if (code >= 0x80) bytes++;
+  }
+  return bytes;
 }
 
 function xml(bytes: Uint8Array): Document {
@@ -88,19 +141,25 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const view = new DataView(buffer);
     const read16 = (offset: number) => view.getUint16(offset, true);
     const read32 = (offset: number) => view.getUint32(offset, true);
-    const floor = Math.max(0, bytes.length - 65557);
-    let end = bytes.length - 22;
+    // unzipSync allocates from declared sizes, so it cannot bound real inflate work.
+    const floor = Math.max(0, bytes.length - ZIP_END.headerSize - ZIP_MAX_16BIT);
+    let end = bytes.length - ZIP_END.headerSize;
     for (; end >= floor; end--)
-      if (read32(end) === 0x06054b50 && end + 22 + read16(end + 20) === bytes.length) break;
+      if (
+        read32(end) === ZIP_END.signature &&
+        end + ZIP_END.headerSize + read16(end + ZIP_END.commentLength) === bytes.length
+      )
+        break;
     if (
       end < floor ||
-      read32(end + 4) !== 0 ||
-      read16(end + 8) !== read16(end + 10) ||
-      read16(end + 10) === 65535
+      read32(end + ZIP_END.diskNumbers) !== 0 ||
+      read16(end + ZIP_END.diskEntries) !== read16(end + ZIP_END.entries) ||
+      read16(end + ZIP_END.entries) === ZIP_MAX_16BIT
     )
       throw new Error("Unsupported ZIP directory");
-    const directory = read32(end + 16);
-    if (directory + read32(end + 12) !== end) throw new Error("Invalid ZIP directory");
+    const directory = read32(end + ZIP_END.directoryOffset);
+    if (directory + read32(end + ZIP_END.directorySize) !== end)
+      throw new Error("Invalid ZIP directory");
     let selectedBytes = 0;
     let extractedBytes = 0;
     const extract = (needed: (name: string) => boolean) => {
@@ -109,52 +168,73 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         { start: number; size: number; originalSize: number; compression: number }
       >();
       let offset = directory;
-      for (let index = 0; index < read16(end + 10); index++) {
-        if (offset + 46 > end || read32(offset) !== 0x02014b50)
+      for (let index = 0; index < read16(end + ZIP_END.entries); index++) {
+        if (offset + ZIP_DIRECTORY.headerSize > end || read32(offset) !== ZIP_DIRECTORY.signature)
           throw new Error("Invalid ZIP entry");
         const record = offset;
-        const flags = read16(record + 8);
-        const nameLength = read16(record + 28);
-        offset += 46 + nameLength + read16(record + 30) + read16(record + 32);
-        if (offset > end || flags & ~0x080e || read16(record + 34) !== 0)
+        const flags = read16(record + ZIP_DIRECTORY.flags);
+        const nameLength = read16(record + ZIP_DIRECTORY.nameLength);
+        offset +=
+          ZIP_DIRECTORY.headerSize +
+          nameLength +
+          read16(record + ZIP_DIRECTORY.extraLength) +
+          read16(record + ZIP_DIRECTORY.commentLength);
+        if (
+          offset > end ||
+          flags & ~ZIP_FLAGS.allowed ||
+          read16(record + ZIP_DIRECTORY.diskNumber) !== 0
+        )
           throw new Error("Unsupported ZIP entry");
         const name = strFromU8(
-          bytes.subarray(record + 46, record + 46 + nameLength),
-          !(flags & 2048),
+          bytes.subarray(
+            record + ZIP_DIRECTORY.headerSize,
+            record + ZIP_DIRECTORY.headerSize + nameLength,
+          ),
+          !(flags & ZIP_FLAGS.utf8),
         );
         if (!needed(name)) continue;
-        const size = read32(record + 20);
-        const originalSize = read32(record + 24);
-        const compression = read16(record + 10);
-        const local = read32(record + 42);
+        const size = read32(record + ZIP_DIRECTORY.compressedSize);
+        const originalSize = read32(record + ZIP_DIRECTORY.originalSize);
+        const compression = read16(record + ZIP_DIRECTORY.compression);
+        const local = read32(record + ZIP_DIRECTORY.localOffset);
         if (
-          size === 0xffffffff ||
-          originalSize === 0xffffffff ||
-          (compression !== 0 && compression !== 8) ||
-          (compression === 0 && size !== originalSize)
+          size === ZIP64_SIZE ||
+          originalSize === ZIP64_SIZE ||
+          (compression !== ZIP_STORED && compression !== ZIP_DEFLATED) ||
+          (compression === ZIP_STORED && size !== originalSize)
         )
           throw new Error("Invalid ZIP size");
         if (
-          local + 30 > directory ||
-          read32(local) !== 0x04034b50 ||
-          read16(local + 6) !== flags ||
-          read16(local + 8) !== compression
+          local + ZIP_LOCAL.headerSize > directory ||
+          read32(local) !== ZIP_LOCAL.signature ||
+          read16(local + ZIP_LOCAL.flags) !== flags ||
+          read16(local + ZIP_LOCAL.compression) !== compression
         )
           throw new Error("Inconsistent ZIP header");
-        const start = local + 30 + read16(local + 26) + read16(local + 28);
+        const start =
+          local +
+          ZIP_LOCAL.headerSize +
+          read16(local + ZIP_LOCAL.nameLength) +
+          read16(local + ZIP_LOCAL.extraLength);
         if (
           start + size > directory ||
           strFromU8(
-            bytes.subarray(local + 30, local + 30 + read16(local + 26)),
-            !(flags & 2048),
+            bytes.subarray(
+              local + ZIP_LOCAL.headerSize,
+              local + ZIP_LOCAL.headerSize + read16(local + ZIP_LOCAL.nameLength),
+            ),
+            !(flags & ZIP_FLAGS.utf8),
           ) !== name
         )
           throw new Error("Invalid ZIP range");
         for (const [field, expected] of [
-          [18, size],
-          [22, originalSize],
+          [ZIP_LOCAL.compressedSize, size],
+          [ZIP_LOCAL.originalSize, originalSize],
         ])
-          if (read32(local + field) !== expected && (!(flags & 8) || read32(local + field) !== 0))
+          if (
+            read32(local + field) !== expected &&
+            (!(flags & ZIP_FLAGS.descriptor) || read32(local + field) !== 0)
+          )
             throw new Error("Inconsistent ZIP size");
         selectedBytes += originalSize;
         if (selectedBytes > MAX_SELECTED_BYTES) throw new Error("3MF byte limit");
@@ -174,7 +254,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
           entry.set(data, length - data.byteLength);
         };
         const compressed = bytes.subarray(declared.start, declared.start + declared.size);
-        if (declared.compression === 0) receive(compressed);
+        if (declared.compression === ZIP_STORED) receive(compressed);
         else {
           const inflater = new Inflate(receive);
           for (
@@ -224,19 +304,24 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     }
     if (candidateColors.size < 2) return buffer;
 
-    const entries = extract((name) => name.endsWith(".model") || name === "_rels/.rels");
+    const entries = new Map(
+      Object.entries(extract((name) => name.endsWith(".model") || name === "_rels/.rels")),
+    );
     const rootRelationship = Array.from(
-      xml(entries["_rels/.rels"]).getElementsByTagName("Relationship"),
+      xml(entries.get("_rels/.rels")!).getElementsByTagName("Relationship"),
     ).find((relationship) => relationship.getAttribute("Type") === MODEL_RELATIONSHIP);
     if (!rootRelationship) return buffer;
     const rootPath = zipPath(rootRelationship.getAttribute("Target") ?? "");
     const models = new Map<string, Document>();
     const objects = new Map<string, Element>();
+    // Moved objects acquire new IDs; keep their original component targets.
+    const links = new Map<string, { id: string; path: string }[]>();
     let objectCount = 0;
     let componentCount = 0;
-    for (const [path, data] of Object.entries(entries)) {
+    for (const [path, data] of entries) {
       if (!path.endsWith(".model")) continue;
       const document = xml(data);
+      entries.delete(path);
       for (const element of document.querySelectorAll("*")) {
         if (
           APPEARANCE.has(element.localName) ||
@@ -256,6 +341,17 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         const key = JSON.stringify([normalizedPath, object.getAttribute("id")]);
         if (objects.has(key)) return buffer;
         objects.set(key, object);
+        links.set(
+          key,
+          children(object, "components").flatMap((components) =>
+            children(components, "component").map((child) => ({
+              id: child.getAttribute("objectid") ?? "",
+              path: child.getAttributeNS(PRODUCTION, "path")
+                ? zipPath(child.getAttributeNS(PRODUCTION, "path")!, normalizedPath)
+                : normalizedPath,
+            })),
+          ),
+        );
       }
     }
     const root = models.get(rootPath);
@@ -286,15 +382,16 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const colors: string[] = [];
     const memo = new Map<string, { id: string; height: number }>();
     const sourceSizes = new Map<string, number>();
-    let emittedCharacters = new XMLSerializer().serializeToString(outputModel).length;
+    const moved = new Set<string>();
+    let emittedBytes = utf8Length(new XMLSerializer().serializeToString(outputModel));
     const reserve = (source: Element, key: string) => {
       let size = sourceSizes.get(key);
       if (size === undefined) {
-        size = new XMLSerializer().serializeToString(source).length;
+        size = utf8Length(new XMLSerializer().serializeToString(source));
         sourceSizes.set(key, size);
       }
-      emittedCharacters += size;
-      if (emittedCharacters > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD)
+      emittedBytes += size;
+      if (emittedBytes > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD)
         throw new Error("3MF emitted byte limit");
     };
     const visiting = new Set<string>();
@@ -330,18 +427,21 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       if (memo.size >= MAX_OBJECTS) throw new Error("3MF emitted object limit");
       reserve(source, sourceKey);
       visiting.add(sourceKey);
-      const object = output.importNode(source, true);
+      const object = moved.has(sourceKey)
+        ? output.importNode(source, true)
+        : output.adoptNode(source);
+      moved.add(sourceKey);
       let height = 0;
+      let childIndex = 0;
       for (const components of children(object, "components")) {
         for (const child of children(components, "component")) {
-          const childId = child.getAttribute("objectid") ?? "";
-          const targetPath = child.getAttributeNS(PRODUCTION, "path");
+          const target = links.get(sourceKey)![childIndex++];
           const cloned = clone(
-            targetPath ? zipPath(targetPath, path) : path,
-            childId,
+            target.path,
+            target.id,
             parts,
             effectiveSlot,
-            depth === 0 ? (parts.get(childId) ?? assigned) : assigned,
+            depth === 0 ? (parts.get(target.id) ?? assigned) : assigned,
             recolor,
             depth + 1,
           );
@@ -355,6 +455,8 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       const result = { id: String(nextId++), height };
       memo.set(key, result);
       object.setAttribute("id", result.id);
+      object.removeAttribute("pid");
+      object.removeAttribute("pindex");
       if (effectiveColor) {
         let index = colors.indexOf(effectiveColor);
         if (index < 0) {
@@ -374,7 +476,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const sourceBuild = children(root.documentElement, "build")[0];
     if (!sourceBuild) return buffer;
     reserve(sourceBuild, "build");
-    const build = output.importNode(sourceBuild, true);
+    const build = output.adoptNode(sourceBuild);
     for (const item of children(build, "item")) {
       const id = item.getAttribute("objectid") ?? "";
       const targetPath = item.getAttributeNS(PRODUCTION, "path");
@@ -401,13 +503,25 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     }
     if (colors.length < 2) return buffer;
     outputModel.append(build);
+    for (const model of models.values()) model.documentElement.replaceChildren();
+    entries.clear();
+    models.clear();
+    objects.clear();
+    links.clear();
+    objectConfigs.clear();
+    sourceSizes.clear();
+    memo.clear();
+    moved.clear();
     const serialized = new XMLSerializer().serializeToString(output);
-    if (serialized.length > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD) return buffer;
+    const encoded = strToU8(serialized);
+    const modelBytes = new Uint8Array(encoded.buffer, encoded.byteOffset, encoded.byteLength);
+    if (modelBytes.byteLength > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD)
+      return buffer;
     const relationships = `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="r" Type="${MODEL_RELATIONSHIP}"/></Relationships>`;
     return zipSync(
       {
         "_rels/.rels": new Uint8Array(strToU8(relationships)),
-        "3D/3dmodel.model": new Uint8Array(strToU8(serialized)),
+        "3D/3dmodel.model": modelBytes,
       },
       { level: 0 },
     ).buffer as ArrayBuffer;
