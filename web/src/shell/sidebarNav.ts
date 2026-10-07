@@ -312,10 +312,10 @@ export function dedupeConversationsById(conversations: readonly Conversation[]):
 
 // Order pinned conversations by when they were pinned, not by `updated_at` —
 // a pinned session holds its slot even when a new message bumps its
-// `updated_at`. The `omnigent.pinned` label value is the epoch-ms pin time;
-// sort ascending so the oldest pin ranks first (top) and a freshly pinned
-// session lands at the bottom of the group (matching the prior localStorage
-// behaviour). A missing/unparseable value sinks to the bottom, stably.
+// `updated_at`. The `omnigent.pinned` label value is the epoch-ms pin time,
+// or a value between two neighbours once the user drags to reorder (see
+// `pinOrderWrites`); sort ascending so a freshly pinned session lands at the
+// bottom. A missing/unparseable value sinks to the bottom, stably.
 export function orderByPinnedTimestamp(conversations: readonly Conversation[]): Conversation[] {
   const pinnedAt = (c: Conversation): number => {
     const raw = c.labels?.[PINNED_LABEL_KEY];

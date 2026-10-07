@@ -1739,8 +1739,8 @@ function ConversationList({
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
-    // by when they were pinned (the `omnigent.pinned` label's epoch-ms value;
-    // oldest pin at the top, newest at the bottom), NOT by `updated_at`, so a
+    // by the `omnigent.pinned` label value (pin time, or a dragged position;
+    // newest pin at the bottom), NOT by `updated_at`, so a
     // pinned session holds its slot when a new message bumps its `updated_at`.
     // Pins are ownership-agnostic, so the Pinned section always shows every
     // non-archived pin regardless of the My/Shared/All/Archived filter — it's

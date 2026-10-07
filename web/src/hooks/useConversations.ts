@@ -1716,8 +1716,8 @@ export function usePinnedConversations(sharedEnabled = true, limit = sidebarConf
 }
 
 /**
- * PATCH the pinned label on a session. Pinning stores the epoch-ms pin time as
- * the value (so the Pinned section can order by pin recency); an empty string
+ * PATCH the pinned label on a session. The value is the Pinned section's sort
+ * key: the epoch-ms pin time, or a drag-to-reorder position; an empty string
  * signals unpin — the server deletes the label row rather than persisting an
  * empty value (labels are upsert-only). An optional `pinnedAt` lets the
  * localStorage migration preserve each legacy pin's relative order.
