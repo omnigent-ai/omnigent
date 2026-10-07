@@ -952,6 +952,66 @@ def test_claude_provider_skips_install_path_outside_plugins_root(
     assert "sp:using-superpowers" not in names
 
 
+def _config_dir_with_symlinked_cache(tmp_path: Path, plugins: dict[str, Path]) -> Path:
+    """A config dir whose ``plugins/cache`` links to a shared cache (ccs-style profile)."""
+    shared = tmp_path / "shared-cache"
+    shared.mkdir(exist_ok=True)
+    cfg = tmp_path / "profile"
+    (cfg / "plugins").mkdir(parents=True)
+    (cfg / "plugins" / "cache").symlink_to(shared, target_is_directory=True)
+    (cfg / "settings.json").write_text(
+        json.dumps({"enabledPlugins": dict.fromkeys(plugins, True)})
+    )
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {key: [{"installPath": str(path)}] for key, path in plugins.items()},
+            }
+        )
+    )
+    return cfg
+
+
+def test_claude_provider_follows_symlinked_plugin_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plugins in a symlinked shared cache surface via either path spelling."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    shared = tmp_path / "shared-cache"
+    _write_skill(shared / "mkt" / "linked" / "1.0.0" / "skills", "review")
+    _write_skill(shared / "mkt" / "direct" / "1.0.0" / "skills", "plan")
+    cfg = _config_dir_with_symlinked_cache(
+        tmp_path,
+        {
+            "linked@mkt": tmp_path / "profile" / "plugins" / "cache" / "mkt" / "linked" / "1.0.0",
+            "direct@mkt": shared / "mkt" / "direct" / "1.0.0",
+        },
+    )
+
+    out = resolve_harness_skills(
+        _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
+    )
+    assert sorted(s.name for s in out) == ["direct:plan", "linked:review"]
+
+
+def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the cache target is trusted, not other directories next to it."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    outside = tmp_path / "evil"
+    _write_skill(outside / "skills", "review")
+    cfg = _config_dir_with_symlinked_cache(tmp_path, {"sp@mkt": outside})
+
+    out = resolve_harness_skills(
+        _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
+    )
+    assert out == []
+
+
 def test_cursor_provider_tolerates_unreadable_skills_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
