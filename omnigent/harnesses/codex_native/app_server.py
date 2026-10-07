@@ -3075,7 +3075,7 @@ class _DatabricksLaunchMaterialization:
     app-server build and the model-options probe so the two cannot drift.
 
     :param config_overrides: ``-c`` overrides routing Codex through the
-        profile's AI Gateway (provider block + auth command + model pin).
+        profile's Unity Gateway (provider block + auth command + model pin).
     :param model: The model the overrides pin, e.g. ``"databricks-gpt-5-4"``
         — the explicit *model* when given, else the catalog default.
     :param host: The profile's workspace origin for ``DATABRICKS_HOST``.
@@ -4033,7 +4033,7 @@ def resolve_native_codex_launch(
             )
             log_info_once(
                 _logger,
-                "native-codex routing: managed connect host — Databricks AI gateway "
+                "native-codex routing: managed connect host — Databricks Unity Gateway "
                 "via the credential broker (host-only [omnigent] profile + sidecar).",
             )
             return NativeCodexLaunch(
@@ -4046,7 +4046,7 @@ def resolve_native_codex_launch(
                 ),
                 model=resolved_model,
                 profile=None,
-                summary="Databricks AI gateway (managed connect host, broker-minted)",
+                summary="Databricks Unity Gateway (managed connect host, broker-minted)",
             )
 
     if entry is None:

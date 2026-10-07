@@ -87,7 +87,7 @@ async def _drive(base_url: str) -> None:
             dialog = page.get_by_role("dialog", name="Your setup is ready")
             await expect(dialog).to_be_visible(timeout=30_000)
             await expect(dialog).to_contain_text("These carry over automatically.")
-            await expect(dialog).to_contain_text("Databricks AI Gateway")
+            await expect(dialog).to_contain_text("Databricks Unity Gateway")
             # Review only: nothing to select.
             await expect(dialog.get_by_role("checkbox")).to_have_count(0)
 
@@ -104,7 +104,7 @@ async def _drive(base_url: str) -> None:
             await expect(assets.get_by_role("tab")).to_have_text(["MCPs 1", "Skills 1"])
             await assets.get_by_role("tab", name="Skills").click()
             await expect(dialog.get_by_role("list", name="Skills")).to_contain_text("fix-ci")
-            await expect(dialog).not_to_contain_text("Databricks AI Gateway")
+            await expect(dialog).not_to_contain_text("Databricks Unity Gateway")
 
             await dialog.get_by_role("button", name="Confirm").click()
             await expect(dialog).to_be_hidden()

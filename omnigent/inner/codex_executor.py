@@ -109,7 +109,7 @@ logger = logging.getLogger(__name__)
 # Default auth-token refresh cadence (ms) for the vendor-neutral gateway
 # transport when ``HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` is unset.
 # Not Databricks-specific: the same fallback applies to any gateway producer
-# (Databricks AI gateway or a generic key/gateway provider).
+# (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _GATEWAY_AUTH_TIMEOUT_MS = 15_000
 
@@ -2122,7 +2122,7 @@ def _normalize_copied_codex_effort(
 
 
 def _databricks_codex_base_url(host: str) -> str:
-    """Return the Unity AI Gateway Codex Responses base URL for *host*."""
+    """Return the Unity Gateway Codex Responses base URL for *host*."""
     return f"{host.rstrip('/')}/ai-gateway/codex/v1"
 
 

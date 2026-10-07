@@ -1699,7 +1699,7 @@ def test_get_openai_client_api_key_falls_back_to_env_base_url(monkeypatch):
 
     Regression for the residual gateway 401 (continuation-turn daemon
     spawns): the api_key is frequently a gateway credential (e.g. a
-    Databricks AI Gateway PAT detected from ``OPENAI_API_KEY``), and the
+    Databricks Unity Gateway PAT detected from ``OPENAI_API_KEY``), and the
     companion base_url can be dropped on the daemon → runner → harness
     propagation chain (the spec-auth bake omits it when ``OPENAI_BASE_URL``
     is absent at materialization time; a reused local daemon may predate the

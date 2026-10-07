@@ -1368,7 +1368,7 @@ function DeleteWorktreesOnArchiveControl() {
 
 /**
  * Connect / disconnect a Databricks workspace. Once connected, a managed
- * sandbox launched by this user reaches the Databricks AI Gateway (MCP + model
+ * sandbox launched by this user reaches the Databricks Unity Gateway (MCP + model
  * serving) as them, using their per-user OAuth token. Databricks is
  * multi-workspace, so the user supplies their workspace URL. The connect action
  * is a full-page redirect to the workspace OAuth consent; on return the callback
@@ -1449,8 +1449,8 @@ function DatabricksIntegrationControl() {
           className="flex-1"
           description={
             status.connected && status.workspace_host
-              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks AI Gateway (MCP + model serving) as you.`
-              : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."
+              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks Unity Gateway (MCP + model serving) as you.`
+              : "Connect your Databricks workspace so new sandboxes reach its Unity Gateway (MCP + model serving) as you."
           }
         />
         <div className="flex shrink-0 items-center gap-2">
