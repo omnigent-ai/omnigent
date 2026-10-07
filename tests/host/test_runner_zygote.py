@@ -170,12 +170,16 @@ def test_zygote_loads_the_deferred_graph_once_nothing_is_pending(monkeypatch) ->
 
     def _record_import() -> None:
         order.append("import")
-        imported.set()
 
     monkeypatch.setattr(_zygote, "_send", _record_send)
     monkeypatch.setattr(_zygote, "_import_deferred_graph", _record_import)
-    monkeypatch.setattr(_zygote, "_exit_unless_single_threaded", lambda: None)
-    monkeypatch.setattr(_zygote.gc, "freeze", lambda: None)
+
+    def _record_thread_check() -> None:
+        order.append("thread-check")
+        imported.set()
+
+    monkeypatch.setattr(_zygote, "_exit_unless_single_threaded", _record_thread_check)
+    monkeypatch.setattr(_zygote.gc, "freeze", lambda: order.append("freeze"))
 
     daemon_side, zygote_side = socket.socketpair()
     daemon_side.sendall(b'{"cmd": "ping"}\n')
@@ -185,8 +189,8 @@ def test_zygote_loads_the_deferred_graph_once_nothing_is_pending(monkeypatch) ->
     replies = daemon_side.makefile("r")
     try:
         assert json.loads(replies.readline()) == {"pong": True}
-        # A ping sent before the import runs is (correctly) served first; wait
-        # so the second request deterministically lands after it.
+        # A ping sent before the import finishes is (correctly) served first;
+        # wait so the second request deterministically lands after it.
         assert imported.wait(timeout=5)
         daemon_side.sendall(b'{"cmd": "ping"}\n')
         assert json.loads(replies.readline()) == {"pong": True}
@@ -196,7 +200,8 @@ def test_zygote_loads_the_deferred_graph_once_nothing_is_pending(monkeypatch) ->
         thread.join(timeout=5)
 
     assert not thread.is_alive()
-    assert order == ["reply", "import", "reply"]
+    # The refreeze and fork-safety check run after the import, before any later fork.
+    assert order == ["reply", "import", "freeze", "thread-check", "reply"]
 
 
 def test_failed_deferred_preload_does_not_stop_the_zygote(monkeypatch) -> None:

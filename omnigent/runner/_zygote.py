@@ -219,7 +219,7 @@ def _import_deferred_graph() -> None:
         pass  # SDK not installed: runners never pay for it either.
     except Exception as exc:  # noqa: BLE001 — an optional preload must not kill the forkserver
         # The SDK can raise OSError probing credentials at import; forks then
-        # pay the import themselves, exactly as before this preload existed.
+        # import it themselves.
         sys.stderr.write(f"zygote: deferred Databricks SDK preload failed: {exc!r}\n")
         sys.stderr.flush()
 
