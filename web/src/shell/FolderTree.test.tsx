@@ -58,8 +58,11 @@ import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFi
 import type * as FileContentModule from "@/hooks/useFileContent";
 import type * as RevealInFileManagerModule from "./RevealInFileManager";
 import userEvent from "@testing-library/user-event";
-import { ROW_ACTION_SIZE_CLASS, ROW_STATUS_SLOT_CLASS } from "./fileStatusUtils";
-import { ROW_MENU_SLOT_CLASS } from "./FileRowActions";
+import {
+  ROW_ACTION_SIZE_CLASS,
+  ROW_META_SLOT_CLASS,
+  ROW_STATUS_SLOT_CLASS,
+} from "./fileStatusUtils";
 import { FolderTree } from "./FolderTree";
 
 afterEach(() => {
@@ -171,12 +174,9 @@ describe("FolderTree row action paths", () => {
       searchResults: [file(`left/${sameName}`), file(`right/${sameName}`)],
       browseLocation: "packages/app",
     });
-    const kebabs = [
-      screen.getByRole("button", { name: `More actions for left/${sameName}` }),
-      screen.getByRole("button", { name: `More actions for right/${sameName}` }),
-    ];
-    expect(kebabs).toHaveLength(2);
-    await user.click(kebabs[1]);
+    expect(screen.queryByRole("button", { name: /^More actions for/ })).not.toBeInTheDocument();
+    const rightResult = screen.getByText(`right/${sameName}`);
+    fireEvent.contextMenu(rightResult.closest('[data-slot="context-menu-trigger"]')!);
     await user.click(await screen.findByRole("menuitem", { name: "Copy relative path" }));
     expect(copyTextMock).toHaveBeenCalledWith(`packages/app/right/${sameName}`);
 
@@ -206,31 +206,32 @@ describe("FolderTree row action paths", () => {
     });
     expect(actionRows).toHaveLength(2);
 
-    const exerciseRow = async (index: number, relativePath: string, path: string) => {
-      const kebab = within(actionRows[index]).getByRole("button", {
-        name: `More actions for ${relativePath}`,
-      });
-      await user.click(kebab);
+    const exerciseRow = async (index: number, path: string) => {
+      const row = actionRows[index];
+      expect(
+        within(row).queryByRole("button", { name: /^More actions for/ }),
+      ).not.toBeInTheDocument();
+      fireEvent.contextMenu(row);
       await user.click(await screen.findByRole("menuitem", { name: "Copy relative path" }));
       expect(copyTextMock).toHaveBeenLastCalledWith(path);
 
-      await user.click(kebab);
+      fireEvent.contextMenu(row);
       await user.click(await screen.findByRole("menuitem", { name: "Download" }));
       expect(downloadMock).toHaveBeenLastCalledWith("conv_abc", path);
 
-      await user.click(kebab);
+      fireEvent.contextMenu(row);
       await user.click(await screen.findByRole("menuitem", { name: "File info" }));
       expect(onOpenInfo).toHaveBeenLastCalledWith(
         expect.objectContaining({ path, name: "x.ts" }),
         expect.any(HTMLElement),
       );
 
-      await user.click(kebab);
+      fireEvent.contextMenu(row);
       await user.click(await screen.findByRole("menuitem", { name: "Show in Finder" }));
       expect(revealMock).toHaveBeenLastCalledWith({ hostId: "local", path: `/workspace/${path}` });
     };
-    await exerciseRow(0, "a/x.ts", paths[0]);
-    await exerciseRow(1, "a/b/x.ts", paths[1]);
+    await exerciseRow(0, paths[0]);
+    await exerciseRow(1, paths[1]);
   });
 });
 
@@ -348,7 +349,7 @@ describe("FolderTree trailing column", () => {
     expect(screen.getByText("README.md").closest("li")).toHaveClass("list-none");
   });
 
-  it("gives folders and files alike the same fixed-width trailing slot", () => {
+  it("keeps folder and file actions in the fixed metadata column without a menu button", () => {
     // The size label is variable width ("985 B" vs "463 KB"). Letting it size
     // the column dragged the copy button, the download button and the status
     // marker to a different x on every row (~16px of measured drift). Every
@@ -358,12 +359,12 @@ describe("FolderTree trailing column", () => {
 
     const copyButtons = screen.getAllByRole("button", { name: /^Copy (path|folder path):/ });
     expect(copyButtons).toHaveLength(3);
+    expect(screen.queryByRole("button", { name: /^More actions for/ })).not.toBeInTheDocument();
     for (const button of copyButtons) {
       expect(button).toHaveAttribute("data-size", "icon-sm");
       // The copy button lives inside the fixed-width trailing column...
-      const slot = button.closest(`.${ROW_MENU_SLOT_CLASS.replaceAll(" ", ".")}`);
+      const slot = button.closest(`.${ROW_META_SLOT_CLASS.replaceAll(" ", ".")}`);
       expect(slot, "every row's copy button must sit in the trailing column").not.toBeNull();
-      expect(slot).toHaveClass("w-20");
       // ...paired with the download button on its LEFT (copy is the rightmost
       // control), or with a spacer standing in for the download where there is
       // none (folders, deleted files) so the pair keeps one x on every row.
