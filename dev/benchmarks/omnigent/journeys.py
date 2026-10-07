@@ -543,9 +543,10 @@ _TURN_PROMPT = "Say hello."
 
 # Warm turns are cheap (~0.1–0.5s per op on CI), but each turn's LLM request
 # grows with session history, so these journeys move to a fresh warmed session
-# every _TURN_SESSION_SAMPLES ops to keep samples at a similar history depth.
+# every _TURN_SESSION_SAMPLES ops to bound history depth. A fresh session costs
+# ~4s on CI (session init, harness spawn, warm-up turn), so rotate sparingly.
 _TURN_MAX_ITERATIONS = 50
-_TURN_SESSION_SAMPLES = 10
+_TURN_SESSION_SAMPLES = 25
 
 # Cold start/restart launch a fresh runner every op, so one warmup absorbs the
 # first-launch costs and further warmups warm nothing. 1 + 14 bounds a run at
@@ -861,8 +862,9 @@ _CLI_STARTUP_READY_SIGNAL = "Launching your agent"
 # polly reuses it; remaining work is session + runner connect ~5-20s on CI.
 _CLI_STARTUP_TIMEOUT_S = 60
 
-# ~5s per attempt; cap so a large --iterations stays in budget.
-_CLI_STARTUP_MAX_ITERATIONS = 3
+# ~7s per attempt on CI (incl. the untimed `omnigent stop`); cap so a large
+# --iterations stays in budget.
+_CLI_STARTUP_MAX_ITERATIONS = 6
 
 
 async def _prepare_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> None:

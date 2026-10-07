@@ -96,11 +96,11 @@ run stays within the CI time budget. Caps only lower a count, never raise it.
 
 - `warm_turn`, `time_to_first_token`, `interrupt`: up to 50 samples per run.
   Each turn's LLM request grows with session history, so they move to a fresh
-  warmed session every 10 samples to keep samples at a similar history depth.
+  warmed session every 25 samples to bound history depth.
 - `session_cold_start`, `session_cold_restart`: 1 warmup and up to 14 samples.
   Every op launches a fresh runner, so one warmup absorbs the first-launch
   costs; a run launches at most 15 runners.
-- `cli_startup`: no warmup, up to 3 samples.
+- `cli_startup`: no warmup, up to 6 samples.
 
 | Journey | Operation timed |
 | --- | --- |
