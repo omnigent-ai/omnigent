@@ -8,11 +8,13 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { ARCA_PREVIEW_TIMEOUT_MS } = require("./arcaPreviewConfig");
 const { buildDesignModeScript } = require("./designModeScript");
 
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
 const DESIGN_MODE_GESTURE_WINDOW_MS = 1500;
+const PREVIEW_REQUEST_TOMBSTONE_MS = 60_000;
 
 /**
  * Detach design-mode listeners (console-message + input-event) off an entry and
@@ -256,7 +258,14 @@ function makeDesignModeInputHandler(gestureState) {
  *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
  *        Resolves the sender window's own browser-view registry.
  */
-function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent }) {
+function registerBrowserIpc({
+  ipcMain,
+  isPinnedOriginSender,
+  getRegistryForEvent,
+  prepareAgentNavigation = async (_event, _conversationId, _url, opts) => opts,
+  previewTimeoutMs = ARCA_PREVIEW_TIMEOUT_MS,
+}) {
+  const previewRequests = new Map();
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
    * `{ registry }` on success or `{ error }` (a structured result, never a
@@ -281,17 +290,119 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     }
   };
 
-  // Open (create-if-absent) or navigate a conversation's view, and measure it
-  // into place. `force` reloads even on the same URL (agent "bring me back"
-  // intent). Returns the registry's structured `{ ok, created, error }`.
-  ipcMain.handle("omnigent:browser-open-or-navigate", (event, args) => {
+  ipcMain.handle("omnigent:browser-begin-preview-navigation", (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId, url, bounds, opts } = args ?? {};
+    const { conversationId } = args ?? {};
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const r = g.registry.openOrNavigate(conversationId, url, bounds, opts);
+    const intentToken = g.registry.beginNavigation(conversationId);
+    const requestId = crypto.randomBytes(16).toString("hex");
+    const deadline = Date.now() + previewTimeoutMs;
+    const timer = setTimeout(() => {
+      const request = previewRequests.get(requestId);
+      if (!request) return;
+      request.expired = true;
+      if (request.registry.isNavigationCurrent(conversationId, intentToken)) {
+        request.registry.beginNavigation(conversationId);
+      }
+      request.retentionTimer = setTimeout(
+        () => previewRequests.delete(requestId),
+        PREVIEW_REQUEST_TOMBSTONE_MS,
+      );
+      request.retentionTimer.unref?.();
+    }, previewTimeoutMs);
+    timer.unref?.();
+    previewRequests.set(requestId, {
+      registry: g.registry,
+      conversationId,
+      intentToken,
+      deadline,
+      timer,
+      expired: false,
+      retentionTimer: null,
+    });
+    return { ok: true, requestId, deadline };
+  });
+
+  // Open (create-if-absent) or navigate a conversation's view, and measure it
+  // into place. `force` reloads even on the same URL (agent "bring me back"
+  // intent). Returns the registry's structured `{ ok, created, error }`.
+  ipcMain.handle("omnigent:browser-open-or-navigate", async (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    const { conversationId, url, bounds, previewRequestId } = args ?? {};
+    const rendererOpts = args?.opts;
+    let opts = {
+      force: !!rendererOpts?.force,
+      agent: !!rendererOpts?.agent,
+      hostId: typeof rendererOpts?.hostId === "string" ? rendererOpts.hostId : null,
+    };
+    if (typeof conversationId !== "string" || !conversationId) {
+      return { ok: false, error: "conversationId is required" };
+    }
+    let request = null;
+    if (typeof previewRequestId === "string") {
+      request = previewRequests.get(previewRequestId) ?? null;
+      const requestMatchesSender =
+        request?.registry === g.registry && request?.conversationId === conversationId;
+      if (requestMatchesSender) {
+        previewRequests.delete(previewRequestId);
+        clearTimeout(request.timer);
+        if (request.retentionTimer) clearTimeout(request.retentionTimer);
+      }
+      if (requestMatchesSender && (request.expired || request.deadline <= Date.now())) {
+        return { ok: false, created: false, error: "localhost preview request expired" };
+      }
+      if (
+        !request ||
+        !requestMatchesSender ||
+        !g.registry.isNavigationCurrent(conversationId, request.intentToken)
+      ) {
+        return { ok: false, created: false, error: "navigation was superseded" };
+      }
+    }
+    const intentToken = request?.intentToken ?? g.registry.beginNavigation(conversationId);
+    const lifecycle = {
+      intentToken,
+      deadline: request?.deadline,
+      onCancel: (cancel) => g.registry.bindNavigationCancel(conversationId, intentToken, cancel),
+    };
+    let preparedRelease = null;
+    if (opts?.agent) {
+      try {
+        const prepared = await prepareAgentNavigation(event, conversationId, url, opts, lifecycle);
+        if (!prepared || typeof prepared !== "object" || Array.isArray(prepared)) {
+          throw new Error("agent navigation preparation returned invalid options");
+        }
+        opts = { ...prepared, ...opts };
+        preparedRelease = opts?.releaseOwnedOrigin || null;
+      } catch (error) {
+        return { ok: false, created: false, error: error?.message ?? String(error) };
+      }
+    }
+    let superseded;
+    try {
+      superseded =
+        !g.registry.isNavigationCurrent(conversationId, intentToken) ||
+        !isPinnedOriginSender(event) ||
+        getRegistryForEvent(event) !== g.registry;
+    } catch {
+      superseded = true;
+    }
+    if (superseded) {
+      preparedRelease?.();
+      return { ok: false, created: false, error: "navigation was superseded" };
+    }
+    let r;
+    try {
+      r = g.registry.openOrNavigate(conversationId, url, bounds, { ...opts, intentToken });
+    } catch (error) {
+      preparedRelease?.();
+      return { ok: false, created: false, error: error?.message ?? String(error) };
+    }
+    if (!r.ok) preparedRelease?.();
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
     if (r.ok && r.created && r.entry) {
@@ -423,7 +534,10 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    goBack(entry.view.webContents);
+    if (readNavState(entry.view.webContents).canGoBack) {
+      g.registry.beginNavigation(args.conversationId);
+      goBack(entry.view.webContents);
+    }
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -432,7 +546,10 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    goForward(entry.view.webContents);
+    if (readNavState(entry.view.webContents).canGoForward) {
+      g.registry.beginNavigation(args.conversationId);
+      goForward(entry.view.webContents);
+    }
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -441,6 +558,7 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    g.registry.beginNavigation(args.conversationId);
     try {
       entry.view.webContents.reload();
     } catch {

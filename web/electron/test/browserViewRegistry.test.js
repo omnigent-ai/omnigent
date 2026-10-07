@@ -296,6 +296,29 @@ describe("browserViewRegistry — recent-session input forwarding", () => {
     assert.equal(prevented.length, 1, "only Ctrl+Tab is claimed");
     assert.equal(sent.length, countAfterUnsubscribe, "ordinary Escape is not forwarded");
   });
+
+  it("cancels a pending switch and releases its preview when the view closes", async () => {
+    const { registry, listeners, sent } = makeRecentSessionInputRegistry();
+    const releases = [];
+    registry.arcaPreview = {
+      release: async (conversationId) => releases.push(conversationId),
+    };
+    const forward = listeners.get("before-input-event");
+    forward({ preventDefault() {} }, { type: "keyDown", key: "Tab", code: "Tab", control: true });
+
+    const result = registry.close("conv_1", "app-quit");
+    await result.cleanup;
+
+    assert.equal(result.removed, true);
+    assert.deepEqual(releases, ["conv_1"]);
+    assert.equal(sent.at(-2).channel, "browser-recent-session-input");
+    assert.equal(sent.at(-2).payload.type, "keydown");
+    assert.equal(sent.at(-2).payload.key, "Escape");
+    assert.deepEqual(sent.at(-1), {
+      channel: "browser-view-closed",
+      payload: { conversationId: "conv_1", reason: "app-quit" },
+    });
+  });
 });
 
 // Build a registry whose stub views record every loadURL call, so we can
@@ -431,15 +454,18 @@ function makeEventCapturingRegistry() {
     externalOpens,
     menus,
     copyCalls: () => copyCalls,
-    fire: (event, targetUrl) => {
+    fire: (event, targetUrl, isMainFrame = true) => {
       const ev = {
         url: targetUrl,
+        isMainFrame,
         prevented: false,
         preventDefault() {
           this.prevented = true;
         },
       };
-      handlers[event](ev, targetUrl);
+      if (event === "will-redirect" || event === "did-start-navigation") {
+        handlers[event](ev, targetUrl, false, isMainFrame);
+      } else handlers[event](ev, targetUrl);
       return ev;
     },
     fireContextMenu: (params) => handlers["context-menu"]({}, params),
@@ -447,7 +473,269 @@ function makeEventCapturingRegistry() {
   };
 }
 
+function previewOwnership(partition, overrides = {}) {
+  return {
+    agent: true,
+    ownedOrigin: "http://localhost:5173",
+    ownedHostId: "host_a",
+    ownedServerUrl: "https://workspace.cloud.databricks.com/omnigent",
+    ownedArcaTarget: "https://target.cloud.databricks.com/omnigent",
+    previewPartition: partition,
+    ...overrides,
+  };
+}
+
+describe("browserViewRegistry — preview partition ownership", () => {
+  it("reuses the same complete owner without recreating its view or partition", () => {
+    const { registry } = makeRegistry();
+    const partition = registry.newPreviewPartition();
+    const first = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173/app",
+      undefined,
+      previewOwnership(partition),
+    );
+    const second = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173/next",
+      undefined,
+      previewOwnership(partition),
+    );
+
+    assert.equal(second.ok, true);
+    assert.equal(second.created, false);
+    assert.equal(second.entry.view, first.entry.view);
+    assert.equal(second.entry.partition, partition);
+    assert.equal(second.entry.agentOwnedPartition, partition);
+  });
+
+  it("fails closed when an existing view or owner does not match the requested partition", () => {
+    const { registry } = makeRegistry();
+    const firstPartition = registry.newPreviewPartition();
+    const secondPartition = registry.newPreviewPartition();
+    const first = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173",
+      undefined,
+      previewOwnership(firstPartition),
+    );
+
+    const partitionMismatch = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173/next",
+      undefined,
+      previewOwnership(secondPartition),
+    );
+    assert.deepEqual(partitionMismatch, { ok: false, error: "preview partition mismatch" });
+    assert.equal(registry.get("conv_1"), first.entry);
+
+    first.entry.agentOwnedHostId = "host_b";
+    const ownerMismatch = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173/next",
+      undefined,
+      previewOwnership(firstPartition),
+    );
+    assert.deepEqual(ownerMismatch, { ok: false, error: "preview ownership mismatch" });
+    assert.equal(first.entry.agentOwnedHostId, "host_b");
+  });
+
+  it("does not treat a private partition name alone as verified ownership", () => {
+    const { registry } = makeRegistry();
+    const result = registry.openOrNavigate("conv_1", "https://example.com", undefined, {
+      agent: true,
+      previewPartition: registry.newPreviewPartition(),
+    });
+    assert.deepEqual(result, {
+      ok: false,
+      error: "preview partition requires verified ownership",
+    });
+    assert.equal(registry.has("conv_1"), false);
+  });
+
+  it("replaces generic and retired views while preserving the current intent", () => {
+    for (const retired of [false, true]) {
+      const { registry, fire } = makeEventCapturingRegistry();
+      const original = retired
+        ? registry.openOrNavigate(
+            "conv_1",
+            "http://localhost:5173",
+            undefined,
+            previewOwnership(registry.newPreviewPartition()),
+          )
+        : registry.openOrNavigate("conv_1", "https://example.com");
+      if (retired) fire("did-navigate", "https://example.com/away");
+      const retiredPartition = original.entry.partition;
+      const token = registry.beginNavigation("conv_1");
+      assert.equal(registry.discardForNavigation("conv_1", token), true);
+      assert.equal(registry.isNavigationCurrent("conv_1", token), true);
+
+      const partition = registry.newPreviewPartition();
+      const admitted = registry.openOrNavigate(
+        "conv_1",
+        "http://localhost:5173/new",
+        undefined,
+        previewOwnership(partition, { intentToken: token }),
+      );
+      assert.equal(admitted.ok, true);
+      assert.notEqual(admitted.entry.view, original.entry.view);
+      assert.notEqual(partition, retiredPartition);
+    }
+  });
+
+  it("never reuses a partition after close or ownership replacement", () => {
+    const { registry } = makeRegistry();
+    const firstPartition = registry.newPreviewPartition();
+    registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173",
+      undefined,
+      previewOwnership(firstPartition),
+    );
+    registry.close("conv_1", "user");
+    const secondPartition = registry.newPreviewPartition();
+    registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173",
+      undefined,
+      previewOwnership(secondPartition),
+    );
+    assert.notEqual(secondPartition, firstPartition);
+    assert.equal(registry.get("conv_1").partition, secondPartition);
+  });
+});
+
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
+  it("admits the owned exact origin on every guard and releases it on navigation away", () => {
+    const { registry, fire, windowOpen } = makeEventCapturingRegistry();
+    let releases = 0;
+    registry.openOrNavigate("conv_1", "http://localhost:5173/app", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => (releases += 1),
+    });
+    assert.equal(fire("will-redirect", "http://localhost:5173/next").prevented, false);
+    assert.equal(fire("will-frame-navigate", "http://localhost:5173/frame").prevented, false);
+    assert.deepEqual(windowOpen("http://localhost:5173/popup"), { action: "deny" });
+    assert.equal(fire("will-navigate", "https://example.com/away").prevented, false);
+    fire("did-navigate", "https://example.com/away");
+    assert.equal(releases, 1);
+    assert.equal(fire("will-navigate", "http://localhost:5173/stale").prevented, true);
+  });
+
+  it("releases the owned origin when the view closes", () => {
+    const { registry } = makeEventCapturingRegistry();
+    let releases = 0;
+    registry.openOrNavigate("conv_1", "http://localhost:5173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => (releases += 1),
+    });
+    registry.close("conv_1", "user");
+    assert.equal(releases, 1);
+  });
+
+  it("keeps the preview for external subframes and rejected top-level targets", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    let releases = 0;
+    registry.openOrNavigate("conv_1", "http://localhost:5173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => (releases += 1),
+    });
+    assert.equal(
+      fire("will-frame-navigate", "https://cdn.example.com/frame", false).prevented,
+      false,
+    );
+    assert.equal(fire("will-redirect", "https://cdn.example.com/redirect", false).prevented, false);
+    assert.equal(fire("will-navigate", "http://10.0.0.5/private").prevented, true);
+    assert.equal(releases, 0);
+    assert.equal(fire("will-navigate", "https://example.com/away").prevented, false);
+    fire("did-navigate", "https://example.com/away");
+    assert.equal(releases, 1);
+  });
+
+  it("transfers an admitted preview out of pending cancellation until departure commits", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    let cancellations = 0;
+    let releases = 0;
+    const token = registry.beginNavigation("conv_1");
+    registry.bindNavigationCancel("conv_1", token, () => (cancellations += 1));
+    registry.openOrNavigate("conv_1", "http://localhost:5173/app", undefined, {
+      agent: true,
+      intentToken: token,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => (releases += 1),
+    });
+    registry.beginNavigation("conv_1");
+    assert.equal(cancellations, 0);
+    assert.equal(releases, 0);
+    const rejected = registry.openOrNavigate("conv_1", "http://10.0.0.5/private", undefined, {
+      agent: true,
+    });
+    assert.equal(rejected.ok, false);
+    assert.equal(releases, 0);
+    fire("did-navigate", "https://example.com/away");
+    assert.equal(releases, 1);
+  });
+
+  it("does not reuse a same-origin preview after the verified execution host changes", () => {
+    const { registry } = makeEventCapturingRegistry();
+    let firstReleases = 0;
+    let secondReleases = 0;
+    registry.openOrNavigate("conv_1", "http://localhost:5173/app", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      ownedHostId: "host_a",
+      ownedServerUrl: "https://workspace.example/omnigent?o=1",
+      releaseOwnedOrigin: () => (firstReleases += 1),
+    });
+    registry.openOrNavigate("conv_1", "http://localhost:5173/next", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      ownedHostId: "host_b",
+      ownedServerUrl: "https://workspace.example/omnigent?o=1",
+      releaseOwnedOrigin: () => (secondReleases += 1),
+    });
+    const entry = registry.get("conv_1");
+    assert.equal(firstReleases, 1);
+    assert.equal(secondReleases, 0);
+    assert.equal(entry.agentOwnedHostId, "host_b");
+  });
+
+  it("retires a released preview and closes a stale history reload", () => {
+    const { registry, fire, loaded } = makeEventCapturingRegistry();
+    let releases = 0;
+    registry.openOrNavigate("conv_1", "http://localhost:5173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => (releases += 1),
+    });
+    registry.clearAgentOrigin("conv_1");
+    assert.equal(releases, 1);
+    assert.equal(loaded.at(-1), "http://localhost:5173");
+    fire("did-start-navigation", "http://localhost:5173/from-history");
+    assert.equal(registry.has("conv_1"), false);
+  });
+
+  it("remembers every retired preview origin until the view is discarded", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "http://localhost:5173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => {},
+    });
+    registry.clearAgentOrigin("conv_1");
+    registry.openOrNavigate("conv_1", "http://localhost:4173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:4173",
+      releaseOwnedOrigin: () => {},
+    });
+    registry.clearAgentOrigin("conv_1");
+    fire("did-start-navigation", "http://localhost:5173/from-history");
+    assert.equal(registry.has("conv_1"), false);
+  });
+
   it("blocks an agent-locked will-redirect to the cloud-metadata IP", () => {
     const { registry, sent, fire } = makeEventCapturingRegistry();
     // Agent navigates to an allowed host (locks the view to agent policy).
@@ -623,5 +911,84 @@ describe("browserViewRegistry — overlay suppression (#3980)", () => {
     assert.deepEqual(ctx.registry.setSuppressed(true), { ok: true });
     assert.equal(ctx.registry.isSuppressed(), true);
     assert.equal(ctx.visibility.length, 0, "nothing to toggle with no active view");
+  });
+});
+
+describe("browserViewRegistry — pending navigation lifecycle", () => {
+  it("cancels pending attempts on close, closeAll, and a newer navigation but not chat switching", () => {
+    const { registry } = makeRegistry();
+    let cancellations = 0;
+    let token = registry.beginNavigation("conv_1");
+    registry.bindNavigationCancel("conv_1", token, () => (cancellations += 1));
+    registry.setActive(null);
+    assert.equal(cancellations, 0);
+    registry.close("conv_1");
+    assert.equal(cancellations, 1);
+
+    token = registry.beginNavigation("conv_1");
+    registry.bindNavigationCancel("conv_1", token, () => (cancellations += 1));
+    registry.openOrNavigate("conv_1", "https://example.com");
+    assert.equal(cancellations, 2);
+
+    token = registry.beginNavigation("conv_2");
+    registry.bindNavigationCancel("conv_2", token, () => (cancellations += 1));
+    registry.closeAll("server-changed");
+    assert.equal(cancellations, 3);
+  });
+
+  it("invalidates pending preparation when a main-frame page navigation starts", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    const token = registry.beginNavigation("conv_1");
+    let cancellations = 0;
+    registry.bindNavigationCancel("conv_1", token, () => (cancellations += 1));
+    fire("did-start-navigation", "https://example.com/next");
+    assert.equal(cancellations, 1);
+    assert.equal(registry.isNavigationCurrent("conv_1", token), false);
+  });
+
+  it("returns cleanup for repeated close and close without an entry", async () => {
+    const { registry } = makeRegistry();
+    let resolveShutdown;
+    const shutdown = new Promise((resolve) => {
+      resolveShutdown = resolve;
+    });
+    const releases = [];
+    registry.arcaPreview = {
+      release: (conversationId) => {
+        releases.push(conversationId);
+        return shutdown;
+      },
+      shutdownAll: async () => {},
+    };
+    registry.openOrNavigate("conv_1", "https://example.com");
+    const first = registry.close("conv_1");
+    const repeated = registry.close("conv_1");
+    let settled = false;
+    repeated.cleanup.then(() => (settled = true));
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(settled, false);
+    assert.deepEqual(releases, ["conv_1", "conv_1"]);
+    resolveShutdown();
+    await Promise.all([first.cleanup, repeated.cleanup]);
+  });
+
+  it("awaits manager-wide cleanup from closeAll", async () => {
+    const { registry } = makeRegistry();
+    let resolveShutdown;
+    const shutdown = new Promise((resolve) => {
+      resolveShutdown = resolve;
+    });
+    registry.arcaPreview = { release: () => null, shutdownAll: () => shutdown };
+    let settled = false;
+    const closing = registry.closeAll("app-quit").then(() => (settled = true));
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(settled, false);
+    resolveShutdown();
+    await closing;
   });
 });

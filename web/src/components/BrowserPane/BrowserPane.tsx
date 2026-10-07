@@ -7,9 +7,9 @@
  *  A "Browser" tab in the Workspace rail, so it mounts only while selected.
  *  Flex column: a fixed toolbar row (URL bar + nav + DevTools + design-mode)
  *  always on top so the URL bar is reachable from a cold start; below it the
- *  content switches on `viewActive` (measuring placeholder once a view attaches,
+ *  content switches on `viewExists` (measuring placeholder once a view exists,
  *  else a hint). Bounds-sync (containerRef + syncBounds + rAF/ResizeObserver) is
- *  gated on `viewActive` and measures only below the toolbar.
+ *  gated on `viewExists` and measures only below the toolbar.
  *
  *  The agent relay is NOT here (it must listen before the first browser_navigate
  *  auto-selects the tab) — it's hoisted to the always-mounted AppShell. On
@@ -66,9 +66,6 @@ interface BrowserPaneBridge {
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
-  onBrowserHostActiveChanged?: (
-    callback: (payload: { conversationId: string | null }) => void,
-  ) => () => void;
   onBrowserViewCreated?: (callback: (payload: { conversationId: string }) => void) => () => void;
   onBrowserViewClosed?: (
     callback: (payload: { conversationId: string; reason: string | null }) => void,
@@ -120,9 +117,9 @@ export function BrowserPane({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
-  // Whether a native view is attached for THIS conversation — drives when the
-  // measuring placeholder mounts (no empty pane on an idle conversation).
-  const [viewActive, setViewActive] = useState(false);
+  // Whether a native view exists for THIS conversation. Attachment is separate:
+  // `active` controls whether the retained view is currently shown in the rail.
+  const [viewExists, setViewExists] = useState(false);
 
   // Toolbar state. `currentUrl` tracks the real view URL EXCEPT while the user
   // edits the input (urlEditingRef gates the stomp); canGoBack/Forward drive
@@ -139,21 +136,32 @@ export function BrowserPane({
   const [designMode, setDesignMode] = useState(false);
   const designModeRef = useRef(false);
 
-  // Feed `viewActive` from three signals so the placeholder mounts exactly when
+  useEffect(() => {
+    setViewExists(false);
+    setCurrentUrl("");
+    setNavigationError(null);
+    setCanGoBack(false);
+    setCanGoForward(false);
+  }, [conversationId]);
+
+  // Feed `viewExists` from lifecycle signals so the placeholder mounts when
   // a view exists: (1) browser-view-created — first navigate (often detached,
-  // no host-active event; breaks the activation deadlock); (2) browserHasView
-  // probe on re-mount; (3) host-active-changed for later attach/detach.
-  // browser-view-closed flips it false.
+  // which breaks the activation deadlock); (2) browserHasView on re-mount.
+  // Only browser-view-closed flips it false. Host attachment events must not:
+  // rail hiding detaches a retained view that should reattach on reopen.
   useEffect(() => {
     if (!browserSupported) return;
     const bridge = getBridge();
     if (!bridge) return;
     let cancelled = false;
+    let lifecycleVersion = 0;
+    const probeVersion = lifecycleVersion;
 
     // (2) Re-show an already-created view when the pane remounts.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && r?.exists) {
-        setViewActive(true);
+      if (!cancelled && lifecycleVersion === probeVersion && r?.exists) {
+        setViewExists(true);
+        setNavigationError(null);
         if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
@@ -162,21 +170,32 @@ export function BrowserPane({
 
     // (1) A view was just created for this conversation (first navigate).
     const unsubCreated = bridge.onBrowserViewCreated?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(true);
-    });
-    // (3) Attach/detach transitions. An attach for another conversation, or a
-    // detach (null), means this pane's view is no longer the visible one.
-    const unsubActive = bridge.onBrowserHostActiveChanged?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(true);
-      else if (payload.conversationId === null) setViewActive(false);
+      if (payload.conversationId === conversationId) {
+        lifecycleVersion += 1;
+        setViewExists(true);
+        setNavigationError(null);
+      }
     });
     const unsubClosed = bridge.onBrowserViewClosed?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(false);
+      if (payload.conversationId !== conversationId) return;
+      lifecycleVersion += 1;
+      setViewExists(false);
+      setCurrentUrl("");
+      setCanGoBack(false);
+      setCanGoForward(false);
+      if (payload.reason === "preview-expired") {
+        setNavigationError("This localhost preview expired. Ask the agent to open it again.");
+      } else if (payload.reason === "preview-exited") {
+        setNavigationError(
+          "This localhost preview is unavailable because its secure connection closed. Ask the agent to open it again.",
+        );
+      } else {
+        setNavigationError(null);
+      }
     });
     return () => {
       cancelled = true;
       unsubCreated?.();
-      unsubActive?.();
       unsubClosed?.();
     };
   }, [conversationId, browserSupported]);
@@ -272,11 +291,11 @@ export function BrowserPane({
   // If the view goes away (closed) while design mode is on, drop the pressed
   // state so the button doesn't lie — the injected picker died with the view.
   useEffect(() => {
-    if ((!viewActive || !active) && designMode) {
+    if ((!viewExists || !active) && designMode) {
       designModeRef.current = false;
       setDesignMode(false);
     }
-  }, [viewActive, active, designMode]);
+  }, [viewExists, active, designMode]);
 
   // Measure the placeholder and push bounds to the main process. These are
   // renderer CSS pixels; the main process converts to WebContentsView DIPs
@@ -316,7 +335,7 @@ export function BrowserPane({
   // present; DETACH (not destroy) on unmount so a background agent's page keeps
   // running when the user switches away. A later mount re-attaches.
   useEffect(() => {
-    if (!browserSupported || !viewActive || !active) return;
+    if (!browserSupported || !viewExists || !active) return;
     const bridge = getBridge();
     if (!bridge?.browserSetActive) return;
     void bridge.browserSetActive(conversationId);
@@ -345,7 +364,7 @@ export function BrowserPane({
         /* swallow — window may be tearing down */
       }
     };
-  }, [conversationId, browserSupported, viewActive, active, syncBounds]);
+  }, [conversationId, browserSupported, viewExists, active, syncBounds]);
 
   // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
   // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that
@@ -353,7 +372,7 @@ export function BrowserPane({
   // teardown still schedules the next frame — else the rAF chain dies and the
   // overlay strands.
   useEffect(() => {
-    if (!browserSupported || !viewActive || !active) return;
+    if (!browserSupported || !viewExists || !active) return;
     let rafId = 0;
     const tick = () => {
       try {
@@ -365,13 +384,13 @@ export function BrowserPane({
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [browserSupported, viewActive, active, syncBounds]);
+  }, [browserSupported, viewExists, active, syncBounds]);
 
   // Defense-in-depth against a hung rAF chain: ResizeObserver (size), window
   // resize, and visibilitychange (tab-back, where rAFs were throttled) each
   // recover bounds on the next interaction.
   useEffect(() => {
-    if (!browserSupported || !viewActive || !active || !containerRef.current) return;
+    if (!browserSupported || !viewExists || !active || !containerRef.current) return;
     const el = containerRef.current;
     const ro = new ResizeObserver(() => syncBounds());
     ro.observe(el);
@@ -386,7 +405,7 @@ export function BrowserPane({
       window.removeEventListener("resize", onResize);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [browserSupported, viewActive, active, syncBounds]);
+  }, [browserSupported, viewExists, active, syncBounds]);
 
   // No browser-capable shell (plain web build, or a desktop build too old for
   // the embedded browser): render nothing so there's no empty split pane. The
@@ -395,20 +414,20 @@ export function BrowserPane({
 
   // Flex column: the toolbar (shrink-0) is ALWAYS the first child so the URL bar
   // is reachable from a cold start (typing a URL creates the view on demand →
-  // viewActive flips true → the measuring container mounts). Gating the toolbar
-  // on viewActive was a deadlock: no page → no toolbar → no way to open a page.
+  // viewExists flips true → the measuring container mounts). Gating the toolbar
+  // on viewExists was a deadlock: no page → no toolbar → no way to open a page.
   //
   // LAYOUT TRAP (verified): the native view paints OVER the measured containerRef
   // rect, so the toolbar must be ABOVE it, never inside. The container is the LAST
   // child, flex-1 min-h-0 (not inset:0), so getBoundingClientRect covers only the
   // region below the toolbar and the view fills exactly that.
   //
-  // Content area below the always-present toolbar switches on viewActive:
-  //   - viewActive: the measuring `containerRef` placeholder. `containerRef` +
-  //     syncBounds + the rAF/observer effects (all gated on viewActive above)
+  // Content area below the always-present toolbar switches on viewExists:
+  //   - viewExists: the measuring `containerRef` placeholder. `containerRef` +
+  //     syncBounds + the rAF/observer effects (all gated on viewExists above)
   //     keep the native view positioned over the container. NO containerRef is
-  //     mounted while !viewActive, so nothing measures an empty div.
-  //   - !viewActive: a centered hint. Back/forward are already disabled off
+  //     mounted while !viewExists, so nothing measures an empty div.
+  //   - !viewExists: a centered hint. Back/forward are already disabled off
   //     canGoBack/canGoForward (both false with no view); reload + DevTools are
   //     explicitly disabled (nothing to reload / no devtools target yet). The
   //     URL bar stays editable so the user can open the first page.
@@ -441,7 +460,7 @@ export function BrowserPane({
         <button
           type="button"
           onClick={handleReload}
-          disabled={!viewActive}
+          disabled={!viewExists}
           aria-label="Reload"
           title="Reload"
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
@@ -475,7 +494,7 @@ export function BrowserPane({
         <button
           type="button"
           onClick={handleDevTools}
-          disabled={!viewActive}
+          disabled={!viewExists}
           aria-label="Toggle DevTools"
           title="Toggle DevTools"
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
@@ -485,7 +504,7 @@ export function BrowserPane({
         <button
           type="button"
           onClick={handleToggleDesignMode}
-          disabled={!viewActive}
+          disabled={!viewExists}
           aria-pressed={designMode}
           aria-label={designMode ? "Exit design mode" : "Enter design mode"}
           title={
@@ -506,10 +525,10 @@ export function BrowserPane({
           {navigationError}
         </div>
       )}
-      {viewActive ? (
+      {viewExists ? (
         /* Measuring region — the native WebContentsView paints over this.
            flex-1 min-h-0 so it fills everything BELOW the toolbar; its rect
-           is what syncBounds() pushes. Mounted only while viewActive so the
+           is what syncBounds() pushes. Mounted only while viewExists so the
            effects never measure an empty div.
            ml-1 (4px, matching the WorkspacePanel resize handle's w-1) shifts
            this box right so the native view's rect.left clears the handle at

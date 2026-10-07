@@ -44,6 +44,22 @@ const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
  */
 const SAFE_URL_RE = /^[A-Za-z0-9\-._~:/?=&%]+$/;
 
+function normalizeSafeServerUrl(serverUrl) {
+  const url = new URL(serverUrl);
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error(`unsupported server URL scheme: ${url.protocol}`);
+  }
+  if (!SAFE_URL_RE.test(url.toString())) {
+    throw new Error("server URL contains characters that are not allowed in an ssh command");
+  }
+  return url.toString();
+}
+
+/** Quote a validated server URL for the remote login shell used by `arca ssh`. */
+function quoteRemoteServerUrl(serverUrl) {
+  return `'${normalizeSafeServerUrl(serverUrl)}'`;
+}
+
 /**
  * @typedef {"timeout" | "omni-auth" | "arca-auth" | "missing-remote-cli" | "unreachable" | "unknown"} ArcaErrorKind
  */
@@ -144,13 +160,7 @@ function resolveArcaPathAsync(deps = {}) {
  * @returns {string[]}
  */
 function buildArcaArgs(serverUrl, login = false) {
-  const url = new URL(serverUrl);
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
-    throw new Error(`unsupported server URL scheme: ${url.protocol}`);
-  }
-  if (!SAFE_URL_RE.test(url.toString())) {
-    throw new Error("server URL contains characters that are not allowed in an ssh command");
-  }
+  const quotedServerUrl = quoteRemoteServerUrl(serverUrl);
   return [
     "ssh",
     // Ordinary arca ssh inherits -R 19222 from ~/.ssh/config. Arca Companion
@@ -161,11 +171,9 @@ function buildArcaArgs(serverUrl, login = false) {
     "ClearAllForwardings=yes",
     "isaac",
     "omni",
-    // Quoted for the remote shell, which would glob a `?` (zsh fails on no
-    // match); SAFE_URL_RE already bars `'`, so the quotes can't be broken out of.
     ...(login
-      ? ["login", `'${url.toString()}'`]
-      : ["host", "--server", `'${url.toString()}'`, "--background", "--non-interactive"]),
+      ? ["login", quotedServerUrl]
+      : ["host", "--server", quotedServerUrl, "--background", "--non-interactive"]),
   ];
 }
 
@@ -451,6 +459,8 @@ module.exports = {
   buildLoginArgs,
   connectArcaHost,
   describeConnectFailure,
+  normalizeSafeServerUrl,
+  quoteRemoteServerUrl,
   isExecutableFile,
   resolveArcaPath,
   resolveArcaPathAsync,

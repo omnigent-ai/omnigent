@@ -111,12 +111,17 @@ function makeRegistry(conversationId, webContents) {
   const entries = new Map();
   if (conversationId) entries.set(conversationId, { view: { webContents } });
   const suppressedCalls = []; // booleans passed to setSuppressed, in order
+  const opened = [];
+  const cleared = [];
+  let intent = 0;
+  const intents = new Map();
   const recentSessionSupportCalls = [];
   let recentSessionCancelCount = 0;
   return {
     get: (id) => entries.get(id) ?? null,
     has: (id) => entries.has(id),
-    openOrNavigate: (id) => {
+    openOrNavigate: (id, url, bounds, opts) => {
+      opened.push({ id, url, bounds, opts });
       const wc = makeWebContents();
       const entry = { view: { webContents: wc } };
       entries.set(id, entry);
@@ -136,7 +141,27 @@ function makeRegistry(conversationId, webContents) {
       return { ok: true };
     },
     close: () => ({ ok: true, removed: true }),
+    clearAgentOrigin: (id) => cleared.push(id),
+    beginNavigation: (id) => {
+      intents.get(id)?.cancel?.();
+      const current = { token: ++intent, cancel: null };
+      intents.set(id, current);
+      return current.token;
+    },
+    bindNavigationCancel: (id, token, cancel) => {
+      const current = intents.get(id);
+      if (!current || current.token !== token) {
+        cancel?.();
+        return false;
+      }
+      current.cancel = cancel;
+      return true;
+    },
+    isNavigationCurrent: (id, token) => intents.get(id)?.token === token,
+    intent: () => intent,
     suppressedCalls,
+    opened,
+    cleared,
     recentSessionSupportCalls,
     recentSessionCancelCount: () => recentSessionCancelCount,
   };
@@ -144,16 +169,27 @@ function makeRegistry(conversationId, webContents) {
 
 /** Register the IPC surface with injectable gate + registry, and capture the
  *  events sent to a fake sender. */
-function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
+function setup({
+  pinned = true,
+  conversationId = "conv_1",
+  webContents,
+  prepareAgentNavigation,
+  previewTimeoutMs,
+} = {}) {
   const ipcMain = makeIpcMain();
   const wc = webContents ?? makeWebContents();
   const registry = makeRegistry(conversationId, wc);
   const sent = [];
-  const event = { sender: { send: (channel, payload) => sent.push({ channel, payload }) } };
+  const event = {
+    sender: { send: (channel, payload) => sent.push({ channel, payload }) },
+    registry,
+  };
   registerBrowserIpc({
     ipcMain,
-    isPinnedOriginSender: () => pinned,
-    getRegistryForEvent: () => registry,
+    isPinnedOriginSender: typeof pinned === "function" ? pinned : () => pinned,
+    getRegistryForEvent: (value) => value.registry,
+    prepareAgentNavigation,
+    previewTimeoutMs,
   });
   return { ipcMain, registry, wc, sent, event };
 }
@@ -282,18 +318,21 @@ describe("browserIpc — recent-session cancellation", () => {
 describe("browserIpc — history navigation", () => {
   it("go-back issues goBack only when canGoBack is true", async () => {
     const wc = makeWebContents({ canBack: true });
-    const { ipcMain, event } = setup({ webContents: wc });
+    const { ipcMain, registry, event } = setup({ webContents: wc });
     const r = await ipcMain.invoke("omnigent:browser-go-back", event, { conversationId: "conv_1" });
     assert.equal(r.ok, true);
     assert.ok(wc.calls.includes("goBack"));
+    assert.equal(registry.intent(), 1);
   });
 
   it("go-back is a no-op when canGoBack is false", async () => {
     const wc = makeWebContents({ canBack: false });
-    const { ipcMain, event } = setup({ webContents: wc });
+    const { ipcMain, registry, event } = setup({ webContents: wc });
+    const pendingIntent = registry.beginNavigation("conv_1");
     const r = await ipcMain.invoke("omnigent:browser-go-back", event, { conversationId: "conv_1" });
     assert.equal(r.ok, true);
     assert.ok(!wc.calls.includes("goBack"));
+    assert.equal(registry.intent(), pendingIntent);
   });
 
   it("go-forward issues goForward when canGoForward is true", async () => {
@@ -301,6 +340,15 @@ describe("browserIpc — history navigation", () => {
     const { ipcMain, event } = setup({ webContents: wc });
     await ipcMain.invoke("omnigent:browser-go-forward", event, { conversationId: "conv_1" });
     assert.ok(wc.calls.includes("goForward"));
+  });
+
+  it("go-forward preserves the current intent when history is unavailable", async () => {
+    const wc = makeWebContents({ canForward: false });
+    const { ipcMain, registry, event } = setup({ webContents: wc });
+    const pendingIntent = registry.beginNavigation("conv_1");
+    await ipcMain.invoke("omnigent:browser-go-forward", event, { conversationId: "conv_1" });
+    assert.ok(!wc.calls.includes("goForward"));
+    assert.equal(registry.intent(), pendingIntent);
   });
 
   it("reload calls webContents.reload", async () => {
@@ -330,6 +378,221 @@ describe("browserIpc — devtools toggle", () => {
 });
 
 describe("browserIpc — url live-tracking", () => {
+  it("mints and consumes a preview intent before preparation", async () => {
+    let lifecycle;
+    const ctx = setup({
+      prepareAgentNavigation: async (_event, _id, _url, opts, value) => {
+        lifecycle = value;
+        return opts;
+      },
+    });
+    const begun = await ctx.ipcMain.invoke("omnigent:browser-begin-preview-navigation", ctx.event, {
+      conversationId: "conv_arca",
+    });
+    assert.equal(begun.ok, true);
+    const opened = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+      previewRequestId: begun.requestId,
+    });
+    assert.equal(opened.ok, true);
+    assert.equal(lifecycle.intentToken, 1);
+    assert.equal(lifecycle.deadline, begun.deadline);
+    assert.equal(ctx.registry.intent(), 1);
+  });
+
+  it("expires a preview intent before late metadata can reach preparation", async () => {
+    let prepares = 0;
+    const ctx = setup({
+      previewTimeoutMs: 5,
+      prepareAgentNavigation: async () => {
+        prepares += 1;
+      },
+    });
+    const begun = await ctx.ipcMain.invoke("omnigent:browser-begin-preview-navigation", ctx.event, {
+      conversationId: "conv_arca",
+    });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    const opened = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+      previewRequestId: begun.requestId,
+    });
+    assert.equal(opened.ok, false);
+    assert.equal(opened.error, "localhost preview request expired");
+    assert.equal(prepares, 0);
+  });
+
+  it("does not grant forged or superseded preview request IDs authority", async () => {
+    const ctx = setup();
+    const forged = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+      previewRequestId: "not-a-minted-request",
+    });
+    assert.equal(forged.error, "navigation was superseded");
+    assert.equal(ctx.registry.opened.length, 0);
+
+    const begun = await ctx.ipcMain.invoke("omnigent:browser-begin-preview-navigation", ctx.event, {
+      conversationId: "conv_arca",
+    });
+    ctx.registry.beginNavigation("conv_arca");
+    const superseded = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+      previewRequestId: begun.requestId,
+    });
+    assert.equal(superseded.error, "navigation was superseded");
+    assert.equal(ctx.registry.opened.length, 0);
+  });
+
+  it("only consumes a preview request for its owning registry and conversation", async () => {
+    const ctx = setup();
+    const begun = await ctx.ipcMain.invoke("omnigent:browser-begin-preview-navigation", ctx.event, {
+      conversationId: "conv_arca",
+    });
+
+    const wrongConversation = await ctx.ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      ctx.event,
+      {
+        conversationId: "conv_other",
+        url: "http://localhost:5173",
+        opts: { agent: true },
+        previewRequestId: begun.requestId,
+      },
+    );
+    assert.equal(wrongConversation.error, "navigation was superseded");
+
+    const foreignEvent = { ...ctx.event, registry: makeRegistry("conv_arca", makeWebContents()) };
+    const wrongRegistry = await ctx.ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      foreignEvent,
+      {
+        conversationId: "conv_arca",
+        url: "http://localhost:5173",
+        opts: { agent: true },
+        previewRequestId: begun.requestId,
+      },
+    );
+    assert.equal(wrongRegistry.error, "navigation was superseded");
+
+    const owner = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+      previewRequestId: begun.requestId,
+    });
+    assert.equal(owner.ok, true);
+  });
+
+  it("prepares an agent navigation before opening and surfaces preparation failure", async () => {
+    const prepared = { agent: true, ownedOrigin: "http://localhost:5173" };
+    const calls = [];
+    const ok = setup({
+      prepareAgentNavigation: async (_event, id, url, opts) => {
+        calls.push({ id, url, opts });
+        return prepared;
+      },
+    });
+    const result = await ok.ipcMain.invoke("omnigent:browser-open-or-navigate", ok.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true, hostId: "host_arca" },
+    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(ok.registry.cleared, []);
+    assert.deepEqual(ok.registry.opened[0].opts, {
+      ...prepared,
+      force: false,
+      hostId: "host_arca",
+      intentToken: 1,
+    });
+    assert.equal(calls[0].opts.hostId, "host_arca");
+
+    const failed = setup({
+      prepareAgentNavigation: async () => {
+        throw new Error("host mismatch");
+      },
+    });
+    const rejected = await failed.ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      failed.event,
+      { conversationId: "conv_arca", url: "http://localhost:5173", opts: { agent: true } },
+    );
+    assert.deepEqual(rejected, { ok: false, created: false, error: "host mismatch" });
+    assert.equal(failed.registry.opened.length, 0);
+  });
+
+  it("preserves sanitized options when preparation returns only internal enrichment", async () => {
+    const ctx = setup({
+      prepareAgentNavigation: async () => ({ ownedOrigin: "http://localhost:5173" }),
+    });
+    const result = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true, force: true, hostId: "host_arca" },
+    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(ctx.registry.opened[0].opts, {
+      ownedOrigin: "http://localhost:5173",
+      agent: true,
+      force: true,
+      hostId: "host_arca",
+      intentToken: 1,
+    });
+  });
+
+  it("rejects invalid preparation results and non-Error throws structurally", async () => {
+    for (const invalid of [undefined, null, "options", []]) {
+      const ctx = setup({ prepareAgentNavigation: async () => invalid });
+      // oxlint-disable-next-line no-await-in-loop -- each case owns isolated IPC state.
+      const result = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+        conversationId: "conv_arca",
+        url: "http://localhost:5173",
+        opts: { agent: true, hostId: "host_arca" },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.error, "agent navigation preparation returned invalid options");
+    }
+
+    for (const thrown of [null, undefined, "plain failure"]) {
+      const ctx = setup({
+        prepareAgentNavigation: async () => {
+          // oxlint-disable-next-line no-throw-literal -- exercises non-Error rejection handling.
+          throw thrown;
+        },
+      });
+      // oxlint-disable-next-line no-await-in-loop -- each case owns isolated IPC state.
+      const result = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+        conversationId: "conv_arca",
+        url: "http://localhost:5173",
+        opts: { agent: true },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.error, String(thrown));
+    }
+  });
+
+  it("returns a structured error when open-or-navigate throws a non-Error", async () => {
+    const ctx = setup();
+    ctx.registry.openOrNavigate = () => {
+      // oxlint-disable-next-line no-throw-literal -- exercises non-Error rejection handling.
+      throw null;
+    };
+    const result = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "https://example.com",
+    });
+    assert.deepEqual(result, { ok: false, created: false, error: "null" });
+  });
+
   it("open-or-navigate wires did-navigate listeners that emit url + nav-state", async () => {
     const { ipcMain, registry, sent, event } = setup({ conversationId: null });
     await ipcMain.invoke("omnigent:browser-open-or-navigate", event, {
@@ -361,6 +624,115 @@ describe("browserIpc — url live-tracking", () => {
     assert.equal(sent.filter((s) => s.channel === "browser-url-changed").length, 0);
     wc.emit("did-navigate-in-page", "https://example.com/#main", true); // main frame → emits
     assert.equal(sent.filter((s) => s.channel === "browser-url-changed").length, 1);
+  });
+
+  it("releases prepared ownership when admission fails or the intent is superseded", async () => {
+    let releases = 0;
+    const failed = setup({
+      prepareAgentNavigation: async () => ({
+        agent: true,
+        ownedOrigin: "http://localhost:5173",
+        ownedServerUrl: "https://workspace.cloud.databricks.com/omnigent",
+        ownedArcaTarget: "https://target.cloud.databricks.com/omnigent",
+        previewPartition: "omnigent-preview-test-1",
+        releaseOwnedOrigin: () => (releases += 1),
+      }),
+    });
+    failed.registry.openOrNavigate = () => ({ ok: false, error: "preview partition mismatch" });
+    const rejected = await failed.ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      failed.event,
+      {
+        conversationId: "conv_arca",
+        url: "http://localhost:5173",
+        opts: { agent: true },
+      },
+    );
+    assert.equal(rejected.ok, false);
+    assert.equal(releases, 1);
+
+    let resolvePrepare;
+    let releaseAttempts = 0;
+    let cleanupEffects = 0;
+    const releaseOnce = () => {
+      releaseAttempts += 1;
+      if (cleanupEffects === 0) cleanupEffects += 1;
+    };
+    const stale = setup({
+      prepareAgentNavigation: (_event, id, _url, _opts, lifecycle) =>
+        new Promise((resolve) => {
+          assert.equal(id, "conv_arca");
+          assert.equal(lifecycle.onCancel(releaseOnce), true);
+          resolvePrepare = resolve;
+        }),
+    });
+    const pending = stale.ipcMain.invoke("omnigent:browser-open-or-navigate", stale.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+    });
+    stale.registry.beginNavigation("conv_arca");
+    resolvePrepare({ agent: true, releaseOwnedOrigin: releaseOnce });
+    const staleResult = await pending;
+    assert.equal(staleResult.ok, false);
+    assert.equal(releases, 1);
+    assert.equal(releaseAttempts, 2);
+    assert.equal(cleanupEffects, 1);
+  });
+
+  it("releases prepared ownership if the sender is destroyed during preparation", async () => {
+    let resolvePrepare;
+    let destroyed = false;
+    let releases = 0;
+    const ctx = setup({
+      pinned: () => {
+        if (destroyed) throw new Error("Object has been destroyed");
+        return true;
+      },
+      prepareAgentNavigation: () =>
+        new Promise((resolve) => {
+          resolvePrepare = resolve;
+        }),
+    });
+    const pending = ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+    });
+    destroyed = true;
+    resolvePrepare({ agent: true, releaseOwnedOrigin: () => (releases += 1) });
+    const result = await pending;
+    assert.deepEqual(result, {
+      ok: false,
+      created: false,
+      error: "navigation was superseded",
+    });
+    assert.equal(releases, 1);
+  });
+
+  it("strips renderer-supplied ownership and private intent fields", async () => {
+    const { ipcMain, registry, event } = setup();
+    await ipcMain.invoke("omnigent:browser-open-or-navigate", event, {
+      conversationId: "conv_1",
+      url: "https://example.com",
+      opts: {
+        force: true,
+        agent: false,
+        hostId: "host_arca",
+        ownedOrigin: "http://169.254.169.254",
+        ownedServerUrl: "https://forged.example",
+        ownedArcaTarget: "https://forged-target.example",
+        previewPartition: "omnigent-preview-forged-1",
+        releaseOwnedOrigin: () => {},
+        intentToken: 999,
+      },
+    });
+    assert.deepEqual(registry.opened[0].opts, {
+      force: true,
+      agent: false,
+      hostId: "host_arca",
+      intentToken: 1,
+    });
   });
 });
 

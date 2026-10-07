@@ -55,7 +55,12 @@ class BrowserNavigateTool(Tool):
             "browser pane to a URL. Auto-opens the pane if it isn't "
             "open yet. Requires the Omnigent desktop window to be "
             "running — fails cleanly otherwise. After a load settles, "
-            "call browser_snapshot to inspect what's on the page."
+            "call browser_snapshot to inspect what's on the page. "
+            "Agent-driven localhost previews are currently supported "
+            "only for internal Databricks use with Arca. They require "
+            "the desktop internal-feature flag and a managed Databricks "
+            "server. General embedded-browser tools remain available "
+            "independently of Arca."
         )
 
     def get_schema(self) -> dict[str, Any]:

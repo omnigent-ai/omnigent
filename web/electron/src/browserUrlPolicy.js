@@ -68,14 +68,15 @@ function isBlockedHostname(hostname) {
 }
 
 /**
- * Decide whether an AGENT-issued navigation to `url` is allowed: `{ ok: true }`
- * for an http(s) URL to a non-internal host, else `{ ok: false, error }`. Never
- * throws — an unparseable URL is a rejection.
+ * Decide whether an AGENT-issued navigation to `url` is allowed. A valid
+ * http(s) URL matching the trusted, normalized `ownedOrigin` exactly may use a
+ * loopback origin; otherwise only non-internal hosts pass. Never throws.
  *
  * @param {string} url
+ * @param {string | null} [ownedOrigin] Trusted normalized preview origin.
  * @returns {{ ok: true } | { ok: false, error: string }}
  */
-function isAgentNavigationAllowed(url) {
+function isAgentNavigationAllowed(url, ownedOrigin = null) {
   if (typeof url !== "string" || url.trim() === "") {
     return { ok: false, error: "navigation blocked: empty url" };
   }
@@ -91,6 +92,7 @@ function isAgentNavigationAllowed(url) {
       error: `navigation blocked: scheme "${parsed.protocol}" is not allowed for agent navigation (only http/https)`,
     };
   }
+  if (ownedOrigin && parsed.origin === ownedOrigin) return { ok: true };
   const hostname = parsed.hostname;
   if (isBlockedHostname(hostname)) {
     return {

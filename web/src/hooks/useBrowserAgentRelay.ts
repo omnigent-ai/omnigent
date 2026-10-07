@@ -9,10 +9,13 @@
  *  desktop build that predates the `browser*` bridge is treated as unsupported,
  *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { prefetchSessionHostChain } from "./useSession";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
+import { getSessionHost } from "@/lib/sessionHost";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -22,8 +25,12 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: { force?: boolean; agent?: boolean; hostId?: string | null },
+    previewRequestId?: string,
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  browserBeginPreviewNavigation?: (
+    conversationId: string,
+  ) => Promise<{ ok: boolean; requestId?: string; deadline?: number; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
   ) => Promise<{ ok: boolean; dataUrl?: string; error?: string }>;
@@ -217,6 +224,7 @@ async function dispatch(
   action: string,
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
+  queryClient: ReturnType<typeof useQueryClient>,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -228,10 +236,57 @@ async function dispatch(
         }
         // force: honor the explicit agent nav even on same-URL. agent: mark it
         // model-issued so the registry applies the scheme/host allowlist (Risk).
-        const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
-          force: true,
-          agent: true,
-        });
+        let isLoopback = false;
+        try {
+          isLoopback = ["localhost", "127.0.0.1"].includes(new URL(url).hostname);
+        } catch {
+          /* Electron returns the URL validation error. */
+        }
+        let previewRequestId: string | undefined;
+        if (isLoopback) {
+          if (!desktop.browserBeginPreviewNavigation) {
+            return { ok: false, error: "this desktop shell does not support localhost previews" };
+          }
+          const request = await desktop.browserBeginPreviewNavigation(conversationId);
+          if (!request.ok || !request.requestId || !request.deadline) {
+            return { ok: false, error: request.error ?? "could not begin localhost preview" };
+          }
+          previewRequestId = request.requestId;
+          const remaining = request.deadline - Date.now();
+          if (remaining <= 0) {
+            return { ok: false, error: "localhost preview request expired" };
+          }
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              prefetchSessionHostChain(queryClient, conversationId),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error("localhost preview request expired")),
+                  remaining,
+                );
+              }),
+            ]);
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+          if (Date.now() >= request.deadline) {
+            return { ok: false, error: "localhost preview request expired" };
+          }
+        }
+        const openArgs = [
+          conversationId,
+          url,
+          undefined,
+          {
+            force: true,
+            agent: true,
+            hostId: getSessionHost(conversationId),
+          },
+        ] as const;
+        const r = previewRequestId
+          ? await desktop.browserOpenOrNavigate(...openArgs, previewRequestId)
+          : await desktop.browserOpenOrNavigate(...openArgs);
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         return { ok: true, data: { final_url: url } };
       }
@@ -350,6 +405,7 @@ async function postResult(
  *   open. Routing uses the delivering conversation, not this.
  */
 export function useBrowserAgentRelay(conversationId: string | null | undefined): void {
+  const queryClient = useQueryClient();
   useEffect(() => {
     if (!conversationId) return;
     if (!supportsBrowser()) return;
@@ -361,10 +417,16 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      const result = await dispatch(sourceConversationId, evt.action, evt.args, desktop);
+      const result = await dispatch(
+        sourceConversationId,
+        evt.action,
+        evt.args,
+        desktop,
+        queryClient,
+      );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 
     return onBrowserActionRequest(handler);
-  }, [conversationId]);
+  }, [conversationId, queryClient]);
 }

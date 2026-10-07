@@ -42,7 +42,7 @@ const { createBrowserViewBoundsController } = require("../src/browserViewBounds"
  * also use `openOrNavigate` which embeds the conversationId so we can confirm
  * isolation per-conversation directly.
  */
-function makePartitionCapturingRegistry() {
+function makePartitionCapturingRegistry(options = {}) {
   // capturedPrefs: conversationId -> webPreferences passed at construction time.
   // Because the registry has no "which conversationId am I creating for?" arg
   // to the ctor, we correlate via call order: the Nth call to ctor corresponds
@@ -50,6 +50,7 @@ function makePartitionCapturingRegistry() {
   const createdPrefs = []; // array of webPreferences objects in creation order
 
   const registry = createBrowserViewRegistry({
+    ...options,
     WebContentsViewCtor: (opts) => {
       // Record exactly what webPreferences the registry passed us.
       createdPrefs.push((opts && opts.webPreferences) || {});
@@ -76,6 +77,46 @@ function makePartitionCapturingRegistry() {
 }
 
 describe("browserViewRegistry — storage partition isolation", () => {
+  it("mints fresh preview partitions across ownership and registry lifetimes", () => {
+    const one = makePartitionCapturingRegistry({ partitionScope: "shared-scope" }).registry;
+    const two = makePartitionCapturingRegistry({ partitionScope: "shared-scope" }).registry;
+    const partitions = [
+      one.newPreviewPartition(),
+      one.newPreviewPartition(),
+      two.newPreviewPartition(),
+    ];
+    assert.equal(new Set(partitions).size, partitions.length);
+    assert.ok(partitions.every((partition) => partition.startsWith("omnigent-preview-")));
+    assert.ok(
+      partitions.every((partition) => partition !== agentPartition("shared-scope", "conv_A")),
+    );
+  });
+
+  it("keeps a verified preview separate from ordinary agent and user-tab storage", () => {
+    const { registry, createdPrefs } = makePartitionCapturingRegistry({
+      partitionScope: "preview-isolation",
+    });
+    const previewPartition = registry.newPreviewPartition();
+    const preview = registry.openOrNavigate("conv_A", "http://localhost:5173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      ownedHostId: "host_a",
+      ownedServerUrl: "https://workspace.example/omnigent",
+      ownedArcaTarget: "https://account.example/omnigent",
+      previewPartition,
+    });
+    registry.openOrNavigate("browser-tab:conv_A:first", "https://example.com/");
+
+    assert.equal(preview.entry.partition, previewPartition);
+    assert.equal(preview.entry.agentOwnedPartition, previewPartition);
+    assert.equal(createdPrefs[0].partition, previewPartition);
+    assert.equal(
+      createdPrefs[1].partition,
+      agentPartition("preview-isolation", "browser-tab:conv_A:first"),
+    );
+    assert.notEqual(createdPrefs[0].partition, createdPrefs[1].partition);
+  });
+
   it("shares storage across the agent browser and user tabs while keeping views independent", () => {
     const { registry, createdPrefs } = makePartitionCapturingRegistry();
     const ids = ["conv_A", "browser-tab:conv_A:first", "browser-tab:conv_A:second"];

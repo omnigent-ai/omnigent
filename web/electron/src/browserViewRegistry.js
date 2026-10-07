@@ -59,6 +59,7 @@ function agentPartition(scope, viewId) {
 // default partition scope. In-memory partitions never outlive the process, so
 // no cross-run uniqueness is needed.
 let registrySeq = 0;
+let previewPartitionSeq = 0;
 
 function createBrowserViewRegistry({
   WebContentsViewCtor, // (opts) => new WebContentsView(opts) — injectable for tests
@@ -81,13 +82,37 @@ function createBrowserViewRegistry({
   partitionScope = `w${++registrySeq}`,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
+  const intents = new Map(); // conversationId -> pending/current navigation
+  let intentSequence = 0;
   let activeConversationId = null;
+  let registry;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
   // overlays (dialogs, menus, tooltips, toasts) aren't covered by the native
   // layer, which always paints above the renderer regardless of z-index. Sticky
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
   let recentSessionSwitchSupported = false;
+
+  function beginNavigation(conversationId) {
+    intents.get(conversationId)?.cancel?.();
+    const intent = { token: ++intentSequence, cancel: null };
+    intents.set(conversationId, intent);
+    return intent.token;
+  }
+
+  function bindNavigationCancel(conversationId, token, cancel) {
+    const intent = intents.get(conversationId);
+    if (!intent || intent.token !== token) {
+      cancel?.();
+      return false;
+    }
+    intent.cancel = cancel;
+    return true;
+  }
+
+  function isNavigationCurrent(conversationId, token) {
+    return intents.get(conversationId)?.token === token;
+  }
 
   // Apply the current suppress flag to the active view (no-op with none active).
   function applyActiveVisibility() {
@@ -108,10 +133,11 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
-  function makeEntry(conversationId, view) {
+  function makeEntry(conversationId, view, partition) {
     const entry = {
       conversationId,
       view,
+      partition,
       boundsController: createBoundsController({
         getZoomFactor: getHostZoomFactor,
         getDisplayScaleFactor: getHostDisplayScaleFactor,
@@ -137,6 +163,13 @@ function createBrowserViewRegistry({
       // this, the allowlist only guards the first hop and a redirect to an
       // internal host slips through (SSRF via screenshot).
       agentNavLocked: false,
+      agentOwnedOrigin: null,
+      agentOwnedHostId: null,
+      agentOwnedServerUrl: null,
+      agentOwnedArcaTarget: null,
+      agentOwnedPartition: null,
+      expiredAgentOrigins: new Set(),
+      releaseAgentOrigin: null,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
       // tracker). Null until design mode is enabled for this entry.
@@ -152,28 +185,36 @@ function createBrowserViewRegistry({
     return entries.get(conversationId) || null;
   }
 
-  function getOrCreate(conversationId) {
+  function getOrCreate(conversationId, { partition } = {}) {
     const existing = entries.get(conversationId);
     if (existing) return { ok: true, entry: existing, created: false };
     if (entries.size >= cap) {
       return { ok: false, error: "browser view cap reached — close one", cap };
     }
+    const storagePartition =
+      typeof partition === "string" && partition
+        ? partition
+        : agentPartition(partitionScope, conversationId);
     const view = WebContentsViewCtor({
       webPreferences: {
         // Per-conversation storage isolation — see agentPartition.
-        partition: agentPartition(partitionScope, conversationId),
+        partition: storagePartition,
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
       },
     });
-    const entry = makeEntry(conversationId, view);
+    const entry = makeEntry(conversationId, view, storagePartition);
     entries.set(conversationId, entry);
     installWindowOpenPolicy(entry);
     attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
     attachRecentSessionInput(entry);
     return { ok: true, entry, created: true };
+  }
+
+  function newPreviewPartition() {
+    return `omnigent-preview-${partitionScope}-${++previewPartitionSeq}`;
   }
 
   // SECURITY: a visited page must not spawn windows from the desktop shell, so
@@ -198,7 +239,7 @@ function createBrowserViewRegistry({
         return { action: "deny" };
       }
       if (entry.agentNavLocked) {
-        const verdict = isAgentNavigationAllowed(url);
+        const verdict = isAgentNavigationAllowed(url, entry.agentOwnedOrigin);
         if (!verdict.ok) {
           sendToRenderer("browser-nav-blocked", {
             conversationId: entry.conversationId,
@@ -262,8 +303,9 @@ function createBrowserViewRegistry({
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     const guard = (event, targetUrl) => {
-      if (!entry.agentNavLocked) return; // user-driven nav: permissive
-      const verdict = isAgentNavigationAllowed(targetUrl);
+      const verdict = entry.agentNavLocked
+        ? isAgentNavigationAllowed(targetUrl, entry.agentOwnedOrigin)
+        : { ok: true };
       if (!verdict.ok) {
         try {
           event.preventDefault();
@@ -275,6 +317,7 @@ function createBrowserViewRegistry({
           url: targetUrl,
           error: verdict.error,
         });
+        return;
       }
     };
     wc.on("will-navigate", guard);
@@ -284,6 +327,31 @@ function createBrowserViewRegistry({
     wc.on("will-frame-navigate", (event) => {
       // will-frame-navigate passes a single event whose `.url` is the target.
       guard(event, event && event.url);
+    });
+    wc.on("did-start-navigation", (_event, targetUrl, isInPlace, isMainFrame) => {
+      let targetOrigin = null;
+      try {
+        targetOrigin = new URL(targetUrl).origin;
+      } catch {
+        /* malformed targets cannot match an expired origin */
+      }
+      if (!isInPlace && isMainFrame && entry.expiredAgentOrigins.has(targetOrigin)) {
+        close(conversationId, "preview-expired");
+        return;
+      }
+      // A full-page reload/HMR during preparation deliberately supersedes it.
+      if (!isInPlace && isMainFrame) beginNavigation(conversationId);
+    });
+    wc.on("did-navigate", (_event, targetUrl) => {
+      let targetOrigin = null;
+      try {
+        targetOrigin = new URL(targetUrl).origin;
+      } catch {
+        /* non-web committed navigation */
+      }
+      if (entry.agentOwnedOrigin && targetOrigin !== entry.agentOwnedOrigin) {
+        clearAgentOrigin(conversationId);
+      }
     });
   }
 
@@ -363,6 +431,11 @@ function createBrowserViewRegistry({
   }
 
   function openOrNavigate(conversationId, url, bounds, opts) {
+    const intentToken = opts?.intentToken;
+    if (intentToken == null) beginNavigation(conversationId);
+    else if (!isNavigationCurrent(conversationId, intentToken)) {
+      return { ok: false, error: "navigation was superseded" };
+    }
     const force = !!(opts && opts.force);
     // Agent-driven nav (opts.agent) is gated by an allowlist (see
     // browserUrlPolicy) so the model can't point the view at file:// /
@@ -370,18 +443,57 @@ function createBrowserViewRegistry({
     // (user-typed) nav stays permissive. Checked before getOrCreate so a
     // rejected nav creates no blank view.
     if (opts && opts.agent && url) {
-      const verdict = isAgentNavigationAllowed(url);
+      const verdict = isAgentNavigationAllowed(url, opts.ownedOrigin);
       if (!verdict.ok) {
         return { ok: false, error: verdict.error };
       }
     }
-    const result = getOrCreate(conversationId);
+    const previewPartition =
+      typeof opts?.previewPartition === "string" && opts.previewPartition
+        ? opts.previewPartition
+        : null;
+    if (opts?.previewPartition != null && !previewPartition) {
+      return { ok: false, error: "invalid preview partition" };
+    }
+    if (previewPartition && !opts?.ownedOrigin) {
+      return { ok: false, error: "preview partition requires verified ownership" };
+    }
+    const existing = entries.get(conversationId);
+    if (previewPartition && existing && existing.partition !== previewPartition) {
+      return { ok: false, error: "preview partition mismatch" };
+    }
+    const result = getOrCreate(conversationId, { partition: previewPartition });
     if (!result.ok) return result;
     const { entry, created } = result;
     // Latch who drives THIS navigation so the will-navigate/will-redirect guard
     // enforces the allowlist on an agent nav's whole redirect chain, and leaves
     // user-typed URL-bar nav permissive. Set only when a url is actually issued.
     if (url) entry.agentNavLocked = !!(opts && opts.agent);
+    if (opts?.agent && opts.ownedOrigin) {
+      const sameOwner =
+        entry.agentOwnedOrigin === opts.ownedOrigin &&
+        entry.agentOwnedHostId === opts.ownedHostId &&
+        entry.agentOwnedServerUrl === opts.ownedServerUrl &&
+        entry.agentOwnedArcaTarget === (opts.ownedArcaTarget || null) &&
+        entry.agentOwnedPartition === previewPartition &&
+        (!previewPartition || entry.partition === previewPartition);
+      if (previewPartition && !created && !sameOwner) {
+        return { ok: false, error: "preview ownership mismatch" };
+      }
+      if (!sameOwner) {
+        entry.releaseAgentOrigin?.();
+        entry.agentOwnedOrigin = opts.ownedOrigin;
+        entry.agentOwnedHostId = opts.ownedHostId || null;
+        entry.agentOwnedServerUrl = opts.ownedServerUrl || null;
+        entry.agentOwnedArcaTarget = opts.ownedArcaTarget || null;
+        entry.agentOwnedPartition = previewPartition;
+        entry.releaseAgentOrigin = opts.releaseOwnedOrigin || null;
+      } else if (opts.releaseOwnedOrigin) {
+        entry.releaseAgentOrigin = opts.releaseOwnedOrigin;
+      }
+      entry.expiredAgentOrigins.delete(opts.ownedOrigin);
+      bindNavigationCancel(conversationId, intentToken, null);
+    }
     if (bounds) entry.boundsController.setRendererBounds(bounds);
     // Only attach immediately when this is the active conversation; otherwise
     // create-detached and let `setActive(conversationId)` attach on user switch.
@@ -409,6 +521,9 @@ function createBrowserViewRegistry({
         try {
           entry.view.webContents.loadURL(url);
         } catch (e) {
+          if (opts?.releaseOwnedOrigin && entry.releaseAgentOrigin === opts.releaseOwnedOrigin) {
+            clearAgentOrigin(conversationId);
+          }
           return { ok: false, error: `loadURL failed: ${e && e.message ? e.message : e}` };
         }
       }
@@ -483,9 +598,22 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
-  function close(conversationId, reason) {
+  function close(conversationId, reason, preserveIntent = false) {
+    const cleanup = [];
+    if (!preserveIntent) {
+      const intent = intents.get(conversationId);
+      intents.delete(conversationId);
+      if (intent?.cancel) cleanup.push(intent.cancel());
+    }
     const entry = entries.get(conversationId);
-    if (!entry) return { ok: true, removed: false };
+    if (!entry) {
+      cleanup.push(registry.arcaPreview?.release(conversationId));
+      return {
+        ok: true,
+        removed: false,
+        cleanup: Promise.allSettled(cleanup.filter(Boolean)),
+      };
+    }
     cancelRecentSessionInput(entry, true);
     if (activeConversationId === conversationId) {
       try {
@@ -522,21 +650,53 @@ function createBrowserViewRegistry({
     } catch {
       /* already destroyed */
     }
+    if (entry.releaseAgentOrigin) cleanup.push(entry.releaseAgentOrigin());
+    cleanup.push(registry.arcaPreview?.release(conversationId));
     entries.delete(conversationId);
     sendToRenderer("browser-view-closed", { conversationId, reason: reason || null });
-    return { ok: true, removed: true };
+    return {
+      ok: true,
+      removed: true,
+      cleanup: Promise.allSettled(cleanup.filter(Boolean)),
+    };
   }
 
-  function closeAll(reason) {
-    for (const conversationId of [...entries.keys()]) {
-      close(conversationId, reason);
+  function discardForNavigation(conversationId, token) {
+    if (!isNavigationCurrent(conversationId, token)) return false;
+    close(conversationId, "preview-replaced", true);
+    return isNavigationCurrent(conversationId, token);
+  }
+
+  async function closeAll(reason) {
+    const cleanup = [];
+    for (const conversationId of [...intents.keys()]) {
+      if (!entries.has(conversationId)) cleanup.push(close(conversationId, reason).cleanup);
     }
+    for (const conversationId of [...entries.keys()]) {
+      cleanup.push(close(conversationId, reason).cleanup);
+    }
+    cleanup.push(registry.arcaPreview?.shutdownAll());
+    await Promise.allSettled(cleanup.filter(Boolean));
   }
 
-  return {
+  function clearAgentOrigin(conversationId) {
+    const entry = entries.get(conversationId);
+    if (!entry) return;
+    if (entry.agentOwnedOrigin) entry.expiredAgentOrigins.add(entry.agentOwnedOrigin);
+    entry.agentOwnedOrigin = null;
+    entry.agentOwnedHostId = null;
+    entry.agentOwnedServerUrl = null;
+    entry.agentOwnedArcaTarget = null;
+    entry.agentOwnedPartition = null;
+    entry.releaseAgentOrigin?.();
+    entry.releaseAgentOrigin = null;
+  }
+
+  registry = {
     // Lifecycle
     get,
     getOrCreate,
+    newPreviewPartition,
     openOrNavigate,
     setActive,
     setSuppressed,
@@ -544,6 +704,11 @@ function createBrowserViewRegistry({
     setRecentSessionSwitchSupported,
     close,
     closeAll,
+    clearAgentOrigin,
+    discardForNavigation,
+    beginNavigation,
+    bindNavigationCancel,
+    isNavigationCurrent,
     // Introspection
     activeConversationId: () => activeConversationId,
     isSuppressed: () => overlaySuppressed,
@@ -553,6 +718,7 @@ function createBrowserViewRegistry({
     // Constants exposed for tests / main.js wiring
     cap,
   };
+  return registry;
 }
 
 module.exports = {

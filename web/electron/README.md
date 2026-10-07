@@ -176,6 +176,33 @@ An explicit `-bool true` also enables browser authentication. Unset defaults and
 non-macOS platforms use browser mode. Development Electron uses its own bundle's
 NSUserDefaults domain, not the packaged app's `ai.omnigent.desktop` domain.
 
+For `just electron-dev`, Electron 42 reads macOS defaults from
+`com.github.Electron`. To exercise the Databricks-internal Arca path locally,
+first quit every development Electron process, record whether the key is absent
+or currently `0`/`1`, then enable it and start the app:
+
+```bash
+defaults read com.github.Electron databricksInternalFeaturesEnabled
+defaults write com.github.Electron databricksInternalFeaturesEnabled -bool true
+just electron-dev
+```
+
+After testing, quit the app and restore the recorded value. If the first
+`defaults read` reported that the key did not exist, delete the temporary
+override; otherwise write back the recorded boolean:
+
+```bash
+# The key was originally absent:
+defaults delete com.github.Electron databricksInternalFeaturesEnabled
+
+# Or it was originally present (replace false with the recorded value):
+defaults write com.github.Electron databricksInternalFeaturesEnabled -bool false
+```
+
+The packaged app continues to use `ai.omnigent.desktop`, and managed policy
+remains authoritative there. These development defaults only select an existing
+gate; they do not change or bypass its policy checks.
+
 ### Manual verification
 
 The classic Connect screen shows a spinner with **Connecting…**, then
@@ -468,6 +495,13 @@ sequenceDiagram
     R-->>S: POST action result + claim token
     S-->>A: result JSON (or clean timeout)
 ```
+
+### Agent-driven localhost previews
+
+Agent-driven localhost previews are currently supported only for internal
+Databricks use with Arca. They require the desktop internal-feature flag
+(`databricksInternalFeaturesEnabled`) and a managed Databricks server. General
+embedded-browser tools remain available independently of Arca.
 
 ### Local network permission
 

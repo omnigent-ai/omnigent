@@ -46,6 +46,63 @@ const urlHelpers = require("../src/url");
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
+/** Load a CommonJS source file with only its runtime boundaries replaced. */
+function loadCommonJsModule(file, fakes) {
+  const realRequire = createRequire(file);
+  const module = { exports: {} };
+  vm.runInNewContext(
+    fs.readFileSync(file, "utf8"),
+    {
+      __dirname: path.dirname(file),
+      __filename: file,
+      AbortController,
+      AbortSignal,
+      Buffer,
+      Error,
+      URL,
+      URLSearchParams,
+      clearTimeout,
+      console,
+      fetch,
+      module,
+      process,
+      require: (specifier) => fakes[specifier] ?? realRequire(specifier),
+      setTimeout,
+    },
+    { filename: file },
+  );
+  return module.exports;
+}
+
+// The pre-install CI gate has no third-party modules. Load the real CLI helpers
+// behind an unused YAML boundary, then give auto-connect that same real module.
+const omnigentCliModule = loadCommonJsModule(path.join(__dirname, "../src/omnigent_cli.js"), {
+  "./url": urlHelpers,
+  "js-yaml": {},
+});
+const arcaAutoConnectModule = loadCommonJsModule(
+  path.join(__dirname, "../src/arca_autoconnect.js"),
+  { "./omnigent_cli": omnigentCliModule },
+);
+
+const electronCredentialBoundary = {
+  shell: { openExternal: async () => {} },
+  safeStorage: { isEncryptionAvailable: () => false },
+};
+const tokenStoreModule = loadCommonJsModule(path.join(__dirname, "../src/token_store.js"), {
+  electron: electronCredentialBoundary,
+});
+const oidcCredentialsModule = loadCommonJsModule(
+  path.join(__dirname, "../src/oidc-credentials.js"),
+  {
+    electron: electronCredentialBoundary,
+    "./token_store": tokenStoreModule,
+  },
+);
+const oidcAuthModule = loadCommonJsModule(path.join(__dirname, "../src/oidc-auth.js"), {
+  "./oidc-credentials": oidcCredentialsModule,
+});
+
 /** A fake workspace behind the real databricks-session module: `verdict` answers session-create. */
 function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } = {}) {
   const network = { verdict: "allow", sessionCreates: 0, browserSignIns: 0 };
@@ -140,6 +197,7 @@ function loadNavigationHarness({
   normalizeServer = (url) => url,
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
+  serverShutdown = async () => {},
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
   arcaLoginResult = { ok: true },
@@ -174,6 +232,7 @@ function loadNavigationHarness({
     progress: [],
     loading: [],
     reloads: 0,
+    quits: 0,
     arcaConnects: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
@@ -311,7 +370,7 @@ function loadNavigationHarness({
       requestSingleInstanceLock: () => true,
       on: (eventName, listener) => appEvents.set(eventName, listener),
       whenReady: () => ({ then: () => {} }),
-      quit: () => {},
+      quit: () => (calls.quits += 1),
       exit: () => {},
       isReady: () => false,
       setAsDefaultProtocolClient: () => {},
@@ -385,6 +444,7 @@ function loadNavigationHarness({
   };
 
   const localRequires = {
+    "./arca_autoconnect": arcaAutoConnectModule,
     "./desktop_updater": { createDesktopUpdater },
     "./connection_loading": {
       createConnectionLoading: () => ({
@@ -466,7 +526,7 @@ function loadNavigationHarness({
       removeStoredRefreshToken: () => false,
     },
     "./oidc-credentials": {
-      ...require("../src/oidc-credentials"),
+      ...oidcCredentialsModule,
       refreshSession: async (...args) => {
         calls.oidc.refresh++;
         if (!oidc.refresh) throw Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
@@ -484,7 +544,7 @@ function loadNavigationHarness({
     },
     "./oidc-auth": {
       createOidcAuth: (options) =>
-        require("../src/oidc-auth").createOidcAuth({
+        oidcAuthModule.createOidcAuth({
           ...options,
           // /v1/me accepts exactly the session tokens the test allows.
           fetchFn: async (_url, init) => ({
@@ -550,13 +610,13 @@ function loadNavigationHarness({
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => (cliPath ? { path: cliPath } : null),
-      cliCommandParts: require("../src/omnigent_cli").cliCommandParts,
-      normalizeServerUrl: require("../src/omnigent_cli").normalizeServerUrl,
+      cliCommandParts: omnigentCliModule.cliCommandParts,
+      normalizeServerUrl: omnigentCliModule.normalizeServerUrl,
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
     },
     "./server_manager": {
-      shutdown: async () => {},
+      shutdown: serverShutdown,
       onChange: () => {},
       ensureServerAuth: async () => ({ ok: true }),
       ensureHostConnected: async () => hostConnectResult,
@@ -570,7 +630,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, matchesAgentPreviewOwner, pickWorkspaceForBridge, prepareArcaPreviewNavigation, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, setWindowArcaServerUrl, trackPreviewShutdown, windowArcaServerUrl, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -596,6 +656,7 @@ function loadNavigationHarness({
       return mainRequire(specifier);
     },
     setInterval,
+    setImmediate,
     setTimeout,
   };
 
@@ -604,6 +665,7 @@ function loadNavigationHarness({
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
     serverUrl,
+    arcaServerUrl: serverUrl,
     ephemeral: false,
     badgeCount: 0,
     browserRegistry: { closeAll: () => {} },
@@ -612,6 +674,7 @@ function loadNavigationHarness({
 
   return {
     api,
+    appEvents,
     calls,
     overlay,
     bannerCalls,
@@ -1619,6 +1682,7 @@ describe("Databricks auth mode wiring", () => {
 
     it("keeps the workspace URL for sign-in, and shows the pick", async (t) => {
       const h = await joinThroughAccount(t);
+      assert.equal(h.api.windowArcaServerUrl(h.win), picked);
       assert.equal(saved(h).server_url, workspace);
       assert.deepEqual(saved(h).recent_servers, [workspace]);
       assert.deepEqual(saved(h).server_labels, { [workspaceOrigin]: picked });
@@ -1895,6 +1959,17 @@ describe("browser permission wiring", () => {
       const a = registry.openOrNavigate("a", "https://login.example").entry.view.webContents;
       const b = registry.openOrNavigate("b", "https://login.example").entry.view.webContents;
       assert.notEqual(a.session, b.session);
+      const previewPartition = registry.newPreviewPartition();
+      const preview = registry.openOrNavigate("preview", "http://localhost:5173", undefined, {
+        agent: true,
+        ownedOrigin: "http://localhost:5173",
+        ownedHostId: "host_a",
+        ownedServerUrl: "https://workspace.cloud.databricks.com/omnigent",
+        ownedArcaTarget: "https://target.cloud.databricks.com/omnigent",
+        previewPartition,
+      }).entry.view.webContents;
+      assert.equal(preview.session, sessions.get(previewPartition));
+      assert.notEqual(preview.session, a.session);
       const check = (wc) =>
         wc.session.check(wc, "loopback-network", wc.getURL(), { isMainFrame: true });
       assert.equal(check(a), false, "detached panes cannot prompt");
@@ -3268,6 +3343,327 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         "close a registry with nothing open. Keep the guard.",
       ].join(" "),
     );
+  });
+
+  it("closes previews when the full connected server identity changes", () => {
+    assert.match(
+      liveCode,
+      /function setWindowServerUrl\(win,\s*serverUrl\)[\s\S]{0,300}state\.serverUrl\s*!==\s*serverUrl[\s\S]{0,160}browserRegistry\?\.closeAll\("server-changed"\)/,
+    );
+  });
+
+  it("closes previews when only the effective Arca enrollment target changes", () => {
+    const harness = loadNavigationHarness();
+    let closes = 0;
+    const state = harness.api.windows.get(harness.win);
+    state.browserRegistry = { closeAll: () => (closes += 1) };
+    state.serverUrl = "https://workspace.cloud.databricks.com/omnigent";
+    state.arcaServerUrl = "https://first.cloud.databricks.com/omnigent";
+
+    harness.api.setWindowArcaServerUrl(harness.win, "https://second.cloud.databricks.com/omnigent");
+    assert.equal(closes, 1);
+    assert.equal(
+      harness.api.windowArcaServerUrl(harness.win),
+      "https://second.cloud.databricks.com/omnigent",
+    );
+    harness.api.setWindowArcaServerUrl(harness.win, null);
+    assert.equal(closes, 2, "clearing the override compares against the connected-server fallback");
+    assert.equal(
+      harness.api.windowArcaServerUrl(harness.win),
+      "https://workspace.cloud.databricks.com/omnigent",
+    );
+    harness.cleanup();
+  });
+
+  it("releases every registry before the forced app-exit fallback can run", () => {
+    assert.match(
+      liveCode,
+      /app\.on\("before-quit"[\s\S]{0,500}browserRegistry\?\.closeAll\("app-quit"\)[\s\S]{0,700}app\.exit\(0\)/,
+    );
+  });
+
+  it("waits for preview cleanup before reissuing app.quit", async () => {
+    const harness = loadNavigationHarness();
+    let resolvePreview;
+    let closes = 0;
+    const previewCleanup = new Promise((resolve) => {
+      resolvePreview = resolve;
+    });
+    harness.api.windows.get(harness.win).browserRegistry = {
+      closeAll: () => {
+        closes += 1;
+        return previewCleanup;
+      },
+    };
+    const beforeQuit = harness.appEvents.get("before-quit");
+    let prevented = 0;
+    const event = { preventDefault: () => (prevented += 1) };
+    beforeQuit(event);
+    beforeQuit(event);
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(prevented, 2);
+    assert.equal(closes, 1);
+    assert.equal(harness.calls.quits, 0);
+    resolvePreview();
+    await new Promise((resolve) => {
+      setImmediate(() => setImmediate(resolve));
+    });
+    assert.equal(harness.calls.quits, 1);
+    harness.cleanup();
+  });
+
+  it("waits for cleanup retained after its window entry is gone", async () => {
+    const harness = loadNavigationHarness();
+    let resolvePreview;
+    const previewCleanup = new Promise((resolve) => {
+      resolvePreview = resolve;
+    });
+    harness.api.trackPreviewShutdown(previewCleanup);
+    harness.api.windows.clear();
+    harness.appEvents.get("before-quit")({ preventDefault() {} });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(harness.calls.quits, 0);
+    resolvePreview();
+    await new Promise((resolve) => {
+      setImmediate(() => setImmediate(resolve));
+    });
+    assert.equal(harness.calls.quits, 1);
+    harness.cleanup();
+  });
+});
+
+describe("Arca preview owner reuse", () => {
+  const connectedServer = "https://workspace.cloud.databricks.com/omnigent?o=1";
+  const arcaTarget = "https://target.cloud.databricks.com/omnigent?o=1";
+  const previewPartition = "omnigent-preview-test-1";
+
+  function previewHarness(t, { existing = null, prepare } = {}) {
+    const h = loadNavigationHarness({
+      serverUrl: connectedServer,
+      internalFeatures: true,
+      registerFallbacks: false,
+    });
+    t.after(h.cleanup);
+    const calls = { discarded: [], prepared: [], released: [], partitions: [] };
+    let entry = existing;
+    let partitionSequence = 0;
+    const registry = {
+      get: () => entry,
+      discardForNavigation: (conversationId, token) => {
+        calls.discarded.push({ conversationId, token });
+        entry = null;
+        return true;
+      },
+      newPreviewPartition: () => {
+        const partition = `omnigent-preview-main-${++partitionSequence}`;
+        calls.partitions.push(partition);
+        return partition;
+      },
+      arcaPreview: {
+        release: (conversationId) => calls.released.push({ conversationId, pending: true }),
+        prepare: async (options) => {
+          calls.prepared.push(options);
+          return prepare
+            ? prepare(options)
+            : {
+                origin: "http://localhost:5173",
+                release: () => calls.released.push({ conversationId: options.conversationId }),
+              };
+        },
+      },
+    };
+    const state = h.api.windows.get(h.win);
+    state.serverUrl = connectedServer;
+    state.arcaServerUrl = arcaTarget;
+    state.browserRegistry = registry;
+    const cancellations = [];
+    const lifecycle = {
+      intentToken: 7,
+      deadline: Date.now() + 60_000,
+      onCancel: (cancel) => {
+        cancellations.push(cancel);
+        return true;
+      },
+    };
+    const event = { sender: h.webContents, senderFrame: { url: connectedServer } };
+    return { h, calls, cancellations, event, lifecycle, registry };
+  }
+
+  it("requires the same origin, host, both server identities, and actual partition", () => {
+    const h = loadNavigationHarness();
+    try {
+      const entry = {
+        agentOwnedOrigin: "http://localhost:5173",
+        agentOwnedHostId: "host_a",
+        agentOwnedServerUrl: connectedServer,
+        agentOwnedArcaTarget: arcaTarget,
+        agentOwnedPartition: previewPartition,
+        partition: previewPartition,
+      };
+      const preview = { origin: "http://localhost:5173" };
+      assert.equal(
+        h.api.matchesAgentPreviewOwner(
+          entry,
+          preview,
+          "host_a",
+          connectedServer,
+          arcaTarget,
+          previewPartition,
+        ),
+        true,
+      );
+      for (const args of [
+        ["host_b", connectedServer, arcaTarget, previewPartition],
+        ["host_a", "https://other.cloud.databricks.com/omnigent", arcaTarget, previewPartition],
+        [
+          "host_a",
+          connectedServer,
+          "https://other.cloud.databricks.com/omnigent",
+          previewPartition,
+        ],
+        ["host_a", connectedServer, arcaTarget, "omnigent-preview-test-2"],
+      ]) {
+        assert.equal(h.api.matchesAgentPreviewOwner(entry, preview, ...args), false);
+      }
+      assert.equal(
+        h.api.matchesAgentPreviewOwner(
+          { ...entry, partition: "omnigent-preview-test-2" },
+          preview,
+          "host_a",
+          connectedServer,
+          arcaTarget,
+          previewPartition,
+        ),
+        false,
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("uses the enrollment target and discards any generic entry before new admission", async (t) => {
+    const ctx = previewHarness(t, {
+      existing: { partition: "omnigent-agent-window-conversation" },
+    });
+    const prepared = await ctx.h.api.prepareArcaPreviewNavigation(
+      ctx.event,
+      "conversation",
+      "http://localhost:5173/app",
+      { agent: true, hostId: "host_a" },
+      ctx.lifecycle,
+    );
+
+    assert.deepEqual(ctx.calls.discarded, [{ conversationId: "conversation", token: 7 }]);
+    assert.equal(ctx.calls.prepared[0].serverUrl, arcaTarget);
+    assert.equal(prepared.ownedServerUrl, connectedServer);
+    assert.equal(prepared.ownedArcaTarget, arcaTarget);
+    assert.equal(prepared.previewPartition, "omnigent-preview-main-1");
+    assert.equal(ctx.cancellations.length, 2);
+  });
+
+  it("reuses only the complete valid owner and its existing partition", async (t) => {
+    const entry = {
+      agentOwnedOrigin: "http://localhost:5173",
+      agentOwnedHostId: "host_a",
+      agentOwnedServerUrl: connectedServer,
+      agentOwnedArcaTarget: arcaTarget,
+      agentOwnedPartition: previewPartition,
+      partition: previewPartition,
+    };
+    const ctx = previewHarness(t, { existing: entry });
+    const prepared = await ctx.h.api.prepareArcaPreviewNavigation(
+      ctx.event,
+      "conversation",
+      "http://localhost:5173/next",
+      { agent: true, hostId: "host_a" },
+      ctx.lifecycle,
+    );
+
+    assert.equal(prepared.previewPartition, previewPartition);
+    assert.deepEqual(ctx.calls.discarded, []);
+    assert.deepEqual(ctx.calls.prepared, []);
+    assert.deepEqual(ctx.calls.partitions, []);
+  });
+
+  it("refuses either unmanaged identity before status verification", async (t) => {
+    const ctx = previewHarness(t);
+    ctx.h.api.windows.get(ctx.h.win).arcaServerUrl = "https://example.com/omnigent";
+    await assert.rejects(
+      ctx.h.api.prepareArcaPreviewNavigation(
+        ctx.event,
+        "conversation",
+        "http://localhost:5173",
+        { agent: true, hostId: "host_a" },
+        ctx.lifecycle,
+      ),
+      /managed Databricks server/,
+    );
+    assert.deepEqual(ctx.calls.prepared, []);
+  });
+
+  it("releases preparation when either server identity changes while status is pending", async (t) => {
+    for (const field of ["serverUrl", "arcaServerUrl"]) {
+      let resolvePrepare;
+      let releases = 0;
+      const ctx = previewHarness(t, {
+        prepare: () =>
+          new Promise((resolve) => {
+            resolvePrepare = resolve;
+          }),
+      });
+      const pending = ctx.h.api.prepareArcaPreviewNavigation(
+        ctx.event,
+        `conversation-${field}`,
+        "http://localhost:5173",
+        { agent: true, hostId: "host_a" },
+        ctx.lifecycle,
+      );
+      ctx.h.api.windows.get(ctx.h.win)[field] = "https://other.cloud.databricks.com/omnigent";
+      resolvePrepare({
+        origin: "http://localhost:5173",
+        release: () => (releases += 1),
+      });
+      // oxlint-disable-next-line no-await-in-loop -- each case owns mutable window state.
+      await assert.rejects(pending, /superseded/);
+      assert.equal(releases, 1, field);
+    }
+  });
+
+  it("releases preparation when the sender is destroyed after acquisition", async (t) => {
+    let resolvePrepare;
+    let releases = 0;
+    let senderDestroyed = false;
+    const ctx = previewHarness(t, {
+      prepare: () =>
+        new Promise((resolve) => {
+          resolvePrepare = resolve;
+        }),
+    });
+    const event = {
+      senderFrame: ctx.event.senderFrame,
+      get sender() {
+        if (senderDestroyed) throw new Error("Object has been destroyed");
+        return ctx.event.sender;
+      },
+    };
+    const pending = ctx.h.api.prepareArcaPreviewNavigation(
+      event,
+      "conversation-destroyed",
+      "http://localhost:5173",
+      { agent: true, hostId: "host_a" },
+      ctx.lifecycle,
+    );
+    senderDestroyed = true;
+    resolvePrepare({
+      origin: "http://localhost:5173",
+      release: () => (releases += 1),
+    });
+    await assert.rejects(pending, /superseded/);
+    assert.equal(releases, 1);
   });
 });
 

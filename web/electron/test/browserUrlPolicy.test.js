@@ -12,6 +12,13 @@ const assert = require("node:assert/strict");
 const { isAgentNavigationAllowed } = require("../src/browserUrlPolicy");
 
 describe("browserUrlPolicy — agent navigation allowlist", () => {
+  it("admits only the exact owned loopback origin", () => {
+    const origin = "http://localhost:5173";
+    assert.equal(isAgentNavigationAllowed("http://localhost:5173/app", origin).ok, true);
+    assert.equal(isAgentNavigationAllowed("http://localhost:5174/app", origin).ok, false);
+    assert.equal(isAgentNavigationAllowed("http://127.0.0.1:5173/app", origin).ok, false);
+  });
+
   it("allows ordinary public http(s) URLs", () => {
     for (const url of [
       "https://example.com/",

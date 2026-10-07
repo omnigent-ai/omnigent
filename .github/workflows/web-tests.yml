@@ -59,6 +59,15 @@ jobs:
       - name: Run Electron storage-isolation unit test
         run: node --test web/electron/test/browserViewRegistry_storage_isolation.test.js
 
+      - name: Run Electron browser and Arca preview unit tests
+        run: |
+          node --test \
+            web/electron/test/arcaPreview.test.js \
+            web/electron/test/browserIpc.test.js \
+            web/electron/test/browserViewRegistry.test.js \
+            web/electron/test/browserUrlPolicy.test.js \
+            web/electron/test/main.test.js
+
       - name: Install dependencies
         # Pin the npm registry to the npmjs default; limit to the web package
         # so the Electron package's large native devDependencies are not fetched.

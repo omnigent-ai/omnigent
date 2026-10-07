@@ -1,5 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// @ts-expect-error The Electron registry is an untyped CommonJS module.
+import { createBrowserViewRegistry } from "../../../electron/src/browserViewRegistry.js";
 import { BrowserPane } from "./BrowserPane";
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
@@ -12,7 +15,7 @@ vi.mock("@/lib/nativeBridge", () => ({
 /**
  * Minimal `window.omnigentDesktop` stub. The empty-state tests only need the
  * subscription methods to exist (they return no-op unsubscribes) and
- * `browserHasView` to resolve "no view", so `viewActive` stays false and the
+ * `browserHasView` to resolve "no view", so `viewExists` stays false and the
  * pane renders its cold-start (no-page-open) state — exactly the state the
  * regression made unreachable.
  */
@@ -41,7 +44,7 @@ function installBridge(overrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
-  // jsdom has no ResizeObserver; the measuring-container effect (viewActive path)
+  // jsdom has no ResizeObserver; the measuring-container effect (viewExists path)
   // constructs one. Stub it so mounting the container doesn't throw.
   (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
     observe() {}
@@ -129,7 +132,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
     render(<BrowserPane conversationId="conv_a" />);
 
     // The address bar must be present with no view attached — this is the whole
-    // point of the fix: gating it on viewActive made it unreachable from a cold
+    // point of the fix: gating it on view existence made it unreachable from a cold
     // start (no page → no bar → no way to open the first page).
     const urlBar = await screen.findByRole("textbox", { name: /address bar/i });
     expect(urlBar).toBeInTheDocument();
@@ -159,7 +162,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
 
   it("shows the measuring container (not the hint) once a view is created", async () => {
     // Capture the browser-view-created callback so the test can fire it and
-    // drive viewActive → true, proving the toolbar stays and the hint is
+    // drive viewExists → true, proving the toolbar stays and the hint is
     // replaced by the measuring region.
     let fireCreated: ((p: { conversationId: string }) => void) | undefined;
     installBridge({
@@ -181,6 +184,256 @@ describe("BrowserPane cold-start (no view yet)", () => {
       expect(screen.queryByText(/enter a url above to get started/i)).toBeNull();
     });
     expect(screen.getByRole("textbox", { name: /address bar/i })).toBeInTheDocument();
+  });
+});
+
+describe("BrowserPane localhost preview lifecycle", () => {
+  function installLifecycleBridge() {
+    let fireCreated: ((p: { conversationId: string }) => void) | undefined;
+    let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
+    installBridge({
+      browserHasView: vi.fn().mockResolvedValue({
+        exists: true,
+        url: "http://localhost:5173/stale",
+        canGoBack: true,
+        canGoForward: true,
+      }),
+      onBrowserViewCreated: vi.fn((cb: (p: { conversationId: string }) => void) => {
+        fireCreated = cb;
+        return () => {};
+      }),
+      onBrowserViewClosed: vi.fn(
+        (cb: (p: { conversationId: string; reason: string | null }) => void) => {
+          fireClosed = cb;
+          return () => {};
+        },
+      ),
+    });
+    return { fireCreated: () => fireCreated, fireClosed: () => fireClosed };
+  }
+
+  it("marks an expired preview unavailable without affecting another conversation", async () => {
+    const events = installLifecycleBridge();
+    render(<BrowserPane conversationId="conv_preview" />);
+    const address = await screen.findByRole("textbox", { name: "Address bar" });
+    await waitFor(() => expect(address).toHaveValue("http://localhost:5173/stale"));
+
+    act(() => {
+      events.fireClosed()?.({ conversationId: "conv_other", reason: "preview-expired" });
+    });
+    expect(address).toHaveValue("http://localhost:5173/stale");
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    act(() => {
+      events.fireClosed()?.({ conversationId: "conv_preview", reason: "preview-expired" });
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "This localhost preview expired. Ask the agent to open it again.",
+    );
+    expect(address).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Go back" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Go forward" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+
+    act(() => {
+      events.fireCreated()?.({ conversationId: "conv_preview" });
+    });
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
+  it("explains when the preview connection exits", async () => {
+    const events = installLifecycleBridge();
+    render(<BrowserPane conversationId="conv_preview" />);
+    await screen.findByRole("textbox", { name: "Address bar" });
+    act(() => {
+      events.fireClosed()?.({ conversationId: "conv_preview", reason: "preview-exited" });
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "This localhost preview is unavailable because its secure connection closed.",
+    );
+  });
+});
+
+describe("BrowserPane retained native view lifecycle", () => {
+  interface ViewEventPayload {
+    conversationId: string | null;
+    reason?: string | null;
+  }
+
+  function installRegistryBridge() {
+    const listeners = new Map<string, Set<(payload: ViewEventPayload) => void>>();
+    const attachedViews: unknown[] = [];
+    const detachedViews: unknown[] = [];
+    const loadURL = vi.fn().mockResolvedValue(undefined);
+    const page = {
+      webContents: Object.assign(new EventEmitter(), {
+        loadURL,
+        close: vi.fn(),
+        setWindowOpenHandler: vi.fn(),
+      }),
+      setVisible: vi.fn(),
+      setBounds: vi.fn(),
+    };
+    let releaseCount = 0;
+    const deliveredEvents: { channel: string; payload: ViewEventPayload }[] = [];
+    const registry = createBrowserViewRegistry({
+      WebContentsViewCtor: () => page,
+      createBoundsController: () => ({
+        setRendererBounds: vi.fn(),
+        clear: vi.fn(),
+        resync: vi.fn(),
+      }),
+      attachToHost: (view: unknown) => attachedViews.push(view),
+      detachFromHost: (view: unknown) => detachedViews.push(view),
+      sendToRenderer: (channel: string, payload: ViewEventPayload) => {
+        queueMicrotask(() => {
+          deliveredEvents.push({ channel, payload });
+          listeners.get(channel)?.forEach((callback) => callback(payload));
+        });
+      },
+      partitionScope: "browser-pane-test",
+    });
+    const opened = registry.openOrNavigate("conv_preview", "http://localhost:5173/app", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => {
+        releaseCount += 1;
+      },
+    });
+    expect(opened.ok).toBe(true);
+
+    const subscribe = (channel: string, callback: (payload: ViewEventPayload) => void) => {
+      const channelListeners = listeners.get(channel) ?? new Set();
+      channelListeners.add(callback);
+      listeners.set(channel, channelListeners);
+      return () => channelListeners.delete(callback);
+    };
+    const bridge = installBridge({
+      browserHasView: vi.fn(async (conversationId: string) => ({
+        exists: registry.has(conversationId),
+        url: "http://localhost:5173/app",
+        canGoBack: false,
+        canGoForward: false,
+      })),
+      browserSetActive: vi.fn(async (conversationId: string | null) =>
+        registry.setActive(conversationId),
+      ),
+      onBrowserHostActiveChanged: vi.fn((callback: (payload: ViewEventPayload) => void) =>
+        subscribe("browser-host-active-changed", callback),
+      ),
+      onBrowserViewCreated: vi.fn((callback: (payload: ViewEventPayload) => void) =>
+        subscribe("browser-view-created", callback),
+      ),
+      onBrowserViewClosed: vi.fn((callback: (payload: ViewEventPayload) => void) =>
+        subscribe("browser-view-closed", callback),
+      ),
+    });
+    return {
+      attachedViews,
+      bridge,
+      deliveredEvents,
+      detachedViews,
+      loadURL,
+      page,
+      registry,
+      releaseCount: () => releaseCount,
+    };
+  }
+
+  it("reattaches the same retained page after an asynchronous rail detach", async () => {
+    const fixture = installRegistryBridge();
+    const { rerender } = render(<BrowserPane conversationId="conv_preview" active />);
+    await waitFor(() => expect(fixture.registry.activeConversationId()).toBe("conv_preview"));
+    expect(fixture.attachedViews).toEqual([fixture.page]);
+
+    rerender(<BrowserPane conversationId="conv_preview" active={false} />);
+    await waitFor(() => expect(fixture.registry.activeConversationId()).toBeNull());
+    await waitFor(() =>
+      expect(fixture.deliveredEvents).toContainEqual({
+        channel: "browser-host-active-changed",
+        payload: { conversationId: null },
+      }),
+    );
+
+    rerender(<BrowserPane conversationId="conv_preview" active />);
+    await waitFor(() => expect(fixture.registry.activeConversationId()).toBe("conv_preview"));
+    expect(fixture.attachedViews).toEqual([fixture.page, fixture.page]);
+    expect(fixture.detachedViews).toEqual([fixture.page]);
+    expect(fixture.loadURL).toHaveBeenCalledTimes(1);
+    expect(fixture.bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+    expect(fixture.releaseCount()).toBe(0);
+  });
+
+  it("does not resurrect a preview that closes while the rail is hidden", async () => {
+    const fixture = installRegistryBridge();
+    const { rerender } = render(<BrowserPane conversationId="conv_preview" active />);
+    await waitFor(() => expect(fixture.registry.activeConversationId()).toBe("conv_preview"));
+
+    rerender(<BrowserPane conversationId="conv_preview" active={false} />);
+    await waitFor(() => expect(fixture.registry.activeConversationId()).toBeNull());
+    act(() => {
+      fixture.registry.close("conv_preview", "preview-exited");
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "This localhost preview is unavailable because its secure connection closed.",
+    );
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
+
+    rerender(<BrowserPane conversationId="conv_preview" active />);
+    await act(async () => Promise.resolve());
+    expect(fixture.registry.activeConversationId()).toBeNull();
+    expect(fixture.attachedViews).toEqual([fixture.page]);
+    expect(fixture.releaseCount()).toBe(1);
+    expect(fixture.bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+  });
+
+  it("ignores a stale existence probe after the retained preview closes", async () => {
+    const fixture = installRegistryBridge();
+    let resolveProbe: ((result: { exists: boolean; url: string }) => void) | undefined;
+    fixture.bridge.browserHasView.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveProbe = resolve;
+        }),
+    );
+    const { rerender } = render(<BrowserPane conversationId="conv_preview" active />);
+    await waitFor(() => expect(resolveProbe).toBeDefined());
+    await waitFor(() => expect(fixture.registry.activeConversationId()).toBe("conv_preview"));
+    rerender(<BrowserPane conversationId="conv_preview" active={false} />);
+    await waitFor(() => expect(fixture.registry.activeConversationId()).toBeNull());
+
+    act(() => {
+      fixture.registry.close("conv_preview", "preview-expired");
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "This localhost preview expired. Ask the agent to open it again.",
+    );
+    await act(async () => {
+      resolveProbe?.({ exists: true, url: "http://localhost:5173/app" });
+      await Promise.resolve();
+    });
+    rerender(<BrowserPane conversationId="conv_preview" active />);
+    await act(async () => Promise.resolve());
+
+    expect(fixture.registry.activeConversationId()).toBeNull();
+    expect(fixture.attachedViews).toEqual([fixture.page]);
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
+    expect(fixture.releaseCount()).toBe(1);
+  });
+
+  it("reattaches the retained page after a true unmount and remount", async () => {
+    const fixture = installRegistryBridge();
+    const first = render(<BrowserPane conversationId="conv_preview" active />);
+    await waitFor(() => expect(fixture.registry.activeConversationId()).toBe("conv_preview"));
+    first.unmount();
+    await waitFor(() => expect(fixture.registry.activeConversationId()).toBeNull());
+
+    render(<BrowserPane conversationId="conv_preview" active />);
+    await waitFor(() => expect(fixture.registry.activeConversationId()).toBe("conv_preview"));
+    expect(fixture.attachedViews).toEqual([fixture.page, fixture.page]);
+    expect(fixture.loadURL).toHaveBeenCalledTimes(1);
+    expect(fixture.bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+    expect(fixture.releaseCount()).toBe(0);
   });
 });
 

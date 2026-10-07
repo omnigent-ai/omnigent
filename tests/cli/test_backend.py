@@ -1741,6 +1741,66 @@ def test_host_status_json_reports_daemon_host_and_sessions(
     assert runner_status_calls == ["runner_abc"]
 
 
+def test_host_status_scoped_server_routes_workspace_selector(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A scoped status command probes the exact host with its org header."""
+    server = "https://workspace.cloud.databricks.com/api/2.0/omnigent"
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda _record: True)
+    monkeypatch.setattr("omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth.json")
+    monkeypatch.setattr("omnigent.chat._stored_databricks_record_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.chat._read_databrickscfg", lambda _profile: None)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target=server,
+        mode="server",
+        server_url=server,
+        host_id="host_abc",
+    )
+    cli._host_http_headers_cache.clear()
+    requests: list[dict[str, object]] = []
+
+    class _Response:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json() -> dict[str, str]:
+            return {"status": "online"}
+
+    class _Client:
+        def __init__(self, *, base_url: str, headers: dict[str, str], **_kwargs: object) -> None:
+            requests.append({"base_url": base_url, "headers": dict(headers)})
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request(self, method: str, path: str, **_kwargs: object) -> _Response:
+            requests[-1].update({"method": method, "path": path})
+            return _Response()
+
+    monkeypatch.setattr("httpx.Client", _Client)
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "status", "--server", f"{server}?o=123", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert '"host_status": "online"' in result.output
+    assert len(requests) == 1
+    assert requests[0]["base_url"] == server
+    assert requests[0]["method"] == "GET"
+    assert requests[0]["path"] == "/v1/hosts/host_abc"
+    headers = requests[0]["headers"]
+    assert isinstance(headers, dict)
+    assert headers["X-Databricks-Org-Id"] == "123"
+
+
 def test_host_status_reports_unreachable_daemon_without_traceback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -214,8 +214,12 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: { force?: boolean; agent?: boolean; hostId?: string | null },
+    previewRequestId?: string,
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  browserBeginPreviewNavigation?: (
+    conversationId: string,
+  ) => Promise<{ ok: boolean; requestId?: string; deadline?: number; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
