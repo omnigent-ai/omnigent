@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import {
@@ -231,6 +231,20 @@ describe("pinOrderWrites", () => {
       { id: "conv_0", pinnedAt: 1001 },
       { id: "conv_2", pinnedAt: 1002 },
     ]);
+  });
+
+  it("renumbers below now when the existing values are too large to count up from", () => {
+    vi.useFakeTimers({ now: 1791337307018 });
+    try {
+      const writes = pinOrderWrites(pins(1e20, 1e20, 1e20), "conv_2", "conv_1");
+      expect(writes).toEqual([
+        { id: "conv_0", pinnedAt: 1791337307015 },
+        { id: "conv_2", pinnedAt: 1791337307016 },
+        { id: "conv_1", pinnedAt: 1791337307017 },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renumbers once repeated moves leave no representable value between neighbours", () => {

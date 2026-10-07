@@ -68,6 +68,24 @@ def _row(page: Page, session_id: str) -> Locator:
     return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
 
 
+def _pin_and_wait(page: Page, row: Locator, session_id: str) -> None:
+    """Click *row*'s pin button and wait for its PATCH to succeed.
+
+    Pin writes don't overlap: the UI refuses a new one while another is
+    saving, so the next pin action must wait for this one to land.
+
+    :param page: Playwright page with the sidebar open.
+    :param row: The session's sidebar row.
+    :param session_id: The session being pinned.
+    """
+    row.hover()
+    with page.expect_response(
+        lambda r: r.request.method == "PATCH" and r.url.endswith(f"/v1/sessions/{session_id}")
+    ) as patch_info:
+        row.get_by_test_id("quick-pin-conversation").click()
+    assert patch_info.value.ok, patch_info.value.status
+
+
 def test_unpin_moves_session_back_to_recent(
     page: Page,
     seeded_session: tuple[str, str],
@@ -94,8 +112,7 @@ def test_unpin_moves_session_back_to_recent(
     expect(row).to_be_visible()
 
     # Pin it.
-    row.hover()
-    row.get_by_test_id("quick-pin-conversation").click()
+    _pin_and_wait(page, row, session_id)
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
 
     # Now unpin from under the Pinned header.
@@ -198,13 +215,11 @@ def test_pinned_section_orders_by_pin_time_not_update_time(
     # Pinned group, below the older pin (a).
     row_a = _row(page, session_a)
     expect(row_a).to_be_visible()
-    row_a.hover()
-    row_a.get_by_test_id("quick-pin-conversation").click()
+    _pin_and_wait(page, row_a, session_a)
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
 
     row_b = _row(page, session_b)
-    row_b.hover()
-    row_b.get_by_test_id("quick-pin-conversation").click()
+    _pin_and_wait(page, row_b, session_b)
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
 
     # Oldest pin (a) sits above the newer pin (b).
@@ -247,8 +262,7 @@ def test_drag_reorders_pinned_sessions(
     for session_id in (session_a, session_b):
         row = _row(page, session_id)
         expect(row).to_be_visible()
-        row.hover()
-        row.get_by_test_id("quick-pin-conversation").click()
+        _pin_and_wait(page, row, session_id)
         expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
 
     order = _pinned_session_order(page)

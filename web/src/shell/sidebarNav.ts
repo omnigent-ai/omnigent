@@ -364,8 +364,13 @@ export function pinOrderWrites(
   ) {
     return [{ id: fromId, pinnedAt }];
   }
+  // Renumber from the lowest existing value, unless it's too large to count up
+  // from in distinct steps; then use a range just below now, so a later pin
+  // (stamped `Date.now()`) still lands at the bottom.
   const finite = pinned.map(value).filter(Number.isFinite);
-  const base = finite.length > 0 ? Math.min(...finite) : Date.now();
+  const lowest = finite.length > 0 ? Math.min(...finite) : NaN;
+  const base =
+    Math.abs(lowest) + moved.length <= Number.MAX_SAFE_INTEGER ? lowest : Date.now() - moved.length;
   // Skip rows that already hold their renumbered value.
   return moved
     .map((c, index) => ({ id: c.id, pinnedAt: base + index }))
