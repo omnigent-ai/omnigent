@@ -16,7 +16,6 @@ interface LoaderBehavior {
   // If set, the TrackballControls constructor throws AFTER the renderer is created,
   // exercising the partial-init failure/teardown path.
   trackballThrows: boolean;
-  orbitThrows: boolean;
   // If set, the parsed object carries a mesh whose material references textures
   // (as a textured 3MF does), so teardown's texture disposal can be asserted.
   texturedMaterial: boolean;
@@ -25,7 +24,6 @@ interface LoaderBehavior {
 const behavior: LoaderBehavior = {
   mode: "valid",
   trackballThrows: false,
-  orbitThrows: false,
   texturedMaterial: false,
 };
 
@@ -70,16 +68,12 @@ let rotationAtBounds: number | null = null;
 interface ControlsRecord {
   kind: "orbit" | "trackball";
   camera: unknown;
-  element: HTMLElement;
-  target: { x: number; y: number; z: number; set: (x: number, y: number, z: number) => void };
   handleResizeCalls: number;
   updateCalls: number;
-  resetCalls: number;
   disposeCalls: number;
 }
 let lastControls: ControlsRecord | null = null;
-let lastCamera: { children: unknown[]; position: { x: number; y: number; z: number } } | null =
-  null;
+let lastCamera: { children: unknown[] } | null = null;
 let lastKeyTarget: { parent: unknown; position: { x: number; y: number; z: number } } | null = null;
 let resizeControls: (() => void) | null = null;
 let rotationWrites = 0;
@@ -114,7 +108,7 @@ function makeParsedObject() {
       }
     : { geometry: null, material: null };
   // Object3D stand-in. Box3.setFromObject reads boxSpec to decide bounds.
-  const object = {
+  return {
     boxSpec:
       behavior.mode === "empty"
         ? { empty: true, nan: false }
@@ -125,8 +119,6 @@ function makeParsedObject() {
     rotation: makeRotation(),
     traverse: (cb: (child: unknown) => void) => cb(child),
   };
-  lastParsedObject = object;
-  return object;
 }
 
 function loaderStub(name: string) {
@@ -145,40 +137,17 @@ vi.mock("three/examples/jsm/loaders/OBJLoader.js", () => ({ OBJLoader: loaderStu
 
 function controlsStub(kind: "orbit" | "trackball") {
   return class {
-    target = {
-      x: 0,
-      y: 0,
-      z: 0,
-      set(x: number, y: number, z: number) {
-        this.x = x;
-        this.y = y;
-        this.z = z;
-      },
-    };
-    constructor(camera: unknown, element: HTMLElement) {
-      if (kind === "trackball" ? behavior.trackballThrows : behavior.orbitThrows) {
+    constructor(camera: unknown) {
+      if (kind === "trackball" && behavior.trackballThrows) {
         throw new Error("controls init failed");
       }
-      lastControls = {
-        kind,
-        camera,
-        element,
-        target: this.target,
-        handleResizeCalls: 0,
-        updateCalls: 0,
-        resetCalls: 0,
-        disposeCalls: 0,
-      };
-      element.style.touchAction = "none";
+      lastControls = { kind, camera, handleResizeCalls: 0, updateCalls: 0, disposeCalls: 0 };
     }
     handleResize() {
       if (lastControls) lastControls.handleResizeCalls += 1;
     }
     update() {
       if (lastControls) lastControls.updateCalls += 1;
-    }
-    reset() {
-      if (lastControls) lastControls.resetCalls += 1;
     }
     dispose() {
       if (lastControls) lastControls.disposeCalls += 1;
@@ -239,7 +208,7 @@ vi.mock("three", () => {
     position = new Vector3();
     children: unknown[] = [];
     constructor() {
-      lastCamera = { children: this.children, position: this.position };
+      lastCamera = { children: this.children };
     }
     add(...objects: { parent?: unknown }[]) {
       for (const object of objects) {
@@ -380,7 +349,6 @@ function makeData(overrides: Partial<FileContentResponse> = {}): FileContentResp
 beforeEach(() => {
   behavior.mode = "valid";
   behavior.trackballThrows = false;
-  behavior.orbitThrows = false;
   behavior.texturedMaterial = false;
   materialTextures.map = makeTextureRecord();
   materialTextures.normalMap = makeTextureRecord();
@@ -517,7 +485,7 @@ describe("ModelViewer print orientation", () => {
 });
 
 describe("ModelViewer trackball controls and headlight", () => {
-  it("keeps a reset, resizable trackball and its directional light with the camera", async () => {
+  it("keeps a resizable trackball and its directional light with the camera", async () => {
     render(<ModelViewer data={makeData()} path="part.stl" />);
     await waitFor(() => expect(lastControls).not.toBeNull());
     const controls = lastControls;
@@ -525,11 +493,6 @@ describe("ModelViewer trackball controls and headlight", () => {
 
     expect(controls.kind).toBe("trackball");
     expect((controls.camera as { children: unknown[] }).children).toBe(lastCamera?.children);
-    expect(controls.element.style.touchAction).toBe("none");
-    expect(controls.target).toMatchObject({ x: 0, y: 0, z: 0 });
-    expect(controls.resetCalls).toBe(1);
-    const initialResizeCalls = controls.handleResizeCalls;
-    expect(initialResizeCalls).toBeGreaterThanOrEqual(1);
     expect(controls.updateCalls).toBeGreaterThanOrEqual(1);
     expect(
       lastCamera?.children.some(
@@ -548,7 +511,7 @@ describe("ModelViewer trackball controls and headlight", () => {
     expect(paintsOwnBackground(lastRenderer)).toBe(false);
 
     resizeControls?.();
-    expect(controls.handleResizeCalls).toBe(initialResizeCalls + 1);
+    expect(controls.handleResizeCalls).toBe(1);
   });
 
   it("disposes its controls on teardown", async () => {

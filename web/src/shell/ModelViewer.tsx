@@ -78,8 +78,7 @@ function parseModel(
 
 /**
  * Frame `object` in `camera`: center it at the origin and pull the camera back
- * far enough that the whole bounding sphere is visible. TrackballControls are
- * constructed afterward so their saved reset state is this fitted view.
+ * far enough that the whole bounding sphere is visible.
  *
  * The caller has already validated that the object's bounding box is non-empty
  * and finite, so `box` here is always usable.
@@ -342,10 +341,6 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
 
         const controls = new TrackballControls(camera, renderer.domElement);
         res.controls = controls;
-        controls.target.set(0, 0, 0);
-        controls.handleResize();
-        controls.reset();
-        controls.update();
 
         const render = () => {
           res.rafId = requestAnimationFrame(render);
