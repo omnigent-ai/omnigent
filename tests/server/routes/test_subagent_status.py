@@ -1,4 +1,4 @@
-"""Subagent inactivity publishes idle status without delivering runner completion."""
+"""Native inactivity observations must not fabricate successful turn outcomes."""
 
 from __future__ import annotations
 
@@ -141,6 +141,7 @@ async def status_route(
                 for cache in (
                     common._session_status_cache,
                     common._session_active_response_cache,
+                    common._session_response_generation_cache,
                     common._session_background_task_count_cache,
                     common._session_background_tasks_cache,
                 ):
@@ -149,49 +150,23 @@ async def status_route(
 
 @pytest.mark.parametrize("is_child", [True, False], ids=["child", "top-level"])
 @pytest.mark.parametrize(
-    ("optional", "wire_fields", "count", "tasks"),
+    "optional",
     [
-        pytest.param({}, {}, 2, [_BACKGROUND_TASK], id="bare"),
-        pytest.param(
-            {
-                "response_id": "resp_turn",
-                "background_task_count": 1,
-                "background_tasks": [_BACKGROUND_TASK.model_dump()],
-                "blocked_on": "permission",
-            },
-            {
-                "response_id": "resp_turn",
-                "background_task_count": 1,
-                "background_tasks": [_BACKGROUND_TASK.model_dump()],
-                "blocked_on": "permission",
-            },
-            1,
-            [_BACKGROUND_TASK],
-            id="optional-fields",
-        ),
-        pytest.param(
-            {"response_id": None, "background_task_count": 0},
-            {"background_task_count": 0},
-            None,
-            None,
-            id="clear-background",
-        ),
-        pytest.param(
-            {"background_task_count": True, "background_tasks": "invalid", "blocked_on": 1},
-            {},
-            2,
-            [_BACKGROUND_TASK],
-            id="best-effort-fields",
-        ),
+        {},
+        {
+            "response_id": "resp_turn",
+            "background_task_count": 1,
+            "background_tasks": [_BACKGROUND_TASK.model_dump()],
+            "blocked_on": "permission",
+        },
+        {"response_id": None, "background_task_count": 0},
+        {"background_task_count": True, "background_tasks": "invalid", "blocked_on": 1},
     ],
 )
-async def test_subagent_idle_publishes_status_without_completion(
+async def test_subagent_idle_does_not_complete_task(
     status_route: _StatusRoute,
     is_child: bool,
     optional: dict[str, Any],
-    wire_fields: dict[str, Any],
-    count: int | None,
-    tasks: list[BackgroundTaskInfo] | None,
 ) -> None:
     route = status_route
     sid = route.child_id if is_child else route.parent_id
@@ -203,48 +178,405 @@ async def test_subagent_idle_publishes_status_without_completion(
     assert response.json() == {"queued": False}
     await _flush_live_state()
 
-    assert common._session_status_cache[sid] == "idle"
-    assert sid not in common._session_active_response_cache
-    assert common._session_background_task_count_cache.get(sid) == count
-    assert common._session_background_tasks_cache.get(sid) == tasks
+    assert common._session_status_cache[sid] == "running"
+    assert common._session_active_response_cache[sid] == "resp_active"
+    assert common._session_background_task_count_cache[sid] == 2
+    assert common._session_background_tasks_cache[sid] == [_BACKGROUND_TASK]
     conv = route.store.get_conversation(sid)
-    assert conv is not None and conv.live_status == "idle"
+    assert conv is not None and conv.live_status == "running"
     assert route.store.list_items(sid).data == []
     runs, _ = route.scheduled.list_runs(route.task_id)
-    run = next(run for run in runs if run.conversation_id == sid)
-    assert run.status == "succeeded"
-    assert run.finished_at is not None
-
-    events = [(call.args[0], call.args[1]) for call in route.published.call_args_list]
-    assert [event for target, event in events if target == sid] == [
-        {
-            "sequence_number": None,
-            "type": "session.status",
-            "conversation_id": sid,
-            "status": "idle",
-            "error": None,
-            **wire_fields,
-        }
-    ]
+    assert next(run for run in runs if run.conversation_id == sid).status == "running"
     if is_child:
-        parent_events = [event for target, event in events if target == route.parent_id]
-        assert len(parent_events) == 1
-        assert parent_events[0]["type"] == "session.child_session.updated"
-        assert parent_events[0]["child_session_id"] == sid
-        assert parent_events[0]["child"]["busy"] is False
-        assert common._session_status_cache[route.parent_id] == "running"
-        assert common._session_active_response_cache[route.parent_id] == "resp_active"
-        assert (
-            next(run for run in runs if run.conversation_id == route.parent_id).status == "running"
-        )
-    else:
-        assert len(events) == 1
+        snapshot = await route.client.get(f"/v1/sessions/{route.parent_id}/child_sessions")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["data"][0]["current_task_status"] == "in_progress"
+    route.published.assert_not_called()
     assert route.forwarded == []
     route.telemetry.assert_not_called()
 
 
+@pytest.mark.parametrize("is_child", [False, True], ids=["top-level", "child"])
+@pytest.mark.parametrize("previous_status", ["running", "idle"])
+async def test_clear_supersession_settles_only_the_old_session(
+    status_route: _StatusRoute,
+    is_child: bool,
+    previous_status: str,
+) -> None:
+    from omnigent.harnesses.claude_native import forwarder
+
+    route = status_route
+    sid = route.child_id if is_child else route.parent_id
+    target = route.parent_id if is_child else route.child_id
+    route.store.update_conversation(sid, harness_override="claude-native")
+    route.store.set_labels(sid, {"omnigent.wrapper": "claude-code-native-ui"})
+    route.store.set_session_live_status(sid, previous_status)
+    common._session_status_cache[sid] = previous_status
+
+    await forwarder._post_clear_supersession(
+        route.client,
+        old_session_id=sid,
+        new_session_id=target,
+        agent_name="claude-native-ui",
+        response_id="resp_active",
+    )
+    await _flush_live_state()
+
+    expected = "failed" if is_child and previous_status == "running" else "idle"
+    assert common._session_status_cache[sid] == expected
+    assert sid not in common._session_active_response_cache
+    conv = route.store.get_conversation(sid)
+    assert conv is not None and conv.live_status == expected
+    runs, _ = route.scheduled.list_runs(route.task_id)
+    assert next(run for run in runs if run.conversation_id == sid).status == "failed"
+    assert common._session_status_cache[target] == "running"
+    assert common._session_active_response_cache[target] == "resp_active"
+    assert next(run for run in runs if run.conversation_id == target).status == "running"
+    events = [call.args[1] for call in route.published.call_args_list]
+    assert any(event.get("type") == "session.superseded" for event in events)
+    if expected == "failed":
+        assert not any(
+            event.get("type") == "session.status" and event.get("status") == "idle"
+            for event in events
+        )
+    assert route.telemetry.call_count == int(is_child and previous_status == "running")
+
+
+@pytest.mark.parametrize("is_child", [False, True], ids=["top-level", "child"])
+async def test_delayed_clear_preserves_a_resumed_source_turn(
+    status_route: _StatusRoute,
+    is_child: bool,
+) -> None:
+    from omnigent.harnesses.claude_native import forwarder
+
+    route = status_route
+    sid = route.child_id if is_child else route.parent_id
+    target = route.parent_id if is_child else route.child_id
+    route.store.update_conversation(sid, harness_override="claude-native")
+
+    async def resume_before_supersession(request: httpx.Request) -> None:
+        if json.loads(request.content).get("type") == "external_session_superseded":
+            common._session_active_response_cache[sid] = "response-newer"
+
+    route.client.event_hooks["request"].append(resume_before_supersession)
+    await forwarder._post_clear_supersession(
+        route.client,
+        old_session_id=sid,
+        new_session_id=target,
+        agent_name="claude-native-ui",
+        response_id="resp_active",
+    )
+    await _flush_live_state()
+
+    assert common._session_status_cache[sid] == "running"
+    assert common._session_active_response_cache[sid] == "response-newer"
+    conv = route.store.get_conversation(sid)
+    assert conv is not None and conv.live_status == "running"
+    runs, _ = route.scheduled.list_runs(route.task_id)
+    assert next(run for run in runs if run.conversation_id == sid).status == "running"
+    assert not any(
+        call.args[1].get("type") in {"session.status", "session.superseded"}
+        for call in route.published.call_args_list
+    )
+    assert route.forwarded == []
+
+
+@pytest.mark.parametrize(
+    "pause_at",
+    ["enrichment", "labels", "activity", "runner-lookup", "runner-lookup-finished", "recovery"],
+)
+async def test_clear_supersession_preserves_a_turn_resumed_during_processing(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    pause_at: str,
+) -> None:
+    route = status_route
+    sid = route.child_id
+    route.store.update_conversation(sid, harness_override="claude-native")
+
+    async def resume() -> None:
+        response = await route.client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "running", "response_id": "response-newer"},
+            },
+        )
+        assert response.status_code == 202, response.text
+        if pause_at.endswith("-finished"):
+            response = await route.client.post(
+                f"/v1/sessions/{sid}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {
+                        "status": "failed",
+                        "response_id": "response-newer",
+                        "output": "New turn failure",
+                    },
+                },
+            )
+            assert response.status_code == 202, response.text
+
+    if pause_at == "enrichment":
+        original = routes_events._enrich_terminal_status_with_subagent_output
+
+        async def enrich(data: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+            result = await original(data, *args, **kwargs)
+            if data.get("output") == "Session ended by /clear.":
+                await resume()
+            return result
+
+        monkeypatch.setattr(routes_events, "_enrich_terminal_status_with_subagent_output", enrich)
+    elif pause_at == "labels":
+        persist = routes_events._persist_session_status_error_labels
+
+        async def persist_labels(*args: Any, **kwargs: Any) -> None:
+            if args[1] is not None and args[1].message == "Session ended by /clear.":
+                await resume()
+            await persist(*args, **kwargs)
+
+        monkeypatch.setattr(routes_events, "_persist_session_status_error_labels", persist_labels)
+    elif pause_at == "activity":
+        record = routes_events.record_subagent_activity
+
+        async def record_activity(*args: Any, **kwargs: Any) -> None:
+            await record(*args, **kwargs)
+            await resume()
+
+        monkeypatch.setattr(routes_events, "record_subagent_activity", record_activity)
+    elif pause_at.startswith("runner-lookup"):
+        get_client = sessions._get_runner_client
+        resumed = False
+
+        async def get_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            nonlocal resumed
+            if not resumed:
+                resumed = True
+                await resume()
+            return await get_client(*args, **kwargs)
+
+        monkeypatch.setattr(sessions, "_get_runner_client", get_runner_client)
+    else:
+        from omnigent.server.routes._sessions import orchestration
+
+        get_client = sessions._get_runner_client
+        initial_lookup = True
+
+        async def unavailable_initial_client(*args: Any, **kwargs: Any) -> Any:
+            nonlocal initial_lookup
+            if initial_lookup:
+                initial_lookup = False
+                return None
+            return await get_client(*args, **kwargs)
+
+        async def recover(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+            await resume()
+            return await get_client(sid, None)
+
+        monkeypatch.setattr(sessions, "_get_runner_client", unavailable_initial_client)
+        monkeypatch.setattr(orchestration, "_heal_subagent_runner_binding_via_parent", recover)
+
+    response = await route.client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "external_session_superseded",
+            "data": {"target_conversation_id": route.parent_id, "response_id": "resp_active"},
+        },
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    expected = "failed" if pause_at.endswith("-finished") else "running"
+    assert common._session_status_cache[sid] == expected
+    assert common._session_active_response_cache.get(sid) == (
+        None if expected == "failed" else "response-newer"
+    )
+    conv = route.store.get_conversation(sid)
+    assert conv is not None and conv.live_status == expected
+    assert conv.labels.get(common._LAST_TASK_ERROR_MESSAGE_LABEL_KEY, "") == (
+        "New turn failure" if expected == "failed" else ""
+    )
+    assert not any(
+        "superseded_response_id" in event.get("data", {}) for _, event in route.forwarded
+    )
+    assert not any(
+        call.args[1].get("type") == "session.superseded" for call in route.published.call_args_list
+    )
+    if pause_at in {"enrichment", "labels"}:
+        runs, _ = route.scheduled.list_runs(route.task_id)
+        assert next(run for run in runs if run.conversation_id == sid).status == "running"
+        assert not any(
+            call.args[1].get("type") == "session.status" and call.args[1].get("status") == "failed"
+            for call in route.published.call_args_list
+        )
+
+
+@pytest.mark.parametrize("is_child", [False, True], ids=["top-level", "child"])
+@pytest.mark.parametrize("status", ["running", "waiting"])
+@pytest.mark.parametrize("old_response", [None, "response-old"])
+async def test_supersession_cannot_end_a_different_busy_response(
+    status_route: _StatusRoute,
+    is_child: bool,
+    status: str,
+    old_response: str | None,
+) -> None:
+    route = status_route
+    sid = route.child_id if is_child else route.parent_id
+    target = route.parent_id if is_child else route.child_id
+    common._session_status_cache[sid] = status
+    route.store.set_session_live_status(sid, status)
+    common._session_active_response_cache[sid] = "response-newer"
+    response = await route.client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "external_session_superseded",
+            "data": {"target_conversation_id": target, "response_id": old_response},
+        },
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    assert common._session_status_cache[sid] == status
+    assert common._session_active_response_cache[sid] == "response-newer"
+    conv = route.store.get_conversation(sid)
+    assert conv is not None and conv.live_status == status
+    assert route.forwarded == []
+    route.published.assert_not_called()
+
+
+@pytest.mark.parametrize("previous_status", ["running", "waiting"])
+async def test_clear_supersession_delivers_and_wakes_the_parent_runner(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_status: str,
+) -> None:
+    from omnigent.harnesses.claude_native import forwarder
+    from omnigent.runner import app as runner_module
+    from omnigent.runner import subagent_work
+    from tests.runner.conftest import _runner_client
+    from tests.runner.helpers import NullServerClient
+    from tests.runner.test_native_subagent_turn_outcome_delivery import _native_app
+
+    route = status_route
+    wake = asyncio.Event()
+    wake_posts: list[dict[str, Any]] = []
+
+    class RecordingServerClient(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url == f"/v1/sessions/{route.parent_id}/events":
+                wake_posts.append(kwargs["json"])
+                wake.set()
+            return await super().post(url, **kwargs)
+
+    native_app = _native_app("claude-native", server_client=RecordingServerClient())
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[route.parent_id] = inbox
+    route.store.update_conversation(route.child_id, harness_override="claude-native")
+    route.store.set_labels(route.child_id, {"omnigent.wrapper": "claude-code-native-ui"})
+    try:
+        async with _runner_client(native_app) as runner_client:
+            created = await runner_client.post(
+                "/v1/sessions", json={"session_id": route.child_id, "agent_id": uuid4().hex}
+            )
+            assert created.status_code == 201, created.text
+            subagent_work.register_subagent_work(
+                parent_session_id=route.parent_id,
+                child_session_id=route.child_id,
+                agent="researcher",
+                title="clear-test",
+            )
+
+            async def get_runner_client(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+                return runner_client
+
+            monkeypatch.setattr(sessions, "_get_runner_client", get_runner_client)
+            active = await route.client.post(
+                f"/v1/sessions/{route.child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": previous_status, "response_id": "resp_active"},
+                },
+            )
+            assert active.status_code == 202, active.text
+            await forwarder._post_clear_supersession(
+                route.client,
+                old_session_id=route.child_id,
+                new_session_id=route.parent_id,
+                agent_name="claude-native-ui",
+                response_id="resp_active",
+            )
+            await asyncio.wait_for(wake.wait(), timeout=2)
+            delivered = inbox.get_nowait()
+            assert delivered["status"] == "failed"
+            assert delivered["output"] == "Session ended by /clear."
+            entry = subagent_work.get_subagent_work(route.child_id)
+            assert entry is not None and entry.status == "failed"
+            assert wake_posts[0]["type"] == "message"
+            assert "failed" in wake_posts[0]["data"]["content"][0]["text"]
+        assert common._session_status_cache[route.parent_id] == "running"
+        assert common._session_active_response_cache[route.parent_id] == "resp_active"
+    finally:
+        subagent_work.unregister_subagent_work(route.child_id)
+        subagent_work._session_inboxes_ref.pop(route.parent_id, None)
+        for sid in (route.parent_id, route.child_id):
+            runner_module._session_event_queues_ref.pop(sid, None)
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+async def test_confirmed_internal_child_result_closes_status_and_schedule(
+    status_route: _StatusRoute,
+    outcome: str,
+) -> None:
+    route = status_route
+    route.store.set_labels(
+        route.child_id,
+        {
+            "omnigent.claude_native.subagent_id": "task-1",
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+        },
+    )
+    response = await route.client.post(
+        f"/v1/sessions/{route.parent_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "response_id": "parent-turn",
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "is_meta": True,
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"<task-notification><task-id>task-1</task-id>"
+                            f"<status>{outcome}</status></task-notification>",
+                        }
+                    ],
+                },
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    expected = "idle" if outcome == "completed" else "failed"
+    assert common._session_status_cache[route.child_id] == expected
+    assert route.child_id not in common._session_active_response_cache
+    child = route.store.get_conversation(route.child_id)
+    assert child is not None and child.live_status == expected
+    runs, _ = route.scheduled.list_runs(route.task_id)
+    assert next(run for run in runs if run.conversation_id == route.child_id).status == (
+        "succeeded" if outcome == "completed" else "failed"
+    )
+    # A later inactivity observation can only replay the confirmed result.
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={"type": "subagent.status", "data": {"idle": True}},
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    assert common._session_status_cache[route.child_id] == expected
+
+
 @pytest.mark.parametrize("fail_idle_top_level", [False, True])
-async def test_offline_sweep_refreshes_child_status_after_idle_observation(
+async def test_offline_sweep_refreshes_child_status_after_confirmed_idle(
     status_route: _StatusRoute, fail_idle_top_level: bool
 ) -> None:
     route = status_route
@@ -253,7 +585,10 @@ async def test_offline_sweep_refreshes_child_status_after_idle_observation(
 
     response = await route.client.post(
         f"/v1/sessions/{route.child_id}/events",
-        json={"type": "subagent.status", "data": {"idle": True}},
+        json={
+            "type": "external_session_status",
+            "data": {"status": "idle", "turn_completed": True},
+        },
     )
     assert response.status_code == 202, response.text
     await _flush_live_state()
@@ -275,7 +610,7 @@ async def test_offline_sweep_refreshes_child_status_after_idle_observation(
     assert sessions._last_task_error_from_labels(child.labels) is None
     assert route.store.list_items(route.parent_id).data == []
     route.published.assert_not_called()
-    assert route.forwarded == []
+    assert len(route.forwarded) == 1
 
     decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
     assert decision["session_id"] == route.child_id
@@ -301,6 +636,7 @@ async def test_subagent_idle_preserves_failed_status(status_route: _StatusRoute)
     sid = route.child_id
     common._session_status_cache[sid] = "failed"
     route.store.set_session_live_status(sid, "failed")
+    common._session_active_response_cache.pop(sid, None)
     response = await route.client.post(
         f"/v1/sessions/{sid}/events", json={"type": "subagent.status", "data": {"idle": True}}
     )
@@ -390,7 +726,8 @@ async def test_external_session_status_still_forwards_to_runner(
             "detail_source": "external_status_output",
         }
     assert body["data"] == expected_data
-    assert route.telemetry.call_count == (0 if status == "running" else 1)
+    confirmed_terminal = status == "failed" or turn_outcome is not None
+    assert route.telemetry.call_count == int(confirmed_terminal)
 
 
 @pytest.mark.parametrize("is_child", [False, True], ids=["main", "native-child"])
@@ -446,6 +783,42 @@ async def test_status_observes_existing_session_metadata_off_event_loop(
         assert "harness" not in attrs
         assert attrs["harness_source"] == "missing_agent"
         assert attrs["harness_resolution"] == "unknown"
+
+
+@pytest.mark.parametrize("is_child", [False, True], ids=["top-level", "child"])
+@pytest.mark.parametrize("harness", ["claude-native", "auto"])
+async def test_unconfirmed_idle_preserves_live_task_and_scheduled_run(
+    status_route: _StatusRoute,
+    is_child: bool,
+    harness: str,
+) -> None:
+    route = status_route
+    sid = route.child_id if is_child else route.parent_id
+    route.store.update_conversation(sid, harness_override=harness)
+    route.store.set_labels(sid, {"omnigent.wrapper": "claude-code-native-ui"})
+
+    response = await route.client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "idle", "output": "partial text"},
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    assert common._session_status_cache[sid] == "running"
+    conv = route.store.get_conversation(sid)
+    assert conv is not None and conv.live_status == "running"
+    runs, _ = route.scheduled.list_runs(route.task_id)
+    assert next(run for run in runs if run.conversation_id == sid).status == "running"
+    route.published.assert_not_called()
+    route.telemetry.assert_not_called()
+    assert route.forwarded[0][1]["data"]["status"] == "idle"
+    if is_child:
+        snapshot = await route.client.get(f"/v1/sessions/{route.parent_id}/child_sessions")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["data"][0]["current_task_status"] == "in_progress"
 
 
 @pytest.mark.parametrize(

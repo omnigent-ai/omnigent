@@ -220,6 +220,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_mcp_startup_cache,
+    _session_response_generation_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
@@ -3473,6 +3474,8 @@ async def _recover_subagent_status_forward_via_parent(
     tunnel_registry: TunnelRegistry | None,
     conversation_store: ConversationStore,
     forward_body: dict[str, Any],
+    *,
+    is_current: Callable[[], bool] | None = None,
 ) -> _RunnerForwardResult | None:
     """
     Re-deliver a sub-agent terminal status through the parent's live runner.
@@ -3505,6 +3508,7 @@ async def _recover_subagent_status_forward_via_parent(
     :param conversation_store: Store used to look up the parent and persist the
         child's healed ``runner_id``.
     :param forward_body: The ``external_session_status`` event body to re-POST.
+    :param is_current: Optional turn guard passed through the recovery retry.
     :returns: The retry's :class:`_RunnerForwardResult` when a live parent
         runner was resolved, or ``None`` when none could be (the caller then
         fails the forward as before).
@@ -3518,6 +3522,7 @@ async def _recover_subagent_status_forward_via_parent(
         child_conv.id,
         runner_router,
         forward_body,
+        **({"is_current": is_current} if is_current is not None else {}),
     )
 
 
@@ -8191,6 +8196,10 @@ async def _relay_runner_stream_once(
                         _rid = resp_obj.get("id")
                         if isinstance(_rid, str) and _rid:
                             current_response_id = _rid
+                            if _session_active_response_cache.get(session_id) != _rid:
+                                _session_response_generation_cache[session_id] = (
+                                    _session_response_generation_cache.get(session_id, 0) + 1
+                                )
                             # Keep the turn identity across transport retries until final status.
                             _session_active_response_cache[session_id] = _rid
                         _model = resp_obj.get("model")

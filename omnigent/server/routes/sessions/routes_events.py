@@ -154,6 +154,7 @@ from omnigent.server.routes._sessions.common import (
     _pushed_model_options_cache,
     _session_active_response_cache,
     _session_mcp_startup_cache,
+    _session_response_generation_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     get_server_runner_router,
@@ -264,6 +265,7 @@ from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
+    settle_claude_subagent_completion,
 )
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
@@ -1736,6 +1738,24 @@ def register_events_routes(
                 )
             _publish_interrupted(session_id, response_id=response_id)
             return {"queued": False}
+        superseded_target: str | None = None
+        supersession_published = False
+        supersession_generation = _session_response_generation_cache.get(session_id, 0)
+        source_live_status = conv.live_status
+
+        def supersession_is_current() -> bool:
+            if superseded_target is None:
+                return True
+            if _session_response_generation_cache.get(session_id, 0) != supersession_generation:
+                return False
+            active_response = _session_active_response_cache.get(session_id)
+            live_status = _session_status_cache.get(session_id, source_live_status)
+            if supersession_published:
+                return active_response is None and live_status == "failed"
+            return active_response == response_id or (
+                active_response is None and live_status not in {"running", "waiting"}
+            )
+
         if body.type == _EXTERNAL_SESSION_SUPERSEDED_TYPE:
             target_conversation_id = body.data.get("target_conversation_id")
             if not isinstance(target_conversation_id, str) or not target_conversation_id.strip():
@@ -1744,8 +1764,44 @@ def register_events_routes(
                     "data.target_conversation_id",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            _publish_session_superseded(session_id, target_conversation_id.strip())
-            return {"queued": False}
+            response_id = body.data.get("response_id")
+            if response_id is not None and (
+                not isinstance(response_id, str) or not response_id.strip()
+            ):
+                raise OmnigentError(
+                    "external_session_superseded data.response_id must be a non-empty string",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            previous_status = _session_status_cache.get(session_id, conv.live_status)
+            current_response_id = _session_active_response_cache.get(session_id)
+            if current_response_id is not None and current_response_id != response_id:
+                return {"queued": False}
+            if previous_status in {"running", "waiting"} and (
+                response_id is None or current_response_id != response_id
+            ):
+                return {"queued": False}
+            superseded_target = target_conversation_id.strip()
+            if conv.parent_conversation_id is not None and previous_status in {
+                "running",
+                "waiting",
+                "failed",
+            }:
+                # Use terminal delivery so the dispatch and parent settle too.
+                body = body.model_copy(
+                    update={
+                        "type": _EXTERNAL_SESSION_STATUS_TYPE,
+                        "data": {
+                            "status": "failed",
+                            "response_id": response_id,
+                            "superseded_response_id": response_id,
+                            "output": "Session ended by /clear.",
+                        },
+                    }
+                )
+            else:
+                _publish_status(session_id, "idle", scheduled_run_outcome="failed")
+                _publish_session_superseded(session_id, superseded_target)
+                return {"queued": False}
         if body.type == _EXTERNAL_BTW_SIDECHAT_TYPE:
             question = body.data.get("question")
             answer = body.data.get("answer")
@@ -1828,16 +1884,8 @@ def register_events_routes(
                 raw_blocked_on if isinstance(raw_blocked_on, str) and raw_blocked_on else None
             )
             if body.type == _SUBAGENT_STATUS_TYPE:
-                # A transcript lull publishes idle but is not a runner completion.
-                _publish_status(
-                    session_id,
-                    "idle",
-                    None,
-                    response_id=response_id,
-                    background_task_count=bg_count,
-                    background_tasks=bg_tasks,
-                    blocked_on=blocked_on,
-                )
+                # Transcript inactivity does not confirm that the turn ended.
+                await settle_claude_subagent_completion(conv, conversation_store)
                 return {"queued": False}
             assert isinstance(status, str)
             # A background-task ``waiting`` marks an ended turn, so deliver it
@@ -1893,34 +1941,8 @@ def register_events_routes(
                     cause=diagnosis.cause if diagnosis else None,
                     remediation=diagnosis.remediation if diagnosis else None,
                 )
-            if status_error is not None:
-                failed_agent_name = await asyncio.to_thread(
-                    _response_agent_name_from_store, conversation_store, session_id, response_id
-                )
-                await _persist_session_status_error_labels(
-                    session_id,
-                    status_error,
-                    conversation_store,
-                    agent_name=failed_agent_name,
-                )
-            elif status == "running":
-                await _persist_session_status_error_labels(session_id, None, conversation_store)
-            _publish_status(
-                session_id,
-                status,
-                status_error,
-                failure_origin="external_session_status",
-                failure_context=data.get("failure_context"),
-                response_id=response_id,
-                background_task_count=bg_count,
-                background_tasks=bg_tasks,
-                blocked_on=blocked_on,
-            )
-            if (
-                conv.parent_conversation_id is not None
-                and status in {"idle", "failed"}
-                and conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
-            ):
+            outcome = None
+            if status in {"idle", "failed"}:
                 harness = await asyncio.to_thread(
                     _native_pane_harness,
                     conv,
@@ -1933,18 +1955,60 @@ def register_events_routes(
                     turn_outcome=data.get("turn_outcome"),
                     turn_completed=data.get("turn_completed"),
                 )
-                if outcome is not None:
-                    await record_subagent_activity(
-                        session_id,
-                        "returned",
-                        conversation_store,
-                        turn_id=response_id,
-                        status=outcome,
-                    )
+            supersession_kwargs: dict[str, Any] = (
+                {"is_current": supersession_is_current} if superseded_target is not None else {}
+            )
+            if status_error is not None:
+                failed_agent_name = await asyncio.to_thread(
+                    _response_agent_name_from_store, conversation_store, session_id, response_id
+                )
+                if not supersession_is_current():
+                    return {"queued": False}
+                await _persist_session_status_error_labels(
+                    session_id,
+                    status_error,
+                    conversation_store,
+                    agent_name=failed_agent_name,
+                    **supersession_kwargs,
+                )
+            elif status == "running":
+                await _persist_session_status_error_labels(session_id, None, conversation_store)
+            # Reads and label persistence can yield to a resumed source turn.
+            if not supersession_is_current():
+                return {"queued": False}
+            quiescence_idle = status == "idle" and outcome is None
+            # Public idle also completes scheduled runs and child summaries.
+            if not quiescence_idle:
+                _publish_status(
+                    session_id,
+                    status,
+                    status_error,
+                    failure_origin="external_session_status",
+                    failure_context=data.get("failure_context"),
+                    response_id=response_id,
+                    background_task_count=bg_count,
+                    background_tasks=bg_tasks,
+                    blocked_on=blocked_on,
+                )
+                supersession_published = superseded_target is not None
+            if (
+                conv.parent_conversation_id is not None
+                and outcome is not None
+                and conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
+            ):
+                await record_subagent_activity(
+                    session_id,
+                    "returned",
+                    conversation_store,
+                    turn_id=response_id,
+                    status=outcome,
+                )
+            if not supersession_is_current():
+                return {"queued": False}
             # Emit a turn-end telemetry event for native harnesses. "idle"
             # means the turn completed normally; "failed" means it errored.
             # No latency or token deltas are available on this path.
-            if status in {"idle", "failed"}:
+            if status in {"idle", "failed"} and not quiescence_idle:
                 _tel_emit(
                     _TelTurnEndEvent(
                         installation_id=_get_installation_id(),
@@ -1967,7 +2031,10 @@ def register_events_routes(
                 session_id,
                 runner_router,
                 forward_body,
+                **supersession_kwargs,
             )
+            if not supersession_is_current():
+                return {"queued": False}
             if (
                 conv.kind == "sub_agent"
                 and status in {"idle", "failed"}
@@ -1995,7 +2062,10 @@ def register_events_routes(
                         getattr(request.app.state, "tunnel_registry", None),
                         conversation_store,
                         forward_body,
+                        **supersession_kwargs,
                     )
+                    if not supersession_is_current():
+                        return {"queued": False}
                     if recovered is not None:
                         runner_result = recovered
                 _require_external_status_forward(
@@ -2003,6 +2073,8 @@ def register_events_routes(
                     status,
                     runner_result,
                 )
+            if superseded_target is not None:
+                _publish_session_superseded(session_id, superseded_target)
             return {"queued": False}
         if body.type == _EXTERNAL_COMPACTION_STATUS_TYPE:
             # Terminal-observed compaction edge (claude-native forwarder):

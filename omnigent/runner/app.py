@@ -1361,6 +1361,7 @@ def create_runner_app(
     _sdk_compact_inprogress: set[str] = set()
     app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
+    _native_pane_response_binding: dict[str, tuple[str, int | None, int, str | None]] = {}
     app.state.native_pane_status = _native_pane_status
     # Detached watchers answering a /model confirm dialog that pops after
     # the active turn settles (a mid-turn switch queues in the composer).
@@ -1811,6 +1812,7 @@ def create_runner_app(
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
         _native_pane_status.pop(event.session_id, None)
+        _native_pane_response_binding.pop(event.session_id, None)
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
@@ -3328,6 +3330,7 @@ def create_runner_app(
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
+        _native_pane_response_binding.pop(session_id, None)
         _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -6448,8 +6451,47 @@ def create_runner_app(
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             terminal_status = None
+            superseded_response_id = (
+                data.get("superseded_response_id") if isinstance(data, dict) else None
+            )
+            superseded_work = get_subagent_work(conversation_id)
+            if isinstance(superseded_response_id, str):
+                initial_binding = (
+                    superseded_response_id,
+                    _turn_bind_epoch.get(conversation_id),
+                    resource_registry.session_activity_epoch(conversation_id),
+                    superseded_work.work_id if superseded_work is not None else None,
+                )
+
+                def superseded_turn_is_current() -> bool:
+                    binding = _native_pane_response_binding.get(conversation_id)
+                    return (
+                        (
+                            binding == initial_binding
+                            if binding is not None
+                            else not resource_registry.session_turn_is_active(conversation_id)
+                        )
+                        and _turn_bind_epoch.get(conversation_id) == initial_binding[1]
+                        and resource_registry.session_activity_epoch(conversation_id)
+                        == initial_binding[2]
+                    )
+
+                recovered_entry = await _ensure_subagent_work_entry(
+                    conversation_id,
+                    is_current=lambda: (
+                        superseded_turn_is_current()
+                        and get_subagent_work(conversation_id) is superseded_work
+                    ),
+                )
+                # Recovery can yield while a newer response or dispatch starts.
+                if (
+                    not superseded_turn_is_current()
+                    or get_subagent_work(conversation_id) is not recovered_entry
+                ):
+                    return Response(status_code=204)
             if status in ("idle", "failed"):
-                recovered_entry = get_subagent_work(conversation_id)
+                if recovered_entry is None:
+                    recovered_entry = get_subagent_work(conversation_id)
                 turn_outcome = data.get("turn_outcome") if isinstance(data, dict) else None
                 if turn_outcome in ("completed", "cancelled", "failed"):
                     recovered_entry = await _ensure_subagent_work_entry(conversation_id)
@@ -6466,21 +6508,27 @@ def create_runner_app(
                     # while its parent inbox is still unavailable.
                     terminal_status = "cancelled"
                     output = recovered_entry.output
+            turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
+            quiescence_idle = (
+                status == "idle"
+                and terminal_status is None
+                and turn_completed is not True
+                and _native_turn_outcome_is_forwarder_confirmed(conversation_id)
+            )
             if status in ("running", "waiting", "idle", "failed"):
                 # Forwarders report these edges straight to the server, so record
                 # them here too; the idle watchdog reads them for native turns.
                 _native_pane_status[conversation_id] = status
                 resource_registry.note_external_session_status(conversation_id, status)
-                child_status = (
-                    "idle" if terminal_status == "completed" else terminal_status or status
-                )
-                _fan_out_child_delta_to_parent(
-                    conversation_id,
-                    {"type": "session.status", "status": child_status},
-                    latest_assistant_text=output,
-                    allow_history_preview_fallback=False,
-                )
-            turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
+                response_id = data.get("response_id") if isinstance(data, dict) else None
+                if status in ("running", "waiting") and isinstance(response_id, str):
+                    current_work = get_subagent_work(conversation_id)
+                    _native_pane_response_binding[conversation_id] = (
+                        response_id,
+                        _turn_bind_epoch.get(conversation_id),
+                        resource_registry.session_activity_epoch(conversation_id),
+                        current_work.work_id if current_work is not None else None,
+                    )
             interrupt_pending = False
             interrupt_work_id: str | None = None
             if status == "idle" and terminal_status is None and turn_completed is not True:
@@ -6499,13 +6547,23 @@ def create_runner_app(
                         _current_entry.work_id if _current_entry is not None else None,
                     )
                 )
-            ambiguous_idle = (
-                status == "idle"
-                and terminal_status is None
-                and turn_completed is not True
-                and not interrupt_pending
-                and _native_turn_outcome_is_forwarder_confirmed(conversation_id)
-            )
+            if status in ("running", "waiting", "idle", "failed") and (
+                not quiescence_idle or interrupt_pending
+            ):
+                child_status = (
+                    "cancelled"
+                    if interrupt_pending
+                    else "idle"
+                    if terminal_status == "completed"
+                    else terminal_status or status
+                )
+                _fan_out_child_delta_to_parent(
+                    conversation_id,
+                    {"type": "session.status", "status": child_status},
+                    latest_assistant_text=output,
+                    allow_history_preview_fallback=False,
+                )
+            ambiguous_idle = quiescence_idle and not interrupt_pending
             if terminal_status is not None:
                 _native_interrupt_runner.clear_pending_interrupt(conversation_id)
                 if terminal_status == "cancelled":
@@ -6536,7 +6594,8 @@ def create_runner_app(
                     _schedule_subagent_wake(entry)
             else:
                 if status in ("idle", "failed"):
-                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                    if not isinstance(superseded_response_id, str):
+                        recovered_entry = await _ensure_subagent_work_entry(conversation_id)
                 if status == "idle" and interrupt_pending:
                     # Interrupt with no confirming edge, resolved to the CURRENT
                     # dispatch (``resolve_pending_interrupt`` only reports pending
@@ -6561,6 +6620,12 @@ def create_runner_app(
                         conversation_id,
                         status="failed",
                         output=output or "Error: native sub-agent turn failed",
+                        only_if_work_id=(
+                            recovered_entry.work_id
+                            if isinstance(superseded_response_id, str)
+                            and recovered_entry is not None
+                            else None
+                        ),
                     )
             if delivery_ack is not None:
                 if (

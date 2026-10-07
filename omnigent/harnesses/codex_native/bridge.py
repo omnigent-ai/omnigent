@@ -185,6 +185,7 @@ class CodexNativeBridgeState:
         ``"/home/user/project"``.
     :param active_turn_id: Current Codex turn id, if one is running,
         e.g. ``"turn_abc123"``.
+    :param pending_terminal_turn_id: Reconciled turn awaiting its terminal notification.
     """
 
     session_id: str
@@ -193,6 +194,7 @@ class CodexNativeBridgeState:
     codex_home: str
     active_turn_id: str | None = None
     cwd: str | None = None
+    pending_terminal_turn_id: str | None = None
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
@@ -1016,6 +1018,7 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "thread_id": state.thread_id,
                     "codex_home": state.codex_home,
                     "active_turn_id": state.active_turn_id,
+                    "pending_terminal_turn_id": state.pending_terminal_turn_id,
                     "cwd": state.cwd,
                 },
                 handle,
@@ -1436,6 +1439,7 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
     thread_id = raw.get("thread_id")
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
+    pending_terminal_turn_id = raw.get("pending_terminal_turn_id")
     cwd = raw.get("cwd")
     if (
         not isinstance(session_id, str)
@@ -1457,6 +1461,11 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
         thread_id=thread_id,
         codex_home=codex_home,
         active_turn_id=parsed_active_turn_id,
+        pending_terminal_turn_id=(
+            pending_terminal_turn_id
+            if isinstance(pending_terminal_turn_id, str) and pending_terminal_turn_id
+            else None
+        ),
         cwd=cwd if isinstance(cwd, str) and cwd else None,
     )
 
@@ -1536,7 +1545,12 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
         )
 
 
-def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | None) -> bool:
+def clear_active_turn_id_if_matches(
+    bridge_dir: Path,
+    completed_turn_id: str | None,
+    *,
+    retain_terminal_turn_id: bool = False,
+) -> bool:
     """
     Clear the active Codex turn id if a terminal event matches it.
 
@@ -1556,7 +1570,9 @@ def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | N
     :param completed_turn_id: Completed or failed turn id, e.g.
         ``"turn_abc123"``. ``None`` means Codex did not include an id;
         if a turn is live it is left intact (returns ``False``), and if
-        no turn is live the call is a no-op (returns ``True``).
+        no active or pending terminal turn remains the call succeeds.
+    :param retain_terminal_turn_id: Preserve correlation until the forwarder
+        receives the reconciled turn's terminal notification.
     :returns: ``True`` when bridge state was cleared or did not exist,
         ``False`` when a stale or ambiguous terminal event was ignored.
     """
@@ -1566,10 +1582,14 @@ def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | N
             return True
         if completed_turn_id is None:
             # No-id terminal mid-turn is ambiguous — ignore (clearing posts a premature idle).
-            if state.active_turn_id is not None:
+            if state.active_turn_id is not None or state.pending_terminal_turn_id is not None:
                 return False
         elif state.active_turn_id != completed_turn_id:
-            return False
+            if (
+                state.active_turn_id is not None
+                or state.pending_terminal_turn_id != completed_turn_id
+            ):
+                return False
         _write_bridge_state_unlocked(
             bridge_dir,
             CodexNativeBridgeState(
@@ -1579,6 +1599,7 @@ def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | N
                 codex_home=state.codex_home,
                 active_turn_id=None,
                 cwd=state.cwd,
+                pending_terminal_turn_id=completed_turn_id if retain_terminal_turn_id else None,
             ),
         )
         return True

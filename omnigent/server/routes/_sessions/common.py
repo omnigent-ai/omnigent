@@ -621,6 +621,8 @@ _runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None
 
 
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+# Retain turn changes after terminal status consumes the active response id.
+_session_response_generation_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
@@ -1241,6 +1243,7 @@ __all__ = [
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_mcp_startup_cache",
+    "_session_response_generation_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",

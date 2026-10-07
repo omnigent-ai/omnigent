@@ -22,6 +22,7 @@ exercise the genuine edge-processing path, not internal helpers.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import uuid
 from typing import Any
 
@@ -30,6 +31,7 @@ import pytest
 from omnigent.runner import create_runner_app, subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
+    _drain_session_event_queue,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
@@ -37,7 +39,7 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 
 
-def _native_app(harness: str) -> Any:
+def _native_app(harness: str, *, server_client: Any | None = None) -> Any:
     """Build a runner app whose sessions resolve to *harness* specs."""
     spec = AgentSpec(
         spec_version=1,
@@ -53,7 +55,7 @@ def _native_app(harness: str) -> Any:
     return create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=server_client if server_client is not None else NullServerClient(),
     )
 
 
@@ -78,6 +80,7 @@ class _Rig:
 
     def close(self) -> None:
         subagent_work.unregister_subagent_work(self.child_id)
+        subagent_work.unregister_child_session(self.child_id)
         subagent_work._session_inboxes_ref.pop(self.parent_id, None)
         self.runner_app._session_event_queues_ref.pop(self.parent_id, None)
         self.runner_app._session_event_queues_ref.pop(self.child_id, None)
@@ -94,6 +97,13 @@ class _Rig:
             json={"session_id": self.child_id, "agent_id": uuid.uuid4().hex},
         )
         assert resp.status_code == 201, resp.text
+        subagent_work.register_child_session(
+            self.child_id,
+            parent_session_id=self.parent_id,
+            title="researcher:cite-check",
+            tool="researcher",
+            session_name="cite-check",
+        )
 
     async def post_status(self, client: Any, data: dict[str, Any]) -> Any:
         return await client.post(
@@ -102,8 +112,109 @@ class _Rig:
         )
 
 
+@pytest.mark.parametrize("during_recovery", [False, True], ids=["before-delivery", "recovery"])
+@pytest.mark.parametrize("takeover", ["response", "message", "dispatch"])
+async def test_supersession_failure_cannot_settle_resumed_runner_work(
+    monkeypatch: pytest.MonkeyPatch,
+    during_recovery: bool,
+    takeover: str,
+) -> None:
+    from omnigent.runner import app as runner_module
+
+    client: Any = None
+    rig: _Rig
+    pending_message: asyncio.Task[Any] | None = None
+    message_started = asyncio.Event()
+
+    async def block_message(*_args: Any, **_kwargs: Any) -> Any:
+        message_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner_module, "_resolve_forwarded_message_content", block_message)
+
+    async def take_over() -> None:
+        nonlocal pending_message
+        if takeover == "response":
+            response = await rig.post_status(
+                client, {"status": "running", "response_id": "response-newer"}
+            )
+            assert response.status_code == 204, response.text
+        elif takeover == "message":
+            pending_message = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{rig.child_id}/events",
+                    json={
+                        "type": "message",
+                        "content": [{"type": "input_text", "text": "resume"}],
+                    },
+                )
+            )
+            await asyncio.wait_for(message_started.wait(), 2)
+        else:
+            subagent_work.register_subagent_work(
+                parent_session_id=rig.parent_id,
+                child_session_id=rig.child_id,
+                agent="researcher",
+                title="new dispatch",
+            )
+
+    if during_recovery:
+        build = runner_module.build_subagent_recovery
+
+        def build_recovery(*args: Any, **kwargs: Any) -> Any:
+            recovery = build(*args, **kwargs)
+
+            async def ensure(conv_id: str, *, is_current: Any = None) -> Any:
+                if is_current is not None:
+                    await take_over()
+                return await recovery.ensure_subagent_work_entry(conv_id, is_current=is_current)
+
+            return dataclasses.replace(recovery, ensure_subagent_work_entry=ensure)
+
+        monkeypatch.setattr(runner_module, "build_subagent_recovery", build_recovery)
+
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app) as client:
+            await rig.create_child_session(client)
+            response = await rig.post_status(
+                client, {"status": "running", "response_id": "response-old"}
+            )
+            assert response.status_code == 204, response.text
+            if not during_recovery:
+                await take_over()
+            response = await rig.post_status(
+                client,
+                {
+                    "status": "failed",
+                    "response_id": "response-old",
+                    "superseded_response_id": "response-old",
+                    "output": "Session ended by /clear.",
+                },
+            )
+            assert response.status_code == 204, response.text
+            assert rig.drained() == []
+            entry = subagent_work.get_subagent_work(rig.child_id)
+            assert entry is not None and entry.status not in ("completed", "cancelled", "failed")
+            assert rig.app.state.session_resource_registry.session_turn_is_active(rig.child_id)
+            events = _drain_session_event_queue(
+                rig.runner_app._session_event_queues_ref.get(rig.parent_id)
+            )
+            assert not any(
+                event.get("child", {}).get("current_task_status") == "failed" for event in events
+            )
+    finally:
+        if pending_message is not None:
+            pending_message.cancel()
+            await asyncio.gather(pending_message, return_exceptions=True)
+        rig.close()
+
+
 @pytest.mark.asyncio
-async def test_quiescence_idle_for_outcome_confirming_harness_delivers_nothing() -> None:
+@pytest.mark.parametrize("confirmation", [{}, {"turn_completed": False}])
+async def test_quiescence_idle_for_outcome_confirming_harness_delivers_nothing(
+    confirmation: dict[str, Any],
+) -> None:
     """A bare idle edge must not report an unfinished claude-native turn completed.
 
     The claude forwarder stamps ``turn_completed`` on its ``Stop``-hook edge, so
@@ -115,12 +226,23 @@ async def test_quiescence_idle_for_outcome_confirming_harness_delivers_nothing()
     try:
         async with _runner_client(rig.app) as client:
             await rig.create_child_session(client)
-            for data in ({"status": "running"}, {"status": "idle", "output": "partial text"}):
+            for data in (
+                {"status": "running"},
+                {"status": "idle", "output": "partial text", **confirmation},
+            ):
                 resp = await rig.post_status(client, data)
                 assert resp.status_code == 204, resp.text
         assert rig.drained() == [], "a bare quiescence idle must not deliver a terminal status"
         entry = subagent_work.get_subagent_work(rig.child_id)
         assert entry is not None and entry.status not in ("completed", "cancelled", "failed")
+        events = _drain_session_event_queue(
+            rig.runner_app._session_event_queues_ref.get(rig.parent_id)
+        )
+        assert [
+            event["child"]["current_task_status"]
+            for event in events
+            if event.get("type") == "session.child_session.updated"
+        ] == ["in_progress"]
     finally:
         rig.close()
 
@@ -164,8 +286,10 @@ async def test_quiescence_idle_for_legacy_native_harness_still_completes() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("newer_dispatch", [False, True])
 async def test_interrupt_then_quiescence_idle_delivers_cancelled_with_output(
     monkeypatch: pytest.MonkeyPatch,
+    newer_dispatch: bool,
 ) -> None:
     """The interrupt defers the wake; the settling idle reports cancelled + output.
 
@@ -190,18 +314,36 @@ async def test_interrupt_then_quiescence_idle_delivers_cancelled_with_output(
     try:
         async with _runner_client(rig.app) as client:
             await rig.create_child_session(client)
+            resp = await rig.post_status(client, {"status": "running"})
+            assert resp.status_code == 204, resp.text
             resp = await client.post(
                 f"/v1/sessions/{rig.child_id}/events", json={"type": "interrupt"}
             )
             assert resp.status_code == 204, resp.text
             assert rig.drained() == [], "an unconfirmed interrupt must not wake the parent"
 
+            if newer_dispatch:
+                subagent_work.unregister_subagent_work(rig.child_id)
+                subagent_work.register_subagent_work(
+                    parent_session_id=rig.parent_id,
+                    child_session_id=rig.child_id,
+                    agent="researcher",
+                    title="new-task",
+                )
             resp = await rig.post_status(client, {"status": "idle", "output": "the verdict"})
             assert resp.status_code == 204, resp.text
         delivered = rig.drained()
-        assert [(item["status"], item["output"]) for item in delivered] == [
-            ("cancelled", "the verdict")
-        ]
+        assert [(item["status"], item["output"]) for item in delivered] == (
+            [] if newer_dispatch else [("cancelled", "the verdict")]
+        )
+        events = _drain_session_event_queue(
+            rig.runner_app._session_event_queues_ref.get(rig.parent_id)
+        )
+        assert [
+            event["child"]["current_task_status"]
+            for event in events
+            if event.get("type") == "session.child_session.updated"
+        ] == (["in_progress"] if newer_dispatch else ["in_progress", "cancelled"])
     finally:
         rig.close()
 

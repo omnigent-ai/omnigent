@@ -37,13 +37,19 @@ class _ScheduleSubagentWakeFn(Protocol):
     def __call__(self, entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None: ...
 
 
+class _EnsureSubagentWorkFn(Protocol):
+    def __call__(
+        self, conv_id: str, *, is_current: Callable[[], bool] | None = None
+    ) -> Coroutine[Any, Any, _SubagentWorkEntry | None]: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class SubagentRecovery:
     """Sub-agent recovery helpers the rest of the runner app calls."""
 
     cancel_subagent_recovery: Callable[[str], Coroutine[Any, Any, None]]
     deliver_retained_subagent_results: Callable[[str], None]
-    ensure_subagent_work_entry: Callable[[str], Coroutine[Any, Any, _SubagentWorkEntry | None]]
+    ensure_subagent_work_entry: _EnsureSubagentWorkFn
     parent_is_nested_subagent: Callable[[_SubagentWorkEntry], Coroutine[Any, Any, bool]]
     recover_sub_agent_name: Callable[[str], Coroutine[Any, Any, str | None]]
     recover_undrained_subagent_results: Callable[[str], Coroutine[Any, Any, None]]
@@ -79,7 +85,11 @@ def build_subagent_recovery(
             _session_sub_agent_names[conv_id] = name
         return name
 
-    async def _ensure_subagent_work_entry(conv_id: str) -> _SubagentWorkEntry | None:
+    async def _ensure_subagent_work_entry(
+        conv_id: str, *, is_current: Callable[[], bool] | None = None
+    ) -> _SubagentWorkEntry | None:
+        if is_current is not None and not is_current():
+            return None
         existing = get_subagent_work(conv_id)
         if existing is not None:
             return existing
@@ -88,6 +98,13 @@ def build_subagent_recovery(
         try:
             snapshot = await _session_snapshot(conv_id)
         except Exception:  # noqa: BLE001 — best-effort recovery
+            return None
+        if is_current is not None and not is_current():
+            return None
+        existing = get_subagent_work(conv_id)
+        if existing is not None:
+            return existing
+        if conv_id in _drained_delivered_subagent_children:
             return None
         parent_id = snapshot.parent_session_id
         if not parent_id or parent_id == conv_id:

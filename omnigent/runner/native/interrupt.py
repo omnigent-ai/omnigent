@@ -698,11 +698,16 @@ class NativeInterruptRunner:
         return Response(status_code=204)
 
     async def _codex_interrupt(self, conv_id: str) -> Response:
-        from omnigent.harnesses.codex_native.app_server import client_for_transport
+        from omnigent.harnesses.codex_native.app_server import (
+            CodexAppServerResponseError,
+            client_for_transport,
+            is_stale_active_turn_error,
+        )
         from omnigent.harnesses.codex_native.bridge import (
             CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
             cancel_pending_mcp_startup,
+            clear_active_turn_id_if_matches,
             read_mcp_startup,
         )
 
@@ -763,13 +768,42 @@ class NativeInterruptRunner:
                         exc_info=True,
                     )
             if state.active_turn_id is not None:
-                await codex_client.request(
-                    "turn/interrupt",
-                    {
-                        "threadId": state.thread_id,
-                        "turnId": state.active_turn_id,
-                    },
-                )
+                try:
+                    await codex_client.request(
+                        "turn/interrupt",
+                        {
+                            "threadId": state.thread_id,
+                            "turnId": state.active_turn_id,
+                        },
+                    )
+                except CodexAppServerResponseError as exc:
+                    if not is_stale_active_turn_error(exc):
+                        raise
+                    # Completion can precede its forwarded status. Reconcile
+                    # only the recorded turn, preserving a newer turn/started.
+                    no_active_turn = (
+                        exc.message or ""
+                    ).strip().casefold() == "no active turn to interrupt"
+                    cleared = clear_active_turn_id_if_matches(
+                        bridge_dir,
+                        state.active_turn_id,
+                        retain_terminal_turn_id=no_active_turn,
+                    )
+                    self._logger.info(
+                        "Codex-native interrupt reconciled stale turn: "
+                        "session=%s turn=%s reason=%s",
+                        conv_id,
+                        state.active_turn_id,
+                        exc.message,
+                    )
+                    if no_active_turn:
+                        # A terminal forwarder may have already cleared the turn.
+                        cleared = cleared or clear_active_turn_id_if_matches(bridge_dir, None)
+                        if cleared:
+                            self._resource_registry.note_external_session_status(conv_id, "idle")
+                    # The forwarder owns public outcomes; quiescence is not success.
+                    # Retain any earlier interrupt's timer until its outcome arrives.
+                    return Response(status_code=204)
         except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures.
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",

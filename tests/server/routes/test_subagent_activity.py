@@ -124,12 +124,15 @@ def _message(text: str) -> dict[str, Any]:
 @pytest.mark.asyncio
 async def test_claude_completion_survives_retries_and_late_child_discovery(
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
     data: dict[str, Any],
     return_id: str | None,
     expected: str | None,
     late: bool,
     batched: bool,
 ) -> None:
+    from omnigent.server.routes._sessions import common
+
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation()
 
@@ -145,6 +148,8 @@ async def test_claude_completion_survives_retries_and_late_child_discovery(
                 "omnigent.claude_native.description": "Inspect authentication",
             },
         )
+        store.set_session_live_status(child.id, "running")
+        monkeypatch.setitem(common._session_status_cache, child.id, "running")
         await record_subagent_activity(child.id, "delegated", store)
         return child.id
 
@@ -206,6 +211,12 @@ async def test_claude_completion_survives_retries_and_late_child_discovery(
         child_id = await register_child()
     assert child_id is not None
     await record_subagent_activity(child_id, "delegated", store)
+    child = store.get_conversation(child_id)
+    expected_live_status = (
+        "idle" if expected == "completed" else "failed" if expected else "running"
+    )
+    assert child is not None and child.live_status == expected_live_status
+    assert common._session_status_cache[child_id] == expected_live_status
     activity = [
         row
         for row in store.list_items(parent.id, type="resource_event").data

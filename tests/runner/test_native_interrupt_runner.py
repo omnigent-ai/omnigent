@@ -10,15 +10,24 @@ no-handler fall-through contract (antigravity/opencode), and the 503 mapping.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from fastapi.responses import Response
 
+from omnigent.harnesses.codex_native import app_server as codex_app_server
+from omnigent.harnesses.codex_native import bridge as codex_bridge
 from omnigent.runner.native.interrupt import NativeInterruptRunner
+from omnigent.runner.resource_registry import SessionResourceRegistry
 
 
 @dataclass
@@ -28,6 +37,27 @@ class _FakeAck:
     delivered: bool = True
     entry: object | None = None
     reason: str = "delivered"
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.scheduled: list[asyncio.TimerHandle] = []
+
+    def call_later(
+        self, delay: float, callback: Callable[..., None], *args: Any
+    ) -> asyncio.TimerHandle:
+        handle = asyncio.TimerHandle(self.now + delay, callback, args, asyncio.get_running_loop())
+        self.scheduled.append(handle)
+        return handle
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        due = [handle for handle in self.scheduled if handle.when() <= self.now]
+        self.scheduled = [handle for handle in self.scheduled if handle.when() > self.now]
+        for handle in due:
+            if not handle.cancelled():
+                handle._run()
 
 
 class _FakeTerminalRegistry:
@@ -469,6 +499,278 @@ async def test_codex_interrupt_noop_when_no_bridge_state() -> None:
     runner, _ = _make_runner()  # default codex_bridge_state returns None
     resp = await runner.interrupt("codex-native", "conv_cx")
     assert isinstance(resp, Response) and resp.status_code == 204
+
+
+def _write_codex_turn(bridge_dir: Path, turn_id: str | None) -> None:
+    codex_bridge.write_bridge_state(
+        bridge_dir,
+        codex_bridge.CodexNativeBridgeState(
+            session_id="conv_codex",
+            socket_path="ws://127.0.0.1:9999",
+            thread_id="thread-codex",
+            codex_home=str(bridge_dir / "codex-home"),
+            active_turn_id=turn_id,
+        ),
+    )
+
+
+def _active_codex_turn(bridge_dir: Path) -> str | None:
+    state = codex_bridge.read_bridge_state(bridge_dir)
+    assert state is not None
+    return state.active_turn_id
+
+
+_CodexInterruptRig = tuple[
+    NativeInterruptRunner, dict[str, Any], AsyncMock, Path, SessionResourceRegistry
+]
+
+
+@pytest.fixture
+async def codex_interrupt_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[_CodexInterruptRig]:
+    bridge_dir = tmp_path / "bridge"
+    _write_codex_turn(bridge_dir, "turn-ended")
+    registry = SessionResourceRegistry()
+    registry.note_external_session_status("conv_codex", "running")
+
+    async def resolve_state(
+        conv_id: str, *, action: str, missing_state_log_level: int = logging.WARNING
+    ) -> codex_bridge.CodexNativeBridgeState | None:
+        assert conv_id == "conv_codex"
+        assert action == "interrupt"
+        return codex_bridge.read_bridge_state(bridge_dir)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_codex/labels"
+        return httpx.Response(200, json={"labels": {}}, request=request)
+
+    # Replace external HTTP/RPC endpoints; bridge files and status handling stay real.
+    codex_client = AsyncMock(spec=codex_app_server.CodexAppServerClient)
+    monkeypatch.setattr(codex_bridge, "bridge_dir_for_bridge_id", lambda _: bridge_dir)
+    monkeypatch.setattr(codex_app_server, "client_for_transport", lambda *a, **kw: codex_client)
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handle)
+    ) as server_client:
+        runner, captured = _make_runner(
+            server_client=server_client,
+            resource_registry=registry,
+            codex_bridge_state_for_session=resolve_state,
+        )
+        try:
+            yield runner, captured, codex_client, bridge_dir, registry
+        finally:
+            runner.clear_pending_interrupt("conv_codex")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["stop", "interrupt"])
+@pytest.mark.parametrize("forwarder_cleared_turn", [False, True])
+async def test_codex_ended_turn_control_succeeds_and_reconciles_idle(
+    codex_interrupt_runner: _CodexInterruptRig,
+    action: str,
+    forwarder_cleared_turn: bool,
+) -> None:
+    runner, captured, codex_client, bridge_dir, registry = codex_interrupt_runner
+    assert registry.session_turn_is_active("conv_codex")
+
+    async def reject(*args: Any, **kwargs: Any) -> None:
+        if forwarder_cleared_turn:
+            _write_codex_turn(bridge_dir, None)
+        raise codex_app_server.CodexAppServerResponseError(
+            {"code": -32600, "message": "no active turn to interrupt"}
+        )
+
+    codex_client.request.side_effect = reject
+
+    response = await getattr(runner, action)("codex-native", "conv_codex")
+
+    assert isinstance(response, Response) and response.status_code == 204
+    assert _active_codex_turn(bridge_dir) is None
+    assert not registry.session_turn_is_active("conv_codex")
+    assert captured["published"] == []
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_codex")[0] is False
+    repeated = await getattr(runner, action)("codex-native", "conv_codex")
+    assert isinstance(repeated, Response) and repeated.status_code == 204
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["stop", "interrupt"])
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+@pytest.mark.parametrize("newer_turn", [False, True])
+async def test_codex_reconciliation_preserves_delayed_terminal_correlation(
+    codex_interrupt_runner: _CodexInterruptRig,
+    action: str,
+    outcome: str,
+    newer_turn: bool,
+) -> None:
+    from omnigent.harnesses.codex_native import forwarder
+
+    runner, _, codex_client, bridge_dir, registry = codex_interrupt_runner
+    codex_client.request.side_effect = codex_app_server.CodexAppServerResponseError(
+        {"code": -32600, "message": "no active turn to interrupt"}
+    )
+    response = await getattr(runner, action)("codex-native", "conv_codex")
+    assert isinstance(response, Response) and response.status_code == 204
+    if newer_turn:
+        codex_bridge.update_active_turn_id(bridge_dir, "turn-newer")
+        registry.note_external_session_status("conv_codex", "running")
+    assert forwarder._terminal_turn_status_edge(bridge_dir, "turn/completed", {}) is None
+    edge = forwarder._terminal_turn_status_edge(
+        bridge_dir,
+        "turn/completed",
+        {"turn": {"id": "turn-ended", "status": outcome}},
+    )
+    if newer_turn:
+        assert edge is None
+        assert _active_codex_turn(bridge_dir) == "turn-newer"
+        assert registry.session_turn_is_active("conv_codex")
+    else:
+        assert edge is not None and edge.turn_id == "turn-ended"
+        assert edge.status == ("failed" if outcome == "failed" else "idle")
+        state = codex_bridge.read_bridge_state(bridge_dir)
+        assert state is not None and state.pending_terminal_turn_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["stop", "interrupt"])
+async def test_codex_ended_turn_response_preserves_newer_local_turn(
+    codex_interrupt_runner: _CodexInterruptRig,
+    action: str,
+) -> None:
+    runner, captured, codex_client, bridge_dir, registry = codex_interrupt_runner
+
+    async def reject(*args: Any, **kwargs: Any) -> None:
+        _write_codex_turn(bridge_dir, "turn-newer")
+        raise codex_app_server.CodexAppServerResponseError(
+            {"code": -32600, "message": "no active turn to interrupt"}
+        )
+
+    codex_client.request.side_effect = reject
+    response = await getattr(runner, action)("codex-native", "conv_codex")
+
+    assert isinstance(response, Response) and response.status_code == 204
+    assert _active_codex_turn(bridge_dir) == "turn-newer"
+    assert registry.session_turn_is_active("conv_codex")
+    assert captured["published"] == []
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_codex")[0] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["stop", "interrupt"])
+async def test_codex_superseded_remote_turn_does_not_publish_idle(
+    codex_interrupt_runner: _CodexInterruptRig,
+    action: str,
+) -> None:
+    runner, captured, codex_client, bridge_dir, registry = codex_interrupt_runner
+    codex_client.request.side_effect = codex_app_server.CodexAppServerResponseError(
+        {"code": -32600, "message": "expected active turn id 'turn-ended' but found 'turn-newer'"}
+    )
+    response = await getattr(runner, action)("codex-native", "conv_codex")
+
+    assert isinstance(response, Response) and response.status_code == 204
+    assert _active_codex_turn(bridge_dir) is None
+    assert registry.session_turn_is_active("conv_codex")
+    assert captured["published"] == []
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_codex")[0] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["stop", "interrupt"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        codex_app_server.CodexAppServerResponseError(
+            {"code": -32600, "message": "thread not found"}
+        ),
+        codex_app_server.CodexAppServerResponseError(
+            {"code": -32603, "message": "no active turn to interrupt"}
+        ),
+        OSError("transport disconnected"),
+    ],
+    ids=["unrelated-rpc-error", "wrong-error-code", "transport-failure"],
+)
+async def test_codex_control_preserves_real_failures(
+    codex_interrupt_runner: _CodexInterruptRig,
+    action: str,
+    error: Exception,
+) -> None:
+    runner, captured, codex_client, bridge_dir, registry = codex_interrupt_runner
+    codex_client.request.side_effect = error
+    response = await getattr(runner, action)("codex-native", "conv_codex")
+
+    assert isinstance(response, Response) and response.status_code == 503
+    assert json.loads(bytes(response.body))["error"] == "codex_native_interrupt_failed"
+    assert _active_codex_turn(bridge_dir) == "turn-ended"
+    assert registry.session_turn_is_active("conv_codex")
+    assert captured["published"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["stop", "interrupt"])
+async def test_codex_active_interrupt_waits_for_turn_outcome(
+    codex_interrupt_runner: _CodexInterruptRig,
+    action: str,
+) -> None:
+    runner, captured, codex_client, bridge_dir, registry = codex_interrupt_runner
+    codex_client.request.return_value = {"result": {}}
+    response = await getattr(runner, action)("codex-native", "conv_codex")
+
+    assert isinstance(response, Response) and response.status_code == 204
+    assert _active_codex_turn(bridge_dir) == "turn-ended"
+    assert registry.session_turn_is_active("conv_codex")
+    assert captured["published"] == []
+    assert runner.take_pending_interrupt("conv_codex")[0] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["stop", "interrupt"])
+@pytest.mark.parametrize("newer_dispatch", [False, True])
+async def test_codex_repeated_control_preserves_pending_interrupt_recovery(
+    codex_interrupt_runner: _CodexInterruptRig,
+    action: str,
+    newer_dispatch: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    clock = _FakeClock()
+    monkeypatch.setattr(
+        interrupt_mod,
+        "asyncio",
+        SimpleNamespace(get_running_loop=lambda: clock, to_thread=asyncio.to_thread),
+    )
+    runner, captured, codex_client, bridge_dir, registry = codex_interrupt_runner
+    captured["current_work_id"] = "work-ended"
+    first = await runner.interrupt("codex-native", "conv_codex")
+    assert isinstance(first, Response) and first.status_code == 204
+    codex_client.request.side_effect = codex_app_server.CodexAppServerResponseError(
+        {"code": -32600, "message": "no active turn to interrupt"}
+    )
+
+    repeated = await getattr(runner, action)("codex-native", "conv_codex")
+
+    assert isinstance(repeated, Response) and repeated.status_code == 204
+    assert _active_codex_turn(bridge_dir) is None
+    assert not registry.session_turn_is_active("conv_codex")
+    assert captured["published"] == []
+    assert captured["wakes"] == []
+    if newer_dispatch:
+        captured["current_work_id"] = "work-newer"
+    clock.advance(interrupt_mod._NATIVE_INTERRUPT_CANCEL_GRACE_S - 1)
+    assert captured["wakes"] == []
+    assert captured["superseded"] == []
+    clock.advance(1)
+    if newer_dispatch:
+        assert captured["wakes"] == []
+        assert captured["superseded"] == [("conv_codex", "cancelled", "work-ended")]
+    else:
+        assert captured["wakes"] == [("conv_codex", "cancelled", None)]
+        assert captured["wake_calls"][0]["only_if_work_id"] == "work-ended"
+    assert runner.take_pending_interrupt("conv_codex") == (False, None)
 
 
 @pytest.mark.asyncio

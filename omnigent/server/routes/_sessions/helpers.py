@@ -232,6 +232,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_mcp_startup_cache,
+    _session_response_generation_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
@@ -4925,6 +4926,16 @@ def _publish_status(
         _session_active_response_cache.pop(session_id, None)
         return
     previous_status = _session_status_cache.get(session_id)
+    if status in ("running", "waiting") and (
+        previous_status not in ("running", "waiting")
+        or (
+            response_id is not None
+            and _session_active_response_cache.get(session_id) != response_id
+        )
+    ):
+        _session_response_generation_cache[session_id] = (
+            _session_response_generation_cache.get(session_id, 0) + 1
+        )
     _session_status_cache[session_id] = status
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
@@ -5113,6 +5124,7 @@ async def _persist_session_status_error_labels(
     *,
     agent_name: str | None = None,
     item_id: str | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> None:
     """
     Persist or clear the reload-visible failure detail for a session status.
@@ -5130,6 +5142,7 @@ async def _persist_session_status_error_labels(
     :param agent_name: Agent responsible for this failure, captured before a rebind.
     :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
         a client whose POST answer was lost can match the refusal to its own send.
+    :param is_current: Optional guard rejecting writes from a superseded turn.
     """
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
@@ -5156,8 +5169,13 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: "",
         }
     )
+
+    def persist_if_current() -> None:
+        if is_current is None or is_current():
+            conversation_store.set_labels(session_id, updates)
+
     try:
-        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
+        await asyncio.to_thread(persist_if_current)
     except Exception:  # noqa: BLE001
         _logger.exception(
             "Failed to persist session status error labels for %s",
@@ -6944,6 +6962,8 @@ async def _forward_session_change_to_runner_impl(
     runner_router: Any,
     event: dict[str, Any],
     timeout_s: float = 5.0,
+    *,
+    is_current: Callable[[], bool] | None = None,
 ) -> _RunnerForwardResult | None:
     """
     Best-effort POST a control event to the bound runner.
@@ -6986,6 +7006,7 @@ async def _forward_session_change_to_runner_impl(
     :param timeout_s: Request budget, e.g. ``5.0``. Callers whose event the
         runner answers by driving the TUI pass
         :data:`_TUI_INJECT_FORWARD_TIMEOUT_S`.
+    :param is_current: Optional turn guard rechecked after client lookup.
     :returns: The runner's HTTP status/body, or ``None`` when no
         runner client could be resolved or the POST failed at the
         transport layer (in both cases the AP-side persisted value /
@@ -6997,6 +7018,8 @@ async def _forward_session_change_to_runner_impl(
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
+        return None
+    if is_current is not None and not is_current():
         return None
     try:
         resp = await runner_client.post(

@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -59,7 +60,11 @@ class _RecoveryHarness:
 
 
 @asynccontextmanager
-async def _recovery_harness(handler: _ResponseHandler) -> AsyncIterator[_RecoveryHarness]:
+async def _recovery_harness(
+    handler: _ResponseHandler,
+    *,
+    snapshot: Callable[[str], Awaitable[Any]] | None = None,
+) -> AsyncIterator[_RecoveryHarness]:
     """Keep recovery real while replacing the remote sessions API with HTTP fixtures."""
     app = FastAPI()
     wakes: list[tuple[str, str]] = []
@@ -81,7 +86,7 @@ async def _recovery_harness(handler: _ResponseHandler) -> AsyncIterator[_Recover
             _background_tasks=background_tasks,
             _schedule_subagent_wake=schedule_wake,
             _session_inboxes=subagent_work._session_inboxes_ref,
-            _session_snapshot=unexpected_snapshot,
+            _session_snapshot=snapshot if snapshot is not None else unexpected_snapshot,
             _session_sub_agent_names={},
             _subagent_recovery_tasks=recovery_tasks,
             server_client=server_client,
@@ -93,6 +98,51 @@ async def _recovery_harness(handler: _ResponseHandler) -> AsyncIterator[_Recover
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+
+
+@pytest.mark.parametrize("takeover", ["dispatch", "delivered", "superseded"])
+async def test_work_entry_recovery_cannot_overwrite_concurrent_work(takeover: str) -> None:
+    reading = asyncio.Event()
+    release = asyncio.Event()
+    current = True
+
+    async def snapshot(session_id: str) -> Any:
+        assert session_id == _CHILD
+        reading.set()
+        await release.wait()
+        return SimpleNamespace(parent_session_id=_PARENT, sub_agent_name="old", agent_name="old")
+
+    async with _recovery_harness(
+        lambda request: httpx.Response(200, json={}), snapshot=snapshot
+    ) as harness:
+        recovery = asyncio.create_task(
+            harness.recovery.ensure_subagent_work_entry(
+                _CHILD, **({"is_current": lambda: current} if takeover == "superseded" else {})
+            )
+        )
+        try:
+            await asyncio.wait_for(reading.wait(), 2)
+            expected = None
+            if takeover == "dispatch":
+                expected = subagent_work.register_subagent_work(
+                    parent_session_id=_PARENT,
+                    child_session_id=_CHILD,
+                    agent="new",
+                    title="new dispatch",
+                    work_id="new-dispatch",
+                )
+            elif takeover == "delivered":
+                subagent_work._drained_delivered_subagent_children.add(_CHILD)
+            else:
+                current = False
+            release.set()
+            assert await asyncio.wait_for(recovery, 2) is expected
+            assert subagent_work.get_subagent_work(_CHILD) is expected
+            assert harness.wakes == []
+        finally:
+            release.set()
+            recovery.cancel()
+            await asyncio.gather(recovery, return_exceptions=True)
 
 
 def _child(

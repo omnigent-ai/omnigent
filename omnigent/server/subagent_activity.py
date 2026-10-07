@@ -136,6 +136,36 @@ async def _recorded_completion_status(
     return None
 
 
+async def settle_claude_subagent_completion(
+    child: Conversation,
+    store: ConversationStore,
+    *,
+    status: str | None = None,
+) -> None:
+    """Settle a correlated native child result, including persisted completion replay."""
+    if child.parent_conversation_id is None:
+        return
+    if status is None:
+        status = await _recorded_completion_status(child.parent_conversation_id, child, store)
+    if status not in _TERMINAL_STATUSES:
+        return
+    from omnigent.server.routes._sessions.common import _session_status_cache
+    from omnigent.server.routes._sessions.helpers import _publish_status
+
+    public_status = "idle" if status == "completed" else "failed"
+    _publish_status(
+        child.id,
+        public_status,
+        persist_live_status=False,
+        failure_origin="claude_subagent_completion",
+    )
+    await asyncio.to_thread(
+        store.set_session_live_status,
+        child.id,
+        _session_status_cache.get(child.id, public_status),
+    )
+
+
 def _native_request_id(child_id: str, turn_id: str, store: ConversationStore) -> str | None:
     """Find the request preceding this response, skipping native context turns."""
     after: str | None = None
@@ -253,6 +283,7 @@ async def record_subagent_activity(
             # A quick result may reach the parent before child discovery runs.
             completion_status = await _recorded_completion_status(parent_id, child, store)
             if completion_status:
+                await settle_claude_subagent_completion(child, store, status=completion_status)
                 await record_subagent_activity(
                     child.id,
                     "returned",
@@ -339,6 +370,7 @@ async def _record_claude_subagent_return(
                 child.labels.get("omnigent.claude_native.subagent_id", "")
             ) or call_ids.get(child.labels.get("omnigent.claude_native.tool_use_id", ""))
             if status:
+                await settle_claude_subagent_completion(child, store, status=status)
                 await record_subagent_activity(
                     child.id,
                     "returned",
