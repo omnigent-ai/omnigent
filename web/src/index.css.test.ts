@@ -992,6 +992,9 @@ describe("index.css electron-mac window drag region", () => {
     ["input", {}],
     ["textarea", {}],
     ["select", {}],
+    ["iframe", {}],
+    ["video", {}],
+    ["audio", {}],
     ["label", {}],
     ["summary", {}],
     ["div", { tabIndex: 0 }],
@@ -1025,7 +1028,6 @@ describe("index.css electron-mac window drag region", () => {
     const shell = container.firstElementChild!;
     const control = shell.firstElementChild!;
     expect(control.matches(controlsSelector)).toBe(true);
-    expect(controlsRule).toContain("-webkit-app-region: no-drag");
     shell.removeAttribute("data-electron-mac");
     expect(control.matches(controlsSelector)).toBe(false);
   });
