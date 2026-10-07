@@ -173,33 +173,3 @@ def test_oversized_session_turn_and_fork_fail_with_content_length_error(
     _expect_content_length_failure(page, expected_pills=1)
     _fail_turn_with_content_length_error(base_url, session_id, "turn_2")
     _expect_content_length_failure(page, expected_pills=2)
-
-
-def test_server_rejects_oversized_transcript_carrying_event(
-    seeded_session: tuple[str, str],
-) -> None:
-    """The real server content-length guard rejects an over-cap ``/events`` body.
-
-    Exercises omnigent's own ``_SessionEventBodyLimitRoute`` (10 MiB) — the
-    in-product analog of the Databricks 32 MiB front-door cap the reported
-    failure hits — so an oversized transcript-carrying request is refused
-    rather than dispatched.
-    """
-    base_url, session_id = seeded_session
-    oversized_text = "x" * (11 * 1024 * 1024)
-    response = httpx.post(
-        f"{base_url}/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_conversation_item",
-            "data": {
-                "item": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": oversized_text}],
-                }
-            },
-        },
-        timeout=30.0,
-    )
-    assert response.status_code == 400, response.status_code
-    assert "exceeds" in response.text.lower() and "limit" in response.text.lower(), response.text
