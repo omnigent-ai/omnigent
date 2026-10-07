@@ -137,12 +137,15 @@ function serverSelectorV2EnvForced() {
 
 /** V2 defaults on for packaged, MDM-enabled Databricks macOS users. */
 function serverSelectorV2Enabled() {
-  return (
-    serverSelectorV2EnvForced() ||
-    (loadSettings().server_selector_v2 ??
-      (app.isPackaged && process.platform === "darwin" && databricksInternalFeaturesEnabled())) ===
-      true
-  );
+  if (serverSelectorV2EnvForced()) return true;
+
+  const savedPreference = loadSettings().server_selector_v2;
+  if (savedPreference != null) return savedPreference === true;
+
+  if (!app.isPackaged) return false;
+  if (process.platform !== "darwin") return false;
+
+  return databricksInternalFeaturesEnabled();
 }
 
 /** Which setup page to load — the server selector when enabled. */
