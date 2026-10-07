@@ -5,6 +5,9 @@ export const SANDBOX_SWITCH_HOST_UNSUPPORTED =
   "Switching hosts is not supported for this sandbox session yet.";
 export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
 
+/** Sandbox providers whose managed integration rejects forking. */
+const UNSUPPORTED_FORK_PROVIDERS = new Set(["arclet", "lakebox"]);
+
 export interface SessionActionSource {
   labels?: Record<string, string | null> | null;
   hostId?: string | null;
@@ -19,8 +22,7 @@ export function sessionActionRestrictions(
   // the source's host. A repository label alone does not imply a restriction.
   const unsupportedSource =
     session?.labels?.["omnigent.host_type"] === "managed" ||
-    host?.sandbox_provider === "arclet" ||
-    host?.sandbox_provider === "lakebox";
+    (host?.sandbox_provider != null && UNSUPPORTED_FORK_PROVIDERS.has(host.sandbox_provider));
   return {
     forkDisabledReason: unsupportedSource ? SANDBOX_FORK_UNSUPPORTED : undefined,
     switchHostDisabledReason:

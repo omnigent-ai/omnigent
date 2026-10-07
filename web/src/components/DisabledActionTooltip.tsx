@@ -1,7 +1,10 @@
 import type { ReactNode } from "react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
-/** Keep hover and focus on a wrapper when the control itself is disabled. */
+/**
+ * Keep hover and focus on a wrapper when the control itself is disabled.
+ * A natively disabled child needs `pointer-events: none` so hover reaches here.
+ */
 export function DisabledActionTooltip({
   reason,
   children,

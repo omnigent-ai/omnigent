@@ -18,7 +18,7 @@ export function useSessionActionRestrictions(
   });
   const host = hosts?.find((candidate) => candidate.host_id === hostId);
   const restrictions = sessionActionRestrictions(session ?? fallback, host);
-  const loading = (sessionId && isLoading) || (hostId && hostsLoading);
+  const loading = Boolean(sessionId && isLoading) || Boolean(hostId && hostsLoading);
   return {
     forkDisabledReason:
       restrictions.forkDisabledReason ?? (loading ? SESSION_ACTIONS_LOADING : undefined),

@@ -62,14 +62,21 @@ def _patch_sandbox(page: Page, session_id: str, provider: str) -> None:
     page.route_web_socket("**/v1/sessions/updates*", lambda _ws: None)
 
 
+def _reason_tooltip(page: Page, reason: str) -> Locator:
+    # Another tooltip (a hovered sidebar row's) can stay mounted while it
+    # animates out, so match the explanation itself.
+    return page.get_by_role("tooltip").filter(has_text=reason)
+
+
 def _disabled_menu_action(page: Page, item: Locator, reason: str) -> None:
+    tooltip = _reason_tooltip(page, reason)
     expect(item).to_be_disabled()
     item.hover()
-    expect(page.get_by_role("tooltip")).to_have_text(reason)
+    expect(tooltip).to_have_text(reason)
     # ARIA-disabled menu items remain in the arrow-key focus order. Enter and
     # Space must neither select them nor dismiss the menu.
     page.mouse.move(0, 0)
-    expect(page.get_by_role("tooltip")).to_have_count(0)
+    expect(tooltip).to_have_count(0)
     menu_items = page.get_by_role("menu").locator('[role="menuitem"]:visible:not([data-disabled])')
     item_index = menu_items.all_text_contents().index(item.inner_text())
     page.keyboard.press("Home")
@@ -78,15 +85,15 @@ def _disabled_menu_action(page: Page, item: Locator, reason: str) -> None:
         page.keyboard.press("ArrowDown")
         expect(menu_items.nth(index + 1)).to_be_focused()
     expect(item).to_be_focused()
-    expect(page.get_by_role("tooltip")).to_have_text(reason)
+    expect(tooltip).to_have_text(reason)
     page.keyboard.press("Enter")
     page.keyboard.press("Space")
     expect(item).to_be_visible()
     expect(page.get_by_test_id("fork-session-dialog")).to_have_count(0)
     expect(page.get_by_test_id("switch-host-dialog")).to_have_count(0)
-    expect(page.get_by_role("tooltip")).to_have_count(0)
+    expect(tooltip).to_have_count(0)
     item.hover()
-    expect(page.get_by_role("tooltip")).to_have_text(reason)
+    expect(tooltip).to_have_text(reason)
 
 
 def _close_menu(page: Page) -> None:
@@ -157,12 +164,13 @@ def test_sandbox_fork_and_switch_host_disabled(
     message_fork = page.get_by_test_id("fork-from-response")
     expect(message_fork).to_be_disabled()
     message_fork.locator("..").hover()
-    expect(page.get_by_role("tooltip")).to_have_text(_FORK_REASON)
+    fork_tooltip = _reason_tooltip(page, _FORK_REASON)
+    expect(fork_tooltip).to_have_text(_FORK_REASON)
     message_fork.locator("..").focus()
     page.keyboard.press("Enter")
     expect(page.get_by_test_id("fork-session-dialog")).to_have_count(0)
     page.keyboard.press("Escape")
-    expect(page.get_by_role("tooltip")).to_have_count(0)
+    expect(fork_tooltip).to_have_count(0)
 
     page.get_by_test_id("composer-host-select").click()
     switch_host = page.get_by_role("menuitem", name="Switch host…")

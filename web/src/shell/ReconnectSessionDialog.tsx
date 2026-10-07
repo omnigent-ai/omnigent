@@ -10,6 +10,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { quoteShellArgument } from "@/lib/shell";
 import { CliCommandBlock } from "./CliCommandBlock";
@@ -186,6 +187,13 @@ export function ReconnectSessionDialog({
     conversationId,
     { hostId: sourceHostId },
   );
+  // Only a settled restriction drives the default tab, the Clone trigger, and
+  // the copy: a disabled trigger would hand the dialog's initial focus to
+  // Reconnect and activate it, so the loading placeholder never disables Clone.
+  const forkRestriction =
+    forkDisabledReason === SESSION_ACTIONS_LOADING ? undefined : forkDisabledReason;
+  const switchHostRestriction =
+    switchHostDisabledReason === SESSION_ACTIONS_LOADING ? undefined : switchHostDisabledReason;
   const isHostReconnect = state === "host_offline";
   const canReconnectThisMachine = isHostReconnect && isOwner && localReconnect != null;
   const canReconnectArca = isHostReconnect && isOwner && arcaReconnect != null;
@@ -205,7 +213,7 @@ export function ReconnectSessionDialog({
         : canReconnectThisMachine
           ? HOST_OWNER_THIS_MACHINE_DESCRIPTION
           : HOST_OWNER_DESCRIPTION
-      : `${HOST_VIEWER_DESCRIPTION} ${forkDisabledReason ?? "Clone the session to continue in a copy you own."}`
+      : `${HOST_VIEWER_DESCRIPTION} ${forkRestriction ?? "Clone the session to continue in a copy you own."}`
     : RUN_DESCRIPTION;
   return (
     <>
@@ -223,7 +231,7 @@ export function ReconnectSessionDialog({
           {/* Uncontrolled tabs: DialogContent unmounts on close, so the
             default re-applies on every open. */}
           <Tabs
-            defaultValue={showCommand || forkDisabledReason ? "reconnect" : "clone"}
+            defaultValue={showCommand || forkRestriction ? "reconnect" : "clone"}
             className="flex min-h-0 flex-1 flex-col gap-4"
             componentId="reconnect.tabs"
           >
@@ -231,11 +239,11 @@ export function ReconnectSessionDialog({
               <TabsTrigger value="reconnect" data-testid="reconnect-session-tab-reconnect">
                 Reconnect
               </TabsTrigger>
-              <DisabledActionTooltip reason={forkDisabledReason} label="Clone session">
+              <DisabledActionTooltip reason={forkRestriction} label="Clone session">
                 <TabsTrigger
                   value="clone"
                   data-testid="reconnect-session-tab-clone"
-                  disabled={!!forkDisabledReason}
+                  disabled={!!forkRestriction}
                 >
                   Clone
                 </TabsTrigger>
@@ -301,7 +309,7 @@ export function ReconnectSessionDialog({
               {isHostReconnect && isOwner && (
                 <div className="flex flex-col gap-2 border-t pt-4">
                   <p className="text-ui text-muted-foreground">
-                    {switchHostDisabledReason ??
+                    {switchHostRestriction ??
                       "Can't bring that machine back? Move the session to another one instead."}
                   </p>
                   <DisabledActionTooltip reason={switchHostDisabledReason} label="Switch host">
@@ -311,7 +319,6 @@ export function ReconnectSessionDialog({
                       data-testid="reconnect-session-switch-host"
                       disabled={!!switchHostDisabledReason}
                       onClick={() => {
-                        if (switchHostDisabledReason) return;
                         setSwitchOpen(true);
                         onOpenChange(false);
                       }}
@@ -346,7 +353,7 @@ export function ReconnectSessionDialog({
       </Dialog>
       {/* Sibling of the dialog above, not a child: the switch opens as the
           reconnect dialog closes, and a child would unmount with it. */}
-      {switchOpen && !switchHostDisabledReason && (
+      {switchOpen && (
         <SwitchHostDialog
           open
           onOpenChange={setSwitchOpen}

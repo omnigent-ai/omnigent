@@ -25,6 +25,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ReconnectSessionDialog, buildReconnectCommand } from "./ReconnectSessionDialog";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 
 vi.mock("@/hooks/useSessionActionRestrictions", () => ({
   useSessionActionRestrictions: vi.fn(),
@@ -329,6 +330,33 @@ describe("<ReconnectSessionDialog />", () => {
       "Forking this sandbox session is not supported yet.",
     );
     expect(screen.queryByText(/Clone the session to continue/)).not.toBeInTheDocument();
+  });
+
+  it("keeps a non-owner on the Clone tab while restrictions are still loading", () => {
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: SESSION_ACTIONS_LOADING,
+      switchHostDisabledReason: SESSION_ACTIONS_LOADING,
+    });
+    renderDialog({ state: "host_offline", isOwner: false });
+    // The fork form gates itself while loading; a disabled trigger would let
+    // the dialog's initial focus activate Reconnect instead.
+    expect(clonePanelState()).toBe("active");
+    expect(screen.getByTestId("reconnect-session-tab-clone")).not.toBeDisabled();
+    switchToTab("reconnect-session-tab-reconnect");
+    expect(screen.getByTestId("reconnect-session-description")).toHaveTextContent(
+      "Clone the session to continue in a copy you own.",
+    );
+    expect(screen.queryByText(SESSION_ACTIONS_LOADING)).not.toBeInTheDocument();
+  });
+
+  it("keeps the switch-host prompt for an owner while restrictions are still loading", () => {
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: SESSION_ACTIONS_LOADING,
+      switchHostDisabledReason: SESSION_ACTIONS_LOADING,
+    });
+    renderDialog({ state: "host_offline", isOwner: true, sourceHostId: "host_dead" });
+    expect(screen.getByText(/Can't bring that machine back/)).toBeInTheDocument();
+    expect(screen.getByTestId("reconnect-session-switch-host")).toBeDisabled();
   });
 
   it("explains owner-only reconnect (no command) on a non-owner's Reconnect tab", () => {
