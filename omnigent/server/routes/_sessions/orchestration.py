@@ -5999,7 +5999,12 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
 
 
-def _native_pane_harness(conv: Conversation) -> str | None:
+def _native_pane_harness(
+    conv: Conversation,
+    *,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+) -> str | None:
     """The native harness a pane actually runs, past the ``"auto"`` sentinel.
 
     A forced-auto child keeps ``harness_override="auto"`` until its first
@@ -6009,10 +6014,12 @@ def _native_pane_harness(conv: Conversation) -> str | None:
     names the real harness.
 
     :param conv: Conversation row for the native session.
+    :param agent_store: Optional agent store for resolving the bound spec.
+    :param agent_cache: Optional cache for loading the bound spec.
     :returns: The canonical native harness, e.g. ``"claude-native"``, or
         ``None`` when it cannot be resolved.
     """
-    harness = _resolve_harness(conv)
+    harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
     if harness is not None and harness != "auto":
         return harness
     native = _native_coding_agent_for_session(conv)
@@ -8066,7 +8073,12 @@ async def _relay_runner_stream_once(
                                 "returned",
                                 conversation_store,
                                 turn_id=pending_subagent_return_id,
-                                status=pending_subagent_return_status,
+                                status=(
+                                    "failed"
+                                    if status == "failed"
+                                    else pending_subagent_return_status
+                                ),
+                                from_runner=True,
                             )
                             pending_subagent_return_id = None
                         if status:
