@@ -121,7 +121,7 @@ const ABOUT_PAGE = path.join(__dirname, "..", "about", "index.html");
 /** The setup page's file:// URL, for verifying IPC sender frames. */
 const SETUP_PAGE_URL = pathToFileURL(SETUP_PAGE);
 
-/** The gated server selector (built by web's `build:server-selector-v2`). */
+/** Default packaged server selector (built by web's `build:server-selector-v2`). */
 const SERVER_SELECTOR_V2_PAGE = path.join(
   __dirname,
   "..",
@@ -135,13 +135,11 @@ function serverSelectorV2EnvForced() {
   return process.env.OMNIGENT_SERVER_SELECTOR_V2 === "1";
 }
 
-/**
- * Whether to show the React server selector instead of the classic static
- * setup page. The env var forces it on (dev/CI); otherwise it's the persisted
- * View → Experiments toggle (settings.json `server_selector_v2`). Default: off.
- */
+/** V2 defaults on in packaged builds; the setup-page switch persists an override. */
 function serverSelectorV2Enabled() {
-  return serverSelectorV2EnvForced() || loadSettings().server_selector_v2 === true;
+  return (
+    serverSelectorV2EnvForced() || (loadSettings().server_selector_v2 ?? app.isPackaged) === true
+  );
 }
 
 /** Which setup page to load — the server selector when enabled. */

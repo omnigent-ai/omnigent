@@ -1,7 +1,7 @@
-// Standalone entry for the gated server selector v2 (Electron shell).
+// Standalone entry for the default packaged Electron server selector.
 //
-// Loaded from a file:// window when OMNIGENT_SERVER_SELECTOR_V2=1 (see
-// electron/src/main.js `setupPagePath`). Renders the ServerSelectorV2, wiring it
+// Loaded from a file:// window (see electron/src/main.js `setupPagePath`).
+// Renders the ServerSelectorV2, wiring it
 // to the shell's `omnigentSetup` preload bridge (server URL, recent / managed
 // servers, connect, start-local). Theme follows the OS via index.css.
 

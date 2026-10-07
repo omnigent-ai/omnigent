@@ -132,6 +132,8 @@ function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } 
 }
 
 function loadNavigationHarness({
+  isPackaged = false,
+  env = {},
   serverUrl = "https://host.example/ml/omnigents",
   savedServerUrl,
   registerFallbacks = true,
@@ -305,7 +307,7 @@ function loadNavigationHarness({
 
   const electron = {
     app: {
-      isPackaged: false,
+      isPackaged,
       getPath: () => userData,
       setName: () => {},
       setPath: () => {},
@@ -579,7 +581,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -596,7 +598,7 @@ function loadNavigationHarness({
     process: {
       ...process,
       platform: internalFeatures ? "darwin" : process.platform,
-      env: { ...process.env },
+      env: { ...process.env, OMNIGENT_SERVER_SELECTOR_V2: "", ...env },
     },
     require: (specifier) => {
       if (specifier === "electron") return electron;
@@ -2288,6 +2290,74 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
         "injecting on every load is a safe no-op elsewhere. See src/workspace-chrome.js.",
       ].join(" "),
     );
+  });
+});
+
+describe("packaged server selector default", () => {
+  for (const [name, settings, v2] of [
+    ["new install", null, true],
+    ["existing install", { recent_servers: ["https://team.example.com/"] }, true],
+    ["explicit V2 preference", { server_selector_v2: true }, true],
+    ["explicit legacy preference", { server_selector_v2: false }, false],
+  ]) {
+    it(`opens the bundled selector for ${name}`, async () => {
+      const h = loadNavigationHarness({ isPackaged: true });
+      try {
+        if (settings) fs.writeFileSync(h.settingsPath, JSON.stringify(settings));
+        h.api.createWindow();
+        await until(() => h.calls.loadFile.length > 0, "setup page load");
+        assert.equal(h.calls.loadFile[0][0], v2 ? h.api.SERVER_SELECTOR_V2_PAGE : h.api.SETUP_PAGE);
+        assert.equal(h.calls.loadURL.length, 0);
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+
+  it("persists switching to legacy and back to V2", async () => {
+    const h = loadNavigationHarness({ isPackaged: true });
+    try {
+      h.api.registerIpc();
+      await h.api.loadSetupPage(h.win, "error=offline&ephemeral=1");
+      assert.equal(h.calls.loadFile[0][0], h.api.SERVER_SELECTOR_V2_PAGE);
+      assert.equal(h.calls.loadFile[0][1].search, "error=offline&ephemeral=1");
+      for (const [enabled, page] of [
+        [false, h.api.SETUP_PAGE],
+        [true, h.api.SERVER_SELECTOR_V2_PAGE],
+      ]) {
+        const previousLoads = h.calls.loadFile.length;
+        h.ipc.get("omnigent:set-server-selector-v2")(
+          {
+            sender: h.webContents,
+            senderFrame: { url: h.webContents.getURL() },
+          },
+          enabled,
+        );
+        // oxlint-disable-next-line no-await-in-loop -- Each toggle reloads the sending page.
+        await until(() => h.calls.loadFile.length > previousLoads, "selector switch");
+        assert.equal(h.calls.loadFile.at(-1)[0], page);
+        assert.equal(
+          JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).server_selector_v2,
+          enabled,
+        );
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("keeps the environment override above a legacy preference", async () => {
+    const h = loadNavigationHarness({
+      isPackaged: true,
+      env: { OMNIGENT_SERVER_SELECTOR_V2: "1" },
+    });
+    try {
+      fs.writeFileSync(h.settingsPath, JSON.stringify({ server_selector_v2: false }));
+      await h.api.loadSetupPage(h.win);
+      assert.equal(h.calls.loadFile[0][0], h.api.SERVER_SELECTOR_V2_PAGE);
+    } finally {
+      h.cleanup();
+    }
   });
 });
 

@@ -747,6 +747,12 @@ name; output lands in `electron/dist-dev/` (the DMG is named
 install production desktop updates. `build:mac:release` retains
 `ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
 
+Packaged apps default to the V2 onboarding and server selector for both new and
+existing profiles. A saved server still reconnects on launch. The selector's
+settings menu offers **Switch to legacy**; that explicit choice persists across
+restarts. Unpackaged development keeps V2 opt-in through the setup-page switch
+or `OMNIGENT_SERVER_SELECTOR_V2=1`, which forces V2 regardless of the saved choice.
+
 Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
 bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly
 and stores settings in **Omnigent Dev** app data. To try a managed preference,
