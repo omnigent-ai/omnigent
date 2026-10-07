@@ -6,9 +6,12 @@ import {
   strFromU8,
   unzipSync,
   zipSync,
-  UnzipInflate,
+  Inflate,
+  Zip,
+  ZipDeflate,
+  ZipPassThrough,
 } from "three/examples/jsm/libs/fflate.module.js";
-import { applyThreeMfColors } from "./threeMfColors";
+import { applyThreeMfColors, INFLATE_CHUNK_BYTES } from "./threeMfColors";
 
 const core = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const production = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
@@ -53,6 +56,27 @@ function archive(
   return zipped.buffer as ArrayBuffer;
 }
 
+function descriptorArchive(pairs: [string, Uint8Array][], method: 0 | 8) {
+  const chunks: Uint8Array[] = [];
+  const zip = new Zip((error, chunk) => {
+    if (error) throw error;
+    chunks.push(chunk);
+  });
+  for (const [name, bytes] of pairs) {
+    const entry = method === 8 ? new ZipDeflate(name) : new ZipPassThrough(name);
+    zip.add(entry);
+    entry.push(bytes, true);
+  }
+  zip.end();
+  const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes.buffer;
+}
+
 function rendered(buffer: ArrayBuffer) {
   const group = new ThreeMFLoader().parse(buffer);
   group.updateMatrixWorld(true);
@@ -88,6 +112,84 @@ function check(
 }
 
 describe("Bambu filament colours through the stock 3MF loader", () => {
+  it("uses the central-directory palette instead of a stale local record", () => {
+    const paletteName = "Metadata/project_settings.config";
+    const pairs = Object.entries(unzipSync(new Uint8Array(archive())));
+    const stale = strToU8(
+      strFromU8(pairs.find(([name]) => name === paletteName)![1])
+        .replace("#F53B9D", "#112233")
+        .replace("#4dc5a080", "#44556680"),
+    );
+    const full = new Uint8Array(
+      descriptorArchive(
+        [
+          [paletteName, stale],
+          pairs[2],
+          ["Metadata/padding.bin", new Uint8Array(2048)],
+          ...pairs.filter(([name]) => name !== pairs[2][0]),
+        ],
+        0,
+      ),
+    );
+    const view = new DataView(full.buffer);
+    const directory = view.getUint32(full.length - 6, true);
+    const removed =
+      46 +
+      view.getUint16(directory + 28, true) +
+      view.getUint16(directory + 30, true) +
+      view.getUint16(directory + 32, true);
+    const bytes = new Uint8Array(full.length - removed);
+    bytes.set(full.subarray(0, directory));
+    bytes.set(full.subarray(directory + removed), directory);
+    const end = bytes.length - 22;
+    const edited = new DataView(bytes.buffer);
+    edited.setUint16(end + 8, pairs.length + 1, true);
+    edited.setUint16(end + 10, pairs.length + 1, true);
+    edited.setUint32(end + 12, edited.getUint32(end + 12, true) - removed, true);
+    expect(strFromU8(unzipSync(bytes)[paletteName])).toContain("#F53B9D");
+    expect(applyThreeMfColors(bytes.buffer)).not.toBe(bytes.buffer);
+    check(bytes.buffer);
+  });
+
+  it("ignores local-header signatures inside unselected descriptor payloads", () => {
+    const payload = new Uint8Array(80);
+    const view = new DataView(payload.buffer);
+    view.setUint32(0, 0x04034b50, true);
+    view.setUint16(26, 4, true);
+    payload.set(strToU8("junk"), 30);
+    view.setUint32(18, 999999, true);
+    const pairs = Object.entries(unzipSync(new Uint8Array(archive())));
+    for (const method of [0, 8] as const) {
+      for (const reverse of [false, true]) {
+        const input = descriptorArchive(
+          [["Metadata/thumbnail.png", payload], ...(reverse ? [...pairs].reverse() : pairs)],
+          method,
+        );
+        expect(unzipSync(new Uint8Array(input))["Metadata/thumbnail.png"]).toEqual(payload);
+        expect(applyThreeMfColors(input)).not.toBe(input);
+        check(input);
+        const invalid = input.slice(0);
+        const edited = new DataView(invalid);
+        let directory = edited.getUint32(invalid.byteLength - 6, true);
+        while (
+          strFromU8(
+            new Uint8Array(invalid, directory + 46, edited.getUint16(directory + 28, true)),
+          ) !== "Metadata/model_settings.config"
+        )
+          directory +=
+            46 +
+            edited.getUint16(directory + 28, true) +
+            edited.getUint16(directory + 30, true) +
+            edited.getUint16(directory + 32, true);
+        edited.setUint32(directory + 20, 1, true);
+        expect(applyThreeMfColors(invalid)).toBe(invalid);
+        if (method === 0) check(invalid, ["ffffff", "ffffff"]);
+        // The stock loader cannot unzip the truncated DEFLATE range.
+        else expect(() => rendered(invalid)).toThrow();
+      }
+    }
+  });
+
   it("aborts incremental inflate after a forged valid XML prefix", () => {
     const control = archive();
     check(control);
@@ -108,7 +210,8 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       }
       expect(strFromU8(unzipSync(bytes)[name])).toBe(prefix);
       const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
-      const inflater = vi.spyOn(UnzipInflate.prototype, "push");
+      const inflater = vi.spyOn(Inflate.prototype, "push");
+      const copier = vi.spyOn(Uint8Array.prototype, "set");
       try {
         expect(applyThreeMfColors(input)).toBe(input);
         expect(parser).not.toHaveBeenCalled();
@@ -117,10 +220,17 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
           0,
         );
         expect(compressedBytes).toBeGreaterThan(0);
-        expect(compressedBytes).toBeLessThan(4096);
+        expect(compressedBytes).toBeLessThan(2 * INFLATE_CHUNK_BYTES);
+        expect(
+          copier.mock.calls.some(
+            ([chunk, offset], index) =>
+              chunk.length + (offset ?? 0) > (copier.mock.contexts[index] as Uint8Array).length,
+          ),
+        ).toBe(false);
       } finally {
         parser.mockRestore();
         inflater.mockRestore();
+        copier.mockRestore();
       }
       check(input, ["ffffff", "ffffff"]);
     });
@@ -131,7 +241,7 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     const input = archive({
       "Metadata/model_settings.config": `<config>${" ".repeat(129 * 1024 * 1024)}</config>`,
     });
-    const inflater = vi.spyOn(UnzipInflate.prototype, "push");
+    const inflater = vi.spyOn(Inflate.prototype, "push");
     const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
     try {
       expect(applyThreeMfColors(input)).toBe(input);

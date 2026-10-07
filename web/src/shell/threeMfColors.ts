@@ -1,18 +1,11 @@
-import {
-  strFromU8,
-  strToU8,
-  unzipSync,
-  zipSync,
-  Unzip,
-  UnzipInflate,
-} from "three/examples/jsm/libs/fflate.module.js";
+import { strFromU8, strToU8, zipSync, Inflate } from "three/examples/jsm/libs/fflate.module.js";
 
 const CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const XMLNS = "http://www.w3.org/2000/xmlns/";
 const PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
-const INFLATE_CHUNK_BYTES = 1024;
+export const INFLATE_CHUNK_BYTES = 16 * 1024;
 const MAX_EMITTED_RATIO = 2;
 const MAX_EMITTED_OVERHEAD = 1024 * 1024;
 const MAX_OBJECTS = 10_000;
@@ -92,68 +85,111 @@ function zipPath(path: string, containing = ""): string {
 export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
   try {
     const bytes = new Uint8Array(buffer);
+    const view = new DataView(buffer);
+    const read16 = (offset: number) => view.getUint16(offset, true);
+    const read32 = (offset: number) => view.getUint32(offset, true);
+    const floor = Math.max(0, bytes.length - 65557);
+    let end = bytes.length - 22;
+    for (; end >= floor; end--)
+      if (read32(end) === 0x06054b50 && end + 22 + read16(end + 20) === bytes.length) break;
+    if (
+      end < floor ||
+      read32(end + 4) !== 0 ||
+      read16(end + 8) !== read16(end + 10) ||
+      read16(end + 10) === 65535
+    )
+      throw new Error("Unsupported ZIP directory");
+    const directory = read32(end + 16);
+    if (directory + read32(end + 12) !== end) throw new Error("Invalid ZIP directory");
     let selectedBytes = 0;
     let extractedBytes = 0;
     const extract = (needed: (name: string) => boolean) => {
-      const sizes = new Map<string, { size: number; originalSize: number; compression: number }>();
-      unzipSync(bytes, {
-        filter: (entry) => {
-          if (!needed(entry.name)) return false;
-          if (
-            !Number.isSafeInteger(entry.size) ||
-            !Number.isSafeInteger(entry.originalSize) ||
-            entry.size < 0 ||
-            entry.originalSize < 0 ||
-            (entry.compression === 0 && entry.size !== entry.originalSize)
-          )
-            throw new Error("Invalid ZIP size");
-          selectedBytes += entry.originalSize;
-          if (selectedBytes > MAX_SELECTED_BYTES) throw new Error("3MF byte limit");
-          if (sizes.has(entry.name)) throw new Error("Duplicate ZIP entry");
-          sizes.set(entry.name, entry);
-          return false;
-        },
-      });
-      const entries: Record<string, Uint8Array> = {};
-      const seen = new Set<string>();
-      let completed = 0;
-      const stream = new Unzip((file) => {
-        const declared = sizes.get(file.name);
-        if (!declared) return;
+      const ranges = new Map<
+        string,
+        { start: number; size: number; originalSize: number; compression: number }
+      >();
+      let offset = directory;
+      for (let index = 0; index < read16(end + 10); index++) {
+        if (offset + 46 > end || read32(offset) !== 0x02014b50)
+          throw new Error("Invalid ZIP entry");
+        const record = offset;
+        const flags = read16(record + 8);
+        const nameLength = read16(record + 28);
+        offset += 46 + nameLength + read16(record + 30) + read16(record + 32);
+        if (offset > end || flags & ~0x080e || read16(record + 34) !== 0)
+          throw new Error("Unsupported ZIP entry");
+        const name = strFromU8(
+          bytes.subarray(record + 46, record + 46 + nameLength),
+          !(flags & 2048),
+        );
+        if (!needed(name)) continue;
+        const size = read32(record + 20);
+        const originalSize = read32(record + 24);
+        const compression = read16(record + 10);
+        const local = read32(record + 42);
         if (
-          seen.has(file.name) ||
-          file.compression !== declared.compression ||
-          (file.size !== undefined && file.size !== declared.size) ||
-          (file.originalSize !== undefined && file.originalSize !== declared.originalSize)
+          size === 0xffffffff ||
+          originalSize === 0xffffffff ||
+          (compression !== 0 && compression !== 8) ||
+          (compression === 0 && size !== originalSize)
         )
-          throw new Error("Inconsistent ZIP entry");
-        seen.add(file.name);
+          throw new Error("Invalid ZIP size");
+        if (
+          local + 30 > directory ||
+          read32(local) !== 0x04034b50 ||
+          read16(local + 6) !== flags ||
+          read16(local + 8) !== compression
+        )
+          throw new Error("Inconsistent ZIP header");
+        const start = local + 30 + read16(local + 26) + read16(local + 28);
+        if (
+          start + size > directory ||
+          strFromU8(
+            bytes.subarray(local + 30, local + 30 + read16(local + 26)),
+            !(flags & 2048),
+          ) !== name
+        )
+          throw new Error("Invalid ZIP range");
+        for (const [field, expected] of [
+          [18, size],
+          [22, originalSize],
+        ])
+          if (read32(local + field) !== expected && (!(flags & 8) || read32(local + field) !== 0))
+            throw new Error("Inconsistent ZIP size");
+        selectedBytes += originalSize;
+        if (selectedBytes > MAX_SELECTED_BYTES) throw new Error("3MF byte limit");
+        if (ranges.has(name)) throw new Error("Duplicate ZIP entry");
+        ranges.set(name, { start, size, originalSize, compression });
+      }
+      if (offset !== end) throw new Error("Invalid ZIP directory length");
+      const entries: Record<string, Uint8Array> = {};
+      for (const [name, declared] of ranges) {
         const entry = new Uint8Array(declared.originalSize);
         let length = 0;
-        file.ondata = (error, data, final) => {
-          if (error) throw error;
+        const receive = (data: Uint8Array) => {
           length += data.byteLength;
           extractedBytes += data.byteLength;
           if (length > declared.originalSize || extractedBytes > MAX_SELECTED_BYTES)
             throw new Error("3MF extracted byte limit");
           entry.set(data, length - data.byteLength);
-          if (final) {
-            if (length !== declared.originalSize) throw new Error("Inconsistent ZIP size");
-            entries[file.name] = entry;
-            completed++;
-          }
         };
-        file.start();
-      });
-      stream.register(UnzipInflate);
-      for (let offset = 0; offset < bytes.length; offset += INFLATE_CHUNK_BYTES) {
-        if (completed === sizes.size) break;
-        stream.push(
-          bytes.subarray(offset, offset + INFLATE_CHUNK_BYTES),
-          offset + INFLATE_CHUNK_BYTES >= bytes.length,
-        );
+        const compressed = bytes.subarray(declared.start, declared.start + declared.size);
+        if (declared.compression === 0) receive(compressed);
+        else {
+          const inflater = new Inflate(receive);
+          for (
+            let compressedOffset = 0;
+            compressedOffset < compressed.length;
+            compressedOffset += INFLATE_CHUNK_BYTES
+          )
+            inflater.push(
+              compressed.subarray(compressedOffset, compressedOffset + INFLATE_CHUNK_BYTES),
+              compressedOffset + INFLATE_CHUNK_BYTES >= compressed.length,
+            );
+        }
+        if (length !== declared.originalSize) throw new Error("Inconsistent ZIP size");
+        entries[name] = entry;
       }
-      if (completed !== sizes.size) throw new Error("Missing ZIP entries");
       return entries;
     };
     const configs = extract(
