@@ -66,11 +66,9 @@ function renderActions(
   const onOpenInfo = vi.fn();
   const actions = (
     <FileRowActions {...file} downloadable onOpenInfo={onOpenInfo} {...props}>
-      {(rowRef, primaryActionRef) => (
+      {(rowRef) => (
         <div ref={rowRef} data-testid="file-row" tabIndex={-1}>
-          <button ref={primaryActionRef} type="button">
-            Open {props.name ?? file.name}
-          </button>
+          <button type="button">Open {props.name ?? file.name}</button>
         </div>
       )}
     </FileRowActions>
@@ -261,9 +259,9 @@ describe("FileRowActions", () => {
               setReturnFocus(target);
             }}
           >
-            {(rowRef, primaryActionRef) => (
+            {(rowRef) => (
               <div ref={rowRef} data-testid="deleted-row" tabIndex={-1}>
-                <button ref={primaryActionRef} type="button" disabled>
+                <button type="button" disabled>
                   Open {file.name}
                 </button>
               </div>
@@ -297,6 +295,21 @@ describe("FileRowActions", () => {
     fireEvent.contextMenu(primary);
 
     expect(await screen.findByRole("menu")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(primary).toHaveFocus();
+  });
+
+  it("opens the menu with Shift+F10 and restores focus to the active control", async () => {
+    const user = userEvent.setup();
+    renderActions();
+    const primary = screen.getByRole("button", { name: `Open ${file.name}` });
+    primary.focus();
+
+    fireEvent.keyDown(primary, { key: "F10", shiftKey: true });
+
+    expect(
+      await screen.findByRole("menu", { name: `More actions for ${file.name}` }),
+    ).toBeInTheDocument();
     await user.keyboard("{Escape}");
     expect(primary).toHaveFocus();
   });
