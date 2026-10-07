@@ -337,7 +337,8 @@ export interface PinOrderWrite {
  * above `toId`. The label value is the list's sort key, so a move normally
  * rewrites only the moved session, to a value between its new neighbours. When
  * there's no room between them (equal or missing values), every pin is
- * renumbered from the lowest existing value. Returns `[]` for a no-op.
+ * renumbered from the lowest existing value (rows already at their new value
+ * are skipped). Returns `[]` for a no-op.
  */
 export function pinOrderWrites(
   pinned: readonly Conversation[],
@@ -365,7 +366,10 @@ export function pinOrderWrites(
   }
   const finite = pinned.map(value).filter(Number.isFinite);
   const base = finite.length > 0 ? Math.min(...finite) : Date.now();
-  return moved.map((c, index) => ({ id: c.id, pinnedAt: base + index }));
+  // Skip rows that already hold their renumbered value.
+  return moved
+    .map((c, index) => ({ id: c.id, pinnedAt: base + index }))
+    .filter((w, index) => value(moved[index]) !== w.pinnedAt);
 }
 
 // ── Drag-and-drop ────────────────────────────────────────────────────────────

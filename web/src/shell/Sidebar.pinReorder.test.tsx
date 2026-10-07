@@ -110,10 +110,7 @@ describe("dropping an unpinned session onto a pinned row", () => {
       pinnedAt: 1001,
     });
     await waitFor(() =>
-      expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([
-        { id: "conv_a", pinnedAt: 1000 },
-        { id: "conv_b", pinnedAt: 1002 },
-      ]),
+      expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_b", pinnedAt: 1002 }]),
     );
   });
 
@@ -150,10 +147,7 @@ describe("dropping an unpinned session onto a pinned row", () => {
       resolveFirst();
     });
     await waitFor(() =>
-      expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([
-        { id: "conv_a", pinnedAt: 1000 },
-        { id: "conv_b", pinnedAt: 1002 },
-      ]),
+      expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_b", pinnedAt: 1002 }]),
     );
   });
 

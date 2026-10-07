@@ -2029,11 +2029,24 @@ export function useReorderPinnedConversations() {
     },
     onSuccess: (results, writes, ctx) => {
       results.forEach((result, index) => {
-        const value =
-          result.status === "fulfilled"
-            ? result.value.labels[PINNED_LABEL_KEY]
-            : ctx?.previous[index];
-        if (value !== undefined) apply(writes[index].id, value);
+        const { id } = writes[index];
+        if (result.status === "fulfilled") {
+          const value = result.value.labels[PINNED_LABEL_KEY];
+          if (value !== undefined) apply(id, value);
+          return;
+        }
+        const previous = ctx?.previous[index];
+        if (previous !== undefined) {
+          apply(id, previous);
+          return;
+        }
+        // No server-side pin label before (e.g. a legacy local pin still
+        // migrating): drop the optimistic one rather than keep the unsaved slot.
+        const base = findCachedConversationRow(queryClient, id)?.labels ?? {};
+        const labels = Object.fromEntries(
+          Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY),
+        );
+        patchPinnedCaches(queryClient, id, labels, false, includeShared, viewerId);
       });
       if (results.some((r) => r.status === "rejected")) {
         showToast("Couldn't save the pinned order.");

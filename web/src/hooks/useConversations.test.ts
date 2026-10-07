@@ -1619,7 +1619,7 @@ describe("useReorderPinnedConversations failure reconcile", () => {
         .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
         ?.conversations.find((c) => c.id === id)?.labels?.[PINNED_LABEL_KEY],
     ];
-    return { rendered, values };
+    return { queryClient, rendered, values };
   }
 
   it("restores the previous value in every cache when the PATCH fails", async () => {
@@ -1630,6 +1630,40 @@ describe("useReorderPinnedConversations failure reconcile", () => {
     await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
 
     expect(values("conv_b")).toEqual(["2000", "2000"]);
+  });
+
+  it("removes the optimistic key when a legacy-only pin PATCH fails", async () => {
+    // conv_l is pinned only in localStorage, so it has no server-side label yet.
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }))
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_a",
+          object: "conversation",
+          labels: { [PINNED_LABEL_KEY]: "1500" },
+        }),
+      );
+    const { queryClient, rendered, values } = seed();
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([
+        pinnedRow("conv_a", "1000"),
+        pinnedRow("conv_b", "2000"),
+        conversation({ id: "conv_l", updated_at: 150 }),
+      ]),
+    );
+
+    act(() =>
+      rendered.result.current.mutate([
+        { id: "conv_l", pinnedAt: 999 },
+        { id: "conv_a", pinnedAt: 1500 },
+      ]),
+    );
+    expect(values("conv_l")).toEqual(["999", "999"]);
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(values("conv_l")).toEqual([undefined, undefined]);
+    expect(values("conv_a")).toEqual(["1500", "1500"]);
   });
 
   it("keeps landed writes and restores failed ones in a partly failed batch", async () => {

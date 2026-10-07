@@ -221,8 +221,8 @@ describe("pinOrderWrites", () => {
   });
 
   it("renumbers every pin when there's no room between the neighbours", () => {
+    // conv_0 already holds 1000, so it isn't rewritten.
     expect(pinOrderWrites(pins(1000, 1000, 1000), "conv_2", "conv_1")).toEqual([
-      { id: "conv_0", pinnedAt: 1000 },
       { id: "conv_2", pinnedAt: 1001 },
       { id: "conv_1", pinnedAt: 1002 },
     ]);
@@ -238,7 +238,6 @@ describe("pinOrderWrites", () => {
     const low = 1791337307018;
     const high = low + 2 ** -12;
     expect(pinOrderWrites(pins(low, high, 5000000000000), "conv_2", "conv_1")).toEqual([
-      { id: "conv_0", pinnedAt: low },
       { id: "conv_2", pinnedAt: low + 1 },
       { id: "conv_1", pinnedAt: low + 2 },
     ]);

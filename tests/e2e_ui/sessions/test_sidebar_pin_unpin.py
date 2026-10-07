@@ -272,7 +272,12 @@ def test_drag_reorders_pinned_sessions(
     page.mouse.down()
     page.mouse.move(target_box["x"] + 20, target_box["y"] + target_box["height"] / 2, steps=10)
     expect(page.get_by_test_id("pin-order-insertion")).to_be_visible()
-    page.mouse.up()
+    # Wait for the moved session's pin PATCH so the reload below reads the saved order.
+    with page.expect_response(
+        lambda r: r.request.method == "PATCH" and r.url.endswith(f"/v1/sessions/{session_b}")
+    ) as patch_info:
+        page.mouse.up()
+    assert patch_info.value.ok, patch_info.value.status
 
     def b_above_a() -> bool:
         current = _pinned_session_order(page)
