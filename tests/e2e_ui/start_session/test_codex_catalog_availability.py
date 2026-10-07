@@ -34,17 +34,28 @@ _MODELS = [
 
 
 @pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
-@pytest.mark.parametrize("catalog_state", ["available", "empty", "failed"])
+@pytest.mark.parametrize(
+    ("catalog_state", "pinned_model"),
+    [
+        pytest.param("available", None, id="available-default"),
+        pytest.param("available", "catalog-model-b", id="available-explicit"),
+        pytest.param("empty", None, id="empty"),
+        pytest.param("failed", None, id="failed"),
+    ],
+)
 def test_codex_prelaunch_label_reflects_catalog_availability(
     seeded_session: tuple[str, str],
     tmp_path: Path,
     width: int,
     catalog_state: str,
+    pinned_model: str | None,
 ) -> None:
     """Default selection is distinct from an empty or failed model catalog."""
     base_url, session_id = seeded_session
     _run_in_fresh_loop(
-        _drive_catalog_availability(base_url, session_id, tmp_path, width, catalog_state)
+        _drive_catalog_availability(
+            base_url, session_id, tmp_path, width, catalog_state, pinned_model
+        )
     )
 
 
@@ -54,6 +65,7 @@ async def _drive_catalog_availability(
     evidence_dir: Path,
     width: int,
     catalog_state: str,
+    pinned_model: str | None,
 ) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
@@ -125,15 +137,16 @@ async def _drive_catalog_availability(
                 "menuitemcheckbox", name="Catalog Model B", exact=True
             ).click()
             await expect(picker).to_have_attribute("aria-label", "Codex, Model Catalog Model B")
-            await default.click()
-            await expect(picker).to_have_attribute("aria-label", "Codex, Model Default")
+            if pinned_model is None:
+                await default.click()
+                await expect(picker).to_have_attribute("aria-label", "Codex, Model Default")
             await _close_entry_models(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("Inspect this repository")
             await page.get_by_test_id("new-chat-landing-submit").click()
             await expect(page).to_have_url(f"{base_url}/c/{session_id}")
             assert len(create_bodies) == 1
-            assert create_bodies[0].get("model") is None
+            assert create_bodies[0].get("model_override") == pinned_model
         finally:
             await context.close()
             await browser.close()
