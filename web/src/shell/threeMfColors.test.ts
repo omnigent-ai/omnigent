@@ -83,6 +83,20 @@ function check(
 
 describe("Bambu filament colours through the stock 3MF loader", () => {
   it("rejects forged selected ZIP sizes before parsing oversized XML", () => {
+    const control = archive();
+    expect(applyThreeMfColors(control)).not.toBe(control);
+    check(control);
+    const forgeSize = (input: ArrayBuffer, name: string, size: number) => {
+      const bytes = new Uint8Array(input);
+      const view = new DataView(input);
+      for (let offset = bytes.length - 22; offset >= 0; offset--) {
+        if (view.getUint32(offset, true) !== 0x02014b50) continue;
+        const filename = strFromU8(
+          bytes.subarray(offset + 46, offset + 46 + view.getUint16(offset + 28, true)),
+        );
+        if (filename === name) view.setUint32(offset + 24, size, true);
+      }
+    };
     const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
     try {
       for (const name of ["Metadata/model_settings.config", "3D/root.model"]) {
@@ -93,20 +107,108 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
           false,
           0,
         );
-        const bytes = new Uint8Array(input);
-        const view = new DataView(input);
-        for (let offset = bytes.length - 22; offset >= 0; offset--) {
-          if (view.getUint32(offset, true) !== 0x02014b50) continue;
-          const filename = strFromU8(
-            bytes.subarray(offset + 46, offset + 46 + view.getUint16(offset + 28, true)),
-          );
-          if (filename === name) view.setUint32(offset + 24, 1, true);
-        }
+        forgeSize(input, name, 1);
         parser.mockClear();
         expect(applyThreeMfColors(input)).toBe(input);
         expect(parser.mock.calls.every(([text]) => String(text).length <= 32 * 1024 * 1024)).toBe(
           true,
         );
+        check(input, ["ffffff", "ffffff"]);
+      }
+      const name = "Metadata/model_settings.config";
+      const length = unzipSync(new Uint8Array(control))[name].byteLength;
+      for (const size of [1, length + 1]) {
+        const input = archive();
+        forgeSize(input, name, size);
+        const extracted = unzipSync(new Uint8Array(input), {
+          filter: (entry) => {
+            if (entry.name !== name) return false;
+            expect(entry.compression).toBe(8);
+            return true;
+          },
+        })[name];
+        expect(extracted.byteLength).toBe(Math.min(size, length));
+        expect(strFromU8(extracted)).toBe(
+          strFromU8(unzipSync(new Uint8Array(control))[name]).slice(0, size),
+        );
+        parser.mockClear();
+        expect(applyThreeMfColors(input)).toBe(input);
+        expect(parser.mock.calls).toHaveLength(size === 1 ? 1 : 0);
+        check(input, ["ffffff", "ffffff"]);
+      }
+    } finally {
+      parser.mockRestore();
+    }
+  });
+
+  it("enforces cached subtree depth independently of build order", () => {
+    const chain = (start: number, length: number, target: number) =>
+      Array.from({ length }, (_, index) =>
+        composite(start + index, component(index === length - 1 ? target : start + index + 1)),
+      ).join("");
+    for (const reverse of [false, true]) {
+      const fixture = (inner: number, outer: number) => {
+        const items = [
+          `<item objectid="200" transform="${transform(0)}"/>`,
+          `<item objectid="300" transform="${transform(20)}"/>`,
+        ];
+        if (reverse) items.reverse();
+        return archive({
+          "3D/root.model": model(
+            mesh(1) +
+              mesh(2, 2) +
+              chain(10, inner, 1) +
+              chain(100, outer, 10) +
+              composite(200, component(10) + component(2, 10)) +
+              composite(300, component(100)),
+            items.join(""),
+          ),
+          "Metadata/model_settings.config": `<config>${config(part(10, 1) + part(2, 2), undefined, 200)}${config(part(100, 1), undefined, 300)}</config>`,
+        });
+      };
+      const positions = reverse ? [20, 0, 10] : [0, 10, 20];
+      const widths = reverse ? [1, 1, 2] : [1, 2, 1];
+      check(
+        fixture(31, 32),
+        reverse ? ["f53b9d", "f53b9d", "4dc5a0"] : ["f53b9d", "4dc5a0", "f53b9d"],
+        positions,
+        widths,
+      );
+      const input = fixture(40, 40);
+      expect(applyThreeMfColors(input)).toBe(input);
+      check(input, ["ffffff", "ffffff", "ffffff"], positions, widths);
+    }
+  });
+
+  it("rejects selected XML doctypes before entity expansion", () => {
+    const control = archive();
+    check(control);
+    const settings = strFromU8(
+      unzipSync(new Uint8Array(control))["Metadata/model_settings.config"],
+    );
+    const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
+    try {
+      for (const declaration of [
+        '<!ENTITY text "lol"><!ENTITY repeated "&text;&text;&text;&text;&text;&text;&text;&text;&text;&text;">',
+        '<!ENTITY repeated SYSTEM "http://127.0.0.1/external-entity">',
+      ]) {
+        const input = archive({
+          "Metadata/model_settings.config": `<!DOCTYPE config [${declaration}]>${settings.replace("<config>", "<config>&repeated;")}`,
+        });
+        parser.mockClear();
+        expect(applyThreeMfColors(input)).toBe(input);
+        expect(parser).not.toHaveBeenCalled();
+        check(input, ["ffffff", "ffffff"]);
+      }
+      for (const [name, root] of [
+        ["3D/root.model", "model"],
+        ["_rels/.rels", "Relationships"],
+      ]) {
+        const source = strFromU8(unzipSync(new Uint8Array(control))[name]);
+        const input = archive({ [name]: `<!DOCTYPE ${root}>${source}` });
+        parser.mockClear();
+        expect(applyThreeMfColors(input)).toBe(input);
+        expect(parser.mock.calls.some(([text]) => String(text).includes("<!DOCTYPE"))).toBe(false);
         check(input, ["ffffff", "ffffff"]);
       }
     } finally {
