@@ -1523,7 +1523,6 @@ def register_events_routes(
                     )
                     cleanup_resp.raise_for_status()
                 except (httpx.HTTPError, ConnectionError) as exc:
-                    _interrupt_fenced_sessions.discard(session_id)
                     raise OmnigentError(
                         "Couldn't release the side chat's resources. Please try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -1554,7 +1553,6 @@ def register_events_routes(
                         else None
                     )
                     if runner_status not in {"dead", "unknown"}:
-                        _interrupt_fenced_sessions.discard(session_id)
                         raise OmnigentError(
                             "Couldn't confirm the session's runner stopped. Please try again.",
                             code=ErrorCode.RUNNER_UNAVAILABLE,

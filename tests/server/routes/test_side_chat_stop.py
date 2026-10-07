@@ -1,6 +1,6 @@
 """Side chats release their own resources on a shared runner."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -8,6 +8,7 @@ import pytest
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import NewConversationItem
 from omnigent.entities.conversation import MessageData
+from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions
 from omnigent.server.routes.sessions import routes_events
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -98,6 +99,13 @@ async def test_side_chat_close_surfaces_runner_failure(
         methods.append(request.method)
         if request.method == "POST":
             return httpx.Response(503 if failure == "stop" else 204)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text='data: {"type":"response.output_text.delta","delta":"Trailing output"}\n\n'
+                'data: {"type":"response.incomplete","response":{"id":"stopped-turn"}}\n\n'
+                "data: [DONE]\n\n",
+            )
         if failure == "disconnect":
             raise httpx.ConnectError("runner disconnected", request=request)
         return httpx.Response(500)
@@ -110,7 +118,19 @@ async def test_side_chat_close_surfaces_runner_failure(
             f"/v1/sessions/{side.id}/events", json={"type": "stop_session"}
         )
 
-    assert response.status_code == 503, response.text
-    assert methods == (["POST"] if failure == "stop" else ["POST", "DELETE"])
+        assert response.status_code == 503, response.text
+        assert methods == (["POST"] if failure == "stop" else ["POST", "DELETE"])
+        publish = Mock(wraps=session_stream.publish)
+        monkeypatch.setattr(session_stream, "publish", publish)
+        await sessions._relay_runner_stream(side.id, runner_client, store)
+
+    deltas = [
+        call.args[1]["delta"]
+        for call in publish.call_args_list
+        if call.args[0] == side.id and call.args[1].get("type") == "response.output_text.delta"
+    ]
+    assert deltas == (["Trailing output"] if failure == "stop" else [])
+    messages = [item for item in store.list_items(side.id).data if item.type == "message"]
+    assert bool(messages) == (failure == "stop")
     assert side.id not in routes_events._interrupt_fenced_sessions
     assert store.get_conversation(side.id) is not None

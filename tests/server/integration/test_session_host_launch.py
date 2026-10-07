@@ -1446,7 +1446,7 @@ async def test_stop_session_requires_confirmed_host_runner_exit(
         else:
             assert status_query.await_args.args[2] == session["runner_id"]
         if not stopped:
-            assert session_id not in routes_events._interrupt_fenced_sessions
+            assert session_id in routes_events._interrupt_fenced_sessions
         assert host_stop.await_count == (2 if stopped else 1)
     finally:
         routes_events._interrupt_fenced_sessions.discard(session_id)
