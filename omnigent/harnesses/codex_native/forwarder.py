@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
     clear_active_turn_id_if_matches,
+    codex_config_revision,
     codex_home_for_bridge_dir,
     pending_mcp_servers,
     read_bridge_state,
@@ -372,6 +373,8 @@ class _CodexForwarderState:
         the last ``_refresh_effort_from_config`` read, so the refresh can tell
         an unchanged file from a rewritten one (an unchanged file must not roll
         back a live ``thread/settings/updated`` effort).
+    :param last_config_effort_revision: File identity and modification time used
+        to retry mirroring after a same-value config rewrite.
     :param collaboration_mode: Latest known Codex collaboration mode kind, e.g.
         ``"plan"`` or ``"default"``.
     :param posted_collaboration_mode: Last collaboration mode kind already
@@ -445,6 +448,7 @@ class _CodexForwarderState:
     # The config.toml effort as of the last _refresh_effort_from_config read,
     # so the refresh can tell an unchanged file from a rewritten one.
     last_config_effort: str | None = None
+    last_config_effort_revision: tuple[int, int] | None = None
     collaboration_mode: str | None = None
     posted_collaboration_mode: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -3348,7 +3352,15 @@ def _refresh_effort_from_config(bridge_dir: Path, forwarder_state: _CodexForward
         updated in place.
     :returns: None.
     """
+    # Stat before reading, so a rewrite that races this read shows on the next pass.
+    revision = codex_config_revision(bridge_dir)
     config_effort = read_codex_config_effort(bridge_dir)
+    if revision is not None:
+        previous_revision = forwarder_state.last_config_effort_revision
+        forwarder_state.last_config_effort_revision = revision
+        if config_effort and previous_revision is not None and previous_revision != revision:
+            # Retry a failed immediate mirror even when the effort is unchanged.
+            forwarder_state.posted_effort_known = False
     if not config_effort:
         return
     # Change is detected by VALUE, not file revision, so an ABA rewrite between

@@ -606,7 +606,7 @@ async def test_relaunch_after_a_reaped_pane_applies_the_persisted_model_and_effo
 
     assert harness.builds[0]["model"] == pick
     assert harness.builds[0]["reasoning_effort"] == effort
-    apply_effort.assert_awaited_once_with(ANY, thread_id, effort, model=pick)
+    apply_effort.assert_awaited_once_with(ANY, thread_id, effort, model=pick, bridge_dir=ANY)
     assert harness.resets == []
 
 

@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { PlusIcon, TrashIcon } from "lucide-react";
+import { useRef, useState } from "react";
+import { PlusIcon, TrashIcon, UploadIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -25,6 +25,9 @@ import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
  * executor (no explicit harness in the bundle).
  */
 const DEFAULT_HARNESS = Object.keys(BRAIN_HARNESS_LABELS)[0];
+
+/** The server's rule for agent names (`omnigent/spec/validator.py`). */
+const AGENT_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 /** A single MCP server row in the form. */
 interface MCPFormEntry {
@@ -115,15 +118,21 @@ function toMCPInputs(entries: MCPFormEntry[]): MCPServerInput[] | undefined {
  * a harness choice, and zero or more MCP server declarations. On submit,
  * passes the agent configuration back to the parent via `onCreate` so it
  * can build a bundle and start a session with it.
+ *
+ * With `onImport`, it also offers "Import bundle": the user picks an existing
+ * agent bundle (`.tar.gz`), which the parent installs so it stays in the picker.
  */
 export function CreateAgentDialog({
   open,
   onOpenChange,
   onCreate,
+  onImport,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreate: (input: AgentBundleInput) => void;
+  /** Install a picked bundle; rejects with a user-facing message on failure. */
+  onImport?: (bundle: File) => Promise<void>;
 }) {
   const brainHarnessLabels = useBrainHarnessLabels();
   const harnessOptions = Object.entries(brainHarnessLabels).map(([value, label]) => ({
@@ -137,6 +146,9 @@ export function CreateAgentDialog({
   const [model, setModel] = useState("");
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   function reset() {
     setName("");
@@ -146,9 +158,12 @@ export function CreateAgentDialog({
     setModel("");
     setMcpEntries([]);
     setNextKey(0);
+    setImportError(null);
   }
 
   function handleOpenChange(next: boolean) {
+    // Stay open while an import is in flight so its result lands somewhere.
+    if (!next && importing) return;
     if (!next) reset();
     onOpenChange(next);
   }
@@ -168,7 +183,7 @@ export function CreateAgentDialog({
 
   function handleSubmit() {
     const trimmedName = name.trim();
-    if (!trimmedName) return;
+    if (!AGENT_NAME_PATTERN.test(trimmedName)) return;
 
     onCreate({
       name: trimmedName,
@@ -182,7 +197,25 @@ export function CreateAgentDialog({
     onOpenChange(false);
   }
 
-  const canSubmit = name.trim().length > 0 && model.trim().length > 0;
+  const nameInvalid = name.trim().length > 0 && !AGENT_NAME_PATTERN.test(name.trim());
+  const canSubmit = AGENT_NAME_PATTERN.test(name.trim()) && model.trim().length > 0;
+
+  async function handleImport(bundle: File | undefined) {
+    if (!bundle || !onImport) return;
+    setImporting(true);
+    setImportError(null);
+    try {
+      await onImport(bundle);
+      reset();
+      onOpenChange(false);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setImporting(false);
+      // Clear so re-picking the same file after a fix fires onChange again.
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -211,8 +244,19 @@ export function CreateAgentDialog({
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="my-agent"
+              aria-invalid={nameInvalid || undefined}
+              aria-describedby={nameInvalid ? "create-agent-name-error" : undefined}
               autoFocus
             />
+            {nameInvalid && (
+              <p
+                id="create-agent-name-error"
+                data-testid="create-agent-name-error"
+                className="text-xs text-destructive"
+              >
+                Use only letters, numbers, hyphens, and underscores.
+              </p>
+            )}
           </div>
 
           {/* Description */}
@@ -319,11 +363,47 @@ export function CreateAgentDialog({
           </div>
         </div>
 
+        {importError && (
+          <p
+            data-testid="create-agent-import-error"
+            role="alert"
+            className="text-sm text-destructive"
+          >
+            {importError}
+          </p>
+        )}
+
         <DialogFooter>
-          <Button variant="ghost" onClick={() => handleOpenChange(false)}>
+          {onImport && (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".tar.gz,.tgz,application/gzip"
+                className="hidden"
+                data-testid="create-agent-import-input"
+                onChange={(e) => void handleImport(e.target.files?.[0])}
+              />
+              <Button
+                variant="outline"
+                className="sm:mr-auto"
+                disabled={importing}
+                data-testid="create-agent-import"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <UploadIcon className="size-3.5" />
+                {importing ? "Importing…" : "Import bundle"}
+              </Button>
+            </>
+          )}
+          <Button variant="ghost" disabled={importing} onClick={() => handleOpenChange(false)}>
             Cancel
           </Button>
-          <Button data-testid="create-agent-submit" onClick={handleSubmit} disabled={!canSubmit}>
+          <Button
+            data-testid="create-agent-submit"
+            onClick={handleSubmit}
+            disabled={!canSubmit || importing}
+          >
             Create
           </Button>
         </DialogFooter>

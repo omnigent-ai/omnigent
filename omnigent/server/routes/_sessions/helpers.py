@@ -62,6 +62,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import (
+    SESSION_AGENT_MISSING_MESSAGE,
     ErrorCategory,
     ErrorCode,
     ErrorImpact,
@@ -91,7 +92,7 @@ from omnigent.runner.identity import (
 from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
-from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runtime import (
     get_policy_store,
     inflight_text,
@@ -1853,7 +1854,7 @@ def _resolve_llm_model(
         if agent is None:
             return None
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
         return loaded.spec.llm.model if loaded.spec.llm else None
     # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
@@ -1932,7 +1933,7 @@ def _resolve_harness_impl(
         if agent is None:
             return None
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
         executor = loaded.spec.executor
         # For a bundled-agent head sub-agent, report the HEAD's own harness,
@@ -2009,7 +2010,7 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
         )
     try:
         loaded = get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
     except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
         raise OmnigentError(
@@ -2043,7 +2044,7 @@ def _validated_harness_override_executor_type(agent: Agent) -> None:
 
     try:
         loaded = get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
     except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
         raise OmnigentError(
@@ -2571,6 +2572,62 @@ def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
         ) from exc
 
 
+class _LiveSettingsChange:
+    """Orders one session's live effort/model changes and records writes made meanwhile."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self._position = 0
+        # Setting → (position, value) of the latest write by another request.
+        self._writes: dict[str, tuple[int, str | None]] = {}
+
+    def note_write(self, key: str, value: str | None) -> None:
+        """Record another request's write, or a terminal report, of *key*."""
+        self._position += 1
+        self._writes[key] = (self._position, value)
+
+    def position(self) -> int:
+        """Return the position that later writes are ordered after."""
+        return self._position
+
+    def restore_target(
+        self, key: str, previous: str | None, *, began: int, saved: int
+    ) -> tuple[bool, str | None]:
+        """Return whether a refused change may restore *key*, and the value to restore.
+
+        A write after the change was saved is a newer selection, so it stays. One
+        between the change's start and its save is what the change replaced.
+        """
+        position, value = self._writes.get(key, (0, None))
+        if position > saved:
+            return False, None
+        return True, value if position > began else previous
+
+
+# Live forwards run on the replica that holds the session's runner, so this
+# process-local registry orders them; weak values drop sessions with no change.
+# custom-lint: disable-next=workspace-scoped-cache -- session ids are globally unique
+_live_settings_changes: weakref.WeakValueDictionary[str, _LiveSettingsChange] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _live_settings_change(session_id: str) -> _LiveSettingsChange:
+    """Return the live settings change for *session_id*, starting one if none is active."""
+    change = _live_settings_changes.get(session_id)
+    if change is None:
+        change = _live_settings_changes[session_id] = _LiveSettingsChange()
+    return change
+
+
+def _note_settings_write(session_id: str, values: Mapping[str, str | None]) -> None:
+    """Record settings another request wrote while a live change may be active."""
+    change = _live_settings_changes.get(session_id)
+    if change is not None:
+        for key, value in values.items():
+            change.note_write(key, value)
+
+
 async def _persist_external_reasoning_effort_change(
     session_id: str,
     conv: Conversation,
@@ -2594,6 +2651,8 @@ async def _persist_external_reasoning_effort_change(
     """
     effort = _validate_external_reasoning_effort(body)
     if conv.reasoning_effort == effort:
+        # The terminal still reports what it runs when the saved value matches.
+        _note_settings_write(session_id, {"reasoning_effort": effort})
         return
     await asyncio.to_thread(
         conversation_store.update_conversation,
@@ -2601,6 +2660,7 @@ async def _persist_external_reasoning_effort_change(
         reasoning_effort=effort,
         _unset_reasoning_effort=effort is None,
     )
+    _note_settings_write(session_id, {"reasoning_effort": effort})
     event = SessionReasoningEffortEvent(
         type="session.reasoning_effort",
         conversation_id=session_id,
@@ -5619,6 +5679,13 @@ async def _wait_for_runner_client_impl(
     instant we are convinced, neither speculatively early nor a full
     timeout late.
 
+    A lookup that misses right after the connect is retried a few times
+    (:func:`_resolve_connected_runner_client`): the binding the router checks
+    can settle just after the tunnel registers, and giving up then reports a
+    healthy runner as failed. The retries share ``timeout_s`` with the connect
+    wait; no lookup starts or result is accepted after that budget expires.
+    The outcome is logged once as ``runner_client_wait``.
+
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param runner_router: The ``RunnerRouter`` instance, or ``None`` for
@@ -5627,20 +5694,85 @@ async def _wait_for_runner_client_impl(
         ``None`` in test setups without runner tunnels.
     :param runner_id: Runner id expected to connect, e.g.
         ``"runner_0123456789abcdef"``.
-    :param timeout_s: Maximum seconds to wait, e.g. ``3.0``.
+    :param timeout_s: Maximum seconds for the connect wait and the client
+        lookups together, e.g. ``3.0``.
     :param runner_exit_reports: Crash-report store consulted to abort the
         wait early when this runner is reported dead. ``None`` keeps the
         plain wait-to-timeout behavior.
     :returns: A runner HTTP client if one becomes available, otherwise
-        ``None`` (timed out, or the runner was reported dead).
+        ``None`` (timed out, the runner was reported dead, or it connected
+        but no client could be resolved before the deadline).
     """
     if runner_id is None:
         return None
     if tunnel_registry is None:
         return await _get_runner_client(session_id, runner_router)
+    started = time.monotonic()
+    session = await _await_runner_connect(
+        tunnel_registry,
+        runner_id,
+        timeout_s=timeout_s,
+        runner_exit_reports=runner_exit_reports,
+    )
+    client: httpx.AsyncClient | None = None
+    attempts = 0
+    if session is not None:
+        client, attempts = await _resolve_connected_runner_client(
+            session_id,
+            runner_router,
+            runner_id=runner_id,
+            deadline=started + timeout_s,
+            runner_exit_reports=runner_exit_reports,
+        )
+    if client is not None:
+        outcome = "resolved"
+    elif session is not None:
+        outcome = "connected_but_unresolved"
+    else:
+        outcome = "never_connected"
+    waited_s = time.monotonic() - started
+    log = _logger.warning if outcome == "connected_but_unresolved" else _logger.info
+    log(
+        "Runner %s for session %s: client wait %s after %.1fs (%d lookups)",
+        runner_id,
+        session_id,
+        outcome,
+        waited_s,
+        attempts,
+        extra=debug_event(
+            "runner_client_wait",
+            session_id=session_id,
+            runner_id=runner_id,
+            outcome=outcome,
+            attempts=attempts,
+            waited_s=round(waited_s, 3),
+            timeout_s=timeout_s,
+        ),
+    )
+    return client
+
+
+async def _await_runner_connect(
+    tunnel_registry: TunnelRegistry,
+    runner_id: str,
+    *,
+    timeout_s: float,
+    runner_exit_reports: RunnerExitReports | None,
+) -> RunnerSession | None:
+    """
+    Wait for a runner's tunnel to register, ending early on a crash report.
+
+    :param tunnel_registry: The server's ``TunnelRegistry``.
+    :param runner_id: Runner id expected to connect, e.g.
+        ``"runner_0123456789abcdef"``.
+    :param timeout_s: Maximum seconds to wait, e.g. ``30.0``.
+    :param runner_exit_reports: Crash-report store, or ``None`` to wait out
+        ``timeout_s`` regardless.
+    :returns: The connected runner's registry session, or ``None`` on
+        timeout or when the runner was reported dead.
+    """
     if runner_exit_reports is None:
-        session = await tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s)
-        return None if session is None else await _get_runner_client(session_id, runner_router)
+        return await tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s)
     # Race the event-driven connect signal against the crash-report poll;
     # whichever resolves first wins. A report means the runner is busted —
     # stop waiting and let the caller fail the turn now.
@@ -5657,8 +5789,53 @@ async def _wait_for_runner_client_impl(
             connect_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await connect_task
-    session = connect_task.result()
-    return None if session is None else await _get_runner_client(session_id, runner_router)
+    return connect_task.result()
+
+
+async def _resolve_connected_runner_client(
+    session_id: str,
+    runner_router: RunnerRouter | None,
+    *,
+    runner_id: str,
+    deadline: float,
+    runner_exit_reports: RunnerExitReports | None,
+) -> tuple[httpx.AsyncClient | None, int]:
+    """
+    Resolve the client of a runner whose tunnel has connected, retrying a miss.
+
+    Tries up to ``_RUNNER_CLIENT_RESOLVE_ATTEMPTS`` lookups,
+    ``_RUNNER_CLIENT_RESOLVE_RETRY_S`` apart. Each pause is clamped to the time
+    left before ``deadline``, and no further lookup starts once the deadline
+    has passed or the daemon has reported the runner dead.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param runner_router: The ``RunnerRouter`` instance, or ``None``.
+    :param runner_id: The runner that connected, e.g. ``"runner_0123456789abcdef"``.
+    :param deadline: ``time.monotonic()`` cutoff for starting lookups and
+        accepting their results.
+    :param runner_exit_reports: Crash-report store, or ``None``.
+    :returns: ``(client, attempts)``; ``client`` is ``None`` when every lookup
+        missed, and ``attempts`` counts the lookups made.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    attempts = 0
+    while True:
+        if time.monotonic() >= deadline or (
+            runner_exit_reports is not None and runner_exit_reports.get(runner_id) is not None
+        ):
+            return None, attempts
+        attempts += 1
+        client = await _get_runner_client(session_id, runner_router)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or (
+            runner_exit_reports is not None and runner_exit_reports.get(runner_id) is not None
+        ):
+            return None, attempts
+        if client is not None or attempts >= _facade._RUNNER_CLIENT_RESOLVE_ATTEMPTS:
+            return client, attempts
+        await asyncio.sleep(min(_facade._RUNNER_CLIENT_RESOLVE_RETRY_S, remaining))
 
 
 async def _validate_session_workspace(
@@ -6262,10 +6439,7 @@ async def _get_runner_client_for_resource_access_impl(
 # Client-safe message for a session whose bound agent no longer resolves.
 # Mirrors the native-terminal payload's wording: never forward the runner's
 # internal resolver text, which names the resolver and the raw agent id.
-_SESSION_AGENT_MISSING_CLIENT_MESSAGE = (
-    "This session's agent is no longer available; it was deleted or "
-    "replaced. Recreate the agent or start a new session, then retry."
-)
+_SESSION_AGENT_MISSING_CLIENT_MESSAGE = SESSION_AGENT_MISSING_MESSAGE
 
 
 def _raise_if_session_agent_missing_payload(payload: object) -> None:
@@ -6776,13 +6950,13 @@ async def _forward_session_change_to_runner_impl(
 
     Used for control inputs the runner dispatches by harness in its
     ``/v1/sessions/{id}/events`` handler — claude-native injects the
-    corresponding slash command into the tmux pane; other harnesses
-    return 204 no-op. Two kinds of caller use this:
+    corresponding slash command into the tmux pane; Codex-native applies
+    settings through its app-server. Two kinds of caller use this:
 
     * PATCH-driven harness notifications (``effort_change``,
-      ``model_change``) — claude-native injects the slash command,
-      other harnesses re-read the persisted value at the next turn
-      boundary, so they ignore the return value.
+      ``model_change``) — native callers inspect refusals and can restore
+      the previous selection; in-process harnesses re-read the persisted
+      value at the next turn boundary.
     * Explicit ``compact`` — the caller inspects the returned status
       to decide whether the runner handled the control (claude-native,
       200) or the Omnigent server must run its own in-process compaction
@@ -7420,6 +7594,7 @@ async def _dispatch_skill_slash_command_to_runner(
         "role": "user",
         "content": meta_content,
         "agent_id": conv.agent_id,
+        "agent_revision": agent.bundle_location,
         "model": agent.name,
         "has_mcp_servers": has_mcp_servers,
         # Live-renderer hint: the runner drops ``browser_*`` schemas for
@@ -8306,7 +8481,7 @@ def _agent_provider_family(agent: Agent) -> str | None:
     try:
         spec = (
             get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .load(agent.id, agent.bundle_location, expand_env=agent.operator_authored)
             .spec
         )
     except Exception:  # noqa: BLE001
@@ -8362,7 +8537,7 @@ def _agent_is_native_impl(agent: Agent) -> bool:
     try:
         spec = (
             get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .load(agent.id, agent.bundle_location, expand_env=agent.operator_authored)
             .spec
         )
     except Exception:  # noqa: BLE001
@@ -8398,7 +8573,7 @@ def _agent_carries_native_fork_history_impl(agent: Agent) -> bool:
     try:
         spec = (
             get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .load(agent.id, agent.bundle_location, expand_env=agent.operator_authored)
             .spec
         )
     except Exception:  # noqa: BLE001
@@ -8423,7 +8598,7 @@ def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
     try:
         spec = (
             get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .load(agent.id, agent.bundle_location, expand_env=agent.operator_authored)
             .spec
         )
     except Exception:  # noqa: BLE001
@@ -8502,7 +8677,7 @@ def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
     try:
         spec = (
             get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .load(agent.id, agent.bundle_location, expand_env=agent.operator_authored)
             .spec
         )
     except Exception:  # noqa: BLE001
@@ -8559,7 +8734,7 @@ def _load_agent_spec_for_session_impl(
     return agent_cache.load(
         agent.id,
         agent.bundle_location,
-        expand_env=agent.session_id is None,
+        expand_env=agent.operator_authored,
     ).spec
 
 
@@ -9669,7 +9844,7 @@ def _resolve_subagent_spec(
 
     try:
         parent_spec = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         ).spec
     except Exception:  # noqa: BLE001
         # A bundle that fails to load here must not break session
@@ -9724,7 +9899,7 @@ def _require_declared_subagent(
 
     try:
         parent_spec = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         ).spec
     except Exception:  # noqa: BLE001
         # Can't load the bundle -> can't prove the name is undeclared.
@@ -10023,7 +10198,7 @@ def _repl_terminal_ui_labels(
     else:
         try:
             spec = agent_cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+                agent.id, agent.bundle_location, expand_env=agent.operator_authored
             ).spec
         except Exception:  # noqa: BLE001
             # Can't resolve the harness -> leave the label to the runner's
@@ -10285,6 +10460,59 @@ def _persist_stored_session_bundle(
         session_id=created.conversation.id,
         agent_id=agent_id,
         agent_name=agent_name,
+    )
+
+
+def _persist_session_for_uploaded_agent(
+    conversation_store: ConversationStore,
+    metadata: SessionCreateMetadata,
+    agent: Agent,
+    *,
+    runner_id: str | None = None,
+    inference_snapshot: dict[str, Any] | None = None,
+    inference_model: str | None = None,
+) -> CreatedSessionResponse:
+    """
+    Persist a top-level session bound to the agent row of an earlier, identical upload.
+
+    Other sessions may use the row and its bundle, so a failure here leaves both.
+
+    :param conversation_store: Store for the new conversation.
+    :param metadata: Validated top-level session metadata.
+    :param agent: The upload's agent (:func:`omnigent.server.bundles.uploaded_agent_for`).
+    :param runner_id: Optional runner binding, e.g. ``"runner_abc123"``.
+    :returns: Response with the new session id.
+    :raises OmnigentError: If the conversation insert violates integrity checks.
+    :raises SQLAlchemyError: If the database transaction fails for
+        any non-integrity reason.
+    """
+    try:
+        conversation = conversation_store.create_conversation(
+            agent_id=agent.id,
+            title=metadata.title,
+            runner_id=runner_id,
+            host_id=metadata.host_id,
+            workspace=metadata.workspace,
+            terminal_launch_args=metadata.terminal_launch_args,
+            project_id=metadata.project_id,
+            inference_snapshot=inference_snapshot,
+            labels=metadata.labels,
+            reasoning_effort=metadata.reasoning_effort,
+            model_override=inference_model,
+        )
+    except IntegrityError as exc:
+        raise OmnigentError(
+            f"session write failed integrity checks: {exc.orig}",
+            code=ErrorCode.ALREADY_EXISTS,
+        ) from exc
+
+    from omnigent.runtime import telemetry
+
+    telemetry.set_session_id(conversation.id)
+    return CreatedSessionResponse(
+        session_id=conversation.id,
+        agent_id=agent.id,
+        agent_name=agent.name,
     )
 
 
@@ -10739,7 +10967,7 @@ async def _handle_advise_models_mcp(
                     .load(
                         agent_obj.id,
                         agent_obj.bundle_location,
-                        expand_env=agent_obj.session_id is None,
+                        expand_env=agent_obj.operator_authored,
                     )
                     .spec
                 )

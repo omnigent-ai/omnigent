@@ -35,14 +35,32 @@ const DEFAULT_BUILTIN_NAMES = new Set(Object.keys(BUILTIN_SLASH_COMMANDS));
 const SLASH_COMMAND_RE = /^\/[A-Za-z0-9][\w:-]*(\s|$)/;
 
 /**
- * True when a user message is a slash-command invocation typed in the
- * composer. The single command-shape definition shared by the in-session
- * composer's submit routing + highlight overlay and the landing
- * composer's skill matching — one guard, so the surfaces can't diverge
- * on what "reads as a command".
+ * True when a user message reads as a slash-command invocation by shape: the
+ * single guard shared by the composer's submit routing and highlight overlay.
  */
 export function isSlashCommandText(text: string): boolean {
   return SLASH_COMMAND_RE.test(text.trim());
+}
+
+/**
+ * The known command or skill `text` invokes, split from its arguments, or null.
+ * Skill names may contain spaces, so the longest key in `commands` (prefix and
+ * exact case included) that prefixes the text at a word boundary wins.
+ */
+export function matchSlashCommandInvocation(
+  text: string,
+  commands: Iterable<string>,
+): { command: string; args: string } | null {
+  const trimmed = text.trim();
+  let command: string | null = null;
+  for (const candidate of commands) {
+    if (command !== null && candidate.length <= command.length) continue;
+    if (!trimmed.startsWith(candidate)) continue;
+    const rest = trimmed.slice(candidate.length);
+    if (rest === "" || /^\s/.test(rest)) command = candidate;
+  }
+  if (command === null) return null;
+  return { command, args: trimmed.slice(command.length).trim() };
 }
 
 /**
