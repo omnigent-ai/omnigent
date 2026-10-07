@@ -619,6 +619,39 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     }
   });
 
+  it("recolours model output above 32 MiB without multiplying its mesh payload", () => {
+    const payloadBytes = 33 * 1024 * 1024;
+    const input = archive(
+      {
+        "3D/root.model": model(
+          mesh(1).replace(
+            "<mesh>",
+            `<metadata name="payload">${"x".repeat(payloadBytes)}</metadata><mesh>`,
+          ) +
+            mesh(2, 2) +
+            composite(100, component(1) + component(2, 10)),
+        ),
+      },
+      false,
+      0,
+    );
+    const normalized = applyThreeMfColors(input);
+    expect(normalized === input).toBe(false);
+    const entries = unzipSync(new Uint8Array(normalized));
+    expect(entries["3D/3dmodel.model"].byteLength).toBeGreaterThan(32 * 1024 * 1024);
+    expect(entries["3D/3dmodel.model"].byteLength).toBeLessThan(payloadBytes + 4096);
+    const rows = rendered(normalized);
+    expect(rows.map((row) => row.hex)).toEqual(["f53b9d", "4dc5a0"]);
+    expect(rows.map((row) => row.min)).toEqual([
+      [0, 0, 0],
+      [10, 0, 0],
+    ]);
+    expect(rows.map((row) => row.max)).toEqual([
+      [1, 2, 3],
+      [12, 2, 3],
+    ]);
+  }, 30_000); // Real large-output normalization and loader parsing need headroom on slower CI runners.
+
   it("memoizes repeated leaf instances before deep import", () => {
     const count = 80;
     const input = archive({
