@@ -24,6 +24,7 @@ import {
   createBubbleCache,
   lastRenderableAssistantIndex,
   liveCandidateAssistantIndex,
+  workingIndicatorInsertIndex,
 } from "./renderItems";
 import type { ActiveResponse } from "@/store/types";
 
@@ -4064,6 +4065,156 @@ describe("liveCandidateAssistantIndex", () => {
       null,
     );
     expect(liveCandidateAssistantIndex(bubbles)).toBe(1);
+  });
+});
+
+describe("workingIndicatorInsertIndex", () => {
+  const textDone = (itemId: string, rid: string, text: string): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId, responseId: rid }),
+    fullText: text,
+    hasCodeBlocks: false,
+  });
+  const userMsg = (itemId: string, text: string): AnyBlock => ({
+    type: "user_message",
+    ctx: ctx({ itemId, responseId: "" }),
+    content: [{ type: "input_text", text }],
+  });
+  const streaming = (rid: string): ActiveResponse => ({
+    responseId: rid,
+    state: "streaming",
+    error: null,
+  });
+
+  it("rides the tail (-1) for a normal live turn with no trailing follow-up", () => {
+    const bubbles = buildBubbles(
+      [userMsg("u1", "q"), textDone("m1", "r1", "working…")],
+      streaming("r1"),
+    );
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), true)).toBe(-1);
+  });
+
+  it("splices above a follow-up steered in behind the streaming turn's reply", () => {
+    const bubbles = buildBubbles(
+      [userMsg("u1", "q"), textDone("m1", "r1", "working…"), userMsg("u2", "follow-up")],
+      streaming("r1"),
+    );
+    // [user u1, assistant r1 (streaming), user u2]: the marker sits after the
+    // active reply (index 1) and above the follow-up, not at the tail below it.
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), true)).toBe(2);
+  });
+
+  it("anchors below the LAST fragment when the streaming turn splits across bubbles", () => {
+    // An answered AskUserQuestion card splits one streaming turn (r1) into
+    // several assistant bubbles. The marker must land after the LAST fragment,
+    // above the steered follow-up, not between the turn's own fragments.
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "r1" }),
+        content: [{ type: "input_text", text: "q" }],
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "r1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "r1" }),
+        elicitationId: "elic_ask",
+        message: "Claude wants to call **AskUserQuestion**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "AskUserQuestion({})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept", content: { Framework: "React" } },
+        askUserQuestion: {
+          questions: [
+            {
+              question: "Which framework?",
+              options: [{ label: "React" }, { label: "Vue" }],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "r1" }),
+        fullText: "working…",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u2", responseId: "" }),
+        content: [{ type: "input_text", text: "follow-up" }],
+      },
+    ];
+    const bubbles = buildBubbles(blocks, streaming("r1"));
+    // [user, assistant r1 x3 (tool, card, text), user u2]: the anchor is the
+    // last r1 fragment (index 3), so the marker splices at 4 — above the
+    // follow-up and below every fragment of the turn, not between them.
+    expect(bubbles.map((b) => b.kind)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "assistant",
+      "user",
+    ]);
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), true)).toBe(4);
+  });
+
+  it("anchors below trailing same-turn rows before the steered follow-up", () => {
+    const blocks: AnyBlock[] = [
+      userMsg("u1", "q"),
+      textDone("a1", "r1", "working…"),
+      {
+        type: "native_tool",
+        ctx: ctx({ itemId: "sub_1", responseId: "r1" }),
+        toolType: "subagent_activity",
+        label: "Sub-agent activity",
+        data: {},
+      },
+      userMsg("u2", "follow-up"),
+    ];
+    const bubbles = buildBubbles(blocks, streaming("r1"));
+    // A subagent-activity row trails the streaming turn's last assistant
+    // fragment. The marker lands after that row (index 3), above the follow-up,
+    // not between the fragment and its own trailing row.
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "subagent_activity", "user"]);
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), true)).toBe(3);
+  });
+
+  it("anchors to the active prompt when its reply has not streamed yet", () => {
+    const bubbles = buildBubbles(
+      [userMsg("u1", "q"), userMsg("u2", "follow-up")],
+      streaming("r_new"),
+    );
+    // No rendered reply yet: the indicator sits right after the prompt that is
+    // actually running (u1), above the steered follow-up.
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r_new"), true)).toBe(1);
+  });
+
+  it("returns -1 when the Working… indicator is not shown", () => {
+    const bubbles = buildBubbles(
+      [userMsg("u1", "q"), textDone("m1", "r1", "working…"), userMsg("u2", "follow-up")],
+      streaming("r1"),
+    );
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), false)).toBe(-1);
+  });
+
+  it("rides the tail (-1) without a streaming response (buffer-drain harness)", () => {
+    // No streaming response to anchor to and the rendered turn (r1) has already
+    // produced its reply, so there is no in-flight turn above the follow-up to
+    // hold the indicator — the tail is correct here.
+    const bubbles = buildBubbles(
+      [userMsg("u1", "q"), textDone("m1", "r1", "answer"), userMsg("u2", "follow-up")],
+      null,
+    );
+    expect(workingIndicatorInsertIndex(bubbles, null, true)).toBe(-1);
   });
 });
 

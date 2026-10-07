@@ -355,6 +355,7 @@ export function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
   if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
   if (bubble.kind === "subagent_activity") return `subagent_activity:${bubble.itemId}`;
+  if (bubble.kind === "working") return "working";
   return `assistant:${bubble.stableId}`;
 }
 
@@ -395,6 +396,19 @@ export function isBackgroundTasksOnly(
 }
 
 /**
+ * Inverse of `isBackgroundTasksOnly`: whether the Working… indicator paints.
+ * Background tasks outliving a finished turn render nothing, so callers can
+ * skip reserving a marker row for it.
+ */
+export function workingIndicatorPaints(
+  bgCount: number,
+  blockedOn: string | null,
+  agentWorking: boolean,
+): boolean {
+  return !isBackgroundTasksOnly(bgCount, blockedOn, agentWorking);
+}
+
+/**
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
  * a local send in flight.
  */
@@ -425,7 +439,9 @@ export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null)
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
 }
 
-export function WorkingIndicator() {
+export function WorkingIndicator({
+  mode = "full",
+}: { mode?: "full" | "visual" | "announce" } = {}) {
   const scopedConversationId = useContext(ConversationScopeContext);
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
@@ -440,27 +456,30 @@ export function WorkingIndicator() {
   // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
   // the state and the shimmer stays off (it would misread as the agent still
   // thinking). While the turn is active the shimmer shows, with the pill beside it.
-  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
+  if (!workingIndicatorPaints(bgCount, blockedOn, agentWorking)) return null;
   const label = workingIndicatorLabel(tick, blockedOn);
   return (
     <>
-      {/* Sole aria-live region for the working state. A stable "Working…" (not
-          the rotating label) so screen readers announce the turn once, without
-          re-announcing every few seconds; the visible shimmer below stays
-          aria-hidden. */}
-      <span role="status" aria-live="polite" className="sr-only">
-        Working…
-      </span>
-      <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
-        <MessageContent>
-          <div className="flex items-center gap-1.5 py-0.5">
-            <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
-            <Shimmer className="text-sm font-mono" duration={1.5}>
-              {label}
-            </Shimmer>
-          </div>
-        </MessageContent>
-      </Message>
+      {/* Sole aria-live region for the working state: a stable "Working…" (not
+          the rotating label) announces the turn once. The visible shimmer stays
+          aria-hidden, so relocating it ("visual") keeps this tail region mounted. */}
+      {mode !== "visual" && (
+        <span role="status" aria-live="polite" className="sr-only">
+          Working…
+        </span>
+      )}
+      {mode !== "announce" && (
+        <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
+          <MessageContent>
+            <div className="flex items-center gap-1.5 py-0.5">
+              <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
+              <Shimmer className="text-sm font-mono" duration={1.5}>
+                {label}
+              </Shimmer>
+            </div>
+          </MessageContent>
+        </Message>
+      )}
     </>
   );
 }
@@ -582,6 +601,7 @@ export const BubbleView = memo(
         />
       );
     }
+    if (bubble.kind === "working") return <WorkingIndicator mode="visual" />;
     return (
       <AssistantBubble
         bubble={bubble}

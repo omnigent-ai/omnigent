@@ -20,6 +20,7 @@ import {
   buildBubbles,
   createBubbleCache,
   liveCandidateAssistantIndex,
+  workingIndicatorInsertIndex,
 } from "@/lib/renderItems";
 import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
@@ -46,6 +47,7 @@ import {
   bubbleKey,
   buildPendingBubbles,
   collectPendingElicitations,
+  computeIsTurnActive,
   computeIsWorking,
   extractUserText,
   isSystemBubble,
@@ -54,6 +56,7 @@ import {
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
+  workingIndicatorPaints,
 } from "@/components/chat/chatBubbleParts";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
@@ -121,6 +124,9 @@ function TranscriptImpl({
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const status = useChatStore((s) => s.status);
+  const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
+  const blockedOn = useChatStore((s) => s.blockedOn);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
@@ -288,9 +294,34 @@ function TranscriptImpl({
     return out;
   }, [display.bubbles]);
 
+  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  // Repositioning the marker is worth it only when the indicator actually
+  // paints. In the background-tasks-only state it renders nothing, so splicing
+  // a marker row would reserve blank space in the virtualized list.
+  const workingIndicatorRenders =
+    showWorkingIndicator &&
+    workingIndicatorPaints(
+      backgroundTaskCount,
+      blockedOn,
+      computeIsTurnActive(sessionStatus, status === "streaming"),
+    );
+  // A message steered in behind the still-active turn is POSTed and promoted to
+  // a bubble below that turn; carry the live Working… indicator on a marker row
+  // beside the active turn so it is not read as the follow-up being processed.
+  const workingInsert = useMemo(
+    () =>
+      workingIndicatorInsertIndex(display.streamBubbles, activeResponse, workingIndicatorRenders),
+    [display.streamBubbles, activeResponse, workingIndicatorRenders],
+  );
+  const streamBubblesWithWorking = useMemo<Bubble[]>(() => {
+    if (workingInsert === -1) return display.streamBubbles;
+    const next = display.streamBubbles.slice();
+    next.splice(workingInsert, 0, { kind: "working", itemId: "working" });
+    return next;
+  }, [display.streamBubbles, workingInsert]);
   const lastAssistantIndex = useMemo(
-    () => liveCandidateAssistantIndex(display.streamBubbles),
-    [display.streamBubbles],
+    () => liveCandidateAssistantIndex(streamBubblesWithWorking),
+    [streamBubblesWithWorking],
   );
 
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) user-turn navigation.
@@ -307,7 +338,6 @@ function TranscriptImpl({
     return () => window.removeEventListener("keydown", handler);
   }, [nav]);
 
-  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   return (
     <>
       {/* Task tracker pinned above the thread. Sibling of the viewport (not an
@@ -364,7 +394,7 @@ function TranscriptImpl({
                 {/* Older pages prepend here while their request is in flight. */}
                 {display.loadingMoreHistory && <HistoryLoadingIndicator />}
                 <VirtualBubbleList
-                  bubbles={display.streamBubbles}
+                  bubbles={streamBubblesWithWorking}
                   scrollEl={scroller?.el ?? null}
                   lastAssistantIndex={lastAssistantIndex}
                   showsWorking={display.showsWorking}
@@ -390,8 +420,15 @@ function TranscriptImpl({
                     </MessageContent>
                   </Message>
                 ))}
-                {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && <WorkingIndicator />}
+                {/* Working… shimmer, lit for the whole busy turn. When a steered
+                follow-up pushes the shimmer onto a marker row inside the list,
+                only the stable aria-live announcement stays at the tail. */}
+                {showWorkingIndicator &&
+                  (workingInsert === -1 ? (
+                    <WorkingIndicator />
+                  ) : (
+                    <WorkingIndicator mode="announce" />
+                  ))}
                 {/* Managed-sandbox stage cue; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the

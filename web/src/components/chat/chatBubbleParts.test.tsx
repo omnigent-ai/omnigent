@@ -4,7 +4,12 @@ import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
-import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
+import {
+  BubbleView,
+  WorkingIndicator,
+  containsMermaidDiagram,
+  workingIndicatorPaints,
+} from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
 const initialStoreState = useChatStore.getState();
@@ -522,5 +527,69 @@ describe("UserBubble long-prompt collapse", () => {
     expect(bubble).not.toHaveTextContent("🔥");
     expect(bubble).not.toHaveTextContent(""); // make sure it's not corrupted
     expect(bubble).toHaveTextContent("a".repeat(COLLAPSE_THRESHOLD - 1));
+  });
+});
+
+describe("WorkingIndicator paint gating", () => {
+  const renderIndicator = (mode?: "full" | "visual" | "announce") =>
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <WorkingIndicator mode={mode} />
+      </QueryClientProvider>,
+    );
+
+  it("workingIndicatorPaints suppresses only the background-tasks-only state", () => {
+    // Suppressed only when background tasks outlive a finished turn.
+    expect(workingIndicatorPaints(2, null, false)).toBe(false);
+    // Otherwise it paints: no background tasks, an active turn, or a block.
+    expect(workingIndicatorPaints(0, null, false)).toBe(true);
+    expect(workingIndicatorPaints(2, null, true)).toBe(true);
+    expect(workingIndicatorPaints(0, "a dialog", false)).toBe(true);
+  });
+
+  it("renders nothing while only background tasks outlive a finished turn", () => {
+    useChatStore.setState({
+      sessionStatus: "idle",
+      status: "idle",
+      backgroundTaskCount: 2,
+      blockedOn: null,
+    });
+    const { container } = renderIndicator();
+    expect(container.querySelector('[data-testid="working-indicator"]')).toBeNull();
+    expect(container.querySelector('[role="status"]')).toBeNull();
+  });
+
+  it("shows the shimmer when the turn is active despite background tasks", () => {
+    useChatStore.setState({
+      sessionStatus: "idle",
+      status: "streaming",
+      backgroundTaskCount: 2,
+      blockedOn: null,
+    });
+    expect(
+      renderIndicator().container.querySelector('[data-testid="working-indicator"]'),
+    ).not.toBeNull();
+  });
+
+  it("splits the announce region from the relocated shimmer so neither duplicates", () => {
+    useChatStore.setState({
+      sessionStatus: "running",
+      status: "idle",
+      backgroundTaskCount: 0,
+      blockedOn: null,
+    });
+    const full = renderIndicator("full");
+    expect(full.container.querySelectorAll('[data-testid="working-indicator"]')).toHaveLength(1);
+    expect(full.container.querySelector('[role="status"]')?.textContent).toContain("Working…");
+    cleanup();
+
+    const announce = renderIndicator("announce");
+    expect(announce.container.querySelector('[data-testid="working-indicator"]')).toBeNull();
+    expect(announce.container.querySelector('[role="status"]')?.textContent).toContain("Working…");
+    cleanup();
+
+    const visual = renderIndicator("visual");
+    expect(visual.container.querySelectorAll('[data-testid="working-indicator"]')).toHaveLength(1);
+    expect(visual.container.querySelector('[role="status"]')).toBeNull();
   });
 });
