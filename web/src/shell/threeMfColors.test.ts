@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as THREE from "three";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
 import { strToU8, strFromU8, unzipSync, zipSync } from "three/examples/jsm/libs/fflate.module.js";
@@ -24,7 +24,11 @@ const composite = (id: number, components: string) =>
 const component = (id: number, x = 0, path = "") =>
   `<component objectid="${id}" transform="${transform(x)}" ${path ? `p:path="${path}"` : ""}/>`;
 
-function archive(overrides: Record<string, string | null> = {}, reverse = false): ArrayBuffer {
+function archive(
+  overrides: Record<string, string | null> = {},
+  reverse = false,
+  level: 0 | 6 = 6,
+): ArrayBuffer {
   const entries: Record<string, string | null> = {
     "_rels/.rels": rels,
     "3D/root.model": model(mesh(1) + mesh(2, 2) + composite(100, component(1) + component(2, 10))),
@@ -38,6 +42,7 @@ function archive(overrides: Record<string, string | null> = {}, reverse = false)
   if (reverse) pairs.reverse();
   const zipped = zipSync(
     Object.fromEntries(pairs.map(([path, text]) => [path, new Uint8Array(strToU8(text))])),
+    { level },
   );
   return zipped.buffer as ArrayBuffer;
 }
@@ -77,6 +82,202 @@ function check(
 }
 
 describe("Bambu filament colours through the stock 3MF loader", () => {
+  it("rejects forged selected ZIP sizes before parsing oversized XML", () => {
+    const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
+    try {
+      for (const name of ["Metadata/model_settings.config", "3D/root.model"]) {
+        const input = archive(
+          name.endsWith(".config")
+            ? { [name]: `<config>${" ".repeat(33 * 1024 * 1024)}</config>` }
+            : {},
+          false,
+          0,
+        );
+        const bytes = new Uint8Array(input);
+        const view = new DataView(input);
+        for (let offset = bytes.length - 22; offset >= 0; offset--) {
+          if (view.getUint32(offset, true) !== 0x02014b50) continue;
+          const filename = strFromU8(
+            bytes.subarray(offset + 46, offset + 46 + view.getUint16(offset + 28, true)),
+          );
+          if (filename === name) view.setUint32(offset + 24, 1, true);
+        }
+        parser.mockClear();
+        expect(applyThreeMfColors(input)).toBe(input);
+        expect(parser.mock.calls.every(([text]) => String(text).length <= 32 * 1024 * 1024)).toBe(
+          true,
+        );
+        check(input, ["ffffff", "ffffff"]);
+      }
+    } finally {
+      parser.mockRestore();
+    }
+  });
+
+  it("bounds cumulative colour-variant expansion before cloning meshes", () => {
+    const count = 35;
+    const input = archive({
+      "3D/root.model": model(
+        mesh(1).replace(
+          "<mesh>",
+          `<metadata name="large">${"x".repeat(1024 * 1024)}</metadata><mesh>`,
+        ) +
+          Array.from({ length: count }, (_, index) => composite(100 + index, component(1))).join(
+            "",
+          ),
+        Array.from(
+          { length: count },
+          (_, index) => `<item objectid="${100 + index}" transform="${transform(index * 10)}"/>`,
+        ).join(""),
+      ),
+      "Metadata/model_settings.config": `<config>${Array.from({ length: count }, (_, index) => config(part(1, index + 1), undefined, 100 + index)).join("")}</config>`,
+      "Metadata/project_settings.config": JSON.stringify({
+        filament_colour: Array.from(
+          { length: count },
+          (_, index) => `#${(index + 1).toString(16).padStart(6, "0")}`,
+        ),
+      }),
+    });
+    const importer = vi.spyOn(Document.prototype, "importNode");
+    try {
+      expect(applyThreeMfColors(input) === input).toBe(true);
+      const meshCopies = importer.mock.calls.filter(
+        ([node]) => node instanceof Element && node.getAttribute("id") === "1",
+      );
+      expect(meshCopies.length).toBeGreaterThan(0);
+      expect(meshCopies.length).toBeLessThan(32);
+    } finally {
+      importer.mockRestore();
+    }
+    check(
+      input,
+      Array.from({ length: count }, () => "ffffff"),
+      Array.from({ length: count }, (_, index) => index * 10),
+      Array.from({ length: count }, () => 1),
+    );
+  });
+
+  it("memoizes repeated leaf instances before deep import", () => {
+    const count = 80;
+    const input = archive({
+      "3D/root.model": model(
+        mesh(1) + mesh(2, 2),
+        Array.from(
+          { length: count },
+          (_, index) => `<item objectid="1" transform="${transform(index * 10)}"/>`,
+        ).join("") + `<item objectid="2" transform="${transform(1000)}"/>`,
+      ),
+      "Metadata/model_settings.config": `<config>${config(part(1, 1), undefined, 1)}${config(part(2, 2), undefined, 2)}</config>`,
+    });
+    const importer = vi.spyOn(Document.prototype, "importNode");
+    let normalized: ArrayBuffer;
+    try {
+      normalized = applyThreeMfColors(input);
+      expect(normalized).not.toBe(input);
+      expect(
+        importer.mock.calls.filter(
+          ([node]) => node instanceof Element && node.getAttribute("id") === "1",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      importer.mockRestore();
+    }
+    const document = new DOMParser().parseFromString(
+      strFromU8(unzipSync(new Uint8Array(normalized))["3D/3dmodel.model"]),
+      "application/xml",
+    );
+    expect(document.querySelectorAll("object > mesh")).toHaveLength(2);
+    const rows = check(
+      input,
+      [...Array.from({ length: count }, () => "f53b9d"), "4dc5a0"],
+      [...Array.from({ length: count }, (_, index) => index * 10), 1000],
+      [...Array.from({ length: count }, () => 1), 2],
+    );
+    expect(new Set(rows.slice(0, count).map((row) => row.geometry)).size).toBe(1);
+  });
+
+  it("keeps many instances of a multi-part plate coloured and shared", () => {
+    const instances = 200;
+    const parts = 50;
+    const input = archive({
+      "3D/root.model": model(
+        Array.from({ length: parts }, (_, index) => mesh(index + 1, index + 1)).join("") +
+          composite(
+            100,
+            Array.from({ length: parts }, (_, index) => component(index + 1, index * 10)).join(""),
+          ),
+        Array.from(
+          { length: instances },
+          (_, index) => `<item objectid="100" transform="${transform(index * 1000)}"/>`,
+        ).join(""),
+      ),
+      "Metadata/model_settings.config": `<config>${config(Array.from({ length: parts }, (_, index) => part(index + 1, (index % 2) + 1)).join(""))}</config>`,
+    });
+    const normalized = applyThreeMfColors(input);
+    expect(normalized).not.toBe(input);
+    const document = new DOMParser().parseFromString(
+      strFromU8(unzipSync(new Uint8Array(normalized))["3D/3dmodel.model"]),
+      "application/xml",
+    );
+    expect(document.querySelectorAll("resources > object")).toHaveLength(parts + 1);
+    check(
+      input,
+      Array.from({ length: instances * parts }, (_, index) => (index % 2 ? "4dc5a0" : "f53b9d")),
+      Array.from(
+        { length: instances * parts },
+        (_, index) => Math.floor(index / parts) * 1000 + (index % parts) * 10,
+      ),
+      Array.from({ length: instances * parts }, (_, index) => (index % parts) + 1),
+    );
+  });
+
+  it("keeps root composites separate from colliding config parts", () => {
+    for (const subtype of ["normal_part", "modifier_part"]) {
+      for (const inherited of [undefined, 0]) {
+        const ids = subtype === "normal_part" ? [100, 2, 3, 4] : [100, 2, 3, 4, 5];
+        const input = archive({
+          "3D/root.model": model(
+            composite(
+              100,
+              ids.map((id, index) => component(id, index * 10, "Objects/parts.model")).join(""),
+            ),
+          ),
+          "3D/Objects/parts.model": model(ids.map((id, index) => mesh(id, index + 1)).join(""), ""),
+          "Metadata/model_settings.config": `<config>${config(part(100, 1, subtype) + part(2, 2) + part(3, inherited) + part(5, 4), 2)}</config>`,
+        });
+        check(
+          input,
+          subtype === "normal_part"
+            ? ["f53b9d", "4dc5a0", "4dc5a0", "ffffff"]
+            : ["ffffff", "4dc5a0", "4dc5a0", "ffffff", "ff7a18"],
+          ids.map((_, index) => index * 10),
+          ids.map((_, index) => index + 1),
+        );
+      }
+    }
+  });
+
+  it("resolves build-item paths before colliding root object ids", () => {
+    for (const path of ["Objects/../Objects/plate.model", "/3D/Objects/plate.model"]) {
+      const input = archive({
+        "3D/root.model": model(
+          mesh(1) + mesh(2, 2) + composite(100, component(1) + component(2, 10)),
+          `<item objectid="100" p:path="${path}" transform="${transform(10)}"/>`,
+        ),
+        "3D/Objects/plate.model": model(
+          mesh(1, 3) + mesh(2, 5) + composite(100, component(1) + component(2, 20)),
+          "",
+        ),
+      });
+      check(input, ["f53b9d", "4dc5a0"], [10, 30], [3, 5]);
+      const document = new DOMParser().parseFromString(
+        strFromU8(unzipSync(new Uint8Array(applyThreeMfColors(input)))["3D/3dmodel.model"]),
+        "application/xml",
+      );
+      expect(document.querySelector("build > item")?.getAttributeNS(production, "path")).toBeNull();
+    }
+  });
+
   it("resolves overrides, object inheritance, zero inheritance and the default slot", () => {
     const resources =
       [1, 2, 3, 4, 5].map((id) => mesh(id, id)).join("") +
