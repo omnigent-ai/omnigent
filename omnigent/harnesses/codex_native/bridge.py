@@ -1120,6 +1120,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
             _STARTUP_ERROR_FILE,
             _STARTUP_TIMEOUT_FILE,
             _MCP_STARTUP_FILE,
+            _EGRESS_CERTIFICATE_FILE,
         ):
             try:
                 (bridge_dir / name).unlink()

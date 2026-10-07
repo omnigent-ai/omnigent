@@ -270,8 +270,7 @@ def test_codex_launcher_certificate_failure_fails_fast_with_actionable_error(
         raise SystemExit(asyncio.run(main()))
         """
     )
-    # An unfixed head never sees a terminal event and waits for the idle
-    # watchdog, so the bound below is the fail-before signal.
+    # The timeout bounds the fast-fail path; without it the turn hangs until the idle watchdog.
     result = subprocess.run(
         [str(omnigent_python), "-c", driver],
         env=env,
@@ -283,7 +282,9 @@ def test_codex_launcher_certificate_failure_fails_fast_with_actionable_error(
 
     output = f"{result.stdout}\n{result.stderr}"
     assert result.returncode != 0, output
-    errors = json.loads(result.stdout.strip().splitlines()[-1])
+    stdout_lines = result.stdout.strip().splitlines()
+    assert stdout_lines, output
+    errors = json.loads(stdout_lines[-1])
     assert len(errors) == 1, output
     error = errors[0]
     assert "could not connect to its model endpoint for databricks-gpt-5" in error["message"]

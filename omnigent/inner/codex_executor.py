@@ -49,6 +49,7 @@ from omnigent.harnesses.codex_egress import (
     certificate_failure_message,
     connection_retry_detail,
     detect_certificate_failure,
+    is_connection_failure_text,
     is_connection_retry,
 )
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
@@ -2815,6 +2816,8 @@ class _CodexAppServerSession:
         # launcher prints it once at start, so it stays until a turn reaches
         # the model and proves the egress works.
         self._certificate_failure: CertificateFailure | None = None
+        # Whether this turn saw Codex retry a request that got no HTTP response.
+        self._saw_connection_retry = False
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
         self._worker_launch: CodexWorkerLaunch | None = None
@@ -3577,6 +3580,7 @@ class _CodexAppServerSession:
         self._pending_fatal_gateway_error = None
         self._saw_retries_exhausted = False
         self._fatal_gateway_error = None
+        self._saw_connection_retry = False
         native_forwarder_health.note_post_success()
 
         is_new_thread = self.thread_id is None
@@ -4056,7 +4060,7 @@ class _CodexAppServerSession:
                             active_turn_id,
                         )
                         continue
-                    if _codex_turn_status(turn) == "completed":
+                    if _codex_turn_status(turn) in (None, "completed"):
                         # The model answered, so a certificate failure printed at
                         # launch no longer describes this process's egress.
                         self._certificate_failure = None
@@ -4085,14 +4089,18 @@ class _CodexAppServerSession:
                     )
                     if failed_turn_id is not None and failed_turn_id != active_turn_id:
                         continue
-                    if self._certificate_failure is not None:
-                        yield self._certificate_error(model)
-                        return
                     error_text = str(
                         params.get("message")
                         or turn.get("error")
                         or "Codex App Server turn failed"
                     )
+                    # Only a connection-level failure is the certificate's doing;
+                    # a tool or provider error keeps its own retryable text.
+                    if self._certificate_failure is not None and (
+                        self._saw_connection_retry or is_connection_failure_text(error_text)
+                    ):
+                        yield self._certificate_error(model, codex_error=error_text)
+                        return
                     # turn/failed is a provider/runtime-level turn error
                     # (e.g. tool exit code, transient provider issue) —
                     # mark retryable so the workflow's retry policy
@@ -4106,6 +4114,7 @@ class _CodexAppServerSession:
                             # Codex retries a connection failure indefinitely:
                             # name it for the idle watchdog, and fail fast once
                             # the launcher has already reported the certificate.
+                            self._saw_connection_retry = True
                             native_forwarder_health.record_transport_failure(
                                 connection_retry_detail(params)
                             )
@@ -4185,11 +4194,15 @@ class _CodexAppServerSession:
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.debug("Codex %s turn interrupt failed: %s", cause, exc)
 
-    def _certificate_error(self, model: str | None) -> ExecutorError:
+    def _certificate_error(
+        self, model: str | None, *, codex_error: str | None = None
+    ) -> ExecutorError:
         """The terminal error for a turn blocked by the launcher-reported certificate failure."""
         assert self._certificate_failure is not None
         return ExecutorError(
-            message=certificate_failure_message(self._certificate_failure, model=model),
+            message=certificate_failure_message(
+                self._certificate_failure, model=model, codex_error=codex_error
+            ),
             retryable=False,
             code=CERTIFICATE_FAILURE_CODE,
             title=CERTIFICATE_FAILURE_TITLE,

@@ -9,6 +9,7 @@ from omnigent.harnesses.codex_egress import (
     certificate_failure_message,
     connection_retry_detail,
     detect_certificate_failure,
+    is_connection_failure_text,
     is_connection_retry,
 )
 
@@ -137,3 +138,33 @@ def test_certificate_failure_message_names_model_cause_and_evidence() -> None:
         "Codex could not connect to its model endpoint: the TLS certificate has expired"
     )
     assert "run dbcert" in CERTIFICATE_REMEDIATION
+
+
+def test_connection_retry_detail_redacts_and_bounds_codex_text() -> None:
+    params = _retry(
+        {
+            "message": "Reconnecting... waiting for network",
+            "additionalDetails": (
+                "error sending request for url (https://user:secret@proxy.example/v1) "
+                + "x" * 1000
+            ),
+        }
+    )
+    detail = connection_retry_detail(params)
+    assert "secret" not in detail
+    assert "https://[REDACTED]@proxy.example/v1" in detail
+    assert len(detail) <= 300 + len("Codex is reconnecting to its model endpoint ()")
+
+
+def test_is_connection_failure_text_matches_connection_level_wording() -> None:
+    assert is_connection_failure_text("stream disconnected: error sending request") is True
+    assert is_connection_failure_text("Connection failed: error trying to connect") is True
+    assert is_connection_failure_text("tool exited with code 1") is False
+    assert is_connection_failure_text(None) is False
+
+
+def test_certificate_failure_message_keeps_codex_text() -> None:
+    failure = detect_certificate_failure(_DBCERT_LINE)
+    assert failure is not None
+    message = certificate_failure_message(failure, codex_error="stream disconnected")
+    assert message.endswith("). Codex reported: stream disconnected")

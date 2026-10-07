@@ -122,8 +122,19 @@ def is_connection_retry(params: Mapping[str, object]) -> bool:
     status = _http_status_from_error_info(error.get("codexErrorInfo"))
     if status is not _NO_STATUS_FIELD:
         return status is None
-    text = " ".join(str(error.get(key) or "") for key in ("message", "additionalDetails")).lower()
-    return any(fragment in text for fragment in _CONNECTION_FAILURE_FRAGMENTS)
+    return is_connection_failure_text(
+        " ".join(str(error.get(key) or "") for key in ("message", "additionalDetails"))
+    )
+
+
+def is_connection_failure_text(text: str | None) -> bool:
+    """Whether Codex error text describes a request that never reached the endpoint.
+
+    :param text: Error text, e.g. ``"Connection failed: error sending request"``.
+    :returns: ``True`` for connection-level wording.
+    """
+    lowered = (text or "").lower()
+    return any(fragment in lowered for fragment in _CONNECTION_FAILURE_FRAGMENTS)
 
 
 def connection_retry_detail(params: Mapping[str, object]) -> str:
@@ -139,19 +150,30 @@ def connection_retry_detail(params: Mapping[str, object]) -> str:
         message = str(error.get("message") or "").strip()
         details = str(error.get("additionalDetails") or "").strip()
     text = ": ".join(part for part in (message, details) if part) or "no detail reported"
+    text = " ".join(sanitize_diagnostic_text(text).split())[:_EVIDENCE_LIMIT]
     return f"Codex is reconnecting to its model endpoint ({text})"
 
 
-def certificate_failure_message(failure: CertificateFailure, *, model: str | None = None) -> str:
+def certificate_failure_message(
+    failure: CertificateFailure,
+    *,
+    model: str | None = None,
+    codex_error: str | None = None,
+) -> str:
     """The user-facing cause for a turn Codex could not get past a bad certificate.
 
     :param failure: The failure read off the launcher's stderr.
     :param model: The model the turn ran with, e.g. ``"gpt-5"``, or ``None``.
+    :param codex_error: Codex's own failure text for the turn, kept alongside
+        the certificate cause, or ``None``.
     :returns: e.g. ``"Codex could not connect to its model endpoint for gpt-5:
         the TLS certificate has expired (stderr: ...)."``
     """
     target = f" for {model}" if model else ""
-    return (
+    message = (
         f"Codex could not connect to its model endpoint{target}: "
         f"{failure.cause} (stderr: {failure.evidence})."
     )
+    if codex_error:
+        message = f"{message} Codex reported: {codex_error}"
+    return message

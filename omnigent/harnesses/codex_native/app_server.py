@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
 from omnigent.harnesses.codex_native.bridge import (
+    clear_certificate_failure,
     mirror_applied_codex_settings,
     read_codex_config_model,
     read_codex_home_config_effort,
@@ -1982,6 +1983,8 @@ class CodexNativeAppServer:
             )
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
+        # A previous launch's certificate record must not fail this launch's turns.
+        clear_certificate_failure(self.bridge_dir)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
             with contextlib.suppress(FileNotFoundError):
                 self.socket_path.unlink()

@@ -3571,12 +3571,21 @@ async def _maybe_fail_turn_on_certificate_failure(
     if failure is None:
         return False
     turn_id = _turn_id_from_payload(params)
-    if forwarder_state is not None and turn_id is not None:
-        if turn_id in forwarder_state.surfaced_terminal_error_turns:
-            return True
-        forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+    if forwarder_state is None or turn_id is None:
+        # Without per-turn state the failure could be posted once per retry and
+        # the interrupt's own boundary could flip it back to idle; leave the
+        # retry to Codex.
+        _logger.info(
+            "Codex forwarder cannot fail retrying turn on certificate failure "
+            "without turn state: turn_id=%s",
+            turn_id,
+        )
+        return False
+    if turn_id in forwarder_state.surfaced_terminal_error_turns:
+        return True
+    forwarder_state.surfaced_terminal_error_turns.add(turn_id)
     thread_id = _thread_id_from_params(params)
-    if codex_client is not None and turn_id is not None and thread_id is not None:
+    if codex_client is not None and thread_id is not None:
         try:
             await codex_client.request(
                 "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
@@ -3585,14 +3594,13 @@ async def _maybe_fail_turn_on_certificate_failure(
             _logger.warning(
                 "Codex turn interrupt after a certificate failure failed", exc_info=True
             )
-    if turn_id is not None:
-        clear_active_turn_id_if_matches(bridge_dir, turn_id)
+    clear_active_turn_id_if_matches(bridge_dir, turn_id)
     _logger.warning(
         "Codex forwarder failing turn on launcher certificate failure: turn_id=%s evidence=%s",
         turn_id,
         failure.evidence,
     )
-    model = forwarder_state.model if forwarder_state is not None else None
+    model = forwarder_state.model
     async with _conversation_item_delivery_scope(session_id):
         if delta_coalescer is not None:
             await delta_coalescer.flush()
@@ -4996,7 +5004,7 @@ def _terminal_turn_status_edge(
                 terminal_turn_id,
                 method,
             )
-        if _turn_status(params) == "completed":
+        if _turn_status_from_params(params) in (None, "completed"):
             # The model answered, so a certificate failure recorded at launch
             # no longer describes this app-server's egress.
             clear_certificate_failure(bridge_dir)
@@ -5005,22 +5013,6 @@ def _terminal_turn_status_edge(
         turn_id=terminal_turn_id,
         source=source,
     )
-
-
-def _turn_status(params: _JsonObject) -> str | None:
-    """
-    Return a Codex turn's recorded status, e.g. ``"completed"`` or ``"interrupted"``.
-
-    :param params: Codex turn event params.
-    :returns: The status string, or ``None`` when the turn carries none.
-    """
-    turn = params.get("turn")
-    if not isinstance(turn, dict):
-        return None
-    status = turn.get("status")
-    if isinstance(status, dict):
-        status = status.get("type") or status.get("status")
-    return status if isinstance(status, str) else None
 
 
 def _turn_status_is_failed(params: _JsonObject) -> bool:
@@ -5034,7 +5026,7 @@ def _turn_status_is_failed(params: _JsonObject) -> bool:
     :param params: Codex turn event params.
     :returns: ``True`` when ``params['turn']['status']`` resolves to ``failed``.
     """
-    return _turn_status(params) in {"failed", "errored"}
+    return _turn_status_from_params(params) in {"failed", "errored"}
 
 
 def _turn_items_are_empty(params: _JsonObject) -> bool:
