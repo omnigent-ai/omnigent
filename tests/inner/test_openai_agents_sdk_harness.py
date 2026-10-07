@@ -13,6 +13,7 @@ API) lives in the e2e suite via :mod:`tests.e2e.test_harness_wrap_e2e`.
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 from unittest.mock import patch
 
@@ -347,3 +348,58 @@ def test_executor_factory_no_env_returns_blank_config(
     assert captured["model"] is None
     assert captured["use_responses"] is True
     assert captured["reasoning_item_id_policy"] is None
+
+
+def test_create_app_starts_the_first_turn_prewarm_once() -> None:
+    """``create_app()`` imports the SDK in the background, once per process."""
+    openai_agents_sdk_harness.create_app()
+    thread = openai_agents_sdk_harness._sdk_prewarm()
+    openai_agents_sdk_harness.create_app()
+
+    assert openai_agents_sdk_harness._sdk_prewarm() is thread
+    thread.join(timeout=60)
+    assert not thread.is_alive()
+    # The modules the first turn would otherwise import are now loaded.
+    for module in openai_agents_sdk_harness._PREWARM_MODULES:
+        assert module in sys.modules
+
+
+def test_executor_factory_waits_for_the_prewarm_before_building() -> None:
+    """The first turn never imports the SDK concurrently with the prewarm thread."""
+    order: list[str] = []
+
+    class _Thread:
+        def join(self, timeout: float | None = None) -> None:
+            order.append(f"join({timeout})")
+
+    def _fake_init(self: Any, **_kwargs: Any) -> None:
+        order.append("executor")
+
+    with (
+        patch.object(openai_agents_sdk_harness, "_sdk_prewarm", lambda: _Thread()),
+        patch(
+            "omnigent.inner.openai_agents_sdk_harness.OpenAIAgentsSDKExecutor.__init__",
+            _fake_init,
+        ),
+    ):
+        openai_agents_sdk_harness._build_openai_agents_sdk_executor()
+
+    assert order == [f"join({openai_agents_sdk_harness._PREWARM_JOIN_TIMEOUT_S})", "executor"]
+
+
+def test_prewarm_leaves_import_failures_to_the_first_turn() -> None:
+    """A failed prewarm import is swallowed; the real call site still reports it."""
+    platform_calls: list[None] = []
+
+    def _fail(_name: str) -> None:
+        raise ImportError("openai-agents is not installed")
+
+    with (
+        patch.object(openai_agents_sdk_harness.importlib, "import_module", _fail),
+        patch.object(
+            openai_agents_sdk_harness.platform, "platform", lambda: platform_calls.append(None)
+        ),
+    ):
+        openai_agents_sdk_harness._prewarm_first_turn()
+
+    assert platform_calls == []
