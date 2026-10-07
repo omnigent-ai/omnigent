@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 from pydantic import BaseModel, Field
 
 from omnigent.process_logging import data_dir
@@ -100,11 +101,14 @@ class SessionPrRegistry:
         return state
 
     def list(self) -> list[SessionPullRequest]:
-        """Read a locked snapshot; corruption is reported without overwriting it."""
+        """Read a locked snapshot, reporting corruption or contention as ValueError."""
         if not self.path.parent.exists():
             return []
-        with FileLock(str(self.path) + ".lock", timeout=1):
-            return sorted(self._read().prs, key=lambda pr: pr.last_seen_at, reverse=True)
+        try:
+            with FileLock(str(self.path) + ".lock", timeout=1):
+                return sorted(self._read().prs, key=lambda pr: pr.last_seen_at, reverse=True)
+        except FileLockTimeout as exc:
+            raise ValueError("PR tracking is busy; try again.") from exc
 
     def _write(self, state: _Registry) -> None:
         foreign = [pr for pr in state.prs if pr.provider != "github"]
