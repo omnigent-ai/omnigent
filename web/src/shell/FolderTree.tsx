@@ -1065,16 +1065,12 @@ function FileRowItem({
             included) shares it: metadata at rest, the copy/download pair on
             hover. */}
             <span
-              className={cn(
-                "relative flex shrink-0 items-center justify-end",
-                ROW_META_SLOT_CLASS,
-                "pointer-coarse:justify-start",
-              )}
+              className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
             >
               {bytes !== null && !isDeleted && (
                 <span
                   className={cn(
-                    "mr-6 w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-has-[:focus-visible]:invisible",
+                    "w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-has-[:focus-visible]:invisible",
                     actionsOpen && "invisible",
                   )}
                 >
