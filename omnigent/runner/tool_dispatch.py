@@ -7206,7 +7206,11 @@ async def _execute_os_env_tool(
         session.
     :returns: Serialized tool result string.
     """
-    from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
+    from omnigent.inner.os_env import (
+        _DEFAULT_READ_LIMIT,
+        agent_identity_env,
+        create_os_environment,
+    )
 
     os_env = None
     owns_environment = True
@@ -7233,7 +7237,9 @@ async def _execute_os_env_tool(
                 else []
             )
             os_env = create_os_environment(
-                effective_spec, additional_read_roots=additional_read_roots
+                effective_spec,
+                additional_read_roots=additional_read_roots,
+                extra_env=agent_identity_env(agent_spec),
             )
         if os_env is None:
             return "Error: unable to create OSEnvironment"

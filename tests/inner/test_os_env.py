@@ -22,6 +22,7 @@ from omnigent.inner.os_env import (
     _project_root,
     _read_impl,
     _shell_impl,
+    agent_identity_env,
     build_helper_env,
     create_os_environment,
 )
@@ -31,6 +32,7 @@ from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
 )
+from omnigent.spec.types import AgentSpec
 
 
 def _inactive_policy() -> SandboxPolicy:
@@ -669,3 +671,36 @@ def test_close_stops_the_helper_and_releases_its_spawner_thread(
         assert not thread.is_alive()
     os_env.close()
     assert asyncio.run(os_env.shell("true")) == {"error": "OS environment helper is closed"}
+
+
+def test_extra_env_survives_helper_env_filtering(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``extra_env`` is applied after ``build_helper_env``, so an allowlist can't drop it.
+
+    :returns: None.
+    """
+    real_build = build_helper_env
+    monkeypatch.setattr(
+        "omnigent.inner.os_env.build_helper_env",
+        lambda parent, policy: {
+            k: v for k, v in real_build(parent, policy).items() if k in ("PATH", "HOME")
+        },
+    )
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none")),
+        extra_env=agent_identity_env(AgentSpec(spec_version=1, name="code-reviewer")),
+    )
+    assert os_env is not None
+    try:
+        result = asyncio.run(os_env.shell("echo name=$OMNIGENT_AGENT_NAME"))
+    finally:
+        os_env.close()
+
+    assert result.get("stdout") == "name=code-reviewer\n"
+
+
+def test_agent_identity_env_is_empty_without_a_named_agent() -> None:
+    """No agent spec means no identity variable.
+
+    :returns: None.
+    """
+    assert agent_identity_env(None) == {}
