@@ -99,7 +99,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { MOD_KEY } from "@/components/KeyboardShortcut";
+import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
 import { withBasePath } from "@/lib/basePath";
@@ -1542,7 +1542,7 @@ function ComposerSendShortcutControl() {
         className="flex-1"
         description={
           <>
-            <p>Off: Enter submits and Shift+Enter inserts a newline.</p>
+            <p>Off: Enter submits and Shift+Enter or {ALT_KEY}+Enter inserts a newline.</p>
             <p>On: Enter inserts a newline and {MOD_KEY}+Enter submits.</p>
           </>
         }

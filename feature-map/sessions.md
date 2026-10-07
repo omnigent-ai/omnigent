@@ -10,6 +10,8 @@ the header menu), and each place is a separate entry point.
 ## Sub-features
 
 - `pin`: pinned sessions move to their own section and back.
+- `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
+  old Pinned slot. Dragging a pinned row into a folder unpins it without one.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
   row pins it into that slot.
@@ -113,6 +115,11 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
+- **`pin-undo`, sidebar row:**
+  `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_undo_unpin_restores_pinned_slot`.
+  The row menu (mobile) and header menu Unpin have web unit coverage only:
+  unpin a pinned session, click Undo on the toast, and expect it back in the
+  same Pinned position.
 - **`pin-reorder`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`.
   Dropping an unpinned row onto a pinned row has web unit coverage only.

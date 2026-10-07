@@ -1987,14 +1987,17 @@ export function useTogglePinnedConversation() {
       patch(id, labels, pinned);
       return { prevPinned, prevPin: base[PINNED_LABEL_KEY] };
     },
-    onError: (_err, { id }, ctx) => {
+    onError: (_err, { id, pinned }, ctx) => {
+      // No context: `onMutate` refused the write and already said why.
+      if (!ctx) return;
       // Roll back only the pin key (other labels may have changed meanwhile),
       // then restore the pinned section's own snapshot.
-      if (!ctx) return;
       restorePinLabelInCaches(queryClient, id, ctx.prevPin);
       if (ctx.prevPinned !== undefined) {
         queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, ctx.prevPinned);
       }
+      // The row snaps back, so say why (e.g. an Undo re-pin that didn't save).
+      showToast(pinned ? "Couldn't pin the session." : "Couldn't unpin the session.");
     },
     onSuccess: (updated, { pinned }) => {
       // No `markConversationSeen` here: a pin PATCH writes only the label row,

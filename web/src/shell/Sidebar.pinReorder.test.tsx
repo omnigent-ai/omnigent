@@ -1,6 +1,6 @@
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
-import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -9,6 +9,7 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 // gap between the pins every value is renumbered: the new pin goes through the
 // pin toggle and, once it's accepted, the existing pins through the batch
 // reorder. The toggle is a real mutation so per-call callback behaviour holds.
+// Unpinning from a row offers an Undo that re-pins into the same slot.
 const mocks = vi.hoisted(() => ({
   pinned: [] as ReturnType<typeof conv>[],
   filterHonored: true,
@@ -38,6 +39,8 @@ vi.mock("@/hooks/useConversations", async () => {
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { useConversations } from "@/hooks/useConversations";
+import { Toaster } from "@/components/ui/sonner";
+import { toast } from "sonner";
 
 const ROW_HEIGHT = 30;
 
@@ -187,5 +190,51 @@ describe("dropping an unpinned session onto a pinned row", () => {
       resolvePin();
     });
     await waitFor(() => expect(pinButton("conv_d")).toHaveAttribute("aria-disabled", "false"));
+  });
+});
+
+describe("unpinning from a sidebar row", () => {
+  const row = (id: string) => screen.getByRole("link", { name: id }).closest("li")!;
+
+  // Sonner keeps toasts in module state across mounts.
+  afterEach(() => {
+    toast.dismiss();
+  });
+
+  it.each([
+    [
+      "quick-pin button",
+      () => fireEvent.click(row("conv_a").querySelector('[data-testid="quick-pin-conversation"]')!),
+    ],
+    [
+      "kebab Unpin item",
+      () => {
+        // Radix DropdownMenu opens on pointerdown, not click.
+        fireEvent.pointerDown(
+          row("conv_a").querySelector('[data-testid="conversation-actions"]')!,
+          {
+            button: 0,
+          },
+        );
+        fireEvent.click(screen.getByTestId("pin-conversation"));
+      },
+    ],
+  ])("offers an Undo from the %s that re-pins into the old slot", async (_name, unpin) => {
+    mocks.pinFn.mockResolvedValue({});
+    render(<Toaster />);
+    renderSidebar();
+
+    unpin();
+
+    await waitFor(() =>
+      expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({ id: "conv_a", pinned: false }),
+    );
+    const pill = await screen.findByTestId("unpin-undo-toast-item");
+    expect(pill).toHaveTextContent("Unpinned session");
+    expect(pill).toHaveTextContent("conv_a");
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() =>
+      expect(mocks.pinFn).toHaveBeenLastCalledWith({ id: "conv_a", pinned: true, pinnedAt: 1000 }),
+    );
   });
 });

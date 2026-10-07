@@ -65,6 +65,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
@@ -231,7 +232,11 @@ export function HeaderConversationMenu({
         data-testid="header-pin-conversation"
         className={itemClass}
         disabled={pinSaving}
-        onSelect={() => togglePinned.mutate({ id: conversation.id, pinned: !isPinned })}
+        onSelect={() =>
+          isPinned
+            ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
+            : togglePinned.mutate({ id: conversation.id, pinned: true })
+        }
       >
         {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
         {isPinned ? "Unpin" : "Pin"}

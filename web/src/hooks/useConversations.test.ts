@@ -1762,6 +1762,11 @@ describe("overlapping pin writes", () => {
     "refuses an unpin while a reorder is saving, then the reorder %s",
     async (_outcome, response, expected) => {
       const { result, state, respond } = setup("3000");
+      const toasts: string[] = [];
+      const onToast = (e: Event) => {
+        toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+      };
+      window.addEventListener("omnigent:toast", onToast);
 
       act(() => result.current.reorder.mutate([{ id: "conv_c", pinnedAt: 999 }]));
       act(() => result.current.toggle.mutate({ id: "conv_c", pinned: false }));
@@ -1771,6 +1776,10 @@ describe("overlapping pin writes", () => {
       await waitFor(() => expect(result.current.reorder.isSuccess).toBe(true));
       expect(fetchMock).toHaveBeenCalledOnce();
       expect(state()).toEqual({ list: expected, pinned: expected });
+      // The refusal explains itself once; it isn't also reported as a failed unpin.
+      expect(toasts).toContain("Still saving your pins. Try again in a moment.");
+      expect(toasts).not.toContain("Couldn't unpin the session.");
+      window.removeEventListener("omnigent:toast", onToast);
     },
   );
 
@@ -1799,11 +1808,16 @@ describe("overlapping pin writes", () => {
 
 describe("useTogglePinnedConversation failure rollback", () => {
   it.each([
-    ["unpin", "3000", false],
-    ["pin", undefined, true],
+    ["unpin", "3000", false, "Couldn't unpin the session."],
+    ["pin", undefined, true, "Couldn't pin the session."],
   ] as const)(
     "a failed %s rolls back only the pin key, keeping labels changed meanwhile",
-    async (_action, pinValue, pinned) => {
+    async (_action, pinValue, pinned, message) => {
+      const toasts: string[] = [];
+      const onToast = (e: Event) => {
+        toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+      };
+      window.addEventListener("omnigent:toast", onToast);
       let rejectPatch!: (r: Response) => void;
       fetchMock.mockImplementationOnce(
         () =>
@@ -1860,6 +1874,9 @@ describe("useTogglePinnedConversation failure rollback", () => {
           .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
           ?.conversations.map((c) => c.id) ?? [];
       expect(pinnedIds).toEqual(pinValue === undefined ? [] : ["conv_x"]);
+      // The row snapped back, so the user is told the write didn't save.
+      expect(toasts).toEqual([message]);
+      window.removeEventListener("omnigent:toast", onToast);
     },
   );
 });

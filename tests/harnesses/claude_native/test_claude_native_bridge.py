@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from typing import Any, TextIO
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
@@ -11234,37 +11235,62 @@ _PRE_TOOL_USE_PAYLOAD: dict[str, object] = {
 }
 
 
-class _ScriptedPolicyClient:
-    """Fake runner policy client with a scripted body or failure.
+_USER_PROMPT_SUBMIT_PAYLOAD: dict[str, object] = {
+    "hook_event_name": "UserPromptSubmit",
+    "prompt": "hello",
+}
 
-    :param body: JSON body for every response, or ``None`` to raise.
+
+class _ScriptedPolicyClient:
+    """Fake runner policy client replaying one scripted step per POST.
+
+    :param steps: Replayed in order, the last one repeating: a dict body
+        answers 200, an int answers that status with an empty body, an
+        exception is raised, and ``None`` raises a connection failure.
     """
 
-    def __init__(self, body: dict[str, object] | None) -> None:
-        """Store the script.
-
-        :param body: Response payload; ``None`` makes every call raise.
-        """
-        self.body = body
+    def __init__(self, *steps: dict[str, object] | int | BaseException | None) -> None:
+        self.steps = list(steps)
         self.calls = 0
+        self.bodies: list[dict[str, object] | None] = []
 
     async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
-        """Return the scripted verdict or raise a transport error.
+        """Replay the next step as a minimal httpx-Response-shaped namespace.
 
         :param url: Evaluate path (ignored).
-        :param json: Forwarded EvaluationRequest (ignored).
-        :returns: Minimal httpx-Response-shaped namespace.
+        :param json: Forwarded EvaluationRequest; recorded for identity checks.
+        :returns: Response namespace, or raises the scripted failure.
         """
         import json as _json
 
-        del url, json
+        del url
+        self.bodies.append(json)
+        step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
-        if self.body is None:
+        if step is None:
             raise ConnectionError("scripted transport failure")
-        raw = _json.dumps(self.body).encode("utf-8")
+        if isinstance(step, BaseException):
+            raise step
+        if isinstance(step, int):
+            return SimpleNamespace(status_code=step, content=b"", headers={})
+        raw = _json.dumps(step).encode("utf-8")
         return SimpleNamespace(
             status_code=200, content=raw, headers={"Content-Type": "application/json"}
         )
+
+
+@pytest.fixture
+def _policy_retry_clock(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Advance relay retry time without changing asyncio's real clock."""
+    clock = Mock(wraps=time)
+    clock.monotonic.return_value = 0.0
+
+    def advance(seconds: float) -> None:
+        clock.monotonic.return_value += seconds
+
+    clock.sleep.side_effect = advance
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    return clock
 
 
 def _hook_relay(tmp_path, monkeypatch, client):
@@ -11381,6 +11407,106 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
         )
         assert post_body == "", "PostToolUse must fail open (tool already ran)"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
+        httpx.ConnectTimeout("connect timed out"),
+    ],
+)
+async def test_hook_evaluate_endpoint_retries_connect_failures_within_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock, error: Exception
+) -> None:
+    """A prompt survives a connection failure lasting beyond three attempts."""
+    client = _ScriptedPolicyClient(error, error, error, {"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        assert body == "", f"recovered lookup must let the prompt through, got {body!r}"
+        assert client.calls == 4
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [1, 2, 4]
+        assert len({body["_omnigent_elicitation_id"] for body in client.bodies if body}) == 1
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_event", ["UserPromptSubmit", "PreToolUse", "PostToolUse"])
+async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock, hook_event: str
+) -> None:
+    """A sustained resolver failure retains each event's enforcement behavior."""
+    client = _ScriptedPolicyClient(
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known")
+    )
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            {
+                **_PRE_TOOL_USE_PAYLOAD,
+                **_USER_PROMPT_SUBMIT_PAYLOAD,
+                "hook_event_name": hook_event,
+                "tool_response": "done",
+            },
+        )
+        if hook_event == "UserPromptSubmit":
+            output = json.loads(body)
+            assert output["decision"] == "block"
+            assert "failing closed for this request" in output["reason"]
+        elif hook_event == "PreToolUse":
+            assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "ask"
+        else:
+            assert body == "", "PostToolUse must still fail open"
+        assert client.calls == 6
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [
+            1,
+            2,
+            4,
+            8,
+            10,
+        ]
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [401, 504, httpx.RequestError("no auth token"), httpx.ReadError("torn poll")],
+)
+async def test_hook_evaluate_endpoint_preserves_non_connect_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _policy_retry_clock: Mock,
+    failure: int | Exception,
+) -> None:
+    """HTTP, auth, and held-poll failures retain the existing three attempts."""
+    client = _ScriptedPolicyClient(failure)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert client.calls == 3
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [0.4, 0.4]
     finally:
         relay.close()
 
