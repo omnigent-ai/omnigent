@@ -7,9 +7,11 @@ dispatch, streaming, and transcript persistence use the real backend.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Iterator
+from typing import Any
 
 import httpx
 import pytest
@@ -485,3 +487,114 @@ def test_side_chat_interrupt_allows_followup_without_stopping_parent(
         expect(page).to_have_url(f"{base_url}/c/{session_id}")
     finally:
         httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+
+
+def _model_requests(mock_url: str) -> list[dict[str, Any]]:
+    """Read the model requests the mock captured, oldest first."""
+    response = httpx.get(f"{mock_url}/mock/requests", timeout=10.0)
+    response.raise_for_status()
+    return [item for item in response.json()["requests"] if isinstance(item, dict)]
+
+
+def _user_texts(model_request: dict[str, Any]) -> list[str]:
+    texts: list[str] = []
+    for item in model_request.get("input") or []:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(
+                block["text"]
+                for block in content
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            )
+    return texts
+
+
+def _agent_turn_request(mock_url: str, latest_user_text: str) -> dict[str, Any]:
+    """The newest agent-turn request whose last user message is *latest_user_text*."""
+    matches = [
+        model_request
+        for model_request in _model_requests(mock_url)
+        if isinstance(model_request.get("instructions"), str)
+        and _user_texts(model_request)
+        and latest_user_text in _user_texts(model_request)[-1]
+    ]
+    assert matches, f"no agent turn request ending with {latest_user_text!r}"
+    return matches[-1]
+
+
+@pytest.mark.parametrize("entrypoint", ["slash", "panel"])
+def test_side_chat_tells_the_model_it_is_a_side_conversation(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+    entrypoint: str,
+) -> None:
+    """A generic side chat's model request marks inherited history as a side conversation."""
+    base_url, session_id = seeded_session
+    task = (
+        f"main-{session_id}: You are working on TASK: rename every occurrence of foo to bar "
+        "under src/. Keep editing until it is done and do not stop for other questions."
+    )
+    task_reply = "Understood - I am renaming foo to bar under src/ now."
+    question = f"side-{session_id}: what does exponential backoff mean?"
+    side_reply = "Backoff spreads retries out over time."
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": task_reply}],
+        key=f"main-{session_id}",
+        match=f"main-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": side_reply}],
+        key=f"side-{session_id}",
+        match=f"side-{session_id}",
+    )
+
+    # Open the recorded page only after the non-browser setup above.
+    page: Page = request.getfixturevalue("page")
+    child_ids: list[str] = []
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        _send_parent(page, task, task_reply)
+        with page.expect_response(f"**/v1/sessions/{session_id}/fork") as forked:
+            _start_side_chat(page, entrypoint, question)
+        assert forked.value.ok
+        child_id = forked.value.json()["id"]
+        child_ids.append(child_id)
+
+        pane = page.locator(".side-chat-backdrop")
+        expect(page.get_by_role("tab", name="Side chat 1", exact=True)).to_be_visible()
+        expect(pane.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        page.wait_for_timeout(1_500)
+
+        child = httpx.get(f"{base_url}/v1/sessions/{child_id}", timeout=10.0).json()
+        print(
+            json.dumps(
+                {
+                    "parent_session_id": session_id,
+                    "child_session_id": child_id,
+                    "child_labels": child.get("labels"),
+                    "child_runner_id": child.get("runner_id"),
+                    "child_workspace": child.get("workspace"),
+                    "child_items": _items(base_url, child_id),
+                }
+            )
+        )
+        parent_request = _agent_turn_request(mock_llm_server_url, task)
+        side_request = _agent_turn_request(mock_llm_server_url, question)
+        print(json.dumps({"parent_request": parent_request, "side_request": side_request}))
+
+        # The fork replays the parent's task as the side chat's own history, so the
+        # model must be told that history is a side conversation's reference context.
+        assert task in _user_texts(side_request)
+        assert "side conversation" not in json.dumps(parent_request).lower()
+        assert "side conversation" in json.dumps(side_request).lower()
+    finally:
+        for child_id in child_ids:
+            httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)

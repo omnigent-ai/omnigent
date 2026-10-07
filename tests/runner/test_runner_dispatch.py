@@ -88,6 +88,12 @@ from omnigent.runner.app import (
 from omnigent.runner.policy_proxy import (
     _evaluate_policy_via_omnigent,
 )
+from omnigent.runner.session_init_protocol import (
+    SESSION_INIT_PAYLOAD_KEY,
+    SESSION_INIT_PROTOCOL_VERSION,
+    RunnerSessionInitEnvelope,
+    RunnerSessionInitSnapshot,
+)
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._executor_adapter import (
     _ORPHAN_RESYNC_THRESHOLD,
@@ -95,9 +101,13 @@ from omnigent.runtime.harnesses._executor_adapter import (
 )
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    SIDE_CONVERSATION_REFERENCE_ONLY_INSTRUCTION,
+)
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
@@ -9583,6 +9593,95 @@ async def test_unresolvable_sub_agent_warns_again_on_later_turns(
     assert recorder.posted_bodies
     composed = recorder.posted_bodies[-1].get("instructions")
     assert isinstance(composed, str) and "Root instructions." in composed
+
+
+def _side_chat_init_body(conv: str, agent_id: str, *, side_chat: bool) -> dict[str, Any]:
+    """A ``/v1/sessions`` create body whose init envelope marks a side chat or not."""
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=conv,
+        agent_id=agent_id,
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=0,
+            updated_at=0,
+            labels={SIDE_CHAT_LABEL_KEY: "1"} if side_chat else {},
+        ),
+    )
+    return {
+        "session_id": conv,
+        "agent_id": agent_id,
+        SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(mode="json"),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_path", ["background", "stream"])
+async def test_side_chat_fork_prompt_marks_inherited_history_reference_only(
+    turn_path: str,
+) -> None:
+    """A side-chat fork's composed prompt carries the reference-only boundary.
+
+    The fork replays the parent's transcript into the child as live history,
+    so without the boundary the model reads the parent's standing task as its
+    own and continues the main agent's work. A plain session must not get it.
+
+    :param turn_path: Which composition call site drives the turn.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    recorder = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    pm = _FakeProcessManager(recorder)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async def _composed_instructions(conv: str, *, side_chat: bool) -> str:
+        created = await http.post(
+            "/v1/sessions", json=_side_chat_init_body(conv, "ag_root", side_chat=side_chat)
+        )
+        assert created.status_code == 201, created.text
+        if turn_path == "background":
+            bg = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_root",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert bg.status_code == 202, bg.text
+            await _await_bg_turn_task(conv)
+        else:
+            streamed = await _post_stream_message(
+                http, conv, agent_id="ag_root", harness="claude-sdk"
+            )
+            assert streamed.status_code == 200, streamed.text
+        composed = recorder.posted_bodies[-1].get("instructions")
+        assert isinstance(composed, str), f"no composed instructions for {conv}"
+        return composed
+
+    async with _runner_test_client(app) as http:
+        side_instructions = await _composed_instructions("conv_side_chat", side_chat=True)
+        plain_instructions = await _composed_instructions("conv_plain", side_chat=False)
+
+    assert SIDE_CONVERSATION_REFERENCE_ONLY_INSTRUCTION in side_instructions
+    assert "side conversation" in side_instructions.lower()
+    assert SIDE_CONVERSATION_REFERENCE_ONLY_INSTRUCTION not in plain_instructions
+    assert "side conversation" not in plain_instructions.lower()
 
 
 @pytest.mark.asyncio

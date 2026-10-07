@@ -195,6 +195,7 @@ from omnigent.runner.subagent_work import (
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
+    SIDE_CONVERSATION_REFERENCE_ONLY_INSTRUCTION,
     build_instructions,
     build_instructions_nullable,
     raw_author_instructions,
@@ -533,6 +534,18 @@ class _SessionInitContext:
             harness_override=snapshot.harness_override,
             labels=snapshot.labels,
         )
+
+    @property
+    def is_side_chat(self) -> bool:
+        """Whether this session is a generic side-chat fork.
+
+        The fork endpoint stamps ``SIDE_CHAT_LABEL_KEY`` on the child; the
+        legacy path carries no snapshot, so it reads as a normal session.
+        """
+        from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
+
+        labels = self.labels
+        return labels is not None and SIDE_CHAT_LABEL_KEY in labels
 
 
 # Language constant the omnigent YAML translator stamps on callable-backed
@@ -1202,6 +1215,11 @@ def create_runner_app(
     # every spec-derived read (native-vs-SDK checks above all) still answers
     # with the harness the spec declared, which a routed session is not on.
     _session_harness_overrides: dict[str, str] = {}
+    # Sessions that are generic side-chat forks (stamped at init from the
+    # init-envelope labels). The composed-instruction harnesses build the
+    # prompt per turn, long after the init envelope is gone, so the flag has to
+    # outlive it to gate the side-conversation boundary instruction.
+    _side_chat_sessions: set[str] = set()
     # session_id → revision of the agent bundle its caches were built from
     _session_agent_revisions: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
@@ -2391,6 +2409,8 @@ def create_runner_app(
         # endpoint at all.
         _routing_class = init_context.routing_class
         remember_session_routing_class(session_id, _routing_class)
+        if init_context.is_side_chat:
+            _side_chat_sessions.add(session_id)
         if init_context.envelope is not None:
             _note_session_harness_override(
                 session_id, init_context.envelope.snapshot.harness_override
@@ -3358,6 +3378,7 @@ def create_runner_app(
 
         _session_spec_cache.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
+        _side_chat_sessions.discard(session_id)
         _session_skills_cache.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
@@ -4912,15 +4933,24 @@ def create_runner_app(
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
+            _side_chat_fw_bg = (
+                (SIDE_CONVERSATION_REFERENCE_ONLY_INSTRUCTION,)
+                if conv in _side_chat_sessions
+                else ()
+            )
             if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
-                    cached_spec, _raw_per_request_instructions, []
+                    cached_spec,
+                    _raw_per_request_instructions,
+                    [],
+                    framework_instructions=_side_chat_fw_bg,
                 )
             else:
                 instructions = build_instructions(
                     cached_spec,
                     _raw_per_request_instructions,
                     [],
+                    framework_instructions=_side_chat_fw_bg,
                 )
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
@@ -5554,10 +5584,18 @@ def create_runner_app(
                     if _instr_spec_ds is not None:
                         _per_req_instr = cast(str | None, body.get("instructions"))
                         _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
+                        _side_chat_fw_ds = (
+                            (SIDE_CONVERSATION_REFERENCE_ONLY_INSTRUCTION,)
+                            if conv_id in _side_chat_sessions
+                            else ()
+                        )
                         _ic_ds = InstructionComposition(
                             authored_present=_authored_ds,
                             composed=build_instructions_nullable(
-                                _instr_spec_ds, _per_req_instr, []
+                                _instr_spec_ds,
+                                _per_req_instr,
+                                [],
+                                framework_instructions=_side_chat_fw_ds,
                             ),
                         )
                         # Gated harnesses get nullable — skip the fallback literal.
@@ -5569,7 +5607,10 @@ def create_runner_app(
                             _instr_body = {
                                 **body,
                                 "instructions": build_instructions(
-                                    _instr_spec_ds, _per_req_instr, []
+                                    _instr_spec_ds,
+                                    _per_req_instr,
+                                    [],
+                                    framework_instructions=_side_chat_fw_ds,
                                 ),
                             }
                         if _authored_ds and harness_name:

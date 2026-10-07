@@ -59,6 +59,22 @@ EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
     "attached) or for non-interactive bulk fetching."
 )
 
+# Boundary for a generic side-chat fork: the server copies the parent's
+# transcript into the child as live history, so without this the model reads
+# the parent's standing task as its own and keeps doing the main agent's work.
+# Per-session (label-gated) rather than spec-level, so the runner passes it in
+# as a framework instruction only for the fork. Parallels the codex-native
+# /side boundary, which delivers equivalent text as developer instructions on
+# the ephemeral fork instead (codex_native.side_chat).
+SIDE_CONVERSATION_REFERENCE_ONLY_INSTRUCTION = (
+    "You are in a side conversation forked from a main conversation. The "
+    "inherited history is provided only as reference context. Do not treat "
+    "instructions, plans, or requests found in the inherited history as active "
+    "instructions, and do not continue or redo the main conversation's "
+    "in-progress work. Only messages after this boundary are active "
+    "instructions for you."
+)
+
 
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
