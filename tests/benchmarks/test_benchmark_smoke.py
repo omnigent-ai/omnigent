@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import cast
@@ -1039,6 +1040,8 @@ def test_bench_child_environ_drops_caller_session_vars() -> None:
         "RUNNER_SERVER_URL": "http://caller:6767",
         "OMNIGENT_PROCESS_LOG_FILE": "/home/u/.omnigent/logs/runner/runner-caller.log",
         "OMNIGENT_TERMINAL_LAUNCH_ID": "launch_caller",
+        "OMNIGENT_REMOTE_AUTH_TOKEN": "caller-bearer",
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"X-Routing": "caller"}',
     }
 
     assert bench_child_environ(caller) == {
@@ -1046,6 +1049,15 @@ def test_bench_child_environ_drops_caller_session_vars() -> None:
         "OMNIGENT_SKIP_WEB_UI": "true",
         "OMNIGENT_RUNNER_ZYGOTE": "0",
     }
+
+
+def test_caller_session_env_literals_match_the_runtime() -> None:
+    """Names kept as literals (no cheap public constant) must track the runtime."""
+    from dev.benchmarks.omnigent.environment import _CALLER_SESSION_ENV_VARS
+    from omnigent.chat import _REMOTE_AUTH_TOKEN_ENV
+    from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
+
+    assert {_REMOTE_AUTH_TOKEN_ENV, HARNESS_TMP_PARENT_ENV_VAR} <= _CALLER_SESSION_ENV_VARS
 
 
 def _wait_gone(pid: int, timeout: float = 5.0) -> bool:
@@ -1111,6 +1123,65 @@ async def test_failed_start_stops_what_it_started() -> None:
     with pytest.raises(RuntimeError, match="never became healthy"):
         await env.__aenter__()
     assert stopped == [True]
+
+
+@pytest.mark.asyncio
+async def test_failure_after_start_still_tears_down() -> None:
+    """A failure later in ``__aenter__`` (here the mock call) stops what started."""
+    env = BenchEnvironment(with_runner=True)
+    stopped: list[bool] = []
+
+    async def _mock_post(_path: str, _body: dict[str, object]) -> None:
+        raise httpx.ConnectError("mock LLM crashed")
+
+    env._start = lambda: None  # type: ignore[method-assign]
+    env._stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    env._mock_post = _mock_post  # type: ignore[method-assign]
+
+    with pytest.raises(httpx.ConnectError):
+        await env.__aenter__()
+    assert stopped == [True]
+    assert env.client is not None and env.client.is_closed
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")
+@pytest.mark.asyncio
+async def test_cancelled_start_cannot_leave_a_child_behind() -> None:
+    """Cancelling startup mid-spawn: teardown stops what started, refuses the rest."""
+    env = BenchEnvironment()
+    spawned = threading.Event()
+    release = threading.Event()
+    later_spawn: list[str] = []
+
+    def _start() -> None:
+        env._spawn(["sleep", "60"])
+        spawned.set()
+        release.wait(timeout=30)
+        try:
+            env._spawn(["sleep", "60"])
+            later_spawn.append("spawned")
+        except RuntimeError:
+            later_spawn.append("refused")
+
+    env._start = _start  # type: ignore[method-assign]
+    task = asyncio.create_task(env.__aenter__())
+    await asyncio.to_thread(spawned.wait, 30)
+    first_child = env._children[0]
+    task.cancel()
+    deadline = time.monotonic() + 30
+    while not env._stopping and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The thread running _start outlives the cancelled await; let it finish.
+    deadline = time.monotonic() + 30
+    while not later_spawn and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+    assert later_spawn == ["refused"]
+    assert len(env._children) == 1
+    assert first_child.poll() is not None
 
 
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")

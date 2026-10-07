@@ -35,13 +35,33 @@ import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from typing import IO, NamedTuple
+from typing import IO, Any, NamedTuple
 
 import httpx
+import psutil
 import yaml
 
-from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.cli_auth import DATABRICKS_EXTRA_HEADERS_ENV_VAR
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, SERVER_URL_ENV_VAR, USER_ID_ENV_VAR
+from omnigent.host.daemon_lifecycle import DAEMON_CONFIG_SIG_ENV_VAR
+from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR, ZYGOTE_HARNESS_FD_ENV_VAR
+from omnigent.runner.identity import (
+    OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_CONNECT_MARKER_ENV_VAR,
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
+    RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
+    RUNNER_ID_ENV_VAR,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
+    RUNNER_LAUNCH_HARNESS_ENV_VAR,
+    RUNNER_PARENT_PID_ENV_VAR,
+    RUNNER_SLICE_KEY_ENV_VAR,
+    RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+    RUNNER_WORKSPACE_ENV_VAR,
+    token_bound_runner_id,
+)
 from tests._helpers.compat import (
     apply_runner_env,
     apply_server_env,
@@ -69,35 +89,37 @@ _RUNNER_OFFLINE_TIMEOUT_S = 30.0
 # Grace for a stopped process group before it is killed.
 _STOP_GRACE_S = 8.0
 
-# Identity, routing, and logging that an enclosing Omnigent session publishes
-# into its process tree. Bench processes that inherited them would bind to the
-# caller's session, server, or log file instead of the bench's own. Tuning knobs
-# (e.g. OMNIGENT_RUNNER_ZYGOTE) are deliberately kept.
+# Identity, routing, auth, and logging an enclosing Omnigent session publishes
+# into its process tree; inherited copies would bind bench processes to the
+# caller's session, server, or log file. Tuning knobs are kept.
 _CALLER_SESSION_ENV_VARS = frozenset(
     {
-        "RUNNER_SERVER_URL",
-        "OMNIGENT_PROCESS_LOG_FILE",
-        "OMNIGENT_USER_ID",
-        "OMNIGENT_HARNESS_TMP_PARENT",
-        "OMNIGENT_HOST_ID",
-        "OMNIGENT_HOST_NAME",
-        "OMNIGENT_HOST_TOKEN",
-        "OMNIGENT_HOST_DAEMON_CONFIG_SIG",
-        "OMNIGENT_RUNNER_ID",
-        "OMNIGENT_RUNNER_DELEGATED_AUTH",
-        "OMNIGENT_RUNNER_PARENT_PID",
-        "OMNIGENT_RUNNER_PRIMARY_SESSION_ID",
-        "OMNIGENT_RUNNER_SLICE_KEY",
-        "OMNIGENT_RUNNER_WORKSPACE",
-        "OMNIGENT_RUNNER_CONNECT_MARKER",
-        "OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP",
-        "OMNIGENT_RUNNER_INTERACTIVE_SHELLS",
-        "OMNIGENT_RUNNER_LAUNCH_HARNESS",
+        SERVER_URL_ENV_VAR,
+        PROCESS_LOG_FILE_ENV_VAR,
+        USER_ID_ENV_VAR,
+        PRIMARY_SESSION_ID_ENV_VAR,
+        DATABRICKS_EXTRA_HEADERS_ENV_VAR,
+        HOST_ID_ENV_VAR,
+        HOST_NAME_ENV_VAR,
+        HOST_TOKEN_ENV_VAR,
+        DAEMON_CONFIG_SIG_ENV_VAR,
+        RUNNER_ID_ENV_VAR,
+        RUNNER_DELEGATED_AUTH_ENV_VAR,
+        RUNNER_PARENT_PID_ENV_VAR,
+        RUNNER_SLICE_KEY_ENV_VAR,
+        RUNNER_WORKSPACE_ENV_VAR,
+        RUNNER_CONNECT_MARKER_ENV_VAR,
+        RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
+        RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
+        RUNNER_LAUNCH_HARNESS_ENV_VAR,
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+        ZYGOTE_CONTROL_FD_ENV_VAR,
+        ZYGOTE_HARNESS_FD_ENV_VAR,
+        # No public constant, or defined in a module too heavy to import here.
         "OMNIGENT_RUNNER_TUNNEL_TOKEN",
-        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN",
-        "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN",
-        "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD",
-        "OMNIGENT_RUNNER_ZYGOTE_HARNESS_FD",
+        "OMNIGENT_REMOTE_AUTH_TOKEN",
+        "OMNIGENT_HARNESS_TMP_PARENT",
     }
 )
 _CALLER_SESSION_ENV_PREFIXES = ("OMNIGENT_TERMINAL_",)
@@ -226,19 +248,47 @@ def _signal_group(proc: subprocess.Popen[bytes], sig: int) -> None:
             proc.send_signal(sig)
 
 
-def _stop_process_group(proc: subprocess.Popen[bytes]) -> None:
-    """SIGTERM *proc*'s process group, then SIGKILL whatever remains of it.
+def _group_members(proc: subprocess.Popen[bytes]) -> list[psutil.Process]:
+    """Return the live processes, other than *proc*, in *proc*'s process group.
 
-    The final SIGKILL also reaches children the leader forked (runners,
-    harnesses) that outlive it.
+    Empty when the group id has been recycled: a new process leads a group
+    with that id after *proc* was reaped.
     """
+    if not hasattr(os, "getpgid"):
+        return []
+    leader_gone = proc.poll() is not None
+    members: list[psutil.Process] = []
+    for candidate in psutil.process_iter():
+        with contextlib.suppress(psutil.Error, OSError):
+            if os.getpgid(candidate.pid) != proc.pid:
+                continue
+            if candidate.pid == proc.pid:
+                if leader_gone:
+                    return []
+                continue
+            members.append(candidate)
+    return members
+
+
+def _stop_process_group(proc: subprocess.Popen[bytes]) -> None:
+    """SIGTERM *proc*'s process group, then kill whatever is left of it.
+
+    The group is only signalled while its leader is alive; members that
+    outlive the leader are killed individually from a snapshot, so a
+    recycled group id is never signalled.
+    """
+    members = _group_members(proc)
     if proc.poll() is None:
         _signal_group(proc, signal.SIGTERM)
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=_STOP_GRACE_S)
-    _signal_group(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=5)
+    if proc.poll() is None:
+        _signal_group(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+    for member in members:
+        with contextlib.suppress(psutil.Error):
+            member.kill()  # psutil refuses a recycled pid
 
 
 class BenchEnvironment:
@@ -298,6 +348,11 @@ class BenchEnvironment:
         self._tmp = Path("/tmp") / f"omni-bench-{uuid.uuid4().hex[:8]}"
         # TMPDIR for bench subprocesses, so their terminal sockets can be swept.
         self._child_tmp = self._tmp / "tmp"
+        # Spawning and teardown share this lock, so a start cancelled mid-spawn
+        # cannot register a child after teardown has run.
+        self._lifecycle_lock = threading.Lock()
+        self._stopping = False
+        self._children: list[subprocess.Popen[bytes]] = []
         self._mock_proc: subprocess.Popen[bytes] | None = None
         self._server_proc: subprocess.Popen[bytes] | None = None
         self._runner_proc: subprocess.Popen[bytes] | None = None
@@ -315,11 +370,16 @@ class BenchEnvironment:
 
     async def __aenter__(self) -> BenchEnvironment:
         try:
-            await asyncio.to_thread(self._start)
-        except BaseException:
-            # __aexit__ never runs when __aenter__ raises; stop what did start.
-            await asyncio.to_thread(self._stop)
+            return await self._enter()
+        except BaseException as exc:
+            # __aexit__ never runs when __aenter__ raises; tear down what started.
+            if not isinstance(exc, asyncio.CancelledError):
+                self._print_log_tails()
+            await self.__aexit__()
             raise
+
+    async def _enter(self) -> BenchEnvironment:
+        await asyncio.to_thread(self._start)
         # A request event hook injects the simulated client↔server network
         # delay before each request leaves the benchmark process. Registered
         # only when a delay is set so the zero-delay default path is untouched.
@@ -407,18 +467,14 @@ class BenchEnvironment:
 
     def _stop(self) -> None:
         """Terminate host, runner, server, and mock; remove the temp dir."""
-        # Host first: SIGTERM-ing the daemon reaps the runners IT spawned (they
-        # are daemon-owned children), so it must go before the server so those
-        # runners' tunnels close cleanly. Each child leads its own process
-        # group, so stopping the group also takes its descendants.
-        for proc in (
-            self._host_proc,
-            self._runner_proc,
-            self._server_proc,
-            self._mock_proc,
-        ):
-            if proc is not None:
-                _stop_process_group(proc)
+        with self._lifecycle_lock:
+            self._stopping = True
+            children = list(self._children)
+        # Newest first, so the host daemon goes before the server and its runners'
+        # tunnels close cleanly. Stops descendants left in each child's process
+        # group; detached tmux servers are cleaned separately.
+        for proc in reversed(children):
+            _stop_process_group(proc)
         self._kill_session_terminals()
         for handle in self._log_handles:
             handle.close()
@@ -448,10 +504,6 @@ class BenchEnvironment:
         process terminates. The first ``cpu_percent`` call always returns 0.0
         (psutil baseline) — we discard it so only real measurements accumulate.
         """
-        try:
-            import psutil
-        except ImportError:
-            return
         if self._server_proc is None:
             return
         try:
@@ -540,13 +592,38 @@ class BenchEnvironment:
         self._log_handles.append(handle)
         return handle
 
+    def _spawn(self, args: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        """Start a child in its own process group and register it for teardown.
+
+        :raises RuntimeError: If teardown has already begun.
+        """
+        with self._lifecycle_lock:
+            self._raise_if_stopping()
+            proc: subprocess.Popen[bytes] = subprocess.Popen(
+                args, start_new_session=True, **kwargs
+            )
+            self._children.append(proc)
+        return proc
+
+    def _raise_if_stopping(self) -> None:
+        if self._stopping:
+            raise RuntimeError("benchmark environment is stopping")
+
+    def _print_log_tails(self, lines: int = 20) -> None:
+        """Echo the end of each child log before teardown deletes the temp dir."""
+        for log_path in sorted(self._tmp.glob("*.log")):
+            with contextlib.suppress(OSError):
+                tail = log_path.read_text(errors="replace").splitlines()[-lines:]
+                if tail:
+                    sys.stderr.write(f"--- {log_path.name} (last {len(tail)} lines) ---\n")
+                    sys.stderr.write("\n".join(tail) + "\n")
+
     def _spawn_mock(self, port: int) -> subprocess.Popen[bytes]:
-        return subprocess.Popen(
+        return self._spawn(
             [sys.executable, str(_MOCK_SERVER), str(port)],
             env={**self.child_env(), "PYTHONPATH": str(_REPO_ROOT)},
             stdout=self._log("mock.log"),
             stderr=subprocess.STDOUT,
-            start_new_session=True,
         )
 
     def _spawn_server(
@@ -589,13 +666,12 @@ class BenchEnvironment:
         server_cfg = self._tmp / "server.yaml"
         server_cfg.write_text(yaml.safe_dump(server_config))
         args.extend(["--config", str(server_cfg)])
-        return subprocess.Popen(
+        return self._spawn(
             args,
             env=env,
             cwd=compat_server_cwd(),
             stdout=self._log("server.log"),
             stderr=subprocess.STDOUT,
-            start_new_session=True,
         )
 
     def _spawn_runner(
@@ -640,13 +716,12 @@ class BenchEnvironment:
                 "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
             }
         )
-        return subprocess.Popen(
+        return self._spawn(
             [runner_executable(), "-m", "omnigent.runner._entry"],
             env=runner_env,
             cwd=compat_runner_cwd(),
             stdout=self._log(log_name),
             stderr=subprocess.STDOUT,
-            start_new_session=True,
         )
 
     def _spawn_host(self, base_env: dict[str, str]) -> subprocess.Popen[bytes]:
@@ -674,13 +749,12 @@ class BenchEnvironment:
             HOST_ID_ENV_VAR: self.host_id,
             HOST_NAME_ENV_VAR: f"bench-host-{self.host_id[-8:]}",
         }
-        return subprocess.Popen(
+        return self._spawn(
             [_omni_executable(), "host", "--server", self.base_url, "--non-interactive"],
             env=host_env,
             cwd=str(workspace),
             stdout=self._log("host-daemon.log"),
             stderr=subprocess.STDOUT,
-            start_new_session=True,
         )
 
     # ── readiness ────────────────────────────────────────────
@@ -688,18 +762,20 @@ class BenchEnvironment:
     def _wait_mock_ready(self) -> None:
         deadline = time.monotonic() + _MOCK_TIMEOUT_S
         while time.monotonic() < deadline:
+            self._raise_if_stopping()
             try:
                 if httpx.get(f"{self.mock_url}/stats", timeout=1).status_code == 200:
                     return
             except httpx.HTTPError:
                 pass
             time.sleep(0.1)
-        raise RuntimeError(f"mock LLM not ready within {_MOCK_TIMEOUT_S}s; logs in {self._tmp}")
+        raise RuntimeError(f"mock LLM not ready within {_MOCK_TIMEOUT_S}s; log tails above")
 
     def _wait_ready(self) -> None:
         """Wait for ``/health`` (and, in runner mode, the runner online)."""
         deadline = time.monotonic() + _HEALTH_TIMEOUT_S
         while time.monotonic() < deadline:
+            self._raise_if_stopping()
             try:
                 health = httpx.get(f"{self.base_url}/health", timeout=2)
                 if health.status_code == 200 and self._runner_ready():
@@ -707,7 +783,7 @@ class BenchEnvironment:
             except httpx.HTTPError:
                 pass
             time.sleep(_POLL_INTERVAL_S)
-        raise RuntimeError(f"server not ready within {_HEALTH_TIMEOUT_S}s; logs in {self._tmp}")
+        raise RuntimeError(f"server not ready within {_HEALTH_TIMEOUT_S}s; log tails above")
 
     def _runner_ready(self) -> bool:
         """Whether the boot runner reports online (always ``True`` server-only)."""
@@ -725,10 +801,11 @@ class BenchEnvironment:
         """
         deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
         while time.monotonic() < deadline:
+            self._raise_if_stopping()
             if self._host_proc is not None and self._host_proc.poll() is not None:
                 raise RuntimeError(
                     f"host daemon exited (code {self._host_proc.returncode}) before "
-                    f"coming online; logs in {self._tmp}"
+                    f"coming online; log tails above"
                 )
             try:
                 resp = httpx.get(f"{self.base_url}/v1/hosts", timeout=2)

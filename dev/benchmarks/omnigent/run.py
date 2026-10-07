@@ -331,8 +331,17 @@ async def _run_until_terminated(args: argparse.Namespace) -> tuple[dict[str, obj
     """
     task = asyncio.current_task()
     assert task is not None
+    cancelled = False
+
+    def _on_sigterm() -> None:
+        # Ignore repeats: a second SIGTERM must not cancel the teardown in flight.
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
+            task.cancel()
+
     with contextlib.suppress(NotImplementedError):  # no loop signal handlers on Windows
-        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, _on_sigterm)
     return await run_benchmark(args)
 
 
