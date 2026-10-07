@@ -23,6 +23,7 @@ class Feature(StrEnum):
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
+    ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     HARNESS_SETTINGS_UI = "harness_settings_ui"
 
 
@@ -55,6 +56,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Canvas page: sessions as draggable cards grouped by project",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.ARCA_SHUTDOWN_WARNINGS,
+        description="Weekday Arca shutdown warning in the web UI",
+        owner="web",
+        review_by_release="0.20.0",
+        frontend_visible=True,
     ),
     FeatureDefinition(
         feature=Feature.HARNESS_SETTINGS_UI,

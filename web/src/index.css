@@ -963,6 +963,10 @@ aside[aria-label="Workspace"][data-maximized] {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
 }
 
+.arca-shutdown-banner + [data-transcript-viewport] .chat-conversation-content {
+  padding-top: 1rem;
+}
+
 /* Settings titles join the mobile header row beside the sidebar control. */
 @media (width < 48rem) {
   .settings-mobile-header::before {

@@ -25,6 +25,7 @@ import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
@@ -58,6 +59,7 @@ import {
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
 export interface TranscriptProps {
+  hostId: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
@@ -103,6 +105,7 @@ export function isNativeFindShortcut(
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
+  hostId,
   setConversationEl,
   containerEl,
   scroller,
@@ -314,10 +317,12 @@ function TranscriptImpl({
       overlay) so it shrinks the scroll area rather than covering messages.
       Self-hides with no tasks. */}
       <ChatPlanAccordion className="mt-14 md:mt-12" />
+      <ArcaShutdownBanner hostId={hostId} hasTasks={display.hasTasks} />
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
       conversation area without requiring Conversation to forward refs. */}
       <div
         ref={setConversationEl}
+        data-transcript-viewport
         className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
         <Conversation
