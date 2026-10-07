@@ -8,6 +8,7 @@ import {
 } from "three/examples/jsm/libs/fflate.module.js";
 
 const CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
+const XMLNS = "http://www.w3.org/2000/xmlns/";
 const PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
@@ -225,6 +226,20 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     if (!root) return buffer;
     const output = document.implementation.createDocument(CORE, "model");
     const outputModel = output.documentElement;
+    const namespaces = new Map<string, string | null>();
+    for (const model of models.values()) {
+      for (const attribute of model.documentElement.attributes) {
+        if (attribute.namespaceURI !== XMLNS || attribute.name === "xmlns") continue;
+        const previous = namespaces.get(attribute.name);
+        namespaces.set(
+          attribute.name,
+          previous === undefined || previous === attribute.value ? attribute.value : null,
+        );
+      }
+    }
+    for (const [name, value] of namespaces) {
+      if (value !== null) outputModel.setAttributeNS(XMLNS, name, value);
+    }
     if (root.documentElement.hasAttribute("unit"))
       outputModel.setAttribute("unit", root.documentElement.getAttribute("unit")!);
     const resources = output.createElementNS(CORE, "resources");
@@ -235,19 +250,15 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const colors: string[] = [];
     const memo = new Map<string, { id: string; height: number }>();
     const sourceSizes = new Map<string, number>();
-    let repeatedCharacters = 0;
+    let emittedCharacters = new XMLSerializer().serializeToString(outputModel).length;
     const reserve = (source: Element, key: string) => {
       let size = sourceSizes.get(key);
       if (size === undefined) {
-        sourceSizes.set(key, 0);
-        return;
-      }
-      if (size === 0) {
         size = new XMLSerializer().serializeToString(source).length;
         sourceSizes.set(key, size);
       }
-      repeatedCharacters += size;
-      if (repeatedCharacters > selectedBytes * (MAX_EMITTED_RATIO - 1) + MAX_EMITTED_OVERHEAD)
+      emittedCharacters += size;
+      if (emittedCharacters > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD)
         throw new Error("3MF emitted byte limit");
     };
     const visiting = new Set<string>();
@@ -354,11 +365,13 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     }
     if (colors.length < 2) return buffer;
     outputModel.append(build);
+    const serialized = new XMLSerializer().serializeToString(output);
+    if (serialized.length > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD) return buffer;
     const relationships = `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="r" Type="${MODEL_RELATIONSHIP}"/></Relationships>`;
     return zipSync(
       {
         "_rels/.rels": new Uint8Array(strToU8(relationships)),
-        "3D/3dmodel.model": new Uint8Array(strToU8(new XMLSerializer().serializeToString(output))),
+        "3D/3dmodel.model": new Uint8Array(strToU8(serialized)),
       },
       { level: 0 },
     ).buffer as ArrayBuffer;
