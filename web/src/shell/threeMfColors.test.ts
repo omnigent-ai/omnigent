@@ -294,13 +294,102 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     }
   });
 
-  it("only sizes source subtrees when emitting colour variants", () => {
+  it("shares inherited namespaces instead of redeclaring them on each mesh", () => {
+    const count = 80;
+    const namespace = `https://example.test/${"n".repeat(64)}`;
+    const input = archive({
+      "3D/root.model": model(
+        Array.from({ length: count }, (_, index) => mesh(index + 1, 1, 'x:note="a"')).join("") +
+          composite(
+            100,
+            Array.from({ length: count }, (_, index) => component(index + 1, index * 2)).join(""),
+          ),
+      ).replace("<model ", `<model xmlns:x="${namespace}" `),
+      "Metadata/model_settings.config": `<config>${config(Array.from({ length: count }, (_, index) => part(index + 1, (index % 2) + 1)).join(""))}</config>`,
+    });
+    const normalized = applyThreeMfColors(input);
+    expect(normalized).not.toBe(input);
+    const text = strFromU8(unzipSync(new Uint8Array(normalized))["3D/3dmodel.model"]);
+    expect(text.match(/xmlns:x=/g)).toHaveLength(1);
+    expect(
+      new DOMParser()
+        .parseFromString(text, "application/xml")
+        .documentElement.getAttribute("xmlns:x"),
+    ).toBe(namespace);
+    check(
+      input,
+      Array.from({ length: count }, (_, index) => (index % 2 ? "4dc5a0" : "f53b9d")),
+      Array.from({ length: count }, (_, index) => index * 2),
+      Array.from({ length: count }, () => 1),
+    );
+  });
+
+  it("bounds inherited namespace expansion on first mesh emissions", () => {
+    check(archive());
+    const count = 80;
+    const namespace = `https://example.test/${"n".repeat(16384)}`;
+    const input = archive({
+      "3D/root.model": model(
+        Array.from({ length: count }, (_, index) => mesh(index + 1, 1, 'x:note="a"')).join("") +
+          composite(
+            100,
+            Array.from({ length: count }, (_, index) => component(index + 1, index * 2)).join(""),
+          ),
+      ).replace("<model ", `<model xmlns:x="${namespace}" `),
+      "Metadata/model_settings.config": `<config>${config(Array.from({ length: count }, (_, index) => part(index + 1, (index % 2) + 1)).join(""))}</config>`,
+    });
+    const selected = Object.values(unzipSync(new Uint8Array(input))).reduce(
+      (total, entry) => total + entry.length,
+      0,
+    );
+    expect(selected).toBeLessThan(64 * 1024);
     const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+    const importer = vi.spyOn(Document.prototype, "importNode");
     try {
-      check(archive());
-      expect(serializer.mock.calls.map(([node]) => node.nodeType)).toEqual([Node.DOCUMENT_NODE]);
+      expect(applyThreeMfColors(input) === input).toBe(true);
+      expect(serializer.mock.calls.some(([node]) => node.nodeType === Node.DOCUMENT_NODE)).toBe(
+        false,
+      );
+      const meshes = importer.mock.calls.filter(
+        ([node]) => node instanceof Element && node.querySelector("mesh"),
+      );
+      expect(meshes.length).toBeGreaterThan(0);
+      expect(meshes.length).toBeLessThan(count);
     } finally {
       serializer.mockRestore();
+      importer.mockRestore();
+    }
+    check(
+      input,
+      Array.from({ length: count }, () => "ffffff"),
+      Array.from({ length: count }, (_, index) => index * 2),
+      Array.from({ length: count }, () => 1),
+    );
+  });
+
+  it("charges first emissions before deep imports", () => {
+    const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+    const importer = vi.spyOn(Document.prototype, "importNode");
+    try {
+      check(archive());
+      const objects = serializer.mock.calls.filter(
+        ([node]) => node instanceof Element && node.localName === "object",
+      );
+      expect(objects.map(([node]) => (node as Element).getAttribute("id"))).toEqual([
+        "100",
+        "1",
+        "2",
+      ]);
+      for (const [index, [source]] of importer.mock.calls.entries()) {
+        const measured = serializer.mock.calls.findIndex(([node]) => node === source);
+        expect(measured).toBeGreaterThanOrEqual(0);
+        expect(serializer.mock.invocationCallOrder[measured]).toBeLessThan(
+          importer.mock.invocationCallOrder[index],
+        );
+      }
+    } finally {
+      serializer.mockRestore();
+      importer.mockRestore();
     }
   });
 
