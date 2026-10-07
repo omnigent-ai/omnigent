@@ -3439,6 +3439,7 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=with_source(devin_models),
+            )
         if harness in ("antigravity-native", "antigravity"):
             agy_models = [
                 {"id": "gemini-3.8-flash", "model": "gemini-3.8-flash", "displayName": "Gemini 3.8 Flash", "isDefault": True},
