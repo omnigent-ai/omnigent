@@ -579,8 +579,8 @@ class SubagentEntry:
         observed in this sub-agent's transcript. Used by the inactivity
         heuristic — when ``now - last_activity_ts >
         _SUBAGENT_IDLE_THRESHOLD_S`` we publish an
-        ``subagent.status`` event with ``idle: true``. The server publishes
-        idle but never forwards this observation as a terminal edge.
+        ``subagent.status`` event with ``idle: true``. The server never forwards
+        this observation as a terminal edge.
         ``None`` means no items have been seen, so the heuristic cannot fire.
     :param last_status: Last observation handled for this sub-agent:
         ``running``, ``idle``, or ``failed``. An ``idle`` observation is sent

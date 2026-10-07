@@ -31,6 +31,8 @@ async def test_subagent_idle_reporting_with_old_server(
     tmp_path: Path,
 ) -> None:
     """An unsupported idle event is tried once; later items/statuses still arrive."""
+    server_release = Version(server_version).release
+    requires_confirmed_outcome = server_release >= (0, 18)
     agent_name = register_inline_agent(
         http_client,
         name=f"subagent-status-compat-{uuid.uuid4().hex[:8]}",
@@ -166,7 +168,7 @@ async def test_subagent_idle_reporting_with_old_server(
             idle_responses = [r for body, r in status_events if body["type"] == "subagent.status"]
             assert idle_responses, "the real inactivity path must attempt the new event"
             first = idle_responses[0]
-            if Version(server_version).release < (0, 15):
+            if server_release < (0, 15):
                 assert first.status_code == 400, first.text
             if first.status_code == 400:
                 assert first.json()["error"]["code"] == "invalid_input"
@@ -179,7 +181,8 @@ async def test_subagent_idle_reporting_with_old_server(
             else:
                 assert all(r.status_code == 202 for r in idle_responses)
                 assert len(idle_responses) == cycle + 1
-                expected_status = "idle"
+                # Older servers expose transcript inactivity as public idle.
+                expected_status = "running" if requires_confirmed_outcome else "idle"
             snapshot = await client.get(f"/v1/sessions/{child_id}")
             snapshot.raise_for_status()
             assert snapshot.json()["status"] == expected_status
@@ -193,11 +196,14 @@ async def test_subagent_idle_reporting_with_old_server(
             == [{"type": "external_session_status", "data": {"status": "running"}}] * 3
         )
 
-        # Authoritative completion and failure still work after the no-op.
+        # Confirmed completion and failure still work after inactivity.
         for child, status in (("first", "idle"), ("second", "failed")):
             child_id = state.subagents[child].child_conversation_id
             await forwarder.post_external_session_status(
-                client, session_id=child_id, status=status
+                client,
+                session_id=child_id,
+                status=status,
+                turn_completed=True if status == "idle" else None,
             )
             snapshot = await client.get(f"/v1/sessions/{child_id}")
             snapshot.raise_for_status()
