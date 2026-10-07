@@ -779,7 +779,29 @@ function headers(config) {
   };
 }
 
-async function postEvent(config, body) {
+const _ASSISTANT_ITEM_MAX_ATTEMPTS = 3;
+const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 50;
+const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 250;
+const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
+
+function boundedSourceId(sourceId) {
+  const value = typeof sourceId === "string" ? sourceId.trim() : "";
+  if (!value) throw new Error("assistant conversation item requires source_id");
+  if (value.length <= 256) return value;
+  return `pi:${crypto.createHash("sha256").update(value).digest("hex")}`;
+}
+
+function eventPostError(response) {
+  const status = response && response.status;
+  if (typeof status === "number" && Number.isFinite(status)) {
+    const error = new Error(`Omnigent event POST failed with HTTP ${status}`);
+    error.status = status;
+    return error;
+  }
+  return new Error("Omnigent event POST returned an invalid response");
+}
+
+async function postEventChecked(config, body, signal) {
   if (
     !config ||
     !config.serverUrl ||
@@ -788,15 +810,92 @@ async function postEvent(config, body) {
   )
     return;
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`;
+  const request = {
+    method: "POST",
+    headers: headers(config),
+    body: JSON.stringify(body),
+  };
+  if (signal) request.signal = signal;
+  const response = await fetch(url, request);
+  const status = response && response.status;
+  if (
+    !response ||
+    (typeof status === "number" &&
+      (!Number.isFinite(status) || status < 200 || status >= 300)) ||
+    (typeof status !== "number" && response.ok !== true)
+  ) {
+    throw eventPostError(response);
+  }
+  return response;
+}
+
+async function postEvent(config, body) {
   try {
-    await fetch(url, {
-      method: "POST",
-      headers: headers(config),
-      body: JSON.stringify(body),
-    });
+    await postEventChecked(config, body);
   } catch (_err) {
     // Keep Pi responsive even if Omnigent is temporarily unavailable.
   }
+}
+
+function isRetryableAssistantError(error) {
+  const status = error && error.status;
+  if (typeof status !== "number") return true;
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function assistantItemPostTimeoutMs(config) {
+  const configured = config && config.assistantItemPostTimeoutMs;
+  return typeof configured === "number" &&
+    Number.isFinite(configured) &&
+    configured > 0
+    ? configured
+    : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
+}
+
+// Only the authoritative assistant message_end uses this checked, bounded
+// path; every other bridge event retains postEvent's best-effort behavior.
+async function postAssistantMessage(config, data, sourceId) {
+  const body = {
+    type: "external_conversation_item",
+    data: { ...data, source_id: boundedSourceId(sourceId) },
+  };
+  let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
+  let lastError;
+  for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      assistantItemPostTimeoutMs(config),
+    );
+    try {
+      return await postEventChecked(config, body, controller.signal);
+    } catch (err) {
+      lastError = err;
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (
+      attempt === _ASSISTANT_ITEM_MAX_ATTEMPTS ||
+      !isRetryableAssistantError(lastError)
+    )
+      break;
+    await sleep(backoff);
+    backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
+  }
+  throw lastError || new Error("assistant conversation item POST failed");
+}
+
+function assistantMessageSourceId(message, responseId, text) {
+  const response =
+    message && typeof message.responseId === "string" && message.responseId
+      ? `response:${message.responseId}`
+      : "";
+  const timestamp =
+    message && typeof message.timestamp === "number"
+      ? `timestamp:${message.timestamp}`
+      : "";
+  const identity = response || timestamp || `turn:${responseId}:${fingerprint(text)}`;
+  return boundedSourceId(`pi:assistant:${identity}`);
 }
 
 async function patchExternalSessionId(config, nativeSessionId) {
@@ -840,34 +939,7 @@ function interruptActiveContext(ctx) {
   }
 }
 
-/**
- * Trigger Pi's own context compaction on the resident ExtensionContext.
- *
- * Pi owns its context window inside this TUI process, so explicit /compact
- * must run here (the Omnigent server's AP-side compaction would only
- * summarise the transcript mirror and desync the two). ctx.compact() is
- * fire-and-forget (returns void); Pi summarises older messages and appends a
- * CompactionEntry to the session. We bracket it with external_compaction_status
- * events the server republishes as response.compaction.* SSE, so the web UI's
- * "Compacting conversation…" spinner tracks Pi's real progress.
- *
- * The server raises the spinner on the in_progress SSE and dismisses it on
- * completed/failed, so a completed/failed that reaches the server before
- * in_progress strands the spinner. ctx.compact() may invoke its callbacks
- * synchronously, so in_progress is AWAITED before the call: the server then
- * holds the spinner-raising edge before any terminal edge can post.
- *
- * Async and self-contained: the poller discards the returned promise, so every
- * edge is published here, never by the caller. Three outcomes:
- *   - No resident compaction API (ctx missing or ctx.compact not a function):
- *     post a visible error item so a user's /compact does not silently vanish
- *     (the runner already returned 200, so the server runs no fallback), post
- *     no spinner edge, return false.
- *   - ctx.compact() threw synchronously: in_progress was already posted, so the
- *     catch posts failed to dismiss the spinner, return false.
- *   - Submitted: in_progress posted and awaited; completed/failed follows from
- *     Pi's onComplete/onError, return true.
- */
+/** Run Pi compaction through its callback API, publishing ordered progress events. */
 async function triggerCompaction(config, ctx, customInstructions) {
   if (!ctx || typeof ctx.compact !== "function") {
     await postEvent(config, {
@@ -887,29 +959,24 @@ async function triggerCompaction(config, ctx, customInstructions) {
     });
     return false;
   }
-  const options = {
-    onComplete: () => {
-      postEvent(config, {
-        type: "external_compaction_status",
-        data: { status: "completed" },
-      });
-    },
-    onError: (_error) => {
-      postEvent(config, {
-        type: "external_compaction_status",
-        data: { status: "failed" },
-      });
-    },
-  };
-  if (typeof customInstructions === "string" && customInstructions.trim()) {
-    options.customInstructions = customInstructions;
-  }
   try {
     await postEvent(config, {
       type: "external_compaction_status",
       data: { status: "in_progress" },
     });
-    ctx.compact(options);
+    await new Promise((resolve, reject) => {
+      ctx.compact({
+        onComplete: resolve,
+        onError: reject,
+        ...(typeof customInstructions === "string" && customInstructions.trim()
+          ? { customInstructions }
+          : {}),
+      });
+    });
+    await postEvent(config, {
+      type: "external_compaction_status",
+      data: { status: "completed" },
+    });
     return true;
   } catch (_err) {
     await postEvent(config, {
@@ -1117,6 +1184,21 @@ async function postModelOptions(config, ctx) {
   });
 }
 
+/**
+ * Tell the runner's terminal watcher that Pi now accepts input: the inbox
+ * poller is armed, so queued web messages will be delivered. The runner
+ * clears the marker before each launch and logs ``native_input_ready`` when
+ * it appears. Best-effort — readiness logging must never break the session.
+ */
+function markInputReady(config) {
+  if (!config || !config.bridgeDir) return;
+  try {
+    fs.writeFileSync(path.join(config.bridgeDir, "input_ready"), "");
+  } catch (_err) {
+    // Diagnostics only.
+  }
+}
+
 function startInboxPoller(
   pi,
   config,
@@ -1125,6 +1207,7 @@ function startInboxPoller(
   handleModelChange,
   handleThinkingLevelChange,
   isTurnActive,
+  isCompacting,
 ) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
@@ -1164,6 +1247,14 @@ function startInboxPoller(
         try {
           fs.unlinkSync(fullPath);
         } catch (_err) {}
+        continue;
+      }
+      // Pi's extension API cannot accept prompts during manual compaction.
+      // Leave them on disk, in order, until its completion callback fires.
+      if (
+        (payload.type === "user_message" || payload.type === "compact") &&
+        isCompacting()
+      ) {
         continue;
       }
       if (
@@ -1291,12 +1382,7 @@ module.exports = function (pi) {
   let turnOrdinal = 0;
   let activeResponseId = null;
   // Response id shared across a turn's ``running`` → ``idle`` status pair.
-  // The web store only clears its local "streaming" flag when an ``idle``
-  // edge's response_id matches the ``running`` edge that opened the turn; a
-  // fresh id per edge would leave the composer stuck in "queued" until a tab
-  // switch resets the store. Minted on agent_start, reused on agent_end.
-  // Must be separate from activeResponseId — turn_start overwrites that with a
-  // turn-level id between agent_start and agent_end.
+  // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
@@ -1305,11 +1391,13 @@ module.exports = function (pi) {
   // agent_start, before turn_start) would look idle by activeResponseId yet the
   // loop is genuinely running — agentRunning arms it correctly. See F18.
   let agentRunning = false;
+  let compacting = false;
   let latestContext = null;
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
   const postedReasoning = new Set();
+  const postedAssistantMessages = new Set();
   const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
   const pendingInterruptMs = 30_000;
@@ -1864,8 +1952,25 @@ module.exports = function (pi) {
       pi,
       config,
       () => requestInterrupt(latestContext),
-      (customInstructions) =>
-        triggerCompaction(config, latestContext, customInstructions),
+      async (customInstructions) => {
+        const responseId = turnStatusResponseId ?? newResponseId("compact");
+        compacting = true;
+        try {
+          await postEvent(config, {
+            type: "external_session_status",
+            data: { status: "running", response_id: responseId },
+          });
+          await triggerCompaction(config, latestContext, customInstructions);
+        } finally {
+          if (!agentRunning) {
+            await postEvent(config, {
+              type: "external_session_status",
+              data: { status: "idle", response_id: responseId },
+            });
+          }
+          compacting = false;
+        }
+      },
       (model) => applyModelChange(pi, config, latestContext, model),
       (level) => pi.setThinkingLevel(level),
       () => {
@@ -1875,7 +1980,9 @@ module.exports = function (pi) {
         const idle = safeIsIdle(latestContext);
         return idle === null ? agentRunning : !idle;
       },
+      () => compacting,
     );
+    markInputReady(config);
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
         ? ctx.sessionManager.getSessionId()
@@ -1896,10 +2003,8 @@ module.exports = function (pi) {
         data: { model: startupModel },
       });
     }
-    await postEvent(config, {
-      type: "external_session_status",
-      data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
-    });
+    // Readiness is not turn completion: a queued prompt may already be running.
+    // Only agent_end publishes idle so startup cannot complete a child task.
   });
 
   pi.on("session_tree", async (_event, ctx) => {
@@ -1943,15 +2048,13 @@ module.exports = function (pi) {
     postedToolCalls.clear();
     postedToolResults.clear();
     postedReasoning.clear();
+    postedAssistantMessages.clear();
     streamedReasoningBlocks.clear();
     toolCallsById.clear();
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
-    // Pin the response_id for this agent loop. agent_end MUST emit the same id
-    // so the web client can match the idle edge to the running edge and clear
-    // the "streaming" status — which unblocks queued follow-up messages.
-    // Use a dedicated variable: activeResponseId is overwritten by turn_start.
+    // Pin the status response_id for this agent loop through agent_end.
     turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
     await postEvent(config, {
       type: "external_session_status",
@@ -1985,6 +2088,8 @@ module.exports = function (pi) {
     const endResponseId =
       turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     turnStatusResponseId = null;
+    // Manual compact aborts the turn first; its own completion publishes idle.
+    if (compacting) return;
     await postEvent(config, {
       type: "external_session_status",
       data: { status: "idle", response_id: endResponseId },
@@ -2158,12 +2263,14 @@ module.exports = function (pi) {
     }
     const text = textFromMessage(message);
     if (!text) return;
+    const sourceId = assistantMessageSourceId(message, responseId, text);
+    if (postedAssistantMessages.has(sourceId)) return;
     // The authoritative assistant item. The web UI retires + replaces the
     // oldest in-flight live preview in place with this (FIFO; one preview
     // per message), so the streamed partials never duplicate the final.
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    await postAssistantMessage(
+      config,
+      {
         response_id: responseId,
         item_type: "message",
         item_data: {
@@ -2172,7 +2279,11 @@ module.exports = function (pi) {
           content: [{ type: "output_text", text }],
         },
       },
-    });
+      sourceId,
+    );
+    // Retry a failed callback on its next delivery; only suppress duplicates
+    // after the authoritative POST has been accepted.
+    postedAssistantMessages.add(sourceId);
   });
 
   pi.on("turn_end", async (event, ctx) => {

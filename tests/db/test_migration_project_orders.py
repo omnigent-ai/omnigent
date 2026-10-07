@@ -58,8 +58,8 @@ def test_project_orders_migration_round_trip(tmp_path: Path) -> None:
     assert store.get_order(user_id=None) == [project.id]
 
 
-def test_mysql_project_order_column_has_large_capacity() -> None:
-    """Both model bootstrap and Alembic must create a column larger than BLOB."""
+def test_mysql_project_order_migration_retains_original_capacity() -> None:
+    """The historical column stays MEDIUMBLOB; current preferences use BLOB."""
     from importlib import import_module
     from io import StringIO
 
@@ -70,7 +70,7 @@ def test_mysql_project_order_column_has_large_capacity() -> None:
     from omnigent.db.db_models import SqlPreference
 
     dialect = mysql.dialect()
-    assert SqlPreference.__table__.c.value.type.compile(dialect=dialect) == "MEDIUMBLOB"
+    assert SqlPreference.__table__.c.value.type.compile(dialect=dialect) == "BLOB"
     output = StringIO()
     context = MigrationContext.configure(
         dialect=dialect, opts={"as_sql": True, "output_buffer": output}

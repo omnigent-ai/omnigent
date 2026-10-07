@@ -150,7 +150,7 @@ feel familiar.
 | `w` | Toggle line wrap (on by default) |
 | `/` `?` | Search forward / back — type, `Enter` to jump, `Esc` to cancel |
 | `n` / `N` | Next / previous match |
-| `r` | Restart the focused process (server/host restart as a pair) |
+| `r` | Restart the focused process: server alone on the server tab, Vite alone on the Vite tab; host tab and combined view restart server then host |
 | `R` | Restart the backend (server then host) |
 | `c` | Clear the focused pane |
 | `q` / `Ctrl-C` | Quit and tear down all processes |

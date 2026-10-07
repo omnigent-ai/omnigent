@@ -22,12 +22,12 @@ Uses the shared ``client`` fixture from ``tests/server/conftest.py``
 
 from __future__ import annotations
 
-from typing import Any
-
 import httpx
 import pytest
 
+from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent
+from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
 
@@ -36,43 +36,6 @@ _MAKE_FIXED = "omnigent.policies.function.make_fixed_action_callable"
 
 
 # ── Helpers ─────────────────────────────────────────────────
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    """
-    Create a session bound to an agent.
-
-    :param client: Test HTTP client.
-    :param agent_id: Agent to bind.
-    :returns: New session id.
-    """
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
-
-
-def _tool_call_request(
-    tool_name: str,
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Build a PHASE_TOOL_CALL EvaluationRequest.
-
-    :param tool_name: Tool name, e.g. ``"echo"``.
-    :param arguments: Tool arguments dict.
-    :returns: EvaluationRequest JSON dict.
-    """
-    return {
-        "event": {
-            "type": "PHASE_TOOL_CALL",
-            "target": "",
-            "data": {
-                "name": tool_name,
-                "arguments": arguments or {},
-            },
-            "context": {},
-        },
-    }
 
 
 # ── Tests ───────────────────────────────────────────────────

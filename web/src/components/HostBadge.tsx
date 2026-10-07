@@ -151,7 +151,7 @@ export function HostBadge({
             data-testid="composer-host-menu"
           >
             <div className="px-2 py-1 text-xs text-muted-foreground">
-              {host?.sandbox_provider ? "Cloud" : "Local"}
+              {host?.sandbox_provider ? "Cloud" : "My machines"}
             </div>
             <DropdownMenuItem disabled className="gap-2" data-selected="true">
               <span

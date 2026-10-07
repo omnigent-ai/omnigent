@@ -554,8 +554,10 @@ def test_concurrent_order_saves_and_mode_changes_retain_manual_ids(
     assert preference["ordered_project_ids"] in orders
 
 
-def test_order_at_api_limit_exceeds_small_blob_capacity(store: SqlAlchemyProjectStore) -> None:
-    """The maximum accepted order survives storage on every supported backend."""
+def test_order_enforces_compressed_blob_capacity(store: SqlAlchemyProjectStore) -> None:
+    """Limit stored bytes while retaining orders whose larger JSON compresses to fit."""
+    import json
+
     from sqlalchemy import func, insert, select
     from sqlalchemy.orm import Session
 
@@ -573,8 +575,15 @@ def test_order_at_api_limit_exceeds_small_blob_capacity(store: SqlAlchemyProject
         )
         session.commit()
     request = ProjectOrderRequest(ordered_project_ids=ids)
-    store.save_order(request.ordered_project_ids, user_id="large")
-    assert store.get_order(user_id="large") == ids
+    with pytest.raises(OmnigentError, match="too large") as exc:
+        store.save_order(request.ordered_project_ids, user_id="large")
+    assert exc.value.code == ErrorCode.INVALID_INPUT
+    assert store.get_order(user_id="large") is None
+
+    fitting_ids = ids[:3000]
+    assert len(json.dumps(fitting_ids).encode()) > 65535
+    store.save_order(fitting_ids, user_id="large")
+    assert store.get_order(user_id="large") == fitting_ids
     with Session(store._engine) as session:
         size = session.scalar(
             select(func.length(SqlPreference.value)).where(
@@ -583,7 +592,16 @@ def test_order_at_api_limit_exceeds_small_blob_capacity(store: SqlAlchemyProject
                 SqlPreference.key == "project_order",
             )
         )
-    assert size is not None and size > 65535
+    assert size is not None and size <= 65535
+
+    with pytest.raises(OmnigentError, match="too large") as exc:
+        store.save_order(request.ordered_project_ids, user_id="large")
+    assert exc.value.code == ErrorCode.INVALID_INPUT
+    assert store.get_order(user_id="large") == fitting_ids
+    assert store.save_order(None, user_id="large") == {
+        "sort_mode": "alphabetical",
+        "ordered_project_ids": fitting_ids,
+    }
 
 
 @pytest.mark.parametrize(

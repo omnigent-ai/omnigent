@@ -218,6 +218,8 @@ def test_review_diagnostics_retain_raw_stdout(
         "REPO": "test/repo",
         "HEAD_SHA": "test-sha",
         "RUN_URL": "https://example.test/run",
+        "GITHUB_RUN_ID": "10",
+        "GITHUB_RUN_ATTEMPT": "1",
     }
 
     def run_step(name: str) -> subprocess.CompletedProcess[str]:
@@ -253,6 +255,10 @@ def test_review_diagnostics_retain_raw_stdout(
         assert result.returncode == (42 if failure_step else 0)
         if failure_step:
             assert "Forced posting failure" in result.stderr
+        assert (tmp_path / "polly-completed-sha.txt").exists() is not bool(failure_step)
+        if not failure_step:
+            assert (tmp_path / "polly-completed-sha.txt").read_text().strip() == "test-sha"
+            assert "<!-- polly-review-run:10-1 -->" in (tmp_path / "comment.md").read_text()
         assert review in (tmp_path / "comment.md").read_text()
         assert "Starting review" not in (tmp_path / "comment.md").read_text()
     result = run_step("Prepare Polly diagnostics")

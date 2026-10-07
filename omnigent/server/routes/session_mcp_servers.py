@@ -22,7 +22,7 @@ from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import session_stream
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider, local_single_user_enabled
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider, local_single_user_enabled
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import (
     get_user_id,
@@ -151,7 +151,7 @@ def create_session_mcp_servers_router(
             agent_cache.load,
             agent.id,
             agent.bundle_location,
-            expand_env=agent.session_id is None,
+            expand_env=agent.operator_authored,
         )
         return {
             "object": "list",
@@ -236,7 +236,7 @@ def create_session_mcp_servers_router(
         the mutation persists as the agent's owner (claim-on-write) for
         legacy rows that predate the ``created_by`` column.
         """
-        agent = await _bound_agent(request, session_id, LEVEL_EDIT)
+        agent = await _bound_agent(request, session_id, LEVEL_OWNER)
         if agent.session_id is None:
             raise OmnigentError(
                 "Built-in agents are read-only through this endpoint.",
@@ -330,7 +330,7 @@ def create_session_mcp_servers_router(
                 agent.id,
                 new_location,
                 new_bundle,
-                expand_env=agent.session_id is None,
+                expand_env=agent.operator_authored,
             )
         return new_spec
 

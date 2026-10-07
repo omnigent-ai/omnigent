@@ -5,6 +5,7 @@ import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
@@ -88,6 +89,11 @@ function makePdfQuery(
 
 const noopRef = { current: null };
 
+const MINIMAL_NB = JSON.stringify({
+  nbformat: 4,
+  cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
+});
+
 function renderViewer(
   content: string,
   panelOpen = true,
@@ -148,9 +154,127 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
 });
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe("CodeViewer find-in-file shortcut", () => {
+  function renderMarkdownViewer(
+    viewMode: "editor" | "source",
+    setSearchOpen: (open: boolean) => void,
+  ) {
+    render(
+      <>
+        <textarea aria-label="Prompt" />
+        <CodeViewer
+          conversationId="conv_1"
+          path="notes.md"
+          fileQuery={makeFileQuery("hello")}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+          panelOpen={true}
+          searchOpen={false}
+          setSearchOpen={setSearchOpen}
+          searchInputRef={noopRef}
+          viewMode={viewMode}
+        />
+      </>,
+    );
+  }
+
+  it("leaves Ctrl+F to a focused composer on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("editor", setSearchOpen);
+    const composer = screen.getByRole("textbox", { name: "Prompt" });
+    composer.focus();
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    composer.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(setSearchOpen).not.toHaveBeenCalled();
+    expect(composer).toHaveFocus();
+  });
+
+  it("opens Markdown find-in-file with Cmd+F on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("editor", setSearchOpen);
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(setSearchOpen).toHaveBeenCalledWith(true);
+  });
+
+  it("leaves Ctrl+F to a focused composer beside Markdown source on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("source", setSearchOpen);
+    const composer = screen.getByRole("textbox", { name: "Prompt" });
+    composer.focus();
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    composer.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(setSearchOpen).not.toHaveBeenCalled();
+    expect(composer).toHaveFocus();
+  });
+
+  it("opens Markdown source find-in-file with Cmd+F on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("source", setSearchOpen);
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(setSearchOpen).toHaveBeenCalledWith(true);
+  });
+
+  it("opens Markdown source find-in-file with Ctrl+F on Windows/Linux", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("source", setSearchOpen);
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(setSearchOpen).toHaveBeenCalledWith(true);
+  });
+});
 
 describe("CodeViewer Cmd+A select-all and copy interception", () => {
   it("copy after Cmd+A writes raw file content to clipboardData", () => {
@@ -255,10 +379,14 @@ describe("CodeViewer editor routing", () => {
   });
 
   it("keeps markdown source on the Shiki path (not Monaco)", () => {
+    vi.mocked(highlightCode).mockClear();
     renderViewer("# heading", true, "notes.md");
     // Markdown source must NOT route to Monaco — it stays on the Shiki render
     // (TipTap handles markdown editing; Monaco is for non-markdown files).
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    // The preview-only highlight skip must not reach here: markdown source still
+    // tokenizes through Shiki.
+    expect(highlightCode).toHaveBeenCalled();
   });
 });
 
@@ -570,6 +698,84 @@ describe("CodeViewer HTML preview sandbox", () => {
   });
 });
 
+describe("CodeViewer rendered previews skip Shiki highlighting", () => {
+  // Rendered previews use their own surfaces and never consume Shiki tokens, so
+  // tokenizing the whole file is wasted work that can freeze a large file.
+
+  it("does not tokenize the file when rendering the HTML preview", () => {
+    vi.mocked(highlightCode).mockClear();
+    const { container } = renderViewer(
+      "<!doctype html><html><body><p>hello</p></body></html>",
+      true,
+      "report.html",
+      { viewMode: "preview" },
+    );
+    expect(container.querySelector('iframe[title="HTML preview"]')).not.toBeNull();
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+
+  it("tokenizes markdown only on entering source view, not across preview transitions", () => {
+    const fileQuery = makeFileQuery("# heading");
+    const build = (viewMode: "preview" | "source") => (
+      <CodeViewer
+        conversationId="conv_1"
+        path="notes.md"
+        fileQuery={fileQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode={viewMode}
+      />
+    );
+    vi.mocked(highlightCode).mockClear();
+    const { rerender } = render(build("preview"));
+    expect(highlightCode).not.toHaveBeenCalled();
+
+    rerender(build("source"));
+    expect(highlightCode).toHaveBeenCalled();
+
+    vi.mocked(highlightCode).mockClear();
+    rerender(build("preview"));
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+
+  // `.ipynb` and `.txt` both detect as "text", so only the notebook path makes
+  // this a rendered preview; toggling it must start and stop highlighting even
+  // though the language never changes.
+  it("toggles highlighting when notebook eligibility changes with the language unchanged", () => {
+    const fileQuery = makeFileQuery(MINIMAL_NB);
+    const build = (path: string) => (
+      <CodeViewer
+        conversationId="conv_1"
+        path={path}
+        fileQuery={fileQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="preview"
+      />
+    );
+    vi.mocked(highlightCode).mockClear();
+    const { rerender } = render(build("analysis.ipynb"));
+    expect(highlightCode).not.toHaveBeenCalled();
+
+    rerender(build("analysis.txt"));
+    expect(highlightCode).toHaveBeenCalled();
+
+    vi.mocked(highlightCode).mockClear();
+    rerender(build("analysis.ipynb"));
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+});
+
 describe("CodeViewer image rendering", () => {
   // jsdom implements neither URL.createObjectURL nor revokeObjectURL; ImageViewer
   // calls both, so stub them and capture the blob it encodes.
@@ -805,11 +1011,6 @@ describe("CodeViewer 3D model routing", () => {
 });
 
 describe("CodeViewer .ipynb routing", () => {
-  const MINIMAL_NB = JSON.stringify({
-    nbformat: 4,
-    cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
-  });
-
   it("renders the notebook preview in preview mode", () => {
     renderViewer(MINIMAL_NB, true, "analysis.ipynb", { viewMode: "preview" });
     expect(screen.getByRole("heading", { name: "Notebook Title" })).toBeDefined();

@@ -9,6 +9,7 @@ import {
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   resolveSetupSteps,
+  skillInvocationPrefix,
 } from "./harnessSetup";
 import type { SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
@@ -196,6 +197,48 @@ describe("harnessReadinessOnHost", () => {
     });
   });
 
+  it("keeps needs-auth SDK harnesses selectable (advisory, not a gate)", () => {
+    // The daemon cannot see agent-level credentials (executor.auth) and its
+    // launch gate stays ungated for SDK harnesses, so needs-auth must warn
+    // without disabling the row.
+    expect(
+      harnessReadinessOnHost("claude-sdk", hostWith({ "claude-sdk": "needs-auth" })),
+    ).toMatchObject({
+      state: "available",
+      reason: "needs-auth",
+      selectable: true,
+      fallbackRelevant: false,
+    });
+    expect(
+      harnessReadinessOnHost("openai-agents", hostWith({ "openai-agents": "needs-auth" })),
+    ).toMatchObject({
+      state: "available",
+      reason: "needs-auth",
+      selectable: true,
+    });
+    // Every SDK spelling the daemon reports readiness for stays selectable,
+    // including the antigravity aliases (specs may use any spelling and the
+    // agents API preserves it).
+    for (const harness of ["antigravity", "agy", "google-antigravity", "openai-agents-sdk"]) {
+      expect(harnessReadinessOnHost(harness, hostWith({ [harness]: "needs-auth" }))).toMatchObject({
+        state: "available",
+        reason: "needs-auth",
+        selectable: true,
+        fallbackRelevant: false,
+      });
+    }
+    // CLI-backed harnesses keep the blocking setup-required mapping: their
+    // launch really is gated on host-side setup. The *native* antigravity
+    // spellings wrap the agy CLI and stay blocking too.
+    for (const harness of ["pi", "agy-native", "native-antigravity"]) {
+      expect(harnessReadinessOnHost(harness, hostWith({ [harness]: "needs-auth" }))).toMatchObject({
+        state: "setup-required",
+        reason: "needs-auth",
+        selectable: false,
+      });
+    }
+  });
+
   it("marks host-wide unavailability as irrelevant to harness fallback", () => {
     expect(
       harnessReadinessOnHost("codex-native", {
@@ -378,5 +421,26 @@ describe("resolveSetupSteps", () => {
   it("returns [] with no descriptor or no harness", () => {
     expect(resolveSetupSteps(undefined, "codex", hostWith({ codex: false }))).toEqual([]);
     expect(resolveSetupSteps(CODEX_STEPS, null, hostWith({ codex: false }))).toEqual([]);
+  });
+});
+
+describe("skillInvocationPrefix", () => {
+  it("returns $ for codex-native", () => {
+    expect(skillInvocationPrefix("codex-native")).toBe("$");
+  });
+
+  it("returns / for non-Codex native harnesses", () => {
+    expect(skillInvocationPrefix("claude-native")).toBe("/");
+    expect(skillInvocationPrefix("cursor-native")).toBe("/");
+  });
+
+  it("returns / for SDK and bare harness spellings", () => {
+    expect(skillInvocationPrefix("codex")).toBe("/");
+    expect(skillInvocationPrefix("claude")).toBe("/");
+  });
+
+  it("returns / for null and undefined", () => {
+    expect(skillInvocationPrefix(null)).toBe("/");
+    expect(skillInvocationPrefix(undefined)).toBe("/");
   });
 });

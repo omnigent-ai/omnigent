@@ -301,6 +301,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
                     "name": "advisor-row",
                     "bundle_location": "bundle",
                     "session_id": None,
+                    "operator_authored": True,
                 },
             )()
 
@@ -406,6 +407,7 @@ async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
                     "name": "advisor-row",
                     "bundle_location": "bundle",
                     "session_id": None,
+                    "operator_authored": True,
                 },
             )()
 
@@ -598,6 +600,46 @@ async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        ('API Error: 499 {"error_code":"CANCELLED","message":""}', "transient_upstream_error"),
+        (
+            'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+            'version 2.1.280 or newer is required."}',
+            "client_update_required",
+        ),
+    ],
+)
+async def test_session_snapshot_classifies_preexisting_gateway_cancel_and_old_cli_errors(
+    message: str,
+    expected_code: str,
+) -> None:
+    """Failures saved as generic native errors pick up the new codes on reload."""
+    session_id = "7c1f0a52d3b94e6c8a5d2e9f4b6a1c30"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": "native_turn_error",
+            "omnigent.last_task_error_message": message,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_native_error", message)],
+        conversations={session_id: conv},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.last_task_error == {"code": expected_code, "message": message}
+    assert conv.labels["omnigent.last_task_error_code"] == "native_turn_error"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     """A session whose runner has no exit report is not marked failed.
 
@@ -730,6 +772,47 @@ class _GatedRunnerClient:
 def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_skips_runner_status_probe_when_excluded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``include_live_status=False`` reports cached/persisted status without probing.
+
+    Runner-owned session reads pass the flag because the probe targets the
+    very runner waiting on this response.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "3db1c2a4e5f60718293a4b5c6d7e8f90"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+
+    class _RunningRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    runner_client = _RunningRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    trimmed = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        include_live_status=False,
+    )
+    assert runner_client.get_calls == []
+    assert trimmed.status == "idle"
+
+    # Same cold cache without the flag: the probe fires and reports.
+    full = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert full.status == "running"
 
 
 @pytest.mark.asyncio
@@ -2988,3 +3071,38 @@ async def test_snapshot_does_not_query_runner_skills_or_publish_skill_events(
     assert "skills_status" not in snapshot.model_dump()
     assert all(not url.endswith("/skills") for url in calls)
     assert all(event.get("type") != "session.skills" for event in published)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_status", "online", "lost"),
+    [
+        ("dead", False, True),
+        ("unknown", False, True),
+        ("alive", False, False),
+        (None, False, False),
+        ("dead", True, False),
+    ],
+)
+async def test_side_chat_fork_lost_trusts_only_a_host_verdict(
+    monkeypatch: pytest.MonkeyPatch, host_status: str | None, online: bool, lost: bool
+) -> None:
+    """Only the launching host can prove an offline runner is gone; no reply proves nothing."""
+    from omnigent.server.routes._sessions import orchestration
+
+    async def _status(_conn: Any, _registry: Any, _runner_id: str) -> str | None:
+        return host_status
+
+    monkeypatch.setattr(orchestration, "_query_host_runner_status", _status)
+    monkeypatch.setattr("omnigent.runner.routing.routing_host_id", lambda _c, _s: "host-1")
+    registry = SimpleNamespace(get=lambda host_id: object() if host_id == "host-1" else None)
+    router = SimpleNamespace(runner_is_online=lambda _runner_id: online)
+    store = _ParentStore(SimpleNamespace(runner_id="runner-birth"))  # parent not relaunched yet
+    child = _side_chat_child(runner_id="runner-birth")
+
+    assert await orchestration._codex_side_chat_fork_lost(child, store, router, registry) is lost  # type: ignore[arg-type]
+
+    ordinary = _side_chat_child(runner_id="runner-birth", nickname="reviewer")
+    assert (
+        await orchestration._codex_side_chat_fork_lost(ordinary, store, router, registry) is False
+    )  # type: ignore[arg-type]

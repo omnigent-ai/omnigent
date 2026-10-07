@@ -13,9 +13,13 @@ import uuid
 from collections.abc import Mapping
 from importlib.resources import files
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnigent.native import native_bridge_common
 from omnigent.util.json_types import JsonObject as _JsonObject
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 # Per-process tiebreaker for inbox ordering. The extension delivers inbox
 # files in lexicographic filename order, so a high-resolution timestamp alone
@@ -57,6 +61,8 @@ _CONFIG_FILE = "config.json"
 _EXTENSION_FILE = "omnigent_pi_native_extension.js"
 _EXTENSION_PACKAGE = "omnigent.resources.pi_native"
 _INBOX_DIR = "inbox"
+# Written by the extension once ``session_start`` has armed the inbox poller.
+_INPUT_READY_FILE = "input_ready"
 _SESSIONS_DIR = "sessions"
 
 
@@ -163,6 +169,20 @@ def extension_path(bridge_dir: Path) -> Path:
 def config_path(bridge_dir: Path) -> Path:
     """Return the generated Pi extension config path for *bridge_dir*."""
     return bridge_dir / _CONFIG_FILE
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: the extension is polling its inbox.
+
+    :param session_id: Omnigent conversation id (unused; the marker lives in
+        the terminal's own bridge directory).
+    :param instance: The live Pi terminal; its extension config env var
+        locates the bridge directory.
+    :returns: Whether this launch's extension wrote the input-ready marker.
+    """
+    del session_id
+    config = instance.env.get(PI_NATIVE_CONFIG_ENV_VAR)
+    return bool(config) and (Path(config).parent / _INPUT_READY_FILE).is_file()
 
 
 def enqueue_user_message(bridge_dir: Path, content: str) -> str:
@@ -352,6 +372,8 @@ def write_extension_files(
         "authHeaders": auth_headers or {},
         "tools": tools or [],
     }
+    # A marker left by a previous Pi process would report this launch ready early.
+    (bridge_dir / _INPUT_READY_FILE).unlink(missing_ok=True)
     _atomic_json(config_path(bridge_dir), payload)
     _atomic_text(extension_path(bridge_dir), _extension_source())
     return extension_path(bridge_dir), config_path(bridge_dir)

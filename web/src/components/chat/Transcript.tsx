@@ -42,7 +42,6 @@ import {
   KeepBottomOnViewportResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
-  UserMessageNavConnected,
   WorkingIndicator,
   bubbleKey,
   buildPendingBubbles,
@@ -321,14 +320,17 @@ function TranscriptImpl({
         ref={setConversationEl}
         className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
-        <Conversation className={cn(!display.hasTasks && "chat-scroll-fade", "flex-1")}>
+        <Conversation
+          className={cn(
+            display.hasTasks ? "chat-scroll-composer-fade" : "chat-scroll-fade",
+            "flex-1",
+          )}
+        >
           <ConversationContent
             scrollClassName="transcript-hide-native-scrollbar"
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6",
+              "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
               display.hasTasks ? "pt-4" : "pt-20",
-              // Keep the rail inset in sync with the column's responsive width.
-              "md:pl-[clamp(1rem,(var(--chat-column-width)+6rem-100cqi)*0.5+1rem,1.5rem)]",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -411,13 +413,6 @@ function TranscriptImpl({
             />
           </ConversationContent>
           <ConversationScrollButton />
-          <UserMessageNavConnected
-            goPrev={nav.goPrev}
-            goNext={nav.goNext}
-            canPrev={nav.canPrev}
-            canNext={nav.canNext}
-            hidden={userMessageIds.length === 0}
-          />
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}

@@ -864,6 +864,50 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     return _DatabricksBearerAuth(host_cfg, failure_message=host_failure), host
 
 
+class _ReusedDatabricksTokenSource:
+    """Reuse SDK auth, re-resolving it after a token mint fails."""
+
+    def __init__(self, server_url: str | None = None, *, host: str | None = None) -> None:
+        if server_url is not None and host is not None:
+            raise ValueError("_ReusedDatabricksTokenSource takes server_url or host, not both")
+        self._server_url = server_url
+        self._host = host
+        self._auth: _DatabricksBearerAuth | None = None
+
+    def _resolve(self) -> _DatabricksBearerAuth | None:
+        """Resolve fresh SDK auth, returning ``None`` on credential failure."""
+        try:
+            if self._host is not None:
+                return _resolve_databricks_auth(host=self._host)[0]
+            from omnigent.cli_auth import load_databricks_workspace_host
+
+            workspace_host = (
+                load_databricks_workspace_host(self._server_url) if self._server_url else None
+            )
+            if workspace_host is not None:
+                return _resolve_databricks_auth(host=workspace_host)[0]
+            return _resolve_databricks_auth()[0]
+        except (DatabricksAuthError, ImportError, ValueError):
+            return None
+
+    def current_token(self) -> str | None:
+        """Mint a token, resolving auth lazily and retrying once if it is stale."""
+        cached = self._auth
+        if cached is not None:
+            try:
+                return cached.current_token()
+            except DatabricksAuthError:
+                self._auth = None
+        auth = self._resolve()
+        if auth is None:
+            return None
+        self._auth = auth
+        try:
+            return auth.current_token()
+        except DatabricksAuthError:
+            return None
+
+
 # Sentinel default_section: keeps [DEFAULT] a plain section carrying only its
 # own keys (no inheritance in either direction), so a [DEFAULT] user profile's
 # ``auth_type = databricks-cli`` cannot smear onto named SP sections and

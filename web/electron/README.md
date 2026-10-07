@@ -139,9 +139,20 @@ If the workspace rejects the session, login requests are blocked while the shell
 tries silent renewal. Missing credentials, failed renewal, unavailable OAuth,
 and cancellation lead to the shell's connect/retry screen—not embedded workspace
 SSO. Failed connections stay blocked through the selector handoff so a late login
-redirect cannot replace it. Choose Connect to explicitly sign in through the system browser again.
-Saved-server launches, additional windows, server switches, and deep links use
-stored credentials without opening a browser automatically.
+redirect cannot replace it. Connect reuses stored credentials and opens the
+system browser only when they can't sign in. To use another account, choose
+**Server → Sign Out of Server** (or **Sign out of <workspace>** in the server
+picker at the bottom of the sidebar, on servers whose web app includes it): it
+forgets the stored OAuth token, clears DBAUTH, and returns every window on that
+workspace to the connect screen, so the next Connect signs in through the
+browser. Saved-server launches, additional windows, server switches, and deep
+links use stored credentials without opening a browser automatically.
+
+When the workspace is briefly unreachable (a VPN reconnecting after wake, an IP
+access list refusing this network, or HTTP 5xx/429), the window keeps its page
+under a **Reconnecting to Databricks…** overlay and retries every 5s for a minute,
+then every 10s for another. Cancel, or running out of retries, returns to the
+setup page with the reason.
 
 For the packaged macOS app, explicitly roll back to embedded Databricks sign-in:
 
@@ -236,6 +247,77 @@ are still deployment metadata; redact those before sharing logs publicly.
   to the Databricks platform owner to check the denial reason (client enablement,
   token scope, or workspace permissions). Do not infer the cause from status alone.
 
+## OIDC sign-in through the system browser
+
+Omnigent servers that sign in with OIDC (`OMNIGENT_AUTH_PROVIDER=oidc`) open
+their identity provider in your **system browser**, not inside the app window.
+Google sign-in (which rejects embedded browsers), passkeys, password managers,
+and the browser's existing IdP session all work there.
+
+Before loading a server, the shell reads its unauthenticated
+`/.well-known/omnigent.json` manifest. Only `auth.mode: "oidc"` switches to
+browser sign-in:
+
+| Server                                                     | Sign-in                                         |
+| ---------------------------------------------------------- | ----------------------------------------------- |
+| OIDC                                                       | System browser (below)                          |
+| Accounts (username + password)                             | Unchanged: the server's own form, in the window |
+| Header mode, custom providers, no auth                     | Unchanged                                       |
+| No `auth` in the manifest (older servers, subpath proxies) | Unchanged: in the window                        |
+| Databricks workspaces, accounts, and Apps                  | Unchanged: detected by URL, manifest not read   |
+
+- **Connect** opens the browser at the server's `/auth/login` with an RFC 8252
+  loopback redirect (`http://127.0.0.1:<random port>/callback`) and a PKCE
+  challenge. After you sign in, the server sends the browser back to that
+  loopback with a one-time code, and the shell exchanges the code and its
+  verifier at `POST /auth/native-token`. The code only reaches this machine and
+  is useless without the verifier. The shell installs the returned session as
+  the server's own session cookie, confirms `/v1/me` accepts it, and brings the
+  window to the front. If the existing session is still valid, or the stored
+  refresh grant renews it, Connect doesn't open the browser at all.
+- **Launch, New Window, deep links, and server switches** reuse the session or
+  renew it silently from the refresh grant (`POST /oauth/token`). They never
+  open the browser. If nothing can renew it, the window returns to the connect
+  screen with the reason (session expired, ended by the server, sign-in
+  required).
+- **While connected,** the shell renews the cookie before it expires and when it
+  is removed. The web app's own redirect to `/auth/login` is stopped before it
+  can reach the IdP; the shell renews and reloads the page you were on.
+- **Sign out** (the web app's `/auth/logout`, **Server → Sign Out of Server**,
+  or **Sign out of <server>** in the sidebar server picker) is handled by the shell: it revokes the refresh
+  grant, clears the session cookie, and shows the connect screen for every
+  window on that server. Your browser stays signed in to the
+  IdP, so the next Connect may finish without a prompt.
+- **Cancel** (the × beside **Authenticating…**) stops the attempt and the
+  loopback listener. A browser tab that finishes later reaches nothing.
+
+The refresh grant is stored per server in `~/.omnigent/oidc_tokens.json`,
+encrypted with the OS keychain (`safeStorage`). Development builds also offer
+**Debug → Authentication → Simulate Session Expiry** (clears the session cookie;
+the lifecycle renews it) and **Invalidate Cached Refresh Token** for OIDC
+windows.
+
+### Manual verification
+
+Run an OIDC server (for example `deploy/docker` with Keycloak, or any IdP whose
+sign-in has a passkey step), then `just electron-dev`:
+
+1. **Server → Change Server…**, enter the server URL, and select **Connect**.
+   The setup page shows **Authenticating…**, your browser opens the IdP, and
+   after sign-in the browser tab says "Return to Omnigent". The app comes to the
+   front, signed in. The IdP page never appears inside the app.
+2. Select the × during **Authenticating…**: the form returns to Connect. Retry
+   works.
+3. Quit and relaunch: the app opens signed in without a browser.
+4. **Debug → Authentication → Simulate Session Expiry**: the app keeps working
+   (the cookie is renewed silently).
+5. **Invalidate Cached Refresh Token**, then **Simulate Session Expiry**, then
+   reload: the connect screen says "Sign in to <host> to continue."
+6. Sign out from the app's settings: the connect screen says "You're signed out
+   of <host>." Relaunching doesn't sign you back in.
+7. An accounts-mode server and `http://localhost:6767` (header mode) still sign
+   in exactly as before.
+
 ## Debugging a packaged macOS build
 
 Developer Tools are disabled by default in the production app. To opt in, quit
@@ -278,6 +360,9 @@ electron/
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
+  src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
+  src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
+  src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
   setup/index.html         # the bundled "connect to server" setup page
   about/index.html         # bundled About UI opened from the macOS app menu
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
@@ -591,8 +676,16 @@ pnpm run build:linux       # AppImage + .deb
 pnpm run build:win         # NSIS installer
 ```
 
-Output lands in `electron/dist/` (the DMG is named
-`Omnigent-<version>-<arch>.dmg`).
+Local packages use the `ai.omnigent.desktop-dev` app ID and the **Omnigent Dev**
+name; output lands in `electron/dist-dev/` (the DMG is named
+`Omnigent Dev-<version>-<arch>.dmg`). They keep their own app data and do not
+install production desktop updates. `build:mac:release` retains
+`ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
+
+Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
+bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly
+and stores settings in **Omnigent Dev** app data. To try a managed preference,
+use the packaged local build instead (see `docs/managed-preferences.md`).
 
 ## macOS code signing & notarization
 

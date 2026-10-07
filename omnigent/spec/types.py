@@ -1144,12 +1144,16 @@ class Phase(str, Enum):
     (``Phase("tool_call")``) and preserves the string form in
     logs / JSON serialization.
 
-    Session-level phases (fire once per turn):
+    Session-level phases:
 
     - ``REQUEST``: after a new user message arrives, before
       the LLM turn.
-    - ``RESPONSE``: after the LLM's final assistant message,
-      before persistence.
+    - ``RESPONSE``: before assistant text is persisted. The runner relay
+      evaluates each nonempty segment, including text before tool calls.
+      ``EvaluationContext.turn_final`` identifies the final segment of a
+      successful turn; response policies should skip only explicit
+      ``False`` for completion actions, preserving callers that supply
+      ``None``. Content checks should evaluate every segment.
 
     Tool phases (fire per tool invocation):
 
@@ -1603,6 +1607,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     guardrails: GuardrailsSpec | None = None
     async_enabled: bool = True
     os_env: OSEnvSpec | None = None
+    # Operator-approved model-signing authority. Separate from sandbox
+    # egress_rules so generic network access cannot authorize credentials.
+    model_egress: list[str] | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False

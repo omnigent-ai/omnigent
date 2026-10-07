@@ -18,6 +18,7 @@ handling of un-tokenizable segments, which differs per policy).
 from __future__ import annotations
 
 import re
+import shlex
 
 # Every harness's shell / terminal tool, all of which surface the command as a
 # string ``command`` argument. This is the default gated surface for every
@@ -397,6 +398,8 @@ def _skip_flag_wrapper_args(
                 captured = attached if equals else _value_at(tokens, index)
             if flag in value_flags and index < len(tokens):
                 index += 1
+            if captured is not None:
+                return index, captured
             continue
         bundle = flag[1:]
         position = next(
@@ -410,6 +413,8 @@ def _skip_flag_wrapper_args(
             captured = _value_at(tokens, index) if is_last else bundle[position + 1 :]
         if is_last and index < len(tokens):
             index += 1
+        if captured is not None:
+            return index, captured
     if has_duration and index < len(tokens):
         index += 1
     return index, captured
@@ -444,14 +449,18 @@ def unwrap_shell_command(tokens: list[str]) -> str | None:
     """
     head = tokens[0].rsplit("/", 1)[-1]
     if head == "env":
-        _, split_string = _skip_flag_wrapper_args(
+        index, split_string = _skip_flag_wrapper_args(
             tokens,
             1,
             value_flags=_FLAG_WRAPPERS["env"],
             has_duration=False,
             capture_flags=_ENV_SPLIT_STRING_FLAGS,
         )
-        return split_string
+        if split_string is None:
+            return None
+        # env inserts the split words before the remaining argv. Those words
+        # can contain more env options, while later arguments belong to the command.
+        return f"env {split_string} {shlex.join(tokens[index:])}"
     if head in SHELL_INTERPRETERS:
         for i, tok in enumerate(tokens):
             if _INTERPRETER_C_FLAG.fullmatch(tok) and i + 1 < len(tokens):

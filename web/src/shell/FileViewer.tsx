@@ -10,6 +10,7 @@
 //   └──────────────────────────────────┴──────────────────┘
 
 import { FileViewerContext, type FilePosition } from "./FileViewerContext";
+import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
 import {
   dismissFilePosition,
   isFilePositionDismissed,
@@ -43,6 +44,7 @@ import {
   EyeIcon,
   EyeOffIcon,
   FileDiffIcon,
+  FolderOpenIcon,
   Link2Icon,
   ListIcon,
   Loader2Icon,
@@ -94,6 +96,7 @@ import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
 import {
@@ -168,11 +171,18 @@ export function classifyAndRemapComments(
       fileContent.length,
       c.start_index + c.anchor_content.length + SEARCH_WINDOW,
     );
-    const nearbyIdx = fileContent.indexOf(c.anchor_content, windowStart);
-    const idx =
-      nearbyIdx !== -1 && nearbyIdx <= windowEnd
-        ? nearbyIdx
-        : fileContent.indexOf(c.anchor_content);
+    let nearbyIdx = -1;
+    let nearbyDistance = Number.POSITIVE_INFINITY;
+    let from = fileContent.indexOf(c.anchor_content, windowStart);
+    while (from !== -1 && from <= windowEnd) {
+      const distance = Math.abs(from - c.start_index);
+      if (distance < nearbyDistance) {
+        nearbyIdx = from;
+        nearbyDistance = distance;
+      }
+      from = fileContent.indexOf(c.anchor_content, from + 1);
+    }
+    const idx = nearbyIdx !== -1 ? nearbyIdx : fileContent.indexOf(c.anchor_content);
     if (idx === -1) {
       // Anchor not found anywhere — keep at stored offsets rather than dropping.
       open.push(c);
@@ -688,6 +698,7 @@ function FileViewerBody({
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+  const revealTarget = useRevealTarget(path);
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
@@ -878,7 +889,7 @@ function FileViewerBody({
   useEffect(() => {
     if (!open || !isMonacoFindSurface) return;
     const handler = (e: KeyboardEvent) => {
-      if (!((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "f")) return;
+      if (!(hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "f")) return;
       if (!viewerIsActiveSurfaceRef.current) return;
       e.preventDefault();
       e.stopPropagation();
@@ -1160,6 +1171,15 @@ function FileViewerBody({
       onSelect: openSearch,
     },
   ];
+  if (revealTarget && !isDeletedFile) {
+    settingsMenu.push({
+      key: "reveal",
+      label: revealLabel(false),
+      icon: <FolderOpenIcon className="size-4" />,
+      active: false,
+      onSelect: () => revealInFileManager(revealTarget),
+    });
+  }
   if (!isDeletedFile && fileQuery.data) {
     settingsMenu.push({
       key: "download",

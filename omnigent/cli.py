@@ -17,7 +17,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from importlib import import_module, resources
 from pathlib import Path
@@ -1754,6 +1754,7 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
         "antigravity",
         "claude",
         "codex",
+        "copilot",
         "cursor",
         "debby",
         "devin",
@@ -1791,9 +1792,11 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     The predicates use ``importlib.util.find_spec`` (no heavy import).
     Commands absent from this map are always listed.
     """
+    from omnigent.onboarding.copilot_auth import copilot_sdk_installed
     from omnigent.onboarding.cursor_auth import cursor_sdk_installed
 
     return {
+        "copilot": copilot_sdk_installed,
         "cursor": cursor_sdk_installed,
     }
 
@@ -2093,12 +2096,14 @@ def cli() -> None:
 # Keep in sync with ``@cli.command()`` decorations below.
 _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     {
+        "agent",
         "agy",
         "antigravity",
         "attach",
         "claude",
         "codex",
         "config",
+        "copilot",
         "cursor",
         "debby",
         "debug",
@@ -2699,6 +2704,47 @@ def _normalize_daemon_target(server_url: str | None) -> str:
     return _normalize_daemon_target_impl(server_url)
 
 
+def _daemon_host_status_probe(
+    record: _HostDaemonRecord, *, timeout_s: float = 2.0
+) -> _HostHttpResult | None:
+    """
+    Fetch the server's view of a daemon's host row.
+
+    :param record: Daemon record to probe.
+    :param timeout_s: Per-request HTTP timeout in seconds, e.g. ``2.0``.
+    :returns: The HTTP result — status ``0`` means the request never got an
+        HTTP answer and the body carries the transport failure — or ``None``
+        when the record has no host id or no server URL to probe.
+    """
+    from omnigent.harnesses.claude_native.bridge import url_component
+
+    host_id = record.host_id or _load_existing_host_id()
+    if host_id is None:
+        return None
+    base_url = _daemon_base_url(record)
+    if base_url is None:
+        return None
+    return _host_http_json(
+        base_url=base_url,
+        method="GET",
+        path=f"/v1/hosts/{url_component(host_id)}",
+        timeout_s=timeout_s,
+        host_id=host_id,
+    )
+
+
+def _host_status_reports_online(result: _HostHttpResult | None) -> bool:
+    """
+    Report whether a host-row probe result says the host is online.
+
+    :param result: Probe result from :func:`_daemon_host_status_probe`.
+    :returns: ``True`` only on a 200 whose body reports ``"online"``.
+    """
+    if result is None or result.status_code != 200 or not isinstance(result.body, dict):
+        return False
+    return result.body.get("status") == "online"
+
+
 def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) -> bool:
     """
     Probe whether a daemon's host is currently online on its server.
@@ -2717,24 +2763,7 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
         as ``"online"``; ``False`` if the host id is unknown, the server
         is unreachable, or the host reports offline.
     """
-    from omnigent.harnesses.claude_native.bridge import url_component
-
-    host_id = record.host_id or _load_existing_host_id()
-    if host_id is None:
-        return False
-    base_url = _daemon_base_url(record)
-    if base_url is None:
-        return False
-    result = _host_http_json(
-        base_url=base_url,
-        method="GET",
-        path=f"/v1/hosts/{url_component(host_id)}",
-        timeout_s=timeout_s,
-        host_id=host_id,
-    )
-    if result.status_code != 200 or not isinstance(result.body, dict):
-        return False
-    return result.body.get("status") == "online"
+    return _host_status_reports_online(_daemon_host_status_probe(record, timeout_s=timeout_s))
 
 
 def _daemon_registry_dir() -> Path:
@@ -4700,9 +4729,8 @@ def server(
             # read that loss as ours, not as the runners dying.
             _shutdown_state.mark_server_shutting_down()
             _session_stream.shutdown_all()
-            # Yield to the event loop so generators can consume _DONE,
-            # flush their final "data: [DONE]\n\n" chunk, and exit before
-            # super().shutdown() calls connection.shutdown() / transport.close().
+            # Yield so streams consume _DONE and exit before transports close.
+            # No [DONE] reaches browsers: they must reconnect after restart.
             # Without this pause the generators write to an already-closing
             # transport, leaving connections open past the graceful window.
             await _asyncio.sleep(0)
@@ -6027,9 +6055,11 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
 
     - ``config.yaml``: ``llm.connection.*`` and
       ``executor.connection.*`` values, ``executor.auth``
-      ``api_key`` / ``base_url`` (when ``type: api_key``), and
-      ``tools.builtins[*]`` dict-entry values (except ``name``)
-    - ``tools/mcp/*.yaml``: ``headers.*`` and ``env.*`` values
+      ``api_key`` / ``base_url`` (when ``type: api_key``),
+      ``tools.builtins[*]`` dict-entry values (except ``name``), and
+      inline ``tools.<name>`` MCP servers' ``url``, ``headers.*`` and
+      ``env.*`` values
+    - ``tools/mcp/*.yaml``: ``url``, ``headers.*`` and ``env.*`` values
 
     These mirror the server-side parser's ``${VAR}`` expansion
     sites. Resolving here, against the client's own environment,
@@ -6059,24 +6089,13 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
                 )
 
     # ── tools/mcp/*.yaml ─────────────────────────────
-    # ``headers`` (HTTP transport auth) and ``env`` (stdio transport
-    # process env) are both secret-bearing and both expanded by the
-    # server-side parser, so resolve both client-side.
     mcp_dir = source / "tools" / "mcp"
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
             raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 continue
-            changed = False
-            for field in ("headers", "env"):
-                value = raw.get(field)
-                if isinstance(value, dict):
-                    raw[field] = expand_env_vars(
-                        {str(k): str(v) for k, v in value.items()},
-                    )
-                    changed = True
-            if changed:
+            if _expand_mcp_server_env_vars(raw, expand_env_vars):
                 arcname = str(yaml_file.relative_to(source))
                 resolved[arcname] = yaml.dump(
                     raw,
@@ -6193,6 +6212,8 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
     - ``executor.auth`` — ``api_key`` / ``base_url`` when
       ``type == "api_key"``
     - ``tools.builtins[*]`` — dict-entry values except ``name``
+    - ``tools.<name>`` inline MCP servers — ``url``, ``headers`` and
+      ``env`` values
 
     :param raw: The parsed config.yaml dict (modified in-place).
     :param expand_fn: Callable that expands env var references
@@ -6237,6 +6258,81 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
             or changed
         )
 
+    return _expand_inline_mcp_env_vars(raw.get("tools"), expand_fn) or changed
+
+
+def _expand_inline_mcp_env_vars(
+    raw_tools: object,
+    expand_fn: Callable[[dict[str, str]], dict[str, str]],
+) -> bool:
+    """
+    Expand ``${VAR}`` references in inline ``type: mcp`` entries of
+    config.yaml's ``tools:`` block, modifying them in-place.
+
+    Selects the same entries the parser's ``_parse_inline_mcp_servers``
+    expands: mappings with ``type: mcp`` under a non-reserved key that
+    declare a ``command`` or ``url``.
+
+    :param raw_tools: The raw ``tools:`` value from config.yaml, e.g.
+        ``{"search": {"type": "mcp", "url": "${SEARCH_URL}"}}``.
+        Non-dict values are ignored.
+    :param expand_fn: Callable that expands env var references
+        in a string-to-string dict.
+    :returns: ``True`` if any values were expanded.
+    """
+    from omnigent.spec.parser import _TOOLS_CONFIG_KEYS
+
+    if not isinstance(raw_tools, dict):
+        return False
+    changed = False
+    for key, entry in raw_tools.items():
+        if key in _TOOLS_CONFIG_KEYS or not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")) != "mcp":
+            continue
+        if entry.get("command") is None and entry.get("url") is None:
+            continue
+        changed = _expand_mcp_server_env_vars(entry, expand_fn) or changed
+    return changed
+
+
+def _expand_mcp_server_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
+    raw: dict[str, Any],
+    expand_fn: Callable[[dict[str, str]], dict[str, str]],
+) -> bool:
+    """
+    Expand ``${VAR}`` references in one MCP server declaration's
+    ``url``, ``headers`` and ``env``, modifying *raw* in-place.
+
+    These are the fields the parser expands for MCP servers. The
+    server re-parses uploaded bundles without expansion, so they are
+    resolved here from the uploading user's environment instead.
+
+    :param raw: One MCP server mapping from ``tools/mcp/*.yaml`` or an
+        inline ``tools.<name>`` entry, e.g.
+        ``{"url": "${MCP_URL}", "headers": {"Authorization": "Bearer ${TOKEN}"}}``.
+    :param expand_fn: Callable that expands env var references
+        in a string-to-string dict.
+    :returns: ``True`` if expansion changed any value; literal-only
+        fields are left untouched so the file can ship unmodified.
+    :raises OmnigentError: If a ``${VAR}`` reference cannot be
+        resolved from the environment.
+    """
+    changed = False
+    url = raw.get("url")
+    if url is not None:
+        expanded_url = expand_fn({"url": str(url)})["url"]
+        if expanded_url != str(url):
+            raw["url"] = expanded_url
+            changed = True
+    for field in ("headers", "env"):
+        value = raw.get(field)
+        if isinstance(value, dict):
+            original = {str(k): str(v) for k, v in value.items()}
+            expanded = expand_fn(original)
+            if expanded != original:
+                raw[field] = expanded
+                changed = True
     return changed
 
 
@@ -6324,6 +6420,20 @@ def debby(run_args: tuple[str, ...]) -> None:
       omnigent debby -p "name ideas for a CLI that runs agents"
     """
     _run_bundled_agent("debby", run_args)
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
+def copilot(run_args: tuple[str, ...]) -> None:
+    """Launch GitHub Copilot with Omnigent.
+
+    Shorthand for ``omnigent run --harness copilot``; every ``run`` option is forwarded."""
+    _run_harness_shorthand("copilot", run_args)
 
 
 @cli.command()
@@ -8754,22 +8864,112 @@ def _background_host_log_detail(log_path: str | None) -> str:
     return detail
 
 
+def _registration_target_display(record: _HostDaemonRecord) -> str:
+    """Return the user-facing URL of the server a daemon must register with.
+
+    The result reaches terminal output and persistent exception text, and a
+    configured server URL may carry basic-auth userinfo
+    (``https://user:token@host``) that daemon-target normalization preserves.
+    Strip the userinfo the same way ``omnigent.cli_auth._safe_log_url`` does,
+    so registration diagnostics never echo embedded credentials. The query is
+    kept: ``ServerUrl`` strips arbitrary queries from the API base, and the
+    display form only re-adds the non-secret ``?o=<workspace>`` selector.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    from omnigent.util.server_url import display_server_url
+
+    base_url = _daemon_base_url(record)
+    if not base_url:
+        return "the configured server"
+    display = display_server_url(base_url)
+    try:
+        parts = urlsplit(display)
+        host = parts.hostname
+    except ValueError:
+        return "the configured server"
+    if not parts.scheme or not host:
+        return "the configured server"
+    # Drop only the userinfo, keeping the rest of the authority verbatim so
+    # an IPv6 literal retains its brackets (``http://[::1]:6767``).
+    netloc = parts.netloc.rpartition("@")[2]
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
+
+
+def _background_registration_timeout(
+    record: _HostDaemonRecord,
+    *,
+    server_responded: bool,
+    transport_error: str | None,
+) -> click.ClickException:
+    """Build the error for a registration wait that exhausted its grace.
+
+    :param record: Registry record of the daemon that never registered.
+    :param server_responded: Whether any status probe got an HTTP answer.
+    :param transport_error: Last probe transport failure, e.g.
+        ``"ConnectError: [Errno 111] Connection refused"``.
+    :returns: The exception to raise — an unreachable server is named
+        together with its transport failure instead of the generic
+        registration-timeout wording.
+    """
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    target = _registration_target_display(record)
+    log_detail = _background_host_log_detail(record.log_path)
+    if not server_responded and transport_error is not None:
+        exc = click.ClickException(
+            f"Could not reach the Omnigent server at {target} within "
+            f"{_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s ({transport_error}). "
+            "Check that the server is running and that your `server` config "
+            f"points at the right URL.{log_detail}"
+        )
+        # A server nothing answered at cannot be a stale-host HTTP 401
+        # tunnel rejection, so the recovery hint would mislead here.
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        return exc
+    return click.ClickException(
+        "The host daemon started but did not register with the server at "
+        f"{target} within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s."
+        f"{log_detail}"
+    )
+
+
 def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
     """Wait until the detached daemon completes server registration."""
     deadline = time.monotonic() + _BACKGROUND_HOST_REGISTRATION_GRACE_S
+    announced = False
+    server_responded = False
+    last_transport_error: str | None = None
     while True:
         if not _pid_alive(record.pid):
             raise click.ClickException(
                 "The host daemon exited before registering with the server."
                 f"{_background_host_log_detail(record.log_path)}"
             )
-        if _daemon_host_online(record, timeout_s=1.0):
+        result = _daemon_host_status_probe(record, timeout_s=1.0)
+        if result is not None and result.status_code == 0:
+            last_transport_error = str(result.body)
+        elif result is not None:
+            server_responded = True
+        if _host_status_reports_online(result):
             return
+        if not announced:
+            # Not registered on the first probe: name what the otherwise
+            # silent wait is for before polling out the grace period. On
+            # stderr, like the nearby progress output, so scripts capturing
+            # the command's result never receive the waiting line.
+            click.echo(
+                "Waiting for the host daemon to register with "
+                f"{_registration_target_display(record)} "
+                f"(up to {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s)...",
+                err=True,
+            )
+            announced = True
         if time.monotonic() >= deadline:
-            raise click.ClickException(
-                "The host daemon started but did not register with the server "
-                f"within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s."
-                f"{_background_host_log_detail(record.log_path)}"
+            raise _background_registration_timeout(
+                record,
+                server_responded=server_responded,
+                transport_error=last_transport_error,
             )
         time.sleep(0.2)
 
@@ -11232,6 +11432,186 @@ if _sandbox_providers():
 # built-in accounts provider to OIDC.
 
 
+_AGENT_SERVER_OPTION = click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+
+
+def _agent_cli_error(message: str) -> click.ClickException:
+    """An ``omnigent agent`` error; the stale-host recovery hint can't fix these."""
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    exc = click.ClickException(message)
+    setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    return exc
+
+
+@contextlib.contextmanager
+def _agent_api_client(server: str | None) -> Iterator[Any]:  # type: ignore[explicit-any]  # httpx imported lazily
+    """Yield an authenticated client for ``/v1/agents`` on the resolved server."""
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    configured = _load_effective_config().get("server")
+    chosen = server if server is not None else configured
+    resolved = (
+        None
+        if isinstance(chosen, str) and _is_local_server_request(chosen)
+        else _resolve_attach_server_url(server, configured)
+    )
+    if resolved is None:
+        resolved = ServerUrl(ensure_local_omnigent_server().url)
+    base_url = resolved.api_base
+    with httpx.Client(
+        base_url=base_url,
+        headers=_remote_headers(server_url=base_url, host_id=None, org_id=resolved.org_id),
+        timeout=60.0,
+        trust_env=_trust_env_for(base_url),
+    ) as client:
+        # Older servers lack user agents; say so rather than failing with a
+        # 405 or reporting an empty list.
+        info = client.get("/v1/info")
+        if not (info.is_success and info.json().get("agent_install") is True):
+            raise _agent_cli_error(
+                f"{base_url} does not support installing agents; upgrade the server "
+                "to use `omnigent agent`."
+            )
+        yield client
+
+
+def _raise_for_agent_api(resp: Any) -> None:  # type: ignore[explicit-any]  # httpx.Response
+    """Turn a failed ``/v1/agents`` response into a clean CLI error."""
+    if resp.is_success:
+        return
+    try:
+        body = resp.json()
+        detail = body.get("error", {}).get("message") or body.get("detail") or resp.text
+    except (ValueError, AttributeError):  # non-JSON, or JSON of an unexpected shape
+        detail = resp.text
+    raise _agent_cli_error(f"{resp.status_code}: {detail}")
+
+
+@cli.group("agent")
+def agent_grp() -> None:
+    """Install reusable agents so they stay in the new-session picker.
+
+    Installed agents are stored on the server under your account, so they
+    appear on every host you use, beside the built-ins, without a restart.
+    """
+
+
+@agent_grp.command("add")
+@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@_AGENT_SERVER_OPTION
+def agent_add(source: Path, server: str | None) -> None:
+    """Install SOURCE (an agent directory, YAML file, or .tar.gz bundle).
+
+    Re-adding an agent with the same name replaces your copy in place.
+    Workers, skills, guardrails, and supporting files in the directory are
+    all kept. For a directory, ``${VAR}`` references are resolved from this
+    shell, as ``omnigent run`` does; a YAML file or tarball is uploaded as is.
+
+    \b
+    Examples:
+      omnigent agent add ./orion
+      omnigent agent add ./orion.tar.gz --server https://myserver.com
+    """
+    with _agent_api_client(server) as client:
+        bundle_bytes = _bundle(source)
+        resp = client.post(
+            "/v1/agents",
+            files={"bundle": ("bundle.tar.gz", bundle_bytes, "application/gzip")},
+        )
+    _raise_for_agent_api(resp)
+    agent = resp.json()
+    click.echo(f"Installed {agent['name']} (version {agent['version']}, id {agent['id']})")
+    if agent["version"] > 1:
+        # Terminal (TUI) harnesses keep the agent they launched with.
+        click.echo(
+            "Sessions using it pick up this version on their next turn; "
+            "terminal sessions do when they relaunch."
+        )
+
+
+def _list_agents(client: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]  # httpx.Client + JSON rows
+    """Page through the caller's own agents (``GET /v1/agents?scope=user``), newest first."""
+    rows: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON rows
+    after: str | None = None
+    while True:
+        params = {"scope": "user", "limit": 50, **({"after": after} if after else {})}
+        resp = client.get("/v1/agents", params=params)
+        _raise_for_agent_api(resp)
+        page = resp.json()
+        rows.extend(page["data"])
+        next_after = page.get("last_id")
+        if not page.get("has_more") or not next_after or next_after == after:
+            return rows
+        after = next_after
+
+
+@agent_grp.command("list")
+@_AGENT_SERVER_OPTION
+def agent_list(server: str | None) -> None:
+    """List your agents (installed with ``omnigent agent add`` or uploaded)."""
+    with _agent_api_client(server) as client:
+        rows = _list_agents(client)
+    if not rows:
+        click.echo("No agents yet. Install one with: omnigent agent add <path>")
+        return
+    table = _host_table("Your agents")
+    table.add_column("Name", style="bold", overflow="fold")
+    table.add_column("Version", justify="right", no_wrap=True)
+    table.add_column("Harness", no_wrap=True)
+    # The id is what `omnigent agent remove` takes when two agents share a name.
+    table.add_column("ID", no_wrap=True, min_width=32)
+    for agent in rows:
+        table.add_row(
+            agent["name"], str(agent["version"]), agent.get("harness") or "-", agent["id"]
+        )
+    _host_console().print(table)
+
+
+@agent_grp.command("remove")
+@click.argument("agent")
+@click.option("--yes", "-y", is_flag=True, help="Remove without asking, even if sessions use it.")
+@_AGENT_SERVER_OPTION
+def agent_remove(agent: str, yes: bool, server: str | None) -> None:
+    """Remove your AGENT, given by name or by the id ``omnigent agent list`` shows.
+
+    Sessions using it keep running while they can, then must be forked into
+    another agent to continue, so you are asked to confirm first.
+    """
+    with _agent_api_client(server) as client:
+        rows = _list_agents(client)
+        matches = [a for a in rows if a["id"] == agent] or [a for a in rows if a["name"] == agent]
+        if not matches:
+            raise _agent_cli_error(f"You have no agent named {agent!r}.")
+        if len(matches) > 1:
+            ids = ", ".join(a["id"] for a in matches)
+            raise _agent_cli_error(
+                f"You have {len(matches)} agents named {agent!r}; remove one by id: {ids}"
+            )
+        name = matches[0]["name"]
+        path = f"/v1/agents/{matches[0]['id']}"
+        resp = client.delete(path, params={"force": "true"} if yes else None)
+        if resp.status_code == 409 and "sessions_in_use" in resp.json():
+            count = resp.json()["sessions_in_use"]
+            click.confirm(
+                f"{count} session(s) still use {name}; removing it will break them. "
+                "Remove anyway?",
+                abort=True,
+            )
+            resp = client.delete(path, params={"force": "true"})
+        _raise_for_agent_api(resp)
+    click.echo(f"Removed {name}")
+
+
 @cli.group("debug")
 def debug() -> None:
     """Internal maintenance commands.
@@ -12454,7 +12834,7 @@ def login(server_url: str) -> None:
     # hosted omnigent) means Databricks fronts the server. This
     # lets one CLI command handle every posture without a flag.
     try:
-        probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
+        probe = _httpx.get(f"{server}/v1/me", timeout=10.0, trust_env=_trust_env_for(server))
     except _httpx.HTTPError as exc:
         raise click.ClickException(
             f"Could not reach {server}/v1/me: {exc}\nIs the server running?"
@@ -12491,20 +12871,36 @@ def login(server_url: str) -> None:
         _remember_default_server(server)
         return
 
-    # Fall through: OIDC mode (or unknown — let the ticket endpoint's
-    # error message guide the user).
+    if probe.status_code != 401:
+        # Not an Omnigent auth answer (an env proxy's block page, a gateway
+        # error): falling into the OIDC ticket flow would blame the wrong
+        # endpoint, so fail on the probe itself.
+        raise click.ClickException(
+            f"Unexpected response from {server}/v1/me: HTTP {probe.status_code}. "
+            "This is not an Omnigent auth answer; the server may be erroring, "
+            "or something other than the server may have replied."
+            f"{_proxy_interference_hint(server)}"
+        )
+
+    # Fall through: OIDC mode (or a 401 without a recognized login_url —
+    # older OIDC servers and auth middlewares answer 401 without the JSON
+    # ``login_url`` payload, so the ticket flow stays the compatibility
+    # path for any 401 and its endpoint's error message guides the user).
     import webbrowser
 
     from omnigent.cli_auth import store_token
 
     # Step 1: Request a CLI login ticket.
     try:
-        resp = _httpx.post(f"{server}/auth/cli-login", timeout=10.0)
+        resp = _httpx.post(
+            f"{server}/auth/cli-login", timeout=10.0, trust_env=_trust_env_for(server)
+        )
         resp.raise_for_status()
     except _httpx.HTTPError as exc:
         raise click.ClickException(
             f"Could not reach {server}/auth/cli-login: {exc}\n"
             f"Is the server running with OMNIGENT_AUTH_PROVIDER=oidc?"
+            f"{_proxy_interference_hint(server)}"
         ) from exc
 
     data = resp.json()
@@ -12524,7 +12920,7 @@ def login(server_url: str) -> None:
     while _time.time() < deadline:
         _time.sleep(2)
         try:
-            poll_resp = _httpx.get(poll_url, timeout=10.0)
+            poll_resp = _httpx.get(poll_url, timeout=10.0, trust_env=_trust_env_for(server))
         except _httpx.HTTPError:
             continue
 
@@ -12558,6 +12954,54 @@ def login(server_url: str) -> None:
 
 
 _CLI_LOGIN_TIMEOUT_SECONDS = 300  # 5 minutes
+
+# The proxy env vars httpx consults for each target scheme: only the
+# matching scheme's proxy (or the scheme-agnostic ALL_PROXY) can route a
+# request, so a hint must never blame e.g. HTTPS_PROXY for an http:// target.
+_PROXY_ENV_VARS_BY_SCHEME = {
+    "http": ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"),
+    "https": ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"),
+}
+
+
+def _proxy_interference_hint(base_url: str) -> str:
+    """A NO_PROXY hint when an env-configured proxy could answer for *base_url*.
+
+    Tracks httpx's actual routing: only proxy variables that apply to the
+    target's scheme count, and ``NO_PROXY`` entries — bare hostnames or
+    port-qualified ``host:port`` forms — that exclude the target suppress
+    the hint.
+
+    :param base_url: Server base URL, e.g. ``"http://omni.internal:6767"``.
+    :returns: A newline-prefixed hint, or ``""`` when no env proxy applies.
+    """
+    if not _trust_env_for(base_url):
+        return ""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(base_url)
+    scheme = (parts.scheme or "http").lower()
+    relevant_vars = _PROXY_ENV_VARS_BY_SCHEME.get(scheme, ("ALL_PROXY", "all_proxy"))
+    if not any(os.environ.get(var) for var in relevant_vars):
+        return ""
+    # Runtime-only stdlib helper (present in CPython, absent from typeshed);
+    # it implements the NO_PROXY list matching we need here.
+    from urllib.request import proxy_bypass_environment  # type: ignore[missing-module-attribute]
+
+    # NO_PROXY may already exclude this host (as a bare hostname or a
+    # port-qualified host:port entry, both of which httpx honors), in which
+    # case the answer really came from the server and blaming a proxy would
+    # misdirect. Pass host:port only when the URL carries an explicit port,
+    # mirroring httpx's port matching.
+    host = parts.hostname
+    bypass_target = f"{host}:{parts.port}" if host and parts.port else host
+    if bypass_target and proxy_bypass_environment(bypass_target):
+        return ""
+    return (
+        "\nA proxy from your environment (HTTP_PROXY/HTTPS_PROXY) may be "
+        "answering instead of the server; add the server host to NO_PROXY "
+        "to bypass it."
+    )
 
 
 def _accounts_login(server: str) -> None:
@@ -12597,6 +13041,7 @@ def _accounts_login(server: str) -> None:
             f"{server}/auth/login",
             json={"username": username, "password": password, "issue_refresh": True},
             timeout=10.0,
+            trust_env=_trust_env_for(server),
         )
     except _httpx.HTTPError as exc:
         raise click.ClickException(f"Could not reach {server}/auth/login: {exc}") from exc
@@ -13213,6 +13658,22 @@ def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     # matching the outer `cli(args=argv, standalone_mode=False)` dispatch.
     run.main(
         args=[_bundled_example_path(name), *extra_args, *run_args],
+        prog_name="omnigent run",
+        standalone_mode=False,
+    )
+
+
+def _run_harness_shorthand(harness: str, run_args: tuple[str, ...]) -> None:
+    """Forward a harness shorthand (``omnigent copilot``) to ``run --harness``, the
+    way :func:`_run_bundled_agent` forwards ``polly``; an explicit ``--harness`` in
+    *run_args* is a usage error rather than a silent override."""
+    if any(arg == "--harness" or arg.startswith("--harness=") for arg in run_args):
+        raise click.UsageError(
+            f"`{cli_invocation()} {harness}` always uses the {harness} harness; drop "
+            f"--harness, or use `{cli_invocation()} run --harness <name>` to pick another."
+        )
+    run.main(
+        args=["--harness", harness, *run_args],
         prog_name="omnigent run",
         standalone_mode=False,
     )

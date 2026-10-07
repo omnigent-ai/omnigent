@@ -127,6 +127,12 @@ describe("HostBadge", () => {
     expect(badge.getAttribute("title")).toBe("Host mac-laptop, online — click to switch");
   });
 
+  it("labels local hosts as My machines in the composer menu", () => {
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    expect(screen.getByText("My machines")).toBeTruthy();
+  });
+
   it("renders nothing when the session is not host-bound", () => {
     useSessionMock.mockReturnValue({ session: { hostId: null }, isLoading: false, error: null });
     render(<HostBadge sessionId="conv_1" />);

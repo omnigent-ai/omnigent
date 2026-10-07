@@ -21,9 +21,9 @@ Enumeration is deterministic per provider kind:
   ``"openai-compatible"``).
 - ``subscription`` → live CLI discovery for Cursor; curated static aliases for
   CLIs without a listing API (source ``"static"``, ``verified: false``).
-- ``cli-config`` → the codex curated static list (source ``"static"``,
-  ``verified: false`` — the credential lives in the CLI's own config
-  file and is resolved by the CLI at launch).
+- ``cli-config`` → native Claude/Codex shared probe catalogs (source ``"cli"``)
+  when available, otherwise an empty static listing. Credentials are
+  resolved by the CLI at launch.
 - anything unresolvable → source ``"none"`` with an explanatory note,
   which doubles as a dead-worker preflight signal.
 """
@@ -249,7 +249,9 @@ class ResolvedModelProvider:
     :param auth_command: Shell command printing a bearer token, for
         providers configured with a dynamic credential.
     :param cli: ``"claude"`` / ``"codex"`` / ``"cursor-agent"`` for
-        ``kind="subscription"``; ``"codex"`` for ``kind="cli-config"``.
+        ``kind="subscription"``; ``"claude"`` / ``"codex"`` for
+        ``kind="cli-config"``.
+    :param model_provider: Codex config.toml provider id for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
     """
@@ -261,6 +263,7 @@ class ResolvedModelProvider:
     api_key: str | None = None
     auth_command: str | None = None
     cli: str | None = None
+    model_provider: str | None = None
     detail: str = ""
 
 
@@ -636,9 +639,33 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
             agent_spec, harness_type=harness_type, actual_harness=harness
         )
     )
-    if entry is not None:
-        return _provider_from_entry(entry, harness_type)
-    return _provider_from_legacy_auth(agent_spec, harness_type)
+    provider = (
+        _provider_from_entry(entry, harness_type)
+        if entry is not None
+        else _provider_from_legacy_auth(agent_spec, harness_type)
+    )
+    # With no launch overrides, Claude's managed settings still own routing
+    # and credentials; reporting a subscription would strip gateway model ids.
+    if canonical_harness in ("claude-native", "native-claude") and (
+        provider.kind == SUBSCRIPTION_KIND or (entry is None and provider.kind == NONE_KIND)
+    ):
+        from omnigent.onboarding.ambient import claude_managed_gateway
+
+        base_url, has_credential = claude_managed_gateway()
+        host = (urlsplit(base_url).hostname or "").lower() if base_url else ""
+        if (
+            base_url
+            and has_credential
+            and host != "anthropic.com"
+            and not host.endswith(".anthropic.com")
+        ):
+            return ResolvedModelProvider(
+                kind=CLI_CONFIG_KIND,
+                cli="claude",
+                base_url=base_url,
+                detail="Claude Code managed settings",
+            )
+    return provider
 
 
 def _provider_from_legacy_auth(
@@ -1021,6 +1048,7 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
         return ResolvedModelProvider(
             kind=CLI_CONFIG_KIND,
             cli=entry.cli,
+            model_provider=entry.model_provider,
             detail=(
                 f"provider {entry.name!r} (codex config.toml model provider "
                 f"{entry.model_provider!r})"
@@ -1427,17 +1455,53 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
 
 
 def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
-    """Build the curated static listing for a ``cli-config`` provider.
+    """Read a CLI-owned catalog, or report that it has not been probed yet.
 
-    A ``cli-config`` provider pins a custom ``[model_providers.X]`` table in
-    the codex CLI's own ``config.toml``; its credential (an auth command /
-    env key in that file) is resolved by codex at launch, so the listing is
-    the codex curated ids with a note saying the credential is the CLI's to
-    resolve — not a "no credentials" preflight failure.
+    Claude managed gateways and Codex config.toml providers share their
+    native launch catalogs. Credentials remain the CLI's responsibility.
 
     :param provider: A ``kind="cli-config"`` provider descriptor.
-    :returns: A ``source="static"`` listing with no models.
+    :returns: A probe-backed listing when cached, else an empty static listing.
     """
+    from omnigent.models import model_catalog_store
+
+    probe: tuple[str, str, str] | None = None
+    if provider.cli == "claude":
+        from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+
+        probe = ("claude-native", claude_catalog_fingerprint(None), "Claude Code")
+    elif provider.cli == "codex" and provider.model_provider:
+        from omnigent.harnesses.codex_native.app_server import (
+            NativeCodexLaunch,
+            codex_catalog_fingerprint,
+        )
+
+        # Pin the worker's selected provider rather than resolving the ambient default.
+        launch = NativeCodexLaunch(
+            config_overrides=[f"model_provider={json.dumps(provider.model_provider)}"],
+            model=None,
+            profile=None,
+        )
+        probe = ("codex-native", codex_catalog_fingerprint(launch), "Codex")
+    if probe is not None:
+        harness, fingerprint, label = probe
+        rows = model_catalog_store.read_catalog(harness, fingerprint)
+        if rows is not None:
+            stale = model_catalog_store.catalog_is_stale(harness, fingerprint)
+            model_ids = dict.fromkeys(str(row.get("model") or row["id"]) for row in rows)
+            return ModelListing(
+                source="cli",
+                verified=not stale,
+                models=tuple(
+                    ModelEntry(id=model_id, family=model_family_token(model_id))
+                    for model_id in model_ids
+                ),
+                note=(
+                    f"cached {label} model probe; catalog needs refreshing"
+                    if stale
+                    else f"models advertised by the {label} model probe"
+                ),
+            )
     return ModelListing(
         source="static",
         verified=False,
@@ -1743,10 +1807,13 @@ def _models_url(base_url: str) -> str:
         ``"https://openrouter.ai/api/v1"`` or
         ``"https://api.anthropic.com"``.
     :returns: The listing URL — ``<base>/models`` when the base already
-        ends in ``/v1``, else ``<base>/v1/models``.
+        ends in a version segment (``/v1``, ``/v4``, …), else
+        ``<base>/v1/models``.
     """
     trimmed = base_url.rstrip("/")
-    if trimmed.endswith("/v1"):
+    # A base that already names its API version lists at <base>/models;
+    # appending /v1 again builds a path no server serves.
+    if re.search(r"/v[0-9]+\Z", urlsplit(trimmed).path):
         return f"{trimmed}/models"
     return f"{trimmed}/v1/models"
 

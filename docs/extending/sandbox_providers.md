@@ -24,6 +24,92 @@ Providers whose sandbox boots running the host directly (Kubernetes), or whose
 control plane owns host startup (Gensee), inherit `SandboxHostLauncher` and
 override `start_host` without exposing a general-purpose exec transport.
 
+## Faster initial Git clones
+
+Admins can reduce the history downloaded for new managed sandbox checkouts:
+
+```yaml
+sandbox:
+  provider: agent_sandbox
+  server_url: https://omnigent.example.com
+  git_clone:
+    depth: 50
+    single_branch: true
+```
+
+This is a useful starting point for short coding sessions. It checks out all
+files on the selected branch, with up to 50 commits of history. It applies to
+each requested repository, including those cloned after claiming a warm pool
+Pod. No prepared workspace image is required. Restart the server after changing
+its configuration and create a new sandbox to try it.
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `depth` | `null` | Full history; a positive integer requests shallow history. |
+| `single_branch` | `null` | Preserve the existing rule: an explicit repo branch selects one branch; otherwise fetch all branches. `true` selects only the requested/default branch; `false` fetches all branches. |
+| `filter` | `null` | `blob:none` enables partial cloning: keep commit history and fetch file contents as needed. The initial checkout still includes all files. Requires remote filter support; Git can warn and fall back to an unfiltered clone. |
+| `tags` | `true` | Normal Git tag following. `false` uses `--no-tags`, which persists for later fetches. `true` does not promise to fetch every remote tag. |
+
+Omitting `git_clone` preserves existing commands and behavior. Setting only
+`depth` preserves the existing branch selection, explicitly countering Git's
+implicit single-branch default for shallow clones. Fetching every branch of a
+repository with many branch tips can erase most of the speed benefit; configure
+`single_branch: true` when that tradeoff fits the workload.
+
+Settings apply only when a checkout needs to be created. Retained checkouts are
+not reset, truncated, or reconfigured when a session wakes. An agent-sandbox
+wake that lost its ephemeral workspace recreates it using the current policy.
+Each entry in `sandbox.providers` can override the entire shared `git_clone`
+mapping; use `git_clone: {}` on an entry to restore compatibility defaults.
+
+Kubernetes, Agent Sandbox (including warm pools), and providers using the
+standard exec clone implementation support these options. Gensee, Islo, and
+custom workspace materializers must explicitly implement support; nondefault
+settings otherwise fail before sandbox provisioning, replacement, or resume.
+Third-party providers advertise `SandboxCapabilities.git_clone_options=True`
+and honor `RepoWorkspace.git_clone`. Exec providers that override
+`materialize_workspace` must accept its optional `git_clone` argument when
+opting in. With default settings, legacy overrides receive no new keyword.
+
+Clone settings do not contain credentials. Kubernetes and Agent Sandbox keep
+using the owner-bound GitHub broker for initial clones and the host's existing
+credential helper for later Git operations. Private-repo deepening and lazy
+blob fetches require continuing access to the remote and valid credentials.
+Vault and Databricks connector configuration is independent of this policy.
+
+### Getting more history later
+
+Inside a shallow checkout:
+
+```bash
+git fetch --deepen=100 origin
+# Or restore full history for the configured branch selection:
+git fetch --unshallow origin
+```
+
+Neither command widens a single-branch fetch refspec or re-enables tags. To fetch
+another branch for a PR comparison, name its remote-tracking destination:
+
+```bash
+git fetch origin '+refs/heads/main:refs/remotes/origin/main'
+# If both branches need more history, include both refspecs:
+git fetch --deepen=100 origin \
+  '+refs/heads/main:refs/remotes/origin/main' \
+  '+refs/heads/feature:refs/remotes/origin/feature'
+git fetch --tags origin  # explicitly fetch tags if needed
+```
+
+Replace `main` and `feature` with the relevant branches. When local PR diffs
+cannot find a merge base because history is shallow, Omnigent reports an
+actionable error rather than showing a misleading branch-tip comparison.
+Unfetched base branches and failed lazy file retrieval also produce errors;
+unavailable content is not treated as an added or deleted file.
+
+Keep full-history defaults for history-heavy development, offline work, or tools
+that expect broad history. `blob:none` is opt-in because it moves work to later
+reads: a first historical `git show` or `git blame` can fetch more data and take
+longer. Sparse checkout, submodule recursion, and LFS behavior are unchanged.
+
 ## Creating a community sandbox provider
 
 ### 1. Implement the launcher

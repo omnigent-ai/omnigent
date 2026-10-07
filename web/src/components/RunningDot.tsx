@@ -1,13 +1,17 @@
 import { Loader2Icon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+// Spin the HTML wrapper, not the svg: Chrome composites SVG transform animations
+// only at effective zoom 1, so on HiDPI an svg spin runs on the main thread.
 export function RunningDot({ className }: { className?: string }) {
   return (
-    <Loader2Icon
+    <span
       aria-hidden
       role="presentation"
       data-testid="running-dot"
-      className={cn("size-3 shrink-0 animate-spin text-muted-foreground", className)}
-    />
+      className={cn("flex size-3 shrink-0 animate-spin text-muted-foreground", className)}
+    >
+      <Loader2Icon className="size-full" />
+    </span>
   );
 }

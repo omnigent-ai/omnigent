@@ -48,6 +48,7 @@ import {
   isUnexpectedTerminalClose,
   resolveTerminalWorkspaceFileLink,
   TerminalSession,
+  terminalTheme,
   WS_CLOSE_WRONG_REPLICA,
 } from "./TerminalSession";
 
@@ -266,6 +267,7 @@ export function TerminalView({
   );
   useEffect(() => subscribeTerminalTheme(setTerminalMode), []);
   const isDark = resolveTerminalIsDark(terminalMode, resolvedMode === "dark");
+  const terminalBackground = terminalTheme(isDark).background;
   // Stable ref so the theme-update effect can reach the live session
   // without adding isDark to the attachSession deps (which would
   // reconnect the WebSocket on every theme change).
@@ -728,13 +730,15 @@ export function TerminalView({
     };
   }, [state, disposeActiveSession, sessionId]);
 
+  // `isolate` scopes the status overlay's z-index to this surface so it
+  // can't paint over body-portaled UI such as the header's session menu.
   return (
     <div
       data-testid="terminal-view"
       data-state={state.kind}
       data-terminal-id={terminalId}
       data-terminal-theme={isDark ? "dark" : "light"}
-      className="relative flex min-h-0 flex-1 flex-col"
+      className="relative isolate flex min-h-0 flex-1 flex-col"
     >
       {visibleClipboardPrompt !== null && (
         <TerminalClipboardPrompt
@@ -746,11 +750,10 @@ export function TerminalView({
           onDismiss={dismissClipboardPrompt}
         />
       )}
-      {/* `p-1` lives on the wrapper, not the xterm mount node: FitAddon
-          reads the parent's border-box height but only subtracts the xterm
-          element's own padding, so padding on the mount node oversizes the
-          grid by a row and `overflow-hidden` clips the footer. */}
-      <div className="relative min-h-0 flex-1 overflow-hidden p-1">
+      <div
+        className="relative min-h-0 flex-1 overflow-hidden p-3"
+        style={{ backgroundColor: terminalBackground }}
+      >
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
         {state.kind !== "connected" && (
           <StatusOverlay
