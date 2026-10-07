@@ -3523,7 +3523,9 @@ def _restore_replaced_daemon_record(
     :param previous: Previous record returned by
         :func:`_claim_foreground_daemon_record`, or ``None``.
     """
-    current = _read_daemon_record(_daemon_record_path(record.target))
+    # Use the rich lookup so older host.pid-only daemons remain guardable
+    # during migration; it returns a synthetic legacy record when needed.
+    current = _find_daemon_record(record.target)
     if current is None:
         return
     if current.pid != record.pid or current.started_at != record.started_at:
@@ -10511,6 +10513,109 @@ def _stop_session_on_server(
         )
 
 
+def _session_status_is_terminal(status: object) -> bool | None:
+    """Classify a session status using the runtime's canonical status sets."""
+    from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
+    from omnigent.runtime.inflight_text import _TERMINAL_STATUS_VALUES
+
+    if not isinstance(status, str):
+        return None
+    if status in _TERMINAL_STATUS_VALUES:
+        return True
+    if status in SESSION_LIVE_STATUS:
+        return False
+    return None
+
+
+def _ensure_daemon_is_idle(record: _HostDaemonRecord) -> None:
+    """Fail closed unless a fresh session snapshot proves *record* is idle."""
+    result = _sessions_for_daemon(record)
+    if result.error is not None or result.base_url is None:
+        detail = result.error or "the daemon server could not be discovered"
+        raise click.ClickException(
+            f"Cannot verify that {_host_display_url(record.target)} is idle: {detail}."
+        )
+
+    active: list[str] = []
+    unknown: list[str] = []
+    for session in result.sessions:
+        session_id = session.get("id")
+        label = session_id if isinstance(session_id, str) and session_id else "<unknown>"
+        terminal = _session_status_is_terminal(session.get("status"))
+        if terminal is None:
+            unknown.append(f"{label}={session.get('status')!r}")
+        elif not terminal:
+            active.append(label)
+    if active:
+        raise click.ClickException(
+            f"Refusing to stop {_host_display_url(record.target)} with active host-bound "
+            f"session(s): {', '.join(active)}."
+        )
+    if unknown:
+        raise click.ClickException(
+            f"Refusing to stop {_host_display_url(record.target)} because session status "
+            f"could not be verified: {', '.join(unknown)}."
+        )
+
+
+def _select_expected_daemon_record(
+    records: list[_HostDaemonRecord],
+    *,
+    expected_pid: int | None,
+    expected_launch_id: str | None,
+) -> list[_HostDaemonRecord]:
+    """Filter owner expectations to exactly one daemon record."""
+    if expected_pid is None and expected_launch_id is None:
+        return records
+    if expected_launch_id is not None and not expected_launch_id.strip():
+        raise click.ClickException("--expected-launch-id must be non-empty.")
+    matches = [
+        record
+        for record in records
+        if (expected_pid is None or record.pid == expected_pid)
+        and (expected_launch_id is None or record.launch_id == expected_launch_id)
+    ]
+    if len(matches) != 1:
+        raise click.ClickException(
+            "Owner expectation did not select exactly one host daemon record "
+            f"(matched {len(matches)})."
+        )
+    return matches
+
+
+def _reread_expected_daemon_record(
+    record: _HostDaemonRecord,
+    *,
+    expected_pid: int | None,
+    expected_launch_id: str | None,
+) -> _HostDaemonRecord:
+    """Reread and validate ownership immediately before daemon termination."""
+    # Use the rich lookup so older host.pid-only daemons remain guardable
+    # during migration; it returns a synthetic legacy record when needed.
+    current = _find_daemon_record(record.target)
+    if current is None:
+        raise click.ClickException(
+            f"Host daemon owner for {_host_display_url(record.target)} changed or disappeared; "
+            "refusing to stop it."
+        )
+    if current.pid != record.pid or current.launch_id != record.launch_id:
+        raise click.ClickException(
+            f"Host daemon owner for {_host_display_url(record.target)} changed; "
+            "refusing to stop it."
+        )
+    if expected_pid is not None and current.pid != expected_pid:
+        raise click.ClickException(
+            f"Host daemon owner for {_host_display_url(record.target)} no longer matches "
+            f"expected pid {expected_pid}; refusing to stop it."
+        )
+    if expected_launch_id is not None and current.launch_id != expected_launch_id:
+        raise click.ClickException(
+            f"Host daemon owner for {_host_display_url(record.target)} no longer matches "
+            "the expected launch id; refusing to stop it."
+        )
+    return current
+
+
 def _stop_daemon_sessions(
     record: _HostDaemonRecord,
 ) -> int:
@@ -10684,6 +10789,22 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     is_flag=True,
     help="Skip session draining and use SIGKILL if needed.",
 )
+@click.option(
+    "--if-idle",
+    is_flag=True,
+    help="Stop only after a fresh snapshot proves all host-bound sessions are terminal.",
+)
+@click.option(
+    "--expected-pid",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Require this positive daemon PID immediately before stopping.",
+)
+@click.option(
+    "--expected-launch-id",
+    default=None,
+    help="Require this daemon launch ownership id immediately before stopping.",
+)
 @click.pass_context
 def host_stop(
     ctx: click.Context,
@@ -10691,6 +10812,9 @@ def host_stop(
     all_targets: bool,
     daemon_only: bool,
     force: bool,
+    if_idle: bool,
+    expected_pid: int | None,
+    expected_launch_id: str | None,
 ) -> None:
     """
     Stop host daemon sessions, then stop daemon processes.
@@ -10701,21 +10825,43 @@ def host_stop(
     :param all_targets: Whether to stop every known daemon target.
     :param daemon_only: Skip server-side session stop calls when ``True``.
     :param force: Skip session draining and use SIGKILL if needed.
+    :param if_idle: Require a fresh quiet-session snapshot; never stop sessions.
+    :param expected_pid: Optional owner PID expectation.
+    :param expected_launch_id: Optional launch ownership expectation.
     """
+    if if_idle and (force or daemon_only):
+        raise click.ClickException("--if-idle cannot be combined with --force or --daemon-only.")
     if server is None:
         server = _host_group_option(ctx, "server")
     records = _selected_daemon_records(server=server, all_targets=all_targets, default_all=False)
+    records = _select_expected_daemon_record(
+        records,
+        expected_pid=expected_pid,
+        expected_launch_id=expected_launch_id,
+    )
     if not records:
         click.echo("No matching host daemon found.")
         return
+    if if_idle:
+        # Preflight every selected target before terminating any of them.
+        for record in records:
+            _ensure_daemon_is_idle(record)
     for record in records:
         stopped = 0
         if not daemon_only and not force:
-            stopped = _stop_daemon_sessions(record)
-        _terminate_daemon(record, force=force)
+            if not if_idle:
+                stopped = _stop_daemon_sessions(record)
+        current = record
+        if if_idle or expected_pid is not None or expected_launch_id is not None:
+            current = _reread_expected_daemon_record(
+                record,
+                expected_pid=expected_pid,
+                expected_launch_id=expected_launch_id,
+            )
+        _terminate_daemon(current, force=force)
         click.echo(
-            f"Stopped {_host_display_url(record.target)} daemon "
-            f"pid={record.pid}; sessions_stopped={stopped}."
+            f"Stopped {_host_display_url(current.target)} daemon "
+            f"pid={current.pid}; sessions_stopped={stopped}."
         )
 
 

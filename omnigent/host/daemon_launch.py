@@ -43,11 +43,17 @@ DAEMON_POLL_BACKOFF_FACTOR = 1.5
 # Public contract for deployment-owned wrappers around the background host.
 HOST_DAEMON_COMMAND_ENV_VAR = "OMNIGENT_HOST_DAEMON_COMMAND"
 HOST_DAEMON_COMMAND_SUPPORTED = os.name != "nt"
+HOST_DAEMON_IDLE_STOP_SUPPORTED = True
 
 
 def supports_host_daemon_command() -> bool:
     """Return whether this build supports ``HOST_DAEMON_COMMAND_ENV_VAR``."""
     return HOST_DAEMON_COMMAND_SUPPORTED
+
+
+def supports_host_daemon_idle_stop() -> bool:
+    """Return whether guarded idle host-stop options are available."""
+    return HOST_DAEMON_IDLE_STOP_SUPPORTED
 
 
 def host_daemon_command(

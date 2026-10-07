@@ -71,6 +71,30 @@ def _persist_fake_daemon_claim(
     return cli_module._find_daemon_record(target)
 
 
+def _write_host_stop_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pid: int = 4242,
+    launch_id: str | None = "launch-a",
+) -> cli_module._HostDaemonRecord:
+    """Write one isolated remote daemon record for host-stop tests."""
+    target = "https://server.example.com"
+    monkeypatch.setattr(cli_module, "_HOST_PID_PATH", tmp_path / "host.pid")
+    record = cli_module._HostDaemonRecord(
+        pid=pid,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=str(tmp_path / "host.log"),
+        started_at=1,
+        host_id="host_abc",
+        launch_id=launch_id,
+    )
+    cli_module._write_daemon_record(record)
+    return record
+
+
 def test_host_pid_path_honors_data_dir_at_import(tmp_path: Path) -> None:
     env = {**os.environ, "OMNIGENT_DATA_DIR": str(tmp_path / "data")}
     result = subprocess.run(
@@ -908,6 +932,278 @@ def test_host_stop_drops_stale_foreign_daemon_record(
         "stale foreign daemon record survived stop — a subsequent host start "
         "would be blocked by an 'already running' conflict"
     )
+
+
+@pytest.mark.parametrize("case", ["active", "unknown", "error"])
+def test_host_stop_if_idle_fails_closed_without_stopping_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """Idle guard refuses active, unknown, and unverifiable snapshots."""
+    record = _write_host_stop_record(tmp_path, monkeypatch)
+    if case == "active":
+        sessions = [{"id": "conv_active", "host_id": record.host_id, "status": "running"}]
+        error = None
+        expected = "active host-bound"
+    elif case == "unknown":
+        sessions = [{"id": "conv_unknown", "host_id": record.host_id, "status": "future"}]
+        error = None
+        expected = "status could not be verified"
+    else:
+        sessions = []
+        error = "session list failed (500): server unavailable"
+        expected = "Cannot verify that"
+
+    monkeypatch.setattr(
+        cli_module,
+        "_sessions_for_daemon",
+        lambda _record, **_kwargs: cli_module._DaemonSessionsResult(
+            base_url=record.server_url,
+            sessions=sessions,
+            error=error,
+        ),
+    )
+    terminated: list[int] = []
+    stop_events: list[str] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append(current.pid),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_stop_session_on_server",
+        lambda **_kwargs: stop_events.append("unexpected"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "stop", "--server", record.target, "--if-idle"],
+    )
+
+    assert result.exit_code != 0
+    assert expected in result.output
+    assert terminated == []
+    assert stop_events == []
+
+
+@pytest.mark.parametrize("extra", [["--force"], ["--daemon-only"]])
+def test_host_stop_if_idle_rejects_unsafe_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    extra: list[str],
+) -> None:
+    """The idle guard cannot be combined with force or daemon-only."""
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append(current.pid),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "stop", "--if-idle", *extra])
+
+    assert result.exit_code != 0
+    assert "cannot be combined" in result.output
+    assert terminated == []
+
+
+def test_host_stop_expected_owner_change_fails_before_termination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reread owner change prevents signals and record cleanup."""
+    record = _write_host_stop_record(tmp_path, monkeypatch)
+    replacement = cli_module._HostDaemonRecord(
+        pid=5151,
+        target=record.target,
+        mode=record.mode,
+        server_url=record.server_url,
+        log_path=record.log_path,
+        started_at=2,
+        host_id=record.host_id,
+        launch_id="launch-b",
+    )
+
+    def _quiet_then_replace(_record: cli_module._HostDaemonRecord, **_kwargs: object):
+        cli_module._write_daemon_record(replacement)
+        return cli_module._DaemonSessionsResult(
+            base_url=record.server_url,
+            sessions=[],
+            error=None,
+        )
+
+    monkeypatch.setattr(cli_module, "_sessions_for_daemon", _quiet_then_replace)
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append(current.pid),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "host",
+            "stop",
+            "--server",
+            record.target,
+            "--if-idle",
+            "--expected-pid",
+            str(record.pid),
+            "--expected-launch-id",
+            str(record.launch_id),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "owner" in result.output and "changed" in result.output
+    assert terminated == []
+    current = cli_module._read_daemon_record(cli_module._daemon_record_path(record.target))
+    assert current is not None and current.pid == replacement.pid
+
+
+def test_host_stop_if_idle_legacy_pid_owner_can_match_expected_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host.pid-only legacy owner remains guardable by its expected PID."""
+    target = "https://server.example.com"
+    monkeypatch.setattr(cli_module, "_HOST_PID_PATH", tmp_path / "host.pid")
+    cli_module._HOST_PID_PATH.write_text(f"4242\n{target}\n")
+    monkeypatch.setattr(
+        cli_module,
+        "_sessions_for_daemon",
+        lambda _record, **_kwargs: cli_module._DaemonSessionsResult(
+            base_url=target,
+            sessions=[],
+            error=None,
+        ),
+    )
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append(current.pid),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "stop", "--server", target, "--if-idle", "--expected-pid", "4242"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert terminated == [4242]
+
+
+def test_host_stop_if_idle_legacy_pid_change_refuses_termination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed host.pid owner fails closed without a JSON launch token."""
+    target = "https://server.example.com"
+    monkeypatch.setattr(cli_module, "_HOST_PID_PATH", tmp_path / "host.pid")
+    cli_module._HOST_PID_PATH.write_text(f"4242\n{target}\n")
+
+    def _quiet_then_replace(_record: cli_module._HostDaemonRecord, **_kwargs: object):
+        cli_module._HOST_PID_PATH.write_text(f"5151\n{target}\n")
+        return cli_module._DaemonSessionsResult(
+            base_url=target,
+            sessions=[],
+            error=None,
+        )
+
+    monkeypatch.setattr(cli_module, "_sessions_for_daemon", _quiet_then_replace)
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append(current.pid),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "stop", "--server", target, "--if-idle", "--expected-pid", "4242"],
+    )
+
+    assert result.exit_code != 0
+    assert "owner" in result.output and "changed" in result.output
+    assert terminated == []
+    assert cli_module._HOST_PID_PATH.read_text() == f"5151\n{target}\n"
+
+
+def test_host_stop_if_idle_quiet_expected_owner_terminates_without_session_rpc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quiet matching owner is terminated directly without stop-session calls."""
+    record = _write_host_stop_record(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_sessions_for_daemon",
+        lambda _record, **_kwargs: cli_module._DaemonSessionsResult(
+            base_url=record.server_url,
+            sessions=[],
+            error=None,
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_stop_session_on_server",
+        lambda **_kwargs: pytest.fail("--if-idle must not send stop-session RPCs"),
+    )
+    terminated: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append((current.pid, force)),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "host",
+            "stop",
+            "--server",
+            record.target,
+            "--if-idle",
+            "--expected-pid",
+            str(record.pid),
+            "--expected-launch-id",
+            str(record.launch_id),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert terminated == [(record.pid, False)]
+    assert "sessions_stopped=0" in result.output
+
+
+def test_host_stop_default_still_drains_before_termination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without new options, the existing session-draining path remains intact."""
+    record = _write_host_stop_record(tmp_path, monkeypatch)
+    drained: list[int] = []
+    terminated: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_stop_daemon_sessions",
+        lambda current: drained.append(current.pid) or 2,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append((current.pid, force)),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "stop", "--server", record.target])
+
+    assert result.exit_code == 0, result.output
+    assert drained == [record.pid]
+    assert terminated == [(record.pid, False)]
+    assert "sessions_stopped=2" in result.output
 
 
 def test_add_daemon_host_status_skips_http_for_dead_process() -> None:

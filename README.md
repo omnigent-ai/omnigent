@@ -516,6 +516,14 @@ This contract covers automatic background launches from `run`,
 `host --background`, and `start`. `host enable` continues to use its existing
 OS-service `service_entry` command.
 
+For unattended cleanup, `omnigent host stop --if-idle` takes a fresh session
+snapshot and refuses to stop while any host-bound session is active or its
+status cannot be verified. Pair it with `--expected-pid <pid>` and
+`--expected-launch-id <id>` to pin the daemon owner across reloads; the owner
+is reread immediately before termination. `--if-idle` never sends session-stop
+events and cannot be combined with `--force` or `--daemon-only`. Without these
+options, `host stop` keeps its existing session-draining behavior.
+
 > [!TIP]
 > On your own network you don't need a deploy. Open your machine's LAN
 > address on your phone (e.g. `http://192.168.x.x:6767`).

@@ -24,10 +24,12 @@ from omnigent.host import daemon_launch
 from omnigent.host.daemon_launch import (
     HOST_DAEMON_COMMAND_ENV_VAR,
     HOST_DAEMON_COMMAND_SUPPORTED,
+    HOST_DAEMON_IDLE_STOP_SUPPORTED,
     host_daemon_command,
     open_daemon_client,
     runner_is_online,
     supports_host_daemon_command,
+    supports_host_daemon_idle_stop,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -137,6 +139,12 @@ def test_host_daemon_command_capability_probe_is_stable() -> None:
     expected = os.name != "nt"
     assert HOST_DAEMON_COMMAND_SUPPORTED is expected
     assert supports_host_daemon_command() is expected
+
+
+def test_host_daemon_idle_stop_capability_probe_is_stable() -> None:
+    """Downstream maintenance can detect guarded host-stop support."""
+    assert HOST_DAEMON_IDLE_STOP_SUPPORTED is True
+    assert supports_host_daemon_idle_stop() is True
 
 
 class _FlakyThenOnline:
