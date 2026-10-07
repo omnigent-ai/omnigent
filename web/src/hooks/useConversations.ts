@@ -1792,12 +1792,7 @@ function refuseOverlappingPinWrite(queryClient: QueryClient) {
   }
 }
 
-// Apply a pin/unpin to every cache that renders the row. `labels` is the
-// authoritative label map to write; membership in the Pinned section is
-// driven by the PINNED_CONVERSATIONS_KEY cache, so that patch is what makes
-// the row visibly move.
-// Set only the pin key on the row's own copy in each label cache (lists,
-// backfill, session), leaving labels other writes changed meanwhile intact.
+// Restore only the pin label across rendered caches (each row's own copy).
 function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: string | undefined) {
   const withPin = (labels: Record<string, string> | undefined) => {
     const rest = Object.fromEntries(
@@ -1826,6 +1821,10 @@ function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: stri
   );
 }
 
+// Apply a pin/unpin to every cache that renders the row. `labels` is the
+// authoritative label map to write; membership in the Pinned section is
+// driven by the PINNED_CONVERSATIONS_KEY cache, so that patch is what makes
+// the row visibly move.
 function patchPinnedCaches(
   queryClient: QueryClient,
   id: string,

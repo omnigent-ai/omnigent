@@ -161,4 +161,31 @@ describe("dropping an unpinned session onto a pinned row", () => {
     expect(mocks.reorderPins).not.toHaveBeenCalled();
     expect(mocks.pinFn).not.toHaveBeenCalled();
   });
+
+  it("disables the other rows' pin buttons while a pin is saving", async () => {
+    let resolvePin!: () => void;
+    mocks.pinFn.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvePin = resolve;
+        }),
+    );
+    renderSidebar();
+    const pinButton = (id: string) =>
+      screen
+        .getByRole("link", { name: id })
+        .closest("li")!
+        .querySelector<HTMLElement>('[data-testid="quick-pin-conversation"]')!;
+
+    fireEvent.click(pinButton("conv_c"));
+    await waitFor(() => expect(mocks.pinFn).toHaveBeenCalledOnce());
+    await waitFor(() => expect(pinButton("conv_d")).toHaveAttribute("aria-disabled", "true"));
+    fireEvent.click(pinButton("conv_d"));
+    expect(mocks.pinFn).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      resolvePin();
+    });
+    await waitFor(() => expect(pinButton("conv_d")).toHaveAttribute("aria-disabled", "false"));
+  });
 });
