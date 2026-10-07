@@ -279,10 +279,17 @@ def _observe_transcript_discovery(
         "observer_stderr_bytes=%s hook_settings=%s"
     )
     if escalate:
-        _logger.error(
+        # An idle pane nobody has used yet never fires a hook; only evidence of a
+        # broken observer (stderr, hooks without a path, no settings) is an error.
+        hook_failure = bool(stderr_size) or hooks_size is not None or not settings_present
+        log = _logger.error if hook_failure else _logger.warning
+        log(
             "Claude transcript forwarding has not started: no observer hook reported a " + detail,
             *args,
-            extra={"session_id": session_id},
+            extra={
+                "session_id": session_id,
+                "discovery_verdict": "hook_failure" if hook_failure else "idle",
+            },
         )
         diagnostics.error_logged = True
         diagnostics.warning_logged = True
