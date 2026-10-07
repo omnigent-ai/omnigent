@@ -986,11 +986,15 @@ async def _launch_config_retry_sleep(delay: float) -> None:
     await asyncio.sleep(delay)
 
 
-# Metadata reads do not need transcript, liveness, or subtree-usage aggregation.
+# Metadata reads need stored-row fields only: skip the transcript page, liveness,
+# usage, and the live-status probe of the very runner making the read.
+# Older servers ignore unknown query params, so a newer runner against an older
+# server keeps working.
 _SESSION_METADATA_PARAMS: dict[str, str] = {
     "include_items": "false",
     "include_liveness": "false",
     "include_usage": "false",
+    "include_live_status": "false",
 }
 
 
@@ -5414,6 +5418,27 @@ async def _auto_create_codex_terminal(
     # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
     try:
         if launch_config.external_session_id is not None:
+            if launch_config.reasoning_effort:
+                # A resumed thread runs the rollout's effort, not the config pin.
+                try:
+                    await apply_codex_thread_effort(
+                        codex_ws_url,
+                        launch_config.external_session_id,
+                        launch_config.reasoning_effort,
+                        model=_codex_launch.model,
+                        bridge_dir=bridge_dir,
+                    )
+                except Exception:  # noqa: BLE001 — a failed update must not sink the launch
+                    _logger.warning(
+                        "codex-native: could not apply reasoning effort %r to resumed thread "
+                        "%s for session %s; the next web turn re-applies it",
+                        launch_config.reasoning_effort,
+                        launch_config.external_session_id,
+                        session_id,
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+            # Publish after resume repair so live settings cannot interleave it.
             write_bridge_state(
                 bridge_dir,
                 CodexNativeBridgeState(
@@ -5426,25 +5451,6 @@ async def _auto_create_codex_terminal(
                     cwd=workspace,
                 ),
             )
-            if launch_config.reasoning_effort:
-                # A resumed thread runs the rollout's effort, not the config pin.
-                try:
-                    await apply_codex_thread_effort(
-                        codex_ws_url,
-                        launch_config.external_session_id,
-                        launch_config.reasoning_effort,
-                        model=_codex_launch.model,
-                    )
-                except Exception:  # noqa: BLE001 — a failed update must not sink the launch
-                    _logger.warning(
-                        "codex-native: could not apply reasoning effort %r to resumed thread "
-                        "%s for session %s; the next web turn re-applies it",
-                        launch_config.reasoning_effort,
-                        launch_config.external_session_id,
-                        session_id,
-                        exc_info=True,
-                        extra={"session_id": session_id},
-                    )
         launched = await _launch_codex_native_tui(
             session_id,
             resource_registry,
@@ -8795,6 +8801,7 @@ async def _auto_create_claude_terminal(
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
+        workspace=Path(workspace),
         ap_server_url=server_url,
         ap_auth_headers=_runner_headers,
         bundle_dir=bundle_dir,

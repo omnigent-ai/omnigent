@@ -7404,6 +7404,9 @@ async def _dispatch_session_event_to_runner_impl(
 RUNNER_DISCONNECT_GRACE_S: float = float(RUNNER_LIVENESS_TTL_S)
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
+# Version marker for the bounded relay recovery event contract. Keep this on
+# every connected/ready row so rollout queries can separate old and new shapes.
+_RELAY_TELEMETRY_SCHEMA = "runner_stream_recovery.v1"
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but
 # stalled and re-registers once it can (observed: 24 s). Hold the message that
 # long before failing it instead of discarding it on a drop the runner outlives.
@@ -7493,7 +7496,8 @@ async def _runner_disconnect_requires_failure(
     observation. Recheck the cache after the read, even when the read fails.
 
     If the read is unavailable, use the sweep or relay's adoption snapshot.
-    Without any known state, report the drop so an interruption is not lost.
+    Without any known state, preserve the session: a failed read does not
+    establish that a turn was interrupted.
     Only top-level sessions can fail before startup with ``fail_idle_top_level``.
 
     A sub-agent mirrored from a native parent fails only on a turn in the
@@ -7508,7 +7512,7 @@ async def _runner_disconnect_requires_failure(
         try:
             persisted = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             lookup = "found" if persisted is not None else "missing"
-        except Exception:  # noqa: BLE001 — a failed read must not swallow a disconnect
+        except Exception:  # noqa: BLE001 — retain fallback state when storage is unavailable
             lookup = "error"
             _logger.warning(
                 "Runner disconnect: live-status read failed for session=%s",
@@ -7542,8 +7546,10 @@ async def _runner_disconnect_requires_failure(
         decision = "intentional_stop"
     elif live in _MID_TURN_STATUSES and source != "cache" and _owned_by_parent_runtime(conv):
         decision = "subagent_unobserved"
-    elif live in _MID_TURN_STATUSES or source == "unknown":
+    elif live in _MID_TURN_STATUSES:
         decision = "failed_mid_turn"
+    elif source == "unknown":
+        decision = "unknown_no_failure"
     elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
         decision = "failed_before_start"
     else:
@@ -7656,8 +7662,46 @@ async def _relay_runner_stream(
     """
     loop = asyncio.get_running_loop()
     deadline: float | None = None
-    outage_started = 0.0
+    outage_started: float | None = None
+    outage_id: str | None = None
+    outage_runner_id: str | None = None
+    outage_turn_id: str | None = None
     retries = 0
+
+    def _on_stream_ready() -> None:
+        """Record one ready-confirmed recovery for the active outage."""
+        nonlocal outage_id, outage_started, outage_runner_id, outage_turn_id
+        if outage_id is None or outage_started is None:
+            # The first ready heartbeat is ordinary relay startup, not recovery.
+            return
+        recovered_id = outage_id
+        recovered_started = outage_started
+        recovered_runner_id = outage_runner_id
+        recovered_turn_id = outage_turn_id
+        outage_id = None
+        outage_started = None
+        outage_runner_id = None
+        outage_turn_id = None
+        attributes = {
+            "outage_id": recovered_id,
+            "runner_id": recovered_runner_id,
+            "recovery_attempt": max(1, retries),
+            "outage_s": round(loop.time() - recovered_started, 3),
+            "recovery_evidence": "stream_heartbeat",
+            "telemetry_schema": _RELAY_TELEMETRY_SCHEMA,
+        }
+        _logger.info(
+            "Relay: runner stream recovered for session=%s after %.1fs",
+            session_id,
+            attributes["outage_s"],
+            extra=debug_event(
+                "runner_stream_recovered",
+                session_id=session_id,
+                turn_id=recovered_turn_id,
+                **attributes,
+            ),
+        )
+
     while True:
         started = loop.time()
         try:
@@ -7667,6 +7711,7 @@ async def _relay_runner_stream(
                 conversation_store,
                 ready,
                 runner_id=runner_id,
+                on_stream_ready=_on_stream_ready,
             )
             return
         except _RelayTransportLost as lost:
@@ -7677,6 +7722,9 @@ async def _relay_runner_stream(
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
                 outage_started = now
                 retries = 0
+                outage_id = uuid.uuid4().hex
+                outage_runner_id = runner_id
+                outage_turn_id = _session_active_response_cache.get(session_id)
                 _logger.info(
                     "Relay: runner transport lost for session=%s (intentional=%s, grace=%.1fs)",
                     session_id,
@@ -7685,9 +7733,14 @@ async def _relay_runner_stream(
                     extra=debug_event(
                         "runner_stream_transport_lost",
                         session_id=session_id,
+                        turn_id=outage_turn_id,
+                        outage_id=outage_id,
+                        runner_id=outage_runner_id,
                         intentional_stop=lost.intentional,
+                        stream_ready=lost.stream_ready,
                         cached_session_status=_session_status_cache.get(session_id),
                         grace_s=RUNNER_DISCONNECT_GRACE_S,
+                        telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
                     ),
                 )
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
@@ -7732,12 +7785,18 @@ async def _relay_runner_stream(
                 extra=debug_event(
                     "runner_stream_disconnected",
                     session_id=session_id,
+                    turn_id=outage_turn_id,
+                    outage_id=outage_id,
+                    runner_id=outage_runner_id,
                     intentional_stop=lost.intentional,
                     cached_session_status=_session_status_cache.get(session_id),
                     decision=decision,
                     grace_s=RUNNER_DISCONNECT_GRACE_S,
-                    outage_s=round(now - outage_started, 3),
+                    outage_s=(
+                        round(now - outage_started, 3) if outage_started is not None else None
+                    ),
                     retries=retries,
+                    telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
                 ),
             )
             if decision == "intentional_stop":
@@ -7770,17 +7829,11 @@ async def _relay_runner_stream(
                     extra={"session_id": session_id},
                 )
             elif decision == "idle_no_failure":
-                # The runner went away while this session sat idle (host
-                # asleep, host restart, `omnigent host` stopped). Nothing was
-                # interrupted, so there is no error to report: publishing one
-                # lit a red "connection to the host dropped" banner over a
-                # session that had simply finished its last turn. The absence
-                # is already carried by liveness (``clear_runner_liveness``),
-                # which drives the reconnect affordance. Stay silent — no
-                # status edge, and no clearing of labels either, so a genuine
-                # earlier failure keeps its error.
+                # No evidence of an interrupted turn. Liveness drives the
+                # reconnect affordance; preserve status and prior error labels.
                 _logger.info(
-                    "Relay: runner gone for idle session=%s; no failure to report",
+                    "Relay: runner gone without a known interrupted turn for session=%s; "
+                    "no failure to report",
                     session_id,
                     extra={"session_id": session_id},
                 )
@@ -7825,6 +7878,7 @@ async def _relay_runner_stream_once(
     ready: asyncio.Event | None = None,
     *,
     runner_id: str | None = None,
+    on_stream_ready: Callable[[], None] | None = None,
 ) -> None:
     """
     Subscribe to the runner's SSE stream and relay events locally.
@@ -7853,6 +7907,9 @@ async def _relay_runner_stream_once(
         that exercise relay parsing/persistence without asserting on
         startup readiness.
     :param runner_id: The runner this attempt owns, used to match stop intent.
+    :param on_stream_ready: Optional callback after this attempt's first
+        ``session.heartbeat``. The supervisor uses it for one recovery row;
+        it is synchronous and does not create a helper task.
     """
     text_acc: list[str] = []
     current_response_id: str | None = None
@@ -7896,7 +7953,12 @@ async def _relay_runner_stream_once(
             _logger.info(
                 "Relay: connected to runner GET /stream for session=%s",
                 session_id,
-                extra=debug_event("runner_stream_connected", session_id=session_id),
+                extra=debug_event(
+                    "runner_stream_connected",
+                    session_id=session_id,
+                    runner_id=runner_id,
+                    telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
+                ),
             )
             buffer = ""
             async for chunk in resp.aiter_text():
@@ -7932,8 +7994,15 @@ async def _relay_runner_stream_once(
                             _logger.info(
                                 "Relay: runner stream ready for session=%s",
                                 session_id,
-                                extra=debug_event("runner_stream_ready", session_id=session_id),
+                                extra=debug_event(
+                                    "runner_stream_ready",
+                                    session_id=session_id,
+                                    runner_id=runner_id,
+                                    telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
+                                ),
                             )
+                            if on_stream_ready is not None:
+                                on_stream_ready()
                         if ready is not None:
                             ready.set()
                         continue
@@ -12030,6 +12099,7 @@ async def _get_session_snapshot(
     conversation: Conversation | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
     include_items: bool = True,
+    include_live_status: bool = True,
     runner_exit_reports: RunnerExitReports | None = None,
     refresh_state: bool = False,
     host_store: HostStore | None = None,
@@ -12070,6 +12140,11 @@ async def _get_session_snapshot(
         and return ``items=[]``. Callers that hydrate the transcript
         through ``GET /sessions/{id}/items`` (the web chat surface)
         pass ``False`` to avoid a redundant history read and serialization.
+    :param include_live_status: When ``False``, skip the live-status probe
+        of the session's bound runner on a status-cache miss and report
+        ``status`` from the cached or persisted value. Runner-owned reads
+        pass ``False`` — the probe targets the very runner waiting on this
+        response.
     :param include_usage: When ``False``, skip subtree usage aggregation and
         return unknown usage with ``usage_included=False``. Launch metadata
         does not need usage; display clients can fetch it separately.
@@ -12154,7 +12229,11 @@ async def _get_session_snapshot(
         # ``_session_status_from_cache`` already collapses the fine-grained
         # relay values (``"waiting"`` → ``"running"``), so the raw cache value
         # is only needed here when it is actually missing (None).
-        if _session_status_cache.get(session_id) is None and runner_client is not None:
+        if (
+            include_live_status
+            and _session_status_cache.get(session_id) is None
+            and runner_client is not None
+        ):
             if (
                 await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
                 is not None

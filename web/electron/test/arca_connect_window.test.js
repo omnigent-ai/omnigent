@@ -4,6 +4,62 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { createArcaConnectFlow } = require("../src/arca_connect_window");
+const fs = require("node:fs");
+const path = require("node:path");
+const { JSDOM } = require("jsdom");
+
+it("renders consent, sign-in, retry, and completion", (t) => {
+  const dom = new JSDOM(
+    fs.readFileSync(path.join(__dirname, "../arca-connect/index.html"), "utf8"),
+    {
+      runScripts: "outside-only",
+    },
+  );
+  t.after(() => dom.window.close());
+  const events = {};
+  let confirms = 0;
+  // Electron supplies this bridge; no remote process is launched by a renderer test.
+  dom.window.arcaConnect = { confirm: () => confirms++, cancel() {} };
+  for (const event of ["Init", "Started", "Output", "Done"]) {
+    dom.window.arcaConnect[`on${event}`] = (listener) => {
+      events[event] = listener;
+    };
+  }
+  dom.window.requestAnimationFrame = () => {};
+  dom.window.eval(fs.readFileSync(path.join(__dirname, "../arca-connect/console.js"), "utf8"));
+  const document = dom.window.document;
+  const confirm = document.getElementById("confirm");
+  const command = document.getElementById("command");
+  events.Init({
+    serverUrl: "https://account.databricks.com/omnigent?o=123",
+    command: "host command",
+  });
+  confirm.click();
+  events.Started({ login: false, command: "host command" });
+  assert.equal(confirm.disabled, true);
+  events.Done({
+    ok: false,
+    authRequired: true,
+    command: "login command",
+    error: "Sign-in required",
+  });
+  assert.equal(confirm.hidden, false);
+  assert.equal(confirm.textContent, "Sign in and retry");
+  assert.equal(document.activeElement, confirm);
+  confirm.click();
+  assert.equal(confirms, 2);
+  events.Started({ login: true, command: "login command" });
+  assert.equal(command.textContent, "login command");
+  assert.equal(confirm.textContent, "Signing in…");
+  assert.equal(confirm.disabled, true);
+  events.Started({ login: false, command: "host command" });
+  assert.equal(command.textContent, "host command");
+  assert.equal(confirm.textContent, "Connecting…");
+  events.Done({ ok: true });
+  assert.equal(confirm.hidden, true);
+  assert.equal(document.getElementById("cancel").textContent, "Close");
+  assert.match(document.getElementById("status").textContent, /Connected/);
+});
 
 /** A fake Electron world: BrowserWindow + ipcMain + a controllable connect. */
 function flowHarness() {
@@ -11,6 +67,7 @@ function flowHarness() {
     windows: [],
     ipc: new EventEmitter(),
     connects: [],
+    logins: [],
   };
 
   class FakeWindow extends EventEmitter {
@@ -58,6 +115,21 @@ function flowHarness() {
     pagePath: "/bundle/arca-connect/index.html",
     preloadPath: "/bundle/src/arca_connect_preload.js",
     commandLine: (url) => `arca ssh isaac omni host --server ${url} …`,
+    loginCommandLine: (url) => `arca ssh isaac omni login ${url}`,
+    startLogin: (serverUrl) => {
+      const login = {
+        serverUrl,
+        canceled: false,
+        cancel() {
+          this.canceled = true;
+        },
+      };
+      login.promise = new Promise((resolve) => {
+        login.finish = resolve;
+      });
+      world.logins.push(login);
+      return login;
+    },
     startConnect: (serverUrl, onOutput) => {
       const connect = {
         serverUrl,
@@ -82,6 +154,45 @@ function flowHarness() {
 }
 
 describe("arca connect console flow", () => {
+  it("requires shell consent to sign in, then retries the identical target only once", async () => {
+    const { world, flow } = flowHarness();
+    const url = "https://account.databricks.com/omnigent?o=123";
+    const result = flow.run(null, url);
+    const win = world.windows[0];
+    world.sendFrom(win, "arca-connect:confirm");
+    world.connects[0].finish({ ok: false, authError: true });
+    await Promise.resolve();
+    assert.equal(world.logins.length, 0);
+    assert.equal(win.webContents.sent.at(-1)[1].authRequired, true);
+    world.ipc.emit("arca-connect:confirm", { sender: { id: 9999 } });
+    assert.equal(world.logins.length, 0);
+    world.sendFrom(win, "arca-connect:confirm");
+    world.sendFrom(win, "arca-connect:confirm");
+    assert.equal(world.logins.length, 1);
+    assert.equal(world.logins[0].serverUrl, url);
+    world.logins[0].finish({ ok: true });
+    await Promise.resolve();
+    assert.equal(world.connects[1].serverUrl, url);
+    world.connects[1].finish({ ok: false, authError: true, error: "still rejected" });
+    assert.equal((await result).error, "still rejected");
+    world.sendFrom(win, "arca-connect:confirm");
+    assert.equal(world.logins.length, 1);
+  });
+
+  it("cancels remote login without starting a host after a late successful exit", async () => {
+    const { world, flow } = flowHarness();
+    const result = flow.run(null, "https://account.databricks.com/omnigent?o=123");
+    const win = world.windows[0];
+    world.sendFrom(win, "arca-connect:confirm");
+    world.connects[0].finish({ ok: false, authError: true });
+    await Promise.resolve();
+    world.sendFrom(win, "arca-connect:confirm");
+    win.close();
+    assert.equal(world.logins[0].canceled, true);
+    world.logins[0].finish({ ok: true });
+    assert.equal((await result).canceled, true);
+    assert.equal(world.connects.length, 1);
+  });
   it("shows the command, runs only after confirm, streams output, resolves the result", async () => {
     const { world, flow } = flowHarness();
     const resultPromise = flow.run(null, "https://srv.example.com");

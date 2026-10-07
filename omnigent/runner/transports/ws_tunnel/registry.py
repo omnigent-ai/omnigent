@@ -44,6 +44,7 @@ from typing import Protocol
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
     HelloFrame,
@@ -103,13 +104,14 @@ class RunnerSession:
     :param close_code: First server-requested close code, recorded under
         the registry lock before helpers can observe retirement.
     :param close_reason: Reason accompanying ``close_code``.
+    :param diagnostics: Timing observations owned by this connection's socket loop.
     """
 
     runner_id: str
     ws: WebSocketLike
     hello: HelloFrame
     loop: asyncio.AbstractEventLoop
-    outbound_queue: asyncio.Queue[str | None]
+    outbound_queue: asyncio.Queue[OutboundFrame | None]
     connected_at: float
     last_frame_at: float
     owner: str | None
@@ -121,6 +123,7 @@ class RunnerSession:
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
     close_code: int | None = None
     close_reason: str | None = None
+    diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
 
 
 @dataclass
@@ -724,28 +727,48 @@ class TunnelRegistry:
             channel, lambda: channel.inbound_queue.put_nowait(item)
         )
 
-    async def send_text(self, session: RunnerSession, data: str) -> None:
+    async def send_text(
+        self, session: RunnerSession, data: str, *, app_ping_ts: int | None = None
+    ) -> None:
         """Enqueue one outbound WebSocket frame on the session's owner loop.
 
         :param session: Current session generation that should send
             the frame.
         :param data: Encoded tunnel frame JSON.
+        :param app_ping_ts: Application ping token, only for heartbeat diagnostics.
         :returns: None after the frame has been accepted into the
             route-loop outbound queue.
         :raises ConnectionError: If ``session`` is no longer the
             registry's current generation for its runner id.
+        :raises Exception: Preparation or queue failures before frame acceptance
+            are forwarded from the owner loop.
         """
+        requested_at = session.diagnostics.timestamp()
         ack: concurrent.futures.Future[None] = concurrent.futures.Future()
 
         def _enqueue() -> None:
             """Run on ``session.loop`` and enqueue the outbound frame."""
-            error: ConnectionError | None = None
-            with self._lock:
-                if self._sessions.get(session.runner_id) is not session:
-                    error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
-                else:
-                    session.outbound_queue.put_nowait(data)
-            if error is not None:
+            try:
+                with self._lock:
+                    if self._sessions.get(session.runner_id) is not session:
+                        raise ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+                    frame = OutboundFrame(
+                        data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
+                    )
+                    session.outbound_queue.put_nowait(frame)
+                    # Recording or logging failures cannot undo an accepted frame.
+                    with contextlib.suppress(Exception):
+                        try:
+                            session.diagnostics.enqueued(
+                                frame, session.outbound_queue.qsize(), requested_at
+                            )
+                        except Exception:  # noqa: BLE001 — recording failures are best-effort.
+                            _logger.debug(
+                                "Runner %s outbound queue diagnostics failed",
+                                session.runner_id,
+                                exc_info=True,
+                            )
+            except Exception as error:  # noqa: BLE001 — forward failures across loops.
                 if not ack.done():
                     ack.set_exception(error)
             else:

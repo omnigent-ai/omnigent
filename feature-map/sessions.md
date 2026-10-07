@@ -153,6 +153,13 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
+- **`reconnect`, idle replica handoff (own environment):**
+  `tests/e2e_ui/sessions/test_idle_runner_handoff.py::test_idle_session_stays_healthy_after_unreadable_replica_handoff`
+  moves a real runner between two servers sharing storage, then makes the old
+  server's session and liveness reads unavailable through its production grace
+  period. A completed legacy transcript without saved lifecycle state must
+  remain readable without a disconnect error, including when the browser
+  returns to the old server after its reads recover.
 - **`stop`, `archive`, active sub-agents (own environment):**
   `tests/e2e/test_parent_stop_subagents_e2e.py::test_native_parent_teardown_preserves_child_outcome`
   drives real Claude and Codex parents, native children, a host daemon, and its

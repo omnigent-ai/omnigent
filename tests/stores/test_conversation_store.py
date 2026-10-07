@@ -2573,6 +2573,90 @@ def test_append_bumps_updated_at(
     )
 
 
+def _deleted_terminal_event(conversation_id: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="resource_event",
+        response_id=conversation_id,
+        data=ResourceEventData(
+            event_type="session.resource.deleted",
+            resource_id="terminal_codex_main",
+            resource_type="terminal",
+        ),
+    )
+
+
+def test_resource_event_only_append_preserves_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operational resource cleanup must not look like new conversation activity."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+
+    appended = conversation_store.append(conv.id, [_deleted_terminal_event(conv.id)])
+
+    assert [item.type for item in appended] == ["resource_event"]
+    assert [item.type for item in conversation_store.list_items(conv.id).data] == [
+        "resource_event"
+    ]
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000
+
+
+def test_mixed_resource_and_message_append_bumps_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mixed batch remains real activity when it contains a new message."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    message = NewConversationItem(
+        type="message",
+        response_id="resp_mixed",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+    )
+
+    conversation_store.append(conv.id, [_deleted_terminal_event(conv.id), message])
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 2000
+
+
+def test_resource_event_with_duplicate_message_preserves_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resource event plus a deduplicated message contains no new activity."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    message = NewConversationItem(
+        type="message",
+        response_id="resp_duplicate",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="ab" * 16,
+    )
+    conversation_store.append(conv.id, [message])
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+
+    appended = conversation_store.append(conv.id, [message, _deleted_terminal_event(conv.id)])
+
+    assert appended[0].deduplicated is True
+    assert [item.type for item in appended] == ["message", "resource_event"]
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000
+
+
 def test_update_title_bumps_updated_at(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,

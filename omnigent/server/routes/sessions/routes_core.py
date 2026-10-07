@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import secrets
 import time
@@ -133,8 +134,11 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _grant_default_public,
+    _live_settings_change,
+    _LiveSettingsChange,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
+    _note_settings_write,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
     _permission_level_from_grants,
@@ -152,6 +156,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
+    _RunnerForwardResult,
     _same_provider_family,
     _session_status_cache,
     _set_read_state,
@@ -312,6 +317,68 @@ async def _wake_runner_for_model_change(
         conv.id, conv.runner_id, runner_client, conversation_store, conversation=conv
     )
     return conv
+
+
+_CODEX_SETTINGS_RESTORED_MESSAGE = (
+    "The terminal did not apply the model and reasoning effort changes. "
+    "The previous selections have been restored."
+)
+
+
+def _runner_reply_field(body: str, key: str) -> object:
+    """Return *key* from a runner's JSON reply, or ``None`` when it has none."""
+    try:
+        result = json.loads(body)
+    except ValueError:
+        return None
+    return result.get(key) if isinstance(result, dict) else None
+
+
+async def _restore_refused_settings(
+    conversation_store: ConversationStore,
+    session_id: str,
+    *,
+    previous: Conversation,
+    attempted: Conversation,
+    restore_model: bool,
+    live_change: _LiveSettingsChange | None,
+    began: int,
+    saved: int,
+) -> None:
+    """Undo a refused live change, keeping newer writes and restoring what it replaced."""
+    from omnigent.server.routes.sessions.routes_events import (
+        _raise_if_runner_re_tunnelled_to_another_replica,
+    )
+
+    # A runner that re-tunnelled is ordered by its new replica, which may have applied
+    # a newer selection; re-address the request there instead of undoing it here.
+    await _raise_if_runner_re_tunnelled_to_another_replica(
+        session_id, attempted.runner_id, conversation_store
+    )
+    restore = {"reasoning_effort": True, "model_override": restore_model}
+    replaced = {
+        "reasoning_effort": previous.reasoning_effort,
+        "model_override": previous.model_override,
+    }
+    if live_change is not None:
+        for key, wanted in restore.items():
+            if wanted:
+                restore[key], replaced[key] = live_change.restore_target(
+                    key, replaced[key], began=began, saved=saved
+                )
+    await asyncio.to_thread(
+        conversation_store.restore_session_settings_if_matches,
+        session_id,
+        previous=dataclasses.replace(previous, **replaced),
+        attempted=attempted,
+        restore_effort=restore["reasoning_effort"],
+        restore_model=restore["model_override"],
+    )
+
+
+def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
+    """Return whether Codex timed out before confirming a settings update it may still apply."""
+    return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
 
 
 def register_core_routes(
@@ -1202,6 +1269,7 @@ def register_core_routes(
         session_id: str,
         include_items: bool = Query(default=True),
         include_liveness: bool = Query(default=True),
+        include_live_status: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
         include_usage: bool = Query(default=True),
     ) -> SessionResponse:
@@ -1224,6 +1292,11 @@ def register_core_routes(
             as ``None``. The web chat surface passes ``False`` because
             it sources liveness from the ``/health`` poll and the WS
             stream, not the snapshot.
+        :param include_live_status: When ``False``, skip the live-status
+            probe of the session's bound runner on a status-cache miss
+            and report ``status`` from the cached or persisted value.
+            Runner-owned reads pass ``False`` because the probe targets
+            the very runner waiting on this response.
         :param include_usage: When ``False``, skip the subtree usage read and
             return null usage fields with ``usage_included=False``. Display
             clients can independently request this route with
@@ -1256,6 +1329,7 @@ def register_core_routes(
             conversation=access.conversation,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
+            include_live_status=include_live_status,
             include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
@@ -2220,6 +2294,23 @@ def register_core_routes(
         :raises OmnigentError: 400 if the runner is not
             registered; 404 if no session exists.
         """
+        # A live effort/model change must read the settings its predecessor confirmed
+        # or restored; otherwise a refusal can restore a value Codex never applied.
+        if not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set:
+            live_change = _live_settings_change(session_id)
+            async with live_change.lock:
+                return await _update_session(request, session_id, body, include_usage, live_change)
+        return await _update_session(request, session_id, body, include_usage)
+
+    async def _update_session(
+        request: Request,
+        session_id: str,
+        body: UpdateSessionRequest,
+        include_usage: bool,
+        live_change: _LiveSettingsChange | None = None,
+    ) -> SessionResponse:
+        """Apply the PATCH that :func:`update_session` documents."""
+        began = live_change.position() if live_change is not None else 0
         user_id = _get_user_id(request, auth_provider)
         if body.delete_worktree and body.archived is not True:
             raise OmnigentError(
@@ -2689,6 +2780,17 @@ def register_core_routes(
         )
         if updated is None:
             raise _session_not_found()
+        saved = live_change.position() if live_change is not None else 0
+        if body.silent:
+            # An active live change orders this write against its own when refused.
+            _note_settings_write(
+                session_id,
+                {
+                    key: getattr(updated, key)
+                    for key in ("reasoning_effort", "model_override")
+                    if key in body.model_fields_set
+                },
+            )
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
@@ -2719,25 +2821,106 @@ def register_core_routes(
         # The runner applies native settings live. Silent startup metadata
         # writes skip both recovery and forwarding to avoid recursive launches.
         live_forward = not body.silent
+        codex_native = (
+            updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+            == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+        )
+        # This server rolls back Codex refusals and keeps unconfirmed changes, so the
+        # runner neither saves a refusal nor waits out this server's forward timeout.
+        negotiation: dict[str, object] = {"rollback_on_refusal": True} if codex_native else {}
+        combined_model_forward = False
+        _model_forward = None
         if live_forward and (effort is not None or clear_effort):
-            await _forward_session_change_to_runner(
+            effort_event: dict[str, object] = {
+                "type": "effort_change",
+                "effort": updated.reasoning_effort,
+                **negotiation,
+            }
+            combined_model_forward = bool(
+                live_model_change and updated.model_override and codex_native
+            )
+            event = (
+                {
+                    "type": "model_change",
+                    "model": updated.model_override,
+                    "effort": updated.reasoning_effort,
+                    **negotiation,
+                }
+                if combined_model_forward
+                else effort_event
+            )
+            effort_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
-                {"type": "effort_change", "effort": updated.reasoning_effort},
+                event,
                 # Same TUI injection budget as the model change below: the
                 # ``/effort`` confirm dialog can render seconds after the
                 # command.
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
-        if live_model_change:
-            _model_forward = await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                {"type": "model_change", "model": updated.model_override},
-                # The runner answers this by typing ``/model`` into the pane and
-                # confirming the dialog, which outlasts the default budget.
-                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+            model_applied = bool(
+                combined_model_forward
+                and effort_forward is not None
+                and 200 <= effort_forward.status_code < 300
             )
+            if combined_model_forward:
+                _model_forward = effort_forward
+            if model_applied and effort_forward is not None:
+                if _runner_reply_field(effort_forward.body, "codex_settings_applied") is not True:
+                    # Older runners apply only the model; reset against that
+                    # model after its update has completed.
+                    effort_forward = await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        effort_event,
+                        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                    )
+            if codex_native and (
+                (effort_forward is None and model_applied)
+                or (
+                    effort_forward is not None
+                    and not 200 <= effort_forward.status_code < 300
+                    and not _codex_update_unconfirmed(effort_forward)
+                    and (
+                        (combined_model_forward and not model_applied)
+                        or _runner_reply_field(effort_forward.body, "rollback_on_refusal") is True
+                    )
+                )
+            ):
+                # A live refusal must not leave the picker claiming unapplied settings.
+                # Older runners keep a refused effort themselves, so roll back only
+                # when the runner confirms it did not, or after a lost fallback reply.
+                restore_model = live_model_change and not model_applied
+                if conv is None:
+                    raise OmnigentError(
+                        "The terminal did not apply the settings change.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                await _restore_refused_settings(
+                    conversation_store,
+                    session_id,
+                    previous=conv,
+                    attempted=updated,
+                    restore_model=restore_model,
+                    live_change=live_change,
+                    began=began,
+                    saved=saved,
+                )
+                raise OmnigentError(
+                    _CODEX_SETTINGS_RESTORED_MESSAGE
+                    if restore_model
+                    else "The terminal did not apply the reasoning effort change. Please try again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+        if live_model_change:
+            if not combined_model_forward:
+                _model_forward = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    {"type": "model_change", "model": updated.model_override, **negotiation},
+                    # The runner can answer by confirming a TUI model dialog.
+                    timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
             # omnigent.ui, which chat-first SDK terminal-view sessions like
@@ -2745,9 +2928,12 @@ def register_core_routes(
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
             if _is_native_terminal_session(updated):
-                # A recovered runner can disconnect again before the forward;
-                # neither a lost request nor a refusal confirms a model switch.
-                forward_failed = _surface_model_change_forward_failure(
+                # Neither a lost request nor a refusal confirms a model switch, but an
+                # unconfirmed Codex update may still apply; the next turn re-applies it.
+                unconfirmed = _model_forward is not None and _codex_update_unconfirmed(
+                    _model_forward
+                )
+                forward_failed = not unconfirmed and _surface_model_change_forward_failure(
                     session_id,
                     updated.model_override,
                     _model_forward,
@@ -2756,6 +2942,21 @@ def register_core_routes(
                     (wake_for_model_change and (_model_forward is None or forward_failed))
                     or (forward_failed and configured_snapshot(conv.inference_snapshot))
                 ):
+                    if combined_model_forward:
+                        # The lost request also carried the effort, so restore both.
+                        await _restore_refused_settings(
+                            conversation_store,
+                            session_id,
+                            previous=conv,
+                            attempted=updated,
+                            restore_model=True,
+                            live_change=live_change,
+                            began=began,
+                            saved=saved,
+                        )
+                        raise OmnigentError(
+                            _CODEX_SETTINGS_RESTORED_MESSAGE, code=ErrorCode.RUNNER_UNAVAILABLE
+                        )
                     await asyncio.to_thread(
                         conversation_store.update_conversation,
                         session_id,

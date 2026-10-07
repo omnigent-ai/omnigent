@@ -2487,9 +2487,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                         if item.stable_id is not None
                     ]
 
-            # Bump updated_at on the conversation.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if conv_row is not None:
+            has_new_conversation_activity = any(
+                item.type != "resource_event"
+                and (item.stable_id is None or item.stable_id not in existing_by_id)
+                for item in items
+            )
+            if conv_row is not None and has_new_conversation_activity:
                 conv_row.updated_at = now
 
             # Allocate item positions from the conversation's maintained
@@ -3492,6 +3496,48 @@ class SqlAlchemyConversationStore(ConversationStore):
         else:
             meta = self._get_meta(conversation_id)
         return _to_conversation(row, meta, labels)
+
+    def restore_session_settings_if_matches(
+        self,
+        conversation_id: str,
+        *,
+        previous: Conversation,
+        attempted: Conversation,
+        restore_effort: bool = True,
+        restore_model: bool = False,
+    ) -> None:
+        """Roll back refused settings under the row lock, retaining newer field values."""
+        settings: dict[str, tuple[str | None, str | None]] = {}
+        if restore_effort:
+            settings["reasoning_effort"] = (attempted.reasoning_effort, previous.reasoning_effort)
+        if restore_model:
+            settings["model_override"] = (attempted.model_override, previous.model_override)
+        if not settings:
+            return
+
+        def restore(session: Session) -> None:
+            query = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                query = query.with_for_update()
+            row = session.scalar(query)
+            if row is None:
+                return
+            overrides = _decode_session_overrides(row.session_overrides)
+            changed = False
+            for key, (expected, original) in settings.items():
+                if overrides.get(key) == expected and expected != original:
+                    overrides[key] = original
+                    changed = True
+            if changed:
+                row.session_overrides = _encode_session_overrides(overrides)
+                row.updated_at = now_epoch()
+
+        run_write_transaction(
+            self._conv_session_immediate, "restore_session_settings_if_matches", restore
+        )
 
     def clear_model_override_if_matches(
         self,

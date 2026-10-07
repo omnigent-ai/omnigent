@@ -1542,7 +1542,7 @@ class TestBuildMcpTools(unittest.TestCase):
         self.assertEqual(parsed["result"], 42)
         self.assertNotIn("isError", result)
 
-    def test_handler_keeps_non_ascii_text_unescaped(self):
+    def test_handler_keeps_unicode_readable_and_surrogates_transport_safe(self):
         # The handler's text is what the model reads. \uXXXX escapes make every
         # non-ASCII character six characters long and several times the tokens,
         # which pushes ordinary non-English tool output past the harness's size
@@ -1550,7 +1550,7 @@ class TestBuildMcpTools(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import _build_mcp_tools
 
         async def mock_executor(name, args):
-            return {"stdout": "Спикер 1: привет"}
+            return {"stdout": "Спикер 1: привет", "path": "recording-\udcff.txt"}
 
         schemas = [
             {
@@ -1563,8 +1563,36 @@ class TestBuildMcpTools(unittest.TestCase):
         result = _run(tools[0].handler({}))
         text = result["content"][0]["text"]
         self.assertIn("Спикер 1: привет", text)
-        self.assertNotIn("\\u", text)
-        self.assertEqual(json.loads(text)["stdout"], "Спикер 1: привет")
+        self.assertNotIn("\\u0421", text)
+        self.assertIn("\\udcff", text)
+        text.encode("utf-8")
+        self.assertEqual(
+            json.loads(text),
+            {"stdout": "Спикер 1: привет", "path": "recording-\udcff.txt"},
+        )
+
+    def test_handler_error_keeps_unicode_readable_and_surrogates_transport_safe(self):
+        from omnigent.inner.claude_sdk_executor import _build_mcp_tools
+
+        async def mock_executor(name, args):
+            raise RuntimeError("ошибка для recording-\udcff.txt")
+
+        schemas = [
+            {
+                "name": "sh",
+                "description": "Shell",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+
+        result = _run(_build_mcp_tools(schemas, mock_executor)[0].handler({}))
+
+        self.assertTrue(result["isError"])
+        text = result["content"][0]["text"]
+        self.assertIn("ошибка", text)
+        self.assertIn("\\udcff", text)
+        text.encode("utf-8")
+        self.assertEqual(json.loads(text), {"error": "ошибка для recording-\udcff.txt"})
 
     def test_handler_marks_blocked_result_as_error(self):
         from omnigent.inner.claude_sdk_executor import _build_mcp_tools

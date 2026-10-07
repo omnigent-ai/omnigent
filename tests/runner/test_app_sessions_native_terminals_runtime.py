@@ -468,6 +468,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         updated_at=11,
         terminal_launch_args=["--config", "approval_policy=on-request"],
         model_override="gpt-5.4-mini",
+        reasoning_effort="high",
         external_session_id=thread_id,
     ).model_dump(mode="json")
     session_init = (
@@ -648,6 +649,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             assert session_key == "main"
             assert resource_role == CODEX_NATIVE_TERMINAL_ROLE
             assert not retained_client.closed
+            assert effort_calls == [(thread_id, "high", None)], (
+                "settings controls must not see the bridge until resume effort is applied"
+            )
             preloaded_state = codex_native_bridge.read_bridge_state(bridge_dir)
             assert preloaded_state is not None
             assert preloaded_state.thread_id == thread_id
@@ -664,6 +668,14 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     published_events: list[dict[str, Any]] = []
     forward_calls: list[dict[str, Any]] = []
     preload_calls: list[tuple[str, str, list[str] | None]] = []
+    effort_calls: list[tuple[str, str, object]] = []
+
+    async def _fake_apply_effort(
+        transport: str, loaded_thread_id: str, effort: str, **kwargs: Any
+    ) -> None:
+        effort_calls.append(
+            (loaded_thread_id, effort, codex_native_bridge.read_bridge_state(bridge_dir))
+        )
 
     async def _fake_preload_thread(
         transport: str,
@@ -705,6 +717,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
+    monkeypatch.setattr(codex_app_mod, "apply_codex_thread_effort", _fake_apply_effort)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
     monkeypatch.setattr(
         startup_config_mod,
@@ -947,6 +960,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
                 "include_items": "false",
                 "include_liveness": "false",
                 "include_usage": "false",
+                "include_live_status": "false",
             }
             return httpx.Response(
                 200,
@@ -1228,6 +1242,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
                     "include_items": "false",
                     "include_liveness": "false",
                     "include_usage": "false",
+                    "include_live_status": "false",
                 }
                 labels = {
                     FORK_SOURCE_LABEL_KEY: source_id,

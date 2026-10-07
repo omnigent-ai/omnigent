@@ -97,6 +97,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "The model service hit a temporary error mid-response; retrying usually continues the turn.",
   budget_exhausted:
     "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
+  client_update_required:
+    "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
