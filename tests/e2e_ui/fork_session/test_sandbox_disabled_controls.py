@@ -1,7 +1,7 @@
-"""Unsupported Arclet actions stay discoverable without reaching write APIs.
+"""Unsupported sandbox actions stay discoverable without reaching write APIs.
 
 The local server and transcript are real; only the managed source metadata is
-patched because the isolated test environment has no Arclet provider.
+patched because the isolated test environment has no Databricks sandbox providers.
 """
 
 from __future__ import annotations
@@ -15,18 +15,20 @@ from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.e2e_ui.conftest import fetch_with_retry
 
-_FORK_REASON = "Forking Arclet sessions is not supported yet."
-_SWITCH_REASON = "Switching hosts is not supported for Arclet sessions yet."
+_FORK_REASON = "Forking this sandbox session is not supported yet."
+_SWITCH_REASON = "Switching hosts is not supported for this sandbox session yet."
 
 
-def _patch_arclet(page: Page, session_id: str) -> None:
+def _patch_sandbox(page: Page, session_id: str, provider: str) -> None:
     def snapshot(route: Route) -> None:
         response = fetch_with_retry(route)
         body = response.json()
-        body["host_id"] = "host_arclet"
+        body["host_id"] = "host_sandbox"
         body["host_resumable"] = True
         body["workspace"] = "/workspace/project"
-        body["labels"] = {**body.get("labels", {}), "omnigent.host_type": "managed"}
+        # Exercise the provider fallback without the managed snapshot marker.
+        body["labels"] = dict(body.get("labels") or {})
+        body["labels"].pop("omnigent.host_type", None)
         route.fulfill(response=response, body=json.dumps(body))
 
     def sessions(route: Route) -> None:
@@ -34,7 +36,7 @@ def _patch_arclet(page: Page, session_id: str) -> None:
         body = response.json()
         for row in body.get("data", []):
             if row.get("id") == session_id:
-                row["host_id"] = "host_arclet"
+                row["host_id"] = "host_sandbox"
                 row["workspace"] = "/workspace/project"
                 # Sidebar rows need not carry the snapshot's synthetic label.
         route.fulfill(response=response, body=json.dumps(body))
@@ -47,11 +49,11 @@ def _patch_arclet(page: Page, session_id: str) -> None:
             json={
                 "hosts": [
                     {
-                        "host_id": "host_arclet",
-                        "name": "Arclet",
+                        "host_id": "host_sandbox",
+                        "name": "Databricks Sandbox" if provider == "lakebox" else "Arclet",
                         "owner": "local",
                         "status": "online",
-                        "sandbox_provider": "arclet",
+                        "sandbox_provider": provider,
                     }
                 ]
             }
@@ -95,13 +97,17 @@ def _close_menu(page: Page) -> None:
     expect(page.get_by_role("menu")).to_have_count(0)
 
 
+@pytest.mark.parametrize(
+    "sandbox_provider", ["arclet", "lakebox"], ids=["arclet", "databricks-sandbox"]
+)
 @pytest.mark.parametrize("viewport_width", [1280, 390], ids=["desktop", "mobile"])
-def test_arclet_fork_and_switch_host_disabled(
+def test_sandbox_fork_and_switch_host_disabled(
     page: Page,
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
     tmp_path: Path,
     viewport_width: int,
+    sandbox_provider: str,
 ) -> None:
     """Hover and keyboard explanations work across the real menu surfaces."""
     del mock_llm_server_url
@@ -114,7 +120,7 @@ def test_arclet_fork_and_switch_host_disabled(
     assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
     expect(assistant).to_have_count(1, timeout=60_000)
 
-    _patch_arclet(page, session_id)
+    _patch_sandbox(page, session_id, sandbox_provider)
     writes: list[str] = []
     page.on(
         "request",
@@ -130,7 +136,7 @@ def test_arclet_fork_and_switch_host_disabled(
     page.get_by_test_id("header-conversation-actions").click()
     header_fork = page.get_by_test_id("header-fork-conversation")
     _disabled_menu_action(page, header_fork, _FORK_REASON)
-    page.screenshot(path=str(tmp_path / "arclet-fork-tooltip.png"))
+    page.screenshot(path=str(tmp_path / f"{sandbox_provider}-fork-tooltip.png"))
     _close_menu(page)
 
     if viewport_width < 768:
@@ -161,5 +167,5 @@ def test_arclet_fork_and_switch_host_disabled(
     page.get_by_test_id("composer-host-select").click()
     switch_host = page.get_by_role("menuitem", name="Switch host…")
     _disabled_menu_action(page, switch_host, _SWITCH_REASON)
-    page.screenshot(path=str(tmp_path / "arclet-switch-host-tooltip.png"))
+    page.screenshot(path=str(tmp_path / f"{sandbox_provider}-switch-host-tooltip.png"))
     assert writes == []

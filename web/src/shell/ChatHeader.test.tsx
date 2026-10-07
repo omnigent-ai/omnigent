@@ -871,7 +871,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       conversationId: conversation.id,
       actionConversation: null,
       canFork: true,
-      forkDisabledReason: "Forking Arclet sessions is not supported yet.",
+      forkDisabledReason: "Forking this sandbox session is not supported yet.",
       onFork,
     });
     fireEvent.pointerDown(

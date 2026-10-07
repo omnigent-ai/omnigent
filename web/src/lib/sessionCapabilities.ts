@@ -1,8 +1,8 @@
 /** UI-only session capability gates, derived from the live session snapshot. */
 
-export const ARCLET_FORK_UNSUPPORTED = "Forking Arclet sessions is not supported yet.";
-export const ARCLET_SWITCH_HOST_UNSUPPORTED =
-  "Switching hosts is not supported for Arclet sessions yet.";
+export const SANDBOX_FORK_UNSUPPORTED = "Forking this sandbox session is not supported yet.";
+export const SANDBOX_SWITCH_HOST_UNSUPPORTED =
+  "Switching hosts is not supported for this sandbox session yet.";
 export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
 
 export interface SessionActionSource {
@@ -18,14 +18,13 @@ export function sessionActionRestrictions(
   // Embedded deployments derive this label even when the viewer cannot list
   // the source's host. A repository label alone does not imply a restriction.
   const unsupportedSource =
-    session?.labels?.["omnigent.host_type"] === "managed" || host?.sandbox_provider === "arclet";
+    session?.labels?.["omnigent.host_type"] === "managed" ||
+    host?.sandbox_provider === "arclet" ||
+    host?.sandbox_provider === "lakebox";
   return {
-    forkDisabledReason: unsupportedSource ? ARCLET_FORK_UNSUPPORTED : undefined,
-    switchHostDisabledReason: unsupportedSource
-      ? ARCLET_SWITCH_HOST_UNSUPPORTED
-      : host?.sandbox_provider
-        ? "Switching hosts is not supported for managed sandbox sessions yet."
-        : undefined,
+    forkDisabledReason: unsupportedSource ? SANDBOX_FORK_UNSUPPORTED : undefined,
+    switchHostDisabledReason:
+      unsupportedSource || host?.sandbox_provider ? SANDBOX_SWITCH_HOST_UNSUPPORTED : undefined,
   };
 }
 

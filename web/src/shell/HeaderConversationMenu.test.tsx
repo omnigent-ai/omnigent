@@ -142,7 +142,7 @@ afterEach(cleanup);
 
 describe("HeaderConversationMenu", () => {
   it("keeps an unsupported Fork visible without opening its dialog", () => {
-    renderMenu({ forkDisabledReason: "Forking Arclet sessions is not supported yet." });
+    renderMenu({ forkDisabledReason: "Forking this sandbox session is not supported yet." });
     openMenu();
     const fork = screen.getByTestId("header-fork-conversation");
     expect(fork).toHaveAttribute("aria-disabled", "true");

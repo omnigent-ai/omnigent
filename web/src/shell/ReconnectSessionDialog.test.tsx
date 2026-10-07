@@ -212,8 +212,8 @@ describe("buildReconnectCommand", () => {
 describe("<ReconnectSessionDialog />", () => {
   it("disables Clone and Switch host for an unsupported managed session", () => {
     vi.mocked(useSessionActionRestrictions).mockReturnValue({
-      forkDisabledReason: "Forking Arclet sessions is not supported yet.",
-      switchHostDisabledReason: "Switching hosts is not supported for Arclet sessions yet.",
+      forkDisabledReason: "Forking this sandbox session is not supported yet.",
+      switchHostDisabledReason: "Switching hosts is not supported for this sandbox session yet.",
     });
     render(
       <ReconnectSessionDialog
@@ -320,13 +320,13 @@ describe("<ReconnectSessionDialog />", () => {
 
   it("does not suggest cloning an unsupported session to a non-owner", () => {
     vi.mocked(useSessionActionRestrictions).mockReturnValue({
-      forkDisabledReason: "Forking Arclet sessions is not supported yet.",
-      switchHostDisabledReason: "Switching hosts is not supported for Arclet sessions yet.",
+      forkDisabledReason: "Forking this sandbox session is not supported yet.",
+      switchHostDisabledReason: "Switching hosts is not supported for this sandbox session yet.",
     });
     renderDialog({ state: "host_offline", isOwner: false });
     expect(clonePanelState()).toBe("inactive");
     expect(screen.getByTestId("reconnect-session-description")).toHaveTextContent(
-      "Forking Arclet sessions is not supported yet.",
+      "Forking this sandbox session is not supported yet.",
     );
     expect(screen.queryByText(/Clone the session to continue/)).not.toBeInTheDocument();
   });

@@ -139,7 +139,11 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("SwitchHostDialog", () => {
-  it("blocks a directly opened managed-session dialog before releasing its runner", () => {
+  it.each([
+    ["managed snapshot", null],
+    ["Arclet host", "arclet"],
+    ["Databricks Sandbox host", "lakebox"],
+  ])("blocks a directly opened %s dialog before releasing its runner", (source, provider) => {
     vi.mocked(useSession).mockReturnValue({
       session: {
         id: "conv_1",
@@ -153,14 +157,26 @@ describe("SwitchHostDialog", () => {
         parentSessionId: null,
         subAgentName: null,
         kind: "default",
-        labels: { "omnigent.host_type": "managed" },
+        hostId: "host_old",
+        labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
       },
       isLoading: false,
       error: null,
     });
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_old",
+          name: "source-host",
+          owner: "alice",
+          status: "online",
+          sandbox_provider: provider,
+        },
+      ],
+    } as ReturnType<typeof useHosts>);
     renderDialog();
     expect(
-      screen.getByText("Switching hosts is not supported for Arclet sessions yet."),
+      screen.getByText("Switching hosts is not supported for this sandbox session yet."),
     ).toBeVisible();
     expect(screen.getByTestId("switch-host-button")).toBeDisabled();
     expect(screen.queryByTestId("mock-workspace-input")).not.toBeInTheDocument();

@@ -108,7 +108,7 @@ describe("AssistantBubble fork source", () => {
         <ForkDialogContextProvider
           value={{
             canFork: true,
-            disabledReason: "Forking Arclet sessions is not supported yet.",
+            disabledReason: "Forking this sandbox session is not supported yet.",
             openForkDialog,
           }}
         >

@@ -117,9 +117,13 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("HostBadge", () => {
-  it.each(["managed snapshot", "Arclet host"])(
+  it.each([
+    ["managed snapshot", null],
+    ["Arclet host", "arclet"],
+    ["Databricks Sandbox host", "lakebox"],
+  ])(
     "explains disabled host switching for %s, including keyboard selection",
-    async (source) => {
+    async (source, provider) => {
       useSessionMock.mockReturnValue({
         session: {
           hostId: "host_a1b2",
@@ -127,7 +131,7 @@ describe("HostBadge", () => {
         },
       });
       useHostsMock.mockReturnValue({
-        data: source === "Arclet host" ? [host({ sandbox_provider: "arclet" })] : [],
+        data: provider ? [host({ sandbox_provider: provider })] : [],
       });
       render(<HostBadge sessionId="conv_1" appearance="composer" />);
       fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
@@ -136,7 +140,7 @@ describe("HostBadge", () => {
       fireEvent.focus(item);
       await waitFor(() =>
         expect(screen.getByRole("tooltip")).toHaveTextContent(
-          "Switching hosts is not supported for Arclet sessions yet.",
+          "Switching hosts is not supported for this sandbox session yet.",
         ),
       );
       fireEvent.click(item);

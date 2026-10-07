@@ -1,24 +1,27 @@
 import { describe, expect, it } from "vitest";
 import {
-  ARCLET_FORK_UNSUPPORTED,
-  ARCLET_SWITCH_HOST_UNSUPPORTED,
+  SANDBOX_FORK_UNSUPPORTED,
+  SANDBOX_SWITCH_HOST_UNSUPPORTED,
   sessionActionRestrictions,
 } from "./sessionCapabilities";
 
 describe("session action restrictions", () => {
   it("recognizes the managed snapshot without access to its host record", () => {
     expect(sessionActionRestrictions({ labels: { "omnigent.host_type": "managed" } })).toEqual({
-      forkDisabledReason: ARCLET_FORK_UNSUPPORTED,
-      switchHostDisabledReason: ARCLET_SWITCH_HOST_UNSUPPORTED,
+      forkDisabledReason: SANDBOX_FORK_UNSUPPORTED,
+      switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
     });
   });
 
-  it("recognizes an Arclet host when the sidebar has no synthetic label", () => {
-    expect(sessionActionRestrictions({ labels: {} }, { sandbox_provider: "arclet" })).toEqual({
-      forkDisabledReason: ARCLET_FORK_UNSUPPORTED,
-      switchHostDisabledReason: ARCLET_SWITCH_HOST_UNSUPPORTED,
-    });
-  });
+  it.each(["arclet", "lakebox"])(
+    "recognizes the %s provider when the session has no synthetic label",
+    (provider) => {
+      expect(sessionActionRestrictions({ labels: {} }, { sandbox_provider: provider })).toEqual({
+        forkDisabledReason: SANDBOX_FORK_UNSUPPORTED,
+        switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
+      });
+    },
+  );
 
   it("preserves forks from supported sandbox providers, including repository labels", () => {
     const result = sessionActionRestrictions(
@@ -26,7 +29,7 @@ describe("session action restrictions", () => {
       { sandbox_provider: "modal" },
     );
     expect(result.forkDisabledReason).toBeUndefined();
-    expect(result.switchHostDisabledReason).toContain("managed sandbox");
+    expect(result.switchHostDisabledReason).toBe(SANDBOX_SWITCH_HOST_UNSUPPORTED);
   });
 
   it("keeps both actions available for ordinary hosts", () => {
