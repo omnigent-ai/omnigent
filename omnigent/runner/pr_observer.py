@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
@@ -291,12 +292,17 @@ def _graphql_create_field(tokens: list[str]) -> str | None:
         or _api_method(tokens) != "POST"
     ):
         return None
-    query = _api_field(tokens, "query") or ""
+    return _graphql_mutation_field(_api_field(tokens, "query") or "")
+
+
+@functools.lru_cache(maxsize=32)
+def _graphql_mutation_field(query: str) -> str | None:
+    """Parse once per query text; the observer consults it several times per command."""
     # Ignore strings and comments so PR mentions in a comment mutation cannot match.
     parts = [
         part
         for part in re.findall(
-            r'"""(?:\\.|(?!""").)*"""|"(?:\\.|[^"\\])*"|\#[^\r\n]*'
+            r'"""(?:[^"\\]|\\.|"(?!""))*"""|"(?:\\.|[^"\\])*"|\#[^\r\n]*'
             r"|[_A-Za-z][_0-9A-Za-z]*|[^\s,]",
             query,
             re.DOTALL,
@@ -331,6 +337,9 @@ def _graphql_create_field(tokens: list[str]) -> str | None:
                 return None
         elif depth == 1:
             fields.append(part)
+        elif part == ":":
+            # A nested alias such as ``url: body`` would relabel body text as identity.
+            return None
     return None
 
 
@@ -481,6 +490,9 @@ def _command_target(tokens: list[str]) -> PullRequestRef | None:
 
 def _content_only(tokens: list[str]) -> bool:
     if field := _graphql_create_field(tokens):
+        # A template prints any selected field, so its output has no identity provenance.
+        if _flag(tokens, "--template", "-t") is not None:
+            return True
         projection = _flag(tokens, "--jq", "-q")
         path = f".data.{field}.pullRequest"
         if projection is not None:

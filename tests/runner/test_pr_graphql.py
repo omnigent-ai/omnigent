@@ -12,6 +12,7 @@ from omnigent.runner.pr_observer import extract_prs, observe_hook
 from omnigent.runner.session_prs import SessionPrRegistry
 
 URL = "https://github.com/example/project/pull/42"
+OTHER_URL = "https://github.com/other/repo/pull/99"
 QUERY = """mutation CreatePullRequest($repositoryId: ID!, $headRepositoryId: ID!) {
   createPullRequest(input: {
     repositoryId: $repositoryId, headRepositoryId: $headRepositoryId,
@@ -125,4 +126,41 @@ def test_graphql_errors_do_not_supply_pr_identity() -> None:
         {"command": command()},
         {"data": {"createPullRequest": None}, "errors": [{"message": URL}]},
     )
+    assert not references
+
+
+def test_unterminated_block_string_fails_fast() -> None:
+    # A backslash before every character is the worst case for string scanning.
+    query = '"""' + "\\a" * 2000
+    assert extract_prs("shell", {"command": command(query)}, URL) == ([], False)
+
+
+@pytest.mark.parametrize(
+    "projection,result",
+    [
+        (None, {"data": {"createPullRequest": {"pullRequest": {"url": OTHER_URL}}}}),
+        (".data.createPullRequest.pullRequest", {"url": OTHER_URL}),
+    ],
+)
+def test_nested_alias_cannot_relabel_body_as_identity(
+    projection: str | None, result: dict[str, object]
+) -> None:
+    query = QUERY.replace("pullRequest { number url title", "pullRequest { number url: body title")
+    assert "url: body" in query
+    assert extract_prs("shell", {"command": command(query, projection)}, result) == ([], False)
+
+
+def test_template_output_is_not_pr_identity() -> None:
+    shell = shlex.join(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={QUERY}",
+            "--template",
+            "{{.data.createPullRequest.pullRequest.body}}",
+        ]
+    )
+    references, _ = extract_prs("shell", {"command": shell}, OTHER_URL)
     assert not references
