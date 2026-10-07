@@ -2633,12 +2633,17 @@ def _codex_function_call_payload_from_session_item(
             "Cannot synthesize Codex resume rollout: Omnigent function_call "
             f"{item_id!r} has non-string arguments."
         )
-    return {
+    payload: _JsonObject = {
         "type": "function_call",
         "name": name,
         "arguments": arguments,
         "call_id": call_id,
     }
+    # The Responses API rejects a replayed namespaced call without it.
+    namespace = item.get("namespace")
+    if isinstance(namespace, str) and namespace:
+        payload["namespace"] = namespace
+    return payload
 
 
 def _codex_function_call_output_payload_from_session_item(

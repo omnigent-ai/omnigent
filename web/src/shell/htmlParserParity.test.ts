@@ -168,13 +168,13 @@ describe("scanner vs DOMParser parity", () => {
       ].map((s) => s.textContent ?? "");
       const out = appendCommentBridge(html, NONCE);
       const doc = new DOMParser().parseFromString(out, "text/html");
-      const bridge = [...doc.querySelectorAll("body script")].find((s) =>
-        (s.textContent ?? "").includes(NONCE),
+      const bridge = [...doc.querySelectorAll("body script")].find(
+        (s) => s.getAttribute("data-omni-nonce") === NONCE,
       );
       expect(bridge).toBeTruthy();
       expect(bridge!.parentElement?.tagName.toLowerCase()).toBe("body");
       const afterDeckScripts = [...doc.querySelectorAll("script")]
-        .filter((s) => !(s.textContent ?? "").includes(NONCE))
+        .filter((s) => s.getAttribute("data-omni-nonce") !== NONCE)
         .map((s) => s.textContent ?? "");
       expect(afterDeckScripts).toEqual(beforeScripts);
     },

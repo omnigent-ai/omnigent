@@ -330,6 +330,62 @@ async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(
     assert items[-1].data.resource["status"] == outcome
 
 
+@pytest.mark.parametrize(
+    ("harness", "wrapper", "native"),
+    [
+        ("claude-native", None, True),
+        ("codex-native", None, True),
+        (None, "claude-code-native-ui", True),
+        ("auto", "claude-code-native-ui", True),
+        ("claude-sdk", "claude-code-native-ui", False),
+        ("claude-sdk", None, False),
+        (None, None, False),
+    ],
+)
+@pytest.mark.parametrize(
+    ("outcome", "status"),
+    [("completed", "idle"), ("failed", "failed"), ("cancelled", "idle"), ("completed", "failed")],
+)
+@pytest.mark.asyncio
+async def test_subagent_activity_uses_effective_harness_for_runner_completion(
+    db_uri: str, harness: str | None, wrapper: str | None, native: bool, outcome: str, status: str
+) -> None:
+    """Native prompt delivery cannot finish a child; errors and SDK results can."""
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        harness_override=harness,
+        labels={"omnigent.wrapper": wrapper} if wrapper is not None else {},
+    )
+    release = asyncio.Event()
+    release.set()
+    await _relay_runner_stream_once(
+        child.id,
+        _ScriptedRunnerClient(
+            release,
+            [
+                {"type": "response.in_progress", "response": {"id": "runner-turn"}},
+                {"type": f"response.{outcome}", "response": {"id": "runner-turn"}},
+                {"type": "session.status", "status": status},
+                {"type": "session.status", "status": status},
+            ],
+        ),
+        store,
+    )
+    notices = store.list_items(parent.id, type="resource_event").data
+    if native and outcome == "completed" and status == "idle":
+        assert notices == []
+    else:
+        assert len(notices) == 1
+        assert notices[0].data.event_type == "session.subagent.returned"
+        assert notices[0].data.resource_id == child.id
+        assert notices[0].data.resource["status"] == ("failed" if status == "failed" else outcome)
+
+
 @pytest.mark.asyncio
 async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
     """
@@ -1921,7 +1977,7 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
         ("sub_agent", "idle", "error", None, "idle_no_failure", "relay_snapshot"),
         ("sub_agent", "running", "error", None, "failed_mid_turn", "relay_snapshot"),
         ("sub_agent", "waiting", "missing", None, "failed_mid_turn", "relay_snapshot"),
-        ("sub_agent", None, "missing", None, "failed_mid_turn", "unknown"),
+        ("sub_agent", None, "missing", None, "unknown_no_failure", "unknown"),
         ("sub_agent", "idle", "running", None, "failed_mid_turn", "persisted"),
         ("sub_agent", "idle", "waiting", None, "failed_mid_turn", "persisted"),
         ("sub_agent", "running", "idle", None, "idle_no_failure", "persisted"),
@@ -1931,12 +1987,16 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
         # edge, and its parent's runtime owns the turn: only the cache fails it.
         ("mirror", "running", "error", None, "subagent_unobserved", "relay_snapshot"),
         ("mirror", "waiting", "missing", None, "subagent_unobserved", "relay_snapshot"),
-        ("mirror", None, "missing", None, "failed_mid_turn", "unknown"),
+        ("mirror", None, "missing", None, "unknown_no_failure", "unknown"),
         ("mirror", "idle", "running", None, "subagent_unobserved", "persisted"),
         ("mirror", "idle", "idle", "running", "failed_mid_turn", "cache"),
         # A top-level session's saved mid-turn status still reports the drop.
         ("default", "running", "error", None, "failed_mid_turn", "relay_snapshot"),
         ("default", "idle", "running", None, "failed_mid_turn", "persisted"),
+        ("default", None, "error", None, "unknown_no_failure", "unknown"),
+        ("default", None, "missing", None, "unknown_no_failure", "unknown"),
+        ("default", None, "error", "running", "failed_mid_turn", "cache"),
+        ("default", None, "error", "waiting", "failed_mid_turn", "cache"),
     ],
 )
 async def test_relay_disconnect_status_after_adoption(
@@ -2045,9 +2105,9 @@ async def test_relay_disconnect_status_after_adoption(
 @pytest.mark.parametrize(
     ("scenario", "expect_failed"),
     [
-        ("wrong_session", True),
-        ("wrong_runner", True),
-        ("rebind", True),
+        ("wrong_session", False),
+        ("wrong_runner", False),
+        ("rebind", False),
         ("caller_mutation", False),
         ("healthy_reuse", False),
     ],
@@ -2120,6 +2180,11 @@ async def test_relay_adoption_snapshot_lifetime(
                     conversation=snapshot,
                 )
                 assert reused is handle
+        if scenario in {"wrong_session", "wrong_runner", "rebind"}:
+            assert handle.status_snapshot is None
+        else:
+            assert handle.status_snapshot is not None
+            assert handle.status_snapshot.live_status == "idle"
         monkeypatch.setattr(store, "get_conversation", missing_disconnect_lookup)
         gate.set()
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
@@ -2251,19 +2316,15 @@ async def test_disconnect_uses_status_arriving_during_lookup(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing_row", [False, True])
-async def test_relay_reports_the_drop_when_live_status_is_unknown(
+async def test_relay_preserves_existing_error_when_live_status_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
     missing_row: bool,
 ) -> None:
     """
-    An unreadable or missing row still reports the drop.
+    An unreadable or missing row cannot establish an interrupted turn.
 
-    The cold-cache fallback reads the row from inside the disconnect
-    handler. A store error there must not escape: an exception thrown out of
-    that handler ends the relay task before either branch publishes,
-    truncating the client's stream with no error event — exactly what the
-    ``failed`` status exists to prevent. An indeterminate answer therefore
-    reports the drop, as the ungated relay always did.
+    The relay exits cleanly without publishing a fabricated failure, clearing
+    a genuine earlier error, or inventing an idle status.
     """
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
@@ -2283,6 +2344,8 @@ async def test_relay_reports_the_drop_when_live_status_is_unknown(
 
     monkeypatch.setattr(store, "get_conversation", unavailable_conversation)
     session_id = "abcdef0123456789abcdef0123456789"
+    original_labels = {"omnigent.last_task_error_code": "required_terminal_exited"}
+    store.labels[session_id] = dict(original_labels)
 
     try:
         assert sessions_module._session_status_cache.get(session_id) is None
@@ -2298,12 +2361,10 @@ async def test_relay_reports_the_drop_when_live_status_is_unknown(
         gate.set()
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
-        # The relay survived the store error and still reported the cause.
+        # The relay survives the read failure without changing session state.
         assert handle.task.exception() is None
-        assert sessions_module._session_status_cache.get(session_id) == "failed"
-        persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
-        assert persisted is not None
-        assert persisted["code"] == "runner_disconnected"
+        assert session_id not in sessions_module._session_status_cache
+        assert store.labels[session_id] == original_labels
     finally:
         gate.set()
         handle = sessions_module._runner_relay_tasks.get(session_id)
@@ -2893,8 +2954,16 @@ async def test_offline_sweep_saved_subagent_turn_without_a_cached_edge(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mark_older_than_grace",
+    [
+        pytest.param(False, id="fresh-mark"),
+        pytest.param(True, id="mark-older-than-grace"),
+    ],
+)
 async def test_relay_does_not_fail_turn_during_server_shutdown(
     monkeypatch: pytest.MonkeyPatch,
+    mark_older_than_grace: bool,
 ) -> None:
     """
     A stream drop while THIS server is shutting down leaves the turn alone.
@@ -2902,23 +2971,32 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
     Shutdown closes the runner tunnels, which drops every relay stream; the
     runner itself is alive and reconnects to the replacement server. The
     give-up path must publish no ``failed`` status and persist no
-    ``runner_disconnected`` labels for that self-inflicted loss.
+    ``runner_disconnected`` labels for that self-inflicted loss, even when it
+    only decides a full disconnect grace after the shutdown mark was set.
     """
+    import time
+
     from omnigent.runtime import session_stream
     from omnigent.server import shutdown_state
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
 
-    monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
-        0.0,
-    )
+    # The production grace, read before it is patched to 0 for the test.
+    production_grace_s = orchestration.RUNNER_DISCONNECT_GRACE_S
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     fake_runner = _TunnelCloseRunnerClient(gate)
     store = _RecordingLabelStore(live_status="running")
     session_id = "5b1e2d7c9a4f4e0b8c3d2a1f6e7d8c9b"
     sessions_module._session_status_cache[session_id] = "running"
-    shutdown_state.mark_server_shutting_down()
+    if mark_older_than_grace:
+        # The tunnels closed a full production grace, plus slack, ago.
+        monkeypatch.setattr(
+            shutdown_state, "_marked_at", time.monotonic() - (production_grace_s + 5.0)
+        )
+    else:
+        shutdown_state.mark_server_shutting_down()
 
     try:
         handle = await sessions_module._ensure_runner_relay_ready(

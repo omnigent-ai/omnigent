@@ -157,6 +157,26 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     ]
 
 
+def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    skill = tmp_path / ".agents" / "skills" / "portable" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: portable\ndescription: Portable skill\n---\nUse this skill.\n")
+
+    body = claude_native._claude_terminal_request(
+        (),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+    )
+
+    args = body["spec"]["args"]
+    overlay = Path(args[args.index("--add-dir") + 1])
+    exposed = list((overlay / ".claude" / "skills").glob("*/SKILL.md"))
+    assert [path.parent.name for path in exposed] == ["portable"]
+    assert [path.read_text() for path in exposed] == [skill.read_text()]
+
+
 def test_claude_terminal_request_default_launch_is_unwrapped(tmp_path, monkeypatch) -> None:
     """Without ``OMNIGENT_CLAUDE_LAUNCHER`` the command/args are unchanged."""
     monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)

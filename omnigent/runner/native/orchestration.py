@@ -983,11 +983,15 @@ async def _launch_config_retry_sleep(delay: float) -> None:
     await asyncio.sleep(delay)
 
 
-# Metadata reads do not need transcript, liveness, or subtree-usage aggregation.
+# Metadata reads need stored-row fields only: skip the transcript page, liveness,
+# usage, and the live-status probe of the very runner making the read.
+# Older servers ignore unknown query params, so a newer runner against an older
+# server keeps working.
 _SESSION_METADATA_PARAMS: dict[str, str] = {
     "include_items": "false",
     "include_liveness": "false",
     "include_usage": "false",
+    "include_live_status": "false",
 }
 
 
@@ -1532,7 +1536,7 @@ async def _auto_create_opencode_terminal(
     clear_bridge_state(bridge_dir)
 
     model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
-    # Route opencode through the Databricks AI gateway when the spec names a
+    # Route opencode through the Databricks Unity Gateway when the spec names a
     # profile. Unlike codex/claude/pi (which consume HARNESS_*_GATEWAY_* env the
     # CLI translates), opencode reads provider/auth from its own config file, so
     # synthesize an opencode.json into the per-session XDG config dir BEFORE the
@@ -5411,6 +5415,27 @@ async def _auto_create_codex_terminal(
     # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
     try:
         if launch_config.external_session_id is not None:
+            if launch_config.reasoning_effort:
+                # A resumed thread runs the rollout's effort, not the config pin.
+                try:
+                    await apply_codex_thread_effort(
+                        codex_ws_url,
+                        launch_config.external_session_id,
+                        launch_config.reasoning_effort,
+                        model=_codex_launch.model,
+                        bridge_dir=bridge_dir,
+                    )
+                except Exception:  # noqa: BLE001 — a failed update must not sink the launch
+                    _logger.warning(
+                        "codex-native: could not apply reasoning effort %r to resumed thread "
+                        "%s for session %s; the next web turn re-applies it",
+                        launch_config.reasoning_effort,
+                        launch_config.external_session_id,
+                        session_id,
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+            # Publish after resume repair so live settings cannot interleave it.
             write_bridge_state(
                 bridge_dir,
                 CodexNativeBridgeState(
@@ -5423,25 +5448,6 @@ async def _auto_create_codex_terminal(
                     cwd=workspace,
                 ),
             )
-            if launch_config.reasoning_effort:
-                # A resumed thread runs the rollout's effort, not the config pin.
-                try:
-                    await apply_codex_thread_effort(
-                        codex_ws_url,
-                        launch_config.external_session_id,
-                        launch_config.reasoning_effort,
-                        model=_codex_launch.model,
-                    )
-                except Exception:  # noqa: BLE001 — a failed update must not sink the launch
-                    _logger.warning(
-                        "codex-native: could not apply reasoning effort %r to resumed thread "
-                        "%s for session %s; the next web turn re-applies it",
-                        launch_config.reasoning_effort,
-                        launch_config.external_session_id,
-                        session_id,
-                        exc_info=True,
-                        extra={"session_id": session_id},
-                    )
         launched = await _launch_codex_native_tui(
             session_id,
             resource_registry,
@@ -7064,7 +7070,7 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     Reads the canonical ``spec.executor.model`` field (the same field the
     in-process claude-sdk harness consumes via ``_resolve_spec_model``). Unlike
     cursor-native, gateway-routed ``databricks-*`` ids are valid Claude Code
-    models when the launch is wired through the Databricks AI gateway, so they
+    models when the launch is wired through the Databricks Unity Gateway, so they
     are passed through.
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
@@ -7147,7 +7153,7 @@ def _pi_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> s
     Reads the canonical ``spec.executor.model`` field (the same field the
     in-process harnesses and cursor-native consume). Unlike cursor-native,
     a gateway-routed id (``databricks-*``) IS usable here: the runner-owned
-    Pi process routes through the Databricks AI Gateway, whose ``models.json``
+    Pi process routes through the Databricks Unity Gateway, whose ``models.json``
     selects the model by its gateway id (see
     :func:`omnigent.harnesses.pi_native.credentials.resolve_pi_native_provider`). The
     resolved model is threaded into ``resolve_pi_native_provider(model=...)``
@@ -8789,6 +8795,7 @@ async def _auto_create_claude_terminal(
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
+        workspace=Path(workspace),
         ap_server_url=server_url,
         ap_auth_headers=_runner_headers,
         bundle_dir=bundle_dir,

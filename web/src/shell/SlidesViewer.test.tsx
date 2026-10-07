@@ -23,7 +23,13 @@ import {
   prepareSlidesExport,
   type KitFile,
 } from "./codeViewerHelpers";
-import { appendCommentBridge, BRIDGE_SOURCE } from "./htmlCommentBridge";
+import { EmbeddedProvider } from "@/lib/embedded";
+import {
+  appendCommentBridge,
+  BRIDGE_MSG,
+  BRIDGE_SOURCE,
+  HTML_COMMENT_BRIDGE_RUNTIME,
+} from "./htmlCommentBridge";
 import { DESIGN_SYSTEM_POINTER, serializeDesignSystemPointer } from "@/lib/designSystem";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { fetchWorkspaceDirectory } from "@/hooks/useWorkspaceChangedFiles";
@@ -1315,6 +1321,35 @@ describe("SlidesViewer comments", () => {
     const exported = prepareSlidesExport(DECK);
     expect(exported).not.toContain(BRIDGE_SOURCE);
     expect(exported).not.toContain("::highlight(omni-comment)");
+  });
+
+  it("loads the bridge runtime externally in embed mode (no inline script under CSP)", () => {
+    render(
+      <EmbeddedProvider>
+        <SlidesViewer content={DECK} />
+      </EmbeddedProvider>,
+    );
+    expect(srcdoc()).toMatch(
+      /<script src="[^"]*htmlCommentBridgeRuntime\.js[^"]*" data-omni-nonce=/,
+    );
+    expect(srcdoc()).not.toContain(HTML_COMMENT_BRIDGE_RUNTIME);
+  });
+
+  it("inlines the bridge runtime outside embed mode", () => {
+    render(<SlidesViewer content={DECK} />);
+    expect(srcdoc()).toContain(HTML_COMMENT_BRIDGE_RUNTIME);
+    expect(srcdoc()).not.toContain("htmlCommentBridgeRuntime.js");
+  });
+
+  it("opens the bridge channel when the deck iframe loads", () => {
+    render(<SlidesViewer content={DECK} />);
+    const post = spyOnFrame();
+    act(() => deckFrame().dispatchEvent(new Event("load")));
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ source: BRIDGE_SOURCE, type: BRIDGE_MSG.init }),
+      "*",
+      expect.any(Array),
+    );
   });
 
   it("Download HTML omits the comment bridge and highlight CSS", async () => {

@@ -632,6 +632,8 @@ describe("Composer send shortcut", () => {
     [false, "{Shift>}{Enter}{/Shift}"],
     [true, "{Enter}"],
     [true, "{Shift>}{Enter}{/Shift}"],
+    [false, "{Alt>}{Enter}{/Alt}"],
+    [true, "{Alt>}{Enter}{/Alt}"],
   ] as const)("preserves newline input (alternate send: %s, keys: %s)", async (alternate, keys) => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
     const onSend = vi.fn();
@@ -4022,6 +4024,39 @@ describe("Composer reply quotes", () => {
     expect(getSessionDraft("conv_test")).toBeUndefined();
   });
 
+  it("retracts delivery that arrives while the failed draft restore is rendering", () => {
+    const stableId = "8".repeat(32);
+    render(<Composer {...composerProps()} />);
+    const unsubscribe = useChatStore.subscribe((state) => {
+      if (state.restoredSendDraft?.stableId !== stableId || state.restoredSendDraft.delivered)
+        return;
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: stableId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
+      });
+    });
+    try {
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: "resend me",
+            files: [],
+            stableId,
+          },
+        }),
+      );
+      expect(textarea()).toHaveValue("");
+      expect(useChatStore.getState().restoredSendDraft).toBeNull();
+      expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+      expect(getSessionDraft("conv_test")).toBeUndefined();
+    } finally {
+      unsubscribe();
+    }
+  });
+
   it("keeps the user's edits when the delivered retraction lands", () => {
     const stableId = "d".repeat(32);
     render(<Composer {...composerProps()} />);
@@ -5636,7 +5671,7 @@ describe("Composer config gear", () => {
     expect(calls).toEqual(["model", "effort"]);
   });
 
-  it("shows a titled actionable tooltip when a session config update fails", async () => {
+  it("leaves no lingering error indicator when a session config update fails", async () => {
     const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
     const options = [
       { id: "opus", model: "opus", displayName: "Opus" },
@@ -5655,12 +5690,14 @@ describe("Composer config gear", () => {
 
     await openSessionModels();
     fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
-    const error = await screen.findByTestId("composer-config-error");
-    fireEvent.focus(error);
-    const tooltip = await screen.findByTestId("composer-config-error-tooltip");
-    expect(tooltip).toHaveTextContent("Couldn’t update configuration");
-    expect(tooltip).toHaveTextContent("Host stopped responding");
-    expect(tooltip).toHaveTextContent("Try again");
+    await waitFor(() =>
+      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
+    );
+    expect(screen.queryByTestId("composer-config-error")).not.toBeInTheDocument();
+    expect(screen.queryByText("Host stopped responding")).not.toBeInTheDocument();
   });
 
   it("recomputes the Codex effort ladder after a confirmed model change and drops an unsupported level", async () => {

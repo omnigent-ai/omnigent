@@ -87,7 +87,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         terminals = list(loaded.spec.terminals or {})
         # Bundled suggestions stay available while the host catalog loads.
         skills = [
-            SkillSummary(name=s.name, description=s.description)
+            SkillSummary(name=s.name, description=s.description, display_name=s.display_name)
             for s in loaded.spec.skills
             if s.user_invocable
         ]

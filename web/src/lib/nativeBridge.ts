@@ -214,7 +214,7 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: { force?: boolean; agent?: boolean; sourceHostId?: string },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
@@ -240,6 +240,8 @@ export type HostControlAction = "start" | "stop" | "restart";
 
 /** Result of connecting the Arca instance as a host, from the desktop shell. */
 export interface ArcaConnectResult extends HostActionResult {
+  /** Actual daemon identity captured on Arca for this selected server target. */
+  identity?: { serverUrl: string; hostId: string };
   /**
    * The box's host daemon was already connected to this server (the command
    * reused it) — so no new host will appear in the host list.

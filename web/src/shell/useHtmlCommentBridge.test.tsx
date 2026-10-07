@@ -27,7 +27,7 @@ function Host({
     } | null,
   ) => void;
 }) {
-  const { nonce, iframeRef, addCommentPortal } = useHtmlCommentBridge({
+  const { nonce, setIframeRef, onLoad, addCommentPortal } = useHtmlCommentBridge({
     conversationId: "conv_1",
     content: SOURCE,
     docKey: SOURCE,
@@ -39,7 +39,8 @@ function Host({
   return (
     <>
       <iframe
-        ref={iframeRef}
+        ref={setIframeRef}
+        onLoad={onLoad}
         title="hook-preview"
         sandbox={HTML_PREVIEW_SANDBOX}
         srcDoc={injectCommentBridge(SOURCE, nonce)}

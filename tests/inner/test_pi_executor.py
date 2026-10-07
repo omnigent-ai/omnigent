@@ -3535,7 +3535,7 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
     the shared Databricks default instead of ``None``.
 
     Failure means pi falls back to its own host default — an
-    Anthropic-direct id the Databricks AI gateway rejects, surfacing as a
+    Anthropic-direct id the Databricks Unity Gateway rejects, surfacing as a
     model error on the agent's first turn.
 
     Live discovery is stubbed unavailable so the resolver drops to the bundled

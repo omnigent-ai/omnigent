@@ -45,7 +45,8 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
@@ -64,6 +65,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
@@ -109,6 +111,8 @@ export function HeaderConversationMenu({
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
+  // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
+  const pinSaving = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
   const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
@@ -227,7 +231,12 @@ export function HeaderConversationMenu({
       <DropdownMenuItem
         data-testid="header-pin-conversation"
         className={itemClass}
-        onSelect={() => togglePinned.mutate({ id: conversation.id, pinned: !isPinned })}
+        disabled={pinSaving}
+        onSelect={() =>
+          isPinned
+            ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
+            : togglePinned.mutate({ id: conversation.id, pinned: true })
+        }
       >
         {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
         {isPinned ? "Unpin" : "Pin"}

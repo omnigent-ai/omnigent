@@ -92,7 +92,7 @@ from omnigent.runner.identity import (
 from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
-from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runtime import (
     get_policy_store,
     inflight_text,
@@ -2572,6 +2572,62 @@ def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
         ) from exc
 
 
+class _LiveSettingsChange:
+    """Orders one session's live effort/model changes and records writes made meanwhile."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self._position = 0
+        # Setting → (position, value) of the latest write by another request.
+        self._writes: dict[str, tuple[int, str | None]] = {}
+
+    def note_write(self, key: str, value: str | None) -> None:
+        """Record another request's write, or a terminal report, of *key*."""
+        self._position += 1
+        self._writes[key] = (self._position, value)
+
+    def position(self) -> int:
+        """Return the position that later writes are ordered after."""
+        return self._position
+
+    def restore_target(
+        self, key: str, previous: str | None, *, began: int, saved: int
+    ) -> tuple[bool, str | None]:
+        """Return whether a refused change may restore *key*, and the value to restore.
+
+        A write after the change was saved is a newer selection, so it stays. One
+        between the change's start and its save is what the change replaced.
+        """
+        position, value = self._writes.get(key, (0, None))
+        if position > saved:
+            return False, None
+        return True, value if position > began else previous
+
+
+# Live forwards run on the replica that holds the session's runner, so this
+# process-local registry orders them; weak values drop sessions with no change.
+# custom-lint: disable-next=workspace-scoped-cache -- session ids are globally unique
+_live_settings_changes: weakref.WeakValueDictionary[str, _LiveSettingsChange] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _live_settings_change(session_id: str) -> _LiveSettingsChange:
+    """Return the live settings change for *session_id*, starting one if none is active."""
+    change = _live_settings_changes.get(session_id)
+    if change is None:
+        change = _live_settings_changes[session_id] = _LiveSettingsChange()
+    return change
+
+
+def _note_settings_write(session_id: str, values: Mapping[str, str | None]) -> None:
+    """Record settings another request wrote while a live change may be active."""
+    change = _live_settings_changes.get(session_id)
+    if change is not None:
+        for key, value in values.items():
+            change.note_write(key, value)
+
+
 async def _persist_external_reasoning_effort_change(
     session_id: str,
     conv: Conversation,
@@ -2595,6 +2651,8 @@ async def _persist_external_reasoning_effort_change(
     """
     effort = _validate_external_reasoning_effort(body)
     if conv.reasoning_effort == effort:
+        # The terminal still reports what it runs when the saved value matches.
+        _note_settings_write(session_id, {"reasoning_effort": effort})
         return
     await asyncio.to_thread(
         conversation_store.update_conversation,
@@ -2602,6 +2660,7 @@ async def _persist_external_reasoning_effort_change(
         reasoning_effort=effort,
         _unset_reasoning_effort=effort is None,
     )
+    _note_settings_write(session_id, {"reasoning_effort": effort})
     event = SessionReasoningEffortEvent(
         type="session.reasoning_effort",
         conversation_id=session_id,
@@ -5620,6 +5679,13 @@ async def _wait_for_runner_client_impl(
     instant we are convinced, neither speculatively early nor a full
     timeout late.
 
+    A lookup that misses right after the connect is retried a few times
+    (:func:`_resolve_connected_runner_client`): the binding the router checks
+    can settle just after the tunnel registers, and giving up then reports a
+    healthy runner as failed. The retries share ``timeout_s`` with the connect
+    wait; no lookup starts or result is accepted after that budget expires.
+    The outcome is logged once as ``runner_client_wait``.
+
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param runner_router: The ``RunnerRouter`` instance, or ``None`` for
@@ -5628,20 +5694,85 @@ async def _wait_for_runner_client_impl(
         ``None`` in test setups without runner tunnels.
     :param runner_id: Runner id expected to connect, e.g.
         ``"runner_0123456789abcdef"``.
-    :param timeout_s: Maximum seconds to wait, e.g. ``3.0``.
+    :param timeout_s: Maximum seconds for the connect wait and the client
+        lookups together, e.g. ``3.0``.
     :param runner_exit_reports: Crash-report store consulted to abort the
         wait early when this runner is reported dead. ``None`` keeps the
         plain wait-to-timeout behavior.
     :returns: A runner HTTP client if one becomes available, otherwise
-        ``None`` (timed out, or the runner was reported dead).
+        ``None`` (timed out, the runner was reported dead, or it connected
+        but no client could be resolved before the deadline).
     """
     if runner_id is None:
         return None
     if tunnel_registry is None:
         return await _get_runner_client(session_id, runner_router)
+    started = time.monotonic()
+    session = await _await_runner_connect(
+        tunnel_registry,
+        runner_id,
+        timeout_s=timeout_s,
+        runner_exit_reports=runner_exit_reports,
+    )
+    client: httpx.AsyncClient | None = None
+    attempts = 0
+    if session is not None:
+        client, attempts = await _resolve_connected_runner_client(
+            session_id,
+            runner_router,
+            runner_id=runner_id,
+            deadline=started + timeout_s,
+            runner_exit_reports=runner_exit_reports,
+        )
+    if client is not None:
+        outcome = "resolved"
+    elif session is not None:
+        outcome = "connected_but_unresolved"
+    else:
+        outcome = "never_connected"
+    waited_s = time.monotonic() - started
+    log = _logger.warning if outcome == "connected_but_unresolved" else _logger.info
+    log(
+        "Runner %s for session %s: client wait %s after %.1fs (%d lookups)",
+        runner_id,
+        session_id,
+        outcome,
+        waited_s,
+        attempts,
+        extra=debug_event(
+            "runner_client_wait",
+            session_id=session_id,
+            runner_id=runner_id,
+            outcome=outcome,
+            attempts=attempts,
+            waited_s=round(waited_s, 3),
+            timeout_s=timeout_s,
+        ),
+    )
+    return client
+
+
+async def _await_runner_connect(
+    tunnel_registry: TunnelRegistry,
+    runner_id: str,
+    *,
+    timeout_s: float,
+    runner_exit_reports: RunnerExitReports | None,
+) -> RunnerSession | None:
+    """
+    Wait for a runner's tunnel to register, ending early on a crash report.
+
+    :param tunnel_registry: The server's ``TunnelRegistry``.
+    :param runner_id: Runner id expected to connect, e.g.
+        ``"runner_0123456789abcdef"``.
+    :param timeout_s: Maximum seconds to wait, e.g. ``30.0``.
+    :param runner_exit_reports: Crash-report store, or ``None`` to wait out
+        ``timeout_s`` regardless.
+    :returns: The connected runner's registry session, or ``None`` on
+        timeout or when the runner was reported dead.
+    """
     if runner_exit_reports is None:
-        session = await tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s)
-        return None if session is None else await _get_runner_client(session_id, runner_router)
+        return await tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s)
     # Race the event-driven connect signal against the crash-report poll;
     # whichever resolves first wins. A report means the runner is busted —
     # stop waiting and let the caller fail the turn now.
@@ -5658,8 +5789,53 @@ async def _wait_for_runner_client_impl(
             connect_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await connect_task
-    session = connect_task.result()
-    return None if session is None else await _get_runner_client(session_id, runner_router)
+    return connect_task.result()
+
+
+async def _resolve_connected_runner_client(
+    session_id: str,
+    runner_router: RunnerRouter | None,
+    *,
+    runner_id: str,
+    deadline: float,
+    runner_exit_reports: RunnerExitReports | None,
+) -> tuple[httpx.AsyncClient | None, int]:
+    """
+    Resolve the client of a runner whose tunnel has connected, retrying a miss.
+
+    Tries up to ``_RUNNER_CLIENT_RESOLVE_ATTEMPTS`` lookups,
+    ``_RUNNER_CLIENT_RESOLVE_RETRY_S`` apart. Each pause is clamped to the time
+    left before ``deadline``, and no further lookup starts once the deadline
+    has passed or the daemon has reported the runner dead.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param runner_router: The ``RunnerRouter`` instance, or ``None``.
+    :param runner_id: The runner that connected, e.g. ``"runner_0123456789abcdef"``.
+    :param deadline: ``time.monotonic()`` cutoff for starting lookups and
+        accepting their results.
+    :param runner_exit_reports: Crash-report store, or ``None``.
+    :returns: ``(client, attempts)``; ``client`` is ``None`` when every lookup
+        missed, and ``attempts`` counts the lookups made.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    attempts = 0
+    while True:
+        if time.monotonic() >= deadline or (
+            runner_exit_reports is not None and runner_exit_reports.get(runner_id) is not None
+        ):
+            return None, attempts
+        attempts += 1
+        client = await _get_runner_client(session_id, runner_router)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or (
+            runner_exit_reports is not None and runner_exit_reports.get(runner_id) is not None
+        ):
+            return None, attempts
+        if client is not None or attempts >= _facade._RUNNER_CLIENT_RESOLVE_ATTEMPTS:
+            return client, attempts
+        await asyncio.sleep(min(_facade._RUNNER_CLIENT_RESOLVE_RETRY_S, remaining))
 
 
 async def _validate_session_workspace(
@@ -6774,13 +6950,13 @@ async def _forward_session_change_to_runner_impl(
 
     Used for control inputs the runner dispatches by harness in its
     ``/v1/sessions/{id}/events`` handler — claude-native injects the
-    corresponding slash command into the tmux pane; other harnesses
-    return 204 no-op. Two kinds of caller use this:
+    corresponding slash command into the tmux pane; Codex-native applies
+    settings through its app-server. Two kinds of caller use this:
 
     * PATCH-driven harness notifications (``effort_change``,
-      ``model_change``) — claude-native injects the slash command,
-      other harnesses re-read the persisted value at the next turn
-      boundary, so they ignore the return value.
+      ``model_change``) — native callers inspect refusals and can restore
+      the previous selection; in-process harnesses re-read the persisted
+      value at the next turn boundary.
     * Explicit ``compact`` — the caller inspects the returned status
       to decide whether the runner handled the control (claude-native,
       200) or the Omnigent server must run its own in-process compaction
@@ -7241,6 +7417,8 @@ async def _resolve_skill_meta_text_via_runner(
     skill_name: str,
     arguments: str,
     runner_client: httpx.AsyncClient,
+    *,
+    legacy_name: str | None = None,
 ) -> str:
     """
     Resolve a skill's hidden ``<skill>`` meta text on the bound runner.
@@ -7258,6 +7436,10 @@ async def _resolve_skill_meta_text_via_runner(
     :param arguments: Raw argument string typed after the slash
         command, e.g. ``"review this plan"``. Empty when none.
     :param runner_client: HTTP client pointed at the bound runner.
+    :param legacy_name: The skill's frontmatter name, e.g. ``"code-review"``
+        for directory ``review``. Retried once when the runner rejects
+        ``skill_name`` but lists this name, as runners from before
+        directory-name invocation do.
     :returns: The hidden ``<skill>`` meta text for a single
         ``input_text`` block.
     :raises OmnigentError: If the skill is not exposed for the session
@@ -7301,6 +7483,10 @@ async def _resolve_skill_meta_text_via_runner(
         ) from exc
     if resp.status_code == 404:
         available = payload.get("available", [])
+        if legacy_name is not None and isinstance(available, list) and legacy_name in available:
+            return await _resolve_skill_meta_text_via_runner(
+                session_id, legacy_name, arguments, runner_client
+            )
         raise OmnigentError(
             f"Skill {skill_name!r} not found. Available skills: {available}",
             code=ErrorCode.INVALID_INPUT,
@@ -7324,6 +7510,7 @@ async def _dispatch_skill_slash_command_to_runner(
     agent: Agent,
     has_mcp_servers: bool,
     created_by: str | None,
+    legacy_skill_names: Mapping[str, str] | None = None,
 ) -> str:
     """
     Persist a skill slash command and forward hidden skill context.
@@ -7357,6 +7544,9 @@ async def _dispatch_skill_slash_command_to_runner(
         servers; forwarded unchanged to the runner event.
     :param created_by: Authenticated actor id, e.g.
         ``"alice@example.com"``, or ``None`` in single-user mode.
+    :param legacy_skill_names: Frontmatter names of the agent's bundled
+        skills keyed by command, e.g. ``{"review": "code-review"}``, for
+        runners that predate directory-name invocation.
     :returns: The persisted visible ``slash_command`` item id.
     :raises OmnigentError: If the skill is not exposed for the
         session, or the runner is unreachable while resolving it.
@@ -7369,6 +7559,7 @@ async def _dispatch_skill_slash_command_to_runner(
         skill_name,
         arguments,
         runner_client,
+        legacy_name=(legacy_skill_names or {}).get(skill_name),
     )
 
     response_id = f"turn_{uuid.uuid4().hex}"

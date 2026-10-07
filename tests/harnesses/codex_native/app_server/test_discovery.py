@@ -736,8 +736,10 @@ def test_codex_catalog_fingerprint_tracks_configured_catalog(
 
 
 @pytest.mark.parametrize("code", [-32600, -32602])
+@pytest.mark.parametrize("include_hidden", [False, True])
 async def test_old_codex_model_list_retries_without_include_hidden_and_paginates(
     code: int,
+    include_hidden: bool,
 ) -> None:
     from omnigent.harnesses.codex_native import app_server
 
@@ -750,9 +752,12 @@ async def test_old_codex_model_list_retries_without_include_hidden_and_paginates
         {"result": {"data": [second], "nextCursor": None}},
     ]
 
-    assert await app_server.list_codex_model_options(client) == [first, second]
+    assert await app_server.list_codex_model_options(client, include_hidden=include_hidden) == [
+        first,
+        second,
+    ]
     assert [call.args for call in client.request.await_args_list] == [
-        ("model/list", {"includeHidden": False}),
+        ("model/list", {"includeHidden": include_hidden}),
         ("model/list", {}),
         ("model/list", {"cursor": "page2"}),
     ]

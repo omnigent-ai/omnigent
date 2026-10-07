@@ -23,6 +23,7 @@ from fastapi.routing import APIRoute
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import (
     add_audit_attrs,
@@ -49,7 +50,10 @@ from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
-from omnigent.runner.launch_failure import classify_native_turn_error
+from omnigent.runner.launch_failure import (
+    classify_native_turn_error,
+    diagnose_client_update_required,
+)
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
@@ -230,6 +234,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
+    _native_pane_harness,
     _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
@@ -484,6 +489,43 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
             "session runner re-tunnelled to another replica; retry",
             code=ErrorCode.WRONG_REPLICA,
         )
+
+
+async def _session_host_offline(conv: Conversation, app_state: Any) -> bool:
+    """
+    Report whether a session's user-run host has no live tunnel.
+
+    Called after a send found no runner to use and the host never took a
+    launch. A host that is not connected cannot start a runner, so the failure
+    is an offline host rather than a runner that failed to start. Managed
+    sandboxes are excluded (the server wakes those itself and the user cannot
+    start them), as is a host whose row still reads live, which can only be
+    connected to another replica.
+
+    :param conv: The session row whose send failed.
+    :param app_state: ``request.app.state`` — supplies the host registry and
+        the host store.
+    :returns: ``True`` when the session is host-bound and its user-run host is
+        absent from this server and not live elsewhere.
+    """
+    if conv.host_id is None:
+        return False
+    host_registry = getattr(app_state, "host_registry", None)
+    if host_registry is None or host_registry.get(conv.host_id) is not None:
+        return False
+    host_store = getattr(app_state, "host_store", None)
+    if host_store is None:
+        return True
+    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+    return host is not None and host.sandbox_provider is None and not host_is_live(host)
+
+
+def _host_offline_message() -> str:
+    """Return the failure text for a send that found its session's host offline."""
+    return (
+        "The host for this session is offline. "
+        f"Start it with `{cli_invocation()} host` (or reconnect it) and send the message again."
+    )
 
 
 async def _recover_retry_session(
@@ -1837,9 +1879,19 @@ def register_events_routes(
                     error_code = "codex_turn_error"
                 else:
                     error_code = "native_turn_error"
+                classified_code = classify_native_turn_error(error_code, output)
+                # The old-CLI refusal carries the versions, so the card can name the fix.
+                diagnosis = (
+                    diagnose_client_update_required(output)
+                    if classified_code == "client_update_required"
+                    else None
+                )
                 status_error = ErrorDetail(
-                    code=classify_native_turn_error(error_code, output),
+                    code=classified_code,
                     message=output.strip(),
+                    title=diagnosis.title if diagnosis else None,
+                    cause=diagnosis.cause if diagnosis else None,
+                    remediation=diagnosis.remediation if diagnosis else None,
                 )
             if status_error is not None:
                 failed_agent_name = await asyncio.to_thread(
@@ -1870,7 +1922,7 @@ def register_events_routes(
                 and conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
             ):
                 harness = await asyncio.to_thread(
-                    _resolve_harness,
+                    _native_pane_harness,
                     conv,
                     agent_store=agent_store,
                     agent_cache=agent_cache,
@@ -2258,6 +2310,7 @@ def register_events_routes(
         # the raw host text the 503 below deliberately owner-scopes.
         relaunch_refusal_reason: str | None = None
         relaunch_refusal_visible = False
+        host_wait_started = time.monotonic()
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             _grace_host_reg = cast(
@@ -2471,7 +2524,8 @@ def register_events_routes(
             # it survives reload and the banner explains why, becoming the
             # AP-server-as-writer failed turn (same shape as a definitive
             # ensure-probe failure). The cause, when known, is the daemon's
-            # exit report keyed by this session's runner_id; otherwise a
+            # exit report keyed by this session's runner_id; failing that, a
+            # host that is offline (so no runner could start); otherwise a
             # generic unavailable message. This is safe precisely because
             # the harness will never see it (no desync — there is no live
             # harness). Other event types and non-native sessions still
@@ -2483,17 +2537,41 @@ def register_events_routes(
                     if runner_exit_reports is not None and conv.runner_id is not None
                     else None
                 )
+                # A launch the host acknowledged or refused reached the host,
+                # so only a host still missing from this server reads as offline.
+                host_offline = (
+                    not exit_cause
+                    and not relaunched_launch_acknowledged
+                    and not relaunched_launch_refused
+                    and await _session_host_offline(conv, request.app.state)
+                )
+                if exit_cause:
+                    failure_message = exit_cause
+                elif host_offline:
+                    failure_message = _host_offline_message()
+                    _logger.warning(
+                        "Host %s is offline; failing the send for session %s",
+                        conv.host_id,
+                        session_id,
+                        extra=debug_event(
+                            "runner_client_wait",
+                            session_id=session_id,
+                            runner_id=relaunched_runner_id or conv.runner_id,
+                            host_id=conv.host_id,
+                            outcome="host_offline",
+                            attempts=0,
+                            waited_s=round(time.monotonic() - host_wait_started, 3),
+                        ),
+                    )
+                else:
+                    failure_message = (
+                        "The runner for this session is not available — "
+                        "it may have failed to start. See the host logs."
+                    )
                 offline_error = ErrorData(
                     source="execution",
                     code="runner_failed_to_start",
-                    message=(
-                        exit_cause
-                        if exit_cause
-                        else (
-                            "The runner for this session is not available — "
-                            "it may have failed to start. See the host logs."
-                        )
-                    ),
+                    message=failure_message,
                 )
                 item_id = await _persist_native_terminal_failure(
                     session_id,
@@ -2673,6 +2751,7 @@ def register_events_routes(
         # asyncio.to_thread wrapper covers the rare cold-cache path
         # where the bundle is extracted from disk for the first time.
         _has_mcp_servers = False
+        _legacy_skill_names: dict[str, str] = {}
         if _agent is not None and agent_cache is not None and _agent.bundle_location:
             try:
                 _loaded_agent = await asyncio.to_thread(
@@ -2681,6 +2760,19 @@ def register_events_routes(
                     _agent.bundle_location,
                 )
                 _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
+                # A declared sub-agent session resolves skills from its own child spec.
+                _skill_spec = _loaded_agent.spec
+                if conv.sub_agent_name:
+                    from omnigent.runtime.workflow import _find_spec_by_name
+
+                    _skill_spec = (
+                        _find_spec_by_name(_skill_spec, conv.sub_agent_name) or _skill_spec
+                    )
+                _legacy_skill_names = {
+                    skill.name: skill.display_name
+                    for skill in _skill_spec.skills
+                    if skill.display_name is not None
+                }
             except Exception:
                 _logger.warning(
                     "Failed to load agent spec for MCP hint for session=%s",
@@ -2725,6 +2817,7 @@ def register_events_routes(
                 agent=_agent,
                 has_mcp_servers=_has_mcp_servers,
                 created_by=created_by,
+                legacy_skill_names=_legacy_skill_names,
             )
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)

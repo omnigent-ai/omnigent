@@ -76,7 +76,14 @@ export function WireframeViewer({
   const [picked, setPicked] = useState<string | null>(null);
   const current = screens.some((s) => s.id === picked) ? picked : (screens[0]?.id ?? null);
   const [scale, setScale] = useState(0);
-  const { nonce, iframeRef, addCommentPortal } = useHtmlCommentBridge({
+  const {
+    nonce,
+    runtimeUrl,
+    iframeRef,
+    setIframeRef,
+    onLoad: onBridgeLoad,
+    addCommentPortal,
+  } = useHtmlCommentBridge({
     conversationId: conversationId ?? "",
     content,
     docKey: preparedDoc,
@@ -86,8 +93,8 @@ export function WireframeViewer({
     scale,
   });
   const srcDoc = useMemo(
-    () => (preparedDoc ? appendCommentBridge(preparedDoc, nonce) : ""),
-    [preparedDoc, nonce],
+    () => (preparedDoc ? appendCommentBridge(preparedDoc, nonce, runtimeUrl) : ""),
+    [preparedDoc, nonce, runtimeUrl],
   );
   const { isFullscreen, supported: fullscreenSupported, toggle } = useFullscreen(rootRef);
 
@@ -157,11 +164,14 @@ export function WireframeViewer({
           {/* A new iframe per document loads without adding a history entry. */}
           <iframe
             key={srcDoc}
-            ref={iframeRef}
+            ref={setIframeRef}
             srcDoc={srcDoc}
             sandbox={HTML_PREVIEW_SANDBOX}
             title="Wireframe"
-            onLoad={() => current && post({ type: "goto", id: current })}
+            onLoad={() => {
+              onBridgeLoad();
+              if (current) post({ type: "goto", id: current });
+            }}
             className="origin-top-left border-0 bg-white shadow-sm"
             style={{ width: device.width, height: device.height, transform: `scale(${scale})` }}
           />

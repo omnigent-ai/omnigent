@@ -9,6 +9,8 @@ import { getSessionSlim } from "@/lib/sessionsApi";
 import { readFixtureFile } from "@/test/designSystemFixture";
 import { DESIGN_KIT_DIR, HTML_PREVIEW_SANDBOX, type KitFile } from "./codeViewerHelpers";
 import { DESIGN_KIT_TIMEOUT_MS } from "./designViewer";
+import { EmbeddedProvider } from "@/lib/embedded";
+import { BRIDGE_MSG, BRIDGE_SOURCE, HTML_COMMENT_BRIDGE_RUNTIME } from "./htmlCommentBridge";
 import { WireframeViewer, fitScale } from "./WireframeViewer";
 import {
   WIREFRAME_DEVICES,
@@ -439,6 +441,36 @@ describe("WireframeViewer comments", () => {
     expect(srcdoc()).toContain(BRIDGE_NONCE);
     // prepareWireframeDoc alone (export-equivalent injection) has no bridge.
     expect(prepareWireframeDoc(body(SCREENS))).not.toContain("omni-html-comment");
+  });
+
+  it("loads the bridge runtime externally in embed mode (no inline script under CSP)", () => {
+    render(
+      <EmbeddedProvider>
+        <WireframeViewer content={body(SCREENS)} />
+      </EmbeddedProvider>,
+    );
+    expect(srcdoc()).toMatch(
+      /<script src="[^"]*htmlCommentBridgeRuntime\.js[^"]*" data-omni-nonce=/,
+    );
+    expect(srcdoc()).not.toContain(HTML_COMMENT_BRIDGE_RUNTIME);
+  });
+
+  it("inlines the bridge runtime outside embed mode", () => {
+    render(<WireframeViewer content={body(SCREENS)} />);
+    expect(srcdoc()).toContain(HTML_COMMENT_BRIDGE_RUNTIME);
+    expect(srcdoc()).not.toContain("htmlCommentBridgeRuntime.js");
+  });
+
+  it("opens the bridge channel when the wireframe iframe loads", () => {
+    render(<WireframeViewer content={body(SCREENS)} />);
+    const post = vi.fn();
+    frame().contentWindow!.postMessage = post;
+    act(() => frame().dispatchEvent(new Event("load")));
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ source: BRIDGE_SOURCE, type: BRIDGE_MSG.init }),
+      "*",
+      expect.any(Array),
+    );
   });
 
   it("navigates to the screen that contains an activated comment", () => {

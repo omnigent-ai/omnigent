@@ -4209,6 +4209,29 @@ def _claude_hook_commands(spec: Any) -> list[str]:
     ]
 
 
+async def test_auto_create_claude_terminal_loads_workspace_agents_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    skill = workspace / ".agents" / "skills" / "portable" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: portable\ndescription: Portable skill\n---\nUse this skill.\n")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f604",
+        routed=False,
+    )
+
+    overlay = Path(spec.args[spec.args.index("--add-dir") + 1])
+    exposed = list((overlay / ".claude" / "skills").glob("*/SKILL.md"))
+    assert [path.parent.name for path in exposed] == ["portable"]
+    assert [path.read_text() for path in exposed] == [skill.read_text()]
+
+
 async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

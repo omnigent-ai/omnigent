@@ -2452,6 +2452,88 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert session_resp.json()["title"] == "/grill-me review this rollout"
 
 
+@pytest.mark.parametrize("in_sub_agent", [False, True])
+@pytest.mark.parametrize(
+    ("available", "status", "expected_names"),
+    [(["code-review"], 202, ["review", "code-review"]), (["other"], 400, ["review"])],
+)
+async def test_skill_slash_command_retries_frontmatter_name_on_older_runner(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    available: list[str],
+    status: int,
+    expected_names: list[str],
+    in_sub_agent: bool,
+) -> None:
+    """
+    A runner from before directory-name invocation knows a bundled skill by
+    its frontmatter name, so the server retries with that name once the
+    runner rejects the directory name and lists the frontmatter name. A
+    declared sub-agent session takes the name from its own skills.
+    """
+    resolved: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Emulate an older runner that resolves only ``code-review``.
+
+        :param request: Request sent to the fake runner.
+        :returns: Meta text for ``code-review``, a 404 for other names, or
+            an accepted response for ``/events``.
+        """
+        if request.method == "POST" and request.url.path.endswith("/skills/resolve"):
+            name = json.loads(request.content)["name"]
+            resolved.append(name)
+            if name != "code-review":
+                return httpx.Response(
+                    404, json={"error": "skill_not_found", "available": available}
+                )
+            skill = SkillSpec(name=name, description="Review changes.", content="Look hard.")
+            return httpx.Response(200, json={"meta_text": format_skill_meta_text(skill, "")})
+        return httpx.Response(202, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        skills = [
+            {
+                "dir": "review",
+                "name": "code-review",
+                "description": "Review changes.",
+                "content": "Look hard.",
+            }
+        ]
+        agent = await create_test_agent(
+            client,
+            name="skill-agent",
+            skills=None if in_sub_agent else skills,
+            sub_agents=[{"name": "worker", "skills": skills}] if in_sub_agent else None,
+        )
+        session = await _create_session(client, agent["id"])
+        if in_sub_agent:
+            child = await client.post(
+                "/v1/sessions",
+                json={
+                    "agent_id": agent["id"],
+                    "parent_session_id": session["id"],
+                    "sub_agent_name": "worker",
+                    "title": "worker:review",
+                },
+            )
+            assert child.status_code == 201, child.text
+            session = child.json()
+
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "slash_command", "data": {"kind": "skill", "name": "review"}},
+        )
+
+    assert resp.status_code == status, resp.text
+    assert resolved == expected_names
+
+
 async def test_skill_slash_command_keeps_existing_title(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -5525,6 +5607,96 @@ async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     assert snapshot_resp.json()["last_task_error"] == {
         **expected,
         "agent_name": "claude-native-ui",
+    }
+
+
+_OLD_CLI_DETAIL = (
+    'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+    "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
+    'desktop app, then try again."}'
+)
+_OLD_CLI_CARD = {
+    "title": "Claude Code needs an update",
+    "cause": (
+        "Claude Code 2.1.217 on the host doesn't support this model; "
+        "version 2.1.280 or newer is required."
+    ),
+    "remediation": "Run `claude update` on the host, then start a new session.",
+}
+
+
+@pytest.mark.parametrize("wire_output", [False, True])
+@pytest.mark.parametrize(
+    ("detail", "expected_code", "card"),
+    [
+        (
+            'API Error: 499 {"error_code":"CANCELLED","message":""}',
+            "transient_upstream_error",
+            {},
+        ),
+        (_OLD_CLI_DETAIL, "client_update_required", _OLD_CLI_CARD),
+    ],
+)
+async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_after_reload(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_output: bool,
+    detail: str,
+    expected_code: str,
+    card: dict[str, str],
+) -> None:
+    """A gateway 499 is retryable and an old-CLI refusal names its fix, live and on reload."""
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    response_id = "resp_native_coded_failure"
+    item_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": response_id,
+                "source_id": "src_native_coded_failure",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": detail}],
+                },
+            },
+        },
+    )
+    assert item_resp.status_code == 202, item_resp.text
+
+    data: dict[str, Any] = {"status": "failed", "response_id": response_id}
+    if wire_output:
+        data["output"] = detail
+    status_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    assert status_resp.status_code == 202, status_resp.text
+    failed_events = [event for event in published if event.get("status") == "failed"]
+    assert len(failed_events) == 1
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == expected_code
+    assert error["message"] == detail
+    for field in ("title", "cause", "remediation"):
+        assert error[field] == card.get(field)
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    assert snapshot_resp.json()["last_task_error"] == {
+        "code": expected_code,
+        "message": detail,
+        "agent_name": "claude-native-ui",
+        **card,
     }
 
 

@@ -34,7 +34,7 @@ export function HtmlCommentViewer({
   activeSelection,
   onSetActiveSelection,
 }: HtmlCommentViewerProps) {
-  const { nonce, iframeRef, addCommentPortal } = useHtmlCommentBridge({
+  const { nonce, runtimeUrl, setIframeRef, onLoad, addCommentPortal } = useHtmlCommentBridge({
     conversationId,
     content,
     docKey: content,
@@ -43,14 +43,19 @@ export function HtmlCommentViewer({
     onSetActiveSelection,
   });
 
-  const srcDoc = useMemo(() => injectCommentBridge(content, nonce), [content, nonce]);
+  const srcDoc = useMemo(
+    () => injectCommentBridge(content, nonce, runtimeUrl),
+    [content, nonce, runtimeUrl],
+  );
 
   return (
     <div className="flex h-full flex-col">
       {truncated && <TruncatedBanner />}
       <div className="min-h-0 flex-1">
         <iframe
-          ref={iframeRef}
+          key={nonce}
+          ref={setIframeRef}
+          onLoad={onLoad}
           srcDoc={srcDoc}
           sandbox={HTML_PREVIEW_SANDBOX}
           title="HTML preview"

@@ -3,10 +3,19 @@
 // SlidesViewer, and WireframeViewer so all three keep the same comment UX.
 
 import { createPortal } from "react-dom";
-import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
+import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { randomUUID } from "@/lib/randomUUID";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -27,6 +36,13 @@ export interface FloatingAnchor {
   end_index: number;
   anchor_content: string;
 }
+
+// Force a file asset: a data: URL would be blocked by the embed's script-src CSP.
+const HTML_COMMENT_BRIDGE_RUNTIME_URL = new URL(
+  "./htmlCommentBridgeRuntime.js?no-inline",
+  import.meta.url,
+).href;
+const BRIDGE_READY_TIMEOUT_MS = 5_000;
 
 function genNonce(): string {
   return randomUUID();
@@ -70,7 +86,13 @@ export interface UseHtmlCommentBridgeArgs {
 
 export interface UseHtmlCommentBridgeResult {
   nonce: string;
+  /** External bridge runtime for embeds whose CSP blocks inline scripts; else undefined. */
+  runtimeUrl: string | undefined;
+  /** Current iframe for reads; attach `setIframeRef` as the iframe's ref. */
   iframeRef: RefObject<HTMLIFrameElement | null>;
+  setIframeRef: (iframe: HTMLIFrameElement | null) => void;
+  /** Must run from the iframe's onLoad to open the bridge channel. */
+  onLoad: () => void;
   /** Portalled floating Add-comment control (or null). */
   addCommentPortal: ReactNode;
 }
@@ -89,12 +111,15 @@ export function useHtmlCommentBridge({
   scale = 1,
 }: UseHtmlCommentBridgeArgs): UseHtmlCommentBridgeResult {
   const canEdit = useCanEdit(conversationId);
+  const runtimeUrl = useIsEmbedded() ? HTML_COMMENT_BRIDGE_RUNTIME_URL : undefined;
   const nonce = useMemo(() => {
     void docKey;
     return genNonce();
   }, [docKey]);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const portRef = useRef<MessagePort | null>(null);
+  const channelRef = useRef<MessageChannel | null>(null);
+  const readyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [floating, setFloating] = useState<FloatingAnchor | null>(null);
   const scaleRef = useRef(scale);
   scaleRef.current = scale;
@@ -108,98 +133,115 @@ export function useHtmlCommentBridge({
   const activeSelectionRef = useRef(activeSelection);
   activeSelectionRef.current = activeSelection;
 
-  useEffect(() => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-    let channel: MessageChannel | null = null;
+  const clearReadyTimer = useCallback(() => {
+    if (readyTimerRef.current !== null) clearTimeout(readyTimerRef.current);
+    readyTimerRef.current = null;
+  }, []);
 
-    const handleInbound = (raw: unknown) => {
-      const msg = parseBridgeMessage(raw, nonce);
-      if (!msg) return;
-      if (msg.type === BRIDGE_MSG.ready) {
-        postState();
-      } else if (msg.type === BRIDGE_MSG.selection) {
-        const offsets = findAnchorInSource(contentRef.current, msg.text, msg.occ);
-        const existing =
-          offsets &&
-          commentsRef.current.find(
-            (c) =>
-              c.status === "draft" &&
-              c.start_index === offsets.start_index &&
-              c.end_index === offsets.end_index,
-          );
-        if (existing) {
-          onSetActiveSelectionRef.current({
-            start_index: existing.start_index,
-            end_index: existing.end_index,
-            anchor_content: existing.anchor_content ?? "",
-            comment_id: existing.id,
-          });
-          setFloating(null);
-          return;
-        }
-        const rect = iframe.getBoundingClientRect();
-        const pos = mapBridgeRectToViewport(rect, msg.rect, scaleRef.current);
-        setFloating({
-          x: pos.x,
-          y: pos.y,
-          start_index: offsets?.start_index ?? 0,
-          end_index: offsets?.end_index ?? 0,
-          anchor_content: msg.text,
-        });
-      } else if (msg.type === BRIDGE_MSG.commentClick) {
-        const c = commentsRef.current.find((x) => x.id === msg.id);
-        if (c) {
-          onSetActiveSelectionRef.current({
-            start_index: c.start_index,
-            end_index: c.end_index,
-            anchor_content: c.anchor_content ?? "",
-            comment_id: c.id,
-          });
-        }
-        setFloating(null);
-      } else if (msg.type === BRIDGE_MSG.selectionCleared) {
-        onSetActiveSelectionRef.current(null);
-        setFloating(null);
+  // Callback ref: a remounted iframe (keyed per document) drops the old channel.
+  const setIframeRef = useCallback(
+    (iframe: HTMLIFrameElement | null) => {
+      if (iframeRef.current !== iframe) {
+        clearReadyTimer();
+        channelRef.current?.port1.close();
+        channelRef.current = null;
+        portRef.current = null;
       }
-    };
+      iframeRef.current = iframe;
+    },
+    [clearReadyTimer],
+  );
 
-    const postState = () => {
-      const port = portRef.current;
-      if (!port) return;
-      port.postMessage({
-        source: BRIDGE_SOURCE,
-        nonce,
-        type: BRIDGE_MSG.setComments,
-        comments: commentsRef.current.map((c) => commentPayload(contentRef.current, c)),
+  const postState = () => {
+    const port = portRef.current;
+    if (!port) return;
+    port.postMessage({
+      source: BRIDGE_SOURCE,
+      nonce,
+      type: BRIDGE_MSG.setComments,
+      comments: commentsRef.current.map((c) => commentPayload(contentRef.current, c)),
+    });
+    port.postMessage({
+      source: BRIDGE_SOURCE,
+      nonce,
+      type: BRIDGE_MSG.setActive,
+      active: activePayload(contentRef.current, activeSelectionRef.current),
+    });
+  };
+
+  const handleInbound = (raw: unknown) => {
+    const msg = parseBridgeMessage(raw, nonce);
+    if (!msg) return;
+    if (msg.type === BRIDGE_MSG.ready) {
+      clearReadyTimer();
+      postState();
+    } else if (msg.type === BRIDGE_MSG.selection) {
+      const offsets = findAnchorInSource(contentRef.current, msg.text, msg.occ);
+      const existing =
+        offsets &&
+        commentsRef.current.find(
+          (c) =>
+            c.status === "draft" &&
+            c.start_index === offsets.start_index &&
+            c.end_index === offsets.end_index,
+        );
+      if (existing) {
+        onSetActiveSelectionRef.current({
+          start_index: existing.start_index,
+          end_index: existing.end_index,
+          anchor_content: existing.anchor_content ?? "",
+          comment_id: existing.id,
+        });
+        setFloating(null);
+        return;
+      }
+      const iframe = iframeRef.current;
+      if (!iframe) return;
+      const rect = iframe.getBoundingClientRect();
+      const pos = mapBridgeRectToViewport(rect, msg.rect, scaleRef.current);
+      setFloating({
+        x: pos.x,
+        y: pos.y,
+        start_index: offsets?.start_index ?? 0,
+        end_index: offsets?.end_index ?? 0,
+        anchor_content: msg.text,
       });
-      port.postMessage({
-        source: BRIDGE_SOURCE,
-        nonce,
-        type: BRIDGE_MSG.setActive,
-        active: activePayload(contentRef.current, activeSelectionRef.current),
-      });
-    };
+    } else if (msg.type === BRIDGE_MSG.commentClick) {
+      const c = commentsRef.current.find((x) => x.id === msg.id);
+      if (c) {
+        onSetActiveSelectionRef.current({
+          start_index: c.start_index,
+          end_index: c.end_index,
+          anchor_content: c.anchor_content ?? "",
+          comment_id: c.id,
+        });
+      }
+      setFloating(null);
+    } else if (msg.type === BRIDGE_MSG.selectionCleared) {
+      onSetActiveSelectionRef.current(null);
+      setFloating(null);
+    }
+  };
 
-    const onLoad = () => {
-      const win = iframe.contentWindow;
-      if (!win) return;
-      channel?.port1.close();
-      channel = new MessageChannel();
-      channel.port1.onmessage = (ev) => handleInbound(ev.data);
-      portRef.current = channel.port1;
-      win.postMessage({ source: BRIDGE_SOURCE, nonce, type: BRIDGE_MSG.init }, "*", [
-        channel.port2,
-      ]);
-    };
-
-    iframe.addEventListener("load", onLoad);
-    return () => {
-      iframe.removeEventListener("load", onLoad);
-      channel?.port1.close();
-      portRef.current = null;
-    };
-  }, [nonce]);
+  // Parent-initiated handshake on the iframe's load event avoids a ready/listen
+  // race and makes the timeout measure the bridge startup, not document parsing.
+  const onLoad = () => {
+    const win = iframeRef.current?.contentWindow;
+    if (!win) return;
+    channelRef.current?.port1.close();
+    const channel = new MessageChannel();
+    channelRef.current = channel;
+    // The port pins this closure, so mutable values in handleInbound must come from refs.
+    channel.port1.onmessage = (ev) => handleInbound(ev.data);
+    portRef.current = channel.port1;
+    // targetOrigin "*" is required: the sandboxed frame has an opaque ("null")
+    // origin. The transferred port + the nonce are the trust mechanism.
+    win.postMessage({ source: BRIDGE_SOURCE, nonce, type: BRIDGE_MSG.init }, "*", [channel.port2]);
+    clearReadyTimer();
+    readyTimerRef.current = setTimeout(() => {
+      console.warn("HTML comment bridge did not become ready; comments are unavailable.");
+    }, BRIDGE_READY_TIMEOUT_MS);
+  };
 
   useEffect(() => {
     portRef.current?.postMessage({
@@ -251,5 +293,5 @@ export function useHtmlCommentBridge({
         )
       : null;
 
-  return { nonce, iframeRef, addCommentPortal };
+  return { nonce, runtimeUrl, iframeRef, setIframeRef, onLoad, addCommentPortal };
 }

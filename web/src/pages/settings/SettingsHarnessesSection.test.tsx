@@ -137,7 +137,7 @@ vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
 let harnessInstall = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
-    features: { harness_install: harnessInstall, harness_settings_ui: true },
+    features: { harness_install: harnessInstall },
   }),
 }));
 
@@ -335,7 +335,7 @@ describe("Harness details", () => {
 
     // The credential lives under the Settings tab.
     selectTab("Settings");
-    expect(screen.getByText("AI Gateway")).toBeTruthy();
+    expect(screen.getByText("Unity Gateway")).toBeTruthy();
     expect(screen.getByText("/opt/bin/claude")).toBeTruthy();
     for (const arg of STARTUP.args ?? []) expect(screen.getAllByText(arg)).toHaveLength(1);
     expect(screen.getByText(/Sessions and workspaces may override/)).toBeTruthy();
@@ -716,6 +716,10 @@ it("probes only the expanded server, showing its tools, count and status", () =>
   expect(mcpLookups).toContainEqual([ONLINE.host_id, "claude", "linear", "toolkit", true]);
   expect(mcpLookups.some((lookup) => lookup[2] === "github" && lookup[4])).toBe(false);
   expect(screen.getByText("read_docs")).toBeTruthy();
+  const toolDetails = screen.getByText("Read documentation").closest("details")!;
+  expect(toolDetails.open).toBe(false);
+  fireEvent.click(screen.getByText("read_docs"));
+  expect(toolDetails.open).toBe(true);
   expect(screen.getByText("· 1 tool")).toBeTruthy();
   expect(screen.getByRole("status").textContent).toBe("Connected");
   expect(screen.getByRole("status").firstElementChild).toHaveClass("bg-success");

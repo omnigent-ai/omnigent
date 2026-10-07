@@ -156,7 +156,14 @@ export function SlidesViewer({
     [deckContent, brandingReady, kitStyle, systemStyle],
   );
   const [scale, setScale] = useState(0);
-  const { nonce, iframeRef, addCommentPortal } = useHtmlCommentBridge({
+  const {
+    nonce,
+    runtimeUrl,
+    iframeRef,
+    setIframeRef,
+    onLoad: onBridgeLoad,
+    addCommentPortal,
+  } = useHtmlCommentBridge({
     conversationId: conversationId ?? "",
     content,
     docKey: preparedDoc,
@@ -167,8 +174,8 @@ export function SlidesViewer({
   });
   // Bridge is preview-only; Download HTML keeps prepareSlidesExport without it.
   const srcDoc = useMemo(
-    () => (preparedDoc ? appendCommentBridge(preparedDoc, nonce) : ""),
-    [preparedDoc, nonce],
+    () => (preparedDoc ? appendCommentBridge(preparedDoc, nonce, runtimeUrl) : ""),
+    [preparedDoc, nonce, runtimeUrl],
   );
   // The iframe's runtime count wins once it reports for the current document.
   const [runtime, setRuntime] = useState<{ srcDoc: string; total: number } | null>(null);
@@ -331,11 +338,14 @@ export function SlidesViewer({
               iframe per document loads without one. */}
           <iframe
             key={srcDoc}
-            ref={iframeRef}
+            ref={setIframeRef}
             srcDoc={srcDoc}
             sandbox={HTML_PREVIEW_SANDBOX}
             title="Slide deck"
-            onLoad={() => post({ type: "goto", index: current })}
+            onLoad={() => {
+              onBridgeLoad();
+              post({ type: "goto", index: current });
+            }}
             className="origin-top-left border-0 bg-white"
             style={{ width: STAGE_W, height: STAGE_H, transform: `scale(${scale})` }}
           />
