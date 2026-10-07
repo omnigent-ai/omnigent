@@ -39,7 +39,9 @@ function slot(element: Element | undefined, inherited: number | null): number | 
 }
 
 function xml(bytes: Uint8Array): Document {
-  const document = new DOMParser().parseFromString(strFromU8(bytes), "application/xml");
+  const text = strFromU8(bytes);
+  if (/<!DOCTYPE/i.test(text)) throw new Error("Unsupported XML doctype");
+  const document = new DOMParser().parseFromString(text, "application/xml");
   if (document.getElementsByTagName("parsererror").length) throw new Error("Invalid XML");
   return document;
 }
@@ -167,7 +169,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     resources.append(bases);
     outputModel.append(resources);
     const colors: string[] = [];
-    const memo = new Map<string, string>();
+    const memo = new Map<string, { id: string; height: number }>();
     const sourceSizes = new Map<string, number>();
     let emittedBytes = 0;
     const reserve = (source: Element, key: string) => {
@@ -189,7 +191,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       assigned: Element | undefined,
       enabled: boolean,
       depth: number,
-    ): string => {
+    ): { id: string; height: number } => {
       if (depth > MAX_COMPONENT_DEPTH) throw new Error("3MF component depth limit");
       const sourceKey = JSON.stringify([path, id]);
       const source = objects.get(sourceKey);
@@ -204,35 +206,39 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
           : [sourceKey, effectiveSlot, recolor, Boolean(assigned), depth === 0],
       );
       const previous = memo.get(key);
-      if (previous) return previous;
+      if (previous) {
+        if (depth + previous.height > MAX_COMPONENT_DEPTH)
+          throw new Error("3MF component depth limit");
+        return previous;
+      }
       if (memo.size >= MAX_OBJECTS) throw new Error("3MF emitted object limit");
       reserve(source, sourceKey);
       visiting.add(sourceKey);
       const object = output.importNode(source, true);
+      let height = 0;
       for (const components of children(object, "components")) {
         for (const child of children(components, "component")) {
           const childId = child.getAttribute("objectid") ?? "";
           const targetPath = child.getAttributeNS(PRODUCTION, "path");
-          child.setAttribute(
-            "objectid",
-            clone(
-              targetPath ? zipPath(targetPath, path) : path,
-              childId,
-              parts,
-              effectiveSlot,
-              depth === 0 ? (parts.get(childId) ?? assigned) : assigned,
-              recolor,
-              depth + 1,
-            ),
+          const cloned = clone(
+            targetPath ? zipPath(targetPath, path) : path,
+            childId,
+            parts,
+            effectiveSlot,
+            depth === 0 ? (parts.get(childId) ?? assigned) : assigned,
+            recolor,
+            depth + 1,
           );
+          height = Math.max(height, cloned.height + 1);
+          child.setAttribute("objectid", cloned.id);
           child.removeAttributeNS(PRODUCTION, "path");
         }
       }
       visiting.delete(sourceKey);
       if (memo.size >= MAX_OBJECTS) throw new Error("3MF emitted object limit");
-      const newId = String(nextId++);
-      memo.set(key, newId);
-      object.setAttribute("id", newId);
+      const result = { id: String(nextId++), height };
+      memo.set(key, result);
+      object.setAttribute("id", result.id);
       if (effectiveColor) {
         let index = colors.indexOf(effectiveColor);
         if (index < 0) {
@@ -247,7 +253,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         object.setAttribute("pindex", String(index));
       }
       resources.append(object);
-      return newId;
+      return result;
     };
     const sourceBuild = children(root.documentElement, "build")[0];
     if (!sourceBuild) return buffer;
@@ -273,7 +279,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
           children(source, "mesh").length ? parts.get(id) : undefined,
           true,
           0,
-        ),
+        ).id,
       );
       item.removeAttributeNS(PRODUCTION, "path");
     }
