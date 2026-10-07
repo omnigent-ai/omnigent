@@ -22,8 +22,8 @@ the header menu), and each place is a separate entry point.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
-  closing one stops only that chat. A stopped generic hosted parent can start a
-  new side chat on a fresh runner while its host remains online.
+  closing one stops only that chat. Starting one from a stopped generic hosted
+  parent relaunches the parent first, then shares its replacement runner.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
@@ -98,9 +98,10 @@ a separate action that leaves the session connected.
 parent composer, or choose **Start a new side chat** from the composer's add
 tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
 side chats open in a drawer. A generic hosted parent can start a new side chat
-after stopping. Close a side chat with its tab's close button; the parent and
-sibling chats keep running. A chat-only side chat can also send messages from
-its direct `/c/<child_id>` URL without choosing a workspace.
+after stopping; this relaunches the parent and both use one runner. Close a side
+chat with its tab's close button; the parent and sibling chats keep running. A
+chat-only side chat can also send messages from its direct `/c/<child_id>` URL
+without choosing a workspace.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -212,15 +213,15 @@ plain `uv run pytest`, which starts a private server for the test.
   drives both desktop sidebar menus and the mobile long-press menu with a real
   host. Side chats share their parent's runner. Closing one leaves its parent
   and sibling working; stopping the parent stops that shared runner and keeps
-  all histories. An unrelated session stays online, and a new side chat launches
-  a fresh runner while its parent remains stopped.
+  all histories. An unrelated session stays online, and a new side chat
+  relaunches its parent before both share the replacement runner.
   Only model replies are scripted.
 - **`side-chat-lifecycle`, creation entry points:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py` covers `/side`, the Workspace
   menu, the composer add tray, selected text's Ask in side chat action, and the
-  mobile side-chat drawer. Its stale-branch scenarios simulate an offline parent
-  runner to exercise host-launch fallback; the hosted lifecycle test above
-  proves live-parent reuse with actual runner processes.
+  mobile side-chat drawer. Its stale-branch scenarios simulate a stopped parent
+  runner and verify parent recovery before binding; the hosted lifecycle test
+  above proves live-parent reuse with actual runner processes.
 - **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
   opens a runnerless child directly and sends a message without a directory
@@ -271,8 +272,8 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - Existing side chats on separate runners must still be closed individually.
   Hostless CLI Stop keeps its existing per-conversation behavior.
-- A side chat launched after its parent stopped owns a fresh runner. Stopping
-  the parent's old runner does not stop that new chat; close the chat itself.
+- Starting a side chat after its parent stopped relaunches the parent. The new
+  chat shares that replacement runner and stops with the parent again.
 - Browser storage sharing is limited to one desktop window and app run;
   restarting the app clears it. Closing an individual tab does not.
 - Archive and unarchive exist on the row, in bulk selection, and in the header

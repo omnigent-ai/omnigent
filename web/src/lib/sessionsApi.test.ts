@@ -560,27 +560,38 @@ describe("createSideChat", () => {
   };
 
   it.each(["worktree-from-another-machine", "main", null])(
-    "launches after parent stop without requiring saved branch %s",
+    "relaunches a stopped parent and reuses its runner without requiring saved branch %s",
     async (gitBranch) => {
+      const relaunchedRunnerId = "runner_relaunched";
       fetchMock
         .mockResolvedValueOnce(
           mockJsonResponse({ ...source, runner_online: false, git_branch: gitBranch }),
         )
+        .mockResolvedValueOnce(mockJsonResponse({ recovered: true, recovery: "runner_relaunched" }))
+        .mockResolvedValueOnce(
+          mockJsonResponse({
+            ...source,
+            runner_id: relaunchedRunnerId,
+            runner_online: true,
+            git_branch: gitBranch,
+          }),
+        )
         .mockResolvedValueOnce(mockJsonResponse(fork))
-        .mockResolvedValueOnce(mockJsonResponse({ runner_id: "runner_side" }));
+        .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: relaunchedRunnerId }));
 
       await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
 
-      const [forkUrl, forkInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      const [retryUrl, retryInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      expect(retryUrl).toBe(`/v1/sessions/${source.id}/events`);
+      expect(JSON.parse(retryInit.body as string)).toEqual({ type: "retry_session", data: {} });
+      const [forkUrl, forkInit] = fetchMock.mock.calls[3] as [string, RequestInit];
       expect(forkUrl).toBe(`/v1/sessions/${source.id}/fork`);
       expect(JSON.parse(forkInit.body as string)).toEqual({ title: "Side chat", side_chat: true });
-      const [launchUrl, launchInit] = fetchMock.mock.calls[2] as [string, RequestInit];
-      expect(launchUrl).toBe("/v1/hosts/host_mac/runners");
-      expect(JSON.parse(launchInit.body as string)).toEqual({
-        session_id: fork.id,
-        workspace: source.workspace,
-      });
-      expect(fetchMock).toHaveBeenCalledTimes(3);
+      const [bindUrl, bindInit] = fetchMock.mock.calls[4] as [string, RequestInit];
+      expect(bindUrl).toBe(`/v1/sessions/${fork.id}`);
+      expect(bindInit.method).toBe("PATCH");
+      expect(JSON.parse(bindInit.body as string)).toEqual({ runner_id: relaunchedRunnerId });
+      expect(fetchMock).toHaveBeenCalledTimes(5);
     },
   );
 

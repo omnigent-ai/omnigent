@@ -887,9 +887,9 @@ export async function forkSession(
 
 /**
  * Fork a generic side chat in the parent's current working directory.
- * Reuse the parent's live runner, or launch one on its host if it has stopped.
- * In-process sessions use normal server dispatch. Codex uses its native
- * `/side` fork instead.
+ * Reuse the parent's live runner, relaunching the parent first if it has
+ * stopped. In-process sessions use normal server dispatch. Codex uses its
+ * native `/side` fork instead.
  *
  * Like native Codex side chats, these share the parent's workspace. A saved
  * branch may belong to a previous host and must not be required to send.
@@ -900,22 +900,23 @@ export async function forkSession(
  */
 export async function createSideChat(sourceId: string): Promise<{ childSessionId: string }> {
   let source = await getSession(sourceId);
-  if (source.hostResumable && source.hostOnline === false && source.runnerOnline !== true) {
+  if (
+    source.runnerOnline === false &&
+    source.hostId != null &&
+    (source.hostOnline !== false || source.hostResumable)
+  ) {
     await retrySession(sourceId);
     source = await getSession(sourceId);
   }
-  const { hostId, workspace, runnerId } = source;
-  const canLaunchOnHost = hostId && workspace && source.hostOnline !== false;
+  const { runnerId } = source;
   const canUseRunner =
     source.runnerOnline !== false && (runnerId != null || source.runnerOnline === true);
-  if (!canLaunchOnHost && !canUseRunner) {
+  if (!canUseRunner) {
     throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
   }
   const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
-  if (canUseRunner && runnerId) {
+  if (runnerId) {
     await updateSession(fork.id, { runnerId });
-  } else if (canLaunchOnHost) {
-    await launchRunner(hostId, fork.id, workspace);
   }
   return { childSessionId: fork.id };
 }

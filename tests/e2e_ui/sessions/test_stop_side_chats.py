@@ -40,7 +40,7 @@ def test_stop_session_stops_hosted_side_chats(
     tmp_path: Path,
     entrypoint: str,
 ) -> None:
-    """Close one chat, stop the parent, then start a fresh chat without resuming it."""
+    """Close one chat, stop the parent, then restart it through a fresh chat."""
     if os.environ.get("OMNIGENT_REPRO_SERVER_URL"):
         pytest.fail("This test owns its host and runners; run it outside verify-env run.")
     base_env = {
@@ -267,13 +267,25 @@ def test_stop_session_stops_hosted_side_chats(
 
         fresh_id = side_chat(f"fresh-{parent_id}: start a new chat", "A new side chat works.")
         fresh = get(f"/v1/sessions/{fresh_id}")
-        assert fresh["runner_id"] != runners[parent_id]
-        assert fresh["host_id"] == host["host_id"]
-        assert len(runner_launches) == 1, runner_launches
+        restarted_parent = get(f"/v1/sessions/{parent_id}")
+        assert restarted_parent["runner_id"] != runners[parent_id]
+        assert fresh["runner_id"] == restarted_parent["runner_id"]
+        assert fresh["host_id"] is None
+        assert not runner_launches, runner_launches
         assert get(f"/v1/runners/{fresh['runner_id']}/status")["online"]
+        assert get(f"/v1/runners/{restarted_parent['runner_id']}/status")["online"]
         assert not online(parent_id) and not online(child_id)
         assert online(unrelated_id)
-        assert _items(stack.base_url, parent_id) == parent_items
+        restarted_items = _items(stack.base_url, parent_id)
+        assert [
+            item
+            for item in restarted_items
+            if not str(item.get("event_type", "")).startswith("session.resource.")
+        ] == [
+            item
+            for item in parent_items
+            if not str(item.get("event_type", "")).startswith("session.resource.")
+        ]
         page.screenshot(path=str(tmp_path / "fresh-side-chat.png"))
         assert stack.server is not None and stack.host is not None
         (tmp_path / "evidence.json").write_text(
@@ -286,6 +298,7 @@ def test_stop_session_stops_hosted_side_chats(
                     "runner_launches": runner_launches,
                     "before": snapshots,
                     "runner_online_after_stop": stopped_runners,
+                    "restarted_parent": restarted_parent,
                     "fresh": fresh,
                 },
                 indent=2,
