@@ -26,6 +26,9 @@ export function ComposerPrLink({
   onOpen: (() => void) | null;
   className?: string;
 }) {
+  // Status belongs to a known PR; lookup and setup errors remain in the GitHub tab.
+  if (prCount <= 0 || !onOpen) return null;
+
   if (state === "loading") {
     return (
       <span
@@ -48,8 +51,6 @@ export function ComposerPrLink({
       </span>
     );
   }
-  if (prCount <= 0 || !onOpen) return null;
-
   const label = prCount > 1 ? `${prCount} PRs` : prNumber == null ? "1 PR" : `#${prNumber}`;
 
   return (

@@ -2489,7 +2489,7 @@ describe("Composer shared visible controls", () => {
         <Composer {...composerProps()} />
       </TooltipProvider>,
     );
-    expect(screen.getByTestId("composer-pr-loading")).toHaveTextContent("Checking PR…");
+    expect(screen.queryByTestId("composer-pr-loading")).toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
 
     setComposerGitStatus({ githubState: "unknown" });
@@ -2498,7 +2498,7 @@ describe("Composer shared visible controls", () => {
         <Composer {...composerProps()} />
       </TooltipProvider>,
     );
-    expect(screen.getByTestId("composer-pr-unknown")).toHaveTextContent("PR unavailable");
+    expect(screen.queryByTestId("composer-pr-unknown")).toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
   });
 
