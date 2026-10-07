@@ -856,11 +856,10 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
 
 # ── CLI startup (omnigent polly against the local bench server) ──────────────
 
-# The REPL's bottom toolbar reads "<model> · ready" once the prompt accepts
-# input, which is after the runner is online and bound (see
-# omnigent_ui_sdk/terminal/_host.py). The earlier "Launching your agent…"
-# spinner phase prints before the runner is even launched.
-_CLI_STARTUP_READY_SIGNAL = "· ready"
+# The REPL paints once the runner is online and bound: its toolbar reads
+# "<model> · ready", or, where the toolbar is suppressed, the "❯ " prompt shows.
+# The earlier "Launching your agent…" spinner precedes the runner launch.
+_CLI_STARTUP_READY_SIGNALS = [r"·\s*ready", r"❯ "]
 
 # Per-attempt timeout: daemon start + session + runner launch, ~4-7s on CI.
 _CLI_STARTUP_TIMEOUT_S = 60
@@ -885,15 +884,27 @@ async def _prepare_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> No
     local port, such as a developer's own.
     """
     del env
+    await _stop_cli_daemons(ctx, drain_sessions=False)
+
+
+async def _stop_cli_daemons(ctx: JourneyContext, *, drain_sessions: bool) -> None:
+    """Run ``omnigent host stop --all`` within the journey's own data dir.
+
+    :param drain_sessions: Stop each daemon's sessions first, so their runners
+        close their REPL terminals themselves before the daemon goes.
+    """
     omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
     if omnigent_bin is None:
         return
+    args = [omnigent_bin, "host", "stop", "--all"]
+    if not drain_sessions:
+        args.append("--daemon-only")
     await asyncio.to_thread(
         subprocess.run,
-        [omnigent_bin, "host", "stop", "--all", "--daemon-only"],
+        args,
         env=_cli_env(ctx),
         capture_output=True,
-        timeout=15,
+        timeout=60 if drain_sessions else 15,
         check=False,
     )
 
@@ -926,7 +937,7 @@ async def _measure_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> No
     """Time ``omnigent polly --server`` from invocation to REPL ready.
 
     Spawns ``omnigent polly --server <local>`` via pexpect and times until the
-    REPL toolbar reports ``ready``. Using polly (the bundled openai-agents
+    REPL toolbar reports ``ready`` (or its prompt shows). Using polly (the bundled openai-agents
     harness) avoids any external binary dependency while exercising the same
     startup path as ``omnigent claude``: daemon start, session create, runner
     launch, and runner connect.
@@ -958,17 +969,16 @@ async def _measure_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> No
         env=_cli_env(ctx),
     )
     try:
-        idx = child.expect([pexpect.TIMEOUT, pexpect.EOF, _CLI_STARTUP_READY_SIGNAL])
+        idx = child.expect([pexpect.TIMEOUT, pexpect.EOF, *_CLI_STARTUP_READY_SIGNALS])
         if idx == 0:
             raise RuntimeError(
-                f"Timed out after {_CLI_STARTUP_TIMEOUT_S}s waiting for "
-                f"{_CLI_STARTUP_READY_SIGNAL!r}"
+                f"Timed out after {_CLI_STARTUP_TIMEOUT_S}s waiting for the REPL "
+                f"({_CLI_STARTUP_READY_SIGNALS!r})"
             )
         if idx == 1:
             output = (child.before or "").strip()
             raise RuntimeError(
-                f"Process exited before {_CLI_STARTUP_READY_SIGNAL!r}. "
-                f"Last output: {output[-200:]!r}"
+                f"Process exited before the REPL was ready. Last output: {output[-200:]!r}"
             )
     except BaseException:
         child.terminate(force=True)
@@ -985,9 +995,13 @@ async def _close_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> None
 
 
 async def _teardown_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> None:
-    """Close a CLI left by an interrupted sample and reap the last sample's daemon."""
+    """Close a CLI left by an interrupted sample, then stop the last session and daemon.
+
+    Between samples the next CLI's daemon reaps the previous terminal; after the
+    last one nothing would, so its session is drained instead of just killed.
+    """
     await _close_cli_startup(env, ctx)
-    await _prepare_cli_startup(env, ctx)
+    await _stop_cli_daemons(ctx, drain_sessions=True)
 
 
 # ── native hook spawn (no server involved) ───────────────────

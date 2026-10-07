@@ -1319,6 +1319,33 @@ def test_sigterm_mid_run_leaves_no_processes(tmp_path: Path) -> None:
                 child.kill()
 
 
+class _CliStubEnv:
+    """The slice of BenchEnvironment the cli_startup journey uses."""
+
+    base_url = "http://127.0.0.1:9"
+
+    def __init__(self, tmp: Path) -> None:
+        self._tmp = tmp
+
+    def child_env(self) -> dict[str, str]:
+        return {"PATH": os.environ.get("PATH", ""), "TMPDIR": str(self._tmp)}
+
+
+def _fake_cli(tmp_path: Path, calls: Path) -> Path:
+    """A stand-in `omnigent`: logs each call, and prints a slow REPL for `polly`."""
+    fake = tmp_path / "omnigent"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'echo "$* | $OMNIGENT_DATA_DIR | $OMNIGENT_CONFIG_HOME" >> {calls}\n'
+        'if [ "$1" = polly ]; then\n'
+        "  printf 'Launching your agent\\n'; sleep 0.5\n"
+        "  printf ' polly \\302\\267  ready \\n'; sleep 30\n"
+        "fi\n"
+    )
+    fake.chmod(0o755)
+    return fake
+
+
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="fake CLI is a POSIX shell script")
 @pytest.mark.asyncio
 async def test_cli_startup_stops_only_its_own_daemons(
@@ -1326,26 +1353,40 @@ async def test_cli_startup_stops_only_its_own_daemons(
 ) -> None:
     """cli_startup must never run `omnigent stop`, which kills any local server."""
     calls = tmp_path / "calls.txt"
-    fake_cli = tmp_path / "omnigent"
-    fake_cli.write_text(f'#!/bin/sh\necho "$* | $OMNIGENT_DATA_DIR" >> {calls}\n')
-    fake_cli.chmod(0o755)
-    monkeypatch.setenv("OMNIGENT_BIN", str(fake_cli))
-    env = BenchEnvironment()
-    env._child_tmp.mkdir(parents=True)
+    monkeypatch.setenv("OMNIGENT_BIN", str(_fake_cli(tmp_path, calls)))
+    env = cast(BenchEnvironment, _CliStubEnv(tmp_path))
     journey = ALL_JOURNEYS["cli_startup"]
-    try:
-        ctx = await journey.run_setup(env)
-        data_dir = cast(dict[str, dict[str, str]], ctx)["env"]["OMNIGENT_DATA_DIR"]
-        config_home = Path(cast(dict[str, dict[str, str]], ctx)["env"]["OMNIGENT_CONFIG_HOME"])
 
-        await journey.run_prepare(env, ctx)
-        await journey.run_teardown(env, ctx)
+    ctx = await journey.run_setup(env)
+    cli_env = cast(dict[str, dict[str, str]], ctx)["env"]
+    await journey.run_prepare(env, ctx)
+    await journey.run_teardown(env, ctx)
 
-        assert (
-            calls.read_text().splitlines() == [f"host stop --all --daemon-only | {data_dir}"] * 2
-        )
-        assert Path(data_dir).is_relative_to(env._child_tmp)
-        # Pre-set theme, so the first-run picker doesn't stand in for the REPL.
-        assert "theme: light" in (config_home / "config.yaml").read_text()
-    finally:
-        shutil.rmtree(env._tmp, ignore_errors=True)
+    scoped = f"{cli_env['OMNIGENT_DATA_DIR']} | {cli_env['OMNIGENT_CONFIG_HOME']}"
+    assert calls.read_text().splitlines() == [
+        f"host stop --all --daemon-only | {scoped}",  # prepare: daemons only, fast
+        f"host stop --all | {scoped}",  # teardown: drain the last session first
+    ]
+    assert Path(cli_env["OMNIGENT_DATA_DIR"]).is_relative_to(tmp_path)
+    # Pre-set theme, so the first-run picker doesn't stand in for the REPL.
+    assert "theme: light" in (Path(cli_env["OMNIGENT_CONFIG_HOME"]) / "config.yaml").read_text()
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="fake CLI is a POSIX shell script")
+@pytest.mark.asyncio
+async def test_cli_startup_times_until_the_repl_is_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spinner line is not readiness; the timed CLI runs in the scoped dirs."""
+    calls = tmp_path / "calls.txt"
+    monkeypatch.setenv("OMNIGENT_BIN", str(_fake_cli(tmp_path, calls)))
+    env = cast(BenchEnvironment, _CliStubEnv(tmp_path))
+    journey = ALL_JOURNEYS["cli_startup"]
+
+    result = await run_latency(journey, env, iterations=1, warmup=0)
+
+    assert result.n_success == 1, result.failures
+    assert result.latencies_ms[0] >= 500  # waited past "Launching your agent"
+    polly = [line for line in calls.read_text().splitlines() if line.startswith("polly")]
+    assert len(polly) == 1
+    assert str(tmp_path) in polly[0].split(" | ")[1]
