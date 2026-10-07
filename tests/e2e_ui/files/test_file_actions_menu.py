@@ -13,16 +13,24 @@ from tests.e2e_ui.conftest import open_right_rail
 
 _FILE_NAME = "row actions Ω report.txt"
 _FILE_CONTENT = "file-row-actions-menu-e2e-content"
+_LONG_FILE_NAME = "A very long report name that truncates beside its size.txt"
 _TOUCH_FOLDER = "touch actions folder"
 
 
-def _seed_file(page: Page, base_url: str, session_id: str, request: pytest.FixtureRequest) -> Path:
+def _seed_file(
+    page: Page,
+    base_url: str,
+    session_id: str,
+    request: pytest.FixtureRequest,
+    *,
+    filename: str = _FILE_NAME,
+) -> Path:
     """Create a predictable file in this session's workspace."""
     response = page.request.get(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem"
     )
     assert response.status == 200, response.text()
-    target = Path(response.json()["base"]) / _FILE_NAME
+    target = Path(response.json()["base"]) / filename
     target.write_text(_FILE_CONTENT, encoding="utf-8")
     request.addfinalizer(lambda: target.unlink(missing_ok=True))
     return target
@@ -201,7 +209,9 @@ def test_size_does_not_overlap_actions_on_keyboard_focus_or_open_menu(
 ) -> None:
     """Tree, search, and Changes rows keep their size clear of visible actions."""
     base_url, session_id = seeded_session
-    _seed_file(page, base_url, session_id, request)
+    target = _seed_file(page, base_url, session_id, request, filename=_LONG_FILE_NAME)
+    with target.open("wb") as file:
+        file.truncate(1_000_000)
     page.route(
         re.compile(
             rf"/v1/sessions/{re.escape(session_id)}/resources/environments/[^/]+/changes(\?|$)"
@@ -210,10 +220,10 @@ def test_size_does_not_overlap_actions_on_keyboard_focus_or_open_menu(
             json={
                 "data": [
                     {
-                        "path": _FILE_NAME,
-                        "name": _FILE_NAME,
+                        "path": _LONG_FILE_NAME,
+                        "name": _LONG_FILE_NAME,
                         "status": "created",
-                        "bytes": len(_FILE_CONTENT),
+                        "bytes": 1_000_000,
                         "modified_at": None,
                         "lines_added": None,
                         "lines_removed": None,
@@ -230,6 +240,7 @@ def test_size_does_not_overlap_actions_on_keyboard_focus_or_open_menu(
     def check_row(row: Locator) -> None:
         page.mouse.move(0, 0)
         expect(row.get_by_role("button", name=re.compile("^More actions for"))).to_have_count(0)
+        _assert_size_inside_meta_slot(row)
         row.locator("button").first.focus()
         page.keyboard.press("Tab")
         assert row.evaluate("row => !!row.querySelector(':focus-visible')")
@@ -239,21 +250,21 @@ def test_size_does_not_overlap_actions_on_keyboard_focus_or_open_menu(
         _assert_size_does_not_overlap_actions(row)
         page.keyboard.press("Escape")
 
-    row = page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_FILE_NAME).last
+    row = page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_LONG_FILE_NAME).last
     expect(row).to_be_visible(timeout=30_000)
     check_row(row)
 
     search = panel.get_by_role("searchbox", name="Search all files")
-    search.fill(_FILE_NAME)
+    search.fill(_LONG_FILE_NAME)
     search_row = (
-        page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_FILE_NAME).last
+        page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_LONG_FILE_NAME).last
     )
     expect(search_row).to_be_visible(timeout=30_000)
     check_row(search_row)
 
     panel.get_by_role("tab", name=re.compile("^Changes")).click()
     changes_row = (
-        page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_FILE_NAME).last
+        page.locator('[data-slot="context-menu-trigger"]').filter(has_text=_LONG_FILE_NAME).last
     )
     expect(changes_row).to_be_visible(timeout=30_000)
     check_row(changes_row)
@@ -467,6 +478,26 @@ def _assert_size_does_not_overlap_actions(row: Locator) -> None:
     )
     assert layout is not None, "expected a size label and hover actions"
     assert layout["visibility"] == "hidden" or not layout["overlap"], layout
+
+
+def _assert_size_inside_meta_slot(row: Locator) -> None:
+    layout = row.evaluate(
+        """row => {
+          const size = [...row.querySelectorAll('span.text-sm.text-muted-foreground')]
+            .find(element => /\\d+(?:\\.\\d+)?\\s+[KMGT]?B/.test(element.textContent || ''));
+          if (!size?.parentElement) return null;
+          const slot = size.parentElement;
+          const sizeBox = size.getBoundingClientRect();
+          const slotBox = slot.getBoundingClientRect();
+          return {
+            size: { left: sizeBox.left, right: sizeBox.right },
+            slot: { left: slotBox.left, right: slotBox.right },
+          };
+        }"""
+    )
+    assert layout is not None, "expected a size label and its metadata slot"
+    assert layout["size"]["left"] >= layout["slot"]["left"] - 0.5, layout
+    assert layout["size"]["right"] <= layout["slot"]["right"] + 0.5, layout
 
 
 def test_coarse_pointer_rows_have_no_menu_button_and_keep_size_visible(
