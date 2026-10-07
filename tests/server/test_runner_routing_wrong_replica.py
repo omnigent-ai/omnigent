@@ -239,10 +239,16 @@ def test_fork_source_only_routes_side_chats_sharing_the_source_runner(runner_id,
     assert fork.parent_conversation_id is None
 
 
-@pytest.mark.parametrize("max_reads", [0, 1, 2])
-def test_side_chat_routing_respects_read_budget_and_subagent_root_fallback(max_reads):
+@pytest.mark.parametrize("depth", [0, 17])
+@pytest.mark.parametrize("max_reads", [0, 1, 2, 16])
+def test_side_chat_routing_respects_read_budget_and_subagent_root_fallback(max_reads, depth):
     root = Conversation(
-        id="root", created_at=1, updated_at=1, root_conversation_id="root", host_id="host_root"
+        id="root",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="root",
+        runner_id="runner_shared",
+        host_id="host_root",
     )
     source = Conversation(
         id="source",
@@ -261,9 +267,44 @@ def test_side_chat_routing_respects_read_budget_and_subagent_root_fallback(max_r
         labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
     )
 
-    assert routing_host_id(
-        side_chat, MockConversationStore(root, source, side_chat), max_ancestor_reads=max_reads
-    ) == ("host_root" if max_reads == 2 else None)
+    ancestors = [
+        Conversation(
+            id=f"ancestor_{index}",
+            created_at=1,
+            updated_at=1,
+            kind="sub_agent",
+            parent_conversation_id=f"ancestor_{index + 1}" if index + 1 < depth else root.id,
+            root_conversation_id=root.id,
+            runner_id=root.runner_id,
+        )
+        for index in range(depth)
+    ]
+    source.parent_conversation_id = ancestors[0].id if ancestors else None
+    store = MockConversationStore(root, source, side_chat, *ancestors)
+    reads = []
+
+    def read(session_id):
+        reads.append(session_id)
+        return store.rows.get(session_id)
+
+    store.get_conversation = read
+    assert routing_host_id(side_chat, store, max_ancestor_reads=max_reads) == (
+        "host_root" if max_reads >= 2 else None
+    )
+    assert len(reads) <= max_reads
+    if max_reads == 16:
+        router = RunnerRouter(
+            registry=MockTunnelRegistry(),
+            conversation_store=store,
+            host_registry=MockHostRegistry(),
+            host_store=MockHostStore({root.host_id: True}),
+        )
+        for child in (side_chat, source):
+            reads.clear()
+            with pytest.raises(OmnigentError) as caught:
+                router.client_for_session_resources(child.id, conversation=child)
+            assert caught.value.code == ErrorCode.WRONG_REPLICA
+            assert len(reads) <= 16
 
 
 def test_side_chat_routing_handles_cyclic_source_links():

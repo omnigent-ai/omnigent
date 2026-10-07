@@ -108,6 +108,13 @@ def routing_host_id(
             break
         if reads >= max_ancestor_reads:
             return None
+        # Reserve the final read for a known root in deep sub-agent chains.
+        if (
+            reads + 1 == max_ancestor_reads
+            and root_id not in (None, ancestor_id)
+            and root_id not in visited
+        ):
+            break
         reads += 1
         visited.add(ancestor_id)
         ancestor = conversation_store.get_conversation(ancestor_id)
