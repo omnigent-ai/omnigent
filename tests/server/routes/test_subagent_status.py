@@ -452,10 +452,13 @@ async def test_status_observes_existing_session_metadata_off_event_loop(
     ("harness", "status", "confirmation", "wrapper", "expected"),
     [
         ("claude-native", "idle", {}, None, None),
+        ("auto", "idle", {}, None, None),
+        ("any", "idle", {}, None, None),
         ("claude-native", "idle", {"turn_completed": True}, None, "completed"),
         ("cursor-native", "idle", {"turn_outcome": "cancelled"}, None, "cancelled"),
         ("cursor-native", "idle", {"turn_outcome": "failed"}, None, "failed"),
         ("codex-native", "idle", {}, None, "completed"),
+        ("claude-sdk", "idle", {}, "claude-code-native-ui", "completed"),
         ("claude-native", "failed", {}, None, "failed"),
         (
             "claude-native",
@@ -497,15 +500,81 @@ async def test_external_child_activity_uses_confirmed_outcome(
         assert items[0].data.resource["status"] == expected
 
 
-@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
-async def test_native_child_completes_once_per_confirmed_turn(
+@pytest.mark.parametrize("harness", ["claude-native", "auto"])
+async def test_claude_child_idle_observations_do_not_complete_new_response_ids(
     status_route: _StatusRoute, harness: str
+) -> None:
+    route = status_route
+    route.store.update_conversation(route.child_id, harness_override=harness)
+    route.store.set_labels(route.child_id, {"omnigent.wrapper": "claude-code-native-ui"})
+
+    for turn in range(2):
+        for observation in range(3):
+            response_id = f"claude-turn-{turn}-observation-{observation}"
+            route.store.append(
+                route.child_id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id=response_id,
+                        data=MessageData(
+                            role="assistant",
+                            agent="claude-native",
+                            content=[
+                                {"type": "output_text", "text": "Still working on the task."}
+                            ],
+                        ),
+                    )
+                ],
+            )
+            response = await route.client.post(
+                f"/v1/sessions/{route.child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "response_id": response_id},
+                },
+            )
+            assert response.status_code == 202, response.text
+            assert len(route.store.list_items(route.parent_id).data) == turn
+
+        response = await route.client.post(
+            f"/v1/sessions/{route.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "response_id": response_id,
+                    "turn_completed": True,
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+        notices = route.store.list_items(route.parent_id).data
+        assert len(notices) == turn + 1
+        assert all(item.data.event_type == "session.subagent.returned" for item in notices)
+        assert all(item.data.resource_id == route.child_id for item in notices)
+        assert all(item.data.resource["status"] == "completed" for item in notices)
+
+
+@pytest.mark.parametrize(
+    ("harness", "wrapper", "native_harness"),
+    [
+        ("claude-native", None, "claude-native"),
+        ("codex-native", None, "codex-native"),
+        ("auto", "claude-code-native-ui", "claude-native"),
+        ("auto", "codex-native-ui", "codex-native"),
+    ],
+)
+async def test_native_child_completes_once_per_confirmed_turn(
+    status_route: _StatusRoute, harness: str, wrapper: str | None, native_harness: str
 ) -> None:
     """Delivery acknowledgments and repeated status posts do not duplicate actual results."""
     from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
 
     route = status_route
     route.store.update_conversation(route.child_id, harness_override=harness)
+    if wrapper is not None:
+        route.store.set_labels(route.child_id, {"omnigent.wrapper": wrapper})
     release = asyncio.Event()
     release.set()
     for index in range(2):
@@ -536,7 +605,7 @@ async def test_native_child_completes_once_per_confirmed_turn(
                     response_id=native_turn_id,
                     data=MessageData(
                         role="assistant",
-                        agent=harness,
+                        agent=native_harness,
                         content=[{"type": "output_text", "text": "Finished the child task."}],
                     ),
                 )
@@ -550,7 +619,7 @@ async def test_native_child_completes_once_per_confirmed_turn(
                     "data": {
                         "status": "idle",
                         "response_id": native_turn_id,
-                        "turn_completed": True,
+                        **({"turn_completed": True} if native_harness == "claude-native" else {}),
                     },
                 },
             )

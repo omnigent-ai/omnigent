@@ -233,6 +233,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
+    _native_pane_harness,
     _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
@@ -1883,7 +1884,7 @@ def register_events_routes(
                 and conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
             ):
                 harness = await asyncio.to_thread(
-                    _resolve_harness,
+                    _native_pane_harness,
                     conv,
                     agent_store=agent_store,
                     agent_cache=agent_cache,
