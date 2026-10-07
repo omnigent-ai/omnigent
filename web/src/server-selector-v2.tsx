@@ -5,7 +5,7 @@
 // to the shell's `omnigentSetup` preload bridge (server URL, recent / managed
 // servers, connect, start-local). Theme follows the OS via index.css.
 
-import { type CSSProperties, useEffect, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Spinner } from "./components/ui/spinner";
 import type { Runner } from "./pages/onboarding/RunnerStep";
@@ -102,6 +102,13 @@ export function BridgeSetupApp() {
   const [ready, setReady] = useState(false);
   // The in-flight connect's request ID; cleared by Cancel so its late result reads as cancelled.
   const activeConnect = useRef<string | null>(null);
+  const refreshCliStatus = useCallback(async () => {
+    const status = await setupBridge()?.getCliStatus();
+    setInstalled(status?.installed === true);
+    setInstallSupported(status?.installSupported === true);
+    setLocalServerRunning(status?.localServerRunning === true);
+    return status?.installed === true;
+  }, []);
 
   useEffect(() => {
     const bridge = setupBridge();
@@ -130,11 +137,7 @@ export function BridgeSetupApp() {
       (names) => setServerNames(names ?? {}),
       () => {},
     );
-    const cli = bridge.getCliStatus().then((status) => {
-      setInstalled(status?.installed === true);
-      setInstallSupported(status?.installSupported === true);
-      setLocalServerRunning(status?.localServerRunning === true);
-    });
+    const cli = refreshCliStatus();
     // Older shells omit getSetupCapabilities → leave the item enabled. Gate on
     // it too, so the legacy item isn't shown enabled before v2Forced resolves.
     const caps = bridge.getSetupCapabilities
@@ -157,7 +160,7 @@ export function BridgeSetupApp() {
       setInstalled((prev) => prev ?? false);
       setReady(true);
     });
-  }, [failedUrl, isEphemeral]);
+  }, [failedUrl, isEphemeral, refreshCliStatus]);
 
   // Sync the wizard's `.dark` class with the shell's effective theme: the dark
   // styles key off the class (index.css), not the OS media query. The shell
@@ -177,6 +180,8 @@ export function BridgeSetupApp() {
     managedServerNames,
     serverNames,
     installed,
+    installSupported,
+    onRecheckCli: refreshCliStatus,
     connectedBefore,
     localServerRunning,
     onConnect: async (url, onPhase) => {
