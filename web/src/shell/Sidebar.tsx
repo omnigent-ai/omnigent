@@ -796,6 +796,7 @@ function SidebarImpl({
     // key after the migration (gated on the query settling) mutates it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pinnedConversations, pinnedLoaded, ownedPinIds]);
+  const queryClient = useQueryClient();
   const togglePinnedMutation = useTogglePinnedConversation();
   const pinnedIdSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   // The migration compares the legacy key against what the SERVER already owns
@@ -811,6 +812,7 @@ function SidebarImpl({
       return;
     }
     unpinWithUndo(
+      queryClient,
       togglePinnedMutation.mutateAsync,
       conversationId,
       pinnedConversations.find((c) => c.id === conversationId),

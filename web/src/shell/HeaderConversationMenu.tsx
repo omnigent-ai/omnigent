@@ -234,7 +234,7 @@ export function HeaderConversationMenu({
         disabled={pinSaving}
         onSelect={() =>
           isPinned
-            ? unpinWithUndo(togglePinned.mutateAsync, conversation.id, conversation)
+            ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
             : togglePinned.mutate({ id: conversation.id, pinned: true })
         }
       >
