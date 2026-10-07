@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import hmac
 import logging
 import os
@@ -141,6 +142,27 @@ _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S
 # Retry only pre-output wedges after confirmed teardown. Replaying a turn
 # with progress can duplicate tool effects; retries never extend the hard cap.
 _WEDGED_TURN_RECOVERY_RETRIES = 1
+
+# Set by the harness subprocess entrypoint. Executors import their SDKs lazily
+# on the first turn, so that graph is only static once the first turn ends.
+_freeze_gc_after_first_turn = False
+
+
+def arm_gc_freeze_after_first_turn() -> None:
+    """Freeze GC-tracked objects once, when this process's first turn ends.
+
+    Only the harness subprocess arms this: freezing moves every live object
+    out of future collections, which an embedding process should not do.
+    """
+    global _freeze_gc_after_first_turn
+    _freeze_gc_after_first_turn = True
+
+
+def _freeze_gc_if_armed() -> None:
+    global _freeze_gc_after_first_turn
+    if _freeze_gc_after_first_turn:
+        _freeze_gc_after_first_turn = False
+        gc.freeze()
 
 
 @dataclass(frozen=True)
@@ -1715,6 +1737,7 @@ class HarnessApp:
             # Sentinel that tells ``_stream_turn`` to stop reading
             # the queue and emit the terminal event.
             ctx._event_queue.put_nowait(None)
+            _freeze_gc_if_armed()
 
     async def _prepare_turn_retry(self) -> bool:
         """Confirm abandoned work is stopped before replaying a no-progress turn.

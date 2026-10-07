@@ -144,6 +144,34 @@ async def test_stale_continuation_without_model_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_turn_end_freezes_gc_once_only_when_armed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The subprocess freezes the lazily imported SDK graph after its first turn, once."""
+    from omnigent.runtime.harnesses import _scaffold
+
+    freezes: list[int] = []
+    monkeypatch.setattr(_scaffold.gc, "freeze", lambda: freezes.append(1))
+    monkeypatch.setattr(_scaffold, "_freeze_gc_after_first_turn", False)
+
+    class _App(HarnessApp):
+        async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+            return None
+
+    app = _App()
+    request = CreateResponseRequest(model="test-agent", input="hi")
+
+    async def _turn() -> None:
+        await app._guarded_run_turn(request, TurnContext("resp", asyncio.Queue(), asyncio.Event()))
+
+    await _turn()
+    assert freezes == []  # an embedding process never arms it
+
+    _scaffold.arm_gc_freeze_after_first_turn()
+    await _turn()
+    await _turn()
+    assert freezes == [1]
+
+
+@pytest.mark.asyncio
 async def test_build_terminal_event_waits_for_run_task_failure() -> None:
     """
     Terminal synthesis must wait for the run task to fully settle.
