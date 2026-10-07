@@ -2,7 +2,8 @@
  * Per-conversation WebContentsView registry.
  *
  * Keyed by the agent's conversation ID or a user tab's view ID. Each entry owns
- * its bounds and navigation; tabs in one conversation share storage.
+ * its bounds and navigation; tabs in one conversation share storage unless
+ * the user opts into a shared persistent browser profile.
  *
  * Pure factory — no Electron imports at module scope. All deps are injected
  * so a unit test can drive create/swap/close/closeAll/cap behavior with a
@@ -79,6 +80,7 @@ function createBrowserViewRegistry({
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
+  getSharedPartition = () => null,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   let activeConversationId = null;
@@ -160,8 +162,7 @@ function createBrowserViewRegistry({
     }
     const view = WebContentsViewCtor({
       webPreferences: {
-        // Per-conversation storage isolation — see agentPartition.
-        partition: agentPartition(partitionScope, conversationId),
+        partition: getSharedPartition() || agentPartition(partitionScope, conversationId),
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,

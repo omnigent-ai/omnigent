@@ -297,6 +297,12 @@ function ffmpegAvailable() {
  */
 function startDisplayCapture(recordDir, display) {
   if (!display || !ffmpegAvailable()) return null;
+  const displayInfo = spawnSync("xdpyinfo", ["-display", display], {
+    encoding: "utf8",
+    timeout: 2_000,
+  });
+  const size = displayInfo.stdout?.match(/dimensions:\s+(\d+x\d+)/)?.[1];
+  if (!size) return null;
   const out = path.join(recordDir, `display@${Date.now()}.webm`);
   const proc = spawn(
     "ffmpeg",
@@ -307,8 +313,9 @@ function startDisplayCapture(recordDir, display) {
       "x11grab",
       "-framerate",
       "10",
-      // No -video_size: x11grab defaults to the full desktop, which always
-      // contains the shell window wherever it was placed.
+      // x11grab otherwise captures only the top-left 640×480 pixels.
+      "-video_size",
+      size,
       "-i",
       display,
       "-c:v",

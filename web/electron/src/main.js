@@ -3557,6 +3557,42 @@ function isPinnedOriginSender(event) {
 // See preload.js + README.
 // ---------------------------------------------------------------------------
 
+const SHARED_BROWSER_PARTITION = "persist:omnigent-browser";
+let browserStorageBusy = false;
+
+async function updateBrowserStorage(enabled) {
+  if (browserStorageBusy) throw new Error("Browser storage is busy. Try again shortly.");
+  const clearing = enabled === undefined;
+  if (!clearing && enabled === (loadSettings().browser_remember_logins === true)) return enabled;
+  browserStorageBusy = true;
+  try {
+    if (!clearing) {
+      const settings = loadSettings();
+      settings.browser_remember_logins = enabled;
+      saveSettings(settings);
+    }
+    for (const state of windows.values()) state.browserRegistry?.closeAll("storage-changed");
+    if (clearing) {
+      const browserSession = session.fromPartition(SHARED_BROWSER_PARTITION);
+      await browserSession.clearStorageData();
+      await browserSession.clearCache();
+      return true;
+    }
+    for (const [win, state] of windows) {
+      if (win.isDestroyed() || !state.origin || originOf(win.webContents.getURL()) !== state.origin)
+        continue;
+      try {
+        win.webContents.send("omnigent:browser-storage-changed", enabled);
+      } catch {
+        // A window may close before its settings notification arrives.
+      }
+    }
+    return enabled;
+  } finally {
+    browserStorageBusy = false;
+  }
+}
+
 /** Deny browser permissions except user-approved local network access. */
 function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
   const ses = session.fromPartition(partition);
@@ -3583,6 +3619,8 @@ function createBrowserRegistryForWindow(win) {
     !registry.isSuppressed() &&
     registry.get(registry.activeConversationId())?.view.webContents === wc;
   const registry = createBrowserViewRegistry({
+    getSharedPartition: () =>
+      loadSettings().browser_remember_logins === true ? SHARED_BROWSER_PARTITION : null,
     WebContentsViewCtor: (opts) => {
       // Install before construction: Electron otherwise auto-grants requests.
       const policy = hardenAgentPartition(opts.webPreferences.partition, win, canPrompt, () =>
@@ -3639,6 +3677,7 @@ function createBrowserRegistryForWindow(win) {
  * @returns {ReturnType<typeof createBrowserViewRegistry> | null}
  */
 function browserRegistryForSender(event) {
+  if (browserStorageBusy) return null;
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win) return null;
   return windows.get(win)?.browserRegistry ?? null;
@@ -4607,6 +4646,22 @@ function registerIpc() {
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
+  });
+  ipcMain.handle("omnigent:browser-storage-get", (event) => {
+    if (!isPinnedOriginSender(event))
+      throw new Error("Browser settings require a connected server page");
+    return loadSettings().browser_remember_logins === true;
+  });
+  ipcMain.handle("omnigent:browser-storage-set", (event, enabled) => {
+    if (!isPinnedOriginSender(event))
+      throw new Error("Browser settings require a connected server page");
+    if (typeof enabled !== "boolean") throw new Error("Remember logins must be a boolean");
+    return updateBrowserStorage(enabled);
+  });
+  ipcMain.handle("omnigent:browser-storage-clear", (event) => {
+    if (!isPinnedOriginSender(event))
+      throw new Error("Browser settings require a connected server page");
+    return updateBrowserStorage();
   });
 }
 

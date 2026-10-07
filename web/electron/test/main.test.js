@@ -570,7 +570,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, browserRegistryForSender, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -1854,6 +1854,120 @@ describe("Databricks auth mode wiring", () => {
     await rejected;
     assert.deepEqual(h.calls.loadURL, [["https://server.example"]]);
     assert.deepEqual(h.calls.loadFile, []);
+  });
+});
+
+describe("browser storage settings", () => {
+  const connect = (t) => {
+    const h = loadNavigationHarness({ registerFallbacks: false });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    return h;
+  };
+
+  it("saves explicit values without a popup and notifies every connected window", async (t) => {
+    const h = connect(t);
+    const closed = [];
+    const siblingEvents = [];
+    h.api.windows.get(h.win).browserRegistry.closeAll = () => closed.push("window");
+    h.api.windows.set(
+      { ...h.win, webContents: { ...h.webContents, send: (...args) => siblingEvents.push(args) } },
+      {
+        origin: new URL(h.webContents.getURL()).origin,
+        browserRegistry: { closeAll: () => closed.push("sibling") },
+      },
+    );
+    h.electron.dialog.showMessageBox = () => assert.fail("toggling must not open a popup");
+    h.api.buildMenu();
+    assert.equal(h.calls.appMenu.getMenuItemById("remember_browser_logins"), null);
+    const get = h.ipc.get("omnigent:browser-storage-get");
+    const set = h.ipc.get("omnigent:browser-storage-set");
+    assert.equal(get(h.event), false);
+    for (const enabled of [true, false, true, true]) {
+      // oxlint-disable-next-line no-await-in-loop -- Apply settings sequentially.
+      assert.equal(await set(h.event, enabled), enabled);
+      assert.equal(get(h.event), enabled);
+      assert.equal(
+        JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).browser_remember_logins,
+        enabled,
+      );
+    }
+    assert.deepEqual(closed, ["window", "sibling", "window", "sibling", "window", "sibling"]);
+    assert.deepEqual(
+      siblingEvents,
+      [true, false, true].map((value) => ["omnigent:browser-storage-changed", value]),
+    );
+    assert.deepEqual(
+      h.calls.progress
+        .filter((event) => event.channel === "omnigent:browser-storage-changed")
+        .map((event) => event.data),
+      [true, false, true],
+    );
+  });
+
+  it("rejects untrusted senders and invalid settings before touching storage", (t) => {
+    const h = connect(t);
+    h.api.windows.get(h.win).browserRegistry.closeAll = () => assert.fail("views must stay open");
+    h.electron.dialog.showMessageBox = () => assert.fail("no dialog for untrusted senders");
+    for (const action of ["get", "set", "clear"]) {
+      const handler = h.ipc.get(`omnigent:browser-storage-${action}`);
+      assert.throws(
+        () => handler({ ...h.event, senderFrame: { url: "https://untrusted.example" } }, true),
+        /connected server/,
+      );
+      h.setUrl("https://untrusted.example");
+      assert.throws(() => handler(h.event, true), /connected server/);
+      h.setUrl(h.event.senderFrame.url);
+    }
+    for (const value of [undefined, null, "true", 1, {}]) {
+      assert.throws(() => h.ipc.get("omnigent:browser-storage-set")(h.event, value), /boolean/);
+    }
+    assert.equal(fs.existsSync(h.settingsPath), false);
+  });
+
+  it("blocks browser access while clearing and restores it after a reported failure", async (t) => {
+    const h = connect(t);
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ browser_remember_logins: true }));
+    const cleared = [];
+    h.api.windows.get(h.win).browserRegistry.closeAll = () => cleared.push("window");
+    h.api.windows.set({}, { browserRegistry: { closeAll: () => cleared.push("sibling") } });
+    let failClear;
+    const browserSession = {
+      clearStorageData: () =>
+        new Promise((_resolve, reject) => {
+          cleared.push("storage");
+          failClear = reject;
+        }),
+      clearCache: async () => cleared.push("cache"),
+    };
+    h.electron.session.fromPartition = (partition) => {
+      assert.equal(partition, "persist:omnigent-browser");
+      return browserSession;
+    };
+    h.electron.dialog.showMessageBox = () => assert.fail("confirmation belongs to app settings");
+    const clear = () => h.ipc.get("omnigent:browser-storage-clear")(h.event);
+    const pending = clear();
+    const rejected = assert.rejects(pending, /storage deletion failed/);
+    await until(() => failClear, "storage deletion");
+    assert.deepEqual(cleared, ["window", "sibling", "storage"]);
+    assert.equal(h.api.browserRegistryForSender(h.event), null);
+    await assert.rejects(h.ipc.get("omnigent:browser-storage-set")(h.event, false), /busy/);
+    failClear(new Error("storage deletion failed"));
+    await rejected;
+    assert.equal(h.api.browserRegistryForSender(h.event), h.api.windows.get(h.win).browserRegistry);
+    assert.equal(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).browser_remember_logins, true);
+    browserSession.clearStorageData = async () => cleared.push("storage");
+    assert.equal(await clear(), true);
+    assert.deepEqual(cleared, [
+      "window",
+      "sibling",
+      "storage",
+      "window",
+      "sibling",
+      "storage",
+      "cache",
+    ]);
   });
 });
 

@@ -1,4 +1,4 @@
-// Regression test: per-conversation WebContentsViews must each
+// Regression test: by default, per-conversation WebContentsViews each
 // receive a distinct storage `partition` so cookie/localStorage/cache stores
 // are isolated between agent sessions.
 //
@@ -42,7 +42,7 @@ const { createBrowserViewBoundsController } = require("../src/browserViewBounds"
  * also use `openOrNavigate` which embeds the conversationId so we can confirm
  * isolation per-conversation directly.
  */
-function makePartitionCapturingRegistry() {
+function makePartitionCapturingRegistry(getSharedPartition) {
   // capturedPrefs: conversationId -> webPreferences passed at construction time.
   // Because the registry has no "which conversationId am I creating for?" arg
   // to the ctor, we correlate via call order: the Nth call to ctor corresponds
@@ -57,7 +57,9 @@ function makePartitionCapturingRegistry() {
         setBounds() {},
         setVisible() {},
         webContents: {
-          loadURL() {},
+          loadURL(url) {
+            this.url = url;
+          },
           close() {},
           removeListener() {},
           on() {},
@@ -70,6 +72,7 @@ function makePartitionCapturingRegistry() {
     detachFromHost() {},
     sendToRenderer() {},
     getHostZoomFactor: () => 1,
+    getSharedPartition,
   });
 
   return { registry, createdPrefs };
@@ -171,7 +174,7 @@ describe("browserViewRegistry — storage partition isolation", () => {
 });
 
 describe("browserViewRegistry — partition storage placement", () => {
-  it("uses an in-memory partition (no persist: prefix) so agent cookies stay off disk", () => {
+  it("defaults to an in-memory partition so agent cookies stay off disk", () => {
     const { createdPrefs, registry } = makePartitionCapturingRegistry();
     registry.openOrNavigate("conv_A", "https://example.com/");
     const { partition } = createdPrefs[0];
@@ -200,6 +203,56 @@ describe("browserViewRegistry — partition storage placement", () => {
       two.createdPrefs[0].partition,
       "two registries gave the same conversationId one shared partition",
     );
+  });
+});
+
+describe("browserViewRegistry — shared browser storage", () => {
+  it("shares a persistent partition across sessions, user tabs, and windows with independent navigation", () => {
+    const partition = "persist:omnigent-browser-shared";
+    const one = makePartitionCapturingRegistry(() => partition);
+    const two = makePartitionCapturingRegistry(() => partition);
+    const ids = ["conv_A", "browser-tab:conv_A:first", "conv_B"];
+    for (const id of ids) one.registry.openOrNavigate(id, `https://example.com/${id}`);
+    two.registry.openOrNavigate("conv_A", "https://example.com/other-window");
+
+    assert.deepEqual(
+      [...one.createdPrefs, ...two.createdPrefs].map((prefs) => prefs.partition),
+      Array(4).fill(partition),
+    );
+    const views = [...ids.map((id) => one.registry.get(id).view), two.registry.get("conv_A").view];
+    assert.equal(new Set(views).size, 4);
+    one.registry.openOrNavigate("conv_A", "https://example.com/next");
+    assert.deepEqual(
+      views.map((view) => view.webContents.url),
+      [
+        "https://example.com/next",
+        "https://example.com/browser-tab:conv_A:first",
+        "https://example.com/conv_B",
+        "https://example.com/other-window",
+      ],
+    );
+  });
+
+  it("returns to separate in-memory stores after closing views and disabling sharing", () => {
+    let partition = "persist:omnigent-browser-shared";
+    const { registry, createdPrefs } = makePartitionCapturingRegistry(() => partition);
+    for (const id of ["conv_A", "conv_B"]) {
+      registry.openOrNavigate(id, "https://example.com/");
+    }
+    assert.equal(createdPrefs[0].partition, partition);
+    assert.equal(createdPrefs[1].partition, partition);
+
+    registry.closeAll("browser-storage-changed");
+    assert.equal(registry.get("conv_A"), null);
+    assert.equal(registry.get("conv_B"), null);
+    partition = null;
+    for (const id of ["conv_A", "conv_B"]) {
+      registry.openOrNavigate(id, "https://example.com/");
+    }
+    const privatePartitions = createdPrefs.slice(2).map((prefs) => prefs.partition);
+    assert.equal(privatePartitions.length, 2);
+    assert.equal(new Set(privatePartitions).size, 2);
+    assert.ok(privatePartitions.every((value) => value && !value.startsWith("persist:")));
   });
 });
 

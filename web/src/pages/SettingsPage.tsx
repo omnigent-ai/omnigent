@@ -246,6 +246,7 @@ import {
   readSettingsFile,
 } from "@/lib/settingsPortability";
 import {
+  browserStorageBridge,
   type CliStatus,
   getCliStatus,
   isElectronShell,
@@ -1599,6 +1600,180 @@ function OpenLinksInAppControl() {
   );
 }
 
+function BrowserStorageControls() {
+  const bridge = browserStorageBridge();
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [pending, setPending] = useState<"saving" | "clearing" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [cleared, setCleared] = useState(false);
+  const [clearDialogOpen, setClearDialogOpen] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
+  const [readAttempt, setReadAttempt] = useState(0);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  useEffect(() => {
+    if (!bridge) return;
+    let alive = true;
+    let changed = false;
+    setError(null);
+    const unsubscribe = bridge.onChanged((next) => {
+      if (!alive) return;
+      changed = true;
+      setEnabled(next);
+      setError(null);
+    });
+    void bridge
+      .getRememberLogins()
+      .then((next) => {
+        // A change from another window supersedes the initial snapshot.
+        if (alive && !changed) setEnabled(next);
+      })
+      .catch((err) => {
+        if (alive && !changed) {
+          setError(
+            `Couldn't load browser settings: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      });
+    return () => {
+      alive = false;
+      unsubscribe();
+    };
+  }, [bridge, readAttempt]);
+
+  if (!bridge) return null;
+  const disabled = enabled === null || pending !== null;
+
+  const toggle = async (next: boolean) => {
+    setPending("saving");
+    setError(null);
+    setCleared(false);
+    try {
+      setEnabled(await bridge.setRememberLogins(next));
+    } catch (err) {
+      setError(
+        `Couldn't save browser settings: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setPending(null);
+    }
+  };
+
+  const clear = async () => {
+    if (pending !== null) return;
+    setPending("clearing");
+    setError(null);
+    setClearError(null);
+    setCleared(false);
+    try {
+      await bridge.clearSavedData();
+      setCleared(true);
+      setClearDialogOpen(false);
+    } catch (err) {
+      setClearError(
+        `Couldn't clear saved browser data: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setPending(null);
+    }
+  };
+
+  return (
+    <div className="mt-4 space-y-3 border-t border-border pt-4">
+      <div className="flex items-start justify-between gap-6">
+        <SettingsLabel
+          label="Remember logins across sessions"
+          labelId={labelId}
+          descriptionId={descriptionId}
+          className="flex-1"
+          description="Saved cookies and site data stay on this device, shared across sessions, agents, windows, connected servers, and accounts. Changing this setting closes browser pages. Turning it off keeps saved data."
+        />
+        <Switch
+          aria-labelledby={labelId}
+          aria-describedby={descriptionId}
+          checked={enabled ?? false}
+          disabled={disabled}
+          onCheckedChange={(next) => void toggle(next)}
+          className="mt-0.5 shrink-0"
+          componentId="settings.general.remember_browser_logins"
+        />
+      </div>
+      <Dialog
+        open={clearDialogOpen}
+        onOpenChange={(open) => {
+          if (pending === "clearing") return;
+          setClearDialogOpen(open);
+          if (open) {
+            setClearError(null);
+            setCleared(false);
+          }
+        }}
+      >
+        <DialogTrigger asChild>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={disabled}
+            componentId="settings.general.open_clear_browser_data_dialog"
+          >
+            Clear saved browser data
+          </Button>
+        </DialogTrigger>
+        <DialogContent showCloseButton={pending !== "clearing"}>
+          <DialogHeader>
+            <DialogTitle>Clear saved browser data?</DialogTitle>
+            <DialogDescription>
+              This closes browser pages and deletes saved cookies and site data on this device
+              across all sessions, agents, windows, connected servers, and accounts. You will need
+              to sign in to websites again. This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          {clearError && (
+            <p role="alert" className="text-sm text-destructive">
+              {clearError}
+            </p>
+          )}
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline" disabled={pending === "clearing"}>
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button
+              variant="destructive"
+              loading={pending === "clearing"}
+              onClick={() => void clear()}
+              componentId="settings.general.clear_browser_data"
+            >
+              Clear data
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {error && (
+        <p role="alert" className="text-sm text-destructive">
+          {error}
+        </p>
+      )}
+      {enabled === null && error && (
+        <Button variant="outline" size="sm" onClick={() => setReadAttempt((n) => n + 1)}>
+          Retry
+        </Button>
+      )}
+      {((enabled === null && !error) || pending === "saving" || cleared) && (
+        <p role="status" className="text-sm text-muted-foreground">
+          {enabled === null
+            ? "Loading browser settings…"
+            : pending === "saving"
+              ? "Saving…"
+              : "Saved browser data cleared."}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
   const labelId = useId();
@@ -1721,8 +1896,9 @@ function GeneralSection() {
           <TerminalClipboardControl />
         </SettingsGroup>
         {supportsBrowser() && (
-          <SettingsGroup title="Links" testId="settings-group-links">
+          <SettingsGroup title="Browser" testId="settings-group-browser">
             <OpenLinksInAppControl />
+            <BrowserStorageControls />
           </SettingsGroup>
         )}
       </div>

@@ -203,6 +203,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   setColorScheme: (scheme) => ipcRenderer.send("omnigent:set-color-scheme", scheme),
 
   // ── Embedded browser pane ──────────────────────────────────────────────
+  browserStorage: {
+    getRememberLogins: () => ipcRenderer.invoke("omnigent:browser-storage-get"),
+    setRememberLogins: (enabled) => ipcRenderer.invoke("omnigent:browser-storage-set", enabled),
+    clearSavedData: () => ipcRenderer.invoke("omnigent:browser-storage-clear"),
+    onChanged: (callback) => {
+      const listener = (_event, enabled) => callback(enabled);
+      ipcRenderer.on("omnigent:browser-storage-changed", listener);
+      return () => ipcRenderer.removeListener("omnigent:browser-storage-changed", listener);
+    },
+  },
+
   // The relay hook (web/src/hooks/useBrowserAgentRelay.ts) drives a native
   // WebContentsView per conversation through these; all args/results are
   // structured-clone-safe. SECURITY: no generic agent `evaluate` is exposed —

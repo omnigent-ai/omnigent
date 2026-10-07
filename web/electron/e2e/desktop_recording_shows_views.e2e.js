@@ -220,6 +220,30 @@ describe(
         // painted inside the view has to appear in its frames. Require it to
         // occupy a visible region (>= 5% of some frame), not a stray pixel.
         const primary = saved[0];
+        if (process.env.DISPLAY) {
+          const displayInfo = spawnSync("xdpyinfo", ["-display", process.env.DISPLAY], {
+            encoding: "utf8",
+            timeout: 2_000,
+          });
+          const displaySize = displayInfo.stdout?.match(/dimensions:\s+(\d+x\d+)/)?.[1];
+          if (displaySize) {
+            const probe = spawnSync(
+              "ffprobe",
+              [
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=s=x:p=0",
+                primary,
+              ],
+              { encoding: "utf8" },
+            );
+            assert.equal(probe.status, 0, `ffprobe failed: ${probe.stderr}`);
+            assert.equal(probe.stdout.trim(), displaySize, "record the full X display");
+          }
+        }
         const fractions = bannerFractions(primary);
         assert.ok(fractions.length > 0, `primary clip ${primary} decoded to zero frames`);
         const maxFraction = Math.max(...fractions);

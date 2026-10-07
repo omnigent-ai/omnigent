@@ -216,6 +216,8 @@ interface ElectronDesktopApi extends NativeShellApi {
     bounds?: unknown,
     opts?: { force?: boolean; agent?: boolean },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  /** Device-wide browser storage preferences; absent on older desktop shells. */
+  browserStorage?: BrowserStorageBridge;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
@@ -361,6 +363,14 @@ export interface ElectronUpdateBridge {
   onOverlayHeight?: (callback: (height: number) => void) => () => void;
 }
 
+export interface BrowserStorageBridge {
+  getRememberLogins: () => Promise<boolean>;
+  setRememberLogins: (enabled: boolean) => Promise<boolean>;
+  /** Caller confirms deletion; resolves true on success and rejects on failure. */
+  clearSavedData: () => Promise<boolean>;
+  onChanged: (callback: (enabled: boolean) => void) => () => void;
+}
+
 /** Data backing the title-bar server picker, from the Electron shell. */
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
@@ -495,6 +505,11 @@ export function isElectronShell(): boolean {
 /** Desktop auto-update bridge, or undefined outside Electron / older shells. */
 export function updateBridge(): ElectronUpdateBridge | undefined {
   return electronApi()?.updates;
+}
+
+/** Browser storage bridge, or undefined outside Electron / older shells. */
+export function browserStorageBridge(): BrowserStorageBridge | undefined {
+  return electronApi()?.browserStorage;
 }
 
 /**
