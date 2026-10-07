@@ -10,6 +10,7 @@ import {
   mapBridgeRectToViewport,
   parseBridgeMessage,
   slideIndexForSourceOffset,
+  topLevelSectionRanges,
   wireframeScreenIdForSourceOffset,
 } from "./htmlCommentBridge";
 
@@ -336,6 +337,76 @@ describe("mapBridgeRectToViewport", () => {
       { left: 5, top: 8, right: 9, bottom: 12 },
     );
     expect(pos).toEqual({ x: 15, y: 20 + 8 - 6 });
+  });
+});
+
+describe("topLevelSectionRanges", () => {
+  it("maps a normal multi-slide deck in document order", () => {
+    const deck = `<html><body>
+<section><h1>One</h1></section>
+<section><h1>Two</h1></section>
+<section><h1>Three</h1></section>
+</body></html>`;
+    const ranges = topLevelSectionRanges(deck);
+    expect(ranges).toHaveLength(3);
+    expect(deck.slice(ranges[0].start, ranges[0].end)).toContain("<h1>One</h1>");
+    expect(deck.slice(ranges[1].start, ranges[1].end)).toContain("<h1>Two</h1>");
+    expect(deck.slice(ranges[2].start, ranges[2].end)).toContain("<h1>Three</h1>");
+  });
+
+  it("ignores a <section> string inside a <script>", () => {
+    // Unbalanced open tag: parsing script as HTML leaves depth > 0 afterward.
+    const deck = `<html><body>
+<script>var fake = "<section>";</script>
+<section><h1>One</h1></section>
+<section><h1>Two script-safe token</h1></section>
+</body></html>`;
+    const ranges = topLevelSectionRanges(deck);
+    expect(ranges).toHaveLength(2);
+    expect(slideIndexForSourceOffset(deck, deck.indexOf("Two script-safe token"))).toBe(1);
+  });
+
+  it("ignores a <section> string inside a <style>", () => {
+    const deck = `<html><body>
+<style>.x::before{content:"<section>"}</style>
+<section><h1>One</h1></section>
+<section><h1>Two style-safe token</h1></section>
+</body></html>`;
+    const ranges = topLevelSectionRanges(deck);
+    expect(ranges).toHaveLength(2);
+    expect(slideIndexForSourceOffset(deck, deck.indexOf("Two style-safe token"))).toBe(1);
+  });
+
+  it("ignores a <section> inside an HTML comment", () => {
+    // Unbalanced open tag inside a comment must not corrupt depth either.
+    const deck = `<html><body>
+<!-- <section> -->
+<section><h1>One</h1></section>
+<section><h1>Two comment-safe token</h1></section>
+</body></html>`;
+    const ranges = topLevelSectionRanges(deck);
+    expect(ranges).toHaveLength(2);
+    expect(slideIndexForSourceOffset(deck, deck.indexOf("Two comment-safe token"))).toBe(1);
+  });
+
+  it("ignores <section> text inside <textarea> and <title>", () => {
+    const deck = `<html><head><title>x <section></title></head><body>
+<textarea><section></textarea>
+<section><h1>Real</h1><p>textarea-safe token</p></section>
+</body></html>`;
+    expect(topLevelSectionRanges(deck)).toHaveLength(1);
+    expect(slideIndexForSourceOffset(deck, deck.indexOf("textarea-safe token"))).toBe(0);
+  });
+
+  it("keeps a slide range intact when its script contains </section>", () => {
+    const deck = `<html><body>
+<section><h1>One</h1><script>var x = "</section>";</script><p>still one</p></section>
+<section><h1>Two close-safe token</h1></section>
+</body></html>`;
+    const ranges = topLevelSectionRanges(deck);
+    expect(ranges).toHaveLength(2);
+    expect(deck.slice(ranges[0].start, ranges[0].end)).toContain("still one");
+    expect(slideIndexForSourceOffset(deck, deck.indexOf("Two close-safe token"))).toBe(1);
   });
 });
 

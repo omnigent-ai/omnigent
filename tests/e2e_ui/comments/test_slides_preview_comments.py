@@ -113,3 +113,22 @@ def test_slides_preview_add_comment(
     assert raw_idx != -1
     assert comment["start_index"] == raw_idx
     assert comment["end_index"] == raw_idx + len(_ANCHOR_SENTENCE)
+
+    # Reopen the deck: the saved comment is highlighted, and clicking its card
+    # navigates to the slide that holds the anchor.
+    page.goto(f"{base_url}/c/{session_id}?file={_SLIDES_PATH}")
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(file_viewer).to_be_visible()
+    expect(file_viewer.locator('iframe[title="Slide deck"]')).to_be_visible(timeout=10_000)
+    # Deck starts on slide 1; open comments and activate the saved card.
+    file_viewer.get_by_role("button", name="Show comments").click()
+    expect(file_viewer.get_by_text(comment_body)).to_be_visible()
+    file_viewer.get_by_text(comment_body).click()
+    expect(file_viewer.get_by_text("2 / 2")).to_be_visible(timeout=5_000)
+    preview = file_viewer.frame_locator('iframe[title="Slide deck"]')
+    highlight_count = preview.locator("body").evaluate(
+        "() => { const h = (typeof CSS !== 'undefined' && CSS.highlights)"
+        " ? CSS.highlights.get('omni-comment-active') || CSS.highlights.get('omni-comment')"
+        " : null; return h ? h.size : 0; }"
+    )
+    assert highlight_count >= 1, "reopened deck should highlight the saved comment"

@@ -692,39 +692,9 @@ export function injectCommentBridge(html: string, nonce: string): string {
   return appendCommentBridge(prepareHtmlPreviewDoc(html), nonce);
 }
 
-/** Index of the matching `</section>` for a `<section` that opens at `openAt`. */
-function sectionCloseEnd(html: string, openAt: number): number {
-  const openTag = /^<section\b[^>]*>/i.exec(html.slice(openAt));
-  if (!openTag) return openAt;
-  let i = openAt + openTag[0].length;
-  let depth = 1;
-  while (i < html.length && depth > 0) {
-    if (html.startsWith("<!--", i)) {
-      const close = html.indexOf("-->", i + 4);
-      i = close === -1 ? html.length : close + 3;
-      continue;
-    }
-    const rest = html.slice(i);
-    const nextOpen = rest.search(/<section\b/i);
-    const nextClose = rest.search(/<\/section\s*>/i);
-    if (nextClose === -1) return html.length;
-    if (nextOpen !== -1 && nextOpen < nextClose) {
-      const tag = /^<section\b[^>]*>/i.exec(html.slice(i + nextOpen));
-      i += nextOpen + (tag ? tag[0].length : 8);
-      depth += 1;
-    } else {
-      const tag = /^<\/section\s*>/i.exec(html.slice(i + nextClose));
-      i += nextClose + (tag ? tag[0].length : 10);
-      depth -= 1;
-    }
-  }
-  return i;
-}
+/** Tags whose contents are raw text (not parsed as HTML) until their close tag. */
+const RAW_TEXT_TAGS = new Set(["script", "style", "textarea", "title"]);
 
-/**
- * Source ranges of `body > section` elements (top-level only), in document
- * order. Used to map a comment's source offset to a slide/screen index.
- */
 const VOID_TAGS = new Set([
   "area",
   "base",
@@ -742,6 +712,69 @@ const VOID_TAGS = new Set([
   "wbr",
 ]);
 
+/** Advance past an HTML comment starting at `i`, or to `limit` if unclosed. */
+function skipHtmlComment(html: string, i: number, limit: number): number {
+  const close = html.indexOf("-->", i + 4);
+  return close === -1 || close >= limit ? limit : close + 3;
+}
+
+/**
+ * Advance past a raw-text element (`script`/`style`/`textarea`/`title`) whose
+ * open tag starts at `openAt`. Contents are not scanned for tags.
+ */
+function skipRawTextElement(html: string, openAt: number, name: string, limit: number): number {
+  const openTag = new RegExp(`^<${name}\\b[^>]*>`, "i").exec(html.slice(openAt));
+  if (!openTag) return Math.min(openAt + 1, limit);
+  if (/\/>$/.test(openTag[0]) || VOID_TAGS.has(name)) {
+    return Math.min(openAt + openTag[0].length, limit);
+  }
+  const after = openAt + openTag[0].length;
+  const close = new RegExp(`</${name}\\s*>`, "i").exec(html.slice(after, limit));
+  if (!close || close.index === undefined) return limit;
+  return after + close.index + close[0].length;
+}
+
+/** Index of the matching `</section>` for a `<section` that opens at `openAt`. */
+function sectionCloseEnd(html: string, openAt: number): number {
+  const openTag = /^<section\b[^>]*>/i.exec(html.slice(openAt));
+  if (!openTag) return openAt;
+  let i = openAt + openTag[0].length;
+  let depth = 1;
+  while (i < html.length && depth > 0) {
+    if (html.startsWith("<!--", i)) {
+      i = skipHtmlComment(html, i, html.length);
+      continue;
+    }
+    if (html.charAt(i) !== "<") {
+      i += 1;
+      continue;
+    }
+    const open = /^<([a-zA-Z][\w:-]*)\b[^>]*>/.exec(html.slice(i));
+    if (open) {
+      const name = open[1].toLowerCase();
+      if (RAW_TEXT_TAGS.has(name)) {
+        i = skipRawTextElement(html, i, name, html.length);
+        continue;
+      }
+      if (name === "section" && !/\/>$/.test(open[0])) depth += 1;
+      i += open[0].length;
+      continue;
+    }
+    const close = /^<\/([a-zA-Z][\w:-]*)\s*>/.exec(html.slice(i));
+    if (close) {
+      if (close[1].toLowerCase() === "section") depth -= 1;
+      i += close[0].length;
+      continue;
+    }
+    i += 1;
+  }
+  return i;
+}
+
+/**
+ * Source ranges of `body > section` elements (top-level only), in document
+ * order. Used to map a comment's source offset to a slide/screen index.
+ */
 export function topLevelSectionRanges(html: string): { start: number; end: number }[] {
   const bodyOpen = /<body\b[^>]*>/i.exec(html);
   const from = bodyOpen && bodyOpen.index !== undefined ? bodyOpen.index + bodyOpen[0].length : 0;
@@ -752,8 +785,7 @@ export function topLevelSectionRanges(html: string): { start: number; end: numbe
   let depth = 0;
   while (i < limit) {
     if (html.startsWith("<!--", i)) {
-      const close = html.indexOf("-->", i + 4);
-      i = close === -1 ? limit : close + 3;
+      i = skipHtmlComment(html, i, limit);
       continue;
     }
     if (html.charAt(i) !== "<") {
@@ -772,6 +804,10 @@ export function topLevelSectionRanges(html: string): { start: number; end: numbe
       continue;
     }
     const name = openTag[1].toLowerCase();
+    if (RAW_TEXT_TAGS.has(name)) {
+      i = skipRawTextElement(html, i, name, limit);
+      continue;
+    }
     const selfClosing = /\/>$/.test(openTag[0]) || VOID_TAGS.has(name);
     if (depth === 0 && name === "section") {
       const start = i;
