@@ -2217,18 +2217,17 @@ def test_seed_isolated_agy_home_uses_custom_source_gemini_dir(
     seed_isolated_agy_home(bridge_dir, source_gemini_dir=custom_gemini)
 
     iso_gemini = agy_gemini_dir(bridge_dir)
-    assert (
-        iso_gemini / "antigravity-cli" / "installation_id"
-    ).read_text(encoding="utf-8") == "custom-install-id"
-    assert (
-        iso_gemini / "oauth_creds.json"
-    ).read_text(encoding="utf-8") == '{"access_token":"custom-token"}'
+    assert (iso_gemini / "antigravity-cli" / "installation_id").read_text(
+        encoding="utf-8"
+    ) == "custom-install-id"
+    assert (iso_gemini / "oauth_creds.json").read_text(
+        encoding="utf-8"
+    ) == '{"access_token":"custom-token"}'
 
 
 # ---------------------------------------------------------------------------
 # Interaction-prompt TUI delivery (send_interaction_keys_via_tui) — #1200
 # ---------------------------------------------------------------------------
-
 
 
 def test_send_interaction_keys_via_tui_sends_one_send_keys_invocation(
@@ -2572,3 +2571,182 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+# ── retention: agy-home conversation history ─────────────────────────────────
+
+
+def _make_dead_exited_pid() -> int:
+    """Spawn-and-wait a subprocess; return its pid (provably dead, not recycled)."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_prune_retains_dead_owner_with_agy_home_conversation_db(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead-owner bridge with an agy conversation SQLite .db file must not be pruned.
+
+    The agy-home/.gemini/antigravity-cli/conversations/ directory stores session
+    history. Deleting it destroys conversation history that the user may want to
+    resume — even after the Omnigent runner exits.
+    """
+    import sqlite3
+
+    root = tmp_path / "antigravity-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+
+    bridge_dir = root / "session-with-history"
+    conv_dir = bridge_dir / "agy-home" / ".gemini" / "antigravity-cli" / "conversations"
+    conv_dir.mkdir(parents=True)
+    db_path = conv_dir / "saved.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE messages (body TEXT)")
+        conn.execute("INSERT INTO messages VALUES ('hello')")
+    (bridge_dir / "owner.pid").write_text(str(_make_dead_exited_pid()), encoding="utf-8")
+
+    pruned = _mod.prune_orphaned_bridge_dirs()
+
+    assert pruned == 0, "bridge with agy conversation history must survive orphan sweep"
+    assert bridge_dir.exists()
+    assert db_path.exists()
+
+
+def test_prune_retains_dead_owner_with_agy_home_db_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bridge with only a .db-wal WAL sidecar must not be pruned.
+
+    SQLite in WAL mode creates <db>.db-wal files alongside the main database.
+    A bridge may contain only the WAL (e.g. after a crash before the final
+    checkpoint); the retention check must treat a WAL file as evidence of
+    history and refuse to prune.
+    """
+    root = tmp_path / "antigravity-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+
+    bridge_dir = root / "session-wal-only"
+    conv_dir = bridge_dir / "agy-home" / ".gemini" / "antigravity-cli" / "conversations"
+    conv_dir.mkdir(parents=True)
+    wal_path = conv_dir / "saved.db-wal"
+    wal_path.write_bytes(b"\x00" * 32)  # minimal non-empty WAL stub
+    (bridge_dir / "owner.pid").write_text(str(_make_dead_exited_pid()), encoding="utf-8")
+
+    pruned = _mod.prune_orphaned_bridge_dirs()
+
+    assert pruned == 0, "bridge with agy WAL sidecar must survive orphan sweep"
+    assert bridge_dir.exists()
+    assert wal_path.exists()
+
+
+def test_prune_retains_dead_owner_when_agy_home_scan_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable agy-home is treated conservatively: the bridge is kept.
+
+    The retention check must fail closed — if we cannot determine whether
+    conversation history exists, we must not delete the bridge.
+    """
+    root = tmp_path / "antigravity-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+
+    bridge_dir = root / "session-unreadable-home"
+    agy_home = bridge_dir / "agy-home"
+    agy_home.mkdir(parents=True)
+    (bridge_dir / "owner.pid").write_text(str(_make_dead_exited_pid()), encoding="utf-8")
+
+    # Make os.walk raise on the agy-home subtree.
+    real_walk = os.walk
+
+    def _failing_walk(path: object, **kwargs: object) -> object:
+        if str(path).startswith(str(agy_home)):
+            raise PermissionError("synthetic unreadable agy-home")
+        return real_walk(path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_mod.os, "walk", _failing_walk)
+
+    pruned = _mod.prune_orphaned_bridge_dirs()
+
+    assert pruned == 0, "unreadable agy-home must prevent bridge deletion (fail-closed)"
+    assert bridge_dir.exists()
+
+
+def test_prune_removes_dead_owner_disposable_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead-owner bridge with no agy-home directory is genuinely disposable and is pruned."""
+    root = tmp_path / "antigravity-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+
+    bridge_dir = root / "session-no-home"
+    bridge_dir.mkdir(parents=True)
+    (bridge_dir / "owner.pid").write_text(str(_make_dead_exited_pid()), encoding="utf-8")
+    # Typical bridge artefacts that appear before agy mints any conversation:
+    (bridge_dir / "state.json").write_text("{}", encoding="utf-8")
+    (bridge_dir / "tmux.json").write_text("{}", encoding="utf-8")
+
+    pruned = _mod.prune_orphaned_bridge_dirs()
+
+    assert pruned == 1, "genuinely empty dead-owner bridge must be pruned"
+    assert not bridge_dir.exists()
+
+
+def test_prune_then_prepare_preserves_resume_bridge_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Global orphan sweep must not destroy a bridge that is then prepared for resume.
+
+    Proof sequence: (1) global sweep runs with a dead-owner bridge that contains
+    agy conversation history → bridge survives. (2) prepare_bridge_dir is called
+    for the same bridge id → bridge is still present and the new owner.pid is
+    written. This simulates the runner resuming an agy session after Omnigent
+    restarts.
+    """
+    import sqlite3
+
+    root = tmp_path / "antigravity-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+
+    bridge_id = "resume-test-bridge-id"
+    bridge_dir = _mod.bridge_dir_for_bridge_id(bridge_id)
+    conv_dir = bridge_dir / "agy-home" / ".gemini" / "antigravity-cli" / "conversations"
+    conv_dir.mkdir(parents=True)
+    db_path = conv_dir / "saved.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE messages (body TEXT)")
+        conn.execute("INSERT INTO messages VALUES ('synthetic reply')")
+    dead_pid = _make_dead_exited_pid()
+    (bridge_dir / "owner.pid").write_text(str(dead_pid), encoding="utf-8")
+
+    # Step 1: global orphan sweep — bridge must survive because it has history.
+    pruned = _mod.prune_orphaned_bridge_dirs()
+    assert pruned == 0, "orphan sweep must not delete a bridge with agy history"
+    assert bridge_dir.exists()
+    assert db_path.exists(), "conversation db must survive the orphan sweep"
+
+    # Step 2: runner prepares the bridge for resume — id is still present.
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda pid: pid == os.getpid())
+    prepared = _mod.prepare_bridge_dir(bridge_id)
+    assert prepared == bridge_dir
+    assert db_path.exists(), "conversation db must still be present after prepare"
+    new_pid_text = (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip()
+    assert new_pid_text == str(os.getpid()), "prepare must refresh owner.pid to current runner"

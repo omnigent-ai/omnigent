@@ -36,6 +36,10 @@ _STATE_FILE = "state.json"
 # the agy terminal launches; read by the executor's first-turn bootstrap.
 _TMUX_FILE = "tmux.json"
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "antigravity-native"
+# Dead-owner bridges with agy conversation history are retained for 7 days.
+# Bridges without any agy-home conversation data (genuinely disposable) are
+# always eligible for immediate reclaim regardless of age.
+_ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 # Prefix of the launcher-minted placeholder conversation id (see
 # ``antigravity_native._mint_agy_conversation_id``). agy mints its own real
@@ -269,9 +273,59 @@ def prune_orphaned_bridge_dirs() -> int:
     at startup to reclaim dirs leaked by a prior runner that died without
     running the explicit delete path.
 
+    A bridge is only eligible when :func:`_agy_orphan_retention_expired` clears
+    it: bridges that contain agy conversation history (any ``.db`` or
+    ``.db-wal`` file under ``agy-home/``) are retained so the user can resume
+    them. Bridges without an ``agy-home/`` directory are genuinely disposable
+    and are always eligible.
+
     :returns: The number of orphaned bridge dirs removed.
     """
-    return native_bridge_common.prune_orphaned_dirs(bridge_root())
+    return native_bridge_common.prune_orphaned_dirs(
+        bridge_root(),
+        should_prune=_agy_orphan_retention_expired,
+    )
+
+
+def _agy_orphan_retention_expired(bridge_dir: Path) -> bool:
+    """Return whether a dead-owner Antigravity bridge is eligible for deletion.
+
+    A bridge is **not** eligible (returns ``False``) when:
+
+    * ``agy-home/`` exists and contains at least one ``.db`` or ``.db-wal``
+      file anywhere in the tree — the user's native conversation history is
+      present; retain it.
+    * Scanning ``agy-home/`` raises any exception — fail closed, retain the
+      bridge rather than risk destroying history.
+
+    A bridge *is* eligible (returns ``True``) when ``agy-home/`` is absent
+    (bridge never reached the point of minting a conversation) or is present
+    but contains no SQLite database files (genuinely disposable early-startup
+    state before any turn was processed).
+
+    :param bridge_dir: Per-session Antigravity bridge directory.
+    :returns: ``True`` when the bridge may be removed.
+    """
+    agy_home = agy_home_dir(bridge_dir)
+    if not agy_home.exists():
+        # No agy-home at all — bridge never reached the point of minting a
+        # conversation; it is genuinely disposable.
+        return True
+    # Scan agy-home for any SQLite database or WAL file. Any such file means
+    # the user's conversation history is present, so we must retain the bridge.
+    try:
+        for _dirpath, _subdirs, filenames in os.walk(agy_home):
+            for filename in filenames:
+                if filename.endswith(".db") or filename.endswith(".db-wal"):
+                    return False
+    except OSError:
+        # Cannot determine whether history exists — fail closed, keep the bridge.
+        _logger.debug(
+            "Cannot scan agy-home for conversation history in %s; retaining bridge",
+            bridge_dir,
+        )
+        return False
+    return True
 
 
 # ── Omnigent MCP relay wiring (sys_* tools) ──────────────────────────────────
