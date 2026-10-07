@@ -444,6 +444,85 @@ async def test_interrupt_moves_to_a_fresh_session_after_a_failed_sample() -> Non
     assert calls == ["finish", "create", "warm", "markers:fresh", "gate:fresh"]
 
 
+def _status_line(status: str) -> bytes:
+    return f'data: {{"type": "session.status", "status": "{status}"}}\n\n'.encode()
+
+
+def _gated_env(statuses: list[str], end_stream: asyncio.Event) -> BenchEnvironment:
+    """A runner-mode env whose SSE stream emits *statuses*, then ends on *end_stream*."""
+
+    async def _stream():
+        for status in statuses:
+            yield _status_line(status)
+        await end_stream.wait()
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, content=_stream())
+        return httpx.Response(202)
+
+    env = BenchEnvironment(with_runner=True)
+    env.client = httpx.AsyncClient(
+        base_url="http://bench", transport=httpx.MockTransport(_handler)
+    )
+
+    async def _no_mock(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    env.configure_mock = _no_mock  # type: ignore[method-assign]
+    env._wait_gate_pending = _no_mock  # type: ignore[method-assign]
+    return env
+
+
+@pytest.mark.asyncio
+async def test_interrupt_fails_when_the_stream_ends_without_idle() -> None:
+    """A stream closing after the interrupt is not a cancel: the sample must fail."""
+    end_stream = asyncio.Event()
+    env = _gated_env(["running"], end_stream)
+    assert env.client is not None
+    try:
+        turn = await env.start_gated_turn("s1", timeout=5)
+        end_stream.set()  # EOF with no idle status
+        with pytest.raises(RuntimeError, match="did not settle cleanly"):
+            await env.interrupt_gated_turn(turn, timeout=5)
+        await env.finish_gated_turn(turn)
+    finally:
+        await env.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_gated_turn_fails_promptly_when_the_turn_settles_before_the_gate() -> None:
+    """A turn that fails before calling the LLM must not wait out the gate timeout."""
+    env = _gated_env(["running", "failed"], asyncio.Event())
+    assert env.client is not None
+
+    async def _never_pending(*, timeout: float) -> None:
+        await asyncio.Event().wait()
+
+    env._wait_gate_pending = _never_pending  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="settled before it was interrupted"):
+            await asyncio.wait_for(env.start_gated_turn("s1", timeout=60), timeout=5)
+    finally:
+        await env.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_cli_startup_terminates_the_stashed_child_once() -> None:
+    terminated: list[bool] = []
+
+    class _Child:
+        def terminate(self, force: bool) -> None:
+            terminated.append(force)
+
+    ctx: dict[str, object] = {"child": _Child()}
+    env = cast(BenchEnvironment, object())
+    await bench_journeys._close_cli_startup(env, ctx)
+    await bench_journeys._close_cli_startup(env, ctx)  # a second cleanup is harmless
+
+    assert terminated == [True]
+
+
 @pytest.mark.asyncio
 async def test_interrupt_refuses_a_turn_that_already_settled() -> None:
     """Timing an interrupt on a settled turn would measure nothing; it must fail."""

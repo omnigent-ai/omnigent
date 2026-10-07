@@ -1174,6 +1174,7 @@ class BenchEnvironment:
                             return
                         elif status == "idle" and running.is_set():
                             return
+                    outcome["error"] = "stream ended before the turn settled"
             except httpx.HTTPError as exc:
                 outcome["error"] = repr(exc)
             finally:
@@ -1194,10 +1195,19 @@ class BenchEnvironment:
             posted = await self.client.post(f"/v1/sessions/{session_id}/events", json=body)
             posted.raise_for_status()
             await asyncio.wait_for(running.wait(), timeout=timeout)
-            if not idle.is_set():
-                await self._wait_gate_pending(timeout=timeout)
+            # Race the gate poll against the turn settling, so a turn that fails
+            # before calling the LLM errors at once instead of after the timeout.
+            gate = asyncio.ensure_future(self._wait_gate_pending(timeout=timeout))
+            settled = asyncio.ensure_future(idle.wait())
+            try:
+                await asyncio.wait({gate, settled}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (gate, settled):
+                    task.cancel()
+                await asyncio.gather(gate, settled, return_exceptions=True)
             if idle.is_set():
                 raise RuntimeError(f"gated turn settled before it was interrupted: {outcome}")
+            gate.result()  # raises when no LLM request reached the gate
         except BaseException:
             await self.finish_gated_turn(turn)
             raise
