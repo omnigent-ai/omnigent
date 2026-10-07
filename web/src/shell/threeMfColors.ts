@@ -3,6 +3,9 @@ import { strFromU8, strToU8, zipSync, Inflate } from "three/examples/jsm/libs/ff
 const CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const XMLNS = "http://www.w3.org/2000/xmlns/";
 const PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
+const MODEL_NAMESPACES = new Set([CORE, PRODUCTION, "http://schemas.bambulab.com/package/2021"]);
+const MAX_NAMESPACE_PREFIX_BYTES = 12;
+const MAX_NAMESPACE_BYTES = 100;
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 export const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
 export const INFLATE_CHUNK_BYTES = 16 * 1024;
@@ -94,7 +97,7 @@ function utf8Length(text: string): number {
   return bytes;
 }
 
-function boundedSerialization(source: Element, limit: number): string {
+function serializationBound(source: Element, limit: number): number {
   const escapedBytes = (text: string, attribute = false) => {
     let size = utf8Length(text);
     for (let index = 0; index < text.length; index++) {
@@ -106,38 +109,19 @@ function boundedSerialization(source: Element, limit: number): string {
     }
     return size;
   };
-  let bound = 0;
-  const namespaceSizes = new Map<string, number>();
-  const namespace = (element: Element, prefix: string | null, uri: string | null) => {
-    if (!uri || uri === XMLNS || prefix === "xml") return;
-    const name = prefix ? `xmlns:${prefix}` : "xmlns";
-    for (let ancestor: Element | null = element; ancestor; ancestor = ancestor.parentElement) {
-      if (ancestor.getAttributeNS(XMLNS, prefix || "xmlns") === uri) return;
-      if (ancestor !== element && ancestor.prefix === prefix && ancestor.namespaceURI === uri)
-        return;
-      if (ancestor === source) break;
-    }
-    let size = namespaceSizes.get(uri);
-    if (size === undefined) {
-      size = escapedBytes(uri, true);
-      namespaceSizes.set(uri, size);
-    }
-    bound += utf8Length(name) + size + 4;
-  };
-  // Standalone serialization can repeat namespace bindings inherited outside this subtree.
+  // Allowlisted URIs and short prefixes bound any serializer-generated namespace declaration.
+  let bound = MAX_NAMESPACE_BYTES;
   const walker = source.ownerDocument.createTreeWalker(source, NodeFilter.SHOW_ALL);
   do {
     const node = walker.currentNode;
     if (node instanceof Element) {
-      bound += 2 * utf8Length(node.tagName) + 5;
-      namespace(node, node.prefix, node.namespaceURI);
+      bound += node.hasChildNodes()
+        ? 2 * utf8Length(node.tagName) + 5
+        : utf8Length(node.tagName) + 3;
+      if (node.prefix) bound += MAX_NAMESPACE_BYTES;
       for (const name of node.getAttributeNames()) {
         bound += utf8Length(name) + escapedBytes(node.getAttribute(name) ?? "", true) + 4;
-        const separator = name.indexOf(":");
-        if (separator >= 0 && !name.startsWith("xmlns:")) {
-          const prefix = name.slice(0, separator);
-          namespace(node, prefix, node.lookupNamespaceURI(prefix));
-        }
+        if (name.includes(":") && !name.startsWith("xmlns:")) bound += MAX_NAMESPACE_BYTES;
       }
     } else {
       bound += escapedBytes(node.nodeValue ?? "");
@@ -145,7 +129,7 @@ function boundedSerialization(source: Element, limit: number): string {
     }
     if (bound > limit) throw new Error("3MF serialization byte limit");
   } while (walker.nextNode());
-  return new XMLSerializer().serializeToString(source);
+  return bound;
 }
 
 function xml(bytes: Uint8Array): Document {
@@ -351,8 +335,9 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     );
     const candidateColors = new Set<string>();
     for (const object of objectConfigs.values()) {
+      const inherited = slot(object, 1);
       for (const part of children(object, "part")) {
-        const effective = normal(part) ? color(slot(part, slot(object, 1))) : null;
+        const effective = normal(part) ? color(slot(part, inherited)) : null;
         if (effective) candidateColors.add(effective);
       }
     }
@@ -370,6 +355,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const objects = new Map<string, Element>();
     // Moved objects acquire new IDs; keep their original component targets.
     const links = new Map<string, { id: string; path: string }[]>();
+    const namespaces = new Map<string, string>();
     let objectCount = 0;
     let componentCount = 0;
     for (const [path, data] of entries) {
@@ -377,6 +363,28 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       const document = xml(data);
       entries.delete(path);
       for (const element of document.querySelectorAll("*")) {
+        if (!MODEL_NAMESPACES.has(element.namespaceURI ?? "")) return buffer;
+        if (utf8Length(element.prefix ?? "") > MAX_NAMESPACE_PREFIX_BYTES) return buffer;
+        for (const name of element.getAttributeNames()) {
+          if (name === "xmlns" || name.startsWith("xmlns:")) {
+            const uri = element.getAttribute(name)!;
+            if (
+              element !== document.documentElement ||
+              !MODEL_NAMESPACES.has(uri) ||
+              utf8Length(name === "xmlns" ? "" : name.slice(6)) > MAX_NAMESPACE_PREFIX_BYTES ||
+              (namespaces.has(name) && namespaces.get(name) !== uri)
+            )
+              return buffer;
+            namespaces.set(name, uri);
+          } else if (name.includes(":")) {
+            const prefix = name.slice(0, name.indexOf(":"));
+            if (
+              utf8Length(prefix) > MAX_NAMESPACE_PREFIX_BYTES ||
+              (prefix !== "xml" && !MODEL_NAMESPACES.has(element.lookupNamespaceURI(prefix) ?? ""))
+            )
+              return buffer;
+          }
+        }
         if (
           APPEARANCE.has(element.localName) ||
           ((element.localName === "object" || element.localName === "triangle") &&
@@ -412,19 +420,8 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     if (!root) return buffer;
     const output = document.implementation.createDocument(CORE, "model");
     const outputModel = output.documentElement;
-    const namespaces = new Map<string, string | null>();
-    for (const model of models.values()) {
-      for (const attribute of model.documentElement.attributes) {
-        if (attribute.namespaceURI !== XMLNS || attribute.name === "xmlns") continue;
-        const previous = namespaces.get(attribute.name);
-        namespaces.set(
-          attribute.name,
-          previous === undefined || previous === attribute.value ? attribute.value : null,
-        );
-      }
-    }
     for (const [name, value] of namespaces) {
-      if (value !== null) outputModel.setAttributeNS(XMLNS, name, value);
+      outputModel.setAttributeNS(XMLNS, name, value);
     }
     if (root.documentElement.hasAttribute("unit"))
       outputModel.setAttribute("unit", root.documentElement.getAttribute("unit")!);
@@ -438,11 +435,11 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const sourceSizes = new Map<string, number>();
     const moved = new Set<string>();
     const emittedLimit = selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD;
-    let emittedBytes = utf8Length(boundedSerialization(outputModel, emittedLimit));
+    let emittedBytes = serializationBound(outputModel, emittedLimit);
     const reserve = (source: Element, key: string) => {
       let size = sourceSizes.get(key);
       if (size === undefined) {
-        size = utf8Length(boundedSerialization(source, emittedLimit - emittedBytes));
+        size = serializationBound(source, emittedLimit - emittedBytes);
         sourceSizes.set(key, size);
       }
       emittedBytes += size;
