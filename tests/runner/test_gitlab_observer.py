@@ -70,9 +70,19 @@ def push_output(url: str = URL) -> str:
 )
 @pytest.mark.parametrize("url", [URL, PRIVATE_URL])
 @pytest.mark.parametrize("stream", ["output", "stdout", "stderr"])
-def test_push_options_track_server_reported_mr_across_worktrees(command, url, stream):
-    refs, created = shell(command, push_output(url), stream=stream)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_push_options_track_server_reported_mr_across_worktrees(command, url, stream, newline):
+    refs, created = shell(command, push_output(url).replace("\n", newline), stream=stream)
     assert [ref.url for ref in refs] == [url] and created
+
+
+def test_push_banner_at_end_of_output_keeps_crlf_url():
+    refs, created = shell(
+        "git push origin HEAD -o merge_request.create",
+        f"remote: View merge request for feature:\r\nremote:   {URL}\r\n",
+        stream="stderr",
+    )
+    assert [ref.url for ref in refs] == [URL] and created
 
 
 @pytest.mark.parametrize("stream", ["output", "stdout", "stderr"])

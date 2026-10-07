@@ -177,7 +177,7 @@ def _push_output(text: str) -> list[PullRequestRef]:
         return []
     refs = []
     for match in re.finditer(
-        r"(?m)^remote:\s*View merge request for [^\n]+:\s*\nremote:[ \t]+(https?://\S+)[ \t]*$",
+        r"(?m)^remote:\s*View merge request for [^\n]+:\s*\nremote:[ \t]+(https?://\S+)[ \t\r]*$",
         text,
     ):
         if re.search(r"/-/merge_requests/[1-9][0-9]*/?$", match[1]) and (
