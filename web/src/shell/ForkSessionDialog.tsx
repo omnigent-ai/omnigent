@@ -28,6 +28,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
@@ -680,7 +682,33 @@ function ForkRunConfig({
  * @param onClose - Closes the host dialog (Cancel, and after a
  *   successful fork).
  */
-export function ForkSessionForm({
+export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionForm>[0]) {
+  const { forkDisabledReason } = useSessionActionRestrictions(props.sourceSessionId, {
+    hostId: props.sourceHostId,
+  });
+  if (forkDisabledReason) {
+    return (
+      <>
+        <p className="text-sm text-muted-foreground" data-testid="fork-session-unavailable">
+          {forkDisabledReason}
+        </p>
+        <DialogFooter>
+          <Button variant="ghost" onClick={props.onClose}>
+            Cancel
+          </Button>
+          <DisabledActionTooltip reason={forkDisabledReason} label="Clone session">
+            <Button data-testid="fork-session-submit" disabled>
+              {props.sourceWorkspace ? "Clone & start" : "Clone"}
+            </Button>
+          </DisabledActionTooltip>
+        </DialogFooter>
+      </>
+    );
+  }
+  return <SupportedForkSessionForm {...props} />;
+}
+
+function SupportedForkSessionForm({
   sourceSessionId,
   sourceTitle,
   sourceWorkspace,

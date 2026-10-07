@@ -1,5 +1,34 @@
 /** UI-only session capability gates, derived from the live session snapshot. */
 
+export const ARCLET_FORK_UNSUPPORTED = "Forking Arclet sessions is not supported yet.";
+export const ARCLET_SWITCH_HOST_UNSUPPORTED =
+  "Switching hosts is not supported for Arclet sessions yet.";
+export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
+
+export interface SessionActionSource {
+  labels?: Record<string, string | null> | null;
+  hostId?: string | null;
+  host_id?: string | null;
+}
+
+export function sessionActionRestrictions(
+  session: SessionActionSource | null | undefined,
+  host?: { sandbox_provider?: string | null },
+): { forkDisabledReason?: string; switchHostDisabledReason?: string } {
+  // Embedded deployments derive this label even when the viewer cannot list
+  // the source's host. A repository label alone does not imply a restriction.
+  const unsupportedSource =
+    session?.labels?.["omnigent.host_type"] === "managed" || host?.sandbox_provider === "arclet";
+  return {
+    forkDisabledReason: unsupportedSource ? ARCLET_FORK_UNSUPPORTED : undefined,
+    switchHostDisabledReason: unsupportedSource
+      ? ARCLET_SWITCH_HOST_UNSUPPORTED
+      : host?.sandbox_provider
+        ? "Switching hosts is not supported for managed sandbox sessions yet."
+        : undefined,
+  };
+}
+
 const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
 const CODEX_NATIVE_WRAPPER = "codex-native-ui";
 const PI_NATIVE_WRAPPER = "pi-native-ui";

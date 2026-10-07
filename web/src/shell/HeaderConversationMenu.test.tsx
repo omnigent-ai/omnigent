@@ -141,6 +141,17 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("HeaderConversationMenu", () => {
+  it("keeps an unsupported Fork visible without opening its dialog", () => {
+    renderMenu({ forkDisabledReason: "Forking Arclet sessions is not supported yet." });
+    openMenu();
+    const fork = screen.getByTestId("header-fork-conversation");
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(mocks.fork).not.toHaveBeenCalled();
+    expect(fork).toBeInTheDocument();
+  });
+
   it("exposes an accessible trigger and the established action order", () => {
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });

@@ -10,6 +10,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
   Select,
   SelectContent,
@@ -62,7 +64,36 @@ import { useChatStore } from "@/store/chatStore";
  * @param currentHostId - The host it is bound to now; excluded from the
  *   picker and used for the "different machine" warning.
  */
-export function SwitchHostDialog({
+export function SwitchHostDialog(props: Parameters<typeof SupportedSwitchHostDialog>[0]) {
+  const { switchHostDisabledReason } = useSessionActionRestrictions(props.sessionId, {
+    hostId: props.currentHostId,
+  });
+  if (switchHostDisabledReason) {
+    return (
+      <Dialog open={props.open} onOpenChange={props.onOpenChange}>
+        <DialogContent data-testid="switch-host-dialog" className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Switch host</DialogTitle>
+            <DialogDescription>{switchHostDisabledReason}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => props.onOpenChange(false)}>
+              Cancel
+            </Button>
+            <DisabledActionTooltip reason={switchHostDisabledReason} label="Switch host">
+              <Button data-testid="switch-host-button" disabled>
+                Switch host
+              </Button>
+            </DisabledActionTooltip>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+  return <SupportedSwitchHostDialog {...props} />;
+}
+
+function SupportedSwitchHostDialog({
   open,
   onOpenChange,
   sessionId,

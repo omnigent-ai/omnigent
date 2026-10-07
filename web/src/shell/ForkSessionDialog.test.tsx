@@ -228,6 +228,48 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ForkSessionDialog", () => {
+  it.each(["managed snapshot", "Arclet host"])(
+    "blocks the whole form for an unsupported source detected by %s",
+    async (source) => {
+      useSessionMock.mockReturnValue({
+        session: {
+          hostId: "host_1",
+          labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
+        },
+        isLoading: false,
+        error: null,
+      } as ReturnType<typeof useSession>);
+      setHosts([host({ sandbox_provider: source === "Arclet host" ? "arclet" : null })]);
+      renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo" });
+
+      const submit = screen.getByTestId("fork-session-submit");
+      expect(submit).toBeDisabled();
+      expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
+        "Forking Arclet sessions is not supported yet.",
+      );
+      expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-advanced-toggle")).not.toBeInTheDocument();
+      fireEvent.click(submit);
+      fireEvent.focus(submit.parentElement!);
+      fireEvent.keyDown(submit.parentElement!, { key: "Enter" });
+      await waitFor(() =>
+        expect(screen.getByRole("tooltip")).toHaveTextContent(
+          "Forking Arclet sessions is not supported yet.",
+        ),
+      );
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not expose an actionable form before the source snapshot resolves", () => {
+    useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo" });
+    expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+    expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+  });
+
   it("leaves the name optional, suggesting 'Fork of <title>' as the placeholder", () => {
     renderDialog({ sourceTitle: "My session" });
     // Name lives under Advanced now (optional, prefilled-by-placeholder).

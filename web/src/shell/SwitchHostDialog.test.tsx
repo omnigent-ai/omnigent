@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { SwitchHostDialog } from "./SwitchHostDialog";
 import { useHosts } from "@/hooks/useHosts";
+import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
@@ -56,6 +57,7 @@ vi.mock("./HostLabel", () => ({
   HostLabel: ({ host }: { host: { name: string } }) => <span>{host.name}</span>,
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
   useRecentWorkspaces: () => ({ recent: ["/Users/alice/repo"], addRecent: vi.fn() }),
@@ -115,6 +117,7 @@ function renderDialog() {
 }
 
 beforeEach(() => {
+  vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
   useHostsMock.mockReset();
   useHostFilesystemMock.mockReset();
   launchRunnerMock.mockReset();
@@ -136,6 +139,36 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("SwitchHostDialog", () => {
+  it("blocks a directly opened managed-session dialog before releasing its runner", () => {
+    vi.mocked(useSession).mockReturnValue({
+      session: {
+        id: "conv_1",
+        agentId: "agent_1",
+        agentName: null,
+        status: "idle",
+        title: null,
+        createdAt: 0,
+        items: [],
+        permissionLevel: null,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+        labels: { "omnigent.host_type": "managed" },
+      },
+      isLoading: false,
+      error: null,
+    });
+    renderDialog();
+    expect(
+      screen.getByText("Switching hosts is not supported for Arclet sessions yet."),
+    ).toBeVisible();
+    expect(screen.getByTestId("switch-host-button")).toBeDisabled();
+    expect(screen.queryByTestId("mock-workspace-input")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("switch-host-button"));
+    expect(updateSessionMock).not.toHaveBeenCalled();
+    expect(launchRunnerMock).not.toHaveBeenCalled();
+  });
+
   it("releases the runner and the model override before launching on the new host", async () => {
     const client = renderDialog();
     const invalidate = vi.spyOn(client, "invalidateQueries");

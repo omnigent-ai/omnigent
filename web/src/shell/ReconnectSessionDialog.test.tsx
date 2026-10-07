@@ -21,9 +21,21 @@
 // default, what each tab shows, and what props reach the form.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ReconnectSessionDialog, buildReconnectCommand } from "./ReconnectSessionDialog";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: vi.fn(),
+}));
+
+beforeEach(() => {
+  vi.mocked(useSessionActionRestrictions).mockReturnValue({
+    forkDisabledReason: undefined,
+    switchHostDisabledReason: undefined,
+  });
+});
 
 vi.mock("./ForkSessionDialog", () => ({
   ForkSessionForm: (props: {
@@ -198,6 +210,28 @@ describe("buildReconnectCommand", () => {
 });
 
 describe("<ReconnectSessionDialog />", () => {
+  it("disables Clone and Switch host for an unsupported managed session", () => {
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: "Forking Arclet sessions is not supported yet.",
+      switchHostDisabledReason: "Switching hosts is not supported for Arclet sessions yet.",
+    });
+    render(
+      <ReconnectSessionDialog
+        open
+        onOpenChange={vi.fn()}
+        conversationId="conv_managed"
+        serverUrl="http://localhost:6767"
+        state="host_offline"
+        isOwner
+      />,
+    );
+    expect(screen.getByTestId("reconnect-session-tab-clone")).toBeDisabled();
+    const switchHost = screen.getByTestId("reconnect-session-switch-host");
+    expect(switchHost).toBeDisabled();
+    fireEvent.click(switchHost);
+    expect(screen.queryByTestId("switch-host-dialog-stub")).not.toBeInTheDocument();
+  });
+
   function renderDialog(props: Partial<React.ComponentProps<typeof ReconnectSessionDialog>> = {}) {
     const onOpenChange = vi.fn();
     render(
@@ -282,6 +316,19 @@ describe("<ReconnectSessionDialog />", () => {
     // no command renders anywhere.
     expect(screen.queryByTestId("reconnect-session-command")).toBeNull();
     expect(screen.getByText("Host is offline")).toBeInTheDocument();
+  });
+
+  it("does not suggest cloning an unsupported session to a non-owner", () => {
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: "Forking Arclet sessions is not supported yet.",
+      switchHostDisabledReason: "Switching hosts is not supported for Arclet sessions yet.",
+    });
+    renderDialog({ state: "host_offline", isOwner: false });
+    expect(clonePanelState()).toBe("inactive");
+    expect(screen.getByTestId("reconnect-session-description")).toHaveTextContent(
+      "Forking Arclet sessions is not supported yet.",
+    );
+    expect(screen.queryByText(/Clone the session to continue/)).not.toBeInTheDocument();
   });
 
   it("explains owner-only reconnect (no command) on a non-owner's Reconnect tab", () => {

@@ -101,6 +101,29 @@ describe("AssistantBubble fork source", () => {
     items: [{ kind: "text", itemId: "side_text", text: "Side reply", final: true }],
   };
 
+  it("disables the message fork without hiding its explanation", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider
+          value={{
+            canFork: true,
+            disabledReason: "Forking Arclet sessions is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <BubbleView bubble={bubble} isLastAssistant={false} />
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+    const fork = screen.getByTestId("fork-from-response");
+    expect(fork).toBeDisabled();
+    expect(fork.parentElement).toHaveAttribute("tabindex", "0");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork.parentElement!, { key: "Enter" });
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       name: "side chat",

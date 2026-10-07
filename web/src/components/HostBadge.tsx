@@ -5,6 +5,9 @@ import type { Host } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
 import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
+import { sessionActionRestrictions } from "@/lib/sessionCapabilities";
+import { DisabledActionTooltip } from "./DisabledActionTooltip";
+import { SessionActionMenuItem } from "./SessionActionMenuItem";
 import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
 import { cn } from "@/lib/utils";
 import { ComposerHostTrigger } from "@/components/composer/ComposerControls";
@@ -128,9 +131,10 @@ export function HostBadge({
       : liveOnline;
 
   const badge = resolveHostBadge({ hostId, host, online });
+  const { switchHostDisabledReason } = sessionActionRestrictions(session, host);
   if (appearance === "composer") {
     const reconnectable = badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
-    const canSwitch = host !== undefined && !host.sandbox_provider && !readOnly;
+    const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
     const label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
     return (
       <>
@@ -167,8 +171,13 @@ export function HostBadge({
                 Reconnect host
               </DropdownMenuItem>
             )}
-            {canSwitch && (
-              <DropdownMenuItem onSelect={() => setSwitchOpen(true)}>Switch host…</DropdownMenuItem>
+            {(canSwitch || switchHostDisabledReason) && (
+              <SessionActionMenuItem
+                disabledReason={switchHostDisabledReason}
+                onSelect={() => setSwitchOpen(true)}
+              >
+                Switch host…
+              </SessionActionMenuItem>
             )}
             {!badge && (
               <p className="max-w-60 px-2 py-1 text-xs text-muted-foreground">
@@ -229,7 +238,7 @@ export function HostBadge({
   // manual move isn't meaningful. An unresolved record — a shared session, or
   // the list still loading — can't be confirmed non-sandbox, so it stays
   // passive too rather than offering a switch that may not apply.
-  const canSwitch = host !== undefined && !host.sandbox_provider;
+  const canSwitch = host !== undefined && !switchHostDisabledReason;
   if (!canSwitch) {
     return (
       // No aria-label: on a non-interactive div it's announced unreliably and
@@ -240,6 +249,13 @@ export function HostBadge({
         title={title}
       >
         {content}
+        {switchHostDisabledReason && (
+          <DisabledActionTooltip reason={switchHostDisabledReason} label="Switch host">
+            <button type="button" disabled className="pointer-events-none opacity-50">
+              Switch host…
+            </button>
+          </DisabledActionTooltip>
+        )}
       </div>
     );
   }

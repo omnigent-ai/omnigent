@@ -3943,6 +3943,21 @@ describe("Mobile session menu", () => {
 });
 
 describe("AppShell clone/fork action", () => {
+  it("blocks direct current-session fork openers for an unsupported managed session", () => {
+    mockConversations([{ id: "conv_managed", permission_level: 4 }]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({
+        id: "conv_managed",
+        labels: { "omnigent.host_type": "managed" },
+      }),
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_managed");
+    fireEvent.click(screen.getByTestId("fork-probe-open"));
+    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+  });
+
   it("exposes canFork to a read-only collaborator on a top-level session", () => {
     // level 1 = read. A collaborator who can only view the shared session
     // must still be able to fork it into their own copy. The header/menu

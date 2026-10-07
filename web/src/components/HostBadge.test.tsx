@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { HostBadge, resolveHostBadge } from "./HostBadge";
@@ -117,6 +117,36 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("HostBadge", () => {
+  it.each(["managed snapshot", "Arclet host"])(
+    "explains disabled host switching for %s, including keyboard selection",
+    async (source) => {
+      useSessionMock.mockReturnValue({
+        session: {
+          hostId: "host_a1b2",
+          labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
+        },
+      });
+      useHostsMock.mockReturnValue({
+        data: source === "Arclet host" ? [host({ sandbox_provider: "arclet" })] : [],
+      });
+      render(<HostBadge sessionId="conv_1" appearance="composer" />);
+      fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+      const item = screen.getByRole("menuitem", { name: "Switch host…" });
+      expect(item).toHaveAttribute("aria-disabled", "true");
+      fireEvent.focus(item);
+      await waitFor(() =>
+        expect(screen.getByRole("tooltip")).toHaveTextContent(
+          "Switching hosts is not supported for Arclet sessions yet.",
+        ),
+      );
+      fireEvent.click(item);
+      fireEvent.keyDown(item, { key: "Enter" });
+      fireEvent.keyDown(item, { key: " " });
+      expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+      expect(item).toBeInTheDocument();
+    },
+  );
+
   it("renders the host name with an online status when reachable", () => {
     render(<HostBadge sessionId="conv_1" />);
     const badge = screen.getByTestId("host-badge");

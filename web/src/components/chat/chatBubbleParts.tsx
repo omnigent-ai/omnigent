@@ -77,6 +77,7 @@ import { useStickToBottomContext } from "use-stick-to-bottom";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { InlineImage, SessionImage } from "@/components/SessionImage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
@@ -1117,20 +1118,24 @@ function AssistantBubble({
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
               {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                <MessageAction
-                  tooltip="Fork from here"
-                  size="icon-xxs"
-                  data-testid="fork-from-response"
-                  onClick={() =>
-                    forkDialog.openForkDialog({
-                      sourceSessionId: scopedConversationId ?? undefined,
-                      upToResponseId: bubble.responseId,
-                    })
-                  }
-                  componentId="chat.message.fork"
-                >
-                  <SplitIcon size={14} />
-                </MessageAction>
+                <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
+                  <MessageAction
+                    tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
+                    label="Fork from here"
+                    disabled={!!forkDialog.disabledReason}
+                    size="icon-xxs"
+                    data-testid="fork-from-response"
+                    onClick={() =>
+                      forkDialog.openForkDialog({
+                        sourceSessionId: scopedConversationId ?? undefined,
+                        upToResponseId: bubble.responseId,
+                      })
+                    }
+                    componentId="chat.message.fork"
+                  >
+                    <SplitIcon size={14} />
+                  </MessageAction>
+                </DisabledActionTooltip>
               )}
               <MessageAction
                 tooltip={isLinkCopied ? "Copied!" : "Copy link"}
