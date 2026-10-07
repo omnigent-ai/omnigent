@@ -130,12 +130,9 @@ _ENV_API_KEY = "HARNESS_OPENAI_AGENTS_API_KEY"
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
 
-# One-time costs a fresh harness otherwise pays on its first turn (~0.8s cold):
-# importing the Agents SDK and the openai resources ``AsyncOpenAI.responses``
-# loads lazily, plus ``platform.platform()`` (forks ``uname``), which the openai
-# client runs before its first request. Paying them while the harness waits for
-# its first message takes them off that turn.
-_PREWARM_MODULES = ("agents", "openai.resources")
+# Prewarm SDK imports and platform metadata while the harness waits for its
+# first message. ``AsyncOpenAI.responses`` loads the openai resources lazily.
+_PREWARM_MODULES = ("agents", "openai.resources", "openai.resources.responses")
 # The first turn waits at most this long for the prewarm before importing itself.
 _PREWARM_JOIN_TIMEOUT_S = 60.0
 
@@ -244,7 +241,15 @@ def _build_openai_agents_sdk_executor() -> Executor:
     """
     # Never import the SDK concurrently with the prewarm thread: concurrent
     # imports of one package's submodules can see it partially initialized.
-    _sdk_prewarm().join(timeout=_PREWARM_JOIN_TIMEOUT_S)
+    prewarm = _sdk_prewarm()
+    prewarm.join(timeout=_PREWARM_JOIN_TIMEOUT_S)
+    if prewarm.is_alive():
+        # A stalled prewarm must not stall the turn; per-module import locks
+        # still serialize any module both threads are importing.
+        _logger.warning(
+            "openai-agents SDK prewarm still running after %.0fs; building the executor anyway",
+            _PREWARM_JOIN_TIMEOUT_S,
+        )
     # Single canonical spelling for the profile env var:
     # ``DATABRICKS_PROFILE`` (Databricks-specific). The AP-side
     # spawn-env builder always emits this name; the parametrized

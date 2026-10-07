@@ -350,56 +350,77 @@ def test_executor_factory_no_env_returns_blank_config(
     assert captured["reasoning_item_id_policy"] is None
 
 
-def test_create_app_starts_the_first_turn_prewarm_once() -> None:
-    """``create_app()`` imports the SDK in the background, once per process."""
-    openai_agents_sdk_harness.create_app()
+def test_create_app_starts_the_first_turn_prewarm() -> None:
+    """``create_app()`` itself kicks off the prewarm, before any turn."""
+    started: list[None] = []
+
+    with patch.object(openai_agents_sdk_harness, "_sdk_prewarm", lambda: started.append(None)):
+        openai_agents_sdk_harness.create_app()
+
+    assert started == [None]
+
+
+def test_sdk_prewarm_runs_once_and_loads_the_first_turn_modules() -> None:
     thread = openai_agents_sdk_harness._sdk_prewarm()
-    openai_agents_sdk_harness.create_app()
 
     assert openai_agents_sdk_harness._sdk_prewarm() is thread
     thread.join(timeout=60)
     assert not thread.is_alive()
-    # The modules the first turn would otherwise import are now loaded.
     for module in openai_agents_sdk_harness._PREWARM_MODULES:
         assert module in sys.modules
 
 
-def test_executor_factory_waits_for_the_prewarm_before_building() -> None:
-    """The first turn never imports the SDK concurrently with the prewarm thread."""
-    order: list[str] = []
+class _FakePrewarm:
+    def __init__(self, order: list[str], *, alive_after_join: bool) -> None:
+        self._order = order
+        self._alive = alive_after_join
 
-    class _Thread:
-        def join(self, timeout: float | None = None) -> None:
-            order.append(f"join({timeout})")
+    def join(self, timeout: float | None = None) -> None:
+        self._order.append(f"join({timeout})")
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
+@pytest.mark.parametrize("alive_after_join", [False, True])
+def test_executor_factory_waits_for_the_prewarm_before_building(
+    alive_after_join: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first turn joins the prewarm first; a stalled prewarm doesn't block it."""
+    order: list[str] = []
+    prewarm = _FakePrewarm(order, alive_after_join=alive_after_join)
 
     def _fake_init(self: Any, **_kwargs: Any) -> None:
         order.append("executor")
 
     with (
-        patch.object(openai_agents_sdk_harness, "_sdk_prewarm", lambda: _Thread()),
+        patch.object(openai_agents_sdk_harness, "_sdk_prewarm", lambda: prewarm),
         patch(
             "omnigent.inner.openai_agents_sdk_harness.OpenAIAgentsSDKExecutor.__init__",
             _fake_init,
         ),
+        caplog.at_level("WARNING", logger=openai_agents_sdk_harness.__name__),
     ):
         openai_agents_sdk_harness._build_openai_agents_sdk_executor()
 
     assert order == [f"join({openai_agents_sdk_harness._PREWARM_JOIN_TIMEOUT_S})", "executor"]
+    assert ("prewarm still running" in caplog.text) is alive_after_join
 
 
-def test_prewarm_leaves_import_failures_to_the_first_turn() -> None:
-    """A failed prewarm import is swallowed; the real call site still reports it."""
+def test_prewarm_leaves_a_missing_sdk_to_the_first_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed prewarm import is swallowed; the first turn still raises the actionable error."""
+    from omnigent.inner.openai_agents_sdk_executor import _ensure_agents_sdk
+
     platform_calls: list[None] = []
+    monkeypatch.setitem(sys.modules, "agents", None)  # ``import agents`` now fails
+    monkeypatch.setattr(
+        openai_agents_sdk_harness.platform, "platform", lambda: platform_calls.append(None)
+    )
 
-    def _fail(_name: str) -> None:
-        raise ImportError("openai-agents is not installed")
-
-    with (
-        patch.object(openai_agents_sdk_harness.importlib, "import_module", _fail),
-        patch.object(
-            openai_agents_sdk_harness.platform, "platform", lambda: platform_calls.append(None)
-        ),
-    ):
-        openai_agents_sdk_harness._prewarm_first_turn()
+    openai_agents_sdk_harness._prewarm_first_turn()
 
     assert platform_calls == []
+    with pytest.raises(ImportError, match="requires the 'openai-agents' package"):
+        _ensure_agents_sdk()
