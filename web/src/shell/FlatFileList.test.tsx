@@ -215,6 +215,7 @@ describe("FlatFileList canonical row actions", () => {
       ],
     });
 
+    expect(screen.queryByRole("button", { name: /^More actions for/ })).not.toBeInTheDocument();
     fireEvent.contextMenu(screen.getByText(path.split("/").at(-1) ?? path));
     await user.click(await screen.findByRole("menuitem", { name: "Copy relative path" }));
     expect(copyTextMock).toHaveBeenCalledWith(path);
