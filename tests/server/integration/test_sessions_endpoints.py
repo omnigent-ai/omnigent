@@ -2452,6 +2452,88 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert session_resp.json()["title"] == "/grill-me review this rollout"
 
 
+@pytest.mark.parametrize("in_sub_agent", [False, True])
+@pytest.mark.parametrize(
+    ("available", "status", "expected_names"),
+    [(["code-review"], 202, ["review", "code-review"]), (["other"], 400, ["review"])],
+)
+async def test_skill_slash_command_retries_frontmatter_name_on_older_runner(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    available: list[str],
+    status: int,
+    expected_names: list[str],
+    in_sub_agent: bool,
+) -> None:
+    """
+    A runner from before directory-name invocation knows a bundled skill by
+    its frontmatter name, so the server retries with that name once the
+    runner rejects the directory name and lists the frontmatter name. A
+    declared sub-agent session takes the name from its own skills.
+    """
+    resolved: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Emulate an older runner that resolves only ``code-review``.
+
+        :param request: Request sent to the fake runner.
+        :returns: Meta text for ``code-review``, a 404 for other names, or
+            an accepted response for ``/events``.
+        """
+        if request.method == "POST" and request.url.path.endswith("/skills/resolve"):
+            name = json.loads(request.content)["name"]
+            resolved.append(name)
+            if name != "code-review":
+                return httpx.Response(
+                    404, json={"error": "skill_not_found", "available": available}
+                )
+            skill = SkillSpec(name=name, description="Review changes.", content="Look hard.")
+            return httpx.Response(200, json={"meta_text": format_skill_meta_text(skill, "")})
+        return httpx.Response(202, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        skills = [
+            {
+                "dir": "review",
+                "name": "code-review",
+                "description": "Review changes.",
+                "content": "Look hard.",
+            }
+        ]
+        agent = await create_test_agent(
+            client,
+            name="skill-agent",
+            skills=None if in_sub_agent else skills,
+            sub_agents=[{"name": "worker", "skills": skills}] if in_sub_agent else None,
+        )
+        session = await _create_session(client, agent["id"])
+        if in_sub_agent:
+            child = await client.post(
+                "/v1/sessions",
+                json={
+                    "agent_id": agent["id"],
+                    "parent_session_id": session["id"],
+                    "sub_agent_name": "worker",
+                    "title": "worker:review",
+                },
+            )
+            assert child.status_code == 201, child.text
+            session = child.json()
+
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "slash_command", "data": {"kind": "skill", "name": "review"}},
+        )
+
+    assert resp.status_code == status, resp.text
+    assert resolved == expected_names
+
+
 async def test_skill_slash_command_keeps_existing_title(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -10012,10 +10094,12 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
 @pytest.mark.parametrize(
     "case", ["request", "request_idle", "cache", "idle", "missing", "invalid", "failure"]
 )
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
 async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     case: str,
+    event_type: str,
 ) -> None:
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions.common import (
@@ -10038,6 +10122,22 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     )
     assert child_response.status_code == 202, child_response.text
     child_id = child_response.json()["child_session_id"]
+    item_response = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex",
+                    "content": [{"type": "output_text", "text": "Keep this side-chat answer."}],
+                },
+            },
+        },
+    )
+    assert item_response.status_code == 202, item_response.text
+    transcript = (await client.get(f"/v1/sessions/{child_id}/items")).json()
     try:
         _session_status_cache[child_id] = "idle" if case in ("idle", "request_idle") else "running"
         if case == "cache":
@@ -10060,7 +10160,7 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
                 data["response_id"] = "unrelated_response"
             with patch.object(routes_events, "_publish_interrupted") as publish_interrupted:
                 response = await client.post(
-                    f"/v1/sessions/{child_id}/events", json={"type": "interrupt", "data": data}
+                    f"/v1/sessions/{child_id}/events", json={"type": event_type, "data": data}
                 )
             publish_interrupted.assert_not_called()
 
@@ -10085,6 +10185,17 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
             assert response.json() == {"queued": False}
         assert parent["id"] not in _interrupt_fenced_sessions
         assert child_id not in _interrupt_fenced_sessions
+        child = (await client.get(f"/v1/sessions/{child_id}")).json()
+        closed = event_type == "stop_session" and expected_status == 202
+        assert (child["labels"].get("omnigent.closed") == "true") is closed
+        assert (await client.get(f"/v1/sessions/{child_id}/items")).json() == transcript
+        if closed:
+            with patch.object(routes_events, "_get_runner_client") as get_runner:
+                repeated = await client.post(
+                    f"/v1/sessions/{child_id}/events", json={"type": "stop_session", "data": {}}
+                )
+            assert repeated.status_code == 202, repeated.text
+            get_runner.assert_not_called()
     finally:
         _interrupt_fenced_sessions.discard(child_id)
         _session_active_response_cache.pop(child_id, None)

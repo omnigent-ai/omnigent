@@ -878,8 +878,8 @@ function WorkspacePanelImpl({
   // pending tab stays put and is rekeyed to the real child once it arrives (via
   // the sideChatToOpen effect above), so there's no disappear/reappear. Codex
   // forks in-process (its runner intercepts the `/side` message on the parent,
-  // kept prompt-cache-warm); every other harness forks server-side + launches a
-  // runner on the parent's host. Rejects so the composer re-enables and keeps
+  // kept prompt-cache-warm); every other harness forks server-side and reuses
+  // the parent's live runner. Rejects so the composer re-enables and keeps
   // the typed text for a retry.
   const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
     if (usesNativeSideChatFork(sideChatHarness)) {
@@ -940,7 +940,7 @@ function WorkspacePanelImpl({
         childId={selectedSideChat}
         onStart={(text) => startPendingSideChat(selectedSideChat, text)}
         // A Codex side chat restored after a restart is a dead ephemeral
-        // fork: show it read-only (and kill it) rather than let the user
+        // fork: show it read-only rather than let the user
         // send into a thread that no longer exists.
         readOnly={
           usesNativeSideChatFork(sideChatHarness) &&
@@ -949,10 +949,15 @@ function WorkspacePanelImpl({
         }
       />
     );
-  // Close a side-chat tab: stop the child's runner (real children only) so its
-  // compute is freed, then drop the browser-local tab.
-  const closeSideChat = (childId: string) => {
-    if (!childId.startsWith("pending:")) void stopSession(childId).catch(() => {});
+  const closeSideChat = async (childId: string) => {
+    if (!childId.startsWith("pending:")) {
+      try {
+        await stopSession(childId);
+      } catch {
+        toast.error("Couldn't close side chat. Try again.");
+        return;
+      }
+    }
     // The tab is gone, so its unsent text/attachments and any seeded question
     // that never got to send have nowhere to return to.
     useChatStore.getState().clearSideChatComposer(childId);
@@ -1246,7 +1251,7 @@ function WorkspacePanelImpl({
                 it hugs the last tab when they fit and stays pinned when they
                 don't. overflow-y-hidden stops overflow-x:auto from spawning a
                 vertical scrollbar that eats horizontal space. */}
-              <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+              <div className="no-drag flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
                 <FileTabsStrip
                   openFiles={openFiles}
                   activeFilePath={selectedFilePath}

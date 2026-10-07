@@ -121,8 +121,11 @@ PINNED_LABEL_KEY = "omnigent.pinned"
 # Marks a top-level fork created as a side chat. A side chat surfaces only as a
 # Workspace-rail tab, so a conversation carrying this label is hidden from the
 # left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
-# otherwise behaves like any other session (its own runner, transcript).
+# keeps its own transcript and may share its parent's runner.
 SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
+
+# Server-owned routing ancestry; it does not require a workspace or own a runner.
+SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
@@ -215,6 +218,8 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
 _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
 }
 

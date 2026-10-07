@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
@@ -27,6 +28,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_startup_failure,
     read_bridge_startup_timeout,
     read_bridge_state,
+    read_certificate_failure,
     read_codex_config_effort,
     read_codex_config_model,
     read_codex_home_config_effort,
@@ -34,6 +36,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_mcp_startup,
     read_policy_hook_config,
     record_app_server_stopped,
+    record_certificate_failure,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -1121,3 +1124,17 @@ def test_mirror_applied_codex_settings_ignores_values_codex_rewrote_after_them(
 
     assert failed == {"model": "gpt-6-sol"}
     assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}
+
+
+def test_clear_bridge_state_removes_egress_certificate_failure(tmp_path: Path) -> None:
+    """A relaunch must not inherit the previous launcher's certificate evidence."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    record_certificate_failure(
+        bridge_dir, CertificateFailure(evidence="certificate expired", expired=True)
+    )
+    assert read_certificate_failure(bridge_dir) is not None
+
+    clear_bridge_state(bridge_dir)
+
+    assert read_certificate_failure(bridge_dir) is None

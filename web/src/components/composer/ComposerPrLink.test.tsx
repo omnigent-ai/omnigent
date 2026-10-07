@@ -7,19 +7,25 @@ import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 afterEach(cleanup);
 
 describe("ComposerPrLink", () => {
-  it("renders nothing when there are no PRs", () => {
-    const { container } = render(
-      <ComposerPrLink state="ready" prCount={0} prNumber={null} onOpen={() => {}} />,
-    );
-    expect(container).toBeEmptyDOMElement();
-  });
+  it.each(["ready", "loading", "unknown"] as const)(
+    "renders nothing when there are no PRs and the lookup is %s",
+    (state) => {
+      const { container } = render(
+        <ComposerPrLink state={state} prCount={0} prNumber={null} onOpen={() => {}} />,
+      );
+      expect(container).toBeEmptyDOMElement();
+    },
+  );
 
-  it("renders nothing when there is no way to open the tab", () => {
-    const { container } = render(
-      <ComposerPrLink state="ready" prCount={1} prNumber={42} onOpen={null} />,
-    );
-    expect(container).toBeEmptyDOMElement();
-  });
+  it.each(["ready", "loading", "unknown"] as const)(
+    "renders nothing when there is no way to open the tab and the lookup is %s",
+    (state) => {
+      const { container } = render(
+        <ComposerPrLink state={state} prCount={1} prNumber={42} onOpen={null} />,
+      );
+      expect(container).toBeEmptyDOMElement();
+    },
+  );
 
   it("shows a single PR number and opens the tab on click", () => {
     const onOpen = vi.fn();
@@ -51,14 +57,14 @@ describe("ComposerPrLink", () => {
     expect(screen.getByText("3 PRs")).toHaveAttribute("title", "3 PRs");
   });
 
-  it("renders explicit loading and unknown states without a null PR number", () => {
+  it("keeps loading and unavailable status for a known PR", () => {
     const { rerender } = render(
-      <ComposerPrLink state="loading" prCount={0} prNumber={null} onOpen={() => {}} />,
+      <ComposerPrLink state="loading" prCount={1} prNumber={42} onOpen={() => {}} />,
     );
     expect(screen.getByTestId("composer-pr-loading")).toHaveTextContent("Checking PR…");
-    rerender(<ComposerPrLink state="unknown" prCount={0} prNumber={null} onOpen={() => {}} />);
+    rerender(<ComposerPrLink state="unknown" prCount={1} prNumber={42} onOpen={() => {}} />);
     expect(screen.getByTestId("composer-pr-unknown")).toHaveTextContent("PR unavailable");
-    expect(screen.queryByText("#null")).toBeNull();
+    expect(screen.queryByTestId("composer-pr-link")).toBeNull();
   });
 
   it("falls back to a safe singular label when the association number is missing", () => {
