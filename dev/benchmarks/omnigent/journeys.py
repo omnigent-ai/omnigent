@@ -875,13 +875,13 @@ async def _prepare_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> N
     ``omnigent polly`` to fail with "runner tunnel rejection (HTTP 401)"
     or "host is on another replica". Runs outside the latency timer.
     """
-    del env
     omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
     if omnigent_bin is None:
         return
     await asyncio.to_thread(
         subprocess.run,
         [omnigent_bin, "stop"],
+        env=env.child_env(),
         capture_output=True,
         timeout=15,
         check=False,
@@ -928,7 +928,7 @@ async def _measure_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> No
         timeout=_CLI_STARTUP_TIMEOUT_S,
         encoding="utf-8",
         codec_errors="ignore",
-        env=dict(os.environ),
+        env=env.child_env(),
     )
     try:
         idx = child.expect([pexpect.TIMEOUT, pexpect.EOF, _CLI_STARTUP_READY_SIGNAL])

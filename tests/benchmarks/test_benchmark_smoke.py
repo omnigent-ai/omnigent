@@ -12,10 +12,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import cast
 
 import httpx
+import psutil
 import pytest
 
 from dev.benchmarks.omnigent import journeys as bench_journeys
@@ -25,6 +32,8 @@ from dev.benchmarks.omnigent.environment import (
     GatedTurn,
     _close_reader,
     _sse_session_status,
+    _stop_process_group,
+    bench_child_environ,
 )
 from dev.benchmarks.omnigent.journeys import ALL_JOURNEYS, Journey, run_latency, run_throughput
 from dev.benchmarks.omnigent.measure import RunResult, aggregate, check_thresholds
@@ -1014,3 +1023,129 @@ def test_report_markdown_cross_report_matrix() -> None:
     # Per-report sections still follow the cross matrix.
     assert "### sqlite" in md
     assert "### postgresql" in md
+
+
+# ── harness hygiene (process groups, caller env, terminals) ──
+
+
+def test_bench_child_environ_drops_caller_session_vars() -> None:
+    """Bench processes must not inherit the enclosing Omnigent session's identity."""
+    caller = {
+        "PATH": "/usr/bin",
+        "OMNIGENT_SKIP_WEB_UI": "true",
+        "OMNIGENT_RUNNER_ZYGOTE": "0",  # a tuning knob, kept
+        "OMNIGENT_RUNNER_ID": "runner_caller",
+        "OMNIGENT_RUNNER_DELEGATED_AUTH": "token",
+        "RUNNER_SERVER_URL": "http://caller:6767",
+        "OMNIGENT_PROCESS_LOG_FILE": "/home/u/.omnigent/logs/runner/runner-caller.log",
+        "OMNIGENT_TERMINAL_LAUNCH_ID": "launch_caller",
+    }
+
+    assert bench_child_environ(caller) == {
+        "PATH": "/usr/bin",
+        "OMNIGENT_SKIP_WEB_UI": "true",
+        "OMNIGENT_RUNNER_ZYGOTE": "0",
+    }
+
+
+def _wait_gone(pid: int, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                return True
+        except psutil.NoSuchProcess:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")
+def test_stop_process_group_kills_descendants_that_ignore_sigterm() -> None:
+    """Stopping a bench child also kills what it forked, even past SIGTERM."""
+    proc = subprocess.Popen(
+        ["sh", "-c", '(trap "" TERM; exec sleep 60) & echo $!; wait'],
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    grandchild = int(proc.stdout.readline())
+
+    _stop_process_group(proc)
+
+    assert proc.poll() is not None
+    assert _wait_gone(grandchild)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux")
+def test_teardown_kills_terminals_under_the_bench_tmpdir() -> None:
+    """A runner's leftover REPL tmux server under the bench TMPDIR is killed."""
+    env = BenchEnvironment()
+    terminal_dir = env._child_tmp / "omnigent-terminal-test"
+    terminal_dir.mkdir(parents=True)
+    socket_path = terminal_dir / "tmux.sock"
+    subprocess.run(["tmux", "-S", str(socket_path), "new-session", "-d", "sleep 60"], check=True)
+    try:
+        env._stop()
+        alive = subprocess.run(
+            ["tmux", "-S", str(socket_path), "has-session"], capture_output=True
+        )
+        assert alive.returncode != 0
+    finally:
+        subprocess.run(["tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
+        shutil.rmtree(env._tmp, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_start_stops_what_it_started() -> None:
+    """``__aexit__`` never runs when ``__aenter__`` raises, so it must clean up itself."""
+    env = BenchEnvironment()
+    stopped: list[bool] = []
+
+    def _start() -> None:
+        raise RuntimeError("server never became healthy")
+
+    env._start = _start  # type: ignore[method-assign]
+    env._stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="never became healthy"):
+        await env.__aenter__()
+    assert stopped == [True]
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")
+@pytest.mark.timeout(180)
+def test_sigterm_mid_run_leaves_no_processes(tmp_path: Path) -> None:
+    """``timeout``/``kill`` on run.py still tears down the server it booted."""
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(bench_run.__file__)),
+            "--journeys",
+            "list_sessions",
+            "--iterations",
+            "100000",
+            "--runs",
+            "1",
+        ],
+        env={**bench_child_environ(), "HOME": str(tmp_path)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert proc.stdout is not None
+    descendants: list[psutil.Process] = []
+    try:
+        for line in proc.stdout:
+            if "Benchmarking" in line:
+                break
+        descendants = psutil.Process(proc.pid).children(recursive=True)
+        assert descendants, "run.py booted no server"
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    assert proc.returncode == 128 + signal.SIGTERM
+    assert all(_wait_gone(child.pid) for child in descendants)

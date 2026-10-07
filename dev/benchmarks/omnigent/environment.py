@@ -33,6 +33,7 @@ import tarfile
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import IO, NamedTuple
 
@@ -65,6 +66,43 @@ _TURN_TIMEOUT_S = 180.0
 _HOST_ONLINE_TIMEOUT_S = 60.0
 # Budget for a host-owned runner tunnel to disappear after ``stop_session``.
 _RUNNER_OFFLINE_TIMEOUT_S = 30.0
+# Grace for a stopped process group before it is killed.
+_STOP_GRACE_S = 8.0
+
+# Identity, routing, and logging that an enclosing Omnigent session publishes
+# into its process tree. Bench processes that inherited them would bind to the
+# caller's session, server, or log file instead of the bench's own. Tuning knobs
+# (e.g. OMNIGENT_RUNNER_ZYGOTE) are deliberately kept.
+_CALLER_SESSION_ENV_VARS = frozenset(
+    {
+        "RUNNER_SERVER_URL",
+        "OMNIGENT_PROCESS_LOG_FILE",
+        "OMNIGENT_USER_ID",
+        "OMNIGENT_HARNESS_TMP_PARENT",
+        "OMNIGENT_HOST_ID",
+        "OMNIGENT_HOST_NAME",
+        "OMNIGENT_HOST_TOKEN",
+        "OMNIGENT_HOST_DAEMON_CONFIG_SIG",
+        "OMNIGENT_RUNNER_ID",
+        "OMNIGENT_RUNNER_DELEGATED_AUTH",
+        "OMNIGENT_RUNNER_PARENT_PID",
+        "OMNIGENT_RUNNER_PRIMARY_SESSION_ID",
+        "OMNIGENT_RUNNER_SLICE_KEY",
+        "OMNIGENT_RUNNER_WORKSPACE",
+        "OMNIGENT_RUNNER_CONNECT_MARKER",
+        "OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP",
+        "OMNIGENT_RUNNER_INTERACTIVE_SHELLS",
+        "OMNIGENT_RUNNER_LAUNCH_HARNESS",
+        "OMNIGENT_RUNNER_TUNNEL_TOKEN",
+        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN",
+        "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN",
+        "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD",
+        "OMNIGENT_RUNNER_ZYGOTE_HARNESS_FD",
+    }
+)
+_CALLER_SESSION_ENV_PREFIXES = ("OMNIGENT_TERMINAL_",)
+# Instance-dir prefix of runner terminals (see omnigent/inner/terminal.py).
+_TERMINAL_DIR_GLOB = "omnigent-terminal-*"
 
 # Terminal SSE events — if one arrives before any delta, the turn produced no
 # streamed text (a failure for the TTFT journey).
@@ -165,6 +203,44 @@ def _omni_executable() -> str:
     return str(Path(server_executable()).with_name("omni"))
 
 
+def bench_child_environ(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return *environ* (default ``os.environ``) without the caller's session vars.
+
+    :param environ: Environment to filter, e.g. ``os.environ``.
+    :returns: A copy safe to hand to bench subprocesses.
+    """
+    source = os.environ if environ is None else environ
+    return {
+        key: value
+        for key, value in source.items()
+        if key not in _CALLER_SESSION_ENV_VARS and not key.startswith(_CALLER_SESSION_ENV_PREFIXES)
+    }
+
+
+def _signal_group(proc: subprocess.Popen[bytes], sig: int) -> None:
+    """Send *sig* to *proc*'s process group (the process alone off POSIX)."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, sig)
+        elif proc.poll() is None:
+            proc.send_signal(sig)
+
+
+def _stop_process_group(proc: subprocess.Popen[bytes]) -> None:
+    """SIGTERM *proc*'s process group, then SIGKILL whatever remains of it.
+
+    The final SIGKILL also reaches children the leader forked (runners,
+    harnesses) that outlive it.
+    """
+    if proc.poll() is None:
+        _signal_group(proc, signal.SIGTERM)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_STOP_GRACE_S)
+    _signal_group(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=5)
+
+
 class BenchEnvironment:
     """Async context manager owning the benchmark's server (± runner + mock).
 
@@ -220,6 +296,8 @@ class BenchEnvironment:
         self.client: httpx.AsyncClient | None = None
 
         self._tmp = Path("/tmp") / f"omni-bench-{uuid.uuid4().hex[:8]}"
+        # TMPDIR for bench subprocesses, so their terminal sockets can be swept.
+        self._child_tmp = self._tmp / "tmp"
         self._mock_proc: subprocess.Popen[bytes] | None = None
         self._server_proc: subprocess.Popen[bytes] | None = None
         self._runner_proc: subprocess.Popen[bytes] | None = None
@@ -236,7 +314,12 @@ class BenchEnvironment:
     # ── lifecycle ────────────────────────────────────────────
 
     async def __aenter__(self) -> BenchEnvironment:
-        await asyncio.to_thread(self._start)
+        try:
+            await asyncio.to_thread(self._start)
+        except BaseException:
+            # __aexit__ never runs when __aenter__ raises; stop what did start.
+            await asyncio.to_thread(self._stop)
+            raise
         # A request event hook injects the simulated client↔server network
         # delay before each request leaves the benchmark process. Registered
         # only when a delay is set so the zero-delay default path is untouched.
@@ -276,6 +359,7 @@ class BenchEnvironment:
     def _start(self) -> None:
         """Spawn the server (± mock + runner) and block until ready."""
         self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._child_tmp.mkdir(exist_ok=True)
         artifact_dir = self._tmp / "artifacts"
         artifact_dir.mkdir(exist_ok=True)
 
@@ -289,7 +373,7 @@ class BenchEnvironment:
         self.base_url = f"http://localhost:{port}"
         binding_token = uuid.uuid4().hex
 
-        base_env = {**os.environ}
+        base_env = self.child_env()
         if self.with_runner:
             self.runner_id = token_bound_runner_id(binding_token)
             base_env["OPENAI_API_KEY"] = "mock-key"
@@ -312,29 +396,50 @@ class BenchEnvironment:
             self._host_proc = self._spawn_host(base_env)
             self._wait_host_online()
 
+    def child_env(self) -> dict[str, str]:
+        """Base environment for anything the bench spawns, journeys included.
+
+        Drops the caller's Omnigent session vars (:func:`bench_child_environ`)
+        and points ``TMPDIR`` at the bench's temp dir, so terminals the bench's
+        runners create are swept at teardown.
+        """
+        return {**bench_child_environ(), "TMPDIR": str(self._child_tmp)}
+
     def _stop(self) -> None:
         """Terminate host, runner, server, and mock; remove the temp dir."""
         # Host first: SIGTERM-ing the daemon reaps the runners IT spawned (they
         # are daemon-owned children), so it must go before the server so those
-        # runners' tunnels close cleanly.
+        # runners' tunnels close cleanly. Each child leads its own process
+        # group, so stopping the group also takes its descendants.
         for proc in (
             self._host_proc,
             self._runner_proc,
             self._server_proc,
             self._mock_proc,
         ):
-            if proc is not None and proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
+            if proc is not None:
+                _stop_process_group(proc)
+        self._kill_session_terminals()
         for handle in self._log_handles:
             handle.close()
         import shutil
 
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _kill_session_terminals(self) -> None:
+        """Kill the tmux servers of terminals created under the bench's TMPDIR.
+
+        Runners auto-create a REPL terminal per session; its detached tmux
+        server outlives a runner stopped before it closes its terminals.
+        """
+        for socket_path in self._child_tmp.glob(f"{_TERMINAL_DIR_GLOB}/tmux.sock"):
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                subprocess.run(
+                    ["tmux", "-S", str(socket_path), "kill-server"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
 
     def _sample_resources(self, interval: float = 1.0) -> None:
         """Sample the server process's CPU and RSS memory at *interval*-second intervals.
@@ -438,9 +543,10 @@ class BenchEnvironment:
     def _spawn_mock(self, port: int) -> subprocess.Popen[bytes]:
         return subprocess.Popen(
             [sys.executable, str(_MOCK_SERVER), str(port)],
-            env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},
+            env={**self.child_env(), "PYTHONPATH": str(_REPO_ROOT)},
             stdout=self._log("mock.log"),
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
     def _spawn_server(
@@ -489,6 +595,7 @@ class BenchEnvironment:
             cwd=compat_server_cwd(),
             stdout=self._log("server.log"),
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
     def _spawn_runner(
@@ -539,6 +646,7 @@ class BenchEnvironment:
             cwd=compat_runner_cwd(),
             stdout=self._log(log_name),
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
     def _spawn_host(self, base_env: dict[str, str]) -> subprocess.Popen[bytes]:
@@ -572,6 +680,7 @@ class BenchEnvironment:
             cwd=str(workspace),
             stdout=self._log("host-daemon.log"),
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
     # ── readiness ────────────────────────────────────────────
