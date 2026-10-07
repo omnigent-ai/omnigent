@@ -3333,3 +3333,137 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
         f"({_MAX_RECONNECT_DELAY_S} * (1 + {_RECONNECT_JITTER_FRACTION}) = "
         f"{worst_case_reconnect_s}s)"
     )
+
+
+class _RunnerKeyedFallbackStore(_RecordingLabelStore):
+    """Store whose session-keyed liveness read fails, as with non-UUID session ids.
+
+    :param by_runner: Conversations returned by the runner-keyed lookup, or an
+        exception to raise from it.
+    """
+
+    def __init__(self, by_runner: list[Conversation] | Exception) -> None:
+        super().__init__()
+        self._by_runner = by_runner
+
+    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+        raise ValueError("expected a 32-char hex uuid, got '4435455105004143'")
+
+    def list_conversations_by_runner_id(self, runner_id: str) -> list[Conversation]:
+        if isinstance(self._by_runner, Exception):
+            raise self._by_runner
+        return self._by_runner
+
+
+def _bound_conversation(runner_id: str, last_seen: int | None) -> Conversation:
+    return Conversation(
+        id="4435455105004143",
+        root_conversation_id="4435455105004143",
+        created_at=0,
+        updated_at=0,
+        runner_id=runner_id,
+        runner_last_seen=last_seen,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["fresh-newer", "stale", "older-than-reference", "lookups-fail"])
+async def test_relay_live_elsewhere_falls_back_to_runner_keyed_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+) -> None:
+    """A failing session-keyed read falls back to the runner-keyed sweep check."""
+    import logging
+    import time
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions.orchestration import (
+        _relay_runner_live_elsewhere,
+        _runner_relay_tasks,
+    )
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+
+    now = int(time.time())
+    runner_id = "runner_fallback"
+    session_id = "4435455105004143"
+    monkeypatch.setattr(
+        "omnigent.server.session_live_state.last_liveness_stamp",
+        lambda _runner_id: now - 60 if case != "older-than-reference" else now + 5,
+    )
+    by_runner: list[Conversation] | Exception
+    if case == "fresh-newer":
+        by_runner = [_bound_conversation(runner_id, now)]
+    elif case == "stale":
+        by_runner = [_bound_conversation(runner_id, now - RUNNER_LIVENESS_TTL_S - 1)]
+    elif case == "older-than-reference":
+        by_runner = [_bound_conversation(runner_id, now)]
+    else:
+        by_runner = RuntimeError("conversation backend unavailable")
+    store = _RunnerKeyedFallbackStore(by_runner)
+    _runner_relay_tasks[session_id] = SimpleNamespace(runner_id=runner_id)  # type: ignore[assignment]
+
+    try:
+        with caplog.at_level(logging.DEBUG):
+            result = await _relay_runner_live_elsewhere(session_id, store)  # type: ignore[arg-type]
+    finally:
+        _runner_relay_tasks.pop(session_id, None)
+
+    assert result is (case == "fresh-newer")
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not [r for r in caplog.records if r.exc_info]
+    assert any("ValueError" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_relay_stays_quiet_when_session_keyed_lookup_fails_but_runner_live_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The grace-expiry decision is live_elsewhere even if the session-keyed read raises."""
+    import time
+
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    runner_id = "runner_live_elsewhere_fallback"
+    session_id = "e1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6"
+    now = int(time.time())
+    monkeypatch.setattr(
+        "omnigent.server.session_live_state.last_liveness_stamp",
+        lambda _runner_id: now - 60,
+    )
+    store = _RunnerKeyedFallbackStore([_bound_conversation(runner_id, now)])
+    sessions_module._session_status_cache[session_id] = "running"
+    sessions_module._session_active_response_cache[session_id] = "response-fallback"
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            runner_id,
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        assert session_id not in store.labels, "drop persisted failure labels"
+        assert sessions_module._session_status_cache.get(session_id) is None
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)

@@ -7601,34 +7601,64 @@ async def _relay_runner_live_elsewhere(
     A full-conversation read can depend on unrelated backends; their outage
     must not hide a fresh heartbeat from another replica. Prefer the active
     relay's runner binding, falling back to the metadata binding when called
-    without a registered relay.
+    without a registered relay. When the session-keyed metadata read fails or
+    finds no row, fall back to the runner-keyed lookup the offline sweep uses.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store used to read runner metadata.
     :returns: ``True`` when the bound runner is confirmed live on
         another replica; ``False`` when unbound, unreadable, or not.
     """
+    handle = _runner_relay_tasks.get(session_id)
+    liveness: tuple[str | None, int | None] | None = None
+    lookup_error: Exception | None = None
     try:
         liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, session_id)
-    except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
+    except Exception as exc:  # noqa: BLE001 — fall back to the runner-keyed check
+        lookup_error = exc
+    bound_runner_id = liveness[0] if liveness is not None else None
+    runner_id = handle.runner_id if handle is not None else bound_runner_id
+    if liveness is not None:
+        if runner_id is None:
+            return False
+        return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
+            stamp=liveness[1],
+            reference_stamp=session_live_state.last_liveness_stamp(runner_id),
+        )
+    # No session-keyed answer: ask by runner id, which works for every store.
+    if runner_id is None:
+        if lookup_error is not None:
+            _logger.warning(
+                "Relay: runner liveness lookup failed for session=%s (%s)",
+                session_id,
+                type(lookup_error).__name__,
+                extra={"session_id": session_id},
+            )
+        return False
+    try:
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
+    except Exception as fallback_exc:  # noqa: BLE001 — treat as not live elsewhere
         _logger.warning(
-            "Relay: runner liveness lookup failed for session=%s",
+            "Relay: runner liveness lookup failed for session=%s (%s); "
+            "runner-keyed fallback failed (%s)",
             session_id,
-            exc_info=True,
+            type(lookup_error).__name__ if lookup_error is not None else "no row",
+            type(fallback_exc).__name__,
             extra={"session_id": session_id},
         )
         return False
-    if liveness is None:
-        return False
-    bound_runner_id, runner_last_seen = liveness
-    handle = _runner_relay_tasks.get(session_id)
-    runner_id = handle.runner_id if handle is not None else bound_runner_id
-    if runner_id is None:
-        return False
-    reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
-        stamp=runner_last_seen,
-        reference_stamp=reference_stamp,
+    if lookup_error is not None:
+        _logger.warning(
+            "Relay: runner liveness lookup failed for session=%s (%s); "
+            "runner-keyed fallback answered",
+            session_id,
+            type(lookup_error).__name__,
+            extra={"session_id": session_id},
+        )
+    return _runner_live_on_another_replica_from_conversations(
+        affected, runner_id, session_live_state.last_liveness_stamp(runner_id)
     )
 
 
