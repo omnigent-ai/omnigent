@@ -39,6 +39,8 @@ export interface SessionWorkspaceState {
   openSideChats?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
   selectedSideChatId?: string | null;
+  /** The pull request picked in the GitHub tab (absent = the session default). */
+  selectedPrUrl?: string;
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
@@ -57,6 +59,18 @@ function isValidWidth(value: unknown): value is number {
 
 function isRailTab(value: unknown): value is RightRailTab {
   return typeof value === "string" && (RAIL_TABS as readonly string[]).includes(value);
+}
+
+// `URL.canParse` is newer than this app's build targets (vite.config.ts) and
+// throws there, so probe with `new URL`. Restrict to http(s) so a stored
+// `javascript:`/`data:` value can't later be surfaced as a link target.
+function isHttpUrl(value: string): boolean {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === "https:" || protocol === "http:";
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -118,6 +132,11 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   }
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
     state.selectedSideChatId = record.selectedSideChatId;
+  }
+  // Forwarded verbatim as a request parameter and used as a link target, so
+  // drop a corrupted or non-http value rather than persist it.
+  if (typeof record.selectedPrUrl === "string" && isHttpUrl(record.selectedPrUrl)) {
+    state.selectedPrUrl = record.selectedPrUrl;
   }
   return state;
 }

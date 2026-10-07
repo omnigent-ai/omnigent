@@ -35,6 +35,18 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("conv_github").rightRailTab).toBe("github");
   });
 
+  it("remembers the picked GitHub pull request per session", () => {
+    const url = "https://github.com/example/project/pull/42";
+    writeSessionWorkspaceState("conv_a", { selectedPrUrl: url });
+    writeSessionWorkspaceState("conv_b", { rightRailTab: "github" });
+    expect(readSessionWorkspaceState("conv_a").selectedPrUrl).toBe(url);
+    expect(readSessionWorkspaceState("conv_b").selectedPrUrl).toBeUndefined();
+
+    // Clearing the pick drops the key, so the session follows its default again.
+    writeSessionWorkspaceState("conv_a", { selectedPrUrl: undefined });
+    expect(readSessionWorkspaceState("conv_a")).toEqual({});
+  });
+
   it("keeps sessions isolated by id", () => {
     writeSessionWorkspaceState("conv_a", { open: true });
     writeSessionWorkspaceState("conv_b", { open: false, widthPx: 600 });
@@ -126,8 +138,31 @@ describe("sessionWorkspaceState", () => {
     // proving one bad field can't poison the whole entry.
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify([{ id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } }]),
+      JSON.stringify([
+        {
+          id: "conv_b",
+          state: { open: true, widthPx: -5, rightRailTab: "bogus", selectedPrUrl: 7 },
+        },
+      ]),
     );
     expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true });
+
+    // The stored PR is forwarded verbatim as a request parameter and used as a
+    // link target, so a non-URL string is dropped rather than kept.
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([{ id: "conv_c", state: { open: true, selectedPrUrl: "not a url" } }]),
+    );
+    expect(readSessionWorkspaceState("conv_c")).toEqual({ open: true });
+
+    // A parseable but non-http(s) scheme is dropped so a stored `javascript:`
+    // or `data:` value can never be surfaced as a link.
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        { id: "conv_d", state: { open: true, selectedPrUrl: "javascript:alert(1)" } },
+      ]),
+    );
+    expect(readSessionWorkspaceState("conv_d")).toEqual({ open: true });
   });
 });

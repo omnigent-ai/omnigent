@@ -69,6 +69,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
   fetchGithubFileContents,
@@ -803,7 +804,14 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   const [focusedPrUrl, setFocusedPrUrl] = useState<string>();
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
-  const selected = selection?.sessionId === conversationId ? selection.url : undefined;
+  // The picked PR is remembered per session so switching sessions or rail tabs
+  // (which remounts this panel) comes back to it rather than the default.
+  const remembered = useMemo(
+    () => readSessionWorkspaceState(conversationId).selectedPrUrl,
+    [conversationId],
+  );
+  const restored = selection?.sessionId === conversationId ? undefined : remembered;
+  const selected = selection?.sessionId === conversationId ? selection.url : remembered;
   const info = useGithubInfo(conversationId, { poll: true, prUrl: selected });
   const [knownAssociations, setKnownAssociations] = useState<{
     sessionId: string;
@@ -818,17 +826,56 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
       });
     }
   }, [conversationId, info.data]);
+  const cachedAssociations =
+    knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined;
+  // A restore error alone can't prove the pick is gone, so with nothing cached
+  // fetch the session default: it keeps the picker and controls usable and
+  // provides the PR list the reconciliation effect uses to keep or forget it.
+  const restorationUnrecoverable =
+    !!selected &&
+    !!info.error &&
+    !info.data &&
+    !(info.error instanceof RunnerOfflineError) &&
+    !cachedAssociations;
+  // Shares the session-default cache key, so stay silent (and disabled) outside
+  // recovery: the normal flow keeps a single live metadata observer and never
+  // re-requests a just-unlinked PR from here.
+  const defaultInfo = useGithubInfo(conversationId, {
+    poll: true,
+    enabled: restorationUnrecoverable,
+    notifyOnChangeProps: restorationUnrecoverable ? "all" : [],
+  });
   // Switching the metadata query must not unmount the session's PR controls.
-  const associations =
-    info.data ??
-    (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
+  const associations = info.data ?? defaultInfo.data ?? cachedAssociations;
   const update = useUpdateSessionPr(conversationId);
   useEffect(() => {
     if (!selected && info.data?.selected_pr_url) {
       setSelection({ sessionId: conversationId, url: info.data.selected_pr_url });
     }
   }, [conversationId, selected, info.data?.selected_pr_url]);
-  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
+  const changeSelection = (next?: string) => {
+    setSelection({ sessionId: conversationId, url: next });
+    writeSessionWorkspaceState(conversationId, { selectedPrUrl: next });
+  };
+  // Show `fallback` now and follow the session default from here on.
+  const forgetSelection = useCallback(
+    (fallback?: string) => {
+      setSelection({ sessionId: conversationId, url: fallback });
+      writeSessionWorkspaceState(conversationId, { selectedPrUrl: undefined });
+    },
+    [conversationId],
+  );
+  // Reconcile the remembered pick against the session: adopt it once a fetch
+  // confirms the session still tracks it, or forget it (showing the default)
+  // once a known PR list proves it does not. A failed fetch leaves it untouched.
+  useEffect(() => {
+    if (!restored) return;
+    if (info.data && !info.error) {
+      setSelection({ sessionId: conversationId, url: restored });
+    } else if (associations?.prs && !associations.prs.some((pr) => pr.url === restored)) {
+      forgetSelection(associations.selected_pr_url);
+    }
+  }, [conversationId, restored, info.data, info.error, associations, forgetSelection]);
   const prs = associations?.prs ?? [];
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const linkInEmptyState = prs.length === 0 && deriveGithubPanelState(info).kind === "no-pr";
@@ -983,7 +1030,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
                       update.mutate(
                         { url: selected, action: "remove" },
                         {
-                          onSuccess: (data) => changeSelection(data.selected_pr_url),
+                          onSuccess: (data) => forgetSelection(data.selected_pr_url),
                         },
                       )
                     }

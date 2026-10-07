@@ -6,7 +6,7 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { GithubChangedFile, GithubInfo } from "@/hooks/useGithub";
+import type { GithubChangedFile, GithubInfo, GithubPrAssociation } from "@/hooks/useGithub";
 
 const state = vi.hoisted(() => ({
   info: null as {
@@ -29,6 +29,8 @@ const state = vi.hoisted(() => ({
     type?: string;
     unifiedLineCount?: number;
   }[],
+  // What a link/unlink mutation resolves with; null leaves `mutate` inert.
+  update: null as ((body: { url: string; action: "attach" | "remove" }) => GithubInfo) | null,
 }));
 
 vi.mock("@/hooks/useGithub", () => ({
@@ -44,7 +46,18 @@ vi.mock("@/hooks/useGithub", () => ({
   fetchGithubFileContents: async () => ({ before: "old", after: "new" }),
   // The account selector (shown in the repo-unresolved empty state) calls this;
   // stub the mutation shape it reads.
-  useUpdateSessionPr: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useUpdateSessionPr: () => ({
+    mutate: vi.fn(
+      (
+        body: { url: string; action: "attach" | "remove" },
+        options?: { onSuccess?: (data: GithubInfo, body: { url: string }) => void },
+      ) => {
+        if (state.update) options?.onSuccess?.(state.update(body), body);
+      },
+    ),
+    isPending: false,
+    isError: false,
+  }),
   useSetGithubPreference: () => ({
     mutate: () => {},
     isPending: false,
@@ -81,6 +94,8 @@ import { useGithubInfo, useGithubChangedFiles } from "@/hooks/useGithub";
 
 import { GithubPanel, deriveGithubPanelState, LARGE_DIFF_THRESHOLD } from "./GithubPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { ApiError } from "@/lib/sessionsApi";
 
 function file(
   path: string,
@@ -118,6 +133,15 @@ function renderChanges() {
 }
 
 let scrollIntoView: ReturnType<typeof vi.fn>;
+
+// The latest metadata request driven by the current selection. Filters out the
+// recovery query (the only call carrying `enabled`) so a switch back to an
+// earlier PR can't be satisfied by that PR's stale initial call.
+const lastSelectedPrCall = () =>
+  vi
+    .mocked(useGithubInfo)
+    .mock.calls.filter(([, options]) => !(options && "enabled" in options))
+    .at(-1);
 
 beforeEach(() => {
   // The diff-layout toggle seeds from persisted prefs; start each test clean.
@@ -678,7 +702,7 @@ describe("session PR selection", () => {
     expect(picker).toHaveTextContent("example/two #42 — Second repository");
     expect(picker).not.toHaveAttribute("title");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
-    expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
+    expect(lastSelectedPrCall()).toEqual(["conv_1", { poll: true, prUrl: two }]);
     await user.hover(picker);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
       "example/two #42 — Second repository",
@@ -705,7 +729,7 @@ describe("session PR selection", () => {
     expect(fallback).toHaveAttribute("href", two);
     await user.click(picker);
     await user.click(screen.getByRole("option", { name: "example/one #42 — First repository" }));
-    expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
+    expect(lastSelectedPrCall()).toEqual(["conv_1", { poll: true, prUrl: one }]);
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<GithubPanel conversationId="conv_other" />);
@@ -793,5 +817,189 @@ describe("session PR selection", () => {
     };
     renderPanel();
     expect(useGithubChangedFiles).toHaveBeenLastCalledWith("conv_1", true, url, "base:head");
+  });
+});
+
+describe("remembered session PR", () => {
+  const open = "https://github.com/example/project/pull/42";
+  const merged = "https://github.com/example/project/pull/7";
+  const openLabel = "example/project #42 — Add session switcher keyboard shortcuts";
+  const mergedLabel = "example/project #7 — Fix sidebar PR label truncation";
+  const prs: GithubPrAssociation[] = [
+    {
+      url: merged,
+      host: "github.com",
+      repository: "example/project",
+      number: 7,
+      title: "Fix sidebar PR label truncation",
+      relationship: "attached",
+    },
+    {
+      url: open,
+      host: "github.com",
+      repository: "example/project",
+      number: 42,
+      title: "Add session switcher keyboard shortcuts",
+      relationship: "attached",
+    },
+  ];
+  type InfoQuery = ReturnType<typeof useGithubInfo>;
+  // Query results are cached per URL: like react-query, the mock must hand back
+  // the same object across renders or the panel's data effects never settle.
+  const servedByUrl = new Map<string, InfoQuery>();
+
+  /** The runner's answer: the requested PR, or the session default (the merged
+   *  PR, seen most recently) when none is requested. */
+  function served(url: string): InfoQuery {
+    let query = servedByUrl.get(url);
+    if (!query) {
+      query = {
+        isLoading: false,
+        error: null,
+        isFetching: false,
+        data: {
+          ...state.info!.data!,
+          tracking_available: true,
+          selected_pr_url: url,
+          prs,
+          pr: {
+            ...state.info!.data!.pr!,
+            url,
+            number: url === open ? 42 : 7,
+            state: url === open ? "OPEN" : "MERGED",
+          },
+        },
+      } as unknown as InfoQuery;
+      servedByUrl.set(url, query);
+    }
+    return query;
+  }
+  function failing(error: Error): InfoQuery {
+    return { data: undefined, isLoading: false, error, isFetching: false } as unknown as InfoQuery;
+  }
+  const picker = () => screen.getByRole("combobox", { name: "Session pull request" });
+
+  beforeEach(() => {
+    servedByUrl.clear();
+    vi.mocked(useGithubInfo).mockImplementation((_conversationId, options) =>
+      served(options?.prUrl ?? merged),
+    );
+  });
+  afterEach(() => {
+    vi.mocked(useGithubInfo).mockImplementation(() => state.info as unknown as InfoQuery);
+    state.update = null;
+  });
+
+  it("keeps a session's picked PR when switching sessions and back", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderPanel();
+    expect(picker()).toHaveTextContent(mergedLabel);
+    await user.click(picker());
+    await user.click(screen.getByRole("option", { name: openLabel }));
+    expect(picker()).toHaveTextContent(openLabel);
+
+    rerender(<GithubPanel conversationId="conv_other" />);
+    expect(picker()).toHaveTextContent(mergedLabel);
+    expect(useGithubInfo).toHaveBeenCalledWith("conv_other", { poll: true, prUrl: merged });
+
+    rerender(<GithubPanel conversationId="conv_1" />);
+    expect(picker()).toHaveTextContent(openLabel);
+    expect(useGithubInfo).toHaveBeenCalledWith("conv_1", { poll: true, prUrl: open });
+  });
+
+  it("restores the picked PR after the panel is remounted", async () => {
+    const user = userEvent.setup();
+    const first = renderPanel();
+    await user.click(picker());
+    await user.click(screen.getByRole("option", { name: openLabel }));
+    first.unmount();
+
+    renderPanel();
+    expect(picker()).toHaveTextContent(openLabel);
+    expect(useGithubInfo).toHaveBeenCalledWith("conv_1", { poll: true, prUrl: open });
+  });
+
+  it("forgets a remembered PR missing from the session's PR list", async () => {
+    const stale = "https://github.com/example/project/pull/99";
+    writeSessionWorkspaceState("conv_1", { selectedPrUrl: stale });
+    const rejected = failing(new Error("pull request not found"));
+    vi.mocked(useGithubInfo).mockImplementation((_conversationId, options) =>
+      options?.prUrl === stale ? rejected : served(options?.prUrl ?? merged),
+    );
+    renderPanel();
+    // The session's PR list (from the default fetch) excludes the stale pick, so
+    // it is forgotten and the panel falls back to the session default.
+    await waitFor(() => expect(picker()).toHaveTextContent(mergedLabel));
+    expect(readSessionWorkspaceState("conv_1").selectedPrUrl).toBeUndefined();
+  });
+
+  // With no reachable session to list its PRs, a failed restore can't prove the
+  // pick is gone, so it is kept; a flaky fetch must not lose the user's pick.
+  it.each([
+    ["the runner is offline", new RunnerOfflineError()],
+    ["the gateway fails", new ApiError("502 Bad Gateway", 502, null)],
+    ["a gateway returns a 400", new ApiError("400 Bad Request", 400, null)],
+    ["the network fails", new TypeError("Failed to fetch")],
+  ])("keeps the remembered PR while %s", (_failure, error) => {
+    writeSessionWorkspaceState("conv_1", { selectedPrUrl: open });
+    const transient = failing(error);
+    vi.mocked(useGithubInfo).mockImplementation(() => transient);
+    renderPanel();
+    expect(useGithubInfo).toHaveBeenCalledWith("conv_1", { poll: true, prUrl: open });
+    expect(readSessionWorkspaceState("conv_1").selectedPrUrl).toBe(open);
+  });
+
+  it("keeps a remembered PR whose refetch rejects while its stale data is cached", async () => {
+    writeSessionWorkspaceState("conv_1", { selectedPrUrl: open });
+    // React Query keeps the last successful data alongside a failed refetch, so
+    // the stale success keeps the pick on screen instead of a transient error
+    // dropping it.
+    const staleThenRejected = {
+      ...served(open),
+      error: new ApiError(
+        "This pull request is not associated with the session",
+        400,
+        "invalid_input",
+      ),
+    } as unknown as InfoQuery;
+    vi.mocked(useGithubInfo).mockImplementation((_conversationId, options) =>
+      options?.prUrl === open ? staleThenRejected : served(options?.prUrl ?? merged),
+    );
+    renderPanel();
+    expect(picker()).toHaveTextContent(openLabel);
+    expect(readSessionWorkspaceState("conv_1").selectedPrUrl).toBe(open);
+  });
+
+  it("keeps the controls usable when restoring the remembered PR fails with no cache", () => {
+    writeSessionWorkspaceState("conv_1", { selectedPrUrl: open });
+    // With no cached associations, a failed restore fetches the session default
+    // so the picker and Link/Unlink controls stay reachable while the preference
+    // is kept.
+    const restoreFailure = failing(new ApiError("502 Bad Gateway", 502, null));
+    vi.mocked(useGithubInfo).mockImplementation((_conversationId, options) =>
+      options?.prUrl === open ? restoreFailure : served(options?.prUrl ?? merged),
+    );
+    renderPanel();
+    expect(picker()).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
+    expect(useGithubInfo).toHaveBeenCalledWith("conv_1", {
+      poll: true,
+      enabled: true,
+      notifyOnChangeProps: "all",
+    });
+    expect(readSessionWorkspaceState("conv_1").selectedPrUrl).toBe(open);
+  });
+
+  it("follows the session default again after unlinking the picked PR", async () => {
+    const user = userEvent.setup();
+    state.update = () => served(merged).data!;
+    renderPanel();
+    await user.click(picker());
+    await user.click(screen.getByRole("option", { name: openLabel }));
+    expect(readSessionWorkspaceState("conv_1").selectedPrUrl).toBe(open);
+
+    await user.click(screen.getByRole("button", { name: "Unlink PR" }));
+    expect(picker()).toHaveTextContent(mergedLabel);
+    expect(readSessionWorkspaceState("conv_1").selectedPrUrl).toBeUndefined();
   });
 });
