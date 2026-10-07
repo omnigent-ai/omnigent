@@ -6137,8 +6137,13 @@ def create_runner_app(
         if _side_thread_id:
             # Side-chat controls use the parent's bridge but target the child's
             # thread, leaving the parent's turn and message buffer untouched.
+            from websockets.exceptions import WebSocketException
+
             from omnigent.harnesses.codex_native import side_chat
-            from omnigent.harnesses.codex_native.app_server import client_for_transport
+            from omnigent.harnesses.codex_native.app_server import (
+                CodexAppServerResponseError,
+                client_for_transport,
+            )
 
             _side_turn_id = body.get("codex_side_turn_id")
             _side_text = ""
@@ -6187,6 +6192,42 @@ def create_runner_app(
                     await side_chat.submit_side_turn(
                         _side_client, str(_side_thread_id), _side_text
                     )
+            except CodexAppServerResponseError as exc:
+                # Codex refused the turn (e.g. typing into a multi-agent-v2
+                # sub-agent, or a thread that no longer exists).
+                _rpc_message = exc.message or str(exc)
+                _missing = "thread not found" in _rpc_message.casefold()
+                _logger.warning(
+                    "Codex side-chat turn rejected: conv=%s thread=%s error=%s",
+                    conversation_id,
+                    _side_thread_id,
+                    exc,
+                    extra={"session_id": conversation_id},
+                )
+                return JSONResponse(
+                    status_code=404 if _missing else 409,
+                    content={
+                        "error": "codex_side_chat_not_found"
+                        if _missing
+                        else "codex_side_chat_rejected",
+                        "detail": _rpc_message,
+                    },
+                )
+            except (ConnectionError, OSError, TimeoutError, WebSocketException) as exc:
+                _logger.warning(
+                    "Codex side-chat app-server unreachable: conv=%s thread=%s error=%r",
+                    conversation_id,
+                    _side_thread_id,
+                    exc,
+                    extra={"session_id": conversation_id},
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "codex_side_chat_unavailable",
+                        "detail": "The Codex app-server connection was lost; try again.",
+                    },
+                )
             finally:
                 await _side_client.close()
             return Response(status_code=202)

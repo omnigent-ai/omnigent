@@ -7019,8 +7019,38 @@ async def _forward_codex_side_chat_turn(
             "codex_side_thread_id": child_thread_id,
         },
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise _codex_side_chat_runner_error(resp)
     return _SessionEventDispatchResult(item_id=None, pending_id=None)
+
+
+def _codex_side_chat_runner_error(resp: httpx.Response) -> OmnigentError:
+    """
+    Translate a parent runner's refusal of a side-chat turn into a structured error.
+
+    :param resp: Non-2xx response from the parent runner's ``/events``.
+    :returns: An :class:`OmnigentError` carrying the runner's detail message.
+    """
+    detail: str | None = None
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            detail = payload["detail"]
+    except ValueError:
+        pass
+    if resp.status_code == 404:
+        code = ErrorCode.NOT_FOUND
+    elif resp.status_code == 409:
+        code = ErrorCode.CONFLICT
+        detail = detail or "Codex rejected this message."
+        if "multi-agent v2" in detail:
+            detail = f"This Codex sub-agent cannot take direct input ({detail})."
+    else:
+        code = ErrorCode.RUNNER_UNAVAILABLE
+    return OmnigentError(
+        detail or "The Codex side chat could not accept this message right now.",
+        code=code,
+    )
 
 
 async def _dispatch_session_event_to_runner_impl(
