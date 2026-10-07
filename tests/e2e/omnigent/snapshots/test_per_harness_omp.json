@@ -1,0 +1,5 @@
+{
+    "exit_code": {"kind": "exact", "value": 0},
+    "stderr_is_clean": {"kind": "exact", "value": true},
+    "assistant_text": {"kind": "min_length", "value": 4}
+}

@@ -133,6 +133,7 @@ def _pin_defaults_after_write(
     sibling default flags a deep-merge can't reach), so each pin re-reads first.
     """
     from omnigent.onboarding.provider_config import (
+        OMP_SURFACE,
         PI_SURFACE,
         default_provider_for_harness,
         get_default_provider,
@@ -151,6 +152,11 @@ def _pin_defaults_after_write(
 
     _pin(family, get_default_provider(load(), family))
     _pin(PI_SURFACE, default_provider_for_harness(load(), PI_SURFACE))
+    # omp resolves independently of pi (its own surface default, else the
+    # same cross-family fallback) and has no CLI login either — pin its
+    # scope too, or a fresh key leaves omp stuck at "needs-auth" while pi
+    # already resolves.
+    _pin(OMP_SURFACE, default_provider_for_harness(load(), OMP_SURFACE))
 
 
 def store_harness_credential(

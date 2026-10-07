@@ -50,6 +50,14 @@ const conv = (id: string): Conversation =>
 
 const convs = (...ids: string[]) => ids.map(conv);
 
+// Sonner's TIME_BEFORE_UNMOUNT: how long a dismissed toast stays mounted
+// while it animates out, and the delay of the timer that removes it.
+const SONNER_TIME_BEFORE_UNMOUNT_MS = 200;
+
+// Captured before any test installs fake timers, so the drain below always
+// waits on the real clock even when a case left `vi.useFakeTimers()` active.
+const realSetTimeout = globalThis.setTimeout;
+
 let navigate: ReturnType<typeof vi.fn>;
 
 function mountToaster() {
@@ -82,12 +90,27 @@ beforeEach(() => {
   toast.dismiss();
 });
 
-afterEach(() => {
+afterEach(async () => {
   // Clear any pending pill/batch before unmounting so a Sonner timer queued
   // during a fake-timer test can't fire into a torn-down module (where the
   // mocked `toast` is gone) and surface as an unhandled error.
   resetArchiveUndoBatchForTests();
   toast.dismiss();
+  // Sonner unmounts a dismissed toast on its own TIME_BEFORE_UNMOUNT timer
+  // (200ms) and — unlike its close timer — never cancels it, so `cleanup()`
+  // cannot stop it. Left alone it fires once Vitest has torn jsdom down, and
+  // sonner's `removeToast` → `setToasts` → React's scheduler then reads a
+  // `window` that no longer exists:
+  //   ReferenceError: window is not defined
+  //     at getCurrentEventPriority (react-dom)
+  //     at sonner/dist/index.mjs:1011  (removeToast → setToasts)
+  //     at Timeout._onTimeout index.mjs:635  (the unmount timer)
+  // Let that timer actually fire before the environment goes away.
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      realSetTimeout(resolve, SONNER_TIME_BEFORE_UNMOUNT_MS + 50);
+    });
+  });
   cleanup();
   // Always leave real timers installed so no fake-timer state escapes the file.
   vi.useRealTimers();

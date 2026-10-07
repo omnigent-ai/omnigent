@@ -136,6 +136,12 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     "pi": "pi",
     "pi-native": "pi",
     "native-pi": "pi",
+    # omp shares pi's gateway/model routing, so it resolves its provider the
+    # same way. Without this entry ``resolve_model_provider`` reports
+    # ``kind="none"`` for omp, which strands ``sys_list_models`` and the
+    # dispatch gate.
+    "omp": "pi",
+    "oh-my-pi": "pi",
     "openai-agents": "openai-agents-sdk",
     "openai-agents-sdk": "openai-agents-sdk",
     "agents_sdk": "openai-agents-sdk",
@@ -1121,10 +1127,11 @@ def list_models_for_worker(
                 note="Configured ACP provider model shortlist; vendor CLI owns authentication.",
             )
     provider = resolve_model_provider(spec, harness)
-    # Pi harnesses use system.ai.* ids (via the Unity Catalog model-services API)
-    # so supervisors see the ids Pi can actually route. Other harnesses use the
-    # serving-endpoints listing which returns databricks-* ids.
-    _pi_harnesses = frozenset({"pi", "pi-native", "native-pi"})
+    # Pi-family harnesses use system.ai.* ids (via the Unity Catalog
+    # model-services API) so supervisors see the ids Pi — and omp, which
+    # routes the same gateway models — can actually route. Other harnesses
+    # use the serving-endpoints listing which returns databricks-* ids.
+    _pi_harnesses = frozenset({"pi", "pi-native", "native-pi", "omp", "oh-my-pi"})
     canonical = (harness or "").lower().replace("-", "").replace("_", "")
     use_uc = canonical in {h.replace("-", "").replace("_", "") for h in _pi_harnesses}
     if use_uc and provider.kind == DATABRICKS_KIND:
