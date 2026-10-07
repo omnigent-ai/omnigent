@@ -50,9 +50,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Job-level so a release.yml caller never shares a group with its own
-    # workflow-level `release` concurrency. PR pushes cancel the previous run.
+    # workflow-level `release` concurrency. Keyed on the calling workflow too,
+    # so the PR benchmark's re-check and this file's own PR run never cancel
+    # each other. PR pushes cancel the previous run.
     concurrency:
-      group: benchmark-release-${{ github.event.pull_request.number || github.run_id }}
+      group: benchmark-release-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     outputs:
       regression: ${{ steps.compare.outputs.regression }}
