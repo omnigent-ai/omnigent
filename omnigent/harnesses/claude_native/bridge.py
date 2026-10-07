@@ -2164,7 +2164,8 @@ def build_hook_settings(
     Besides the hooks, the fragment pre-approves every project ``.mcp.json``
     server (``enableAllProjectMcpServers``): the "New MCP server found"
     dialog is another unhookable startup gate that a host-spawned terminal
-    can never answer.
+    can never answer. It also turns off auto mode's post-turn
+    environment-setup offer (``skillOverrides``) for the same reason.
 
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
@@ -2464,6 +2465,10 @@ def build_hook_settings(
     # approval dialog in every new directory (each worktree included). It
     # fires no hook either, so pre-approve them like the other consent gates.
     settings["enableAllProjectMcpServers"] = True
+    # Auto mode offers "Teach auto mode about your environment?" after a turn;
+    # only the terminal can answer it, so web-UI messages stall behind it. This
+    # Claude Code switch turns off that offer and its /auto-mode-setup wizard.
+    settings["skillOverrides"] = {"auto-mode-setup": "off"}
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -2559,6 +2564,7 @@ def augment_claude_args(
     api_key_helper: str | None = None,
     model_overrides: Mapping[str, str] | None = None,
     bundle_dir: Path | None = None,
+    workspace: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
     append_system_prompt: str | None = None,
@@ -2597,6 +2603,7 @@ def augment_claude_args(
         skills natively — the CLI mirror of the SDK executor's plugin
         wiring. ``None`` (e.g. the ``omnigent claude`` CLI's minimal
         spec) adds no plugin args.
+    :param workspace: Session workspace used to discover portable ``.agents`` skills.
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
@@ -2649,7 +2656,7 @@ def augment_claude_args(
     if append_system_prompt:
         args.extend(["--append-system-prompt", append_system_prompt])
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
-    from omnigent.inner.bundle_skills import claude_native_skill_args
+    from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
     args.extend(
         claude_native_skill_args(
@@ -2658,6 +2665,9 @@ def augment_claude_args(
             skills_filter=skills_filter,
         )
     )
+    if workspace is not None:
+        roots = (workspace, bundle_dir) if bundle_dir is not None else (workspace,)
+        args.extend(claude_agents_skill_args(bridge_dir, roots, skills_filter))
     from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
 
     return augment_claude_debug_args(args, bridge_dir)

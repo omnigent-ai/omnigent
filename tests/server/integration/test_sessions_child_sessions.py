@@ -2101,6 +2101,58 @@ async def test_side_chat_message_after_runner_loss(
         assert CLOSED_LABEL_KEY not in after.labels
 
 
+@pytest.mark.parametrize(
+    ("parent_runner", "host_reports_dead", "expected_status"),
+    [
+        ("runner_replacement", False, 409),
+        ("runner_side", True, 409),
+        ("runner_side", False, 503),
+    ],
+    ids=["parent-relaunched", "host-reports-runner-gone", "transient-outage"],
+)
+async def test_side_chat_retry_after_runner_loss(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_runner: str,
+    host_reports_dead: bool,
+    expected_status: int,
+) -> None:
+    """Resume seals a lost fork, while a temporary outage remains recoverable."""
+    child = await _create_native_child(client, name="retry-side-chat")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(
+        child["id"],
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+        },
+    )
+    conv_store.replace_runner_id(child["id"], "runner_side")
+    conv_store.replace_runner_id(child["parent_session_id"], parent_runner)
+
+    async def _none(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    real_fork_lost = routes_events_module._codex_side_chat_fork_lost
+
+    async def _fork_lost(*args: Any, **kwargs: Any) -> bool:
+        return host_reports_dead or await real_fork_lost(*args, **kwargs)
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _none)
+    monkeypatch.setattr(routes_events_module, "_codex_side_chat_fork_lost", _fork_lost)
+    response = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == expected_status, response.text
+    after = conv_store.get_conversation(child["id"])
+    assert after is not None
+    assert (after.labels.get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE) == (expected_status == 409)
+    assert conv_store.list_items(child["id"]).data == []
+
+
 async def test_non_subagent_session_not_healed_via_parent(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

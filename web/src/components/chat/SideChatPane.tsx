@@ -26,12 +26,18 @@ import { ChatComposer, ComposerSendButton } from "@/components/composer/ChatComp
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
+import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
-import { useChatStore, ensureConversationStreamed } from "@/store/chatStore";
+import {
+  EMPTY_SIDE_CHAT_COMPOSER,
+  ensureConversationStreamed,
+  useChatStore,
+} from "@/store/chatStore";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useSession } from "@/hooks/useSession";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
+import { serializeReplyDraft } from "@/lib/replyDraft";
 import { interrupt, stopSession } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
@@ -241,6 +247,8 @@ export function SideChatPane({
     setStarting(true);
     try {
       await onStart(text);
+      // The quoted selection now travels with the fork's first message.
+      useChatStore.getState().clearSideChatDraft(childId);
     } catch {
       // Re-enable the composer while preserving the draft for retry.
       setStarting(false);
@@ -282,6 +290,7 @@ export function SideChatPane({
                   bubble={bubble}
                   isLastAssistant={index === lastAssistantIndex}
                   showsWorking={showsWorking}
+                  recoveryDisabled={readOnly}
                 />
               ))}
               {shouldShowWorkingIndicator(showsWorking, bubbles) && <WorkingIndicator />}
@@ -341,38 +350,57 @@ function SideChatComposer({
   const send = useChatStore((s) => s.send);
   const queryClient = useQueryClient();
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
-  const [text, setText] = useState("");
-  const [files, setFiles] = useState<File[]>([]);
-  const [autoSend, setAutoSend] = useState<string | null>(null);
+  // Unsent text + attachments live in the store, keyed by child id, NOT in
+  // component state: this pane mounts in the desktop rail or the mobile
+  // drawer's portal, so crossing the `md` breakpoint (a phone rotating) moves
+  // it between subtrees and unmounts it, and so does switching rail tabs.
+  const composer = useChatStore((s) => s.sideChatComposers[childId]);
+  const { text, files } = composer ?? EMPTY_SIDE_CHAT_COMPOSER;
+  const updateComposer = useChatStore((s) => s.updateSideChatComposer);
+  const clearComposer = useChatStore((s) => s.clearSideChatComposer);
+  const setText = useCallback(
+    (next: string) => updateComposer(childId, (current) => ({ ...current, text: next })),
+    [childId, updateComposer],
+  );
+  const setFiles = useCallback(
+    (mutate: (current: File[]) => File[]) =>
+      updateComposer(childId, (current) => ({ ...current, files: mutate(current.files) })),
+    [childId, updateComposer],
+  );
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceSnapshotRef = useRef("");
   const dictation = useDictationInsert(text, setText, textareaRef);
-
-  // A `/side <question>` that opened this side chat seeds a draft to SEND (not
-  // just populate). Consumed once on mount; the send waits until the child's
-  // agent binding is known. Live tabs only (a pending tab has no child yet).
+  // This tab's seeded text: on a pending tab the "Ask in side chat" selection
+  // to QUOTE, on a live tab the `/side` question to SEND.
+  const draft = useChatStore((s) => s.sideChatDrafts[childId]);
+  const quote = pending ? draft : undefined;
+  const autoSend = pending ? undefined : draft;
   useEffect(() => {
-    if (pending) return;
-    const draft = useChatStore.getState().sideChatDrafts[childId];
-    if (draft) {
-      clearSideChatDraft(childId);
-      setAutoSend(draft);
-    }
-  }, [pending, childId, clearSideChatDraft]);
+    if (quote !== undefined) textareaRef.current?.focus();
+  }, [quote]);
   // Re-read the labels so a side chat the server just sealed turns read-only.
   const refreshLabels = useCallback(
     () => void queryClient.invalidateQueries({ queryKey: ["session", childId] }),
     [queryClient, childId],
   );
+  // Send the seeded question once the child's agent binding is known. The text
+  // stays in the store until this dispatches — never copied into component
+  // state first — so unmounting in the meantime (closing the mobile drawer,
+  // switching tabs) defers the send instead of discarding the only copy.
   useEffect(() => {
-    if (autoSend === null || agentId === null) return;
-    void send(autoSend, agentId, undefined, { pinnedConversationId: childId }).finally(
+    if (autoSend === undefined || agentId === null) return;
+    // Re-read and consume the LIVE draft rather than the one captured at
+    // render: a replayed mount effect (React StrictMode in development) would
+    // otherwise send the captured question a second time.
+    const question = useChatStore.getState().sideChatDrafts[childId];
+    if (question === undefined) return;
+    clearSideChatDraft(childId);
+    void send(question, agentId, undefined, { pinnedConversationId: childId }).finally(
       refreshLabels,
     );
-    setAutoSend(null);
-  }, [autoSend, agentId, send, childId, refreshLabels]);
+  }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels]);
 
   const ready = pending ? !starting : agentId !== null;
   const canSend = text.trim().length > 0 || (!pending && files.length > 0);
@@ -391,13 +419,16 @@ function SideChatComposer({
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
       // Keep the text so a failed fork can be retried without re-typing.
-      void onStart(trimmed);
+      void onStart(
+        quote === undefined
+          ? trimmed
+          : serializeReplyDraft({ quotes: [{ before: "", text: quote }], text: trimmed }),
+      );
       return;
     }
     if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
-    setText("");
     const outgoing = files;
-    setFiles([]);
+    clearComposer(childId);
     void send(trimmed, agentId, outgoing.length > 0 ? outgoing : undefined, {
       pinnedConversationId: childId,
     }).finally(refreshLabels);
@@ -437,6 +468,17 @@ function SideChatComposer({
           },
         }}
         slots={{
+          inputPrefix:
+            quote === undefined ? undefined : (
+              <ReplyDraftBlocks
+                quotes={[{ id: childId, before: "", text: quote }]}
+                activeTextId={null}
+                keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+                disabled={!ready}
+                inputFor={() => ({})}
+                onRemove={() => clearSideChatDraft(childId)}
+              />
+            ),
           attachments:
             !pending && files.length > 0 ? (
               <ComposerAttachments

@@ -28,6 +28,15 @@ def test_explicit_mark_is_fresh_within_the_window_then_expires() -> None:
     assert shutdown_state.server_shutting_down(now=expired) is False
 
 
+def test_mark_outlasts_the_runner_disconnect_grace() -> None:
+    """The relay and the per-runner timer consult the mark only once the grace ends."""
+    from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
+
+    shutdown_state.mark_server_shutting_down()
+    decided_at = time.monotonic() + RUNNER_DISCONNECT_GRACE_S + 10.0
+    assert shutdown_state.server_shutting_down(now=decided_at) is True
+
+
 @pytest.mark.parametrize(
     ("code", "expected"),
     [(1012, True), (1000, False), (1001, False), (1006, False), (None, False)],
