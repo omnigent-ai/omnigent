@@ -5,9 +5,8 @@ items for tools outside the default namespace (``sleep`` in ``container``),
 and the Responses backend rejects the next turn unless each such call is
 round-tripped with its ``namespace`` field. This drives the production
 cold-resume path with the real installed ``codex`` binary and a loopback
-Responses provider that records the request Codex actually sends. Before the
-fix the synthesizer kept only name/arguments/call_id, so the replayed call
-reached the provider without ``namespace``. No credentials or network needed.
+Responses provider that records the request Codex actually sends; that request
+must retain the replayed call's namespace. No credentials or network needed.
 """
 
 from __future__ import annotations

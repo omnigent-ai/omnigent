@@ -2545,6 +2545,18 @@
             "description": "Tool function name, e.g. `\"search.web\"`.",
             "title": "Name",
             "type": "string"
+          },
+          "namespace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Tool namespace the model emitted the call under, e.g. `\"container\"`. `None` for the default namespace. Harnesses that replay history must round-trip it with the call.",
+            "title": "Namespace"
           }
         },
         "required": [
