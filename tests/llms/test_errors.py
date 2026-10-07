@@ -64,7 +64,46 @@ def test_detect_request_size_overflow_repeated_fields_ending_in_valid_pair() -> 
     elapsed = time.perf_counter() - start
 
     assert result is not None
-    # The first request field after the phrase wins; the limit is the real cap.
-    assert result.request_bytes == 1
+    # Only the adjacent request/limit pair matches; the standalone noise fields
+    # are skipped, so the real cap's request and limit are returned intact.
+    assert result.request_bytes == 33967957
     assert result.limit_bytes == 33554432
     assert elapsed < _TIME_BUDGET_S, f"parser took {elapsed:.3f}s on hostile input"
+
+
+def test_detect_request_size_overflow_requires_adjacent_pair() -> None:
+    """A stray request and a distant limit are not paired into an overflow."""
+    assert (
+        detect_request_size_overflow(
+            "exceeds maximum allowed content length RequestSize(bytes): 1 "
+            + "x " * 500
+            + "Limit(bytes): 33554432"
+        )
+        is None
+    )
+
+
+# Python's int(str) conversion rejects more than this many digits by default.
+_OVERLONG_DIGITS = "9" * 4301
+
+
+def test_detect_request_size_overflow_overlong_request_field_is_none() -> None:
+    """An overlong request field returns None instead of raising ValueError."""
+    assert (
+        detect_request_size_overflow(
+            "exceeds maximum allowed content length. "
+            f"RequestSize(bytes): {_OVERLONG_DIGITS}, Limit(bytes): 33554432"
+        )
+        is None
+    )
+
+
+def test_detect_request_size_overflow_overlong_limit_field_is_none() -> None:
+    """An overlong limit field returns None instead of raising ValueError."""
+    assert (
+        detect_request_size_overflow(
+            "exceeds maximum allowed content length. "
+            f"RequestSize(bytes): 33967957, Limit(bytes): {_OVERLONG_DIGITS}"
+        )
+        is None
+    )

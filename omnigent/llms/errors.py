@@ -56,13 +56,14 @@ def is_context_length_exceeded(exc: BaseException) -> bool:
 
 
 # Databricks front-door rejection of an oversized request body; sizes are
-# bytes, not tokens. Scanned field-by-field, not with one combined wildcard
-# regex, whose nested ``.*?`` under ``DOTALL`` backtracks on hostile input.
+# bytes, not tokens. The request/limit pair is matched directly as one adjacent
+# group (no nested ``.*?`` wildcards) to stay linear-time on hostile input.
 _CONTENT_LENGTH_PHRASE = re.compile(
     r"exceeds maximum allowed content length", re.IGNORECASE
 )
-_REQUEST_SIZE_FIELD = re.compile(r"RequestSize\(bytes\):\s*(\d+)", re.IGNORECASE)
-_LIMIT_SIZE_FIELD = re.compile(r"Limit\(bytes\):\s*(\d+)", re.IGNORECASE)
+_REQUEST_LIMIT_PAIR = re.compile(
+    r"RequestSize\(bytes\):\s*(\d+),\s*Limit\(bytes\):\s*(\d+)", re.IGNORECASE
+)
 
 # Rough bytes-per-token ratio for expressing a byte-cap rejection in the
 # token units the context-overflow plumbing carries.
@@ -108,16 +109,18 @@ def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
     phrase = _CONTENT_LENGTH_PHRASE.search(message)
     if phrase is None:
         return None
-    request = _REQUEST_SIZE_FIELD.search(message, phrase.end())
-    if request is None:
+    pair = _REQUEST_LIMIT_PAIR.search(message, phrase.end())
+    if pair is None:
         return None
-    limit = _LIMIT_SIZE_FIELD.search(message, request.end())
-    if limit is None:
+    try:
+        return RequestSizeOverflow(
+            request_bytes=int(pair.group(1)),
+            limit_bytes=int(pair.group(2)),
+        )
+    except ValueError:
+        # Python caps int(str) at 4300 digits; a malformed oversized field must
+        # not crash classification, so treat it as an unrecognized message.
         return None
-    return RequestSizeOverflow(
-        request_bytes=int(request.group(1)),
-        limit_bytes=int(limit.group(1)),
-    )
 
 
 def llm_error_category(code: str) -> ErrorCategory:

@@ -157,8 +157,8 @@ def test_oversized_session_turn_and_fork_fail_with_content_length_error(
     _fail_turn_with_content_length_error(base_url, fork_id, "fork_turn_1")
     _expect_content_length_failure(page, expected_pills=1)
 
-    # Back on the source, the turn fails the same way and retrying re-hits
-    # the cap; each failure must keep the context-overflow classification.
+    # Back on the source, successive turns fail the same way; each failure
+    # must keep the context-overflow classification.
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=90_000)
     _fail_turn_with_content_length_error(base_url, session_id, "turn_1")

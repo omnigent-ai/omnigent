@@ -723,35 +723,44 @@ _CONTEXT_OVERFLOW_PATTERNS = (
 )
 
 
-def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
+def _is_context_overflow_error(
+    event: _JsonObject,
+) -> tuple[int, int, str | None] | None:
     """
     Check if a ``response.failed`` SSE event indicates a context-window overflow.
 
     :param event: The parsed SSE event dict.
-    :returns: ``(max_tokens, actual_tokens)`` if overflow detected, else ``None``.
+    :returns: ``(max_tokens, actual_tokens, detail_message)`` on overflow, else
+        ``None``. ``detail_message`` carries a byte-cap rejection's raw text and
+        is ``None`` for token-shaped overflows, which have no extra detail.
     """
     if event.get("type") != "response.failed":
         return None
     error = cast(_JsonObject, event.get("error", {}))
-    msg = str(error.get("message", "")).lower()
+    raw = str(error.get("message", ""))
+    msg = raw.lower()
     # Parse byte-cap rejections (request first, limit second) ahead of the
     # generic gate so the numeric fallback can't invert the pair; size-less
     # content-length phrases stay generic. Sizes are expressed as tokens.
     size_overflow = detect_request_size_overflow(msg)
     if size_overflow is not None:
-        return size_overflow.approx_limit_tokens, size_overflow.approx_request_tokens
+        return (
+            size_overflow.approx_limit_tokens,
+            size_overflow.approx_request_tokens,
+            raw,
+        )
     if not any(pat in msg for pat in _CONTEXT_OVERFLOW_PATTERNS):
         return None
     actual_gt_max = re.search(r"(\d{4,})\D*>\D*(\d{4,})", msg)
     if actual_gt_max is not None:
-        return int(actual_gt_max.group(2)), int(actual_gt_max.group(1))
+        return int(actual_gt_max.group(2)), int(actual_gt_max.group(1)), None
 
     numbers = re.findall(r"(\d{4,})", msg)
     if len(numbers) >= 2:
-        return int(numbers[-2]), int(numbers[-1])
+        return int(numbers[-2]), int(numbers[-1]), None
     if len(numbers) == 1:
-        return int(numbers[0]), int(numbers[0]) + 1
-    return 128000, 128001
+        return int(numbers[0]), int(numbers[0]) + 1, None
+    return 128000, 128001, None
 
 
 def _response_failed_payload(
@@ -5706,18 +5715,11 @@ def create_runner_app(
 
                                 _overflow = _is_context_overflow_error(event)
                                 if _overflow is not None:
-                                    _ov_error = cast(_JsonObject, event.get("error", {}))
-                                    _ov_raw = str(_ov_error.get("message", ""))
-                                    # Keep a byte-cap's raw rejection text (with
-                                    # its RequestSize/Limit bytes) for the error
-                                    # detail; a token-shaped overflow has none.
-                                    _ov_detail = (
-                                        _ov_raw
-                                        if detect_request_size_overflow(_ov_raw)
-                                        else None
-                                    )
+                                    _max_tokens, _actual_tokens, _ov_detail = _overflow
                                     raise _ContextWindowOverflow(
-                                        *_overflow, detail_message=_ov_detail
+                                        _max_tokens,
+                                        _actual_tokens,
+                                        detail_message=_ov_detail,
                                     )
 
                                 _evt_type = event.get("type")

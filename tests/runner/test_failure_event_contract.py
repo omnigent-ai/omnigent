@@ -222,8 +222,11 @@ def test_byte_cap_rejection_classifies_as_overflow_without_inversion() -> None:
         )
     )
     assert overflow is not None
-    max_tokens, actual_tokens = overflow
+    max_tokens, actual_tokens, detail = overflow
     assert actual_tokens > max_tokens
+    # The raw rejection is carried through once for the error detail.
+    assert detail is not None
+    assert "RequestSize(bytes): 33967957" in detail
 
 
 def test_content_length_phrase_without_sizes_is_not_overflow() -> None:
