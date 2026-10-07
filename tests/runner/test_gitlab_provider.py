@@ -319,11 +319,20 @@ def test_no_oauth_or_cli_failure_hides_checkout(
     api.object.assert_not_called()
 
 
-def test_auth_failure_keeps_repo_context(root: str, api: Mock) -> None:
+@pytest.mark.parametrize("explicit", [False, True])
+def test_auth_failure_keeps_repo_context(root: str, api: Mock, explicit: bool) -> None:
     api.object.side_effect = GitLabError("Access denied")
-    info = module.PULL_REQUESTS.reference_info(root, ref())
-    assert info["available"] and info["repo"]["name_with_owner"] == ref().repository
+    info = (
+        module.PULL_REQUESTS.reference_info(root, ref())
+        if explicit
+        else module.PULL_REQUESTS.workspace_info(root)
+    )
+    assert info["available"]
+    assert info["repo"]["name_with_owner"] == (
+        ref().repository if explicit else "fork/sub/project"
+    )
     assert info["pr"] is None and not info["auth"]["authenticated"]
+    assert info["auth"]["hint"] == "Access denied"
     assert info["warnings"] == ["Access denied"]
 
 
@@ -337,6 +346,37 @@ def test_no_current_mr_is_an_authenticated_empty_state(root: str, api: Mock) -> 
         "projects/fork%2Fsub%2Fproject/merge_requests",
         "projects/team%2Fsub%2Fproject/merge_requests",
     ]
+
+
+@pytest.mark.parametrize(
+    "problem,message",
+    [
+        ("ambiguous", "Several merge requests use this branch"),
+        ("partial", "GitLab returned an incomplete MR list"),
+        ("timeout", "Discovery timed out"),
+    ],
+)
+def test_discovery_failure_preserves_successful_project_access(
+    root: str, api: Mock, mr: dict, monkeypatch: pytest.MonkeyPatch, problem: str, message: str
+) -> None:
+    from omnigent.runner import pr_resource
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(Path(root) / "data"))
+
+    def list_response(path: str, **_query):
+        if "fork%2Fsub%2Fproject" in path:
+            return [], False
+        if problem == "timeout":
+            raise GitLabTimeoutError("Discovery timed out")
+        matches = [mr, {**mr, "iid": 8, "web_url": URL.replace("/7", "/8")}]
+        return matches, problem == "partial"
+
+    api.pages.side_effect = list_response
+    info = pr_resource.pr_info(root, session_id="discovery-failure")
+    assert info["auth"]["authenticated"]
+    assert info["auth"]["hint"] is None
+    assert info["pr"] is None and info["prs"] == []
+    assert any(message in warning for warning in info["warnings"])
 
 
 @pytest.fixture(params=["detached", "no_remotes", "foreign_remote"])

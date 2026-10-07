@@ -34,6 +34,10 @@ _STATES = {"opened": "OPEN", "merged": "MERGED", "closed": "CLOSED", "locked": "
 _BUCKETS = {"success": "passing", "skipped": "passing", "failed": "failing", "canceled": "failing"}
 
 
+class _DiscoveryError(ValueError):
+    """MR discovery failed after access to the source project succeeded."""
+
+
 def _object(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -124,7 +128,7 @@ def _resolved(
     project = client.object(f"projects/{quote(source.repository, safe='')}")
     source_id = project.get("id")
     if not isinstance(source_id, int) or isinstance(source_id, bool) or source_id <= 0:
-        raise ValueError("GitLab returned an invalid source project identity.")
+        raise _DiscoveryError("GitLab returned an invalid source project identity.")
     parent = GitLabProvider().parse_remote_url(
         str(_object(project.get("forked_from_project")).get("web_url") or ""), EnvInstances()
     )
@@ -171,7 +175,7 @@ def _resolved(
         except ValueError as exc:
             failure = exc
     if failure is not None:
-        raise failure
+        raise _DiscoveryError(str(failure)) from failure
     return None
 
 
@@ -307,7 +311,11 @@ def _info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
             info["pr"] = _pr_payload(client, ref, mr, info["warnings"])
             info["base_ref"] = info["pr"]["base_ref"]
     except ValueError as exc:
-        info["auth"]["hint"] = str(exc)
+        if isinstance(exc, _DiscoveryError):
+            info["auth"]["authenticated"] = True
+            info["auth"]["hint"] = None
+        else:
+            info["auth"]["hint"] = str(exc)
         info["warnings"].append(str(exc))
     return info
 
