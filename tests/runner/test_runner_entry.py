@@ -590,6 +590,36 @@ def test_create_app_reuses_a_resolved_no_credential_result(
     assert len(resolutions) == expected_resolutions
 
 
+@pytest.mark.asyncio
+async def test_tunnel_boot_hands_its_auth_resolution_to_create_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boot marks its credential resolution final, so create_app doesn't redo it."""
+    import omnigent.runner._entry as entry_mod
+
+    class _Stop(Exception):
+        """Ends the boot sequence once create_app is reached."""
+
+    seen: dict[str, object] = {}
+
+    def _capture_create_app(**kwargs: object) -> None:
+        seen.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(entry_mod, "_runner_auth_factory", None)
+    monkeypatch.setattr(entry_mod, "_server_url_from_env", lambda: "http://runner.test")
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(entry_mod, "_runner_tunnel_binding_token_from_env", lambda: None)
+    monkeypatch.setattr(entry_mod, "_runner_parent_pid_from_env", lambda: None)
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+    monkeypatch.setattr(entry_mod, "create_app", _capture_create_app)
+
+    with pytest.raises(_Stop):
+        await entry_mod._run_tunnel_from_env()
+
+    assert seen == {"auth_token_factory": None, "auth_resolved": True}
+
+
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

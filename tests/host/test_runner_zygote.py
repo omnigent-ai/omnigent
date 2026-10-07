@@ -166,8 +166,14 @@ def test_zygote_loads_the_deferred_graph_once_nothing_is_pending(monkeypatch) ->
         order.append("reply")
         real_send(conn, payload)
 
+    imported = threading.Event()
+
+    def _record_import() -> None:
+        order.append("import")
+        imported.set()
+
     monkeypatch.setattr(_zygote, "_send", _record_send)
-    monkeypatch.setattr(_zygote, "_import_deferred_graph", lambda: order.append("import"))
+    monkeypatch.setattr(_zygote, "_import_deferred_graph", _record_import)
     monkeypatch.setattr(_zygote, "_exit_unless_single_threaded", lambda: None)
     monkeypatch.setattr(_zygote.gc, "freeze", lambda: None)
 
@@ -179,6 +185,9 @@ def test_zygote_loads_the_deferred_graph_once_nothing_is_pending(monkeypatch) ->
     replies = daemon_side.makefile("r")
     try:
         assert json.loads(replies.readline()) == {"pong": True}
+        # A ping sent before the import runs is (correctly) served first; wait
+        # so the second request deterministically lands after it.
+        assert imported.wait(timeout=5)
         daemon_side.sendall(b'{"cmd": "ping"}\n')
         assert json.loads(replies.readline()) == {"pong": True}
     finally:
@@ -188,6 +197,22 @@ def test_zygote_loads_the_deferred_graph_once_nothing_is_pending(monkeypatch) ->
 
     assert not thread.is_alive()
     assert order == ["reply", "import", "reply"]
+
+
+def test_failed_deferred_preload_does_not_stop_the_zygote(monkeypatch) -> None:
+    """An optional preload that raises (e.g. an SDK OSError) leaves the zygote serving."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _failing_import(name: str, *args, **kwargs):
+        if name == "databricks.sdk.config":
+            raise OSError("credential probe failed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _failing_import)
+
+    _zygote._import_deferred_graph()  # must not raise
 
 
 def test_manager_starts_and_pings(manager: ZygoteManager) -> None:

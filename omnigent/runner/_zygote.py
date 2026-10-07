@@ -211,10 +211,17 @@ def _import_deferred_graph() -> None:
     keeps it out of each later fork. ``databricks-sdk`` is an optional
     dependency.
     """
-    with contextlib.suppress(ImportError):
+    try:
         import databricks.sdk.config  # noqa: F401
 
         from omnigent.inner import databricks_executor  # noqa: F401
+    except ImportError:
+        pass  # SDK not installed: runners never pay for it either.
+    except Exception as exc:  # noqa: BLE001 — an optional preload must not kill the forkserver
+        # The SDK can raise OSError probing credentials at import; forks then
+        # pay the import themselves, exactly as before this preload existed.
+        sys.stderr.write(f"zygote: deferred Databricks SDK preload failed: {exc!r}\n")
+        sys.stderr.flush()
 
 
 def _exit_unless_single_threaded() -> None:
