@@ -1385,8 +1385,9 @@ const TreeNodeRow = memo(function TreeNodeRow({
             )}
           </button>
           {/* The same trailing column as a file row. A folder has no size and
-          nothing to download, so the download footprint stays reserved beside
-          the copy button to keep it aligned with every file row. */}
+          nothing to download, so the column shows only the copy button — with
+          the download's footprint reserved beside it so that button lands in
+          the same x as every file row's. */}
           <span
             className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
           >
