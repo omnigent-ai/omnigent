@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import shutil
 import signal
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -1082,11 +1084,16 @@ def test_stop_process_group_kills_descendants_that_ignore_sigterm() -> None:
     )
     assert proc.stdout is not None
     grandchild = int(proc.stdout.readline())
+    try:
+        _stop_process_group(proc)
 
-    _stop_process_group(proc)
-
-    assert proc.poll() is not None
-    assert _wait_gone(grandchild)
+        assert proc.poll() is not None
+        assert _wait_gone(grandchild)
+    finally:
+        for pid in (grandchild, proc.pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        proc.wait(timeout=5)
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux")
@@ -1165,23 +1172,67 @@ async def test_cancelled_start_cannot_leave_a_child_behind() -> None:
 
     env._start = _start  # type: ignore[method-assign]
     task = asyncio.create_task(env.__aenter__())
-    await asyncio.to_thread(spawned.wait, 30)
-    first_child = env._children[0]
-    task.cancel()
-    deadline = time.monotonic() + 30
-    while not env._stopping and time.monotonic() < deadline:
-        await asyncio.sleep(0.01)
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    # The thread running _start outlives the cancelled await; let it finish.
-    deadline = time.monotonic() + 30
-    while not later_spawn and time.monotonic() < deadline:
-        await asyncio.sleep(0.01)
+    try:
+        await asyncio.to_thread(spawned.wait, 30)
+        first_child = env._children[0]
+        task.cancel()
+        await _wait_until(lambda: env._stopping)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The thread running _start outlives the cancelled await; let it finish.
+        await _wait_until(lambda: bool(later_spawn))
 
-    assert later_spawn == ["refused"]
-    assert len(env._children) == 1
-    assert first_child.poll() is not None
+        assert later_spawn == ["refused"]
+        assert len(env._children) == 1
+        assert first_child.poll() is not None
+    finally:
+        release.set()
+        for child in env._children:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+async def test_start_cancelled_before_it_begins_creates_nothing() -> None:
+    """Teardown that runs first must not leave a temp dir for the late start to fill."""
+    env = BenchEnvironment()
+    entered = threading.Event()
+    release = threading.Event()
+    outcome: list[str] = []
+    real_start = env._start
+
+    def _paused_start() -> None:
+        entered.set()
+        release.wait(timeout=30)
+        try:
+            real_start()
+        except RuntimeError as exc:
+            outcome.append(str(exc))
+            raise
+
+    env._start = _paused_start  # type: ignore[method-assign]
+    task = asyncio.create_task(env.__aenter__())
+    try:
+        await asyncio.to_thread(entered.wait, 30)
+        task.cancel()
+        await _wait_until(lambda: env._stopping)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _wait_until(lambda: bool(outcome))
+
+        assert outcome == ["benchmark environment is stopping"]
+        assert not env._tmp.exists()
+    finally:
+        release.set()
+        shutil.rmtree(env._tmp, ignore_errors=True)
+
+
+async def _wait_until(condition: Callable[[], bool], timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
 
 
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")
@@ -1214,9 +1265,12 @@ def test_sigterm_mid_run_leaves_no_processes(tmp_path: Path) -> None:
         assert descendants, "run.py booted no server"
         proc.send_signal(signal.SIGTERM)
         proc.communicate(timeout=60)
+        assert proc.returncode == 128 + signal.SIGTERM
+        assert all(_wait_gone(child.pid) for child in descendants)
     finally:
         if proc.poll() is None:
             proc.kill()
-
-    assert proc.returncode == 128 + signal.SIGTERM
-    assert all(_wait_gone(child.pid) for child in descendants)
+            proc.wait(timeout=10)
+        for child in descendants:
+            with contextlib.suppress(psutil.Error):
+                child.kill()

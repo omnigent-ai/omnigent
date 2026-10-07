@@ -418,10 +418,15 @@ class BenchEnvironment:
 
     def _start(self) -> None:
         """Spawn the server (± mock + runner) and block until ready."""
-        self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._child_tmp.mkdir(exist_ok=True)
         artifact_dir = self._tmp / "artifacts"
-        artifact_dir.mkdir(exist_ok=True)
+        # Under the lifecycle lock, so a start cancelled before it got here
+        # cannot recreate the temp dir after teardown removed it. Later writes
+        # all need this root, so they fail instead.
+        with self._lifecycle_lock:
+            self._raise_if_stopping()
+            self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._child_tmp.mkdir(exist_ok=True)
+            artifact_dir.mkdir(exist_ok=True)
 
         if self.with_runner:
             mock_port = _find_free_port()
