@@ -14,9 +14,9 @@ import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
-import { prefetchSessionHostChain } from "@/hooks/useSession";
-import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -373,19 +373,27 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       let sourceHostId: string | null = null;
       if (evt.action === "navigate") {
         try {
-          // Child-list parent links do not establish whether the child has its own host.
-          const source = await queryClient.fetchQuery({
-            queryKey: ["session", sourceConversationId],
-            queryFn: () => getSessionSlim(sourceConversationId),
-            staleTime: Infinity,
-            retry: false,
-          });
-          setSessionHost(source.id, source.hostId);
-          setSessionParent(source.id, source.parentSessionId);
-          if (getSessionHost(sourceConversationId) === null) {
-            await prefetchSessionHostChain(queryClient, sourceConversationId);
+          // Parent hints cannot establish which ancestor has the nearest own host binding.
+          const visited = new Set<string>();
+          let id: string | null = sourceConversationId;
+          while (id !== null && !visited.has(id)) {
+            visited.add(id);
+            const hopId: string = id;
+            // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
+            const source: Session = await queryClient.fetchQuery({
+              queryKey: ["session", hopId],
+              queryFn: () => getSessionSlim(hopId),
+              staleTime: Infinity,
+              retry: false,
+            });
+            setSessionHost(source.id, source.hostId);
+            setSessionParent(source.id, source.parentSessionId);
+            if (source.hostId) {
+              sourceHostId = source.hostId;
+              break;
+            }
+            id = source.parentSessionId;
           }
-          sourceHostId = getSessionHost(sourceConversationId);
         } catch {
           // Unknown provenance stays denied for localhost; public browsing still works.
         }
