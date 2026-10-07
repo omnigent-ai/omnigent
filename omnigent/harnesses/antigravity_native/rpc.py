@@ -1384,6 +1384,22 @@ def _child_pids_from_proc(pid: int) -> list[int]:
     return children
 
 
+def _is_agy_process(pid: int) -> bool:
+    """Return whether pid is actually the agy executable rather than a shell wrapper."""
+    try:
+        proc = psutil.Process(pid)
+        cmdline = proc.cmdline()
+    except (psutil.Error, OSError):
+        try:
+            raw = Path(_PROC_FS, str(pid), "cmdline").read_bytes()
+            cmdline = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+        except OSError:
+            return False
+    if not cmdline:
+        return False
+    return Path(cmdline[0]).name == "agy"
+
+
 def _agy_pid_in_pane_subtree(pane_pid: int) -> int | None:
     """
     Return the agy pid running at or beneath a tmux pane's process (best-effort).
@@ -1401,9 +1417,14 @@ def _agy_pid_in_pane_subtree(pane_pid: int) -> int | None:
     :returns: The agy pid in the pane's subtree, or ``None`` when none is found
         (the caller then falls back to the host-wide candidate scan).
     """
-    agy_pids = set(_list_agy_pids())
-    if not agy_pids:
+    candidate_pids = set(_list_agy_pids())
+    if not candidate_pids:
         return None
+    # Filter candidate pids down to actual agy processes so intermediate shell
+    # wrappers (e.g. `fish -c .../bin/agy`) in the pane are not mistaken for agy.
+    agy_pids = {pid for pid in candidate_pids if _is_agy_process(pid)}
+    if not agy_pids:
+        agy_pids = candidate_pids
     if pane_pid in agy_pids:
         return pane_pid
     # Breadth-first descent, bounded by depth and visited-set so a cyclic ppid

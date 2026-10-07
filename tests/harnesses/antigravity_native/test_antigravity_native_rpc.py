@@ -2218,6 +2218,23 @@ def test_agy_pid_in_pane_subtree_tolerates_cycle(
     assert rpc._agy_pid_in_pane_subtree(100) is None
 
 
+def test_agy_pid_in_pane_subtree_skips_shell_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the pane pid is a shell wrapper (e.g. fish -c .../bin/agy), agy child is resolved.
+
+    pgrep -f matches both the shell command line and the child agy.
+    _agy_pid_in_pane_subtree must not treat the shell as agy, but descend to
+    the actual agy child process.
+    """
+    children = {100: [200], 200: []}
+    monkeypatch.setattr(rpc, "_list_agy_pids", lambda: [100, 200])
+    monkeypatch.setattr(rpc, "_child_pids", lambda pid: children.get(pid, []))
+    # 100 is shell wrapper (not agy), 200 is actual agy
+    monkeypatch.setattr(rpc, "_is_agy_process", lambda pid: pid == 200)
+    assert rpc._agy_pid_in_pane_subtree(100) == 200
+
+
 # ---------------------------------------------------------------------------
 # _child_pids
 # ---------------------------------------------------------------------------
