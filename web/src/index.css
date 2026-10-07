@@ -626,22 +626,29 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   }
 }
 
-/* Chat scroll fade: the ChatHeader overlay paints no background (a flat
- * fill can't track the .app-shell canvas gradient, and a copy of the
- * gradient can't stay aligned — the header resizes when the sidebar
- * opens), so instead of occluding scrolled-under text at the header, the
- * conversation's scroll viewport masks its own top edge: content
- * dissolves into the canvas before it reaches the header's control row
- * (on mobile, message text used to render straight through the icons).
- * Geometry is tied to the header chrome — fully transparent through 48px
- * (the h-14 bar is 56px tall; its 32px controls end at 44px), ramping to
- * full opacity at 80px, the chat column's pt-20 clearance line, so
- * at-rest content is never faded. Stops are px from the top so the fade
- * is independent of viewport height, and the mask sits on the viewport
- * box (not the scrolling content) so it stays pinned while text moves. */
+/* Fade scrolling content before it reaches the transparent header or composer.
+ * Both ramps are 32px; the header's control band occupies the first 48px. */
 .chat-scroll-fade {
-  mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
-  -webkit-mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 48px,
+    black 80px,
+    black calc(100% - 32px),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 48px,
+    black 80px,
+    black calc(100% - 32px),
+    transparent 100%
+  );
+}
+
+/* A pinned plan already clears the header, so only fade into the composer. */
+.chat-scroll-composer-fade {
+  mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
 }
 
 /* Snap target for the "Worked for" fold row (scrollIntoView block:"start").
@@ -789,12 +796,10 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-electron-mac] .conversations-sidebar [data-testid="sidebar-header-actions"] {
     display: none;
   }
-  /* With both the wordmark and the cluster gone, the 3rem row is empty — it
-   * would leave the same dead band this change set out to reclaim. Collapse it
-   * to the title-bar strip's height so the session list starts right below the
-   * window furniture instead of 3rem down. */
+  /* Reserve the full drag strip so the session list starts below the
+   * window furniture and stays outside the drag region. */
   [data-electron-mac] .sidebar-header-row {
-    height: 2.25rem;
+    height: 3rem;
     padding: 0;
   }
   /* The chat header's own open-sidebar button is redundant here: the title-bar
@@ -805,22 +810,13 @@ aside[aria-label="Workspace"][data-maximized] {
   [data-electron-mac] .chat-header-sidebar-toggle {
     display: none;
   }
-  /* The peek card floats at inset-2 (8px from the top), which on this shell puts
-   * its first row level with the traffic lights and the title-bar cluster — the
-   * card slides up UNDER the window controls and collides with them. Drop its
-   * top edge below the 2.25rem strip so it floats in beneath the controls
-   * instead, keeping the same 0.5rem breathing room the other edges use.
-   * The docked sidebar is unaffected: only the floating card is offset. */
+  /* Float the peek card below the 3rem drag strip, with the same 0.5rem
+   * breathing room as its other edges. The docked sidebar is unaffected. */
   [data-electron-mac] .conversations-sidebar.is-peek {
-    top: 2.75rem;
+    top: 3.5rem;
   }
-  /* ...and once it floats down there, the header row it still carries is dead
-   * space. That row exists to reserve the title-bar strip for the lights and the
-   * icon cluster, which only applies to the DOCKED sidebar starting at y=0 — the
-   * peek card is already clear of all of it, so on mac the row is 2.25rem of
-   * empty canvas above the first entry (both the wordmark and the cluster inside
-   * it are hidden here). Drop it so the card's content lines up against its own
-   * top padding. */
+  /* The peek card already clears the drag strip, so it needs no reserved
+   * header row above its content. */
   [data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row {
     display: none;
   }
@@ -828,37 +824,19 @@ aside[aria-label="Workspace"][data-maximized] {
    * sit under the traffic lights. Push it below them — it has no cluster to
    * align beside the lights, so it clears them vertically instead. */
   [data-electron-mac] .settings-sidebar-header {
-    padding-top: 2.75rem;
+    padding-top: 3.5rem;
   }
 }
-/* The strip spans the top of the window but stops 20rem short of the right
- * edge, keeping the chat header's action cluster (share, panel toggles) and
- * devtools chrome clear of the drag region. Interactive elements that
- * overlap the strip elsewhere stay clickable via the blanket no-drag rule
- * below — including the sidebar's own header buttons, which now live inside
- * this strip's band since the sidebar starts at the window's top edge. */
+/* Match the full desktop header; controls opt out of dragging below. */
 [data-electron-mac] .electron-drag-strip {
   position: absolute;
-  inset: 0 20rem auto 0;
-  height: 2.25rem;
+  inset: 0 0 auto 0;
+  height: 3rem;
   -webkit-app-region: drag;
 }
-/* The title-bar cluster (Search/Settings/toggle), pinned beside the traffic
- * lights and independent of the sidebar — that independence is the point: it
- * holds this exact spot whether the sidebar is open, collapsed, or peeking.
- *
- * Sits ABOVE the drag strip in source order so it wins the same stacking
- * context; the blanket no-drag rule below keeps its buttons clickable inside the
- * drag band. Ordered Collapse, Search, Settings reading outward from the window
- * controls, while the DOM keeps Search → Settings → toggle (tab order follows
- * importance), so the toggle is reordered visually rather than in the markup.
- *
- * Geometry: left 5.5rem clears the three lights plus their inset. The buttons
- * align to the LIGHTS, not to a text row — macOS paints them OUTSIDE the page
- * (absent from the DOM and from page screenshots), so there is nothing to
- * measure; anchor to the same 2.25rem strip the drag region uses and centre a
- * 1.5rem button in it: (48px - 24px) / 2 = 12px, landing on the
- * lights' centre line. */
+/* Pin the cluster beside the lights independently of the sidebar. The top
+ * inset centers 1.5rem buttons in the 3rem bar; visually reorder the toggle
+ * without changing the Search → Settings → toggle tab order. */
 [data-electron-mac] .electron-sidebar-header-actions {
   position: absolute;
   top: 0.75rem;
@@ -904,10 +882,46 @@ aside[aria-label="Workspace"][data-maximized] {
   .workspace-tab-strip {
   padding-left: 10.5rem;
 }
-/* Drag regions are geometric, not z-ordered: anything that overlaps the
- * strip (e.g. the mobile full-screen sidebar overlay) would lose clicks
- * without an explicit counter-region on interactive elements. */
-[data-electron-mac] :is(a, button, input, textarea, [role="button"]) {
+/* Drag regions ignore z-order, so controls and overlays need counter-regions.
+ * Scope through html to cover portals outside AppShell on macOS only. */
+html:has([data-electron-mac])
+  :is(
+    a,
+    button,
+    input,
+    textarea,
+    select,
+    iframe,
+    video,
+    audio,
+    label,
+    summary,
+    [tabindex]:not([tabindex="-1"]),
+    .no-drag,
+    [role="button"],
+    [role="link"],
+    [role="tab"],
+    [role="separator"],
+    [role="menuitem"],
+    [role="menuitemcheckbox"],
+    [role="menuitemradio"],
+    [role="combobox"],
+    [role="option"],
+    [role="radio"],
+    [role="checkbox"],
+    [role="switch"],
+    [role="slider"],
+    [role="listbox"],
+    [role="textbox"],
+    [role="searchbox"],
+    [role="spinbutton"],
+    [role="menu"],
+    [role="dialog"],
+    [role="tooltip"],
+    [contenteditable="" i],
+    [contenteditable="plaintext-only" i],
+    [contenteditable="true" i]
+  ) {
   -webkit-app-region: no-drag;
 }
 /* The title-bar breadcrumb doubles as a window-drag handle (its title is a
@@ -956,6 +970,41 @@ aside[aria-label="Workspace"][data-maximized] {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
 }
 
+/* Settings titles join the mobile header row beside the sidebar control. */
+@media (width < 48rem) {
+  .settings-mobile-header::before {
+    position: absolute;
+    top: 0;
+    right: 0;
+    left: 0;
+    height: 80px;
+    pointer-events: none;
+    content: "";
+    background: linear-gradient(to bottom, var(--background) 0 48px, transparent 80px);
+  }
+
+  .settings-page-title {
+    position: fixed;
+    top: 0;
+    right: 4rem;
+    left: 4rem;
+    z-index: 30;
+    height: var(--omnigent-header-height);
+    margin: 0;
+    overflow: hidden;
+    font-size: var(--text-ui);
+    line-height: var(--omnigent-header-height);
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+
+  :is([data-ios-native], [data-android-native]) .settings-page-title {
+    top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  }
+}
+
 /* Remaining native-shell adjustments are specific to the mobile layout. */
 @media (width < 48rem) {
   /* Slide animation for the mobile drawer. Covers BOTH paths that move the
@@ -993,6 +1042,10 @@ aside[aria-label="Workspace"][data-maximized] {
     font-size: 16px;
   }
 
+  [data-ios-native] .composer-input-text {
+    font-size: var(--text-ui);
+  }
+
   [data-ios-native] .chat-conversation-content,
   [data-android-native] .chat-conversation-content {
     /* header band + 1.5rem breathing room + OS safe area, sourced from the
@@ -1009,12 +1062,16 @@ aside[aria-label="Workspace"][data-maximized] {
     mask-image: linear-gradient(
       to bottom,
       transparent calc(48px + var(--omnigent-inset-top)),
-      black calc(80px + var(--omnigent-inset-top))
+      black calc(80px + var(--omnigent-inset-top)),
+      black calc(100% - 32px),
+      transparent 100%
     );
     -webkit-mask-image: linear-gradient(
       to bottom,
       transparent calc(48px + var(--omnigent-inset-top)),
-      black calc(80px + var(--omnigent-inset-top))
+      black calc(80px + var(--omnigent-inset-top)),
+      black calc(100% - 32px),
+      transparent 100%
     );
   }
 
@@ -1033,12 +1090,16 @@ aside[aria-label="Workspace"][data-maximized] {
     mask-image: linear-gradient(
       to bottom,
       transparent var(--fade-start),
-      black calc(var(--fade-start) + 32px)
+      black calc(var(--fade-start) + 32px),
+      black calc(100% - 32px),
+      transparent 100%
     );
     -webkit-mask-image: linear-gradient(
       to bottom,
       transparent var(--fade-start),
-      black calc(var(--fade-start) + 32px)
+      black calc(var(--fade-start) + 32px),
+      black calc(100% - 32px),
+      transparent 100%
     );
   }
 
@@ -1091,55 +1152,6 @@ aside[aria-label="Workspace"][data-maximized] {
   }
 }
 
-/* Liquid glass for the mobile sidebar's two floating chips (Search at the top
- * of the header row, Settings over the bottom of the session list) — the iOS
- * control idiom.
- *
- * The rim, the specular top edge, and the drop shadow do the work, not the
- * blur: the surface behind these chips is the sidebar's own near-flat card, so
- * blurring it alone would leave nothing to see. The blur earns its keep on the
- * Settings chip, which floats over the scrolling session list and frosts the
- * row titles passing under it.
- *
- * Scoped to `width < 48rem` so the class is inert on desktop, where the same
- * two icons are flat ghost buttons in the header row. Both chips share it so
- * they can't drift apart again.
- *
- * Backdrop sampling stops at the sidebar: the `.conversations-sidebar` carries
- * a translate for its slide, which makes it a backdrop root, so the chips frost
- * the drawer's own content rather than the chat behind it — which is what we
- * want. If WebKit drops the filter (it does, once a Radix popper opens — see
- * `max-md:bg-card-solid` on the sidebar), the fill and rim still read as a
- * chip. */
-@media (width < 48rem) {
-  .sidebar-glass-chip {
-    /* Opaque --card-solid base UNDER the glass tint: WebKit drops
-     * backdrop-filter on mobile once a Radix popper opens, and a purely
-     * translucent fill then shows the scrolling session rows straight through,
-     * so the chip reads as transparent. The solid base keeps it a chip no
-     * matter what the filter does; the tint + blur just add frost on top.
-     *
-     * -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
-     * build) collapses the pair and keeps only the last declaration. */
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
-    backdrop-filter: blur(20px) saturate(180%);
-    background-color: var(--card-solid);
-    background-image: linear-gradient(rgba(255, 255, 255, 0.6), rgba(255, 255, 255, 0.6));
-    border: 1px solid rgba(0, 0, 0, 0.06);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.8),
-      0 1px 2px rgba(0, 0, 0, 0.05),
-      0 6px 16px rgba(0, 0, 0, 0.07);
-  }
-
-  .dark .sidebar-glass-chip {
-    background-image: linear-gradient(rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.1));
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.12),
-      0 2px 10px rgba(0, 0, 0, 0.45);
-  }
-}
 /* Share button — glassy pink effect (both modes). The vertical
  * gradient alone does the embossed work (lighter top = light catch,
  * darker bottom = shadow, simulating a convex surface lit from above);
@@ -1247,24 +1259,25 @@ aside[aria-label="Workspace"][data-maximized] {
   }
 }
 
-/* Mobile-specific sidebar geometry. The root remains at the global 16px so
- * rem-based typography and controls keep the same scale across viewports. */
+/* Mobile typography and sidebar geometry. The root remains at the global 16px
+ * so rem-based controls and spacing keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile keeps its own touch-friendly base (14px at the default 13px
-   * preference) but scales it off the Appearance value, so the setting
-   * applies on phones instead of being a dead store. The 14/13 factor maps
-   * the default preference exactly onto the historical 14px mobile base. */
+  /* Mobile defaults to 14px when no preference is saved. An inline value from
+   * the Appearance setting overrides this directly, without rescaling. */
   :root {
-    --mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (14 / 13));
+    --desktop-ui-font-size: 14px;
+    --mobile-ui-font-size: var(--desktop-ui-font-size);
+    --ui-ramp-anchor: var(--mobile-ui-font-size);
     --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
     --text-ui: var(--mobile-ui-font-size);
+    --text-base: var(--mobile-ui-font-size);
+    --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
+    --text-xl: calc(var(--ui-ramp-anchor) * 1.25);
+    --text-2xl: calc(var(--ui-ramp-anchor) * 1.5);
   }
 
-  /* Keep draft text and its mirrors above Safari's input-focus zoom threshold.
-   * Native inputs must also preserve larger Appearance sizes. */
-  .composer-input-text,
-  [data-ios-native] textarea.composer-input-text {
-    font-size: max(16px, var(--text-ui));
+  body {
+    font-size: var(--mobile-ui-font-size);
   }
 
   /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */

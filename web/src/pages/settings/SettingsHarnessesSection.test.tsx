@@ -75,8 +75,13 @@ const STARTUP: HarnessStartup = {
   command: "claude",
   resolved_path: "/opt/bin/claude",
   command_source: "config",
-  arg_count: 2,
+  arg_count: 4,
+  args: ["--model", "opus", "--api-key", "synthetic-secret"],
+  configured_command: "claude",
+  configured_args: ["--model", "opus", "--api-key", "synthetic-secret"],
+  environment: { inherit: true, variables: {}, unset: [] },
 };
+let startupData = STARTUP;
 let startupError: ApiError | null = null;
 const startupCalls = vi.fn();
 let hosts: Host[] = [];
@@ -85,7 +90,7 @@ vi.mock("@/hooks/useHosts", async (importActual) => ({
   useHosts: () => ({ data: hosts }),
   useHarnessStartup: (hostId: string, harness: string) => {
     startupCalls(hostId, harness);
-    return { data: startupError ? undefined : STARTUP, error: startupError, isPending: false };
+    return { data: startupError ? undefined : startupData, error: startupError, isPending: false };
   },
 }));
 
@@ -202,6 +207,7 @@ afterEach(() => {
   harnessInstall = true;
   setupDialogProps.mockReset();
   startupCalls.mockClear();
+  startupData = STARTUP;
   startupError = null;
 });
 
@@ -215,7 +221,7 @@ describe("Harnesses grid", () => {
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
 
     // codex-native reports needs-auth → warning badge + a Set-up button.
-    expect(screen.getByText("needs auth")).toBeTruthy();
+    expect(screen.getByText("Needs auth")).toBeTruthy();
     expect(screen.getByTestId("harness-action-codex-native")).toBeTruthy();
   });
 
@@ -241,7 +247,7 @@ describe("Harnesses grid", () => {
     expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
     expect(within(card("claude-native")).queryByText("Installed")).toBeNull();
-    expect(screen.queryByText("needs setup")).toBeNull();
+    expect(screen.queryByText("Needs setup")).toBeNull();
   });
 
   it("hides Set-up (keeps the badge) when harness_install is disabled", () => {
@@ -251,7 +257,7 @@ describe("Harnesses grid", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
     renderHarnesses();
 
-    expect(screen.getByText("binary missing")).toBeTruthy();
+    expect(screen.getByText("Binary missing")).toBeTruthy();
     expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
   });
 
@@ -331,9 +337,9 @@ describe("Harness details", () => {
     selectTab("Settings");
     expect(screen.getByText("AI Gateway")).toBeTruthy();
     expect(screen.getByText("/opt/bin/claude")).toBeTruthy();
-    expect(screen.getByText("2 configured arguments (values hidden)")).toBeTruthy();
-    expect(screen.getByText(/harness.claude-native.command/)).toBeTruthy();
-    expect(screen.getByText(/workspace's .omnigent/)).toBeTruthy();
+    for (const arg of STARTUP.args ?? []) expect(screen.getAllByText(arg)).toHaveLength(1);
+    expect(screen.getByText(/Sessions and workspaces may override/)).toBeTruthy();
+    expect(screen.getByText(/harness.claude-native in ~\/.omnigent\/config.yaml/)).toBeTruthy();
   });
 
   it("keeps tool discovery lazy and shows host-reported details", () => {
@@ -416,13 +422,120 @@ describe("Harness details", () => {
 });
 
 describe("Launch settings compatibility", () => {
+  it.each(["claude-native", "codex-native"])(
+    "shows one startup configuration with separate env values and arguments for %s",
+    (harness) => {
+      hosts = [{ ...ONLINE, configured_harnesses: { [harness]: true } }];
+      startupData = {
+        ...STARTUP,
+        command: "isaac",
+        resolved_path: "/opt/bin/isaac",
+        args: ["codex", "--", ""],
+        configured_command: "/usr/bin/env",
+        configured_args: [
+          "-i",
+          "-u",
+          "REMOVED",
+          "TOKEN=synthetic-secret=with spaces",
+          "EMPTY=",
+          "isaac",
+          "codex",
+          "--",
+          "",
+        ],
+        environment: {
+          inherit: false,
+          variables: { TOKEN: "synthetic-secret=with spaces", EMPTY: "" },
+          unset: ["REMOVED"],
+        },
+      };
+      renderHarnesses(harness);
+      selectTab("Settings");
+      const startupSection = screen
+        .getByRole("heading", { name: "Startup configuration" })
+        .closest("section")!;
+      expect(
+        within(startupSection)
+          .getAllByRole("heading", { level: 3 })
+          .map((heading) => heading.textContent),
+      ).toEqual(["Command", "Environment", "Arguments"]);
+      expect(within(startupSection).getByText("/opt/bin/isaac")).toBeTruthy();
+      const envSection = within(startupSection)
+        .getByRole("heading", { name: "Environment" })
+        .closest("div")!;
+      expect(within(envSection).getByText("TOKEN")).toBeTruthy();
+      expect(within(envSection).getByText("synthetic-secret=with spaces")).toBeTruthy();
+      expect(within(envSection).getByText("EMPTY")).toBeTruthy();
+      expect(within(envSection).getByText('""')).toBeTruthy();
+      expect(within(envSection).getByText("Inherited environment cleared.")).toBeTruthy();
+      expect(within(envSection).getByText("REMOVED")).toBeTruthy();
+      const argsSection = within(startupSection)
+        .getByRole("heading", { name: "Arguments" })
+        .closest("div")!;
+      expect(
+        within(argsSection)
+          .getAllByRole("listitem")
+          .map((item) => item.textContent),
+      ).toEqual(["codex", "--", '""']);
+      expect(screen.queryByText("Configured invocation")).toBeNull();
+      expect(screen.queryByText("Environment overrides")).toBeNull();
+      expect(screen.queryByText("Startup arguments")).toBeNull();
+      expect(screen.queryByText("/usr/bin/env")).toBeNull();
+      expect(screen.queryByText("TOKEN=synthetic-secret=with spaces")).toBeNull();
+      expect(screen.getAllByText("synthetic-secret=with spaces")).toHaveLength(1);
+      expect(screen.getByText(/not a running session's full command or environment/)).toBeTruthy();
+    },
+  );
+
+  it("does not invent env settings for an opaque env wrapper", () => {
+    hosts = [ONLINE];
+    startupData = {
+      ...STARTUP,
+      command: "/usr/bin/env",
+      resolved_path: "/usr/bin/env",
+      args: ["-S", "TOKEN=synthetic-secret isaac codex --"],
+      configured_command: "/usr/bin/env",
+      configured_args: ["-S", "TOKEN=synthetic-secret isaac codex --"],
+      environment: null,
+    };
+    renderHarnesses("claude-native");
+    selectTab("Settings");
+    expect(screen.getByText(/Cannot separate environment values/)).toBeTruthy();
+    expect(screen.getByText("/usr/bin/env")).toBeTruthy();
+    expect(screen.getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "-S",
+      "TOKEN=synthetic-secret isaac codex --",
+    ]);
+    expect(screen.queryByText("Inherited values are not listed.")).toBeNull();
+    expect(screen.queryByText("Configured invocation")).toBeNull();
+  });
+
+  it("requests an update when the host reports args without env metadata", () => {
+    hosts = [ONLINE];
+    startupData = { ...STARTUP, configured_args: undefined, environment: undefined };
+    renderHarnesses("claude-native");
+    selectTab("Settings");
+    expect(screen.getByText("Update my-laptop to see environment settings.")).toBeTruthy();
+    expect(screen.queryByText("Configured invocation")).toBeNull();
+  });
+
+  it("asks for a host update when an older host reports only the argument count", () => {
+    hosts = [ONLINE];
+    startupData = { ...STARTUP, args: null, configured_args: null, environment: null };
+    renderHarnesses("claude-native");
+    selectTab("Settings");
+    expect(
+      screen.getByText("4 configured arguments. Update my-laptop to view values."),
+    ).toBeTruthy();
+  });
+
   it.each([404, 501, 502])("keeps the credential when startup returns %s", (status) => {
     hosts = [ONLINE];
     startupError = new ApiError("unavailable", status, null);
     renderHarnesses("claude-native");
     selectTab("Settings");
     expect(screen.getByText("Signed in")).toBeTruthy();
-    expect(screen.queryByText("Path to binary")).toBeNull();
+    expect(screen.queryByText("Startup configuration")).toBeNull();
     if (status === 501)
       expect(screen.getByText("Update my-laptop to see launch settings.")).toBeTruthy();
     if (status === 502)
@@ -598,13 +711,15 @@ it("probes only the expanded server, showing its tools, count and status", () =>
   hosts = [ONLINE];
   renderHarnesses("claude-native");
   expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
-  expect(screen.queryByRole("img", { name: "Connected" })).toBeNull();
+  expect(screen.queryByRole("status")).toBeNull();
   fireEvent.click(screen.getByTestId("catalog-row-linear"));
   expect(mcpLookups).toContainEqual([ONLINE.host_id, "claude", "linear", "toolkit", true]);
   expect(mcpLookups.some((lookup) => lookup[2] === "github" && lookup[4])).toBe(false);
   expect(screen.getByText("read_docs")).toBeTruthy();
   expect(screen.getByText("· 1 tool")).toBeTruthy();
-  expect(screen.getByRole("img", { name: "Connected" })).toBeTruthy();
+  expect(screen.getByRole("status").textContent).toBe("Connected");
+  expect(screen.getByRole("status").firstElementChild).toHaveClass("bg-success");
+  expect(screen.queryByText(/Tools reported when probed/)).toBeNull();
   fireEvent.click(screen.getByTestId("catalog-row-linear"));
   expect(screen.queryByText("read_docs")).toBeNull();
 });
@@ -648,18 +763,27 @@ it("hides MCP expansion on old-server 404", () => {
 it.each([
   [
     "needs_auth",
+    "Needs auth",
+    "bg-warning",
     "Authentication required. Harness sign-in credentials cannot be reused for this probe.",
   ],
-  ["timeout", "MCP probe timed out."],
-  ["unreachable", "Couldn't reach this MCP server."],
-  ["unsupported", "This MCP configuration cannot be probed from the host."],
-])("reports probe status %s without a tool count", (connection, label) => {
+  ["timeout", "Failed to connect", "bg-destructive", "MCP probe timed out."],
+  ["unreachable", "Failed to connect", "bg-destructive", "Couldn't reach this MCP server."],
+  [
+    "unsupported",
+    "Failed to connect",
+    "bg-destructive",
+    "This MCP configuration cannot be probed from the host.",
+  ],
+])("reports probe status %s without a tool count", (connection, statusLabel, color, detail) => {
   hosts = [ONLINE];
   mcpResult = { data: { tools: [], connection, truncated: false }, isPending: false };
   renderHarnesses("claude-native");
   fireEvent.click(screen.getByTestId("catalog-row-github"));
-  expect(screen.getByRole("img", { name: label })).toBeTruthy();
-  expect(screen.getByText(label)).toBeTruthy();
+  const status = screen.getByRole("status");
+  expect(status.textContent).toBe(statusLabel);
+  expect(status.firstElementChild).toHaveClass(color);
+  expect(screen.getByText(detail)).toBeTruthy();
   expect(screen.queryByText(/· 0 tools/)).toBeNull();
 });
 

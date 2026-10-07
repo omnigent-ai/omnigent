@@ -25,6 +25,7 @@ export function SetupTerminalStep({
   onRun,
   onSetupLog,
   onBack,
+  onConnectAnyway,
   runningLabel = "Starting Omnigent",
   runningHint = "Starting the local server…",
   connection = null,
@@ -39,6 +40,8 @@ export function SetupTerminalStep({
   /** Subscribe to the run action's log lines (server boot); returns unsubscribe. */
   onSetupLog?: (cb: (line: string) => void) => () => void;
   onBack: () => void;
+  /** Offered only when remote runner startup failed; opens the server without it. */
+  onConnectAnyway?: () => void;
   /** Heading + verb for the run phase ("Starting Omnigent" / "Connecting…"). */
   runningLabel?: string;
   /** Placeholder log line for the run phase until its first line streams. */
@@ -206,14 +209,21 @@ export function SetupTerminalStep({
       <ConnectStatus connection={connection} onCancel={onCancelConnect} />
 
       {phase === "failed" && (
-        <div className="mt-3 flex gap-2">
-          <Button variant="outline" className="flex-1" onClick={onBack}>
+        <div className="mt-3 flex justify-between gap-2">
+          <Button variant="outline" onClick={onBack}>
             Back
           </Button>
-          <Button className="flex-1" onClick={() => setAttempt((n) => n + 1)}>
-            <RotateCw className="size-4" aria-hidden />
-            Retry
-          </Button>
+          <div className="flex gap-2">
+            {onConnectAnyway && (
+              <Button variant="outline" onClick={onConnectAnyway}>
+                Continue anyway
+              </Button>
+            )}
+            <Button onClick={() => setAttempt((n) => n + 1)}>
+              <RotateCw className="size-4" aria-hidden />
+              Retry
+            </Button>
+          </div>
         </div>
       )}
     </div>

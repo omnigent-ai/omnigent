@@ -84,7 +84,7 @@ async def _drive(base_url: str) -> None:
             await _register_routes(page)
             await page.goto(f"{base_url}/")
 
-            dialog = page.get_by_role("dialog", name="Your imports are ready")
+            dialog = page.get_by_role("dialog", name="Your setup is ready")
             await expect(dialog).to_be_visible(timeout=30_000)
             await expect(dialog).to_contain_text("These carry over automatically.")
             await expect(dialog).to_contain_text("Databricks AI Gateway")
@@ -153,7 +153,7 @@ async def _drive_empty(base_url: str) -> None:
             )
             # Give the gate a moment to act on the settled inventory.
             await page.wait_for_timeout(1_000)
-            await expect(page.get_by_role("dialog", name="Your imports are ready")).to_be_hidden()
+            await expect(page.get_by_role("dialog", name="Your setup is ready")).to_be_hidden()
             reviewed = await page.evaluate(
                 f"window.localStorage.getItem('omnigent:imports-reviewed:{_HOST_ID}')"
             )

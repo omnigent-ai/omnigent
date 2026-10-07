@@ -1131,6 +1131,41 @@ def builtin_agent_id(name: str) -> str:
     return digest[:32]
 
 
+def installed_agent_id(owner: str | None, name: str) -> str:
+    """
+    Deterministic id for an installed user agent, derived from owner and name.
+
+    Makes "one install per owner and name" a primary-key invariant, so two
+    concurrent installs of the same agent collide instead of both inserting.
+
+    :param owner: Installing user, or ``None`` on an auth-less server.
+    :param name: The agent's name, e.g. ``"orion"``.
+    :returns: A deterministic bare 32-char hex id.
+    """
+    digest = hashlib.sha256(f"installed:{owner or ''}\0{name}".encode()).hexdigest()
+    return digest[:32]
+
+
+def uploaded_agent_id(owner: str | None, name: str, content_digest: str, attempt: int = 0) -> str:
+    """
+    Deterministic id for an uploaded agent, derived from owner, name, and bundle content.
+
+    The same owner uploading the same files under the same name (each
+    ``omnigent run --harness codex``, say) gets the same id, so the session binds
+    the row the first upload created instead of adding one per run.
+
+    :param owner: Uploading user, or ``None`` on an auth-less server.
+    :param name: The agent's name, e.g. ``"codex"``.
+    :param content_digest: :func:`omnigent.server.bundles.bundle_content_digest`
+        of the upload.
+    :param attempt: ``0`` first; the next attempt when the row at an earlier id
+        was edited since (an MCP edit) and so no longer holds this content.
+    :returns: A deterministic bare 32-char hex id.
+    """
+    key = f"uploaded:{owner or ''}\0{name}\0{content_digest}\0{attempt}"
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+
 def generate_file_id() -> str:
     """
     Generate a unique file identifier.

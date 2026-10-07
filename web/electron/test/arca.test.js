@@ -5,10 +5,12 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const {
   buildConnectArgs,
+  buildLoginArgs,
   connectArcaHost,
   describeConnectFailure,
   resolveArcaPath,
   startArcaConnect,
+  startArcaLogin,
 } = require("../src/arca");
 
 /** A fake connect child: an EventEmitter with stdout/stderr stream stubs. */
@@ -53,6 +55,20 @@ describe("arca binary resolution", () => {
 });
 
 describe("arca connect command", () => {
+  it("binds remote login and noninteractive startup to the same SPOG workspace", () => {
+    const server = "https://account.databricks.com/omnigent?o=123&test=value";
+    const args = buildLoginArgs(server);
+    assert.deepEqual(args, [
+      "ssh",
+      "-o",
+      "ClearAllForwardings=yes",
+      "isaac",
+      "omni",
+      "login",
+      `'${server}'`,
+    ]);
+    assert.equal(buildConnectArgs(server)[7], args[6]);
+  });
   it("passes the remote isaac omni host command through ssh", () => {
     assert.deepEqual(buildConnectArgs("https://workspace.example.com/ml/omnigents"), [
       "ssh",
@@ -93,6 +109,14 @@ describe("arca connect command", () => {
 });
 
 describe("arca connect failures", () => {
+  it("classifies managed OAuth failures without treating them as network errors", () => {
+    for (const stderr of [
+      "Error: OMNIGENT_AUTH_REQUIRED: sign in",
+      "Authentication failed (HTTP 401): rejected",
+    ]) {
+      assert.equal(describeConnectFailure({ code: 1, stdout: "", stderr }).errorKind, "omni-auth");
+    }
+  });
   it("maps a timeout, sign-in, missing-CLI, and unreachable instance", () => {
     assert.match(
       describeConnectFailure({ code: null, stdout: "", stderr: "", timedOut: true }).error,
@@ -155,6 +179,68 @@ describe("arca connect failures", () => {
 });
 
 describe("startArcaConnect / connectArcaHost", () => {
+  it("settles canceled login without waiting for a remote process exit", async () => {
+    const child = fakeConnectChild();
+    const run = startArcaLogin("https://account.databricks.com/omnigent?o=123", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+    });
+    run.cancel();
+    assert.equal((await run.promise).canceled, true);
+    assert.equal(child.killed, true);
+    child.emit("exit", 0);
+    assert.equal((await run.promise).ok, false);
+  });
+  it("does not forward remote login output or error tickets to the renderer", async () => {
+    for (const [code, errorKind] of [
+      [0, undefined],
+      [1, "omni-auth"],
+      [127, "missing-remote-cli"],
+      [255, "unreachable"],
+    ]) {
+      const child = fakeConnectChild();
+      const chunks = [];
+      const run = startArcaLogin("https://account.databricks.com/omnigent?o=123", {
+        resolveArcaPath: () => "/bin/arca",
+        spawn: (_file, args, opts) => {
+          assert.equal(args[5], "login");
+          assert.equal(opts.stdio[0], "ignore");
+          return child;
+        },
+        onOutput: (text) => chunks.push(text),
+      });
+      child.stdout.emit("data", "https://example.com/auth/login?ticket=SECRET");
+      child.stderr.emit("data", "SECRET");
+      child.emit("exit", code);
+      // oxlint-disable-next-line no-await-in-loop -- Exercise both process outcomes.
+      const result = await run.promise;
+      assert.equal(result.ok, code === 0);
+      assert.equal(result.errorKind, errorKind);
+      assert.equal(result.authError === true, code === 1);
+      assert.deepEqual(chunks, []);
+      assert.doesNotMatch(JSON.stringify(result), /SECRET|ticket=/);
+    }
+  });
+
+  it("settles a timed-out login even if the child never emits exit", async () => {
+    const child = fakeConnectChild();
+    const run = startArcaLogin("https://account.databricks.com/omnigent?o=123", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+      timeoutMs: 1,
+    });
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const result = await run.promise;
+      assert.equal(result.errorKind, "timeout");
+      assert.match(result.error, /sign-in timed out.*Arca Companion/);
+      assert.equal(child.killed, true);
+      child.emit("exit", 0);
+      assert.equal((await run.promise).ok, false);
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
   it("streams live output, exposes the command, and resolves ok on exit 0", async () => {
     const chunks = [];
     let child;

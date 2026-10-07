@@ -349,7 +349,7 @@ function PluginPage({
           <PlugIcon className="size-5 text-muted-foreground" />
         </span>
         <div className="flex min-w-0 flex-col">
-          <h1 className="truncate text-2xl font-semibold">{plugin.name}</h1>
+          <h1 className="settings-page-title truncate text-2xl font-semibold">{plugin.name}</h1>
           <span className="text-ui text-muted-foreground">{pluginDetail(plugin, mcps.length)}</span>
         </div>
       </div>
@@ -426,7 +426,7 @@ function SkillPage({
   return (
     <>
       <BackButton label={backLabel} onClick={onBack} />
-      <h1 className="truncate text-2xl font-semibold">{name}</h1>
+      <h1 className="settings-page-title truncate text-2xl font-semibold">{name}</h1>
       {query.isPending ? (
         <Notice>Loading skill contents…</Notice>
       ) : query.error ? (
@@ -515,13 +515,21 @@ function McpList({
   );
 }
 
-const CONNECTION_LABELS: Record<McpServerTools["connection"], string> = {
+const CONNECTION_DETAILS: Record<McpServerTools["connection"], string> = {
   connected: "Connected",
   needs_auth:
     "Authentication required. Harness sign-in credentials cannot be reused for this probe.",
   unreachable: "Couldn't reach this MCP server.",
   timeout: "MCP probe timed out.",
   unsupported: "This MCP configuration cannot be probed from the host.",
+};
+
+const CONNECTION_STATUS: Record<McpServerTools["connection"], { label: string; color: string }> = {
+  connected: { label: "Connected", color: "bg-success" },
+  needs_auth: { label: "Needs auth", color: "bg-warning" },
+  unreachable: { label: "Failed to connect", color: "bg-destructive" },
+  timeout: { label: "Failed to connect", color: "bg-destructive" },
+  unsupported: { label: "Failed to connect", color: "bg-destructive" },
 };
 
 function McpRow({
@@ -544,6 +552,7 @@ function McpRow({
     if (missingRoute) onUnavailable();
   }, [missingRoute, onUnavailable]);
   const data = query.data;
+  const status = data && CONNECTION_STATUS[data.connection];
   return (
     <AccordionPrimitive.Item value={server.id} className="not-last:border-b">
       <AccordionPrimitive.Header className="flex">
@@ -563,16 +572,11 @@ function McpRow({
           {server.detail && (
             <span className="min-w-0 truncate text-muted-foreground">{server.detail}</span>
           )}
-          {data && (
-            <span
-              role="img"
-              aria-label={CONNECTION_LABELS[data.connection]}
-              title={CONNECTION_LABELS[data.connection]}
-              className={cn(
-                "ml-auto size-2 shrink-0 rounded-full",
-                data.connection === "connected" ? "bg-success" : "bg-destructive",
-              )}
-            />
+          {status && (
+            <span role="status" className="ml-auto flex shrink-0 items-center gap-1.5 text-xs">
+              <span aria-hidden="true" className={cn("size-2 rounded-full", status.color)} />
+              {status.label}
+            </span>
           )}
         </AccordionPrimitive.Trigger>
       </AccordionPrimitive.Header>
@@ -580,7 +584,7 @@ function McpRow({
         {query.isPending ? (
           <div className="flex items-center gap-2 mt-1">
             <Spinner />
-            <Notice> Loading tools...</Notice>
+            <Notice>Loading tools...</Notice>
           </div>
         ) : query.error ? (
           <Notice>
@@ -592,12 +596,12 @@ function McpRow({
           </Notice>
         ) : data ? (
           data.connection !== "connected" ? (
-            <Notice>{CONNECTION_LABELS[data.connection]}</Notice>
+            <Notice>{CONNECTION_DETAILS[data.connection]}</Notice>
           ) : (
             <>
               {data.tools.length === 0 && <Notice>No tools reported.</Notice>}
               {data.truncated && <Notice>Showing the first 500 tools.</Notice>}
-              <ul className="flex flex-col gap-1 text-xs text-muted-foreground">
+              <ul className="flex flex-col gap-1 text-xs text-muted-foreground my-2">
                 {data.tools.map((tool, index) => (
                   // Capped names can collide; these display-only rows have no state.
                   // eslint-disable-next-line react/no-array-index-key
@@ -609,10 +613,6 @@ function McpRow({
                   </li>
                 ))}
               </ul>
-              <p className="mb-2 text-xs">
-                Tools reported when probed from this host. Workspace overrides and harness sign-in
-                credentials are not used.
-              </p>
             </>
           )
         ) : null}

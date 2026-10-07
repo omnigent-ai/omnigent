@@ -1,5 +1,8 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 
 import {
   ImportContextModal,
@@ -22,16 +25,26 @@ afterEach(() => {
 function renderModal(
   context: ImportContext = MOCK_IMPORT_CONTEXT,
   props: Partial<Omit<ImportContextModalProps, "context">> = {},
+  info: ServerInfo | "loading" = "loading",
 ) {
   return render(
-    <ImportContextModal
-      open={true}
-      onOpenChange={vi.fn()}
-      onConfirm={vi.fn()}
-      {...props}
-      context={context}
-    />,
+    <MemoryRouter>
+      <CapabilitiesProvider info={info}>
+        <ImportContextModal
+          open={true}
+          onOpenChange={vi.fn()}
+          onConfirm={vi.fn()}
+          {...props}
+          context={context}
+        />
+      </CapabilitiesProvider>
+      <LocationProbe />
+    </MemoryRouter>,
   );
+}
+
+function LocationProbe() {
+  return <span data-testid="location">{useLocation().pathname}</span>;
 }
 
 function selectTab(tab: HTMLElement) {
@@ -79,7 +92,7 @@ describe("ImportContextModal – harness tabs", () => {
     expect(screen.getByRole("tab", { name: "Claude Code" })).toBe(tabs[0]);
     expect(screen.getByRole("tab", { name: "Codex" })).toBe(tabs[1]);
     expect(screen.getByRole("tab", { name: "Cursor" })).toBe(tabs[2]);
-    expect(screen.getByText("Your imports are ready")).toBeTruthy();
+    expect(screen.getByText("Your setup is ready")).toBeTruthy();
     expect(screen.getByText(/These carry over automatically\./)).toBeTruthy();
   });
 
@@ -87,7 +100,7 @@ describe("ImportContextModal – harness tabs", () => {
     renderModal();
 
     expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
-    expect(screen.getAllByText("Imported")).toHaveLength(1);
+    expect(screen.getAllByText("Detected")).toHaveLength(1);
     expect(assetTabNames()).toEqual(["MCPs 5", "Skills 10", "Plugins 3"]);
 
     expect(rowNames("MCPs")).toEqual(["databricks-v2", "jira", "safe", "web-search", "figma"]);
@@ -192,6 +205,43 @@ describe("ImportContextModal – empty states", () => {
 });
 
 describe("ImportContextModal – closing", () => {
+  it("opens Harnesses and dismisses without confirming on See more when enabled", () => {
+    const onConfirm = vi.fn();
+    const onOpenChange = vi.fn();
+    renderModal(
+      MOCK_IMPORT_CONTEXT,
+      { onConfirm, onOpenChange },
+      { ...FALLBACK_SERVER_INFO, features: { harness_settings_ui: true } },
+    );
+
+    const seeMore = screen.getByRole("link", { name: "See more" });
+    expect(seeMore.getAttribute("href")).toBe("/settings/harnesses");
+    expect(seeMore.nextElementSibling).toBe(screen.getByRole("button", { name: "Confirm" }));
+    fireEvent.click(seeMore);
+
+    expect(screen.getByTestId("location").textContent).toBe("/settings/harnesses");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  it.each([false, undefined, "loading"] as const)(
+    "hides See more when the feature is %s",
+    (enabled) => {
+      renderModal(
+        MOCK_IMPORT_CONTEXT,
+        {},
+        enabled === "loading"
+          ? "loading"
+          : {
+              ...FALLBACK_SERVER_INFO,
+              features: enabled === undefined ? {} : { harness_settings_ui: enabled },
+            },
+      );
+      expect(screen.queryByRole("link", { name: "See more" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy();
+    },
+  );
+
   it("confirms and closes on Confirm", () => {
     const onConfirm = vi.fn();
     const onOpenChange = vi.fn();
