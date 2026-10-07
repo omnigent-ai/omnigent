@@ -215,18 +215,20 @@ def _overflow_event(message: str) -> dict[str, Any]:
 
 def test_byte_cap_rejection_classifies_as_overflow_without_inversion() -> None:
     """A byte-cap rejection reads actual > max despite reporting bytes."""
-    overflow = _is_context_overflow_error(
-        _overflow_event(
-            "Server received a request which exceeds maximum allowed content "
-            "length. RequestSize(bytes): 33967957, Limit(bytes): 33554432"
-        )
+    message = (
+        "Server received a request which exceeds maximum allowed content "
+        "length. RequestSize(bytes): 33967957, Limit(bytes): 33554432"
     )
+    overflow = _is_context_overflow_error(_overflow_event(message))
     assert overflow is not None
     max_tokens, actual_tokens, detail = overflow
+    # Each byte count is divided by the 4-byte token estimate, so the request
+    # reads above the limit rather than being inverted into actual < max.
+    assert max_tokens == 33554432 // 4
+    assert actual_tokens == 33967957 // 4
     assert actual_tokens > max_tokens
-    # The raw rejection is carried through once for the error detail.
-    assert detail is not None
-    assert "RequestSize(bytes): 33967957" in detail
+    # The complete raw rejection is carried through once for the error detail.
+    assert detail == message
 
 
 def test_content_length_phrase_without_sizes_is_not_overflow() -> None:

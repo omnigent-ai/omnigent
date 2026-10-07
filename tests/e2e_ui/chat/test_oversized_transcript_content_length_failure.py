@@ -1,16 +1,15 @@
 """Native byte-cap failures render the context-overflow headline, not a generic error.
 
-Journey: a turn (and its fork's) fails with the Databricks front-door "exceeds
-maximum allowed content length" rejection
-(``RequestSize(bytes): 33967957, Limit(bytes): 33554432``). It must classify as
-a context-window overflow — pill headline "The conversation grew past the
-model's context window." — so the user is pointed at compaction, not a dead end.
+Journey: a turn, and its fork, fail with the Databricks front-door "exceeds
+maximum allowed content length" rejection and must classify as a context-window
+overflow — pill headline "The conversation grew past the model's context
+window." — so the user is pointed at compaction.
 
 Environment fidelity: the 32 MiB cap is the Databricks Apps front-door limit,
-absent from this codebase, so the test stands in for that host — it seeds a
-genuinely oversized transcript, forks it through the real UI action, and drives
-the failed turn through the real native-forwarder failed-status path carrying
-the exact reported error string.
+absent from this codebase. The test stands in for that host by injecting the
+exact reported rejection through the real native failed-status path; it does not
+provoke the cap itself. The oversized seed and fork reproduce the reported
+session shape but do not trigger the rejection.
 """
 
 from __future__ import annotations
