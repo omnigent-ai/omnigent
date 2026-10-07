@@ -1632,7 +1632,11 @@ function PullRequestPanelDetails({
                 )}
               </div>
             )}
-            <div ref={scrollRef} onScroll={onScroll} className="min-w-0 flex-1 overflow-y-auto">
+            <div
+              ref={scrollRef}
+              onScroll={onScroll}
+              className="github-diff-stack min-w-0 flex-1 overflow-y-auto"
+            >
               {prDiff.error ? (
                 <PanelMessage>{(prDiff.error as Error).message}</PanelMessage>
               ) : prDiff.data?.unavailable_reason ? (

@@ -1331,6 +1331,17 @@ html[data-electron-mac] .breadcrumb-folder {
     "calt" 0;
 }
 
+/* @pierre/diffs renders the GitHub tab's diff in a shadow root that falls back
+ * to a fixed 13px/20px SF Mono, ignoring the Interface font size. Bind it to the
+ * panel's text-ui step with the same mono compensation as chat code above. */
+.github-diff-stack {
+  --diffs-font-size: calc(var(--text-ui) * 0.875);
+  --diffs-line-height: calc(var(--diffs-font-size) * var(--text-ui--line-height));
+  --diffs-font-family: var(--font-mono);
+  --diffs-header-font-family: var(--ui-font-family, var(--font-sans));
+  --diffs-font-features: "liga" 0, "calt" 0;
+}
+
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
  * hide the native one so both don't show. */
 .transcript-hide-native-scrollbar {
