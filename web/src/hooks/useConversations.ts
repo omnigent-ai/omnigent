@@ -1980,13 +1980,19 @@ export function useTogglePinnedConversation() {
  * Pinned section). Every write is applied optimistically to all caches; once
  * the PATCHes settle, each row is reconciled to what the server stored — the
  * new value if its write landed, its previous value if not — so a failed or
- * partly failed batch leaves the caches matching the persisted order.
+ * partly failed batch leaves the caches matching the persisted order. Batches
+ * share a mutation scope so their PATCHes run in order (the latest drag writes
+ * last), and a row a newer drag has since moved skips the older reconcile.
  */
 export function useReorderPinnedConversations() {
   const { pinsIncludeShared, sharedAvailable } = useContext(SidebarConfigContext);
   const includeShared = pinsIncludeShared && sharedAvailable;
   const viewerId = getCurrentUserId();
   const queryClient = useQueryClient();
+  // Per row with a write still settling: the most recent value requested, and
+  // the last value the server confirmed (what a failed write falls back to).
+  const latest = useRef(new Map<string, number>());
+  const confirmed = useRef(new Map<string, string | undefined>());
   const apply = (id: string, pinnedAt: string) => {
     const base = findCachedConversationRow(queryClient, id)?.labels ?? {};
     patchPinnedCaches(
@@ -1999,25 +2005,29 @@ export function useReorderPinnedConversations() {
     );
   };
   return useMutation({
+    scope: { id: "pinned-order" },
     mutationFn: (writes: { id: string; pinnedAt: number }[]) =>
       Promise.allSettled(writes.map((w) => setConversationPinned(w.id, true, w.pinnedAt))),
     onMutate: (writes) => {
-      const previous = new Map(
-        writes.map((w) => [
-          w.id,
-          findCachedConversationRow(queryClient, w.id)?.labels?.[PINNED_LABEL_KEY],
-        ]),
-      );
-      for (const w of writes) apply(w.id, String(w.pinnedAt));
-      return { previous };
+      for (const w of writes) {
+        if (!latest.current.has(w.id)) {
+          const cached = findCachedConversationRow(queryClient, w.id)?.labels?.[PINNED_LABEL_KEY];
+          confirmed.current.set(w.id, cached);
+        }
+        latest.current.set(w.id, w.pinnedAt);
+        apply(w.id, String(w.pinnedAt));
+      }
     },
-    onSuccess: (results, writes, ctx) => {
+    onSuccess: (results, writes) => {
       results.forEach((result, index) => {
-        const id = writes[index].id;
-        const value =
-          result.status === "fulfilled"
-            ? result.value.labels[PINNED_LABEL_KEY]
-            : ctx?.previous.get(id);
+        const { id, pinnedAt } = writes[index];
+        if (result.status === "fulfilled") {
+          confirmed.current.set(id, result.value.labels[PINNED_LABEL_KEY]);
+        }
+        if (latest.current.get(id) !== pinnedAt) return;
+        const value = confirmed.current.get(id);
+        latest.current.delete(id);
+        confirmed.current.delete(id);
         if (value !== undefined) apply(id, value);
       });
       if (results.some((r) => r.status === "rejected")) {

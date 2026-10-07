@@ -233,6 +233,17 @@ describe("pinOrderWrites", () => {
     ]);
   });
 
+  it("renumbers once repeated moves leave no representable value between neighbours", () => {
+    // Adjacent doubles at epoch-ms scale: their midpoint rounds to one of them.
+    const low = 1791337307018;
+    const high = low + 2 ** -12;
+    expect(pinOrderWrites(pins(low, high, 5000000000000), "conv_2", "conv_1")).toEqual([
+      { id: "conv_0", pinnedAt: low },
+      { id: "conv_2", pinnedAt: low + 1 },
+      { id: "conv_1", pinnedAt: low + 2 },
+    ]);
+  });
+
   it("inserts a not-yet-pinned session above the row it's dropped on", () => {
     expect(pinOrderWrites(pins(1000, 2000), "new", "conv_1")).toEqual([
       { id: "new", pinnedAt: 1500 },
