@@ -53,6 +53,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, cast
 
 import httpx
@@ -855,33 +856,42 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
 
 # ── CLI startup (omnigent polly against the local bench server) ──────────────
 
-# Signal that the REPL is ready — the last spinner message before the prompt.
-# polly (omnigent run) emits this just before the agent REPL appears.
-_CLI_STARTUP_READY_SIGNAL = "Launching your agent"
+# The REPL's bottom toolbar reads "<model> · ready" once the prompt accepts
+# input, which is after the runner is online and bound (see
+# omnigent_ui_sdk/terminal/_host.py). The earlier "Launching your agent…"
+# spinner phase prints before the runner is even launched.
+_CLI_STARTUP_READY_SIGNAL = "· ready"
 
-# Per-attempt timeout. With the bench host daemon pre-running (needs_host=True),
-# polly reuses it; remaining work is session + runner connect ~5-20s on CI.
+# Per-attempt timeout: daemon start + session + runner launch, ~4-7s on CI.
 _CLI_STARTUP_TIMEOUT_S = 60
+
+# Pre-set theme for the journey's fresh config home, so the first-run theme
+# picker doesn't stand in for the REPL.
+_CLI_STARTUP_CONFIG = "tui:\n  theme: light\n"
 
 # ~7s per attempt on CI (incl. the untimed `omnigent stop`); cap so a large
 # --iterations stays in budget.
 _CLI_STARTUP_MAX_ITERATIONS = 6
 
 
-async def _prepare_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> None:
-    """Stop stale daemons before each timed cli_startup iteration.
+async def _prepare_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Stop the journey's leftover CLI daemons before each timed iteration.
 
     A leftover host daemon from the previous iteration causes the next
     ``omnigent polly`` to fail with "runner tunnel rejection (HTTP 401)"
-    or "host is on another replica". Runs outside the latency timer.
+    or "host is on another replica". Runs outside the latency timer. Only
+    daemons in the journey's own data dir are stopped: ``omnigent stop``
+    would also kill the bench's host daemon and any server on the default
+    local port, such as a developer's own.
     """
+    del env
     omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
     if omnigent_bin is None:
         return
     await asyncio.to_thread(
         subprocess.run,
-        [omnigent_bin, "stop"],
-        env=env.child_env(),
+        [omnigent_bin, "host", "stop", "--all", "--daemon-only"],
+        env=_cli_env(ctx),
         capture_output=True,
         timeout=15,
         check=False,
@@ -889,20 +899,37 @@ async def _prepare_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> N
 
 
 async def _setup_cli_startup(env: BenchEnvironment) -> JourneyContext:
-    """Return a holder for the spawned CLI, so closing it stays off the clock."""
-    del env
-    return {}
+    """Give the CLI its own data and config dirs; return the per-run holder.
+
+    Sharing the bench's data dir, ``omnigent polly`` would reuse the bench host
+    daemon's registry record for the same server and wait for its own host id,
+    which that daemon never registers. The holder also carries the spawned CLI,
+    so closing it stays off the clock.
+    """
+    root = Path(tempfile.mkdtemp(prefix="cli-", dir=env.child_env()["TMPDIR"]))
+    config_home = root / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(_CLI_STARTUP_CONFIG)
+    cli_env = {
+        **env.child_env(),
+        "OMNIGENT_DATA_DIR": str(root / "data"),
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+    }
+    return {"env": cli_env}
+
+
+def _cli_env(ctx: JourneyContext) -> dict[str, str]:
+    return cast(dict[str, dict[str, str]], ctx)["env"]
 
 
 async def _measure_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> None:
     """Time ``omnigent polly --server`` from invocation to REPL ready.
 
-    Spawns ``omnigent polly --server <local>`` via pexpect and times until
-    ``"Launching your agent…"`` appears — the last spinner message before the
-    agent REPL. Using polly (the bundled openai-agents harness) avoids any
-    external binary dependency while exercising the same startup path as
-    ``omnigent claude``: daemon start, session create, runner launch, and
-    runner connect.
+    Spawns ``omnigent polly --server <local>`` via pexpect and times until the
+    REPL toolbar reports ``ready``. Using polly (the bundled openai-agents
+    harness) avoids any external binary dependency while exercising the same
+    startup path as ``omnigent claude``: daemon start, session create, runner
+    launch, and runner connect.
 
     Requires ``pexpect``. No external LLM binary needed. The live process is
     left in *ctx* for :func:`_close_cli_startup`, so shutdown is not timed.
@@ -928,7 +955,7 @@ async def _measure_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> No
         timeout=_CLI_STARTUP_TIMEOUT_S,
         encoding="utf-8",
         codec_errors="ignore",
-        env=env.child_env(),
+        env=_cli_env(ctx),
     )
     try:
         idx = child.expect([pexpect.TIMEOUT, pexpect.EOF, _CLI_STARTUP_READY_SIGNAL])
@@ -1190,7 +1217,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             max_warmup=0,
             description=(
                 "Spawn `omnigent polly --server` and time invocation → REPL ready "
-                "(daemon + session + runner connect). No LLM call needed. "
+                "(daemon + session + runner launch and connect). No LLM call needed. "
                 "Requires pexpect."
             ),
         ),

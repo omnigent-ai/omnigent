@@ -1317,3 +1317,35 @@ def test_sigterm_mid_run_leaves_no_processes(tmp_path: Path) -> None:
         for child in descendants:
             with contextlib.suppress(psutil.Error):
                 child.kill()
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="fake CLI is a POSIX shell script")
+@pytest.mark.asyncio
+async def test_cli_startup_stops_only_its_own_daemons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cli_startup must never run `omnigent stop`, which kills any local server."""
+    calls = tmp_path / "calls.txt"
+    fake_cli = tmp_path / "omnigent"
+    fake_cli.write_text(f'#!/bin/sh\necho "$* | $OMNIGENT_DATA_DIR" >> {calls}\n')
+    fake_cli.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_BIN", str(fake_cli))
+    env = BenchEnvironment()
+    env._child_tmp.mkdir(parents=True)
+    journey = ALL_JOURNEYS["cli_startup"]
+    try:
+        ctx = await journey.run_setup(env)
+        data_dir = cast(dict[str, dict[str, str]], ctx)["env"]["OMNIGENT_DATA_DIR"]
+        config_home = Path(cast(dict[str, dict[str, str]], ctx)["env"]["OMNIGENT_CONFIG_HOME"])
+
+        await journey.run_prepare(env, ctx)
+        await journey.run_teardown(env, ctx)
+
+        assert (
+            calls.read_text().splitlines() == [f"host stop --all --daemon-only | {data_dir}"] * 2
+        )
+        assert Path(data_dir).is_relative_to(env._child_tmp)
+        # Pre-set theme, so the first-run picker doesn't stand in for the REPL.
+        assert "theme: light" in (config_home / "config.yaml").read_text()
+    finally:
+        shutil.rmtree(env._tmp, ignore_errors=True)
