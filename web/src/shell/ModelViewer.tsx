@@ -12,7 +12,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { TrackballControls } from "three/examples/jsm/controls/TrackballControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
@@ -54,6 +54,7 @@ function parseModel(
   buffer: ArrayBuffer,
   theme: ModelViewerTheme,
 ): ParsedModel {
+  // Print formats use Z-up coordinates; convert them once at the parsed root.
   if (format === "stl") {
     const geometry = new STLLoader().parse(buffer);
     const material = new THREE.MeshStandardMaterial({
@@ -61,10 +62,14 @@ function parseModel(
       metalness: 0.1,
       roughness: 0.6,
     });
-    return { object: new THREE.Mesh(geometry, material), stlMaterial: material };
+    const object = new THREE.Mesh(geometry, material);
+    object.rotation.x = -Math.PI / 2;
+    return { object, stlMaterial: material };
   }
   if (format === "3mf") {
-    return { object: new ThreeMFLoader().parse(buffer), stlMaterial: null };
+    const object = new ThreeMFLoader().parse(buffer);
+    object.rotation.x = -Math.PI / 2;
+    return { object, stlMaterial: null };
   }
   // OBJ is ASCII text.
   const text = new TextDecoder().decode(buffer);
@@ -73,8 +78,8 @@ function parseModel(
 
 /**
  * Frame `object` in `camera`: center it at the origin and pull the camera back
- * far enough that the whole bounding sphere is visible, then aim OrbitControls
- * at the center.
+ * far enough that the whole bounding sphere is visible. TrackballControls are
+ * constructed afterward so their saved reset state is this fitted view.
  *
  * The caller has already validated that the object's bounding box is non-empty
  * and finite, so `box` here is always usable.
@@ -83,7 +88,6 @@ function fitToObject(
   object: THREE.Object3D,
   box: THREE.Box3,
   camera: THREE.PerspectiveCamera,
-  controls: OrbitControls,
 ): void {
   const size = box.getSize(new THREE.Vector3());
   const center = box.getCenter(new THREE.Vector3());
@@ -100,9 +104,6 @@ function fitToObject(
   camera.near = distance / 100;
   camera.far = distance * 100;
   camera.updateProjectionMatrix();
-
-  controls.target.set(0, 0, 0);
-  controls.update();
 }
 
 /**
@@ -163,7 +164,7 @@ function disposeObject(object: THREE.Object3D): void {
 interface SceneResources {
   scene: THREE.Scene;
   renderer: THREE.WebGLRenderer | null;
-  controls: OrbitControls | null;
+  controls: TrackballControls | null;
   object: THREE.Object3D | null;
   rafId: number;
   resizeObserver: ResizeObserver | null;
@@ -322,9 +323,11 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         res.ambient = ambient;
         res.scene.add(ambient);
         const key = new THREE.DirectionalLight(0xffffff, theme.keyIntensity);
-        key.position.set(1, 1, 1);
+        key.position.set(0, 0, 0);
+        key.target.position.set(0, 0, -1);
         res.key = key;
-        res.scene.add(key);
+        res.scene.add(camera);
+        camera.add(key, key.target);
 
         // Transparent canvas: the pane's theme background shows through, so it
         // follows light/dark and custom theme colors with no JS plumbing.
@@ -335,11 +338,14 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         renderer.setSize(rect.width || 1, rect.height || 1);
         container.appendChild(renderer.domElement);
 
-        const controls = new OrbitControls(camera, renderer.domElement);
-        res.controls = controls;
-        controls.enableDamping = true;
+        fitToObject(object, box, camera);
 
-        fitToObject(object, box, camera, controls);
+        const controls = new TrackballControls(camera, renderer.domElement);
+        res.controls = controls;
+        controls.target.set(0, 0, 0);
+        controls.handleResize();
+        controls.reset();
+        controls.update();
 
         const render = () => {
           res.rafId = requestAnimationFrame(render);
@@ -349,6 +355,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         render();
 
         const onResize = () => {
+          controls.handleResize();
           const r = container.getBoundingClientRect();
           if (r.width === 0 || r.height === 0) return;
           camera.aspect = r.width / r.height;

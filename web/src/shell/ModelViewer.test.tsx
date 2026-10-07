@@ -13,8 +13,9 @@ import type { FileContentResponse } from "@/hooks/useFileContent";
 interface LoaderBehavior {
   // What the active loader's parse should do.
   mode: "valid" | "empty" | "nan" | "throw";
-  // If set, the OrbitControls constructor throws AFTER the renderer is created,
+  // If set, the TrackballControls constructor throws AFTER the renderer is created,
   // exercising the partial-init failure/teardown path.
+  trackballThrows: boolean;
   orbitThrows: boolean;
   // If set, the parsed object carries a mesh whose material references textures
   // (as a textured 3MF does), so teardown's texture disposal can be asserted.
@@ -23,6 +24,7 @@ interface LoaderBehavior {
 
 const behavior: LoaderBehavior = {
   mode: "valid",
+  trackballThrows: false,
   orbitThrows: false,
   texturedMaterial: false,
 };
@@ -58,11 +60,44 @@ interface RendererRecord {
 }
 let lastRenderer: RendererRecord | null = null;
 // The scene's `background`, which three.js paints over the clear color when set.
-let lastScene: { background: unknown } | null = null;
+let lastScene: { background: unknown; children: unknown[] } | null = null;
 
 // The mesh's material, exposed so theme tests can assert its color. Set when
 // the STL loader runs (the only format that builds its own material).
 let lastMaterial: { color: number } | null = null;
+let lastParsedObject: { rotation: { x: number } } | null = null;
+let rotationAtBounds: number | null = null;
+interface ControlsRecord {
+  kind: "orbit" | "trackball";
+  camera: unknown;
+  element: HTMLElement;
+  target: { x: number; y: number; z: number; set: (x: number, y: number, z: number) => void };
+  handleResizeCalls: number;
+  updateCalls: number;
+  resetCalls: number;
+  disposeCalls: number;
+}
+let lastControls: ControlsRecord | null = null;
+let lastCamera: { children: unknown[]; position: { x: number; y: number; z: number } } | null =
+  null;
+let lastKeyTarget: { parent: unknown; position: { x: number; y: number; z: number } } | null = null;
+let resizeControls: (() => void) | null = null;
+let rotationWrites = 0;
+
+function makeRotation() {
+  let x = 0;
+  return Object.defineProperty({}, "x", {
+    get: () => x,
+    set: (value: number) => {
+      x = value;
+      rotationWrites += 1;
+    },
+  }) as { x: number };
+}
+
+function parsedRotation(): number | null {
+  return lastParsedObject?.rotation.x ?? null;
+}
 
 function makeParsedObject() {
   // A textured mesh mirrors what a 3MF loader yields: a material whose slots
@@ -79,7 +114,7 @@ function makeParsedObject() {
       }
     : { geometry: null, material: null };
   // Object3D stand-in. Box3.setFromObject reads boxSpec to decide bounds.
-  return {
+  const object = {
     boxSpec:
       behavior.mode === "empty"
         ? { empty: true, nan: false }
@@ -87,8 +122,11 @@ function makeParsedObject() {
           ? { empty: false, nan: true }
           : { empty: false, nan: false },
     position: { sub: () => {} },
+    rotation: makeRotation(),
     traverse: (cb: (child: unknown) => void) => cb(child),
   };
+  lastParsedObject = object;
+  return object;
 }
 
 function loaderStub(name: string) {
@@ -105,16 +143,54 @@ vi.mock("three/examples/jsm/loaders/STLLoader.js", () => ({ STLLoader: loaderStu
 vi.mock("three/examples/jsm/loaders/3MFLoader.js", () => ({ ThreeMFLoader: loaderStub("3mf") }));
 vi.mock("three/examples/jsm/loaders/OBJLoader.js", () => ({ OBJLoader: loaderStub("obj") }));
 
-vi.mock("three/examples/jsm/controls/OrbitControls.js", () => ({
-  OrbitControls: class {
-    constructor() {
-      if (behavior.orbitThrows) throw new Error("orbit init failed");
+function controlsStub(kind: "orbit" | "trackball") {
+  return class {
+    target = {
+      x: 0,
+      y: 0,
+      z: 0,
+      set(x: number, y: number, z: number) {
+        this.x = x;
+        this.y = y;
+        this.z = z;
+      },
+    };
+    constructor(camera: unknown, element: HTMLElement) {
+      if (kind === "trackball" ? behavior.trackballThrows : behavior.orbitThrows) {
+        throw new Error("controls init failed");
+      }
+      lastControls = {
+        kind,
+        camera,
+        element,
+        target: this.target,
+        handleResizeCalls: 0,
+        updateCalls: 0,
+        resetCalls: 0,
+        disposeCalls: 0,
+      };
+      element.style.touchAction = "none";
     }
-    enableDamping = false;
-    target = { set: () => {} };
-    update() {}
-    dispose() {}
-  },
+    handleResize() {
+      if (lastControls) lastControls.handleResizeCalls += 1;
+    }
+    update() {
+      if (lastControls) lastControls.updateCalls += 1;
+    }
+    reset() {
+      if (lastControls) lastControls.resetCalls += 1;
+    }
+    dispose() {
+      if (lastControls) lastControls.disposeCalls += 1;
+    }
+  };
+}
+
+vi.mock("three/examples/jsm/controls/OrbitControls.js", () => ({
+  OrbitControls: controlsStub("orbit"),
+}));
+vi.mock("three/examples/jsm/controls/TrackballControls.js", () => ({
+  TrackballControls: controlsStub("trackball"),
 }));
 
 vi.mock("three", () => {
@@ -122,7 +198,10 @@ vi.mock("three", () => {
     x = 0;
     y = 0;
     z = 0;
-    set() {
+    set(x: number, y: number, z: number) {
+      this.x = x;
+      this.y = y;
+      this.z = z;
       return this;
     }
     sub() {
@@ -134,6 +213,8 @@ vi.mock("three", () => {
     max = { x: 1, y: 1, z: 1 };
     private empty = false;
     setFromObject(obj: { boxSpec?: { empty: boolean; nan: boolean } }) {
+      lastParsedObject = obj as { rotation: { x: number } };
+      rotationAtBounds = (obj as { rotation?: { x: number } }).rotation?.x ?? 0;
       const box = obj.boxSpec ?? { empty: false, nan: false };
       this.empty = box.empty;
       if (box.nan) this.max = { x: NaN, y: 1, z: 1 };
@@ -150,11 +231,22 @@ vi.mock("three", () => {
     }
   }
   class PerspectiveCamera {
+    isPerspectiveCamera = true;
     fov = 45;
     aspect = 1;
     near = 0.1;
     far = 1000;
     position = new Vector3();
+    children: unknown[] = [];
+    constructor() {
+      lastCamera = { children: this.children, position: this.position };
+    }
+    add(...objects: { parent?: unknown }[]) {
+      for (const object of objects) {
+        object.parent = this;
+        this.children.push(object);
+      }
+    }
     updateProjectionMatrix() {}
   }
   class WebGLRenderer {
@@ -189,7 +281,11 @@ vi.mock("three", () => {
   }
   class Scene {
     // Shared with the test so a scene background is observable after the build.
-    record: { background: unknown } = { background: null };
+    children: unknown[] = [];
+    record: { background: unknown; children: unknown[] } = {
+      background: null,
+      children: this.children,
+    };
     constructor() {
       lastScene = this.record;
     }
@@ -199,13 +295,16 @@ vi.mock("three", () => {
     set background(value: unknown) {
       this.record.background = value;
     }
-    add() {}
+    add(...objects: unknown[]) {
+      this.children.push(...objects);
+    }
     remove() {}
   }
   class Mesh {
     geometry = null;
     material = null;
     position = new Vector3();
+    rotation = makeRotation();
     traverse(cb: (c: unknown) => void) {
       cb(this);
     }
@@ -240,10 +339,14 @@ vi.mock("three", () => {
       }
     },
     DirectionalLight: class {
+      isDirectionalLight = true;
       position = new Vector3();
       intensity: number;
+      parent: unknown = null;
+      target = { parent: null as unknown, position: new Vector3() };
       constructor(_color?: number, intensity = 1) {
         this.intensity = intensity;
+        lastKeyTarget = this.target;
       }
     },
   };
@@ -276,6 +379,7 @@ function makeData(overrides: Partial<FileContentResponse> = {}): FileContentResp
 // its body exactly once instead of spinning.
 beforeEach(() => {
   behavior.mode = "valid";
+  behavior.trackballThrows = false;
   behavior.orbitThrows = false;
   behavior.texturedMaterial = false;
   materialTextures.map = makeTextureRecord();
@@ -284,6 +388,13 @@ beforeEach(() => {
   lastRenderer = null;
   lastScene = null;
   lastMaterial = null;
+  lastParsedObject = null;
+  rotationAtBounds = null;
+  lastControls = null;
+  lastCamera = null;
+  lastKeyTarget = null;
+  resizeControls = null;
+  rotationWrites = 0;
   themeState.resolvedTheme = "light";
   vi.stubGlobal(
     "requestAnimationFrame",
@@ -293,6 +404,9 @@ beforeEach(() => {
   vi.stubGlobal(
     "ResizeObserver",
     class {
+      constructor(callback: ResizeObserverCallback) {
+        resizeControls = () => callback([], this as unknown as ResizeObserver);
+      }
       observe() {}
       unobserve() {}
       disconnect() {}
@@ -367,6 +481,86 @@ describe("ModelViewer loader selection (unified with dispatch)", () => {
   });
 });
 
+describe("ModelViewer print orientation", () => {
+  it("rotates STL once before bounds and leaves OBJ unchanged", async () => {
+    const { unmount } = render(
+      <ModelViewer data={makeData({ path: "part.stl" })} path="part.stl" />,
+    );
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(parseCalls).toEqual(["stl"]);
+    expect(parsedRotation()).toBe(-Math.PI / 2);
+    expect(rotationAtBounds).toBe(-Math.PI / 2);
+    expect(rotationWrites).toBe(1);
+    unmount();
+
+    rotationWrites = 0;
+    parseCalls.length = 0;
+    lastRenderer = null;
+    lastParsedObject = null;
+    rotationAtBounds = null;
+    render(<ModelViewer data={makeData({ path: "mesh.obj" })} path="mesh.obj" />);
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(parseCalls).toEqual(["obj"]);
+    expect(parsedRotation()).toBe(0);
+    expect(rotationAtBounds).toBe(0);
+    expect(rotationWrites).toBe(0);
+  });
+
+  it("rotates 3MF once before calculating bounds", async () => {
+    render(<ModelViewer data={makeData({ path: "part.3mf" })} path="part.3mf" />);
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(parseCalls).toEqual(["3mf"]);
+    expect(parsedRotation()).toBe(-Math.PI / 2);
+    expect(rotationAtBounds).toBe(-Math.PI / 2);
+    expect(rotationWrites).toBe(1);
+  });
+});
+
+describe("ModelViewer trackball controls and headlight", () => {
+  it("keeps a reset, resizable trackball and its directional light with the camera", async () => {
+    render(<ModelViewer data={makeData()} path="part.stl" />);
+    await waitFor(() => expect(lastControls).not.toBeNull());
+    const controls = lastControls;
+    if (!controls) throw new Error("TrackballControls were not initialized");
+
+    expect(controls.kind).toBe("trackball");
+    expect((controls.camera as { children: unknown[] }).children).toBe(lastCamera?.children);
+    expect(controls.element.style.touchAction).toBe("none");
+    expect(controls.target).toMatchObject({ x: 0, y: 0, z: 0 });
+    expect(controls.resetCalls).toBe(1);
+    const initialResizeCalls = controls.handleResizeCalls;
+    expect(initialResizeCalls).toBeGreaterThanOrEqual(1);
+    expect(controls.updateCalls).toBeGreaterThanOrEqual(1);
+    expect(
+      lastCamera?.children.some(
+        (child) => (child as { isDirectionalLight?: boolean }).isDirectionalLight,
+      ),
+    ).toBe(true);
+    expect(lastCamera?.children).toContain(lastKeyTarget);
+    expect(lastKeyTarget?.parent).toBe(controls.camera);
+    expect(lastKeyTarget?.position).toMatchObject({ x: 0, y: 0, z: -1 });
+    expect(
+      lastScene?.children.some(
+        (child) => (child as { isPerspectiveCamera?: boolean }).isPerspectiveCamera,
+      ),
+    ).toBe(true);
+    expect(lastScene?.background).toBeNull();
+    expect(paintsOwnBackground(lastRenderer)).toBe(false);
+
+    resizeControls?.();
+    expect(controls.handleResizeCalls).toBe(initialResizeCalls + 1);
+  });
+
+  it("disposes its controls on teardown", async () => {
+    const { unmount } = render(<ModelViewer data={makeData()} path="part.stl" />);
+    await waitFor(() => expect(lastControls).not.toBeNull());
+    const controls = lastControls;
+    expect(controls?.kind).toBe("trackball");
+    unmount();
+    expect(controls?.disposeCalls).toBe(1);
+  });
+});
+
 describe("ModelViewer error states", () => {
   it("shows the error overlay for a malformed model (parse throws)", async () => {
     behavior.mode = "throw";
@@ -414,10 +608,10 @@ describe("ModelViewer error recovery (container stays mounted)", () => {
 
 describe("ModelViewer teardown", () => {
   it("releases the renderer/WebGL context on a post-init failure (no leak)", async () => {
-    // Renderer is created, then OrbitControls throws — the failure path must
+    // Renderer is created, then TrackballControls throws — the failure path must
     // tear down the already-created renderer (dispose + forceContextLoss)
     // rather than leaking the context until unmount.
-    behavior.orbitThrows = true;
+    behavior.trackballThrows = true;
     render(<ModelViewer data={makeData()} path="part.stl" />);
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     await waitFor(() => expect(lastRenderer?.contextLost).toBe(true));
