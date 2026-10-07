@@ -41,8 +41,11 @@ def _run_compare_step(
     uv.chmod(0o755)
     output = tmp_path / "github_output"
     output.touch()
+    # The step's literal env (thresholds); expressions are filled in below.
+    step_env = {k: str(v) for k, v in COMPARE_STEP["env"].items() if "${{" not in str(v)}
     env = {
         **os.environ,
+        **step_env,
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         "GITHUB_OUTPUT": str(output),
         "REQUIRE_JOURNEYS": require,
@@ -99,13 +102,26 @@ def test_compare_step_outputs(
     assert outputs == expected
 
 
-def test_compare_step_fails_when_compare_writes_no_report(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("uv_body", "error"),
+    [
+        pytest.param("exit 1", "compare.py failed (exit 1)", id="crash-without-report"),
+        pytest.param(
+            "echo report > ../comparison.md",
+            "compare.py exited 0 without writing its JSON report",
+            id="no-json-report",
+        ),
+    ],
+)
+def test_compare_step_fails_when_compare_writes_no_report(
+    tmp_path: Path, uv_body: str, error: str
+) -> None:
     report = {"journeys": {"interrupt": _MEASURED}}
 
     result, outputs = _run_compare_step(
-        tmp_path, report, report, "interrupt", uv_body="#!/usr/bin/env bash\nexit 1\n"
+        tmp_path, report, report, "interrupt", uv_body=f"#!/usr/bin/env bash\n{uv_body}\n"
     )
 
     assert result.returncode != 0
-    assert "without writing its JSON report" in result.stdout
+    assert error in result.stdout
     assert outputs == {}

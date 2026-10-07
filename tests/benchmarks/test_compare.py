@@ -293,7 +293,7 @@ def _failed_journey(runs: int = 3) -> dict:
 
 
 def test_compare_fails_a_journey_whose_every_candidate_op_failed() -> None:
-    # The all-HTTP-500 case: both sides recorded 0.0 ms and it used to read "ok +0.0%".
+    # Both sides failed every request (all HTTP 500s); 0.0 ms is not a measurement.
     baseline = {"journeys": {"policy_evaluate": _failed_journey()}}
     candidate = {"journeys": {"policy_evaluate": _failed_journey()}}
 
@@ -357,3 +357,17 @@ def test_compare_still_reports_an_errored_journey_as_skipped() -> None:
 
     assert passed
     assert rows[0]["status"] == "skipped"
+
+
+def test_a_failed_run_does_not_disable_p95_gating() -> None:
+    # Two 100-sample runs regress P95 by 100%+; a third run failed outright.
+    candidate_journey = _journey([10, 10], [30, 30], n=100)
+    candidate_journey["runs"].append({"n_success": 0, "p50_ms": 0.0, "p95_ms": 0.0})
+    baseline = {"journeys": {"list_sessions": _journey([10, 10, 10], [12, 12, 12], n=100)}}
+    candidate = {"journeys": {"list_sessions": candidate_journey}}
+
+    passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+
+    assert rows[0]["p95_gated"] is True
+    assert not passed
+    assert rows[0]["status"] == "regression"

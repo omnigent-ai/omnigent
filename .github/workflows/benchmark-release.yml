@@ -224,9 +224,9 @@ jobs:
             --output-markdown ../comparison.md "${require[@]}"
           RC=$?
           set -e
-          # 1 = regression, 3 = a required journey was not measured; anything else
-          # means the comparison itself broke.
-          if [ "$RC" -ne 0 ] && [ "$RC" -ne 1 ] && [ "$RC" -ne 3 ]; then
+          # 1 with a report = regression, 3 = a required journey was not measured.
+          # Anything else means the comparison broke (an uncaught exception exits 1, no report).
+          if { [ "$RC" -ne 0 ] && [ "$RC" -ne 1 ] && [ "$RC" -ne 3 ]; } || { [ "$RC" -eq 1 ] && [ ! -s ../comparison.md ]; }; then
             echo "::error::compare.py failed (exit ${RC})."
             exit "$RC"
           fi

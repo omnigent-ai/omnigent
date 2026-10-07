@@ -34,11 +34,14 @@ _UNGATED_P95_NOTE = (
 
 
 def _min_run_samples(data: dict) -> int | None:
-    """Return the smallest per-run sample count, or ``None`` if no run records it."""
+    """Return the smallest per-run sample count, or ``None`` if no run records it.
+
+    Runs with no successful samples are ignored, as in the run medians.
+    """
     counts = [
         run["n_success"]
         for run in (data.get("runs") or [])
-        if isinstance(run.get("n_success"), int)
+        if isinstance(run.get("n_success"), int) and run["n_success"] > 0
     ]
     return min(counts) if counts else None
 
