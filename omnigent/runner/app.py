@@ -3641,6 +3641,7 @@ def create_runner_app(
         harness = _session_harness_name(conv_id)
         if harness not in ("claude-native", "codex-native", "opencode-native"):
             return
+        from omnigent.inner.databricks_executor import DatabricksAuthError
         from omnigent.native.native_cost_popup import launch_cost_popup, wait_for_tmux_client
 
         attached = await asyncio.to_thread(
@@ -3653,6 +3654,10 @@ def create_runner_app(
                 f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
             )
         except httpx.HTTPError:
+            return
+        except DatabricksAuthError as exc:
+            # Best-effort: the host credential service may be unable to sign the request.
+            _logger.warning("Skipping cost popup repopulation for %s: %s", conv_id, exc)
             return
         if resp.status_code != 200:
             return
