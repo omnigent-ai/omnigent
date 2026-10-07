@@ -29,9 +29,10 @@ struct WebShellView: View {
   private var isWorkspace: Bool {
     ServerAuthentication(origin: initialURL.omnigentOrigin) == .databricksWorkspace
   }
-  private var showsServerSwitcher: Bool { !model.serverSwitcherHidden }
+  func showsServerSwitcher(for model: WebViewModel) -> Bool { !model.serverSwitcherHidden }
 
   var body: some View {
+    let showsServerSwitcher = self.showsServerSwitcher(for: model)
     GeometryReader { geometry in
       ZStack(alignment: .top) {
         OmnigentWebView(

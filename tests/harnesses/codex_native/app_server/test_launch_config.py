@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
+import tomlkit
+from cachetools import TTLCache
 
 try:
     import tomllib
@@ -372,6 +376,189 @@ async def test_start_pins_reasoning_effort_in_config(
     assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
 
 
+@pytest.mark.parametrize(
+    ("requested", "inherited", "expected"),
+    [
+        ("minimal", "medium", "low"),
+        ("max", "medium", "xhigh"),
+        (None, "max", "xhigh"),
+        (None, "high", "high"),
+    ],
+)
+@pytest.mark.parametrize("pin_model", [True, False])
+async def test_start_clamps_effort_to_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested: str | None,
+    inherited: str,
+    expected: str,
+    pin_model: bool,
+) -> None:
+    """The terminal and first turn start with a supported explicit or copied effort."""
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    original = f'model = "gpt-5.4"\nmodel_reasoning_effort = "{inherited}"\n'
+    (source_home / "config.toml").write_text(original)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", tmp_path)
+    server.pinned_model = "databricks-gpt-5-4" if pin_model else None
+    server.pinned_effort = requested
+    server.model_catalog_rows = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": effort} for effort in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+
+    try:
+        await server.start()
+        config = tomllib.loads((server.codex_home / "config.toml").read_text())
+        assert config["model_reasoning_effort"] == expected
+        assert (source_home / "config.toml").read_text() == original
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize(
+    ("write_failure", "symlink_config"),
+    [
+        (None, False),
+        (None, True),
+        ("rejected", False),
+        ("rejected", True),
+        ("disconnected", False),
+        ("timeout", False),
+        ("unwritable", False),
+    ],
+)
+async def test_start_without_catalog_snapshot_checks_the_live_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    write_failure: str | None,
+    symlink_config: bool,
+) -> None:
+    """Startup repairs the private config without touching the source, locally if the RPC fails."""
+    from unittest.mock import AsyncMock, call
+
+    from omnigent.harnesses.codex_native import app_server
+
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    original = 'model = "gpt-5.4"\nmodel_reasoning_effort = "max"\n'
+    (source_home / "config.toml").write_text(original)
+    private_home = tmp_path / "codex-home"
+    if symlink_config:
+        private_home.mkdir()
+        (private_home / "config.toml").symlink_to(source_home / "config.toml")
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+
+    async def request(method: str, params: dict[str, Any]) -> dict[str, object]:
+        if method == "model/list":
+            return {
+                "result": {
+                    "data": [
+                        {
+                            "id": "gpt-5.4",
+                            "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+                        }
+                    ]
+                }
+            }
+        assert method == "config/batchWrite"
+        if write_failure in ("rejected", "unwritable"):
+            raise app_server.CodexAppServerResponseError(
+                {"code": -32601, "message": "unavailable"}
+            )
+        if write_failure == "disconnected":
+            raise ConnectionError("control socket disconnected")
+        if write_failure == "timeout":
+            await asyncio.Event().wait()
+        # Perform the write so an unmaterialized symlink would change the source.
+        config_path = Path(params["filePath"])
+        document = tomlkit.parse(config_path.read_text())
+        for edit in params["edits"]:
+            document[edit["keyPath"]] = edit["value"]
+        config_path.write_text(tomlkit.dumps(document))
+        return {"result": {}}
+
+    client.request.side_effect = request
+    monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(app_server, "_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        app_server.CodexNativeAppServer, "_wait_until_ready", AsyncMock(return_value=client)
+    )
+    trust = AsyncMock()
+    monkeypatch.setattr(app_server.CodexNativeAppServer, "_trust_policy_hooks", trust)
+    server = _test_app_server(tmp_path, private_home, tmp_path / "bridge", tmp_path)
+    # A previous server on this transport left capabilities that allowed max.
+    transport = str(server.socket_path)
+    stale_catalog: TTLCache[str, list[dict[str, Any]]] = TTLCache(maxsize=2, ttl=60)
+    stale_catalog[transport] = [
+        {"id": "gpt-5.4", "supportedReasoningEfforts": [{"reasoningEffort": "max"}]}
+    ]
+    stale_misses: TTLCache[str, set[str]] = TTLCache(maxsize=2, ttl=60)
+    stale_misses[transport] = {"gpt-5.4"}
+    monkeypatch.setattr(app_server, "_effort_catalog_cache", stale_catalog)
+    monkeypatch.setattr(app_server, "_effort_catalog_misses", stale_misses)
+
+    if write_failure == "unwritable":
+        # With both repair writes failing, startup stops before any TUI thread exists.
+        def unwritable(*args: object) -> None:
+            raise PermissionError("private config is read-only")
+
+        monkeypatch.setattr(app_server, "_pin_codex_config_effort", unwritable)
+        with pytest.raises(PermissionError):
+            await server.start()
+        assert (source_home / "config.toml").read_text() == original
+        return
+
+    try:
+        await server.start()
+        assert client.request.await_args_list == [
+            call("model/list", {"includeHidden": True}),
+            call(
+                "config/batchWrite",
+                {
+                    "filePath": str(server.codex_home / "config.toml"),
+                    "edits": [
+                        {
+                            "keyPath": "model_reasoning_effort",
+                            "value": "xhigh",
+                            "mergeStrategy": "replace",
+                        }
+                    ],
+                },
+            ),
+        ]
+        assert (source_home / "config.toml").read_text() == original
+        assert not (private_home / "config.toml").is_symlink()
+        # A failed RPC repair falls back to the local write, so the TUI's thread starts supported.
+        assert (
+            tomllib.loads((private_home / "config.toml").read_text())["model_reasoning_effort"]
+            == "xhigh"
+        )
+        trust.assert_awaited_once_with(client=client)
+        client.close.assert_awaited_once()
+        if write_failure:
+            assert "Could not persist supported Codex reasoning effort at startup" in caplog.text
+        next_client = AsyncMock(spec=app_server.CodexAppServerClient)
+        assert (
+            await app_server.resolve_codex_effort_for_model(
+                next_client, "max", "gpt-5.4", transport=str(server.socket_path)
+            )
+            == "xhigh"
+        )
+        next_client.request.assert_not_awaited()
+    finally:
+        await server.close()
+
+
 class TestPinCodexConfigModel:
     """_pin_codex_config_model seeds the per-session config.toml model."""
 
@@ -597,48 +784,3 @@ async def test_codex_native_launch_config_reads_reasoning_effort(
         config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
 
     assert config.reasoning_effort == expected
-
-
-@pytest.mark.parametrize(
-    ("model", "expected_effort"),
-    [("gpt-5.6-sol", "ultra"), (None, "ultra"), ("glm-5-2", "medium")],
-    ids=["sol", "no-model", "clamped"],
-)
-async def test_apply_codex_thread_effort_updates_the_loaded_thread(
-    monkeypatch: pytest.MonkeyPatch, model: str | None, expected_effort: str
-) -> None:
-    """
-    The persisted effort reaches a resumed thread via ``thread/settings/update``.
-
-    A resumed thread runs the rollout's recorded effort — none after a runner
-    restart rebuilt the rollout, the source's on a forked clone — so the launch
-    re-applies the session's effort (clamped to the model's ladder) once the
-    thread has started, instead of leaving the TUI at ``default`` until a web
-    turn happens to send one.
-    """
-    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-
-    requests: list[tuple[str, dict[str, object]]] = []
-
-    class _FakeClient:
-        def __init__(self, *, ws_url: str, client_name: str) -> None:
-            assert ws_url == "ws://127.0.0.1:9876"
-            assert client_name == "omnigent-codex-native-effort"
-
-        async def connect(self) -> None:
-            return None
-
-        async def close(self) -> None:
-            return None
-
-        async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
-            requests.append((method, params))
-            return {"result": {}}
-
-    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
-    await codex_native_app_server.apply_codex_thread_effort(
-        "ws://127.0.0.1:9876", "thread_abc", "ultra", model=model
-    )
-    assert requests == [
-        ("thread/settings/update", {"threadId": "thread_abc", "effort": expected_effort})
-    ]

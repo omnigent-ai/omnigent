@@ -45,10 +45,9 @@ import {
 import { prefetchSessionHostChain } from "./hooks/useSession";
 import { resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import {
-  applyDesktopUiFontSize,
+  applyStoredUiFontSize,
   applyUiFontFamily,
   readUiFontFamily,
-  readUiFontSizePx,
 } from "./lib/uiFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
@@ -194,7 +193,7 @@ function OmnigentProviders({
   const scopeRootRef = useCallback((el: HTMLDivElement | null) => {
     setEmbedScopeRoot(el);
     if (el) {
-      applyDesktopUiFontSize(readUiFontSizePx());
+      applyStoredUiFontSize();
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
       applyCustomTheme(readCustomTheme());

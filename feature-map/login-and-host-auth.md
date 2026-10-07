@@ -33,6 +33,13 @@ be able to write resources without a separate Omnigent account.
   remain restricted.
 - `embedded-auth-context`: HTTP, WebSocket, and background writes use the
   app's account mode; an embedded app must not weaken a separate accounts app.
+- `desktop-oidc-browser-sign-in`: the desktop app signs in to an OIDC server in
+  the system browser and never shows the identity provider inside its window.
+  States: Connect with no session, Connect with a still-valid session (no
+  browser), cancel mid sign-in, a refused sign-in (disallowed domain), relaunch
+  (silent), session expiry while open (silent), an expired or revoked sign-in
+  (back to the connect screen with the reason), and sign-out. Accounts, header,
+  older servers, and Databricks hosts keep their previous sign-in.
 
 ## How to get to it (user POV)
 
@@ -45,6 +52,12 @@ and `disable`.
 
 **Web:** a harness that needs sign-in is marked in the harness picker, and a
 session whose host went offline offers reconnect (see [sessions](./sessions.md)).
+
+**Desktop:** Connect on the setup screen (or the server selector) to an OIDC
+server; relaunching the app, New Window, deep links, and switching servers on a
+signed-in server; the app's sign-out in Settings, **Server → Sign Out of Server**
+in the native menu, and **Sign out of <server>** in the sidebar server picker (Databricks and OIDC servers; the next Connect opens
+the browser, which is how a user switches accounts).
 
 **Embedded API:** construct `create_app(auth_provider=...)` with the embedding
 application's provider and stores, then use its authenticated REST client to
@@ -87,6 +100,22 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   handling; revocation and saved-identity restrictions must still hold. Report backend
   skips separately. These are not browser or live identity-provider checks.
 
+- **`desktop-oidc-browser-sign-in` (desktop shell, own environment):** drive the
+  desktop app per `web/electron/README.md` ("OIDC sign-in through the system
+  browser", Manual verification) against an OIDC server. The verification
+  instance is header mode, so it can't show this. Component tests:
+  `web/electron/test/oidc-auth.test.js`, `oidc-credentials.test.js`, and the
+  "OIDC system-browser sign-in wiring" suite in `main.test.js`; server flow:
+  `tests/server/integration/test_oidc_native_login.py`.
+- **Desktop sign-out (Server menu and sidebar picker):** connect the desktop to an
+  OIDC server or a Databricks workspace, choose **Server → Sign Out of Server**,
+  and confirm every window on it shows "You're signed out of …" and the next
+  Connect opens the browser. The sidebar picker's **Sign out of <server>** needs a
+  server serving this checkout's web build. Component tests: the
+  "signs a workspace out…", "Server → Sign Out of Server…", and "holds a
+  connection that starts during sign-out…" cases in `web/electron/test/main.test.js`,
+  and `web/src/shell/SidebarServerPicker.test.tsx`.
+
 ## Gotchas
 
 - **Find out which credential kind the reporter's host uses before trusting a
@@ -109,3 +138,6 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   establish every resource endpoint or a real host-registration flow.
 - Sign-in can open a browser even with `--no-open`; use `--non-interactive` in
   scripted runs.
+- The desktop decides OIDC from the server's manifest, so a server reached
+  through a subpath proxy (manifest not at the origin root) keeps the in-window
+  sign-in. Reproduce with the reporter's exact server URL.

@@ -11,6 +11,8 @@
 
 import { type ReactNode, useEffect, useState } from "react";
 import { PageScroll } from "@/components/PageScroll";
+import { SettingsGroup } from "@/components/SettingsGroup";
+import { SettingsLabel } from "@/components/SettingsLabel";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { type SharingMode, isSingleUserMode } from "@/lib/capabilities";
@@ -121,8 +123,8 @@ export function SharingPage() {
 
   if (!isSingleUser && meIsAdmin === false) {
     return (
-      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
-        <h1 className="mb-2 text-2xl font-semibold">Session sharing</h1>
+      <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
+        <h1 className="settings-page-title mb-2 text-2xl font-semibold">Session sharing</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage session sharing.
         </p>
@@ -170,11 +172,11 @@ export function SharingPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+    <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div>
         <div className="mb-6">
-          <h1 className="text-2xl font-semibold">Session sharing</h1>
-          <p className="mt-1 text-ui text-muted-foreground">
+          <h1 className="settings-page-title text-2xl font-semibold">Session sharing</h1>
+          <p className="mt-1 text-ui text-muted-foreground max-md:hidden">
             Control whether users on this server can share sessions with others. Applies server-wide
             and takes effect immediately. Changes affect only new shares — existing grants
             (including already-public sessions) keep working until revoked.
@@ -190,119 +192,125 @@ export function SharingPage() {
                 The sharing mode is managed by this deployment and can't be changed here.
               </p>
             )}
-            <fieldset
-              className="space-y-2"
-              disabled={!editable || setMode.isPending}
-              aria-label="Session sharing mode"
-            >
-              {TIERS.map((tier) => {
-                const selected = tier.id === current;
-                return (
-                  <label
-                    key={tier.id}
-                    className={cn(
-                      "flex cursor-pointer items-start gap-3 rounded-lg border px-4 py-3 transition-colors",
-                      selected ? "border-primary bg-primary/5" : "border-border hover:bg-muted/50",
-                      (!editable || setMode.isPending) && "cursor-not-allowed opacity-70",
-                    )}
-                  >
-                    <input
-                      type="radio"
-                      name="sharing-mode"
-                      value={tier.id}
-                      checked={selected}
-                      onChange={() => choose(tier.id)}
-                      disabled={!editable || setMode.isPending}
-                      className="mt-1 size-4 accent-primary"
-                    />
-                    <span className="flex-1">
-                      <span className="block text-ui font-medium">{tier.label}</span>
-                      <span className="mt-0.5 block text-sm text-muted-foreground">
-                        {tier.description}
-                      </span>
-                    </span>
-                  </label>
-                );
-              })}
-            </fieldset>
-
-            {/* Public access — a separate switch from the tiers above. */}
-            <BlockedBy reason={publicBlockedReason}>
-              <div className="mt-6 flex items-center justify-between rounded-lg border px-4 py-3">
-                <div className="pr-4">
-                  <p className="text-ui font-medium">Public access</p>
-                  <p className="mt-0.5 text-sm text-muted-foreground">
-                    Allow sharing a session with anyone who has the link (public read access). When
-                    off, the Share dialog's "Public access" toggle is hidden and new public grants
-                    are rejected; sessions already shared publicly stay public until revoked.
-                  </p>
-                  {!publicEditable && (
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      Managed by this deployment and can't be changed here.
-                    </p>
-                  )}
-                </div>
-                <Switch
-                  checked={effectivePublic}
-                  onCheckedChange={togglePublic}
-                  disabled={publicDisabled}
-                  aria-label="Public access"
-                  componentId="settings.sharing.public_access"
-                />
-              </div>
-            </BlockedBy>
-            {/* Default visibility of NEW sessions: writes a public read grant at creation. */}
-            <BlockedBy reason={defaultPublicBlockedReason}>
-              <div className="mt-6">
-                <p className="text-ui font-medium">Default visibility for new sessions</p>
-                <p className="mt-0.5 mb-2 text-sm text-muted-foreground">
-                  Whether new sessions start with public read access. Owners can still revoke it
-                  from the Share dialog. Existing sessions are unchanged.
-                </p>
-                {!defaultPublicEditable && (
-                  <p className="mb-2 text-sm text-muted-foreground">
-                    Managed by this deployment and can't be changed here.
-                  </p>
-                )}
+            <div className="flex flex-col gap-6">
+              <SettingsGroup title="Sharing mode" testId="settings-group-sharing-mode">
                 <fieldset
-                  className="space-y-2"
-                  disabled={defaultPublicDisabled}
-                  aria-label="Default visibility for new sessions"
+                  className="divide-y divide-border"
+                  disabled={!editable || setMode.isPending}
+                  aria-label="Session sharing mode"
                 >
-                  {DEFAULT_PUBLIC_OPTIONS.map((option) => {
-                    const selected = option.id === effectiveDefaultPublic;
+                  {TIERS.map((tier) => {
+                    const selected = tier.id === current;
                     return (
                       <label
-                        key={option.id}
+                        key={tier.id}
                         className={cn(
-                          "flex cursor-pointer items-start gap-3 rounded-lg border px-4 py-3 transition-colors",
-                          selected
-                            ? "border-primary bg-primary/5"
-                            : "border-border hover:bg-muted/50",
-                          defaultPublicDisabled && "cursor-not-allowed opacity-70",
+                          "flex cursor-pointer items-start gap-3 py-4 first:pt-0 last:pb-0",
+                          (!editable || setMode.isPending) && "cursor-not-allowed opacity-70",
                         )}
                       >
                         <input
                           type="radio"
-                          name="default-public-sessions"
-                          value={option.id}
+                          name="sharing-mode"
+                          value={tier.id}
                           checked={selected}
-                          onChange={() => chooseDefaultPublic(option.id)}
-                          disabled={defaultPublicDisabled}
+                          onChange={() => choose(tier.id)}
+                          disabled={!editable || setMode.isPending}
                           className="mt-1 size-4 accent-primary"
                         />
-                        <span className="flex-1">
-                          <span className="block text-ui font-medium">{option.label}</span>
-                          <span className="mt-0.5 block text-sm text-muted-foreground">
-                            {option.description}
-                          </span>
-                        </span>
+                        <SettingsLabel
+                          label={tier.label}
+                          description={tier.description}
+                          className="flex-1"
+                        />
                       </label>
                     );
                   })}
                 </fieldset>
-              </div>
-            </BlockedBy>
+              </SettingsGroup>
+
+              <SettingsGroup title="Public sharing" testId="settings-group-public-sharing">
+                <BlockedBy reason={publicBlockedReason}>
+                  <div className="flex items-center justify-between gap-4">
+                    <SettingsLabel
+                      label="Public access"
+                      className="flex-1"
+                      description={
+                        <>
+                          Allow sharing a session with anyone who has the link (public read access).
+                          When off, the Share dialog&apos;s Public access toggle is hidden and new
+                          public grants are rejected; existing public grants keep working.
+                          {!publicEditable && (
+                            <span className="mt-1 block">
+                              Managed by this deployment and can&apos;t be changed here.
+                            </span>
+                          )}
+                        </>
+                      }
+                    />
+                    <Switch
+                      checked={effectivePublic}
+                      onCheckedChange={togglePublic}
+                      disabled={publicDisabled}
+                      aria-label="Public access"
+                      componentId="settings.sharing.public_access"
+                    />
+                  </div>
+                </BlockedBy>
+
+                <div className="mt-4 border-t border-border pt-4">
+                  <BlockedBy reason={defaultPublicBlockedReason}>
+                    <SettingsLabel
+                      label="Default visibility for new sessions"
+                      description={
+                        <>
+                          Whether new sessions start with public read access. Owners can still
+                          revoke it from the Share dialog. Existing sessions are unchanged.
+                          {!defaultPublicEditable && (
+                            <span className="mt-1 block">
+                              Managed by this deployment and can&apos;t be changed here.
+                            </span>
+                          )}
+                        </>
+                      }
+                    />
+                    <fieldset
+                      className="mt-4 divide-y divide-border border-t border-border"
+                      disabled={defaultPublicDisabled}
+                      aria-label="Default visibility for new sessions"
+                    >
+                      {DEFAULT_PUBLIC_OPTIONS.map((option) => {
+                        const selected = option.id === effectiveDefaultPublic;
+                        return (
+                          <label
+                            key={option.id}
+                            className={cn(
+                              "flex cursor-pointer items-start gap-3 py-4 last:pb-0",
+                              defaultPublicDisabled && "cursor-not-allowed opacity-70",
+                            )}
+                          >
+                            <input
+                              type="radio"
+                              name="default-public-sessions"
+                              value={option.id}
+                              checked={selected}
+                              onChange={() => chooseDefaultPublic(option.id)}
+                              disabled={defaultPublicDisabled}
+                              className="mt-1 size-4 accent-primary"
+                            />
+                            <SettingsLabel
+                              label={option.label}
+                              description={option.description}
+                              className="flex-1"
+                            />
+                          </label>
+                        );
+                      })}
+                    </fieldset>
+                  </BlockedBy>
+                </div>
+              </SettingsGroup>
+            </div>
             {error && <p className="mt-3 text-ui text-destructive">{error}</p>}
           </>
         )}

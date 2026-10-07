@@ -301,6 +301,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
                     "name": "advisor-row",
                     "bundle_location": "bundle",
                     "session_id": None,
+                    "operator_authored": True,
                 },
             )()
 
@@ -406,6 +407,7 @@ async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
                     "name": "advisor-row",
                     "bundle_location": "bundle",
                     "session_id": None,
+                    "operator_authored": True,
                 },
             )()
 
@@ -595,6 +597,46 @@ async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
 
     assert snapshot.last_task_error == {"code": expected_code, "message": message}
     assert conv.labels["omnigent.last_task_error_code"] == stored_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        ('API Error: 499 {"error_code":"CANCELLED","message":""}', "transient_upstream_error"),
+        (
+            'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+            'version 2.1.280 or newer is required."}',
+            "client_update_required",
+        ),
+    ],
+)
+async def test_session_snapshot_classifies_preexisting_gateway_cancel_and_old_cli_errors(
+    message: str,
+    expected_code: str,
+) -> None:
+    """Failures saved as generic native errors pick up the new codes on reload."""
+    session_id = "7c1f0a52d3b94e6c8a5d2e9f4b6a1c30"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": "native_turn_error",
+            "omnigent.last_task_error_message": message,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_native_error", message)],
+        conversations={session_id: conv},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.last_task_error == {"code": expected_code, "message": message}
+    assert conv.labels["omnigent.last_task_error_code"] == "native_turn_error"
 
 
 @pytest.mark.asyncio
