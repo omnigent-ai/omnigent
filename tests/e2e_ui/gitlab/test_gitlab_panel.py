@@ -339,6 +339,8 @@ def test_gitlab_canvas_link_uses_merge_request_identity(
     base_url, session_id = seeded_session
     stub(page)
     _stub_server_info(page, canvas=True)
+    # Keep live session updates from replacing the mocked Canvas branch.
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
     page.route(
         "**/v1/sessions?*",
         _serve_list(
