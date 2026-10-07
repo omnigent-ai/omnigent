@@ -342,6 +342,9 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
 
         const controls = new TrackballControls(camera, renderer.domElement);
         res.controls = controls;
+        // A drag across the canvas width turns the model once, close to the
+        // full turn per canvas height OrbitControls gave.
+        controls.rotateSpeed = Math.PI;
 
         const render = () => {
           res.rafId = requestAnimationFrame(render);
