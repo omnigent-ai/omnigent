@@ -764,7 +764,8 @@ def build_agent_bundle(
     :param skills: Optional bundled skills. Each dict must include
         ``"name"``, ``"description"``, and ``"content"``, e.g.
         ``{"name": "triage", "description": "Triage issues",
-        "content": "Ask one question."}``.
+        "content": "Ask one question."}``. An optional ``"dir"`` names
+        the skill directory when it differs from ``"name"``.
     :param guardrails: Optional ``guardrails:`` block written verbatim
         into the spec, e.g. ``{"policies": {"cost_guard": {"type":
         "function", "function": {"path": "...cost_budget",
@@ -863,7 +864,7 @@ def build_agent_bundle(
             )
             skill_bytes = skill_doc.encode()
             skill_info = tarfile.TarInfo(
-                name=f"skills/{skill['name']}/SKILL.md",
+                name=f"skills/{skill.get('dir', skill['name'])}/SKILL.md",
             )
             skill_info.size = len(skill_bytes)
             tf.addfile(skill_info, io.BytesIO(skill_bytes))

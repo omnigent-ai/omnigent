@@ -2452,6 +2452,71 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert session_resp.json()["title"] == "/grill-me review this rollout"
 
 
+@pytest.mark.parametrize(
+    ("available", "status", "expected_names"),
+    [(["code-review"], 202, ["review", "code-review"]), (["other"], 400, ["review"])],
+)
+async def test_skill_slash_command_retries_frontmatter_name_on_older_runner(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    available: list[str],
+    status: int,
+    expected_names: list[str],
+) -> None:
+    """
+    A runner from before directory-name invocation knows a bundled skill by
+    its frontmatter name, so the server retries with that name once the
+    runner rejects the directory name and lists the frontmatter name.
+    """
+    resolved: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Emulate an older runner that resolves only ``code-review``.
+
+        :param request: Request sent to the fake runner.
+        :returns: Meta text for ``code-review``, a 404 for other names, or
+            an accepted response for ``/events``.
+        """
+        if request.method == "POST" and request.url.path.endswith("/skills/resolve"):
+            name = json.loads(request.content)["name"]
+            resolved.append(name)
+            if name != "code-review":
+                return httpx.Response(
+                    404, json={"error": "skill_not_found", "available": available}
+                )
+            skill = SkillSpec(name=name, description="Review changes.", content="Look hard.")
+            return httpx.Response(200, json={"meta_text": format_skill_meta_text(skill, "")})
+        return httpx.Response(202, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        agent = await create_test_agent(
+            client,
+            name="skill-agent",
+            skills=[
+                {
+                    "dir": "review",
+                    "name": "code-review",
+                    "description": "Review changes.",
+                    "content": "Look hard.",
+                }
+            ],
+        )
+        session = await _create_session(client, agent["id"])
+
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "slash_command", "data": {"kind": "skill", "name": "review"}},
+        )
+
+    assert resp.status_code == status, resp.text
+    assert resolved == expected_names
+
+
 async def test_skill_slash_command_keeps_existing_title(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

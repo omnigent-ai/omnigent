@@ -237,11 +237,25 @@ def _has_plugin_provenance(skill: SkillSpec, plugin: str) -> bool:
     )
 
 
+def _label_alias(skill: SkillSpec) -> str:
+    """
+    The name a skill had before directory-name invocation.
+
+    :param skill: Skill with a frontmatter label, e.g. ``plugin:review``
+        labelled ``code-review``.
+    :returns: The label, keeping any namespace, e.g. ``"plugin:code-review"``.
+    """
+    namespace, sep, _ = skill.name.rpartition(":")
+    return f"{namespace}{sep}{skill.display_name}"
+
+
 def find_skill_by_name(skills: list[SkillSpec], name: str) -> SkillSpec | None:
     """
     Return the skill with the requested name, accepting namespace aliases.
 
-    An exact match always wins. When none exists, plugin-namespace aliases
+    An exact match always wins. Next, a frontmatter label that exactly one
+    skill carries resolves to that skill, so a name from an older server
+    (``code-review`` for directory ``review``) still works. Then plugin-namespace aliases
     are tried: the same installed plugin skill is surfaced as
     ``<plugin>:<skill>`` by claude-family discovery but as the bare
     ``<skill>`` by codex-family discovery, so a name carried from one
@@ -263,6 +277,10 @@ def find_skill_by_name(skills: list[SkillSpec], name: str) -> SkillSpec | None:
     for skill in skills:
         if skill.name == name:
             return skill
+    # Older servers name a skill by its frontmatter label; accept it when unambiguous.
+    labelled = [s for s in skills if s.display_name is not None and _label_alias(s) == name]
+    if len(labelled) == 1:
+        return labelled[0]
     if ":" in name:
         plugin, bare = name.split(":", 1)
         for skill in skills:

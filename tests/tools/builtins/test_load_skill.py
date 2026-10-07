@@ -328,6 +328,39 @@ def test_find_skill_by_name_ambiguous_bare_alias_stays_unresolved() -> None:
     assert find_skill_by_name([a, b], "brand-review") is None
 
 
+def _labelled(name: str, label: str) -> SkillSpec:
+    """A skill invoked as *name* whose frontmatter name is *label*."""
+    return SkillSpec(name=name, description="d", content="body", display_name=label)
+
+
+def test_find_skill_by_name_accepts_unique_frontmatter_label() -> None:
+    """An older server's frontmatter name resolves to the directory-named skill."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    review = _labelled("review", "code-review")
+    plugin = _labelled("myplugin:audit", "security-audit")
+    assert find_skill_by_name([review, plugin], "code-review") is review
+    assert find_skill_by_name([review, plugin], "myplugin:security-audit") is plugin
+
+
+def test_find_skill_by_name_exact_name_beats_frontmatter_label() -> None:
+    """A skill actually named the requested command wins over another's label."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    exact = _spec("code-review")
+    labelled = _labelled("review", "code-review")
+    assert find_skill_by_name([labelled, exact], "code-review") is exact
+
+
+def test_find_skill_by_name_ambiguous_frontmatter_label_stays_unresolved() -> None:
+    """Two skills sharing a frontmatter label: don't guess."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    a = _labelled("review", "code-review")
+    b = _labelled("review-v2", "code-review")
+    assert find_skill_by_name([a, b], "code-review") is None
+
+
 def test_find_skill_by_name_unknown_names_return_none() -> None:
     """Unknown bare and namespaced names still miss."""
     from omnigent.tools.builtins.load_skill import find_skill_by_name
