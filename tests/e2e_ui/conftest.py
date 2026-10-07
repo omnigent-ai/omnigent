@@ -59,7 +59,6 @@ from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
 from tests._helpers.compat import (
     apply_server_env,
     compat_server_cwd,
-    compat_server_python,
     server_executable,
 )
 from tests._helpers.native_session import create_native_session
@@ -1054,9 +1053,6 @@ def live_server(
     # drop PYTHONPATH so the pinned old build in the compat venv resolves
     # instead of being shadowed by the worktree.
     apply_server_env(env, _REPO_ROOT)
-    # Fresh test databases and current writers exercise the post-backfill reader mode.
-    if compat_server_python() is None:
-        env.setdefault("OMNIGENT_FEATURES", "unread_message_watermark")
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     server_argv = [
         server_executable(),

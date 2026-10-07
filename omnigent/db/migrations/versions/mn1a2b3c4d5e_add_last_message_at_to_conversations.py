@@ -1,12 +1,11 @@
-"""Prepare visible-message watermark storage without activating readers.
+"""Add nullable visible-message watermark storage.
 
 Revision ID: mn1a2b3c4d5e
 Revises: mm1a2b3c4d5e
 Create Date: 2026-10-05 00:00:00.000000
 
-Existing rows remain unknown until the application reconciles their visible
-message history in bounded transactions. Older writers can continue using
-the existing columns throughout this additive schema deployment.
+Existing rows remain nullable legacy rows. New application writers initialize
+the field to zero and advance it only for visible messages.
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Add nullable storage; leave initialization to bounded reconciliation."""
+    """Add nullable storage without scanning or backfilling existing rows."""
     bind = op.get_bind()
     existing = {column["name"] for column in sa.inspect(bind).get_columns("conversations")}
     if "last_message_at" not in existing:

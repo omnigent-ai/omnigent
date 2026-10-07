@@ -1403,9 +1403,6 @@ function ProjectFolder({
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
-  // Read-state writes can change a collapsed folder's aggregate marker without
-  // changing the session-list query that supplied these rows.
-  useUnseenTick();
   const marker = projectMarkerState(conversations, errors, startingConversationId);
 
   // Publish the folder's rendered rows upward so projects-scope bulk selection

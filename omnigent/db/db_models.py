@@ -865,8 +865,9 @@ class SqlConversation(ConversationBase):
         created.
     :param updated_at: Unix epoch seconds when the conversation was
         last updated (item append, title change, etc.).
-    :param last_message_at: Latest visible-message timestamp, or ``None`` until
-        initialized or when no visible message exists.
+    :param last_message_at: Latest visible-message timestamp. ``0`` marks a
+        known-empty new conversation; ``NULL`` marks a legacy or unknown row
+        whose readers fall back to ``updated_at``.
     :param title: Human-readable title; empty string when untitled.
     :param parent_conversation_id: For Phase 4 named sub-agents,
         points at the parent conversation. ``None`` for top-level

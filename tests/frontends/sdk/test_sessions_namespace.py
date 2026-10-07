@@ -266,6 +266,26 @@ async def test_get_updated_at_defaults_to_none_when_omitted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_parses_last_message_at() -> None:
+    """Session snapshots preserve the nullable visible-message watermark."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json=_session_response_body() | {"last_message_at": 1700000001},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert session.last_message_at == 1700000001
+
+
+@pytest.mark.asyncio
 async def test_get_parses_agent_name() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1434,6 +1454,7 @@ async def test_list_preserves_host_id_on_rows() -> None:
                         "status": "idle",
                         "created_at": 1700000000,
                         "updated_at": 1700000042,
+                        "last_message_at": 1700000039,
                         "host_id": "a1b2c3d4e5f67890abcdef1234567890",
                     },
                     {
@@ -1464,7 +1485,9 @@ async def test_list_preserves_host_id_on_rows() -> None:
 
     by_id = {row.id: row for row in rows}
     assert by_id["conv_host_bound"].host_id == "a1b2c3d4e5f67890abcdef1234567890"
+    assert by_id["conv_host_bound"].last_message_at == 1700000039
     assert by_id["conv_unbound"].host_id is None
+    assert by_id["conv_unbound"].last_message_at is None
     assert by_id["conv_unbound"].parent_session_id is None
     assert by_id["conv_child"].host_id is None
     assert by_id["conv_child"].parent_session_id == "conv_host_bound"

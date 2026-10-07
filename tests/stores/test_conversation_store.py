@@ -33,7 +33,6 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.conversation_store import WatermarkReconciliationCursor
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -639,6 +638,136 @@ def test_append_and_list_items(conversation_store: SqlAlchemyConversationStore) 
     assert len(page.data) == 2
     assert page.data[0].data.role == "user"
     assert page.data[1].data.role == "assistant"
+
+
+def _watermark_message(
+    text: str,
+    *,
+    response_id: str,
+    is_meta: bool = False,
+    stable_id: str | None = None,
+) -> NewConversationItem:
+    """Build a message item for the visible-message watermark tests."""
+    return NewConversationItem(
+        type="message",
+        response_id=response_id,
+        stable_id=stable_id,
+        data=MessageData(
+            role="assistant",
+            agent="test-agent",
+            content=[{"type": "output_text", "text": text}],
+            is_meta=is_meta,
+        ),
+    )
+
+
+def test_last_message_at_tracks_visible_messages_only(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New rows start at zero; hidden and metadata writes do not advance it."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_module
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 1000)
+    conversation = conversation_store.create_conversation()
+    assert conversation.last_message_at == 0
+
+    def current_watermark() -> int | None:
+        row = conversation_store.get_conversation(conversation.id)
+        assert row is not None
+        return row.last_message_at
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 2000)
+    conversation_store.append(
+        conversation.id,
+        [_watermark_message("hidden", response_id="hidden", is_meta=True)],
+    )
+    assert current_watermark() == 0
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 3000)
+    conversation_store.update_conversation(conversation.id, title="metadata")
+    assert current_watermark() == 0
+
+    conversation_store.append(
+        conversation.id,
+        [_watermark_message("visible", response_id="visible", stable_id="a" * 32)],
+    )
+    assert current_watermark() == 3000
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 3500)
+    conversation_store.append(
+        conversation.id,
+        [
+            NewConversationItem(
+                type="reasoning",
+                response_id="reasoning",
+                data=ReasoningData(
+                    agent="test-agent",
+                    summary=[{"type": "summary_text", "text": "hidden reasoning"}],
+                ),
+            )
+        ],
+    )
+    assert current_watermark() == 3000
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 4000)
+    conversation_store.update_conversation(conversation.id, title="metadata again")
+    conversation_store.append(
+        conversation.id,
+        [_watermark_message("hidden later", response_id="hidden-later", is_meta=True)],
+    )
+    assert current_watermark() == 3000
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 5000)
+    duplicate = conversation_store.append(
+        conversation.id,
+        [_watermark_message("duplicate", response_id="duplicate", stable_id="a" * 32)],
+    )
+    assert duplicate[0].deduplicated is True
+    assert current_watermark() == 3000
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 6000)
+    conversation_store.append(conversation.id, [_user_message("visible user", "visible-user")])
+    assert current_watermark() == 6000
+
+
+def test_session_creation_path_starts_with_empty_watermark(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The bundled-agent creation path has the same known-empty sentinel."""
+    created = conversation_store.create_session_with_agent(
+        agent_id="1e86f0ad04829bc03ee95dfa02291e33",
+        agent_name="watermark-agent",
+        agent_bundle_location="1e86f0ad04829bc03ee95dfa02291e33/bundle",
+        agent_description=None,
+    )
+    assert created.conversation.last_message_at == 0
+
+
+def test_fork_carries_full_watermark_and_unknowns_truncate(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full forks carry a known watermark; truncated forks use NULL fallback."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_module
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 1000)
+    source = conversation_store.create_conversation()
+    conversation_store.append(
+        source.id,
+        [_watermark_message("visible", response_id="visible")],
+    )
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 2000)
+    conversation_store.append(
+        source.id,
+        [_watermark_message("hidden", response_id="hidden", is_meta=True)],
+    )
+
+    full = conversation_store.fork_conversation(source.id)
+    assert full.last_message_at == 1000
+
+    truncated = conversation_store.fork_conversation(source.id, up_to_response_id="visible")
+    assert truncated.last_message_at is None
 
 
 def test_append_records_human_author_attribution(
@@ -2572,512 +2701,6 @@ def test_append_bumps_updated_at(
     assert fetched.updated_at == 2000, (
         f"Expected updated_at to advance to 2000 after append, got {fetched.updated_at}."
     )
-
-
-def test_last_message_at_ignores_hidden_metadata_and_metadata_writes(
-    conversation_store: SqlAlchemyConversationStore,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only visible message appends advance the unread activity watermark."""
-    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
-    conv = conversation_store.create_conversation()
-    assert conv.last_message_at is None
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
-    conversation_store.append(
-        conv.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="meta",
-                data=MessageData(
-                    role="user",
-                    content=[{"type": "input_text", "text": "hidden context"}],
-                    is_meta=True,
-                ),
-            )
-        ],
-    )
-    after_meta = conversation_store.get_conversation(conv.id)
-    assert after_meta is not None
-    assert after_meta.last_message_at is None
-    assert after_meta.updated_at == 2000
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 3000)
-    conversation_store.update_conversation(conv.id, reported_model="model-a")
-    after_metadata = conversation_store.get_conversation(conv.id)
-    assert after_metadata is not None
-    assert after_metadata.last_message_at is None
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 4000)
-    conversation_store.append(
-        conv.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="visible",
-                data=MessageData(
-                    role="assistant",
-                    agent="test-agent",
-                    content=[{"type": "output_text", "text": "visible"}],
-                ),
-            )
-        ],
-    )
-    after_visible = conversation_store.get_conversation(conv.id)
-    assert after_visible is not None
-    assert after_visible.last_message_at == 4000
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 5000)
-    conversation_store.update_conversation(conv.id, archived=True)
-    after_archive = conversation_store.get_conversation(conv.id)
-    assert after_archive is not None
-    assert after_archive.last_message_at == 4000
-
-
-def test_append_updates_visible_message_after_allocator_gap(
-    conversation_store: SqlAlchemyConversationStore,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """New writers update the one-column watermark independently of history."""
-    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
-    from omnigent.db.db_models import SqlConversation
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
-    conv = conversation_store.create_conversation()
-    conversation_store.append(conv.id, [_user_message("before")])
-
-    # Simulate a mixed-version allocator update: the old writer advances the
-    # counter but has no protocol marker to advance with it.
-    with conversation_store._session("test_setup") as session:
-        row = session.get(SqlConversation, (0, conv.id))
-        assert row is not None
-        row.next_position = 2
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
-    conversation_store.append(conv.id, [_user_message("gap-visible")])
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 3000)
-    conversation_store.append(
-        conv.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="gap-hidden",
-                data=MessageData(
-                    role="user",
-                    content=[{"type": "input_text", "text": "hidden"}],
-                    is_meta=True,
-                ),
-            )
-        ],
-    )
-    updated = conversation_store.get_conversation(conv.id)
-    assert updated is not None
-    assert updated.last_message_at == 2000
-
-
-def test_reconciliation_recomputes_stale_timestamp_with_hidden_history(
-    conversation_store: SqlAlchemyConversationStore,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A stale stored timestamp is rebuilt from a bounded external cursor."""
-    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
-    from omnigent.db.db_models import SqlConversation
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
-    conv = conversation_store.create_conversation()
-    for timestamp, hidden in ((2000, False), (3000, True), (5000, False)):
-        monkeypatch.setattr(store_mod, "now_epoch", lambda timestamp=timestamp: timestamp)
-        conversation_store.append(
-            conv.id,
-            [
-                NewConversationItem(
-                    type="message",
-                    response_id=f"repair-{timestamp}",
-                    data=MessageData(
-                        role="user",
-                        content=[{"type": "input_text", "text": str(timestamp)}],
-                        is_meta=hidden,
-                    ),
-                )
-            ],
-        )
-    with conversation_store._session("test_setup") as session:
-        row = session.get(SqlConversation, (0, conv.id))
-        assert row is not None
-        row.last_message_at = 999
-
-    cursor = None
-    first = conversation_store.reconcile_last_message_watermarks(cursor=cursor, item_batch_limit=1)
-    assert first.complete is False
-    assert first.next_cursor is not None
-    assert first.next_cursor.item_position is not None
-    assert conversation_store.get_conversation(conv.id).last_message_at == 999  # type: ignore[union-attr]
-
-    result = conversation_store.reconcile_last_message_watermarks(
-        cursor=first.next_cursor, item_batch_limit=10
-    )
-    assert result.complete is False
-    repaired = conversation_store.get_conversation(conv.id)
-    assert repaired is not None
-    assert repaired.last_message_at == 5000
-
-
-def test_reconciliation_rejects_malformed_message_without_advancing_timestamp(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """Unread repair must not publish a timestamp it could not decode."""
-    from omnigent.db.db_models import SqlConversation, SqlConversationItem
-
-    conv = conversation_store.create_conversation()
-    conversation_store.append(conv.id, [_user_message("bad")])
-    with conversation_store._session("test_setup") as session:
-        row = session.get(SqlConversation, (0, conv.id))
-        item = session.query(SqlConversationItem).filter_by(conversation_id=conv.id).one()
-        assert row is not None
-        row.last_message_at = 999
-        item.data = "{not-json"
-
-    with pytest.raises(ValueError, match="invalid message payload"):
-        conversation_store.reconcile_last_message_watermarks()
-
-    unchanged = conversation_store.get_conversation(conv.id)
-    assert unchanged is not None
-    assert unchanged.last_message_at == 999
-
-
-def test_reconciliation_is_workspace_scoped(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """Repairing one tenant never locks or updates its same-id sibling."""
-    from omnigent.db.db_models import SqlConversation, workspace_scope
-
-    conversation_id = "ab" * 16
-    for workspace_id in (11, 22):
-        with workspace_scope(workspace_id):
-            conversation_store.create_conversation(conversation_id=conversation_id)
-            conversation_store.append(conversation_id, [_user_message(str(workspace_id))])
-            with conversation_store._session("test_setup") as session:
-                row = session.get(SqlConversation, (workspace_id, conversation_id))
-                assert row is not None
-                row.last_message_at = 999
-
-    with workspace_scope(11):
-        result = conversation_store.reconcile_last_message_watermarks()
-        assert result.complete is False
-        repaired = conversation_store.get_conversation(conversation_id)
-        assert repaired is not None
-        assert repaired.last_message_at != 999
-
-    with workspace_scope(22):
-        untouched = conversation_store.get_conversation(conversation_id)
-        assert untouched is not None
-        assert untouched.last_message_at == 999
-
-    with workspace_scope(11), pytest.raises(ValueError, match="workspace"):
-        conversation_store.reconcile_last_message_watermarks(
-            cursor=WatermarkReconciliationCursor(22, conversation_id, None, None)
-        )
-
-
-@pytest.mark.asyncio
-async def test_reconciliation_deleted_continuation_advances_to_next_conversation(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """A deleted in-progress row yields a boundary checkpoint, not completion."""
-    first = conversation_store.create_conversation(conversation_id="01" * 16)
-    second = conversation_store.create_conversation(conversation_id="02" * 16)
-    conversation_store.append(first.id, [_user_message("first"), _user_message("first-2")])
-    conversation_store.append(second.id, [_user_message("second")])
-    from omnigent.db.db_models import SqlConversation
-
-    with conversation_store._session("test_setup") as session:
-        for conversation_id in (first.id, second.id):
-            row = session.get(SqlConversation, (0, conversation_id))
-            assert row is not None
-            row.last_message_at = 999
-
-    first_page = conversation_store.reconcile_last_message_watermarks(item_batch_limit=1)
-    assert first_page.next_cursor is not None
-    assert first_page.next_cursor.item_position == 1
-    assert await conversation_store.delete_conversation(first.id) is True
-
-    deleted = conversation_store.reconcile_last_message_watermarks(
-        cursor=first_page.next_cursor, item_batch_limit=1
-    )
-    assert deleted.complete is False
-    assert deleted.next_cursor is not None
-    assert deleted.next_cursor.conversation_id == first.id
-    assert deleted.next_cursor.item_position is None
-
-    repaired = conversation_store.reconcile_last_message_watermarks(
-        cursor=deleted.next_cursor, item_batch_limit=1
-    )
-    assert repaired.complete is False
-    assert repaired.next_cursor is not None
-    assert repaired.next_cursor.conversation_id == second.id
-    end = conversation_store.reconcile_last_message_watermarks(
-        cursor=repaired.next_cursor, item_batch_limit=1
-    )
-    assert end.complete is True
-    repaired_second = conversation_store.get_conversation(second.id)
-    assert repaired_second is not None
-    assert repaired_second.last_message_at != 999
-
-
-def test_reconciliation_resumes_one_message_page_without_skipping_history(
-    conversation_store: SqlAlchemyConversationStore,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A partial external checkpoint resumes through hidden messages."""
-    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
-
-    decode_sizes: list[int] = []
-    original_decode = conversation_store._decode_item_data_batch
-
-    def record_decode(stored: list[str]) -> list[str]:
-        decode_sizes.append(len(stored))
-        return original_decode(stored)
-
-    monkeypatch.setattr(conversation_store, "_decode_item_data_batch", record_decode)
-    first = conversation_store.create_conversation(conversation_id="01" * 16)
-    for index, (timestamp, is_meta) in enumerate(
-        ((2000, False), (3000, False), (4000, True), (5000, False)),
-        start=1,
-    ):
-        monkeypatch.setattr(store_mod, "now_epoch", lambda timestamp=timestamp: timestamp)
-        conversation_store.append(
-            first.id,
-            [
-                NewConversationItem(
-                    type="message",
-                    response_id=f"history-{index}",
-                    data=MessageData(
-                        role="assistant",
-                        agent="test-agent",
-                        content=[{"type": "output_text", "text": str(index)}],
-                        is_meta=is_meta,
-                    ),
-                )
-            ],
-        )
-    second = conversation_store.create_conversation(conversation_id="02" * 16)
-    conversation_store.append(second.id, [_user_message("second")])
-    from omnigent.db.db_models import SqlConversation
-
-    with conversation_store._session("test_setup") as session:
-        for conversation_id in (first.id, second.id):
-            row = session.get(SqlConversation, (0, conversation_id))
-            assert row is not None
-            row.last_message_at = 999
-    first_page = conversation_store.reconcile_last_message_watermarks(item_batch_limit=1)
-    assert first_page.complete is False
-    assert first_page.next_cursor is not None
-    assert first_page.next_cursor.item_position is not None
-    assert first_page.next_cursor.max_visible_message_at == 2000
-    assert conversation_store.get_conversation(first.id).last_message_at == 999  # type: ignore[union-attr]
-
-    cursor = first_page.next_cursor
-    for _ in range(10):
-        result = conversation_store.reconcile_last_message_watermarks(
-            cursor=cursor, item_batch_limit=1
-        )
-        cursor = result.next_cursor
-        if cursor is not None and cursor.item_position is None:
-            break
-    else:
-        raise AssertionError("bounded repair did not finish the first conversation")
-
-    # The boundary cursor resumes at the next conversation instead of ending
-    # the workspace scan early.
-    while True:
-        result = conversation_store.reconcile_last_message_watermarks(
-            cursor=cursor, item_batch_limit=1
-        )
-        cursor = result.next_cursor
-        if result.complete:
-            break
-
-    repaired_first = conversation_store.get_conversation(first.id)
-    repaired_second = conversation_store.get_conversation(second.id)
-    assert repaired_first is not None and repaired_second is not None
-    assert repaired_first.last_message_at == 5000
-    assert repaired_second.last_message_at is not None
-    assert decode_sizes and max(decode_sizes) <= 1
-
-
-def test_mysql_reconciliation_initial_seek_is_a_current_read(
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """MySQL RR must see an append injected before the locking keyset seek."""
-    store = SqlAlchemyConversationStore(db_uri)
-    if store._conv_engine.dialect.name != "mysql":
-        pytest.skip("MySQL REPEATABLE READ regression")
-    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
-    from omnigent.db.db_models import SqlConversation
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
-    conversation = store.create_conversation(conversation_id="03" * 16)
-    store.append(conversation.id, [_user_message("before")])
-    with store._session("test_setup") as session:
-        row = session.get(SqlConversation, (0, conversation.id))
-        assert row is not None
-        row.last_message_at = None
-
-    appender = SqlAlchemyConversationStore(db_uri)
-    injected = False
-
-    def inject_before_current_seek(conn, cursor, statement, parameters, context, executemany):
-        del conn, cursor, parameters, context, executemany
-        nonlocal injected
-        normalized = statement.lower()
-        if not injected and "select conversations.id" in normalized and "for update" in normalized:
-            injected = True
-            monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
-            appender.append(conversation.id, [_user_message("after")])
-
-    event.listen(store._conv_engine, "before_cursor_execute", inject_before_current_seek)
-    try:
-        result = store.reconcile_last_message_watermarks(item_batch_limit=100)
-    finally:
-        event.remove(store._conv_engine, "before_cursor_execute", inject_before_current_seek)
-
-    assert injected is True
-    assert result.complete is False
-    repaired = store.get_conversation(conversation.id)
-    assert repaired is not None
-    assert repaired.last_message_at == 2000
-
-
-def test_fork_carries_visible_message_watermark(
-    conversation_store: SqlAlchemyConversationStore,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A fork's copied visible history supplies its own message watermark."""
-    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
-    source = conversation_store.create_conversation()
-    conversation_store.append(
-        source.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="visible",
-                data=MessageData(
-                    role="user",
-                    content=[{"type": "input_text", "text": "history"}],
-                ),
-            ),
-        ],
-    )
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
-    conversation_store.append(
-        source.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="meta",
-                data=MessageData(
-                    role="user",
-                    content=[{"type": "input_text", "text": "hidden"}],
-                    is_meta=True,
-                ),
-            )
-        ],
-    )
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 3000)
-    conversation_store.append(
-        source.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="visible-later",
-                data=MessageData(
-                    role="assistant",
-                    agent="test-agent",
-                    content=[{"type": "output_text", "text": "later"}],
-                ),
-            )
-        ],
-    )
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 4000)
-    conversation_store.append(
-        source.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="meta-later",
-                data=MessageData(
-                    role="user",
-                    content=[{"type": "input_text", "text": "hidden later"}],
-                    is_meta=True,
-                ),
-            )
-        ],
-    )
-
-    # A fork always recomputes history, even when the source timestamp is stale.
-    from omnigent.db.db_models import SqlConversation
-
-    with conversation_store._session("test_setup") as session:
-        row = session.get(SqlConversation, (0, source.id))
-        assert row is not None
-        row.last_message_at = 999
-
-    fork = conversation_store.fork_conversation(source.id)
-    assert fork.last_message_at == 3000
-
-    truncated = conversation_store.fork_conversation(source.id, up_to_response_id="visible-later")
-    assert truncated.last_message_at == 3000
-
-    hidden_cutoff = conversation_store.fork_conversation(source.id, up_to_response_id="meta")
-    assert hidden_cutoff.last_message_at == 1000
-
-
-def test_full_fork_recomputes_authoritative_watermark(
-    conversation_store: SqlAlchemyConversationStore,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A full fork decodes copied messages instead of trusting its source."""
-    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
-    from omnigent.db.db_models import SqlConversation
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
-    source = conversation_store.create_conversation()
-    conversation_store.append(source.id, [_user_message("source")])
-    conversation_store.append(
-        source.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="source-meta",
-                data=MessageData(
-                    role="user",
-                    content=[{"type": "input_text", "text": "context"}],
-                    is_meta=True,
-                ),
-            )
-        ],
-    )
-    with conversation_store._session("test_setup") as session:
-        row = session.get(SqlConversation, (0, source.id))
-        assert row is not None
-        row.last_message_at = 999
-    decode_calls: list[int] = []
-    original_decode = conversation_store._decode_item_data_batch
-
-    def record_decode(stored: list[str]) -> list[str]:
-        decode_calls.append(len(stored))
-        return original_decode(stored)
-
-    monkeypatch.setattr(conversation_store, "_decode_item_data_batch", record_decode)
-    fork = conversation_store.fork_conversation(source.id)
-    assert fork.last_message_at == 1000
-    assert decode_calls and max(decode_calls) >= 1
 
 
 def test_update_title_bumps_updated_at(
@@ -5050,9 +4673,9 @@ def test_fork_reuses_encoded_payloads_without_per_item_encode(
         f"fork paid {calls['batch']} batch encode calls for a source with "
         f"no compaction items; nothing needed re-encoding"
     )
-    assert calls["decode_batch"] == 1, (
-        f"fork paid {calls['decode_batch']} batch decode calls; visible-message "
-        "watermark recomputation should decode copied messages once"
+    assert calls["decode_batch"] == 0, (
+        f"fork paid {calls['decode_batch']} batch decode calls for a source "
+        f"with no compaction items; nothing needed decoding"
     )
     fork_items = conversation_store.list_items(fork.id).data
     source_items = conversation_store.list_items(source.id).data
@@ -5114,9 +4737,9 @@ def test_fork_reencodes_only_compaction_payloads_in_one_batch(
         f"fork paid {calls['batch']} batch encode calls; the remapped "
         f"compaction payloads must be re-encoded in one batch"
     )
-    assert calls["decode_batch"] == 2, (
-        f"fork paid {calls['decode_batch']} batch decode calls; copied "
-        "messages and compaction payloads each decode once"
+    assert calls["decode_batch"] == 1, (
+        f"fork paid {calls['decode_batch']} batch decode calls; only the "
+        f"compaction payloads need decoding, in one batch"
     )
     fork_items = conversation_store.list_items(fork.id).data
     fork_compaction = next(item for item in fork_items if item.type == "compaction")
@@ -6621,9 +6244,10 @@ def test_fork_retry_reuses_prepared_ids_and_encoded_payloads(
     fork = store.fork_conversation(source.id)
 
     assert retrying_ap_maker.attempts == 2
-    # Watermark preparation decodes once; copied payloads keep their encoding.
-    # A transaction retry replays SQL without repeating that preparation.
-    assert store.decode_calls == 1
+    # Copied payloads reuse the source's stored encoding verbatim (only
+    # compaction payloads re-encode, and this source has none), so a retry
+    # replays SQL alone: zero decode/encode hook calls on either attempt.
+    assert store.decode_calls == 0
     assert store.encode_calls == 0
     assert generated_ids == ["1" * 32, "2" * 32]
     assert [item.id for item in store.list_items(fork.id).data] == generated_ids
@@ -8120,7 +7744,6 @@ def test_pure_dedupe_append_leaves_conversation_metadata_alone(
     after = conversation_store.get_conversation(conv.id)
     assert after is not None
     assert after.updated_at == before.updated_at
-    assert after.last_message_at == before.last_message_at
 
 
 def test_same_stable_id_twice_in_one_batch_inserts_once(

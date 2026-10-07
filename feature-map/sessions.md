@@ -18,10 +18,6 @@ the header menu), and each place is a separate entry point.
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
-- `read-state`: new visible messages light unread indicators after a turn;
-  metadata and hidden context do not. Opening a chat marks it read, while an
-  explicit unread flag survives reload. Collapsed project markers and desktop
-  badges follow the same read state.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
 - `fork-custom-agent`: switch to a custom agent discovered from an existing
@@ -53,13 +49,6 @@ actions (archive, unarchive, delete).
 **Session header menu:** open a session and use the menu next to its title for
 pin, fork, rename, archive or unarchive, and delete. Clicking the title also
 renames. Sub-agent sessions hide owner-only actions.
-
-**Unread controls:** the row menu and right-click menu offer Mark as read or
-Mark as unread; bulk selection applies them to selected sessions. The session
-header offers Mark as unread, including on mobile. Reopen a chat through the
-sidebar, command palette, or browser Back after visiting Inbox or Settings.
-Collapsed project folders show their sessions' unread activity. In the desktop
-app, focus the chat window to read activity that arrived while it was blurred.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
@@ -105,20 +94,6 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
-- **`read-state`, reload and reopen:**
-  Enable the `unread_message_watermark` server feature when starting the isolated
-  environment; its fresh database needs no historical backfill. Owned pytest
-  servers enable it by default, while existing environments must opt in at startup.
-  `tests/e2e_ui/sessions/test_sidebar_mark_unread.py`.
-  **Live messages, metadata, hidden context, and fallback polling:**
-  `tests/e2e_ui/sessions/test_unread_live_updates.py`.
-  **Header, row, context, bulk, mobile, navigation, and collapsed folders:**
-  `tests/e2e_ui/sessions/test_unread_user_journeys.py`.
-  **Real Electron window and badge IPC:** build the desktop overlays, then run
-  `web/electron/e2e/desktop_unread.e2e.js` with `node --test` through
-  `verify-env run`. On Linux use `xvfb-run -a` around the command and the
-  desktop test prerequisites in `web/electron/e2e/README.md`. Set
-  `OMNIGENT_DESKTOP_RECORD_DIR` outside the checkout to retain its evidence.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`
@@ -208,12 +183,6 @@ plain `uv run pytest`, which starts a private server for the test.
 
 ## Gotchas
 
-- After rebuilding the web UI, restart the verification instance: the server
-  caches its HTML entry point, which can reference assets removed by the build.
-- A reload preserves an explicit unread flag. Reading by navigation requires
-  leaving the chat and reopening it; selecting the already-active route is
-  not the same journey. Desktop badge IPC counts can be verified on Linux even
-  when the virtual display has no taskbar that can paint the native badge.
 - Browser storage sharing is limited to one desktop window and app run;
   restarting the app clears it. Closing an individual tab does not.
 - Archive and unarchive exist on the row, in bulk selection, and in the header

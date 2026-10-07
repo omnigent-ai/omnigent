@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -231,22 +231,6 @@ class CreatedSession:
 
     conversation: Conversation
     agent: Agent
-
-
-class WatermarkReconciliationCursor(NamedTuple):
-    """External checkpoint for one bounded watermark-repair page."""
-
-    workspace_id: int
-    conversation_id: str | None
-    item_position: int | None
-    max_visible_message_at: int | None
-
-
-class WatermarkReconciliationResult(NamedTuple):
-    """Continuation returned by a bounded unread-watermark reconciliation."""
-
-    next_cursor: WatermarkReconciliationCursor | None
-    complete: bool
 
 
 @dataclass(frozen=True)
@@ -740,19 +724,6 @@ class ConversationStore(ABC):
             with store-assigned IDs and timestamps.
         """
         ...
-
-    def reconcile_last_message_watermarks(
-        self,
-        cursor: WatermarkReconciliationCursor | None = None,
-        item_batch_limit: int = 1000,
-    ) -> WatermarkReconciliationResult:
-        """Reconcile a bounded page of visible-message watermarks.
-
-        The checkpoint is external to the conversation row. A result whose
-        ``complete`` flag is false must be passed back unchanged until the
-        workspace scan finishes.
-        """
-        raise NotImplementedError
 
     @abstractmethod
     def list_conversations(

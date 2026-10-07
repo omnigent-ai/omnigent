@@ -3084,9 +3084,6 @@ def create_app(
             # per-session comments fingerprint so the web app refreshes
             # its comment list on external mutations.
             comment_store=comment_store,
-            # Capture the deployment feature snapshot once for both GET and
-            # WS session-list projections.
-            feature_flags=resolved_feature_flags,
             # Same allow-list the tunnel router gets: authorizes runner
             # writes to the policy-owned cost_control.* session labels.
             runner_tunnel_tokens=runner_tunnel_tokens,

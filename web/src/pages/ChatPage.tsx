@@ -195,6 +195,8 @@ import {
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
+import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
+import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -414,6 +416,19 @@ export function ChatPage() {
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
     [conversationsData],
+  );
+
+  // Clear the sidebar dot for the conversation the user is currently viewing.
+  // Legacy rows fall back to updated_at until a numeric watermark is present.
+  const selectedConversation = conversations?.find((c) => c.id === sessionConvId);
+  useMarkConversationSeen(
+    sessionConvId,
+    selectedConversation === undefined
+      ? undefined
+      : conversationReadTimestamp(
+          selectedConversation.updated_at,
+          selectedConversation.last_message_at,
+        ),
   );
 
   // Sync the store's active conversation to the URL. Single source of

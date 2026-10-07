@@ -138,6 +138,9 @@ class Session:
         resets the clock — treat it as a session-write heartbeat, not a pure
         item-append signal. ``None`` when connected to an older server that
         does not return the field.
+    :param last_message_at: Unix epoch seconds of the latest visible message.
+        ``0`` marks a known-empty session; ``None`` marks a legacy or unknown
+        row whose unread consumers fall back to ``updated_at``.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -187,6 +190,7 @@ class Session:
     status: str
     created_at: int
     updated_at: int | None = None
+    last_message_at: int | None = None
     agent_name: str | None = None
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
@@ -217,12 +221,16 @@ class Session:
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
         raw_updated_at = raw.get("updated_at")
+        raw_last_message_at = raw.get("last_message_at")
         return cls(
             id=str(raw["id"]),
             agent_id=str(raw["agent_id"]),
             status=str(raw["status"]),
             created_at=int(raw["created_at"]),
             updated_at=int(raw_updated_at) if raw_updated_at is not None else None,
+            last_message_at=(
+                int(raw_last_message_at) if raw_last_message_at is not None else None
+            ),
             agent_name=raw.get("agent_name"),
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
@@ -254,6 +262,9 @@ class SessionListItem:
     :param status: Derived session lifecycle status.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
+    :param last_message_at: Unix epoch seconds of the latest visible message.
+        ``0`` marks a known-empty session; ``None`` marks a legacy or unknown
+        row whose unread consumers fall back to ``updated_at``.
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.
@@ -286,6 +297,7 @@ class SessionListItem:
     status: str
     created_at: int
     updated_at: int
+    last_message_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     runner_id: str | None = None
@@ -313,6 +325,9 @@ class SessionListItem:
             status=str(raw["status"]),
             created_at=int(raw["created_at"]),
             updated_at=int(raw["updated_at"]),
+            last_message_at=(
+                int(raw["last_message_at"]) if raw.get("last_message_at") is not None else None
+            ),
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
             runner_id=raw.get("runner_id"),

@@ -143,8 +143,8 @@ def test_last_message_at_columns_preserve_rows_and_reenter(db_uri: str) -> None:
             (17, b"\x01" * 16): None,
         }
 
-        # Application reconciliation may populate a marker before a migration
-        # process retries; the DDL-only re-entry must leave it untouched.
+        # Application writers may populate a marker before a migration process
+        # retries; the DDL-only re-entry must leave it untouched.
         with engine.begin() as connection:
             connection.execute(
                 sa.text(

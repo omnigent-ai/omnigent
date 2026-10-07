@@ -931,6 +931,7 @@ describe("getSession", () => {
         agent_id: "agent_xyz",
         status: "running",
         created_at: 1704067200,
+        last_message_at: 1704067199,
         items: [],
       }),
     );
@@ -941,6 +942,7 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc");
     expect(session.agentId).toBe("agent_xyz");
     expect(session.createdAt).toBe(1704067200);
+    expect(session.lastMessageAt).toBe(1704067199);
   });
 
   it("url-encodes the session id", async () => {

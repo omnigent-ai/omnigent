@@ -12,11 +12,13 @@
 // replica happens to have them. Cross-device unread is best-effort by
 // design.
 //
-// Unseen means visible-message activity beyond the baseline, or an explicit
-// unread override. Sessions without a baseline start read at their current
-// content watermark, even when the server has no read-state entry.
+// A conversation is "unseen" when its visible-message watermark exceeds the
+// stored baseline. A conversation with no baseline anywhere seeds to its
+// read timestamp at load ("read as of load") — pod-independent, so the
+// automatic dot for a turn finishing after load always works, and a
+// null server seed can no longer permanently disable a row's dot.
 
-import { useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
 import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
@@ -184,7 +186,7 @@ export function seedReadState(conversations: readonly ReadStateSeed[]): void {
  * (possibly empty) list arrives we must NOT seed or flip `hydrated`, or the
  * transient empty list on a deep-link/reload would release the mark-seen
  * gate before the server's `viewer_*` read-state is known — clobbering a
- * cross-device unread (the very race the gate guards).
+ * cross-device unread (the very race the hydration guard prevents).
  */
 export function useSeedReadState(conversations: readonly ReadStateSeed[] | undefined): void {
   useEffect(() => {
@@ -236,8 +238,12 @@ export function isExplicitlyUnread(conversationId: string): boolean {
   return explicitlyUnread.has(conversationId);
 }
 
-// `atSeconds` lets callers anchor the baseline to a server timestamp instead
-// of the client's wall clock when dismissing self-initiated changes.
+// `atSeconds` lets callers anchor the baseline to a server timestamp
+// (e.g. a PATCH response's `updated_at`) instead of the client's wall
+// clock — used to dismiss self-initiated `updated_at` bumps like a
+// rename, which would otherwise flag the conversation unseen because
+// the server's new updated_at can land slightly past the client's
+// nowSeconds() under clock skew.
 export function markConversationSeen(conversationId: string, atSeconds?: number): void {
   // A conversation the user explicitly marked unread stays unread until they
   // reopen it (which clears the override first). This guards every caller —
@@ -341,11 +347,11 @@ export function useConversationReadState(
 }
 
 /**
- * A conversation is "unseen" only after the agent has finished a turn —
- * status is "idle" or "failed", not "running" — and either the conversation
- * has an explicit unread override or its content watermark exceeds the wall-clock
- * time the user last had it open. This avoids false positives from the user's
- * own message sends and in-flight processing bumps.
+ * A conversation is "unseen" only when (a) the agent has finished
+ * a turn — status is "idle" or "failed", not "running" — and
+ * (b) the conversation's visible-message watermark exceeds the wall-clock time the
+ * user last had it open. This avoids false positives from the
+ * user's own message sends and in-flight processing bumps.
  */
 export function isConversationUnseen(
   conversationId: string,
@@ -353,7 +359,6 @@ export function isConversationUnseen(
   status: string | undefined,
 ): boolean {
   if (status === "running" || status === undefined) return false;
-  if (explicitlyUnread.has(conversationId)) return true;
   const stored = lastSeenMap[conversationId];
   if (stored === undefined) return false;
   return readTimestamp > stored;
@@ -366,97 +371,58 @@ function windowHasFocus(): boolean {
 }
 
 /**
- * Marks the active conversation as seen while AppShell is mounted, on every poll
- * refresh (watermark changes keep the stored time fresh), on the
+ * Marks the active conversation as seen on mount, on every poll
+ * refresh (updatedAt change keeps the stored time fresh), on the
  * window regaining focus, and on cleanup (navigation away).
  * Wall-clock time is stored so any server-side update that happened
  * while the user was viewing is captured, even if the conversations
  * poll hadn't picked it up yet.
  *
- * AppShell stays mounted while the route moves through non-chat pages, so an
- * explicit unread is cleared when the user leaves a session and genuinely
- * reopens it. The first AppShell mount is skipped to preserve an explicit
- * unread across a hard reload.
- *
- * Focus is tracked from DOM focus/blur and user-interaction events. This is
- * more reliable in native shells than polling `document.hasFocus()`.
+ * Every mark is gated on the window having focus: a thread open in a
+ * blurred window is NOT being read, so a turn finishing there must
+ * stay unseen (the dock badge counts it) until focus returns. The
+ * focus listener covers the return path — refocusing while the
+ * thread is open marks it seen at that moment.
  */
 export function useMarkConversationSeen(
   conversationId: string | undefined,
   readTimestamp: number | undefined,
 ): void {
-  // Only a route change clears an explicit unread flag; reloads and
-  // StrictMode effect replays preserve it.
-  const previousConversationId = useRef(conversationId);
-  const conversationIdRef = useRef(conversationId);
-  const readTimestampRef = useRef(readTimestamp);
-  const focusedRef = useRef(windowHasFocus());
-  const authoritativeFocusRef = useRef(false);
-  const focusAtMark = () => {
-    if (!authoritativeFocusRef.current) focusedRef.current = windowHasFocus();
-    return focusedRef.current;
-  };
-
-  useLayoutEffect(() => {
-    conversationIdRef.current = conversationId;
-    readTimestampRef.current = readTimestamp;
-    // Before a DOM focus/blur/interact event has arrived, refresh the probe on
-    // each committed render; native shells can report it late at mount.
-    if (!authoritativeFocusRef.current) focusedRef.current = windowHasFocus();
-  }, [conversationId, readTimestamp]);
-
-  useLayoutEffect(() => {
-    const markCurrentIfFocused = () => {
-      const id = conversationIdRef.current;
-      const timestamp = readTimestampRef.current;
-      if (!focusAtMark() || !id || timestamp === undefined) return;
-      markConversationSeen(id, Math.max(nowSeconds(), timestamp));
-    };
-    const onFocus = () => {
-      const wasFocused = focusedRef.current;
-      authoritativeFocusRef.current = true;
-      focusedRef.current = true;
-      if (!wasFocused) markCurrentIfFocused();
-    };
-    const onBlur = () => {
-      authoritativeFocusRef.current = true;
-      focusedRef.current = false;
-    };
-    const onInteract = () => {
-      const wasFocused = focusedRef.current;
-      authoritativeFocusRef.current = true;
-      focusedRef.current = true;
-      if (!wasFocused) markCurrentIfFocused();
-    };
-    window.addEventListener("focus", onFocus);
-    window.addEventListener("blur", onBlur);
-    window.addEventListener("pointerdown", onInteract);
-    window.addEventListener("keydown", onInteract);
-    return () => {
-      window.removeEventListener("focus", onFocus);
-      window.removeEventListener("blur", onBlur);
-      window.removeEventListener("pointerdown", onInteract);
-      window.removeEventListener("keydown", onInteract);
-    };
-  }, []);
-
+  // Opening a thread is reading it, so clear any explicit-unread
+  // override before the mark-seen below runs (and runs first, so
+  // markConversationSeen isn't no-op'd by a stale override). Keyed on
+  // the id alone: a poll bumping `updatedAt` while the thread stays
+  // open must NOT re-clear an override the user just set on it.
+  //
+  // The very first mount is skipped: an initial page load / reload while
+  // sitting on a thread must NOT clear the hydrated explicit-unread
+  // override (otherwise the dot you set silently vanishes on refresh).
+  // ChatPage stays mounted across in-app /c/:id navigations, so this ref
+  // only resets on a real reload — genuine reopens (the id changing while
+  // mounted) still clear, matching "reopen = read".
+  const isInitialMount = useRef(true);
   useEffect(() => {
-    const wasSameRoute = previousConversationId.current === conversationId;
-    previousConversationId.current = conversationId;
-    if (!conversationId || wasSameRoute) return;
+    const wasInitial = isInitialMount.current;
+    isInitialMount.current = false;
+    if (!conversationId) return;
+    if (wasInitial) return;
     clearUnreadOverride(conversationId);
   }, [conversationId]);
 
   useEffect(() => {
     if (!conversationId || readTimestamp === undefined) return;
     const markIfFocused = () => {
-      // Anchor at or above the content watermark being viewed. Wall clock wins
-      // when it is ahead, capturing an update the poll has not picked up yet.
-      if (focusAtMark())
+      // Anchor at or above the content watermark being viewed: a server clock that
+      // leads the client must not leave a just-read turn reading as unseen
+      // (read timestamp > client wall clock). Wall clock still wins when it's
+      // ahead, capturing an update the poll hasn't picked up yet.
+      if (windowHasFocus())
         markConversationSeen(conversationId, Math.max(nowSeconds(), readTimestamp));
     };
     markIfFocused();
+    window.addEventListener("focus", markIfFocused);
     return () => {
+      window.removeEventListener("focus", markIfFocused);
       // Navigation away normally happens via user interaction (focused);
       // an unmount in a blurred window (e.g. the session deleted from
       // another client) must not silently mark the thread read.

@@ -179,11 +179,17 @@ describe("computeUnreadBadgeIds", () => {
   /** Conversation with badge-relevant fields under test. */
   function convB(
     id: string,
-    opts: { status?: Conversation["status"]; pending?: number; updatedAt?: number } = {},
+    opts: {
+      status?: Conversation["status"];
+      pending?: number;
+      updatedAt?: number;
+      lastMessageAt?: number | null;
+    } = {},
   ): Conversation {
     return {
       ...conv(id, opts.status ?? "idle"),
       updated_at: opts.updatedAt ?? 100,
+      last_message_at: opts.lastMessageAt,
       pending_elicitations_count: opts.pending ?? 0,
     };
   }
@@ -251,12 +257,12 @@ describe("computeUnreadBadgeIds", () => {
     expect([...next].sort()).toEqual(["a", "b", "c"]);
   });
 
-  it("passes each session's id, updated_at, and status to the predicate", () => {
+  it("passes each session's read timestamp and status to the predicate", () => {
     // The hook wires isConversationUnseen here; wrong arguments would make
     // the localStorage lookup miss and the badge silently read 0.
     const calls: { id: string; updatedAt: number; status: string | undefined }[] = [];
     computeUnreadBadgeIds(
-      [convB("a", { updatedAt: 42, status: "failed" })],
+      [convB("a", { updatedAt: 42, lastMessageAt: 17, status: "failed" })],
       undefined,
       true,
       (id, updatedAt, status) => {
@@ -264,7 +270,7 @@ describe("computeUnreadBadgeIds", () => {
         return false;
       },
     );
-    expect(calls).toEqual([{ id: "a", updatedAt: 42, status: "failed" }]);
+    expect(calls).toEqual([{ id: "a", updatedAt: 17, status: "failed" }]);
   });
 
   it("excludes an archived session, even one awaiting input", () => {

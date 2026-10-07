@@ -18,7 +18,6 @@ import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import {
-  markConversationRead,
   markConversationSeen,
   resetReadStateForTests,
   seedReadState,
@@ -1711,25 +1710,6 @@ describe("Sidebar idle latest-message error", () => {
       within(row).getByRole("img", { name: "Latest message is an error" }),
     ).toBeInTheDocument();
     expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
-  });
-
-  it("updates a collapsed project unread marker after a read-state write", () => {
-    projectsMock.push("Customer X");
-    const session = conv("conv_unread_project", "Claude Code", {
-      status: "idle",
-      updated_at: 200,
-      labels: { omni_project: "Customer X" },
-    });
-    seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
-    mockConversations([session]);
-    renderSidebar();
-
-    const header = screen.getByRole("button", { name: /^Customer X/ });
-    expect(within(header).getByRole("img", { name: "New messages" })).toBeInTheDocument();
-
-    act(() => markConversationRead(session.id, session.updated_at));
-
-    expect(within(header).queryByRole("img", { name: "New messages" })).toBeNull();
   });
 });
 

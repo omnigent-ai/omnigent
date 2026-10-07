@@ -24,7 +24,6 @@ class Feature(StrEnum):
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
     HARNESS_SETTINGS_UI = "harness_settings_ui"
-    UNREAD_MESSAGE_WATERMARK = "unread_message_watermark"
 
 
 @dataclass(frozen=True)
@@ -62,13 +61,6 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Harnesses settings page with per-harness MCPs, skills, and plugins",
         owner="web",
         review_by_release="0.15.0",
-    ),
-    FeatureDefinition(
-        feature=Feature.UNREAD_MESSAGE_WATERMARK,
-        description="Expose visible-message watermarks in session list projections",
-        owner="server",
-        review_by_release="0.18.0",
-        frontend_visible=False,
     ),
 )
 

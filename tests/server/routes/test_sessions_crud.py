@@ -98,6 +98,7 @@ async def test_get_session(
     assert resp.status_code == 200
     body = resp.json()
     assert body["id"] == session_id
+    assert body["last_message_at"] == 0
 
 
 async def test_get_session_not_found(client: httpx.AsyncClient) -> None:

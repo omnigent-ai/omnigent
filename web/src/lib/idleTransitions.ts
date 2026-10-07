@@ -103,7 +103,7 @@ export function detectNewElicitations(
  *   when on a non-chat route, e.g. \`"conv_a"\`.
  * :param windowFocused: Whether the app window itself has focus.
  * :param isUnseen: Predicate matching \`isConversationUnseen\`'s signature —
- *   whether a session has unseen activity, given its id, content watermark, and
+ *   whether a session has unseen activity, given its id, \`updated_at\`, and
  *   status.
  * :returns: The unread-session id set; its size is the badge number.
  */
@@ -111,7 +111,7 @@ export function computeUnreadBadgeIds(
   conversations: Conversation[],
   activeId: string | undefined,
   windowFocused: boolean,
-  isUnseen: (id: string, updatedAt: number, status: string | undefined) => boolean,
+  isUnseen: (id: string, readTimestamp: number, status: string | undefined) => boolean,
 ): Set<string> {
   const unread = new Set<string>();
   for (const conversation of conversations) {

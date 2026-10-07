@@ -23,7 +23,6 @@ from starlette.testclient import TestClient
 
 from omnigent.entities import Conversation
 from omnigent.errors import OmnigentError
-from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes import sessions as sessions_mod
 from omnigent.server.routes.sessions import create_sessions_router
 
@@ -44,12 +43,11 @@ class _AgentStore:
         return
 
 
-def _build_app(feature_flags: FeatureFlags | None = None) -> FastAPI:
+def _build_app() -> FastAPI:
     """Build a FastAPI app exposing the sessions router with no auth."""
     router = create_sessions_router(
         conversation_store=_ConversationStore(),  # type: ignore[arg-type]
         agent_store=_AgentStore(),  # type: ignore[arg-type]
-        feature_flags=feature_flags,
     )
     app = FastAPI()
 
@@ -77,12 +75,7 @@ def _make_conversation(conv_id: str = "conv_a") -> Conversation:
     )
 
 
-def _build_item(
-    user_id: str | None,
-    conv: Conversation,
-    *,
-    unread_message_watermark_enabled: bool = False,
-) -> object:
+def _build_item(user_id: str | None, conv: Conversation) -> object:
     """Call the list-item builder the way ``GET /v1/sessions`` does."""
     return sessions_mod._build_session_list_item(
         conv,
@@ -94,7 +87,6 @@ def _build_item(
         pending_count=0,
         child_session_ids=[],
         comments_fingerprint=None,
-        unread_message_watermark_enabled=unread_message_watermark_enabled,
     )
 
 
@@ -176,29 +168,6 @@ def test_list_item_defaults_when_user_never_saw_session() -> None:
     item = _build_item(None, _make_conversation("conv_untouched"))
     assert item.viewer_last_seen is None  # type: ignore[attr-defined]
     assert item.viewer_unread is False  # type: ignore[attr-defined]
-    assert item.last_message_at is None  # type: ignore[attr-defined]
-
-
-def test_list_item_watermark_gate_hides_populated_rows_by_default() -> None:
-    conv = _make_conversation("conv_populated")
-    conv.last_message_at = 123
-
-    off = _build_item(None, conv)
-    on = _build_item(None, conv, unread_message_watermark_enabled=True)
-
-    assert off.last_message_at is None  # type: ignore[attr-defined]
-    assert on.last_message_at == 123  # type: ignore[attr-defined]
-
-
-def test_list_item_watermark_gate_uses_zero_for_empty_rows() -> None:
-    flags = FeatureFlags(frozenset({Feature.UNREAD_MESSAGE_WATERMARK}))
-    item = _build_item(
-        None,
-        _make_conversation("conv_empty"),
-        unread_message_watermark_enabled=flags.enabled(Feature.UNREAD_MESSAGE_WATERMARK),
-    )
-
-    assert item.last_message_at == 0  # type: ignore[attr-defined]
 
 
 def test_read_state_is_scoped_per_user() -> None:

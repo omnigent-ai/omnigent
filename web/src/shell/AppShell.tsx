@@ -23,7 +23,7 @@ import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
-import { useMarkConversationSeen, useSeedReadState } from "@/hooks/useUnseenConversations";
+import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -87,7 +87,6 @@ import {
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
-import { conversationReadTimestamp } from "@/lib/conversationReadTimestamp";
 import {
   isNativeWrapper as isNativeWrapperLabel,
   nativeCodingAgentForSubagentWrapper,
@@ -545,14 +544,6 @@ export function AppShell() {
     if (!serverConversationId) return null;
     return allConversations?.find((c) => c.id === serverConversationId) ?? null;
   }, [serverConversationId, allConversations]);
-  // Keep read tracking at the shell level so leaving a chat for Inbox/Settings
-  // and returning to it is observed as a genuine reopen, not a fresh mount.
-  useMarkConversationSeen(
-    serverConversationId,
-    activeConv
-      ? conversationReadTimestamp(activeConv.updated_at, activeConv.last_message_at)
-      : undefined,
-  );
   // A temporary row is display-only: it can supply optimistic breadcrumb
   // text, but must not participate in permissions, actions, or server hooks.
   const provisionalConv = useMemo(() => {

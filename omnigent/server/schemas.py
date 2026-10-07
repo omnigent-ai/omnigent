@@ -2178,6 +2178,9 @@ class SessionResponse(BaseModel):
         therefore resets the clock, so an orchestrator treating this as a pure
         item-append heartbeat should account for that. Can be compared across
         snapshots independently of lifecycle status.
+    :param last_message_at: Unix epoch seconds of the latest user-visible
+        message. ``0`` marks a known-empty session; ``None`` marks a legacy or
+        unknown row whose readers fall back to ``updated_at``.
     """
 
     id: str
@@ -2188,6 +2191,7 @@ class SessionResponse(BaseModel):
     background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
     updated_at: int | None = None
+    last_message_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
@@ -2671,14 +2675,15 @@ class ReadStatePutRequest(BaseModel):
     Sets the *calling user's* read tracking for one session. Mirrors the
     two values the web client keeps per session: a "last seen" wall-clock
     baseline (seconds since epoch) and an explicit "marked unread"
-    override. The unread dot shows when ``last_message_at > last_seen`` and
-    the session is finished; ``unread`` separately pins the override so the
-    thread the user is *viewing* (or a running one) still surfaces the dot
-    where the automatic "seen" logic would otherwise suppress it.
+    override. The unread dot compares the visible-message timestamp (falling
+    back to ``updated_at`` for legacy rows) with ``last_seen`` once the session
+    is finished. ``unread`` separately pins the override so the thread the user
+    is *viewing* (or a running one) still surfaces the dot where the automatic
+    "seen" logic would otherwise suppress it.
 
     :param last_seen: Wall-clock baseline in seconds, e.g. ``1717000000``.
-        Marking seen sets this to "now"; marking unread pins it to
-        ``last_message_at - 1`` so the row reads unseen.
+        Marking seen sets this to "now"; marking unread pins it just below the
+        selected message/fallback timestamp so the row reads unseen.
     :param unread: Whether this session is explicitly flagged unread for
         the caller.
     """
@@ -2705,11 +2710,10 @@ class SessionListItem(BaseModel):
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
     :param last_message_at: Unix epoch seconds of the latest user-visible
-        message item when the ``unread_message_watermark`` rollout is enabled.
-        ``0`` means no visible message is known. ``None`` means the rollout is
-        disabled or the row's watermark is not yet authoritative; readers fall
-        back to ``updated_at``. Unlike ``updated_at``, metadata and lifecycle
-        writes do not advance it.
+        message item. ``0`` means a new conversation is known to be empty;
+        ``NULL`` means a legacy or unknown row, so readers fall back to
+        ``updated_at``. Unlike ``updated_at``, metadata and lifecycle writes do
+        not advance it.
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.
@@ -2783,9 +2787,10 @@ class SessionListItem(BaseModel):
         wall-clock baseline in seconds for this session, or ``None``
         when they have never seen it. Per-viewer (built from the
         server's in-memory per-user read-state, written by
-        ``PUT /v1/sessions/{id}/read-state``); the unread dot shows
-        when ``last_message_at > viewer_last_seen`` and the session is
-        finished. In-memory only — resets on a server restart.
+        ``PUT /v1/sessions/{id}/read-state``); the unread dot compares the
+        visible-message timestamp (or ``updated_at`` fallback) with
+        ``viewer_last_seen`` once the session is finished. In-memory only —
+        resets on a server restart.
     :param viewer_unread: Whether the *requesting user* explicitly
         marked this session unread. Per-viewer; lifts the active-row
         dot suppression on the client. ``False`` by default.

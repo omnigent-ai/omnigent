@@ -312,6 +312,8 @@ export interface Session {
    */
   backgroundTasks?: BackgroundTaskInfo[];
   createdAt: number;
+  /** Latest visible-message timestamp; null means the legacy fallback applies. */
+  lastMessageAt?: number | null;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent (the spawn tool seeds this) or a user-supplied string
