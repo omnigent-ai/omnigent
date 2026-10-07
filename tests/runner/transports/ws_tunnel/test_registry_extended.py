@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 import omnigent.runner.transports.ws_tunnel.registry as registry_mod
-from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
+from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     ResponseHeadFrame,
@@ -550,7 +550,7 @@ async def test_send_text_waits_for_a_full_queue_to_drain() -> None:
     await asyncio.wait_for(send, timeout=2.0)
 
     drained = [session.outbound_queue.get_nowait() for _ in range(session.outbound_queue.qsize())]
-    assert drained[-1] == "tail-frame"
+    assert drained[-1].data == "tail-frame"
 
 
 @pytest.mark.asyncio
@@ -644,13 +644,13 @@ async def test_send_text_cancellation_is_atomic_across_event_loop_threads() -> N
     release_put = threading.Event()
     inserted = threading.Event()
 
-    class _PausingQueue(asyncio.Queue[str | None]):
-        def put_nowait(self, item: str | None) -> None:
-            if item == "cancelled-frame":
+    class _PausingQueue(asyncio.Queue[OutboundFrame | None]):
+        def put_nowait(self, item: OutboundFrame | None) -> None:
+            if item is not None and item.data == "cancelled-frame":
                 entered_put.set()
                 release_put.wait(timeout=2.0)
             super().put_nowait(item)
-            if item == "cancelled-frame":
+            if item is not None and item.data == "cancelled-frame":
                 inserted.set()
 
     owner_loop = asyncio.new_event_loop()
@@ -682,9 +682,11 @@ async def test_send_text_cancellation_is_atomic_across_event_loop_threads() -> N
         assert await asyncio.wait_for(asyncio.to_thread(inserted.wait, 2.0), timeout=3.0)
 
         async def _drain() -> list[str | None]:
-            return [
-                session.outbound_queue.get_nowait() for _ in range(session.outbound_queue.qsize())
-            ]
+            result = []
+            while not session.outbound_queue.empty():
+                item = session.outbound_queue.get_nowait()
+                result.append(item.data if item is not None else None)
+            return result
 
         drained = await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_drain(), owner_loop))
         assert drained == ["cancelled-frame"]
