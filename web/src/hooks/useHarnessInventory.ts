@@ -32,6 +32,7 @@ export interface InventoryMcpServer {
   detail?: string;
   /** Plugin that bundles the server, e.g. ``"figma"``. */
   plugin?: string;
+  sourceId?: string;
 }
 
 export interface InventorySkill {
@@ -79,6 +80,8 @@ export interface HarnessInventory {
   context: HarnessInventoryContext;
   /** Asset kinds the host couldn't report; what did load is still in `context`. */
   unavailable: InventoryAssetKind[];
+  /** The host needs an update before it can report MCP inventory. */
+  mcpUnsupported: boolean;
   /** No MCP servers, skills, or plugins (credentials alone don't count). */
   isEmpty: boolean;
 }
@@ -90,6 +93,7 @@ interface McpServerWire {
   transport: "stdio" | "http";
   scope: "user";
   plugin?: string | null;
+  source_id?: string | null;
   url_host?: string | null;
 }
 
@@ -176,11 +180,14 @@ export function buildInventoryContext(
         .filter(Boolean)
         .join(" · ");
       context.mcps.push({
-        id: `${harness}:${server.plugin ? `plugin:${server.plugin}:` : ""}${server.name}`,
+        id:
+          server.source_id ??
+          `${harness}:${server.plugin ? `plugin:${server.plugin}:` : ""}${server.name}`,
         name: server.name,
         harness,
         detail: detail || undefined,
         plugin: server.plugin ?? undefined,
+        sourceId: server.source_id ?? undefined,
       });
     }
     for (const [name, skills] of plugins) {
@@ -325,6 +332,7 @@ export function useHarnessInventory(
         : "ready",
     context,
     unavailable,
+    mcpUnsupported: online && mcpQuery.error instanceof ApiError && mcpQuery.error.status === 501,
     isEmpty: context.mcps.length + context.skills.length + context.plugins.length === 0,
   };
 }

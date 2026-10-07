@@ -1,5 +1,7 @@
+import * as AccordionPrimitive from "radix-ui/accordion";
+import { useMcpServerTools, type McpServerTools } from "@/hooks/useMcpServerTools";
 import { useEffect, useState, type ReactNode } from "react";
-import { ArrowLeftIcon, PlugIcon, SparkleIcon } from "lucide-react";
+import { ArrowLeftIcon, ChevronRightIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -17,6 +19,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useSkillContent } from "@/hooks/useSkillContent";
 import { ApiError } from "@/lib/sessionsApi";
+import { Spinner } from "../../components/ui/spinner";
 
 type CatalogKind = "mcps" | "skills" | "plugins";
 
@@ -102,12 +105,20 @@ export function HarnessCatalog({
     plugins: mine(context.plugins),
   };
   const pluginMcps = (plugin: InventoryPlugin) =>
+    plugin.mcp_entries?.map(({ id, name }) => ({
+      id,
+      name,
+      sourceId: id,
+      harness: family,
+      plugin: plugin.name,
+    })) ??
     plugin.mcp_servers?.map((name) => ({
       id: `${plugin.id}:${name}`,
       name,
       harness: family,
       plugin: plugin.name,
-    })) ?? own.mcps.filter((server) => server.plugin === plugin.name);
+    })) ??
+    own.mcps.filter((server) => server.plugin === plugin.name);
   const loading = inventory.status === "loading";
   const failed = (kind: CatalogKind) =>
     kind === "plugins" && family !== "claude"
@@ -145,6 +156,8 @@ export function HarnessCatalog({
   const ownList = (kind: CatalogKind, count: number, list: ReactNode) => {
     const noun = KINDS.find((k) => k.id === kind)?.noun;
     if (loading) return <Notice>Loading {noun}…</Notice>;
+    if (kind === "mcps" && inventory.mcpUnsupported)
+      return <Notice>Please update host {host.name} to list MCP servers.</Notice>;
     if (failed(kind))
       return (
         <Notice>
@@ -186,20 +199,7 @@ export function HarnessCatalog({
         </TabsList>
         <TabsContent value="settings">{settings}</TabsContent>
         <TabsContent value="mcps">
-          {ownList(
-            "mcps",
-            own.mcps.length,
-            <ul className="flex flex-col gap-2">
-              {own.mcps.map((server) => (
-                <CatalogRow
-                  key={server.id}
-                  icon={<LetterAvatar name={server.name} />}
-                  name={server.name}
-                  detail={server.detail}
-                />
-              ))}
-            </ul>,
-          )}
+          {ownList("mcps", own.mcps.length, <McpList host={host} servers={own.mcps} />)}
         </TabsContent>
         <TabsContent value="skills">
           {ownList(
@@ -349,7 +349,7 @@ function PluginPage({
           <PlugIcon className="size-5 text-muted-foreground" />
         </span>
         <div className="flex min-w-0 flex-col">
-          <h1 className="truncate text-2xl font-semibold">{plugin.name}</h1>
+          <h1 className="settings-page-title truncate text-2xl font-semibold">{plugin.name}</h1>
           <span className="text-ui text-muted-foreground">{pluginDetail(plugin, mcps.length)}</span>
         </div>
       </div>
@@ -384,17 +384,17 @@ function PluginPage({
           </ul>
         </TabsContent>
         <TabsContent value="mcps">
-          <ul className="flex flex-col gap-2">
-            {mcps.length === 0 && <Notice>No MCPs found.</Notice>}
-            {mcps.map((server) => (
-              <CatalogRow
-                key={server.id}
-                icon={<LetterAvatar name={server.name} />}
-                name={server.name}
-                detail={server.detail}
-              />
-            ))}
-          </ul>
+          <McpList
+            host={host}
+            servers={mcps}
+            unavailableReason={
+              plugin.enabled === false
+                ? "This plugin is disabled. Enable it in Claude Code to inspect MCP tools."
+                : plugin.marketplace !== undefined && !plugin.mcp_entries
+                  ? `Update ${host.name} to inspect installed plugin MCP tools.`
+                  : undefined
+            }
+          />
         </TabsContent>
       </Tabs>
     </>
@@ -426,7 +426,7 @@ function SkillPage({
   return (
     <>
       <BackButton label={backLabel} onClick={onBack} />
-      <h1 className="truncate text-2xl font-semibold">{name}</h1>
+      <h1 className="settings-page-title truncate text-2xl font-semibold">{name}</h1>
       {query.isPending ? (
         <Notice>Loading skill contents…</Notice>
       ) : query.error ? (
@@ -465,3 +465,158 @@ const SKILL_MARKDOWN_COMPONENTS: Components = {
     </a>
   ),
 };
+
+function McpList({
+  host,
+  servers,
+  unavailableReason,
+}: {
+  host: Host;
+  servers: InventoryMcpServer[];
+  unavailableReason?: string;
+}) {
+  const [expanded, setExpanded] = useState<string[]>([]);
+  const [supported, setSupported] = useState(true);
+  if (servers.length === 0) return <Notice>No MCPs found.</Notice>;
+  if (!supported || unavailableReason)
+    return (
+      <>
+        {unavailableReason && <Notice>{unavailableReason}</Notice>}
+        <ul className="flex flex-col gap-2">
+          {servers.map((server) => (
+            <CatalogRow
+              key={server.id}
+              icon={<LetterAvatar name={server.name} />}
+              name={server.name}
+              detail={server.detail}
+            />
+          ))}
+        </ul>
+      </>
+    );
+  // Leading chevron and instant expansion match the harness catalog.
+  return (
+    <AccordionPrimitive.Root
+      type="multiple"
+      value={expanded}
+      onValueChange={setExpanded}
+      className="flex flex-col rounded-xl border border-border"
+    >
+      {servers.map((server) => (
+        <McpRow
+          key={server.id}
+          host={host}
+          server={server}
+          expanded={expanded.includes(server.id)}
+          onUnavailable={() => setSupported(false)}
+        />
+      ))}
+    </AccordionPrimitive.Root>
+  );
+}
+
+const CONNECTION_DETAILS: Record<McpServerTools["connection"], string> = {
+  connected: "Connected",
+  needs_auth:
+    "Authentication required. Harness sign-in credentials cannot be reused for this probe.",
+  unreachable: "Couldn't reach this MCP server.",
+  timeout: "MCP probe timed out.",
+  unsupported: "This MCP configuration cannot be probed from the host.",
+};
+
+const CONNECTION_STATUS: Record<McpServerTools["connection"], { label: string; color: string }> = {
+  connected: { label: "Connected", color: "bg-success" },
+  needs_auth: { label: "Needs auth", color: "bg-warning" },
+  unreachable: { label: "Failed to connect", color: "bg-destructive" },
+  timeout: { label: "Failed to connect", color: "bg-destructive" },
+  unsupported: { label: "Failed to connect", color: "bg-destructive" },
+};
+
+function McpRow({
+  host,
+  server,
+  expanded,
+  onUnavailable,
+}: {
+  host: Host;
+  server: InventoryMcpServer;
+  expanded: boolean;
+  onUnavailable: () => void;
+}) {
+  const query = useMcpServerTools(host.host_id, server.harness, server.name, server.plugin, {
+    enabled: expanded,
+    sourceId: server.sourceId,
+  });
+  const missingRoute = query.error instanceof ApiError && query.error.status === 404;
+  useEffect(() => {
+    if (missingRoute) onUnavailable();
+  }, [missingRoute, onUnavailable]);
+  const data = query.data;
+  const status = data && CONNECTION_STATUS[data.connection];
+  return (
+    <AccordionPrimitive.Item value={server.id} className="not-last:border-b">
+      <AccordionPrimitive.Header className="flex">
+        <AccordionPrimitive.Trigger
+          className="group flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-4 py-2.5 text-left text-ui outline-none hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50"
+          data-testid={`catalog-row-${server.name}`}
+        >
+          <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground group-aria-expanded:rotate-90" />
+          <LetterAvatar name={server.name} />
+          <span className="shrink-0 font-medium text-foreground">{server.name}</span>
+          {data?.connection === "connected" && (
+            <span className="shrink-0 text-muted-foreground">
+              · {data.tools.length}
+              {data.truncated ? "+" : ""} {data.tools.length === 1 ? "tool" : "tools"}
+            </span>
+          )}
+          {server.detail && (
+            <span className="min-w-0 truncate text-muted-foreground">{server.detail}</span>
+          )}
+          {status && (
+            <span role="status" className="ml-auto flex shrink-0 items-center gap-1.5 text-xs">
+              <span aria-hidden="true" className={cn("size-2 rounded-full", status.color)} />
+              {status.label}
+            </span>
+          )}
+        </AccordionPrimitive.Trigger>
+      </AccordionPrimitive.Header>
+      <AccordionPrimitive.Content className="pr-4 pb-2.5 pl-10">
+        {query.isPending ? (
+          <div className="flex items-center gap-2 mt-1">
+            <Spinner />
+            <Notice>Loading tools...</Notice>
+          </div>
+        ) : query.error ? (
+          <Notice>
+            {query.error instanceof ApiError && query.error.status === 501
+              ? `Update ${host.name} to list tools.`
+              : query.error instanceof ApiError && query.error.status === 503
+                ? "Host is busy probing other MCP servers. Collapse and reopen to retry."
+                : `Couldn't reach ${server.name}.`}
+          </Notice>
+        ) : data ? (
+          data.connection !== "connected" ? (
+            <Notice>{CONNECTION_DETAILS[data.connection]}</Notice>
+          ) : (
+            <>
+              {data.tools.length === 0 && <Notice>No tools reported.</Notice>}
+              {data.truncated && <Notice>Showing the first 500 tools.</Notice>}
+              <ul className="flex flex-col gap-1 text-xs text-muted-foreground my-2">
+                {data.tools.map((tool, index) => (
+                  // Capped names can collide; these display-only rows have no state.
+                  // eslint-disable-next-line react/no-array-index-key
+                  <li key={index}>
+                    <div>
+                      <span className="font-mono">{tool.name}</span>
+                    </div>
+                    {tool.description && <div className="mb-1">{tool.description}</div>}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )
+        ) : null}
+      </AccordionPrimitive.Content>
+    </AccordionPrimitive.Item>
+  );
+}

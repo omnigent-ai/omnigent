@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
+import threading
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
@@ -13,6 +16,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
@@ -21,6 +25,8 @@ from omnigent.host.frames import (
     HostImportLocalDoneFrame,
     HostImportLocalSessionChunkFrame,
     HostLaunchRunnerResultFrame,
+    HostMcpToolsFrame,
+    HostMcpToolsResultFrame,
     HostPluginsResultFrame,
     HostSkillContentFrame,
     HostSkillContentResultFrame,
@@ -28,9 +34,16 @@ from omnigent.host.frames import (
     encode_host_frame,
     encode_import_local_session_frames,
 )
+from omnigent.runner.transports.ws_tunnel.frames import (
+    PingFrame,
+    PongFrame,
+    decode_frame,
+    encode_frame,
+)
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
+from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
 from omnigent.stores.host_store import HostStore
 from tests.budgets import budget
@@ -144,6 +157,24 @@ async def _send_hello_and_wait(
         _wait_registered(registry, host_id),
         timeout=budget(2.0),
     )
+
+
+async def _receive_ping_and_pong(communicator: ApplicationCommunicator) -> PingFrame:
+    """Read one application ping and answer it on the host tunnel."""
+    while True:
+        message = await communicator.receive_output(timeout=budget(2.0))
+        if message["type"] != "websocket.send":
+            continue
+        frame = decode_frame(message["text"])
+        if not isinstance(frame, PingFrame):
+            continue
+        await communicator.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(PongFrame(ts=frame.ts)),
+            }
+        )
+        return frame
 
 
 async def _wait_registered(
@@ -267,6 +298,194 @@ async def test_host_tunnel_ping_loop_persists_heartbeat(
 
     # Clean up the live tunnel so the loop stops.
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+@pytest.mark.parametrize("failures", [1, 5])
+async def test_host_tunnel_heartbeat_failure_does_not_kill_ping_loop(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failures: int,
+) -> None:
+    """A transient heartbeat-store failure leaves the tunnel alive and recovers."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    caplog.set_level(logging.INFO)
+
+    app, registry, store = host_app
+    original_heartbeat = store.heartbeat
+    calls = 0
+
+    def flaky_heartbeat(host_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls <= failures:
+            raise RuntimeError("private-store-error-detail")
+        original_heartbeat(host_id)
+
+    monkeypatch.setattr(store, "heartbeat", flaky_heartbeat)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    try:
+        await _receive_ping_and_pong(comm)
+        await _receive_ping_and_pong(comm)
+
+        async def recovered() -> None:
+            while not any(
+                getattr(record, "event_name", None) == "host_heartbeat_recovered"
+                for record in caplog.records
+            ):
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(recovered(), timeout=budget(1.0))
+        assert registry.get(_HOST_ID) is not None
+        (failed,) = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "host_heartbeat_failed"
+        ]
+        assert failed.attributes["host_id"] == _HOST_ID
+        assert failed.attributes["error_type"] == "RuntimeError"
+        assert failed.attributes["failure_count"] == 1
+        assert failed.attributes["duration_s"] >= 0
+        (recovery,) = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "host_heartbeat_recovered"
+        ]
+        assert recovery.attributes["failure_count"] == failures
+        assert "private-store-error-detail" not in caplog.text
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
+
+
+async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow store write cannot block pings or race the offline transition."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+
+    app, registry, store = host_app
+    original_heartbeat = store.heartbeat
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls = 0
+
+    def slow_heartbeat(host_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        release.wait(timeout=budget(5.0))
+        try:
+            original_heartbeat(host_id)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(store, "heartbeat", slow_heartbeat)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    try:
+        assert await asyncio.to_thread(started.wait, budget(1.0))
+        await _receive_ping_and_pong(comm)
+        await _receive_ping_and_pong(comm)
+        assert registry.get(_HOST_ID) is not None
+        assert calls == 1
+
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
+        await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
+        await comm.wait(timeout=budget(2.0))
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, budget(2.0))
+        with contextlib.suppress(asyncio.TimeoutError):
+            await comm.wait(timeout=budget(2.0))
+
+    await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
+    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
+    assert calls == 1
+    assert not store.is_online(_HOST_ID)
+
+
+async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 3)
+    app, registry, store = host_app
+
+    def fail_heartbeat(_host_id: str) -> None:
+        raise RuntimeError("temporary store failure")
+
+    monkeypatch.setattr(store, "heartbeat", fail_heartbeat)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    try:
+        while True:
+            message = await comm.receive_output(timeout=budget(2.0))
+            if message["type"] == "websocket.close":
+                assert message["code"] == 4003
+                assert message["reason"] == "ping timeout"
+                break
+        await comm.wait(timeout=budget(2.0))
+        assert registry.get(_HOST_ID) is None
+        assert not store.is_online(_HOST_ID)
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(2.0))
+
+
+async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(db_uri: str) -> None:
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    app = FastAPI()
+    entered = asyncio.Event()
+
+    async def on_connect(_host_id: str, _owner: str | None) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    app.include_router(
+        create_host_tunnel_router(registry, store, on_host_connect=on_connect),
+        prefix="/v1",
+    )
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    await asyncio.wait_for(entered.wait(), timeout=budget(1.0))
+    helpers = [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name()
+        in {
+            f"host-sender:{_HOST_ID}",
+            f"host-ping:{_HOST_ID}",
+            f"host-receive:{_HOST_ID}",
+            f"host-heartbeat:{_HOST_ID}",
+        }
+    ]
+    assert len(helpers) == 4
+    try:
+        comm.future.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await comm.future
+        assert all(task.done() for task in helpers)
+        assert registry.get(_HOST_ID) is None
+        assert not store.is_online(_HOST_ID)
+    finally:
+        for task in helpers:
+            task.cancel()
+        await asyncio.gather(*helpers, return_exceptions=True)
 
 
 async def test_host_tunnel_accepts_and_registers(
@@ -1302,6 +1521,14 @@ async def test_startup_gates_before_dispatch(
         ({"arg_count": "4"}, 502),
         ({"arg_count": -3}, 502),
         ({"arg_count": True}, 502),
+        ({"args": "--model opus"}, 502),
+        ({"args": ["--model", 5]}, 502),
+        ({"configured_command": 5}, 502),
+        ({"configured_args": ["--model", 5]}, 502),
+        ({"environment": {"inherit": "true", "variables": {}, "unset": []}}, 502),
+        ({"environment": {"inherit": True, "variables": {"TOKEN": 5}, "unset": []}}, 502),
+        ({"environment": {"inherit": True, "variables": {}, "unset": [5]}}, 502),
+        ("old", 200),
         ({"command": 5}, 502),
         ({"resolved_path": []}, 502),
         ({"command_source": "unknown"}, 502),
@@ -1328,13 +1555,25 @@ async def test_startup_http_through_real_tunnel(startup_app, monkeypatch, reply,
         "resolved_path": None,
         "command_source": "default",
         "arg_count": 2,
+        "args": ["--model", "opus"],
+        "configured_command": "env",
+        "configured_args": ["TOKEN=visible-value", "claude", "--model", "opus"],
+        "environment": {"inherit": True, "variables": {"TOKEN": "visible-value"}, "unset": []},
     }
     if reply == "disconnect":
         await peer.send_input({"type": "websocket.disconnect", "code": 1000})
     elif reply == "replace":
         registry.register(_HOST_ID, conn.ws, conn.hello, owner="owner")
     elif reply != "timeout":
-        payload = {**expected, **reply} if isinstance(reply, dict) else reply
+        if reply == "old":
+            payload = {
+                key: value
+                for key, value in expected.items()
+                if key not in ("configured_command", "configured_args", "environment")
+            }
+            expected.update(configured_command=None, configured_args=None, environment=None)
+        else:
+            payload = {**expected, **reply} if isinstance(reply, dict) else reply
         await peer.send_input(
             {
                 "type": "websocket.receive",
@@ -1458,4 +1697,85 @@ async def test_malformed_skill_content_reply_returns_502(
     assert response.status_code == 502
     assert response.json() == {"detail": "host skill content lookup failed"}
     assert not conn.pending_skill_content
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_host_tunnel_routes_mcp_tools_result_to_future(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A mcp_tools_result resolves only its own pending request, and drops it."""
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+
+    loop = asyncio.get_event_loop()
+    mine: asyncio.Future[HostMcpToolsResultFrame] = loop.create_future()
+    other: asyncio.Future[HostMcpToolsResultFrame] = loop.create_future()
+    conn.pending_mcp_tools["req_mine"] = mine
+    conn.pending_mcp_tools["req_other"] = other
+
+    tools = [{"name": "read", "description": None}]
+    result = HostMcpToolsResultFrame(request_id="req_mine", status="ok", tools=tools)
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(result)})
+
+    resolved = await asyncio.wait_for(mine, timeout=budget(2.0))
+    assert (resolved.status, resolved.tools and resolved.tools[0]["name"]) == (
+        "ok",
+        "read",
+    )
+    assert not other.done()
+    assert list(conn.pending_mcp_tools) == ["req_other"]
+
+
+@pytest.mark.parametrize(
+    "invalid", [{"tools": "private"}, {"truncated": "no"}, {"connection": None}]
+)
+async def test_malformed_mcp_tools_reply_returns_502(
+    host_app: tuple[FastAPI, HostRegistry, HostStore], invalid: dict[str, object]
+) -> None:
+    import json
+
+    import httpx
+
+    app, registry, store = host_app
+    app.include_router(create_mcp_tools_router(registry, store), prefix="/v1")
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities.append(CAP_MCP_TOOLS)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        task = asyncio.create_task(
+            client.post(
+                f"/v1/hosts/{_HOST_ID}/mcp-servers/tools",
+                json={"harness": "claude", "server": "docs"},
+            )
+        )
+        sent = await comm.receive_output(timeout=budget(2.0))
+        request = decode_host_frame(sent["text"])
+        assert isinstance(request, HostMcpToolsFrame)
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": json.dumps(
+                    {
+                        "kind": "host.mcp_tools_result",
+                        "request_id": request.request_id,
+                        "status": "ok",
+                        "tools": [],
+                        "connection": "connected",
+                        "truncated": False,
+                        **invalid,
+                    }
+                ),
+            }
+        )
+        response = await asyncio.wait_for(task, timeout=budget(2.0))
+    assert response.status_code == 502
+    assert response.json() == {"detail": "host MCP tools lookup failed"}
+    assert not conn.pending_mcp_tools
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})

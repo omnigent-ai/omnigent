@@ -38,6 +38,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
+    HostMcpToolsFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
     HostPluginsFrame,
@@ -180,6 +182,17 @@ def test_import_local_frames_round_trip() -> None:
             status="ok",
             skills=[{"name": "toolkit:review", "description": "Review changes"}],
         ),
+        HostSkillsResultFrame(
+            request_id="req_skills",
+            status="ok",
+            skills=[
+                {
+                    "name": "asd-ste100",
+                    "description": "Write in Simplified Technical English",
+                    "display_name": "Simplified Technical English (ASD-STE100)",
+                }
+            ],
+        ),
         HostSkillsFrame(
             request_id="session",
             harness="session",
@@ -205,7 +218,14 @@ def test_skills_frames_round_trip(frame: HostSkillsFrame | HostSkillsResultFrame
 
 
 @pytest.mark.parametrize(
-    "skills", [{}, ["review"], [{"name": "review"}], [{"name": 1, "description": "x"}]]
+    "skills",
+    [
+        {},
+        ["review"],
+        [{"name": "review"}],
+        [{"name": 1, "description": "x"}],
+        [{"name": "review", "description": "x", "display_name": 1}],
+    ],
 )
 def test_skills_result_rejects_malformed_catalog(skills: object) -> None:
     with pytest.raises(ValueError):
@@ -2367,3 +2387,39 @@ def test_skill_content_allow_list_and_correlated_malformed_result():
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostSkillContentResultFrame)
     assert (frame.request_id, frame.status, frame.skill) == ("s", "failed", None)
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostMcpToolsFrame("m", "claude", "odd/server", "toolkit"),
+        HostMcpToolsFrame("m", "claude", "odd/server", "toolkit", "a" * 64),
+        HostMcpToolsResultFrame(
+            "m", "ok", tools=[{"name": "read", "description": None}], connection="connected"
+        ),
+        HostMcpToolsResultFrame("m", "failed"),
+    ],
+)
+def test_mcp_tools_round_trip(frame):
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_mcp_tools_allow_list_and_correlated_malformed_result():
+    payload = {
+        "kind": "host.mcp_tools_result",
+        "request_id": "m",
+        "status": "ok",
+        "tools": [{"name": "read", "description": None, "inputSchema": {"secret": "value"}}],
+        "connection": "connected",
+        "truncated": False,
+        "env": {"TOKEN": "secret"},
+        "error": "private",
+    }
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostMcpToolsResultFrame)
+    assert frame.tools == [{"name": "read", "description": None}]
+    assert frame.error == "private"
+    payload["tools"] = "private"
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostMcpToolsResultFrame)
+    assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])

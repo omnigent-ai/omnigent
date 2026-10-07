@@ -168,18 +168,24 @@ async def test_real_codex_launch_config_does_not_load_usage(
     usage_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise the actual launch callback against the authorized server route."""
+    """Legacy clients can still fetch launch fields from the authorized route."""
     load_usage = Mock(side_effect=AssertionError("Codex launch must not load usage"))
     monkeypatch.setattr(orchestration, "load_session_usage", load_usage)
     usage_app.conversations.update_conversation(
-        usage_app.parent_id, model_override="gpt-5", reasoning_effort="high"
+        usage_app.parent_id,
+        model_override="gpt-5",
+        reasoning_effort="high",
+        terminal_launch_args=["--config", "approval_policy=on-request"],
     )
+    usage_app.conversations.set_external_session_id(usage_app.parent_id, "thread-resumed")
     config = await _codex_native_launch_config(
         session_id=usage_app.parent_id, server_client=usage_client
     )
     assert config.workspace == usage_app.workspace
     assert config.model_override == "gpt-5"
     assert config.reasoning_effort == "high"
+    assert config.terminal_launch_args == ["--config", "approval_policy=on-request"]
+    assert config.external_session_id == "thread-resumed"
     load_usage.assert_not_called()
 
 

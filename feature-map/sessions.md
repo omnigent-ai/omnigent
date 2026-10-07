@@ -10,18 +10,24 @@ the header menu), and each place is a separate entry point.
 ## Sub-features
 
 - `pin`: pinned sessions move to their own section and back.
+- `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
+  order, which persists across reloads; dropping an unpinned row onto a pinned
+  row pins it into that slot.
 - `rename`: from the row, the header menu, or the header title; long titles are
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged.
+- `stop`: Stop session ends a host-launched parent and the sub-agents on its
+  runner without reporting their expected disconnect as a task failure.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
-- `fork-custom-agent`: switch to a custom agent discovered from an existing
-  session, as well as to a built-in agent; the fork uses the chosen agent.
+- `fork-custom-agent`: switch to one of your custom agents (installed, imported,
+  or discovered from an existing session), as well as to a built-in agent; the
+  fork uses the chosen agent.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
@@ -43,6 +49,10 @@ the header menu), and each place is a separate entry point.
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, rename, archive or unarchive, and delete.
 
+**Pinned section drag:** drag a pinned row onto another pinned row to reorder
+the Pinned section, or drop an unpinned row onto a pinned row to pin it into
+that slot.
+
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (archive, unarchive, delete).
 
@@ -52,8 +62,10 @@ renames. Sub-agent sessions hide owner-only actions.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
-dialog, keep the agent or choose another built-in or custom agent. To make a
-custom agent available, first run a session using its spec file.
+dialog, keep the agent or choose another built-in or custom agent. Your custom
+agents (installed with `omnigent agent add`, imported in the Create custom agent
+dialog, or uploaded by running a session with their spec) stay available until
+you remove them.
 
 **Archived view:** switch the sidebar to archived sessions and filter by project.
 
@@ -68,6 +80,10 @@ and send a follow-up after its parent runner is replaced.
 
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
+
+**Stop session:** open the native parent's sidebar menu and choose Stop session
+while a sub-agent is working. This ends the runner; the current-turn interrupt
+control is a separate action that leaves the session connected.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -94,6 +110,9 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
+- **`pin-reorder`:**
+  `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`.
+  Dropping an unpinned row onto a pinned row has web unit coverage only.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`
@@ -142,8 +161,30 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/fork_session/test_typed_workspace_enables_clone.py::test_typed_tilde_workspace_enables_clone`
 - **`reconnect`, spinner:**
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
+- **`reconnect`, offline-host cause (own environment):**
+  `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_native_host_preserves_failed_turn_and_retry`
+  creates Claude/Codex native-wrapper sessions on a real disposable host, stops
+  the host and its runners, and checks the API failure and browser details.
+  It covers missing and stale runner bindings, reload persistence, and retry
+  without duplicate transcript input. Repeat with `--device='iPhone 13'` for
+  the mobile entry point; keep browser evidence outside the checkout.
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
+- **`reconnect`, idle replica handoff (own environment):**
+  `tests/e2e_ui/sessions/test_idle_runner_handoff.py::test_idle_session_stays_healthy_after_unreadable_replica_handoff`
+  moves a real runner between two servers sharing storage, then makes the old
+  server's session and liveness reads unavailable through its production grace
+  period. A completed legacy transcript without saved lifecycle state must
+  remain readable without a disconnect error, including when the browser
+  returns to the old server after its reads recover.
+- **`stop`, `archive`, active sub-agents (own environment):**
+  `tests/e2e/test_parent_stop_subagents_e2e.py::test_native_parent_teardown_preserves_child_outcome`
+  drives real Claude and Codex parents, native children, a host daemon, and its
+  dedicated runner through the public Stop/Archive APIs. Only model replies are
+  scripted. It waits through the production disconnect grace and includes a
+  real runner crash that must still report a failure. Requires both native
+  CLIs and tmux; Claude's machine-managed credentials require an isolated
+  container for the local model endpoint.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`
@@ -193,8 +234,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
-- A custom agent belongs to its original session; appearing in the picker does
-  not prove the fork API accepts it. Check the bound agent after navigation.
+- A custom agent outlives its sessions: forks of your own sessions share it,
+  and forking someone else's session gives you your own copy. Appearing in the
+  picker does not prove the fork API accepts it; check the bound agent after
+  navigation.
 - A copied web transcript does not prove the native CLI received that history.
   Native variants of the agent-switch test skip without `LLM_API_KEY`; record
   those skips and use a configured test harness before claiming native coverage.

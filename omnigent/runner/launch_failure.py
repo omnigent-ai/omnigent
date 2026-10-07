@@ -20,13 +20,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.errors import ErrorCategory
+from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
 
 __all__ = [
     "FailureDiagnosis",
     "classify_native_turn_error",
     "classify_terminal_failure",
     "describe_failure_code",
+    "diagnose_client_update_required",
 ]
 
 
@@ -229,15 +230,26 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "connection lost mid-response",
     "overloaded",
 )
-_TRANSIENT_UPSTREAM_STATUSES = {"500", "502", "503", "504", "529"}
+# 499 is the gateway reporting its own cancelled upstream call, which Claude Code never retries.
+_TRANSIENT_UPSTREAM_STATUSES = {"499", "500", "502", "503", "504", "529"}
+# The gateway's CANCELLED error envelope, which can arrive without a parseable status.
+_UPSTREAM_CANCELLED_ENVELOPE = re.compile(r'"error_code"\s*:\s*"CANCELLED"', re.IGNORECASE)
+# Claude Code's refusal when its installed version predates the selected model, e.g.
+# "Claude Code 2.1.217 does not support this model; version 2.1.280 or newer is required".
+_CLIENT_UPDATE_REQUIRED = re.compile(
+    r"(?:Claude Code\s+(?P<installed>\S+)\s+)?does not support this model;"
+    r"\s+version\s+(?P<required>\S+)\s+or newer is required",
+    re.IGNORECASE,
+)
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
     """Refine a native turn's generic code when its text identifies the cause.
 
     Recognizes rate limits and transient upstream model-gateway failures so
-    the web UI can offer a one-click retry instead of a terminal error. Also
-    corrects ``codex_reauth_required`` when the message reveals that the real
+    the web UI can offer a one-click retry instead of a terminal error, and a
+    Claude Code too old for the selected model. Also corrects
+    ``codex_reauth_required`` when the message reveals that the real
     cause is a budget/usage-limit exhaustion (older runners misclassify the
     gateway's 403 as auth; the server fixes it on deploy).
 
@@ -250,17 +262,44 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return "budget_exhausted"
     if code not in {"native_turn_error", "codex_turn_error"}:
         return code
+    if _CLIENT_UPDATE_REQUIRED.search(message):
+        return "client_update_required"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
     if status in {"401", "403"}:
         return code
     if status == "429" or _RATE_LIMIT_ERROR.search(message):
         return "rate_limit_exceeded"
-    if status in _TRANSIENT_UPSTREAM_STATUSES or any(
-        fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS
+    if (
+        status in _TRANSIENT_UPSTREAM_STATUSES
+        or _UPSTREAM_CANCELLED_ENVELOPE.search(message)
+        or any(fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS)
     ):
         return "transient_upstream_error"
     return code
+
+
+def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:
+    """Explain Claude Code's refusal of a model its installed version predates.
+
+    :param message: Turn error text, e.g. ``"API Error: 400 ... Claude Code
+        2.1.217 does not support this model; version 2.1.280 or newer is required"``.
+    :returns: A diagnosis naming the installed and required versions and the
+        update command, or ``None`` when *message* is not that refusal.
+    """
+    match = _CLIENT_UPDATE_REQUIRED.search(message)
+    if match is None:
+        return None
+    installed = match.group("installed")
+    client = f"Claude Code {installed}" if installed else "Claude Code"
+    return FailureDiagnosis(
+        title="Claude Code needs an update",
+        cause=(
+            f"{client} on the host doesn't support this model; "
+            f"version {match.group('required')} or newer is required."
+        ),
+        remediation="Run `claude update` on the host, then start a new session.",
+    )
 
 
 # --- failure-code English fallbacks -------------------------------------------
@@ -302,6 +341,11 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "The AI gateway refused this turn because a spending budget or usage limit is "
         "exhausted. Contact an admin to raise it, or use a different budget."
     ),
+    "client_update_required": (
+        "The agent CLI on the host is too old for the selected model. Update it on the "
+        "host, then start a new session."
+    ),
+    "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 
 

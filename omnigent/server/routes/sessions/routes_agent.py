@@ -15,7 +15,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runner.routing import RunnerRouter
@@ -139,10 +139,7 @@ def register_agent_routes(
             )
         agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
         if agent is None:
-            raise OmnigentError(
-                f"Agent not found: {conv.agent_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            )
+            raise OmnigentError(SESSION_AGENT_MISSING_MESSAGE, code=ErrorCode.NOT_FOUND)
         mcp_servers_editable = await asyncio.to_thread(
             _can_mutate_session_agent,
             user_id,
@@ -229,10 +226,7 @@ def register_agent_routes(
             )
         agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
         if agent is None:
-            raise OmnigentError(
-                f"Agent not found: {conv.agent_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            )
+            raise OmnigentError(SESSION_AGENT_MISSING_MESSAGE, code=ErrorCode.NOT_FOUND)
         if artifact_store is None:
             raise OmnigentError(
                 "Artifact store not configured",
@@ -253,13 +247,11 @@ def register_agent_routes(
                 "X-Agent-Version": str(agent.version),
                 "X-Agent-Name": agent.name,
                 # Provenance for the runner's env-expansion decision:
-                # session-scoped agents are
-                # tenant-uploaded and must NOT have ${VAR} expanded
-                # against the runner process env; template agents
-                # (session_id is None) are operator-authored and may.
-                # The runner fails safe (treats a missing header as
-                # session-scoped → no expansion).
-                "X-Agent-Session-Scoped": "true" if agent.session_id is not None else "false",
+                # user agents are tenant input and must NOT have ${VAR}
+                # expanded against the runner process env; only server
+                # agents may. The runner fails safe (treats a
+                # missing header as session-scoped → no expansion).
+                "X-Agent-Session-Scoped": "false" if agent.operator_authored else "true",
             },
         )
 
@@ -307,10 +299,7 @@ def register_agent_routes(
             )
         agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
         if agent is None:
-            raise OmnigentError(
-                f"Agent not found: {conv.agent_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            )
+            raise OmnigentError(SESSION_AGENT_MISSING_MESSAGE, code=ErrorCode.NOT_FOUND)
 
         # Shared/template agents are read-only here;
         # mirrors the guard in session_mcp_servers._editable_agent.
@@ -369,11 +358,10 @@ def register_agent_routes(
             )
 
         if agent_cache is not None:
-            # Only operator-authored template agents
-            # (session_id is None) may expand ${VAR} against the server
-            # env; tenant session-scoped bundles must not.
+            # Only server agents may expand ${VAR} against the server env;
+            # user agents are tenant input.
             agent_cache.replace(
-                agent.id, new_loc, bundle_bytes, expand_env=agent.session_id is None
+                agent.id, new_loc, bundle_bytes, expand_env=agent.operator_authored
             )
 
         return _to_agent_object(updated, agent_cache, mcp_servers_editable=True)

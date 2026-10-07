@@ -19,6 +19,7 @@ export function conversationHooksMock() {
       isSuccess: true,
     }),
     useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+    useReorderPinnedConversations: () => ({ mutate: vi.fn() }),
     setConversationPinned: vi.fn(() => Promise.resolve({})),
     PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
     useRenameConversation: () => ({ mutate: vi.fn() }),
