@@ -19,9 +19,7 @@ const APPEARANCE = new Set([
 ]);
 
 const children = (element: Element, name: string) =>
-  Array.from(element.childNodes).filter(
-    (child): child is Element => child.nodeType === 1 && (child as Element).localName === name,
-  );
+  Array.from(element.children).filter((child) => child.localName === name);
 const metadata = (element: Element | undefined, key: string) =>
   element &&
   children(element, "metadata")
@@ -171,7 +169,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       const source = objects.get(sourceKey);
       if (!source || visiting.has(sourceKey)) throw new Error("Invalid component graph");
       visiting.add(sourceKey);
-      const effectiveSlot = assigned ? slot(assigned, inherited) : inherited;
+      const effectiveSlot = slot(assigned, inherited);
       const recolor = enabled && (!assigned || normal(assigned));
       const object = output.importNode(source, true);
       const mesh = children(object, "mesh")[0];
