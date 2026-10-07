@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, expect, it, vi } from "vitest";
 import { BridgeSetupApp } from "./server-selector-v2";
 
@@ -19,6 +20,26 @@ function stubBridge(over: Record<string, unknown>) {
     ...over,
   };
 }
+
+it("reserves a full-width 48px desktop title-bar band", async () => {
+  stubBridge({});
+  const { container } = render(<BridgeSetupApp />);
+  await screen.findByRole("button", { name: /open omnigent/i });
+  expect(container.firstElementChild).toHaveStyle({
+    position: "fixed",
+    top: "0px",
+    left: "0px",
+    right: "0px",
+    height: "48px",
+  });
+});
+
+it("marks the desktop title-bar band as a window drag region", () => {
+  stubBridge({});
+  expect(renderToStaticMarkup(<BridgeSetupApp />)).toMatch(
+    /^<div style="[^"]*-webkit-app-region:drag[;"]/,
+  );
+});
 
 it("tags a connect with a request ID, shows only its phases, and cancels it", async () => {
   let progress: (p: { requestId?: string; phase?: string }) => void = () => {};

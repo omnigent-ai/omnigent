@@ -797,7 +797,7 @@ def _build_models_json(
         provider_models[provider_name].append(entry)
     config: _PiModelsConfig = {
         "providers": {
-            # Models advertising Responses support use the AI Gateway's Codex
+            # Models advertising Responses support use the Unity Gateway's Codex
             # surface, including tool-result chaining on subsequent turns.
             "databricks-openai": {
                 "baseUrl": codex_gateway_url,
@@ -922,7 +922,7 @@ def _pi_needs_responses_api(
 
 
 def _is_databricks_gateway_base_url(base_url: str) -> bool:
-    """Return whether a family base URL fronts a Databricks AI Gateway.
+    """Return whether a family base URL fronts a Databricks Unity Gateway.
 
     The one generic-provider vs. Databricks-gateway distinction this module
     makes: a workspace-hosted ``/ai-gateway/`` path or a canonical gateway
@@ -1829,7 +1829,7 @@ class PiExecutor(Executor):
         :param pi_path: Absolute path to a ``pi`` CLI binary.  When ``None``
             the executor searches ``PATH``.
         :param gateway: When ``True``, write a ``models.json`` pointing Pi
-            at a vendor-neutral gateway. The Databricks AI gateway is one
+            at a vendor-neutral gateway. The Databricks Unity Gateway is one
             producer of this transport; generic providers are another.
         :param databricks_profile: Databricks-specific config profile from
             ``~/.databrickscfg``, e.g. ``"<your-profile>"``.  Only used on the
@@ -2119,7 +2119,7 @@ class PiExecutor(Executor):
                 raise TypeError("Databricks model resolution returned a non-string model id")
             return model_id
         # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
-        # by the direct Anthropic API but not by the Databricks AI Gateway.
+        # by the direct Anthropic API but not by the Databricks Unity Gateway.
         if model and self._gateway and not self._preserve_model_ids:
             model = re.sub(r"\[.*?\]$", "", model)
         return model

@@ -99,7 +99,7 @@ describe("ImportContextModal – harness tabs", () => {
   it("shows the credential line and read-only asset lists with details", () => {
     renderModal();
 
-    expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
+    expect(screen.getByText("Databricks Unity Gateway")).toBeTruthy();
     expect(screen.getAllByText("Detected")).toHaveLength(1);
     expect(assetTabNames()).toEqual(["MCPs 5", "Skills 10", "Plugins 3"]);
 
@@ -191,7 +191,7 @@ describe("ImportContextModal – empty states", () => {
     renderModal({ ...MOCK_IMPORT_CONTEXT, mcps: [], skills: [], plugins: [] });
 
     expect(harnessTabs()).toHaveLength(3);
-    expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
+    expect(screen.getByText("Databricks Unity Gateway")).toBeTruthy();
     expect(screen.getByText("No MCPs, skills, or plugins detected")).toBeTruthy();
     expect(assetTabNames()).toEqual([]);
   });

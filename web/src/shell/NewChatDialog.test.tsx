@@ -8839,7 +8839,7 @@ describe("NewChatLandingScreen smart routing", () => {
   });
 
   // Per-family gateway gating: the apply layer rewrites the model through the
-  // workspace AI gateway, so a family the host doesn't back there can't be
+  // workspace Unity Gateway, so a family the host doesn't back there can't be
   // routed — and each dialog gates on its OWN family only.
   it.each([
     ["Claude Code", "a1", { "claude-native": false }, false],
@@ -9390,7 +9390,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     expect(screen.getByTestId(SMART_ROUTING_ROW)).toBeTruthy();
   });
 
-  // The five-arm menu needs both families on the workspace AI gateway, so
+  // The five-arm menu needs both families on the workspace Unity Gateway, so
   // either one the host doesn't back takes the whole row away.
   it.each([
     ["codex isn't gateway-backed", { "claude-native": true, "codex-native": false }],
@@ -9508,7 +9508,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
 
     const notice = await screen.findByTestId("new-chat-landing-smart-routing-dropped");
     expect(notice.textContent).toContain(
-      "needs Codex running on the workspace AI gateway on machine-2",
+      "needs Codex running on the workspace Unity Gateway on machine-2",
     );
   });
 
@@ -9968,7 +9968,7 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
   });
 
   // The fully-auto brain routes across the same two arms as the top-level
-  // row, so it needs both on the workspace AI gateway — a codex pane running
+  // row, so it needs both on the workspace Unity Gateway — a codex pane running
   // off a personal subscription cannot run a routed pick.
   it.each([
     ["codex isn't gateway-backed", { "claude-native": true, "codex-native": false }],

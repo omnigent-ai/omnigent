@@ -337,10 +337,7 @@ export function BridgeSetupApp() {
 
   return (
     <>
-      {/* Window drag surface: with the native title bar hidden (titleBarStyle
-          "hiddenInset" / frame:false, see electron/src/main.js) this strip is
-          the only place the user can grab to move the window. Matches the
-          static setup page's 36px .drag-strip. */}
+      {/* Match the main shell and static setup page's 48px window drag band. */}
       <div
         style={
           {
@@ -348,7 +345,7 @@ export function BridgeSetupApp() {
             top: 0,
             left: 0,
             right: 0,
-            height: 36,
+            height: 48,
             WebkitAppRegion: "drag",
           } as CSSProperties
         }

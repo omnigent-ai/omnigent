@@ -335,7 +335,7 @@ describe("Harness details", () => {
 
     // The credential lives under the Settings tab.
     selectTab("Settings");
-    expect(screen.getByText("AI Gateway")).toBeTruthy();
+    expect(screen.getByText("Unity Gateway")).toBeTruthy();
     expect(screen.getByText("/opt/bin/claude")).toBeTruthy();
     for (const arg of STARTUP.args ?? []) expect(screen.getAllByText(arg)).toHaveLength(1);
     expect(screen.getByText(/Sessions and workspaces may override/)).toBeTruthy();

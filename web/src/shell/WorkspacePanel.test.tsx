@@ -641,6 +641,19 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(tabsRegion).not.toContainElement(plus);
   });
 
+  it.each([false, true])(
+    "excludes the scrolling tabs from window dragging without excluding the whole toolbar (maximized=%s)",
+    (maximized) => {
+      renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"], maximized });
+      const toolbar = screen.getByRole("toolbar", { name: "Workspace tabs" });
+      const viewport = toolbar.querySelector(".overflow-x-auto");
+      expect(viewport).not.toBeNull();
+      expect(viewport).toHaveClass("no-drag");
+      expect(viewport).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
+      expect(toolbar).not.toHaveClass("no-drag");
+    },
+  );
+
   it("offers Shell (gated on declared terminals), creating one and opening it as a tab", async () => {
     // Agent declares a shell; creating it resolves to a terminal whose tab key
     // is handed to openTerminalTab.

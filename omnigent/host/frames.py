@@ -2774,12 +2774,15 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
     for skill in raw_skills:
         if not isinstance(skill, dict):
             raise ValueError("frame field must be a list of skill summaries: 'skills'")
-        skills.append(
-            {
-                "name": _required_str(skill, "name"),
-                "description": _required_str(skill, "description"),
-            }
-        )
+        summary = {
+            "name": _required_str(skill, "name"),
+            "description": _required_str(skill, "description"),
+        }
+        # Absent from older hosts; the menu falls back to ``name``.
+        display_name = _optional_nullable_str(skill, "display_name")
+        if display_name is not None:
+            summary["display_name"] = display_name
+        skills.append(summary)
     return HostSkillsResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),

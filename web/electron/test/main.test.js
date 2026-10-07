@@ -689,6 +689,9 @@ describe("Arca auto-connect wiring", () => {
     await h.ipc.get("omnigent:set-server-url")(setupEvent, picked);
     await tick();
     assert.deepEqual(h.calls.arcaConnects, [picked]);
+    // The onboarding runner follows the window to the workspace host.
+    const take = h.ipc.get("omnigent:take-onboarding-runner");
+    assert.equal(take({ sender: h.webContents, senderFrame: { url: workspace } }), "remote");
 
     // Next launch opens the saved workspace host, and Arca still targets the pick.
     const relaunched = loadNavigationHarness({ ...options, serverUrl: workspace });

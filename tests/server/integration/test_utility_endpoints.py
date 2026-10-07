@@ -234,7 +234,7 @@ def _sources_caps(*, external: bool, local: bool, factory: bool) -> object:
             _sources_caps(external=False, local=False, factory=False),
             {"external": False, "oss": False},
         ),
-        # The workspace AI Gateway alone: no fallback for an ungatewayed harness.
+        # The workspace Unity Gateway alone: no fallback for an ungatewayed harness.
         (
             _sources_caps(external=True, local=False, factory=False),
             {"external": True, "oss": False},

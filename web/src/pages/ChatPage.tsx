@@ -70,7 +70,7 @@ import {
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
-import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
+import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
@@ -203,6 +203,8 @@ import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
   matchSlashCommandInvocation,
+  skillDisplayNames,
+  skillMenuDescription,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -897,11 +899,12 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  const { reconnect, dialogOpen, setDialogOpen, localReconnect } = useSessionReconnect({
-    sessionId: urlConvId ?? null,
-    hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
-    isOwner: isOwnerLevel(permissionLevel),
-  });
+  const { reconnect, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
+    useSessionReconnect({
+      sessionId: urlConvId ?? null,
+      hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
+      isOwner: isOwnerLevel(permissionLevel),
+    });
 
   const onSend = useCallback(
     (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
@@ -1171,6 +1174,7 @@ export function ChatPage() {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         localReconnect={localReconnect}
+        arcaReconnect={arcaReconnect}
         conversationId={urlConvId}
         serverUrl={getCliServerUrl()}
         wrapper={activeConv?.labels?.["omnigent.wrapper"]}
@@ -2088,7 +2092,7 @@ interface ComposerProps {
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
-  skills: readonly { name: string; description: string }[],
+  skills: readonly SkillSummary[],
   showEffort: boolean,
   showModel: boolean,
   showCompact = true,
@@ -2109,7 +2113,7 @@ export function buildSlashCommandMap(
     m[name] = name === "/model" && supportsModelReset ? `${description} | default` : description;
   }
   for (const skill of skills) {
-    m[`${skillPrefix}${skill.name}`] = skill.description;
+    m[`${skillPrefix}${skill.name}`] = skillMenuDescription(skill);
   }
   return m;
 }
@@ -3198,15 +3202,19 @@ function ComposerImpl(
 
   const skillCommands = useMemo(
     () =>
-      Object.fromEntries(skills.map((skill) => [`${skillPrefix}${skill.name}`, skill.description])),
+      Object.fromEntries(
+        skills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
+      ),
     [skills, skillPrefix],
   );
+  const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
 
   // Complete the token at the caret; inline suggestions only insert skills.
   const slashCompletion = useSlashCompletion({
     text: value,
     commands: slashCommands,
     skills: skillCommands,
+    labels: skillLabels,
     textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
@@ -3797,6 +3805,7 @@ function ComposerImpl(
                   onSelect={applyMenuSelection}
                   commands={slashCompletion.commands}
                   builtinNames={slashCompletion.builtinNames}
+                  labels={slashCompletion.labels}
                   skillsStatus={skillsStatus}
                   onRetrySkills={() => void refreshSkills()}
                 />

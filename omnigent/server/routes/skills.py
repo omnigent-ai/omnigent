@@ -160,7 +160,9 @@ def create_skills_router(
             # Hidden bundled skills also reserve their names against host collisions.
             reserved = {skill.name for skill in spec.skills}
             skills = [
-                SkillSummary(name=skill.name, description=skill.description)
+                SkillSummary(
+                    name=skill.name, description=skill.description, display_name=skill.display_name
+                )
                 for skill in spec.skills
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]

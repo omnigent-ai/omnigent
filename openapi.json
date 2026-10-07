@@ -8367,8 +8367,20 @@
             "title": "Description",
             "type": "string"
           },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human-facing label from the SKILL.md frontmatter `name`, e.g. `\"Triage Issues\"`. `None` when it equals `name` or the source has no label.",
+            "title": "Display Name"
+          },
           "name": {
-            "description": "Skill identifier as parsed from the SKILL.md frontmatter, e.g. `\"triage-issues\"`. Lowercase kebab-case.",
+            "description": "Invocation identifier (the skill's directory name), e.g. `\"triage-issues\"`, typed as `/triage-issues`.",
             "title": "Name",
             "type": "string"
           }
