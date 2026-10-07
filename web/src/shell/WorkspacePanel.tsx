@@ -1246,7 +1246,7 @@ function WorkspacePanelImpl({
                 it hugs the last tab when they fit and stays pinned when they
                 don't. overflow-y-hidden stops overflow-x:auto from spawning a
                 vertical scrollbar that eats horizontal space. */}
-              <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+              <div className="no-drag flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
                 <FileTabsStrip
                   openFiles={openFiles}
                   activeFilePath={selectedFilePath}
