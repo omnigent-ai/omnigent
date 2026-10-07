@@ -117,7 +117,6 @@ import {
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -262,7 +261,6 @@ import {
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
-import { ReviewImportsPanel } from "@/components/onboarding/HostImportReview";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -2718,7 +2716,6 @@ function selectValueToRetentionDays(value: string): number | null {
 }
 
 function ImportSection() {
-  const info = useServerInfo();
   return (
     <Section
       title="Import sessions"
@@ -2730,17 +2727,6 @@ function ImportSection() {
           <ImportSessionsPanel />
         </div>
       </div>
-      {!isFeatureEnabled(info, "harness_settings_ui") && (
-        <div className="mt-8 flex flex-col gap-3">
-          <h2 className="text-ui font-medium">Harness imports</h2>
-          <p className="-mt-2 text-ui text-muted-foreground">
-            See the logins, MCP servers, skills, and plugins each machine's harnesses carry over.
-          </p>
-          <div className="rounded-xl border border-border bg-card p-4">
-            <ReviewImportsPanel />
-          </div>
-        </div>
-      )}
     </Section>
   );
 }

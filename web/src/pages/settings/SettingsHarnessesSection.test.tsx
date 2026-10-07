@@ -137,7 +137,7 @@ vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
 let harnessInstall = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
-    features: { harness_install: harnessInstall, harness_settings_ui: true },
+    features: { harness_install: harnessInstall },
   }),
 }));
 
