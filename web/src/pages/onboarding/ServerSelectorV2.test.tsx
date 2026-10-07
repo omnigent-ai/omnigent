@@ -58,25 +58,51 @@ describe("ServerSelectorV2", () => {
     expect(screen.getByRole("heading", { name: "Meet Omnigent" })).toBeInTheDocument();
   });
 
-  it("a returning MDM user starts on the landing, and Join opens the preset directly", async () => {
+  it.each([true, false])(
+    "a returning MDM user opens the preset directly (CLI installed: %s)",
+    async (installed) => {
+      const onConnect = vi.fn().mockResolvedValue({});
+      const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+      const getRunnerOptions = vi.fn().mockResolvedValue({ remote: true });
+      render(
+        <ServerSelectorV2
+          setup={makeSetup({
+            installed,
+            connectedBefore: true,
+            managedServers: ["https://team.example.com/"],
+            onConnect,
+            onInstallCli,
+            getRunnerOptions,
+          })}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+      await waitFor(() =>
+        expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+      );
+      expect(getRunnerOptions).not.toHaveBeenCalled();
+      expect(onInstallCli).not.toHaveBeenCalled();
+    },
+  );
+
+  it("opens a recent remote server without installing the local CLI", async () => {
     const onConnect = vi.fn().mockResolvedValue({});
-    const getRunnerOptions = vi.fn().mockResolvedValue({ remote: true });
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     render(
       <ServerSelectorV2
         setup={makeSetup({
-          installed: true,
-          connectedBefore: true,
-          managedServers: ["https://team.example.com/"],
+          installed: false,
+          recentServers: ["https://team.example.com/"],
           onConnect,
-          getRunnerOptions,
+          onInstallCli,
         })}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
     await waitFor(() =>
       expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
     );
-    expect(getRunnerOptions).not.toHaveBeenCalled();
+    expect(onInstallCli).not.toHaveBeenCalled();
   });
 
   it("an MDM landing shows a direct connect's error, and a failed load's", async () => {
@@ -160,6 +186,25 @@ describe("ServerSelectorV2", () => {
       expect(onConnect).toHaveBeenCalledWith("http://localhost:6767/", expect.any(Function)),
     );
     expect(onStartLocal).not.toHaveBeenCalled();
+  });
+
+  it("still installs the CLI when explicitly opening a local installation", async () => {
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+    const onStartLocal = vi.fn().mockResolvedValue({ ok: true });
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: false,
+          recentServers: ["http://localhost:6767/"],
+          onInstallCli,
+          onStartLocal,
+          onCheckServer: vi.fn().mockResolvedValue({ status: "unreachable" }),
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(onStartLocal).toHaveBeenCalledOnce());
+    expect(onInstallCli).toHaveBeenCalledOnce();
   });
 
   it("re-checks on click: a local install that stopped since the list loaded is booted", async () => {
@@ -403,6 +448,7 @@ describe("ServerSelectorV2", () => {
       getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
     });
     expect(screen.getByText(/connecting your remote environment/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
     await waitFor(() =>
       expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "remote"),
     );
@@ -417,6 +463,68 @@ describe("ServerSelectorV2", () => {
     );
     expect(onInstallCli).not.toHaveBeenCalled();
   });
+
+  it("can retry Arca or Continue anyway after Arca startup fails", async () => {
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: false, error: "Arca failed" });
+    const onInstallCli = vi.fn();
+    let finishConnect: (result: { error?: string }) => void = () => {};
+    const onConnect = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<{ error?: string }>((resolve) => {
+            finishConnect = resolve;
+          }),
+      )
+      .mockResolvedValue({});
+    await installFromRunnerStep({
+      installed: false,
+      onInstallCli,
+      onConnectRunner,
+      onConnect,
+      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
+    });
+    expect(await screen.findByText("Arca failed")).toBeInTheDocument();
+    expect(onConnect).not.toHaveBeenCalled();
+    const skip = screen.getByRole("button", { name: "Continue anyway" });
+    expect(skip.nextElementSibling).toBe(screen.getByRole("button", { name: "Retry" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Arca failed")).toBeInTheDocument();
+    expect(onConnectRunner).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
+    expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Arca failed")).not.toBeInTheDocument();
+
+    act(() => finishConnect({ error: "Server unavailable" }));
+    expect(await screen.findByText("Server unavailable")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Server ready")).toBeInTheDocument();
+    expect(onConnect).toHaveBeenCalledTimes(2);
+    expect(onConnectRunner).toHaveBeenCalledTimes(2);
+    expect(onInstallCli).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
+  });
+
+  it.each(["install", "laptop", "server"])(
+    "does not offer Continue anyway after a %s failure",
+    async (failure) => {
+      await installFromRunnerStep({
+        installed: false,
+        onInstallCli: vi.fn().mockResolvedValue({ ok: failure !== "install", error: "failed" }),
+        onConnectRunner: vi.fn().mockResolvedValue({ ok: failure !== "laptop", error: "failed" }),
+        onConnect: vi.fn().mockResolvedValue({ error: "failed" }),
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: failure === "server" }),
+      });
+      expect(await screen.findByText("failed")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
+    },
+  );
 
   it("a cancelled connect in the terminal fails with Retry instead of reading ready", async () => {
     await installFromRunnerStep({
@@ -581,6 +689,17 @@ describe("ServerSelectorV2", () => {
     );
     await waitFor(() => expect(calls).toEqual(["install", "runner", "connect"]));
     expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
+  });
+
+  it("still installs for explicit laptop setup on shells without runner support", async () => {
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+    const onConnect = vi.fn().mockResolvedValue({});
+    await installFromRunnerStep({ installed: false, onInstallCli, onConnect });
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    expect(onInstallCli).toHaveBeenCalledOnce();
+    expect(onInstallCli.mock.invocationCallOrder[0]).toBeLessThan(
+      onConnect.mock.invocationCallOrder[0],
+    );
   });
 
   it("a failed runner connect shows the error, doesn't open the server, and Back returns to the runner step", async () => {

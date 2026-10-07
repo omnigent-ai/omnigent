@@ -313,9 +313,10 @@ async function disconnectHost(cliCommand, serverUrl) {
  * and skip the login that should open the browser. When not authed it runs
  * `omnigent login <url>` (browser/OIDC/Databricks), which is idempotent: a
  * live-but-expired Databricks access token refreshes silently with no browser,
- * and only a dead grant opens the sign-in browser.
+ * and only a dead grant opens the sign-in browser. Managed `isaac omni` hosts
+ * always prepare their app-specific grant: a legacy token can pass the probe.
  *
- * Returns ok when already authed, when the server is unreachable (so the connect
+ * Returns ok for an already-authed unmanaged CLI, when the server is unreachable (so the connect
  * attempt can raise its own, clearer error), or after a successful login. On
  * login failure returns `{ ok:false, authError:true, error }` so the UI can
  * offer a sign-in/retry affordance instead of a generic failure.
@@ -329,9 +330,10 @@ async function disconnectHost(cliCommand, serverUrl) {
 async function ensureServerAuth(cliCommand, serverUrl, { onLogin } = {}) {
   if (cli.isLoopbackServer(serverUrl)) return { ok: true };
   const probe = await cli.probeServerAuth(serverUrl);
-  // Already authed, or unreachable — in the unreachable case skip a doomed login
-  // and let the connect attempt surface the real (connectivity) error.
-  if (probe.authed || !probe.reachable) return { ok: true };
+  const managedOmni = cli.cliCommandParts(cliCommand).prefixArgs[0] === "omni";
+  // A legacy token can pass /v1/me but cannot supply the managed host's OAuth grant.
+  // Skip unreachable servers so the connect attempt reports the connectivity error.
+  if ((!managedOmni && probe.authed) || !probe.reachable) return { ok: true };
   onLogin?.();
   const res = await cli.loginServer(cliCommand, serverUrl);
   if (res.ok) return { ok: true };

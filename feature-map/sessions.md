@@ -22,8 +22,9 @@ the header menu), and each place is a separate entry point.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
-- `fork-custom-agent`: switch to a custom agent discovered from an existing
-  session, as well as to a built-in agent; the fork uses the chosen agent.
+- `fork-custom-agent`: switch to one of your custom agents (installed, imported,
+  or discovered from an existing session), as well as to a built-in agent; the
+  fork uses the chosen agent.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
@@ -54,8 +55,10 @@ renames. Sub-agent sessions hide owner-only actions.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
-dialog, keep the agent or choose another built-in or custom agent. To make a
-custom agent available, first run a session using its spec file.
+dialog, keep the agent or choose another built-in or custom agent. Your custom
+agents (installed with `omnigent agent add`, imported in the Create custom agent
+dialog, or uploaded by running a session with their spec) stay available until
+you remove them.
 
 **Archived view:** switch the sidebar to archived sessions and filter by project.
 
@@ -150,6 +153,13 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
+- **`reconnect`, idle replica handoff (own environment):**
+  `tests/e2e_ui/sessions/test_idle_runner_handoff.py::test_idle_session_stays_healthy_after_unreadable_replica_handoff`
+  moves a real runner between two servers sharing storage, then makes the old
+  server's session and liveness reads unavailable through its production grace
+  period. A completed legacy transcript without saved lifecycle state must
+  remain readable without a disconnect error, including when the browser
+  returns to the old server after its reads recover.
 - **`stop`, `archive`, active sub-agents (own environment):**
   `tests/e2e/test_parent_stop_subagents_e2e.py::test_native_parent_teardown_preserves_child_outcome`
   drives real Claude and Codex parents, native children, a host daemon, and its
@@ -207,8 +217,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
-- A custom agent belongs to its original session; appearing in the picker does
-  not prove the fork API accepts it. Check the bound agent after navigation.
+- A custom agent outlives its sessions: forks of your own sessions share it,
+  and forking someone else's session gives you your own copy. Appearing in the
+  picker does not prove the fork API accepts it; check the bound agent after
+  navigation.
 - A copied web transcript does not prove the native CLI received that history.
   Native variants of the agent-switch test skip without `LLM_API_KEY`; record
   those skips and use a configured test harness before claiming native coverage.

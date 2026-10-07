@@ -51,7 +51,7 @@ def _now() -> int:
 def _make_agent(
     id: str = "0ecf75a6ff1ff86bcc1902eb0951ef45",
     name: str = "test-agent",
-    kind: str = "template",
+    kind: str = "server",
 ) -> SqlAgent:
     return SqlAgent(
         id=id,
@@ -132,7 +132,7 @@ class TestSqlAgent:
             assert loaded.version == 1
             assert loaded.description is None
             assert loaded.updated_at is None
-            assert loaded.kind == encode_agent_kind("template")
+            assert loaded.kind == encode_agent_kind("server")
 
     def test_nullable_columns(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
@@ -155,22 +155,22 @@ class TestSqlAgent:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
-        agent = _make_agent(kind="session")
+        agent = _make_agent(kind="user")
         with managed() as session:
             session.add(agent)
 
         with managed() as session:
             loaded = session.get(SqlAgent, (0, "0ecf75a6ff1ff86bcc1902eb0951ef45"))
             assert loaded is not None
-            assert loaded.kind == encode_agent_kind("session")
+            assert loaded.kind == encode_agent_kind("user")
 
     def test_multiple_session_agents_allowed(self, db_uri: str) -> None:
         """Multiple session-scoped agents are permitted (no unique constraint on kind)."""
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
-        a1 = _make_agent(id="880b5afda28ad55ff74cbeb9b5fc67fb", name="agent-1", kind="session")
-        a2 = _make_agent(id="0fa804039e209a10554da55135751438", name="agent-2", kind="session")
+        a1 = _make_agent(id="880b5afda28ad55ff74cbeb9b5fc67fb", name="agent-1", kind="user")
+        a2 = _make_agent(id="0fa804039e209a10554da55135751438", name="agent-2", kind="user")
 
         with managed() as session:
             session.add(a1)
