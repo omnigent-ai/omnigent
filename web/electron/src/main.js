@@ -2371,6 +2371,24 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
+  // Native fullscreen hides the macOS traffic lights, so the SPA drops the
+  // clearance it reserves for them. Only the pinned server page is told; a
+  // foreign page (SSO) loaded in this window learns nothing about it.
+  const sendFullScreenState = () => {
+    if (win.isDestroyed() || win.webContents.isDestroyed()) return;
+    const pinned = pinnedOrigin(win);
+    if (!pinned || originOf(win.webContents.getURL()) !== pinned) return;
+    try {
+      win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
+    } catch {
+      // Window torn down between the check and the send; ignore.
+    }
+  };
+  win.on("enter-full-screen", sendFullScreenState);
+  win.on("leave-full-screen", sendFullScreenState);
+  // A foreign page (SSO) ignores the live events above; re-send once the
+  // pinned server page is restored so it reflects the current state.
+  win.webContents.on("did-navigate", sendFullScreenState);
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
   // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
@@ -3725,6 +3743,15 @@ function pickWorkspaceForBridge(parent, workspaces, { signal } = {}) {
 
 function registerIpc() {
   registerWorkspacePickerIpc();
+  // Initial state for a renderer that loads while the window is already
+  // fullscreen; the transition events alone would leave it windowed.
+  ipcMain.handle("omnigent:window-is-full-screen", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] window-is-full-screen from untrusted sender dropped");
+      return false;
+    }
+    return BrowserWindow.fromWebContents(event.sender)?.isFullScreen() ?? false;
+  });
   ipcMain.handle("omnigent:cancel-server-connection", (event, requestId) => {
     if (!isSetupPageSender(event))
       throw new Error("Connection cancellation is only available to the setup page");

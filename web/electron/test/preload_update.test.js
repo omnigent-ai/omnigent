@@ -1,46 +1,18 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const vm = require("node:vm");
 
-const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
+const { loadPreload: loadPreloadWithIpc } = require("../test-support/preload_harness");
 
 function loadPreload() {
-  const exposed = new Map();
-  const listeners = new Map();
-  const invokes = [];
   let updateStatus = { state: "idle" };
-  const ipcRenderer = {
-    invoke: async (channel, args) => {
-      invokes.push({ channel, args });
-      if (channel === "omnigent:get-update-status") return updateStatus;
-      return null;
-    },
-    send: () => {},
-    on: (channel, listener) => listeners.set(channel, listener),
-    removeListener: (channel, listener) => {
-      if (listeners.get(channel) === listener) listeners.delete(channel);
-    },
-  };
-  vm.runInNewContext(PRELOAD, {
-    console,
-    require: (specifier) => {
-      assert.equal(specifier, "electron");
-      return {
-        contextBridge: { exposeInMainWorld: (name, value) => exposed.set(name, value) },
-        ipcRenderer,
-      };
-    },
-  });
+  const h = loadPreloadWithIpc((channel) =>
+    channel === "omnigent:get-update-status" ? updateStatus : null,
+  );
   return {
-    desktop: exposed.get("omnigentDesktop"),
+    ...h,
     setStatus: (status) => {
       updateStatus = status;
     },
-    emit: (channel, payload) => listeners.get(channel)?.({}, payload),
-    hasListener: (channel) => listeners.has(channel),
-    invokes,
   };
 }
 

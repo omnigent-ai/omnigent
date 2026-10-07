@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  getDesktopFullScreen,
   getServerPicker,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
   isNativeShell,
   nativeNotify,
+  onDesktopFullScreenChanged,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
@@ -591,5 +593,61 @@ describe("getServerPicker / switchServer over the iOS bridge", () => {
     setIOS(true, true, true);
     iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
     await expect(getServerPicker()).resolves.toBeNull();
+  });
+});
+
+describe("getDesktopFullScreen / onDesktopFullScreenChanged", () => {
+  const install = (api: Record<string, unknown>) => {
+    (window as unknown as Record<string, unknown>).omnigentDesktop = { kind: "electron", ...api };
+  };
+
+  it("report windowed with a no-op subscription outside Electron", async () => {
+    expect(await getDesktopFullScreen()).toBe(false);
+    const callback = vi.fn();
+    const unsubscribe = onDesktopFullScreenChanged(callback);
+    expect(() => unsubscribe()).not.toThrow();
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it("report windowed on an older shell without the fullscreen bridge", async () => {
+    install({});
+    expect(await getDesktopFullScreen()).toBe(false);
+    expect(() => onDesktopFullScreenChanged(vi.fn())()).not.toThrow();
+  });
+
+  it("read the shell's state and only ever yield booleans", async () => {
+    const isFullScreen = vi.fn().mockResolvedValue(true);
+    install({ isFullScreen });
+    expect(await getDesktopFullScreen()).toBe(true);
+    isFullScreen.mockResolvedValue("yes");
+    expect(await getDesktopFullScreen()).toBe(false);
+  });
+
+  it("fall back to windowed when the bridge rejects or throws", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    install({
+      isFullScreen: () => Promise.reject(new Error("ipc down")),
+      onFullScreenChanged: () => {
+        throw new Error("ipc down");
+      },
+    });
+    expect(await getDesktopFullScreen()).toBe(false);
+    expect(() => onDesktopFullScreenChanged(vi.fn())()).not.toThrow();
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+
+  it("forward transitions as booleans and hand back the shell's unsubscribe", () => {
+    const unsubscribe = vi.fn();
+    const onFullScreenChanged = vi.fn().mockReturnValue(unsubscribe);
+    install({ onFullScreenChanged });
+    const callback = vi.fn();
+    const off = onDesktopFullScreenChanged(callback);
+    const listener = onFullScreenChanged.mock.calls[0][0] as (fullScreen: unknown) => void;
+    listener(true);
+    listener("junk");
+    expect(callback.mock.calls).toEqual([[true], [false]]);
+    off();
+    expect(unsubscribe).toHaveBeenCalledOnce();
   });
 });

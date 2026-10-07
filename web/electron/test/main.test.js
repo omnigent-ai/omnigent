@@ -230,6 +230,7 @@ function loadNavigationHarness({
   const appEvents = new Map();
   const webContents = {
     id: 1,
+    isDestroyed: () => false,
     send: (channel, data) => calls.progress.push({ channel, data }),
     stop() {},
     reload() {
@@ -257,11 +258,13 @@ function loadNavigationHarness({
     setWindowOpenHandler: () => {},
   };
   const winListeners = new Map();
+  let fullScreen = false;
   const win = {
     webContents,
     contentView: { addChildView: () => {}, removeChildView: () => {} },
     isDestroyed: () => false,
     isMaximized: () => false,
+    isFullScreen: () => fullScreen,
     isMinimized: () => false,
     isFocused: () => true,
     restore: () => {},
@@ -630,6 +633,9 @@ function loadNavigationHarness({
     hasListener: (eventName) => listeners.has(eventName),
     setUrl: (url) => {
       currentUrl = url;
+    },
+    setFullScreen: (value) => {
+      fullScreen = value;
     },
     win,
     cleanup: () => {
@@ -3472,6 +3478,95 @@ it("dismisses native loading feedback when the server document fails", async (t)
   const shown = h.calls.loading.find((call) => call.action === "show");
   assert.equal(shown.label, "Opening Omnigent…");
   assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+});
+
+describe("fullscreen state plumbing", () => {
+  const server = "https://host.example/ml/omnigents";
+  const foreign = "https://idp.example/login";
+  const fullScreenEvents = (h) =>
+    h.calls.progress.filter((c) => c.channel === "omnigent:full-screen-changed").map((c) => c.data);
+
+  it("forwards native fullscreen transitions to the pinned server page", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.createWindow();
+
+    h.setFullScreen(true);
+    h.emitWindow("enter-full-screen");
+    h.setFullScreen(false);
+    h.emitWindow("leave-full-screen");
+
+    assert.deepEqual(
+      fullScreenEvents(h),
+      [true, false],
+      "createWindow must forward enter/leave-full-screen as omnigent:full-screen-changed booleans",
+    );
+  });
+
+  it("tells a foreign page in the window nothing about its fullscreen state", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.createWindow();
+    h.setUrl(foreign);
+
+    h.setFullScreen(true);
+    h.emitWindow("enter-full-screen");
+    h.setFullScreen(false);
+    h.emitWindow("leave-full-screen");
+
+    assert.deepEqual(fullScreenEvents(h), []);
+  });
+
+  it("catches the pinned page up once a foreign page hands the window back", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.createWindow();
+    h.setUrl(foreign);
+    h.setFullScreen(true);
+    h.emitWindow("enter-full-screen");
+    assert.deepEqual(fullScreenEvents(h), [], "the foreign page must not be told");
+
+    h.setUrl(server);
+    h.emit("did-navigate", server, 200, "OK");
+    assert.deepEqual(fullScreenEvents(h), [true]);
+  });
+
+  it("stays silent when the webContents is torn down mid-transition", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.createWindow();
+
+    h.webContents.isDestroyed = () => true;
+    h.setFullScreen(true);
+    h.emitWindow("enter-full-screen");
+
+    assert.deepEqual(fullScreenEvents(h), [], "a destroyed webContents must not be sent to");
+  });
+
+  it("answers the initial fullscreen query only for the pinned server page", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+
+    const handler = h.ipc.get("omnigent:window-is-full-screen");
+    assert.ok(handler, "registerIpc must expose omnigent:window-is-full-screen");
+    const pinned = { sender: h.webContents, senderFrame: { url: server } };
+    h.setFullScreen(true);
+    assert.equal(await handler(pinned), true);
+    h.setFullScreen(false);
+    assert.equal(await handler(pinned), false);
+
+    h.setFullScreen(true);
+    assert.equal(
+      await handler({ sender: h.webContents, senderFrame: { url: foreign } }),
+      false,
+      "a foreign frame reads false, never the window state",
+    );
+    h.setUrl(foreign);
+    assert.equal(await handler({ sender: h.webContents, senderFrame: { url: foreign } }), false);
+    // A sender with no window (e.g. a detached view) reads false, not a throw.
+    assert.equal(await handler({ sender: {} }), false);
+  });
 });
 
 describe("OIDC system-browser sign-in wiring", () => {
