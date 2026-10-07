@@ -151,7 +151,10 @@ links use stored credentials without opening a browser automatically.
 When the workspace is briefly unreachable (a VPN reconnecting after wake, an IP
 access list refusing this network, or HTTP 5xx/429), the window keeps its page
 under a **Reconnecting to Databricks…** overlay and retries every 5s for a minute,
-then every 10s for another. Cancel, or running out of retries, returns to the
+then every 10s for another. After that, an unreachable or IP-blocked workspace
+keeps retrying every minute until it answers; HTTP 5xx/429 stops there. Attempts
+wait while the Mac is offline without counting, and waking or unlocking the Mac
+starts the 5s retries over. Cancel, or running out of retries, returns to the
 setup page with the reason.
 
 For the packaged macOS app, explicitly roll back to embedded Databricks sign-in:

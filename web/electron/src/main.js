@@ -24,6 +24,8 @@ const {
   ipcMain,
   nativeImage,
   nativeTheme,
+  net,
+  powerMonitor,
   screen,
   session,
   shell,
@@ -559,6 +561,10 @@ let awayBannerDelayMs = AWAY_BANNER_DELAY_MS;
 // Silent Databricks reconnects: every 5s for a minute, then every 10s for another.
 // `let` so wiring tests can shrink it via testApi.setReconnectDelaysMs.
 let reconnectDelaysMs = [...Array(12).fill(5_000), ...Array(6).fill(10_000)];
+// After that, network failures keep retrying every minute: a VPN can take longer
+// than two minutes to come back after wake (e.g. a GlobalProtect sign-in).
+// `let` so wiring tests can shrink it via testApi.setReconnectSlowDelayMs.
+let reconnectSlowDelayMs = 60_000;
 
 /**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
@@ -899,7 +905,7 @@ const UNREACHABLE_NET_ERRORS = new Set([
 ]);
 
 // Pending silent reconnects behind the overlay:
-// win → { serverUrl, returnUrl, attempt, timer, finalMessage }.
+// win → { serverUrl, returnUrl, attempt, timer, hint, finalMessage, network }.
 const reconnects = new WeakMap();
 
 function cancelReconnect(win) {
@@ -931,14 +937,17 @@ function stopReconnect(win) {
 
 /**
  * Arm the next silent reconnect for a transient failure and show the overlay;
- * false once the schedule runs out. `finalMessage` is what Cancel shows.
+ * false once the schedule runs out. `finalMessage` is what Cancel shows. A
+ * `network` failure (unreachable, or blocked by the IP access list) never runs
+ * out: past the fast schedule it retries every reconnectSlowDelayMs.
  */
-function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage }) {
+function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage, network = false }) {
+  restartReconnectsOnWake();
   const previous = reconnects.get(win);
   const same = previous?.serverUrl === serverUrl;
   clearTimeout(previous?.timer);
   const attempt = same ? previous.attempt : 0;
-  const delayMs = reconnectDelaysMs[attempt];
+  const delayMs = reconnectDelaysMs[attempt] ?? (network ? reconnectSlowDelayMs : undefined);
   if (delayMs === undefined) return false;
   const state = {
     serverUrl,
@@ -946,7 +955,9 @@ function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage }) {
     returnUrl: returnUrl ?? (same ? previous.returnUrl : undefined) ?? serverUrl,
     attempt: attempt + 1,
     timer: null,
+    hint,
     finalMessage,
+    network,
   };
   const origin = originOf(serverUrl);
   console.log("[omnigent] databricks auth: reconnect scheduled", {
@@ -954,9 +965,14 @@ function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage }) {
     attempt: state.attempt,
     delayMs,
   });
-  state.timer = setTimeout(() => {
+  const fire = () => {
     // Cancel, Change Server, a new connection, or closing the window cleared it.
     if (win.isDestroyed() || reconnects.get(win) !== state) return;
+    // Offline: check again soon, without using up an attempt that can't succeed.
+    if (!net.isOnline()) {
+      state.timer = setTimeout(fire, reconnectDelaysMs[0] ?? delayMs);
+      return;
+    }
     // Another load (e.g. a deep link) is already reconnecting this window.
     if (connectionAttempts.get(win)?.pending) return;
     console.log("[omnigent] databricks auth: reconnecting", { origin, attempt: state.attempt });
@@ -964,10 +980,36 @@ function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage }) {
     loadServerUrl(win, serverUrl, undefined, { loadUrl: state.returnUrl }).catch((error) => {
       if (error.name === "AbortError" && reconnects.get(win) === state) cancelReconnect(win);
     });
-  }, delayMs);
+  };
+  state.timer = setTimeout(fire, delayMs);
   reconnects.set(win, state);
   reconnectOverlay.show(win, hint);
   return true;
+}
+
+let restartsReconnectsOnWake = false;
+
+/**
+ * Waking or unlocking the Mac starts pending reconnects' fast schedule over, so
+ * a VPN that comes back after wake is picked up within seconds.
+ */
+function restartReconnectsOnWake() {
+  if (restartsReconnectsOnWake) return;
+  restartsReconnectsOnWake = true;
+  const restart = (reason) => {
+    for (const win of windows.keys()) {
+      const state = reconnects.get(win);
+      if (!state || win.isDestroyed()) continue;
+      console.log("[omnigent] databricks auth: reconnect restarted", {
+        origin: originOf(state.serverUrl),
+        reason,
+      });
+      state.attempt = 0;
+      if (!scheduleReconnect(win, state.serverUrl, state.returnUrl, state)) stopReconnect(win);
+    }
+  };
+  powerMonitor.on("resume", () => restart("resume"));
+  powerMonitor.on("unlock-screen", () => restart("unlock-screen"));
 }
 
 /** Network advice for an unreachable workspace, or one whose IP access list blocked us. */
@@ -1027,6 +1069,7 @@ function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedRe
     scheduleReconnect(win, serverUrl, returnUrl, {
       hint: unreachable ? reconnectingHint(serverUrl, blocked) : UNAVAILABLE_HINT,
       finalMessage: message,
+      network: unreachable,
     });
   if (!retrying) showConnectFailure(win, serverUrl, message);
 }
@@ -2263,7 +2306,8 @@ function registerNavigationFallbacks(win) {
         pinWindow(win, null);
         // DNS/VPN may still be reconnecting right after wake: retry behind the overlay.
         const hint = reconnectingHint(validatedURL);
-        if (scheduleReconnect(win, serverUrl, validatedURL, { hint, finalMessage: error })) return;
+        const options = { hint, finalMessage: error, network: true };
+        if (scheduleReconnect(win, serverUrl, validatedURL, options)) return;
       }
       showConnectFailure(win, url, error);
     },
