@@ -2,6 +2,7 @@
 
 Failed turns surface their reason; authentication errors include a re-auth hint.
 Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
+A hook run that halts the prompt fails the turn with the hook's own reason.
 """
 
 from __future__ import annotations
@@ -15,6 +16,14 @@ from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     read_bridge_state,
     write_bridge_state,
+)
+from omnigent.runner.turn_routing import (
+    MARKER_FILE,
+    ROUTED_PROMPT_BLOCK_PREFIX,
+    clear_pending_replay,
+    routed_prompt_block_reason,
+    write_pending_replay,
+    write_turn_routing_marker,
 )
 from tests.harnesses.codex_native.forwarder._support import (
     _RecordingClient,
@@ -614,3 +623,435 @@ async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
     assert data["status"] == "idle"
     assert "output" not in data
     assert "reauth_required" not in data
+
+
+def _hook_run_params(
+    *,
+    status: str,
+    entries: list[dict[str, str]] | None = None,
+    event_name: str = "userPromptSubmit",
+    source_path: str | None = "/home/user/.codex/hooks.json",
+) -> dict[str, object]:
+    """
+    Build Codex ``hook/started`` / ``hook/completed`` params for ``turn_123``.
+
+    :param status: Run status, e.g. ``"blocked"``.
+    :param entries: Hook output entries, e.g. ``[{"kind": "feedback", "text": "no"}]``.
+    :param event_name: Hook event, e.g. ``"userPromptSubmit"``.
+    :param source_path: Hook file the run came from; ``None`` omits the field.
+    :returns: Notification params shaped like the app-server's ``HookRunSummary``.
+    """
+    run: dict[str, object] = {
+        "id": "hook_run_1",
+        "eventName": event_name,
+        "status": status,
+        "statusMessage": None,
+        "entries": entries or [],
+        "handlerType": "command",
+        "executionMode": "sync",
+        "scope": "turn",
+        "source": "user",
+        "displayOrder": 0,
+        "startedAt": 1,
+        "completedAt": 2,
+        "durationMs": 1,
+    }
+    if source_path is not None:
+        run["sourcePath"] = source_path
+    return {"threadId": "thread_123", "turnId": "turn_123", "run": run}
+
+
+_MISSING_SCRIPT_FEEDBACK = (
+    "python3: can't open file '/tmp/plugin/activate.py': [Errno 2] No such file or directory"
+)
+_ROUTING_HANDOFF_NOTICE = routed_prompt_block_reason("gpt-5.6")
+
+
+def _hook_run_error(
+    params: dict[str, object], bridge_dir: Path, session_id: str = "conv_x"
+) -> fwd._CodexTerminalError | None:
+    """Classify the hook run in *params* the way the forwarder does for *session_id*."""
+    return fwd._terminal_error_from_hook_run(
+        fwd._hook_run_from_params(params), bridge_dir=bridge_dir, session_id=session_id
+    )
+
+
+def _owe_replay(bridge_dir: Path, session_id: str = "conv_x") -> None:
+    """Record the replay the runner owes *session_id*, as it does before the hook blocks."""
+    assert write_pending_replay(
+        bridge_dir,
+        session_id=session_id,
+        prompt="hello",
+        blocked_turn_id="turn_123",
+        model="gpt-5.6",
+    )
+
+
+def test_terminal_error_from_hook_run_blocked_prompt_carries_hook_output(tmp_path: Path) -> None:
+    """A blocked ``userPromptSubmit`` run yields the TUI's label, the hook text, and the file."""
+    error = _hook_run_error(
+        _hook_run_params(
+            status="blocked", entries=[{"kind": "feedback", "text": _MISSING_SCRIPT_FEEDBACK}]
+        ),
+        tmp_path,
+    )
+
+    assert error is not None
+    assert error.message == (
+        f"Blocked by hook: {_MISSING_SCRIPT_FEEDBACK}\nHook: /home/user/.codex/hooks.json"
+    )
+    assert error.kind == fwd._CODEX_ERROR_KIND_GENERIC
+
+
+def test_terminal_error_from_hook_run_stopped_prompt_uses_stop_reason(tmp_path: Path) -> None:
+    """A ``continue: false`` run reads as stopped, with its stop reason."""
+    error = _hook_run_error(
+        _hook_run_params(
+            status="stopped",
+            entries=[{"kind": "stop", "text": "stopped by hook"}],
+            source_path=None,
+        ),
+        tmp_path,
+    )
+
+    assert error is not None
+    assert error.message == "Stopped by hook: stopped by hook"
+
+
+def test_terminal_error_from_hook_run_without_user_output_names_outcome(tmp_path: Path) -> None:
+    """Model-addressed ``context`` entries are not user-facing; the label stands alone."""
+    error = _hook_run_error(
+        _hook_run_params(
+            status="blocked",
+            entries=[{"kind": "context", "text": "for the model"}],
+            source_path=None,
+        ),
+        tmp_path,
+    )
+
+    assert error is not None
+    assert error.message == "Blocked by hook"
+
+
+def test_terminal_error_from_hook_run_mixed_entries_keep_user_facing_order(
+    tmp_path: Path,
+) -> None:
+    """``context`` stays hidden while the user-facing entries keep their order."""
+    error = _hook_run_error(
+        _hook_run_params(
+            status="blocked",
+            entries=[
+                {"kind": "context", "text": "for the model"},
+                {"kind": "warning", "text": "plugin cache is stale"},
+                {"kind": "error", "text": _MISSING_SCRIPT_FEEDBACK},
+                {"kind": "feedback", "text": "run the plugin sync and retry"},
+            ],
+            source_path=None,
+        ),
+        tmp_path,
+    )
+
+    assert error is not None
+    assert error.message == (
+        "Blocked by hook: plugin cache is stale\n"
+        f"{_MISSING_SCRIPT_FEEDBACK}\n"
+        "run the plugin sync and retry"
+    )
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        pytest.param(
+            _hook_run_params(
+                status="failed", entries=[{"kind": "error", "text": "hook exited with code 1"}]
+            ),
+            id="failed-run-lets-the-turn-continue",
+        ),
+        pytest.param(_hook_run_params(status="completed"), id="completed"),
+        pytest.param(_hook_run_params(status="running"), id="running"),
+        pytest.param(
+            _hook_run_params(
+                status="blocked",
+                event_name="preToolUse",
+                entries=[{"kind": "feedback", "text": "no rm -rf"}],
+            ),
+            id="pre-tool-use-block-denies-a-call-not-the-turn",
+        ),
+        pytest.param(
+            {"threadId": "thread_123", "turnId": "turn_123", "run": "garbage"}, id="malformed"
+        ),
+    ],
+)
+def test_terminal_error_from_hook_run_ignores_runs_that_leave_the_turn_running(
+    params: dict[str, object], tmp_path: Path
+) -> None:
+    """Only a halted ``userPromptSubmit`` run is a turn failure."""
+    assert _hook_run_error(params, tmp_path) is None
+
+
+def test_terminal_error_from_hook_run_exempts_routing_handoff_only_while_replay_owed(
+    tmp_path: Path,
+) -> None:
+    """Smart Routing's block is a handoff only while its reason and the owed replay agree.
+
+    The runner records the replay before the route-turn hook blocks and clears
+    it once delivered, so the reason text alone (another hook could print it)
+    never hides a block, nor does a record left by another session or one
+    already delivered. The session's routing marker outlives the replay and
+    therefore does not count either.
+    """
+    routed = _hook_run_params(
+        status="blocked", entries=[{"kind": "feedback", "text": _ROUTING_HANDOFF_NOTICE}]
+    )
+
+    error = _hook_run_error(routed, tmp_path)
+    assert error is not None
+    assert error.message.startswith(f"Blocked by hook: {_ROUTING_HANDOFF_NOTICE}")
+
+    _owe_replay(tmp_path, session_id="conv_other")
+    assert _hook_run_error(routed, tmp_path) is not None
+    _owe_replay(tmp_path)
+    assert _hook_run_error(routed, tmp_path) is None
+    clear_pending_replay(tmp_path)
+    assert _hook_run_error(routed, tmp_path) is not None
+
+    assert write_turn_routing_marker(tmp_path, session_id="conv_x", decision_id="decision_1")
+    assert _hook_run_error(routed, tmp_path) is not None
+    (tmp_path / MARKER_FILE).unlink()
+
+    _owe_replay(tmp_path)
+    for entries in (
+        [{"kind": "feedback", "text": f"{ROUTED_PROMPT_BLOCK_PREFIX}gpt-5.6"}],
+        [
+            {"kind": "feedback", "text": _ROUTING_HANDOFF_NOTICE},
+            {"kind": "error", "text": "rejected by the team policy hook"},
+        ],
+    ):
+        assert _hook_run_error(_hook_run_params(status="blocked", entries=entries), tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_handle_event_hook_blocked_prompt_fails_turn_and_owns_terminal_boundary(
+    tmp_path: Path,
+) -> None:
+    """A hook-blocked prompt surfaces as the turn's failure instead of a silent idle.
+
+    Codex follows the ``blocked`` run with a zero-item ``turn/completed``; that
+    boundary must not flip the session back to ``idle`` and hide the reason.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    client = _RecordingClient()
+    usage_coalescer = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    elicitation_tracker = fwd._CodexElicitationTaskTracker()
+    forwarder_state = fwd._CodexForwarderState()
+
+    for event in (
+        {"method": "hook/started", "params": _hook_run_params(status="running")},
+        {
+            "method": "hook/completed",
+            "params": _hook_run_params(
+                status="blocked", entries=[{"kind": "feedback", "text": _MISSING_SCRIPT_FEEDBACK}]
+            ),
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turn": {"id": "turn_123", "status": "completed", "items": [], "error": None},
+            },
+        },
+    ):
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=event,
+            usage_coalescer=usage_coalescer,
+            elicitation_tracker=elicitation_tracker,
+            expected_thread_id="thread_123",
+            forwarder_state=forwarder_state,
+        )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_session_status",
+                "data": {
+                    "status": "failed",
+                    "response_id": "codex_turn_123",
+                    "output": (
+                        f"Blocked by hook: {_MISSING_SCRIPT_FEEDBACK}\n"
+                        "Hook: /home/user/.codex/hooks.json"
+                    ),
+                },
+            },
+        )
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_handle_event_failed_hook_run_leaves_turn_lifecycle_alone(tmp_path: Path) -> None:
+    """A non-blocking hook failure posts nothing; the turn still ends idle on its own."""
+    _seed_active_turn(tmp_path, "turn_123")
+    client = _RecordingClient()
+    usage_coalescer = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    elicitation_tracker = fwd._CodexElicitationTaskTracker()
+    forwarder_state = fwd._CodexForwarderState()
+
+    for event in (
+        {
+            "method": "hook/completed",
+            "params": _hook_run_params(
+                status="failed", entries=[{"kind": "error", "text": "hook exited with code 1"}]
+            ),
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turn": {
+                    "id": "turn_123",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "id": "a", "text": "done"}],
+                },
+            },
+        },
+    ):
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=event,
+            usage_coalescer=usage_coalescer,
+            elicitation_tracker=elicitation_tracker,
+            expected_thread_id="thread_123",
+            forwarder_state=forwarder_state,
+        )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_session_status",
+                "data": {"status": "idle", "response_id": "codex_turn_123"},
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_event_routing_shaped_block_after_replay_posts_failed_edge(
+    tmp_path: Path,
+) -> None:
+    """Once the replay has landed, a block using the routing words is a real rejection.
+
+    The session marker the route-turn hook left behind must not exempt it: the
+    forwarder posts the failed edge and owns the terminal boundary as for any
+    other hook rejection.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    assert write_turn_routing_marker(tmp_path, session_id="conv_x", decision_id="decision_1")
+    client = _RecordingClient()
+    usage_coalescer = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    elicitation_tracker = fwd._CodexElicitationTaskTracker()
+    forwarder_state = fwd._CodexForwarderState()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "hook/completed",
+            "params": _hook_run_params(
+                status="blocked", entries=[{"kind": "feedback", "text": _ROUTING_HANDOFF_NOTICE}]
+            ),
+        },
+        usage_coalescer=usage_coalescer,
+        elicitation_tracker=elicitation_tracker,
+        expected_thread_id="thread_123",
+        forwarder_state=forwarder_state,
+    )
+
+    assert len(client.posts) == 1
+    path, body = client.posts[0]
+    assert path == "/v1/sessions/conv_x/events"
+    assert body["data"]["status"] == "failed"
+    assert body["data"]["output"].startswith(f"Blocked by hook: {_ROUTING_HANDOFF_NOTICE}")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_handle_event_smart_routing_block_does_not_fail_replayed_turn(
+    tmp_path: Path,
+) -> None:
+    """Smart Routing's deliberate prompt block is a handoff, not a failure.
+
+    The runner replays the prompt on the routed model and waits for the blocked
+    turn's own ``turn/completed`` to clear the active turn, so the forwarder
+    must post no failed edge and leave that boundary intact. The runner recorded
+    the replay it owes before the hook blocked, as it does for real.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    _owe_replay(tmp_path)
+    client = _RecordingClient()
+    usage_coalescer = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    elicitation_tracker = fwd._CodexElicitationTaskTracker()
+    forwarder_state = fwd._CodexForwarderState()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "hook/completed",
+            "params": _hook_run_params(
+                status="blocked", entries=[{"kind": "feedback", "text": _ROUTING_HANDOFF_NOTICE}]
+            ),
+        },
+        usage_coalescer=usage_coalescer,
+        elicitation_tracker=elicitation_tracker,
+        expected_thread_id="thread_123",
+        forwarder_state=forwarder_state,
+    )
+
+    assert client.posts == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == "turn_123"
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turn": {"id": "turn_123", "status": "completed", "items": [], "error": None},
+            },
+        },
+        usage_coalescer=usage_coalescer,
+        elicitation_tracker=elicitation_tracker,
+        expected_thread_id="thread_123",
+        forwarder_state=forwarder_state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_session_status",
+                "data": {"status": "idle", "response_id": "codex_turn_123"},
+            },
+        )
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None

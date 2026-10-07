@@ -114,6 +114,11 @@ ADVERTISEMENT_FILE = "turn_router.json"
 #: absent; see :func:`turn_routing_marker_present`.
 MARKER_FILE = "turn_routing_done"
 
+#: Start of the reason the codex route-turn hook attaches when it blocks the
+#: first prompt for a replay; see :func:`routed_prompt_block_reason`.
+ROUTED_PROMPT_BLOCK_PREFIX = "Smart Routing selected "
+_ROUTED_PROMPT_BLOCK_SUFFIX = "; rerunning your message on it."
+
 #: Bridge-dir file holding the prompt a routed verdict still owes a replay.
 #: Written before the hook blocks and removed once the prompt is delivered
 #: (or once the hook is known to have fallen open), so a runner that dies
@@ -424,6 +429,33 @@ def turn_routing_marker_present(bridge_dir: Path, session_id: str) -> bool:
     :returns: ``True`` only when the marker names *session_id*.
     """
     return turn_routing_marker_session(bridge_dir) == session_id
+
+
+def routed_prompt_block_reason(model: str) -> str:
+    """Return the reason the route-turn hook attaches when it blocks a prompt for *model*.
+
+    :param model: Routed model id, e.g. ``"gpt-5.6"``.
+    :returns: The user-facing block reason, e.g. ``"Smart Routing selected
+        gpt-5.6; rerunning your message on it."``.
+    """
+    return f"{ROUTED_PROMPT_BLOCK_PREFIX}{model}{_ROUTED_PROMPT_BLOCK_SUFFIX}"
+
+
+def is_routed_prompt_block_reason(text: str) -> bool:
+    """Report whether *text* is a reason written by :func:`routed_prompt_block_reason`.
+
+    The codex forwarder pairs this with :func:`pending_replay_owed` to tell
+    the routing handoff apart from a hook that rejected the prompt.
+
+    :param text: One hook output entry, e.g. the block reason.
+    :returns: ``True`` only for the full reason shape, never for a bare prefix.
+    """
+    reason = text.strip()
+    return (
+        reason.startswith(ROUTED_PROMPT_BLOCK_PREFIX)
+        and reason.endswith(_ROUTED_PROMPT_BLOCK_SUFFIX)
+        and len(reason) > len(ROUTED_PROMPT_BLOCK_PREFIX) + len(_ROUTED_PROMPT_BLOCK_SUFFIX)
+    )
 
 
 def _allow(reason: str, *, terminal: bool = False) -> TurnRouteDecision:
@@ -1045,6 +1077,21 @@ def clear_pending_replay(bridge_dir: Path) -> None:
     """
     with contextlib.suppress(OSError):
         (bridge_dir / PENDING_FILE).unlink()
+
+
+def pending_replay_owed(bridge_dir: Path, session_id: str) -> bool:
+    """Report whether *session_id* still owes a blocked prompt its replay.
+
+    ``True`` only between the routed verdict, recorded before the hook blocks,
+    and the replay's delivery; see :data:`PENDING_FILE`. A record left by
+    another session sharing the bridge dir reads as absent.
+
+    :param bridge_dir: Session bridge directory.
+    :param session_id: Session asking.
+    :returns: ``True`` only when the record names *session_id*.
+    """
+    pending = read_pending_replay(bridge_dir)
+    return pending is not None and pending.session_id == session_id
 
 
 # ── The replay ─────────────────────────────────────────────────────────────

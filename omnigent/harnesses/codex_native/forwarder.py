@@ -66,6 +66,10 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.runner.turn_routing import (
+    is_routed_prompt_block_reason,
+    pending_replay_owed,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -232,6 +236,17 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
 # snake_case (``unauthorized``), but older/alternate spellings (``Unauthorized``)
 # are matched too.
 _CODEX_ERROR_ITEM_TYPE = "error"
+# A ``userPromptSubmit`` hook run that ends ``blocked`` (non-zero exit or
+# ``decision: block``) or ``stopped`` (``continue: false``) ends the turn before
+# any model call; the labels mirror the Codex TUI's wording.
+_CODEX_HOOK_COMPLETED_METHOD = "hook/completed"
+_CODEX_PROMPT_SUBMIT_HOOK_EVENT = "userPromptSubmit"
+_CODEX_HALTED_PROMPT_HOOK_LABELS: dict[str, str] = {
+    "blocked": "Blocked by hook",
+    "stopped": "Stopped by hook",
+}
+# Hook output entries addressed to the model rather than the user.
+_CODEX_HOOK_CONTEXT_ENTRY_KIND = "context"
 _CODEX_AUTH_ERROR_INFO = frozenset({"unauthorized"})
 _CODEX_AUTH_HTTP_STATUS = frozenset({401, 403})
 # Message-substring fallback for app-server versions that omit codexErrorInfo.
@@ -403,8 +418,9 @@ class _CodexForwarderState:
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
-    :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
-        ``error`` notification was already surfaced. Used to suppress a later
+    :param surfaced_terminal_error_turns: Turn ids whose failure was already
+        surfaced ahead of the turn boundary, by a standalone ``error``
+        notification or a hook run that halted the prompt. Used to suppress a later
         terminal boundary for the same turn.
     :param posted_user_turns: Turn ids whose ``userMessage`` has been
         posted to Omnigent this connection, e.g. ``{"turn_123"}``. Used to
@@ -1110,6 +1126,72 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
         return None
     message = _error_payload_message(payload)
     return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+
+
+def _hook_run_from_params(params: _JsonObject) -> _JsonObject:
+    """
+    Return the ``run`` summary of a Codex ``hook/started`` / ``hook/completed`` event.
+
+    :param params: Codex hook notification params.
+    :returns: The run object, or an empty dict when it is missing or malformed.
+    """
+    run = params.get("run")
+    return run if isinstance(run, dict) else {}
+
+
+def _terminal_error_from_hook_run(
+    run: _JsonObject, *, bridge_dir: Path, session_id: str
+) -> _CodexTerminalError | None:
+    """
+    Return the failure carried by a ``hook/completed`` run that halted the prompt.
+
+    Codex runs ``userPromptSubmit`` hooks before the model call. A run that ends
+    ``blocked`` or ``stopped`` ends the turn with zero items and a clean
+    ``turn/completed``, so this notification is the only carrier of the reason
+    the TUI prints as "Blocked by hook" plus the hook's output. Other hook
+    events and statuses leave the turn running and yield ``None``, as does
+    Smart Routing's own block: the runner records the replay it owes before
+    the route-turn hook blocks and clears it once the replay lands, and the
+    hook attaches a fixed-shape reason, so a run carrying only that reason
+    while this session's replay is pending is the handoff, and the ordinary
+    ``turn/completed`` boundary must stay in charge. The session's routing
+    marker is not consulted: it outlives the replay, so it cannot tell a
+    handoff from a later rejection that happens to use the same words.
+
+    :param run: The ``run`` summary of a ``hook/completed`` event, from
+        :func:`_hook_run_from_params`.
+    :param bridge_dir: Native Codex bridge directory holding the replay record.
+    :param session_id: Omnigent session the replay record must name.
+    :returns: Generic-classified error naming the outcome, the hook's output
+        text, and the hook file, or ``None`` when the run did not halt the prompt.
+    """
+    if run.get("eventName") != _CODEX_PROMPT_SUBMIT_HOOK_EVENT:
+        return None
+    status = run.get("status")
+    label = _CODEX_HALTED_PROMPT_HOOK_LABELS.get(status) if isinstance(status, str) else None
+    if label is None:
+        return None
+    entries = run.get("entries")
+    texts = [
+        entry["text"].strip()
+        for entry in (entries if isinstance(entries, list) else [])
+        if isinstance(entry, dict)
+        and entry.get("kind") != _CODEX_HOOK_CONTEXT_ENTRY_KIND
+        and isinstance(entry.get("text"), str)
+        and entry["text"].strip()
+    ]
+    if (
+        texts
+        and all(is_routed_prompt_block_reason(text) for text in texts)
+        and pending_replay_owed(bridge_dir, session_id)
+    ):
+        return None
+    detail = "\n".join(texts)
+    message = f"{label}: {detail}" if detail else label
+    source_path = run.get("sourcePath")
+    if isinstance(source_path, str) and source_path:
+        message = f"{message}\nHook: {source_path}"
+    return _CodexTerminalError(message=message, kind=_CODEX_ERROR_KIND_GENERIC)
 
 
 @dataclass(frozen=True)
@@ -3566,34 +3648,37 @@ async def _maybe_handle_turn_event(
                 _turn_id_from_payload(params),
             )
             return True
-        async with _conversation_item_delivery_scope(session_id):
-            if delta_coalescer is not None:
-                await delta_coalescer.flush()
-            error = _terminal_error_from_notification(params)
-            if error is None:
-                _logger.warning("Codex forwarder ignored malformed error notification")
-                return True
-            turn_id = _turn_id_from_payload(params)
-            if forwarder_state is not None and turn_id is not None:
-                if turn_id in forwarder_state.surfaced_terminal_error_turns:
-                    _logger.info(
-                        "Codex forwarder ignored duplicate terminal error: turn_id=%s",
-                        turn_id,
-                    )
-                    return True
-                forwarder_state.surfaced_terminal_error_turns.add(turn_id)
-                clear_active_turn_id_if_matches(bridge_dir, turn_id)
-            await _post_turn_status_edge(
+        error = _terminal_error_from_notification(params)
+        if error is None:
+            _logger.warning("Codex forwarder ignored malformed error notification")
+            return True
+        await _surface_turn_failure_ahead_of_boundary(
+            client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            turn_id=_turn_id_from_payload(params),
+            error=error,
+            source="error",
+            usage_coalescer=usage_coalescer,
+            delta_coalescer=delta_coalescer,
+            forwarder_state=forwarder_state,
+        )
+        return True
+    if method == _CODEX_HOOK_COMPLETED_METHOD:
+        run = _hook_run_from_params(params)
+        error = _terminal_error_from_hook_run(run, bridge_dir=bridge_dir, session_id=session_id)
+        if error is not None:
+            await _surface_turn_failure_ahead_of_boundary(
                 client,
-                session_id,
-                _CodexTurnStatusEdge(
-                    status="failed",
-                    turn_id=turn_id,
-                    source="error",
-                    error=error,
-                ),
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                turn_id=_turn_id_from_payload(params),
+                error=error,
+                source=f"{method}:{run.get('status')}",
+                usage_coalescer=usage_coalescer,
+                delta_coalescer=delta_coalescer,
+                forwarder_state=forwarder_state,
             )
-            await usage_coalescer.flush()
         return True
     if method == "turn/started":
         async with _conversation_item_delivery_scope(session_id):
@@ -3771,6 +3856,59 @@ async def _maybe_handle_delta_event(
         await _handle_reasoning_delta(params, delta_coalescer, forwarder_state)
         return True
     return False
+
+
+async def _surface_turn_failure_ahead_of_boundary(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    turn_id: str | None,
+    error: _CodexTerminalError,
+    source: str,
+    usage_coalescer: _SessionUsageCoalescer,
+    delta_coalescer: _OutputTextDeltaCoalescer | None,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Publish a ``failed`` edge for a turn whose own boundary will not carry the reason.
+
+    Codex's standalone ``error`` notification and a prompt-halting hook run both
+    precede a ``turn/completed`` that looks clean. Posting the failure here and
+    recording the turn in ``surfaced_terminal_error_turns`` lets
+    :func:`_prepare_terminal_turn_event` suppress that later boundary instead of
+    flipping the session back to ``idle``.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param turn_id: Codex turn id the failure belongs to, e.g. ``"turn_abc123"``.
+    :param error: Classified failure surfaced as the status output.
+    :param source: Lifecycle source recorded on the edge, e.g. ``"error"``.
+    :param usage_coalescer: Token-usage coalescer flushed after the edge.
+    :param delta_coalescer: Optional text-delta coalescer flushed before the edge.
+    :param forwarder_state: Optional forwarder state used to dedupe the turn.
+    :returns: None.
+    """
+    async with _conversation_item_delivery_scope(session_id):
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        if forwarder_state is not None and turn_id is not None:
+            if turn_id in forwarder_state.surfaced_terminal_error_turns:
+                _logger.info(
+                    "Codex forwarder ignored duplicate terminal error: turn_id=%s source=%s",
+                    turn_id,
+                    source,
+                )
+                return
+            forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+            clear_active_turn_id_if_matches(bridge_dir, turn_id)
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            _CodexTurnStatusEdge(status="failed", turn_id=turn_id, source=source, error=error),
+        )
+        await usage_coalescer.flush()
 
 
 async def _handle_completed_event(
@@ -4824,7 +4962,7 @@ def _prepare_terminal_turn_event(
     ):
         clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
         _logger.info(
-            "Codex forwarder suppressed terminal boundary after standalone error: "
+            "Codex forwarder suppressed terminal boundary after surfaced failure: "
             "method=%s turn_id=%s",
             method,
             terminal_turn_id,
