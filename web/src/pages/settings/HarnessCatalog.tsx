@@ -605,7 +605,7 @@ function McpRow({
                 {data.tools.map((tool, index) => (
                   // Capped names can collide; these display-only rows have no state.
                   // eslint-disable-next-line react/no-array-index-key
-                  <li key={index}>
+                  <li key={`${tool.name}-${index}`}>
                     {tool.description ? (
                       <details className="group">
                         <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
