@@ -2280,6 +2280,25 @@ def register_events_routes(
             _grace_host_conn = (
                 _grace_host_reg.get(conv.host_id) if _grace_host_reg is not None else None
             )
+            if (
+                body.type == "message"
+                and _is_native_terminal_session(conv)
+                and _grace_host_conn is None
+            ):
+                host_store = getattr(request.app.state, "host_store", None)
+                host = (
+                    await asyncio.to_thread(host_store.get_host, conv.host_id)
+                    if host_store is not None
+                    else None
+                )
+                if host is None or host.sandbox_provider is None:
+                    # No tunnel can confirm delivery or runner death. Do not
+                    # wait out the reconnect grace and consume the draft as a
+                    # boot failure while the original runner is still alive.
+                    raise OmnigentError(
+                        "The host is offline. Reconnect it and retry your message.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
             # A just-created host session already has a runner_id before
             # the runner's tunnel is registered. The Web UI can post the
             # first message during that gap; wait briefly for the pinned
@@ -2490,6 +2509,20 @@ def register_events_routes(
             # harness). Other event types and non-native sessions still
             # raise: their message would replay to a relaunched runner, so
             # persisting now WOULD desync the store from harness state.
+            host_registry = getattr(request.app.state, "host_registry", None)
+            if (
+                body.type == "message"
+                and _is_native_terminal_session(conv)
+                and conv.host_id is not None
+                and (host_registry is None or host_registry.get(conv.host_id) is None)
+            ):
+                # A disconnected host can still have the original runner and
+                # terminal alive. No launch verdict proves it died; consuming
+                # the message here would lose it when that runner reconnects.
+                raise OmnigentError(
+                    "The host is offline. Reconnect it and retry your message.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
             if body.type == "message" and _is_native_terminal_session(conv):
                 exit_cause = (
                     runner_exit_reports.get(conv.runner_id)

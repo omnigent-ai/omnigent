@@ -6382,6 +6382,29 @@ async def test_native_dispatch_tunnel_drop_retry_failure_is_durable_after_one_at
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wrapper", ["claude-code-native-ui", "codex-native-ui"])
+async def test_host_bound_ensure_transport_loss_refuses_unconsumed_message(wrapper: str) -> None:
+    """A dropped tunnel cannot establish terminal boot failure on a live host."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _ensure_native_terminal_ready
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, host_id="host_offline", labels={"omnigent.wrapper": wrapper})
+
+    class _DroppedTunnel(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            raise ConnectionError("tunnel closed before request completed")
+
+    async with httpx.AsyncClient(transport=_DroppedTunnel(), base_url="http://runner") as runner:
+        with pytest.raises(OmnigentError) as exc:
+            await _ensure_native_terminal_ready(runner, conv.id, conv)
+    assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+
+
+@pytest.mark.asyncio
 async def test_ensure_native_terminal_ready_retries_over_the_runners_new_tunnel() -> None:
     """Over the real tunnel transport, a mid-request drop waits for re-registration and retries.
 

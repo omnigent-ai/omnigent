@@ -5256,6 +5256,14 @@ async def _ensure_native_terminal_ready(
             exc_info=exc,
             extra={"session_id": session_id},
         )
+        if conv.host_id is not None:
+            # No message has been injected yet. A lost host/runner tunnel
+            # cannot establish that the terminal failed to boot; refuse the
+            # send so the client retains the draft for a later retry.
+            raise OmnigentError(
+                "The runner is unreachable. Reconnect the host and retry your message.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
         return _NativeTerminalEnsureOutcome(
             error=_native_terminal_ensure_transport_error(exc, display_name=display_name),
         )

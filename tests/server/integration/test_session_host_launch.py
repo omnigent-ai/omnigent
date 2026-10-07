@@ -1053,7 +1053,7 @@ async def _offline_native_host_session(client: httpx.AsyncClient, app: FastAPI) 
 
 
 @pytest.mark.parametrize("has_runner_binding", [True, False])
-async def test_offline_host_gets_real_grace_before_native_failure(
+async def test_offline_host_refuses_native_message_without_consuming_it(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
@@ -1061,7 +1061,7 @@ async def test_offline_host_gets_real_grace_before_native_failure(
     caplog: pytest.LogCaptureFixture,
     has_runner_binding: bool,
 ) -> None:
-    """An absent host is waited for even when no runner ID was ever assigned."""
+    """An absent host cannot prove runner death; leave the user's draft unconsumed."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
 
@@ -1082,16 +1082,13 @@ async def test_offline_host_gets_real_grace_before_native_failure(
             "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
         },
     )
-    assert time.monotonic() - started >= grace_s
-    assert response.status_code == 202, response.text
+    assert time.monotonic() - started < grace_s
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "runner_unavailable"
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-    assert [item["code"] for item in items if item["type"] == "error"] == [
-        "runner_failed_to_start"
-    ]
-    assert len([item for item in items if item.get("role") == "user"]) == 1
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("to reconnect for session" in message for message in messages)
-    assert not any("to spawn a runner for session" in message for message in messages)
+    assert not [item for item in items if item["type"] in {"message", "error"}]
+    assert (await client.get(f"/v1/sessions/{session_id}")).json()["status"] != "failed"
+    assert not any("to spawn a runner for session" in r.getMessage() for r in caplog.records)
 
 
 async def test_host_reconnect_on_another_replica_redirects_without_failing_input(
@@ -1100,7 +1097,7 @@ async def test_host_reconnect_on_another_replica_redirects_without_failing_input
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A host returning elsewhere during grace must not create a failed turn."""
+    """An offline-host refusal must not create a failed turn on any replica."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
 
@@ -1109,26 +1106,16 @@ async def test_host_reconnect_on_another_replica_redirects_without_failing_input
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
     monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", budget(2.0))
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
-    pending = asyncio.create_task(
-        client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={
-                "type": "message",
-                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
-            },
-        )
+    # A different replica owns the only host tunnel before the send starts.
+    host = app.state.host_store.get_host(_HOST_ID)
+    app.state.host_store.upsert_on_connect(host.host_id, host.name, host.user_id)
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
     )
-    try:
-        async with asyncio.timeout(budget(5.0)):
-            while not any("to reconnect for session" in r.getMessage() for r in caplog.records):
-                await asyncio.sleep(0.01)
-        # A different replica updates the shared row but owns the only tunnel.
-        host = app.state.host_store.get_host(_HOST_ID)
-        app.state.host_store.upsert_on_connect(host.host_id, host.name, host.user_id)
-        response = await asyncio.wait_for(pending, timeout=budget(5.0))
-    finally:
-        pending.cancel()
-        await asyncio.gather(pending, return_exceptions=True)
     assert response.status_code == 400, response.text
     assert response.json()["error"]["code"] == "wrong_replica"
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]

@@ -33,13 +33,6 @@ _KNOWN_GAPS = {
         [("approve", 150)],
     ),
     **contract.gaps(
-        "R3: a message sent while the host is unreachable is accepted (202), then the "
-        "relaunch fails with runner_failed_to_start; the message is never delivered and "
-        "the failure stays after the host returns",
-        [("send", 20), ("send", 150)],
-        harnesses=("claude", "codex"),
-    ),
-    **contract.gaps(
         "R4: Stop with the host unreachable reports success and shows idle, but the turn "
         "keeps running on the host and finishes once it returns (claude can also lose the "
         "next message in the busy TUI)",
@@ -94,6 +87,20 @@ def test_s5_host_offline_user_acts(
         ended = time.time()
         _check_outcome(report, lab, driver, entered, action, accepted)
         contract.check_settled_idle(report, lab, session_id)
+        if action == "send" and not accepted:
+            # A prompt refusal ends before the host's reconnect backoff does.
+            # Wait for the same runner to be reachable before testing the
+            # user's next send; otherwise that send is correctly refused too.
+            reachable = contract.eventually(
+                lambda: (
+                    True
+                    if (snapshot := lab.snapshot(session_id)).get("runner_online")
+                    and snapshot.get("host_online")
+                    else None
+                ),
+                timeout=contract.RECOVERY_S,
+            )
+            report.check("host_and_runner_reconnected", bool(reachable))
         next_turn = contract.eventually_round_trip(driver)
         report.check(
             "next_turn_round_trips",

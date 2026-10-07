@@ -63,7 +63,7 @@ a run happens to pass. Outages beyond the short default run only with
 | S4 | idle, tool running, approval pending | 10 s / 60 s / 300 s | pass | pass |
 | S5 | approve | 20 s | pass | pass |
 | S5 | approve | 150 s | gap: R2 | pass |
-| S5 | send | 20 s / 150 s | gap: [R3](#r3-a-message-sent-while-the-host-is-unreachable-is-lost) | gap: R3 |
+| S5 | send | 20 s / 150 s | pass | pass |
 | S5 | stop | 20 s / 150 s | gap: [R4](#r4-stop-reports-success-while-the-host-is-unreachable) | gap: R4 |
 | S6 | tool ends during outage, approval pending (half-open and refused) | 20 s / 120 s | gap: [R5](#r5-the-page-never-says-it-is-offline) | gap: R5 |
 | S7 | before the first call, mid-stream | 10 s / 60 s | pass | pass |
@@ -95,13 +95,16 @@ approval the user already gave while the host was offline never reaches
 Claude. The session stays `running`, and new messages queue behind a prompt
 that only the terminal can answer.
 
-### R3: A message sent while the host is unreachable is lost
+### R3: A message sent while the host is unreachable is lost (fixed)
 
-Both harnesses; this is server behavior. With the host's links down for 20 s, a message sent from the browser returned
-`202` after about 10 s. The server then tried to relaunch the runner through
-the unreachable host and published `failed` with `runner_failed_to_start`. The
-message never reached the runner. The failure stayed after the host
-reconnected, because passive recovery clears only `runner_disconnected`.
+Both harnesses; this was server behavior. With the host's links down, the
+server could treat an unreachable runner as a definitive boot failure, consume
+the message with `202`, and publish `runner_failed_to_start`. The runner was
+still alive on the disconnected host, so the message never reached it and the
+failure stayed after reconnect. A send without a reachable runner or a
+confirmed terminal now returns `runner_unavailable` without consuming the
+message; the web keeps the draft for retry. A confirmed runner delivery still
+follows the normal transcript-forwarded path.
 
 ### R4: Stop reports success while the host is unreachable
 
