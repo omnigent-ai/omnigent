@@ -43,7 +43,7 @@ function makeIpcMain() {
 }
 
 describe("browser IPC Arca context", () => {
-  it("uses shell-derived context and ignores caller exception flags", () => {
+  it("pairs the renderer's source host with main's context and ignores caller exception flags", () => {
     const ipcMain = makeIpcMain();
     const calls = [];
     const context = { serverTarget: "current", sourceHostId: "actual-host" };

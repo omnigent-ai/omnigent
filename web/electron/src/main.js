@@ -1351,6 +1351,7 @@ function setWindowServerUrl(win, serverUrl) {
   const state = windows.get(win);
   if (state) {
     if (state.serverUrl && arcaTarget(state.serverUrl) !== arcaTarget(serverUrl)) {
+      // Same-origin workspace/mount switches bypass pinWindow's origin teardown.
       state.browserRegistry?.closeAll("server-changed");
     }
     state.serverUrl = serverUrl;

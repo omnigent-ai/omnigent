@@ -26,12 +26,15 @@ import type { BrowserActionRequestEvent } from "@/lib/events";
 import { useBrowserAgentRelay } from "./useBrowserAgentRelay";
 
 const CONV = "conv_relay";
-const renderRelay = (id = CONV) =>
-  renderHook(() => useBrowserAgentRelay(id), {
+const renderRelay = (visibleId: string | null | undefined = CONV) => {
+  const client = new QueryClient();
+  return renderHook(({ id }) => useBrowserAgentRelay(id), {
+    initialProps: { id: visibleId },
     wrapper: ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={new QueryClient()}>{children}</QueryClientProvider>
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
     ),
   });
+};
 
 /** Build a `browser.action_request` event for the bus. */
 function actionEvent(
@@ -214,6 +217,64 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     );
     expect(resultUrl).toContain(`/v1/sessions/${BACKGROUND}/browser/action_result/`);
   });
+
+  it("completes the source session's screenshot when the visible session changes mid-claim", async () => {
+    const bridge = installBridge();
+    let resolveClaim!: (response: Response) => void;
+    authenticatedFetch
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveClaim = resolve;
+          }),
+      )
+      .mockResolvedValue(jsonResponse({}));
+    const hook = renderRelay(CONV);
+    emitBrowserActionRequest(actionEvent("screenshot"), "conv_background_A");
+    await vi.waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    hook.rerender({ id: "conv_visible_B" });
+    resolveClaim(WON);
+    await vi.waitFor(() =>
+      expect(postedResult().result).toEqual({
+        ok: true,
+        data_url: "data:image/png;base64,AAA",
+      }),
+    );
+    expect(bridge.browserScreenshot).toHaveBeenCalledWith("conv_background_A");
+    expect(authenticatedFetch.mock.calls[0][0]).toContain(
+      "/v1/sessions/conv_background_A/browser/action_claim/",
+    );
+    expect(authenticatedFetch.mock.calls[1][0]).toContain(
+      "/v1/sessions/conv_background_A/browser/action_result/",
+    );
+  });
+
+  it("cancels a pending claimed action when leaving all conversations", async () => {
+    const bridge = installBridge();
+    let resolveClaim!: (response: Response) => void;
+    authenticatedFetch
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveClaim = resolve;
+          }),
+      )
+      .mockResolvedValue(jsonResponse({}));
+    const hook = renderRelay();
+    emitBrowserActionRequest(actionEvent("screenshot"), "conv_background_A");
+    await vi.waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    hook.rerender({ id: null });
+    resolveClaim(WON);
+    await vi.waitFor(() =>
+      expect(postedResult().result).toEqual({
+        ok: false,
+        error: "browser relay context changed",
+      }),
+    );
+    expect(bridge.browserScreenshot).not.toHaveBeenCalled();
+    emitBrowserActionRequest(actionEvent("screenshot", {}, "later"), "conv_background_A");
+    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("useBrowserAgentRelay — action dispatch", () => {
@@ -256,7 +317,48 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     );
   });
 
-  it("does not dispatch a stale metadata resolution after the relay context changes", async () => {
+  it("keeps source-host resolution alive across visible-session switches", async () => {
+    const bridge = installBridge();
+    let resolveHost!: () => void;
+    prefetchSessionHostChain.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveHost = resolve;
+        }),
+    );
+    const hook = renderRelay();
+    emitBrowserActionRequest(
+      actionEvent("navigate", { url: "http://localhost:5173" }),
+      "conv_background_A",
+    );
+    await vi.waitFor(() => expect(prefetchSessionHostChain).toHaveBeenCalled());
+    hook.rerender({ id: "conv_visible_B" });
+    setSessionHost("conv_visible_B", "local-host");
+    setSessionHost("parent", "arca-host");
+    setSessionParent("conv_background_A", "parent");
+    resolveHost();
+    await vi.waitFor(() =>
+      expect(postedResult().result).toEqual({
+        ok: true,
+        data: { final_url: "http://localhost:5173" },
+      }),
+    );
+    expect(prefetchSessionHostChain).toHaveBeenCalledWith(
+      expect.any(QueryClient),
+      "conv_background_A",
+    );
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_background_A",
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true, sourceHostId: "arca-host" },
+    );
+    expect(authenticatedFetch.mock.calls[1][0]).toContain(
+      "/v1/sessions/conv_background_A/browser/action_result/",
+    );
+  });
+
+  it("does not dispatch a stale metadata resolution after relay unmount", async () => {
     const bridge = installBridge();
     let resolve!: () => void;
     prefetchSessionHostChain.mockImplementation(

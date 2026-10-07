@@ -299,7 +299,8 @@ function registerBrowserIpc({
     const r = g.registry.openOrNavigate(conversationId, url, bounds, {
       force: !!opts?.force,
       agent: !!opts?.agent,
-      // Context is shell-derived; never accept a renderer's exception flag.
+      // The first-party renderer supplies the source-session host; main owns
+      // the target and eligibility. Caller exception flags never establish identity.
       agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
     });
     // On first creation, wire nav listeners here (not in the registry factory,

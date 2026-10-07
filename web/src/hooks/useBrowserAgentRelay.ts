@@ -355,9 +355,10 @@ async function postResult(
  *   open. Routing uses the delivering conversation, not this.
  */
 export function useBrowserAgentRelay(conversationId: string | null | undefined): void {
+  const relayEnabled = !!conversationId;
   const queryClient = useQueryClient();
   useEffect(() => {
-    if (!conversationId) return;
+    if (!relayEnabled) return;
     if (!supportsBrowser()) return;
 
     let cancelled = false;
@@ -392,5 +393,5 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       cancelled = true;
       unsubscribe();
     };
-  }, [conversationId, queryClient]);
+  }, [relayEnabled, queryClient]);
 }
