@@ -283,6 +283,57 @@ def _changes_review_state(event: object) -> bool:
     return isinstance(event, str) and event.upper() in {"APPROVE", "REQUEST_CHANGES"}
 
 
+def _graphql_create_field(tokens: list[str]) -> str | None:
+    """Recognize a single literal createPullRequest mutation and its response key."""
+    if (
+        tokens[0] != "api"
+        or (_api_endpoint(tokens[1:]) or "").strip("/") != "graphql"
+        or _api_method(tokens) != "POST"
+    ):
+        return None
+    query = _api_field(tokens, "query") or ""
+    # Ignore strings and comments so PR mentions in a comment mutation cannot match.
+    parts = [
+        part
+        for part in re.findall(
+            r'"""(?:\\.|(?!""").)*"""|"(?:\\.|[^"\\])*"|\#[^\r\n]*'
+            r"|[_A-Za-z][_0-9A-Za-z]*|[^\s,]",
+            query,
+            re.DOTALL,
+        )
+        if not part.startswith(('"', "#"))
+    ]
+    if not parts or parts[0] != "mutation":
+        return None
+    depth = parentheses = 0
+    fields: list[str] = []
+    for index, part in enumerate(parts[1:], 1):
+        if part == "(":
+            parentheses += 1
+        elif part == ")":
+            parentheses -= 1
+            if parentheses < 0:
+                return None
+        elif parentheses:
+            continue
+        elif part == "{":
+            depth += 1
+        elif part == "}":
+            depth -= 1
+            if depth == 0:
+                # Multiple operations/fields are ambiguous, especially with --jq.
+                if index != len(parts) - 1:
+                    return None
+                if fields == ["createPullRequest"]:
+                    return "createPullRequest"
+                if len(fields) == 3 and fields[1:] == [":", "createPullRequest"]:
+                    return fields[0]
+                return None
+        elif depth == 1:
+            fields.append(part)
+    return None
+
+
 def _tracks_pr(tokens: list[str]) -> bool:
     """Track PR changes, excluding reads and comment-only interactions."""
     if tokens[0] == "pr":
@@ -293,6 +344,8 @@ def _tracks_pr(tokens: list[str]) -> bool:
         return tokens[1] in _PR_WRITES
     if tokens[0] != "api" or _api_method(tokens) not in {"POST", "PATCH", "PUT", "DELETE"}:
         return False
+    if _graphql_create_field(tokens) is not None:
+        return True
     endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0]
     path = endpoint.strip("/").split("/")
     # GraphQL POSTs can be queries or comment mutations; HTTP method alone is insufficient.
@@ -311,6 +364,8 @@ def _creates_pr(tokens: list[str]) -> bool:
         return True
     if tokens[0] != "api":
         return False
+    if _graphql_create_field(tokens) is not None:
+        return True
     endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0]
     return (
         _api_method(tokens) == "POST"
@@ -425,6 +480,11 @@ def _command_target(tokens: list[str]) -> PullRequestRef | None:
 
 
 def _content_only(tokens: list[str]) -> bool:
+    if field := _graphql_create_field(tokens):
+        projection = _flag(tokens, "--jq", "-q")
+        path = f".data.{field}.pullRequest"
+        if projection is not None:
+            return projection.strip() not in {path, f"{path}.url"}
     fields = _flag(tokens, "--json")
     return (
         tokens[:2] == ["pr", "diff"]
@@ -523,9 +583,17 @@ def extract_prs(
         if len(commands) == len(gh_commands) and (
             len(commands) > 1 or not _content_only(commands[0])
         ):
+            graphql_fields = [
+                field for tokens in commands if (field := _graphql_create_field(tokens))
+            ]
             for obj in _objects(result):
                 if ref := _reference(obj.get("html_url", obj.get("url"))):
                     references.append(ref)
+                for field in graphql_fields:
+                    mutation = obj.get(field)
+                    pr = mutation.get("pullRequest") if isinstance(mutation, dict) else None
+                    if isinstance(pr, dict) and (ref := _reference(pr.get("url"))):
+                        references.append(ref)
             # A single operation's known identity makes rendered body links redundant.
             if len(commands) > 1 or not references:
                 for line in text.splitlines():
