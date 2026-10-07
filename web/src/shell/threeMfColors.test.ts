@@ -637,6 +637,7 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
         "3D/root.model": standard.replace("<model ", `<model xmlns:q="${production}" `),
         "3D/Objects/other.model": standard.replace("<model ", `<model xmlns:q="${slicer}" `),
       },
+      { "3D/root.model": standard.replace(`xmlns="${core}"`, `xmlns="${production}"`) },
     ];
     const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
     try {
@@ -675,6 +676,149 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     } finally {
       childrenGetter.mockRestore();
     }
+  });
+
+  it("indexes configuration once across repeated build items", () => {
+    const count = 128;
+    const input = archive({
+      "3D/root.model": model(
+        mesh(1) + mesh(2, 2) + composite(100, component(1) + component(2, 10)),
+        Array.from(
+          { length: count },
+          (_, index) => `<item objectid="100" transform="${transform(index * 20)}"/>`,
+        ).join(""),
+      ),
+      "Metadata/model_settings.config": `<config>${config(Array.from({ length: count }, (_, index) => part(index + 1, index === 1 ? 2 : 0)).join(""), 1)}</config>`,
+    });
+    const getter = Object.getOwnPropertyDescriptor(Element.prototype, "children")!.get!;
+    let visits = 0;
+    const observer = vi.spyOn(Element.prototype, "children", "get").mockImplementation(function (
+      this: Element,
+    ) {
+      const result = getter.call(this) as HTMLCollection;
+      if (this.localName === "object" && this.parentElement?.localName === "config") {
+        visits += result.length;
+        if (visits > count * 8) throw new Error("Repeated configuration scan");
+      }
+      return result;
+    });
+    try {
+      check(
+        input,
+        Array.from({ length: count }, () => ["f53b9d", "4dc5a0"]).flat(),
+        Array.from({ length: count }, (_, index) => [index * 20, index * 20 + 10]).flat(),
+        Array.from({ length: count }, () => [1, 2]).flat(),
+      );
+      expect(visits).toBeLessThan(count * 8);
+    } finally {
+      observer.mockRestore();
+    }
+  });
+
+  it("reads explicit part slots once across repeated component instances", () => {
+    const count = 128;
+    const input = archive({
+      "3D/root.model": model(
+        mesh(1) +
+          mesh(2, 2) +
+          composite(
+            100,
+            Array.from({ length: count }, (_, index) => component(1, index * 10)).join("") +
+              component(2, count * 10),
+          ),
+      ),
+      "Metadata/model_settings.config": `<config>${config(
+        `<part id="1">${'<metadata key="note" value="x"/>'.repeat(count)}${metadata(0)}</part>` +
+          part(2, 2) +
+          Array.from({ length: count }, (_, index) => part(index + 3, 0)).join(""),
+        1,
+      )}</config>`,
+    });
+    const getter = Object.getOwnPropertyDescriptor(Element.prototype, "children")!.get!;
+    let visits = 0;
+    const observer = vi.spyOn(Element.prototype, "children", "get").mockImplementation(function (
+      this: Element,
+    ) {
+      const result = getter.call(this) as HTMLCollection;
+      if (this.localName === "part") {
+        visits += result.length;
+        if (visits > count * 8) throw new Error("Repeated part metadata scan");
+      }
+      return result;
+    });
+    try {
+      check(
+        input,
+        [...Array(count).fill("f53b9d"), "4dc5a0"],
+        Array.from({ length: count + 1 }, (_, index) => index * 10),
+        [...Array(count).fill(1), 2],
+      );
+      expect(visits).toBeLessThan(count * 8);
+    } finally {
+      observer.mockRestore();
+    }
+  });
+
+  it("normalizes root-bound aliases without per-descendant namespace charges", () => {
+    const input = archive({
+      "3D/root.model": model(
+        mesh(1).replace(
+          "<mesh>",
+          `<metadata name="note">${'<p:n p:note="a"/>'.repeat(7000)}</metadata><mesh>`,
+        ) +
+          mesh(2, 2) +
+          composite(100, component(1) + component(2, 10)),
+      ).replace("<model ", `<model xmlns:abcdefghijkl="${production}" `),
+    });
+    check(input);
+  });
+
+  it("reserves rewritten ID growth before serializing near-budget references", () => {
+    const fixture = (length: number, count: number, components: boolean) => {
+      const dummyIds = Array.from({ length: 8 }, (_, index) => index + 20);
+      const composites = [100, 101, 102];
+      return archive({
+        "3D/root.model": model(
+          dummyIds.map((id) => mesh(id)).join("") +
+            mesh(1).replace(
+              "<mesh>",
+              `<metadata name="note">${"x".repeat(length)}</metadata><mesh>`,
+            ) +
+            composites.map((id) => composite(id, component(1))).join("") +
+            (components ? composite(300, component(1).repeat(count)) : ""),
+          [...dummyIds, ...composites].map((id) => `<item objectid="${id}"/>`).join("") +
+            (components ? '<item objectid="300"/>' : '<item objectid="1"/>'.repeat(count)),
+        ),
+        "Metadata/model_settings.config": `<config>${config(part(1, 1), undefined, 1)}${composites.map((id, index) => config(part(1, index + 1), undefined, id)).join("")}${components ? config(part(1, 1), undefined, 300) : ""}</config>`,
+      });
+    };
+    [false, true].forEach((components) => {
+      check(
+        fixture(32, 8, components),
+        [...Array(8).fill("ffffff"), "f53b9d", "4dc5a0", "212329", ...Array(8).fill("f53b9d")],
+        Array(19).fill(0),
+        Array(19).fill(1),
+      );
+      const base = fixture(0, 2400, components);
+      const selected = Object.values(unzipSync(new Uint8Array(base))).reduce(
+        (sum, bytes) => sum + bytes.length,
+        0,
+      );
+      const normalized = applyThreeMfColors(base);
+      expect(normalized).not.toBe(base);
+      const outputSize = unzipSync(new Uint8Array(normalized))["3D/3dmodel.model"].length;
+      const length = selected * 2 + 1024 * 1024 - outputSize + 1;
+      const input = fixture(length, 2400, components);
+      const budget = (selected + length) * 2 + 1024 * 1024;
+      const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+      try {
+        expect(applyThreeMfColors(input)).toBe(input);
+        for (const result of serializer.mock.results)
+          expect(strToU8(String(result.value)).byteLength).toBeLessThanOrEqual(budget);
+      } finally {
+        serializer.mockRestore();
+      }
+    });
   });
 
   it("bounds inherited namespace expansion before standalone subtree serialization", () => {

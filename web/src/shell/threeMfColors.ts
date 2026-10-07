@@ -5,13 +5,14 @@ const XMLNS = "http://www.w3.org/2000/xmlns/";
 const PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
 const MODEL_NAMESPACES = new Set([CORE, PRODUCTION, "http://schemas.bambulab.com/package/2021"]);
 const MAX_NAMESPACE_PREFIX_BYTES = 12;
-const MAX_NAMESPACE_BYTES = 100;
+const MAX_GENERATED_BYTES = 128;
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 export const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
 export const INFLATE_CHUNK_BYTES = 16 * 1024;
 const MAX_EMITTED_RATIO = 2;
 const MAX_EMITTED_OVERHEAD = 1024 * 1024;
 const MAX_OBJECTS = 10_000;
+const MAX_ID_WIDTH = String(MAX_OBJECTS + 1).length;
 const MAX_COMPONENTS = 10_000;
 const MAX_COMPONENT_DEPTH = 64;
 const ZIP_END = {
@@ -109,8 +110,8 @@ function serializationBound(source: Element, limit: number): number {
     }
     return size;
   };
-  // Allowlisted URIs and short prefixes bound any serializer-generated namespace declaration.
-  let bound = MAX_NAMESPACE_BYTES;
+  // Emitted objects can acquire appearance attributes and a new material resource.
+  let bound = MAX_GENERATED_BYTES;
   const walker = source.ownerDocument.createTreeWalker(source, NodeFilter.SHOW_ALL);
   do {
     const node = walker.currentNode;
@@ -118,10 +119,14 @@ function serializationBound(source: Element, limit: number): number {
       bound += node.hasChildNodes()
         ? 2 * utf8Length(node.tagName) + 5
         : utf8Length(node.tagName) + 3;
-      if (node.prefix) bound += MAX_NAMESPACE_BYTES;
       for (const name of node.getAttributeNames()) {
-        bound += utf8Length(name) + escapedBytes(node.getAttribute(name) ?? "", true) + 4;
-        if (name.includes(":") && !name.startsWith("xmlns:")) bound += MAX_NAMESPACE_BYTES;
+        const value = node.getAttribute(name) ?? "";
+        bound += utf8Length(name) + escapedBytes(value, true) + 4;
+        if (
+          (name === "id" && node.localName === "object") ||
+          (name === "objectid" && (node.localName === "component" || node.localName === "item"))
+        )
+          bound += Math.max(0, MAX_ID_WIDTH - utf8Length(value));
       }
     } else {
       bound += escapedBytes(node.nodeValue ?? "");
@@ -327,6 +332,16 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         : null;
     };
     const settings = xml(configs["Metadata/model_settings.config"]);
+    const slots = new Map<Element, number | null>();
+    const cachedSlot = (element: Element | undefined, inherited: number | null) => {
+      if (!element) return inherited;
+      let value = slots.get(element);
+      if (value === undefined) {
+        value = slot(element, 0);
+        slots.set(element, value);
+      }
+      return value === 0 ? inherited : value;
+    };
     const objectConfigs = new Map(
       children(settings.documentElement, "object").map((object) => [
         object.getAttribute("id"),
@@ -335,9 +350,9 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     );
     const candidateColors = new Set<string>();
     for (const object of objectConfigs.values()) {
-      const inherited = slot(object, 1);
+      const inherited = cachedSlot(object, 1);
       for (const part of children(object, "part")) {
-        const effective = normal(part) ? color(slot(part, inherited)) : null;
+        const effective = normal(part) ? color(cachedSlot(part, inherited)) : null;
         if (effective) candidateColors.add(effective);
       }
     }
@@ -361,6 +376,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     for (const [path, data] of entries) {
       if (!path.endsWith(".model")) continue;
       const document = xml(data);
+      if (document.documentElement.getAttribute("xmlns") !== CORE) return buffer;
       entries.delete(path);
       for (const element of document.querySelectorAll("*")) {
         if (!MODEL_NAMESPACES.has(element.namespaceURI ?? "")) return buffer;
@@ -461,7 +477,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       const sourceKey = JSON.stringify([path, id]);
       const source = objects.get(sourceKey);
       if (!source || visiting.has(sourceKey)) throw new Error("Invalid component graph");
-      const effectiveSlot = slot(assigned, inherited);
+      const effectiveSlot = cachedSlot(assigned, inherited);
       const recolor = enabled && (!assigned || normal(assigned));
       const mesh = children(source, "mesh")[0];
       const effectiveColor = mesh && assigned && recolor ? color(effectiveSlot) : null;
@@ -529,6 +545,10 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     if (!sourceBuild) return buffer;
     reserve(sourceBuild, "build");
     const build = output.adoptNode(sourceBuild);
+    const contexts = new Map<
+      Element | undefined,
+      { parts: Map<string | null, Element>; inherited: number | null }
+    >();
     for (const item of children(build, "item")) {
       const id = item.getAttribute("objectid") ?? "";
       const targetPath = item.getAttributeNS(PRODUCTION, "path");
@@ -536,16 +556,24 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       const source = objects.get(JSON.stringify([path, id]));
       if (!source) return buffer;
       const config = objectConfigs.get(id);
-      const parts = new Map(
-        config ? children(config, "part").map((part) => [part.getAttribute("id"), part]) : [],
-      );
+      let context = contexts.get(config);
+      if (!context) {
+        context = {
+          parts: new Map(
+            config ? children(config, "part").map((part) => [part.getAttribute("id"), part]) : [],
+          ),
+          inherited: cachedSlot(config, 1),
+        };
+        contexts.set(config, context);
+      }
+      const { parts, inherited } = context;
       item.setAttribute(
         "objectid",
         clone(
           path,
           id,
           parts,
-          slot(config, 1),
+          inherited,
           children(source, "mesh").length ? parts.get(id) : undefined,
           true,
           0,
@@ -561,6 +589,8 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     objects.clear();
     links.clear();
     objectConfigs.clear();
+    contexts.clear();
+    slots.clear();
     sourceSizes.clear();
     memo.clear();
     moved.clear();
