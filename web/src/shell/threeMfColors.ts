@@ -3,8 +3,9 @@ import { strFromU8, strToU8, unzipSync, zipSync } from "three/examples/jsm/libs/
 const CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
-const MAX_SELECTED_BYTES = 32 * 1024 * 1024;
-const MAX_EMITTED_BYTES = 32 * 1024 * 1024;
+const MAX_SELECTED_BYTES = 256 * 1024 * 1024;
+const MAX_EMITTED_RATIO = 2;
+const MAX_EMITTED_OVERHEAD = 1024 * 1024;
 const MAX_OBJECTS = 10_000;
 const MAX_COMPONENTS = 10_000;
 const MAX_COMPONENT_DEPTH = 64;
@@ -179,7 +180,8 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         sourceSizes.set(key, size);
       }
       emittedBytes += size;
-      if (emittedBytes > MAX_EMITTED_BYTES) throw new Error("3MF emitted byte limit");
+      if (emittedBytes > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD)
+        throw new Error("3MF emitted byte limit");
     };
     const visiting = new Set<string>();
     let nextId = 2;
