@@ -21,20 +21,52 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-console = Console()
+# Rich falls back to 80 columns when stdout is not a TTY (CI logs), which
+# truncates the delta columns; give the non-interactive path room.
+_NONINTERACTIVE_WIDTH = 160
+console = Console(width=None if sys.stdout.isatty() else _NONINTERACTIVE_WIDTH)
+
+# Below this many successful samples in a run, the ceil-index p95 is the slowest
+# single sample, so one stall reads as a >100% regression. Such journeys gate on
+# p50 only; their p95 stays in the tables as an indicator.
+_P95_MIN_SAMPLES_PER_RUN = 20
+_UNGATED_MARK = "†"
+_UNGATED_NOTE = (
+    f"{_UNGATED_MARK} P95 not gated: a run has fewer than {_P95_MIN_SAMPLES_PER_RUN} samples,"
+    " so its P95 is the slowest single sample."
+)
 
 
 def _comparison_metric(data: dict, run_key: str, summary_key: str) -> float | None:
-    """Return the median run metric, falling back for summary-only reports."""
+    """Return the median run metric, falling back for summary-only reports.
+
+    Fully failed runs report ``0.0`` and are left out so they cannot read as fast.
+    """
     values = [
         float(value)
         for run in (data.get("runs") or [])
-        if isinstance((value := run.get(run_key)), (int, float)) and math.isfinite(value)
+        if run.get("n_success") != 0
+        and isinstance((value := run.get(run_key)), (int, float))
+        and math.isfinite(value)
     ]
     if values:
         return statistics.median(values)
     value = data.get("summary", {}).get(summary_key)
     return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
+
+
+def _p95_gated(*journeys: dict) -> bool:
+    """Whether every timed run has enough samples for p95 to be a percentile.
+
+    Fully failed runs have no samples and summary-only legacy reports have no
+    per-run counts; neither turns the gate off.
+    """
+    for data in journeys:
+        for run in data.get("runs") or []:
+            n = run.get("n_success")
+            if isinstance(n, int) and 0 < n < _P95_MIN_SAMPLES_PER_RUN:
+                return False
+    return True
 
 
 def _fmt_ms(v: float | None) -> str:
@@ -80,7 +112,10 @@ def compare_reports(
     :param backend: If set, only compare journeys whose ``backend`` key matches.
     Run-level medians drive latency comparisons so one noisy timed run cannot
     dominate a three-run report. Summary averages remain the fallback for
-    legacy reports that did not retain per-run metrics.
+    legacy reports that did not retain per-run metrics. P95 gates a journey
+    only when every run with successful samples, on both sides, has at least
+    ``_P95_MIN_SAMPLES_PER_RUN`` of them; below that it is the slowest sample
+    and is reported, not gated.
 
     :returns: ``(passed, rows)`` where *rows* hold per-journey comparison data.
     """
@@ -116,6 +151,7 @@ def compare_reports(
                     "delta_p95": None,
                     "b_req": b_j_summary.get("avg_http_requests_per_op"),
                     "c_req": c_req,
+                    "p95_gated": None,
                 }
             )
             continue
@@ -133,6 +169,7 @@ def compare_reports(
                     "delta_p95": None,
                     "b_req": None,
                     "c_req": c_req,
+                    "p95_gated": None,
                 }
             )
             continue
@@ -152,6 +189,7 @@ def compare_reports(
                     "delta_p95": None,
                     "b_req": None,
                     "c_req": c_req,
+                    "p95_gated": None,
                 }
             )
             continue
@@ -166,7 +204,8 @@ def compare_reports(
         delta_p50 = (c_p50 - b_p50) / b_p50 if b_p50 > 0 else 0.0
         delta_p95 = (c_p95 - b_p95) / b_p95 if b_p95 > 0 else 0.0
 
-        regression = delta_p50 > threshold or delta_p95 > threshold
+        p95_gated = _p95_gated(b_data, c_data)
+        regression = delta_p50 > threshold or (p95_gated and delta_p95 > threshold)
         if regression:
             passed = False
 
@@ -182,10 +221,32 @@ def compare_reports(
                 "delta_p95": delta_p95,
                 "b_req": b_req,
                 "c_req": c_req,
+                "p95_gated": p95_gated,
             }
         )
 
     return passed, rows
+
+
+def _delta_cells(row: dict, threshold: float) -> tuple[str, str]:
+    """Rich markup for a row's Δ P50 and Δ P95 cells.
+
+    An ungated p95 carries the marker; only a gated breach is painted red.
+    """
+    p50 = _fmt_delta(row["delta_p50"])
+    p95 = _fmt_delta(row["delta_p95"])
+    if row["p95_gated"] is False:
+        p95 += _UNGATED_MARK
+    if row["status"] == "regression":
+        if row["delta_p50"] is not None and row["delta_p50"] > threshold:
+            p50 = f"[red]{p50}[/red]"
+        if (
+            row["p95_gated"] is True
+            and row["delta_p95"] is not None
+            and row["delta_p95"] > threshold
+        ):
+            p95 = f"[red]{p95}[/red]"
+    return p50, p95
 
 
 def _status_style(status: str) -> str:
@@ -214,14 +275,7 @@ def print_table(rows: list[dict], threshold: float) -> None:
 
     for row in rows:
         style = _status_style(row["status"])
-        delta_p50_str = _fmt_delta(row["delta_p50"])
-        delta_p95_str = _fmt_delta(row["delta_p95"])
-
-        if row["status"] == "regression":
-            if row["delta_p50"] is not None and row["delta_p50"] > threshold:
-                delta_p50_str = f"[red]{delta_p50_str}[/red]"
-            if row["delta_p95"] is not None and row["delta_p95"] > threshold:
-                delta_p95_str = f"[red]{delta_p95_str}[/red]"
+        delta_p50_str, delta_p95_str = _delta_cells(row, threshold)
 
         table.add_row(
             row["journey"],
@@ -237,6 +291,8 @@ def print_table(rows: list[dict], threshold: float) -> None:
 
     console.print()
     console.print(table)
+    if any(row["p95_gated"] is False for row in rows):
+        console.print(_UNGATED_NOTE)
     console.print()
 
 
@@ -261,6 +317,8 @@ def build_markdown(rows: list[dict], threshold: float, passed: bool) -> str:
         b_p95 = _fmt_ms(row["b_p95"])
         c_p95 = _fmt_ms(row["c_p95"])
         d_p95 = _fmt_delta(row["delta_p95"])
+        if row["p95_gated"] is False:
+            d_p95 += _UNGATED_MARK
         lines.append(
             f"| {row['journey']} | {emoji} {status} "
             f"| {b_p50} | {c_p50} | {d_p50} "
@@ -268,6 +326,9 @@ def build_markdown(rows: list[dict], threshold: float, passed: bool) -> str:
         )
 
     lines.append("")
+    if any(row["p95_gated"] is False for row in rows):
+        lines.append(_UNGATED_NOTE)
+        lines.append("")
     verdict = (
         "**PASS** — no regressions detected." if passed else "**FAIL** — regression(s) detected."
     )

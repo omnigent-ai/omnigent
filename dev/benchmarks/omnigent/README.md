@@ -97,6 +97,11 @@ only lowers the count, never raises it. A cold start never deletes its session,
 so sessions accumulate across a run; keeping the count small also keeps that
 drift negligible (~2 ms/turn).
 
+With five samples per run, the ceil-index p95 is simply the slowest sample, so
+`compare.py` gates these journeys on run-median p50 only and reports their p95
+as an indicator (marked `†`). The p95 gate applies once every run with
+successful samples, on both sides, has at least 20 of them.
+
 | Journey | Operation timed |
 | --- | --- |
 | `session_cold_start` | Create a new host-bound session and time its fresh runner launch through the first token — the full new-conversation cold path |
