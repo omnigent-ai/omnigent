@@ -135,17 +135,32 @@ function serverSelectorV2EnvForced() {
   return process.env.OMNIGENT_SERVER_SELECTOR_V2 === "1";
 }
 
-/** V2 defaults on for packaged, MDM-enabled Databricks macOS users. */
+/** V2 defaults on for MDM-enabled Databricks macOS users. */
 function serverSelectorV2Enabled() {
-  if (serverSelectorV2EnvForced()) return true;
+  // If enforced by the environment variable, enable.
+  if (serverSelectorV2EnvForced()) {
+    return true;
+  }
+  const savedPreference = loadSettings().server_selector_v2 ?? null;
+  const isDatabricksManaged = databricksInternalFeaturesEnabled();
 
-  const savedPreference = loadSettings().server_selector_v2;
-  if (savedPreference != null) return savedPreference === true;
+  // Respect the user's preference.
+  if (savedPreference !== null) {
+    return savedPreference === true;
+  }
 
-  if (!app.isPackaged) return false;
-  if (process.platform !== "darwin") return false;
+  // Enable on macOS only.
+  if (process.platform !== "darwin") {
+    return false;
+  }
 
-  return databricksInternalFeaturesEnabled();
+  // Enable on Databricks managed devices.
+  if (isDatabricksManaged) {
+    return true;
+  }
+
+  // Otherwise, disable.
+  return false;
 }
 
 /** Which setup page to load — the server selector when enabled. */

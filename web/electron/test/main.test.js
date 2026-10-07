@@ -1426,7 +1426,7 @@ describe("Databricks auth mode wiring", () => {
           assert.equal(h.calls.auth.length, attempts, "Cancel stops the pending reconnect");
         }
         assert.equal(h.overlay.hint, null);
-        const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+        const params = new URL(h.webContents.getURL()).searchParams;
         // The setup page keeps the mounted server URL for the next Connect.
         finals.push([params.get("error"), params.get("url")]);
       }
@@ -2294,7 +2294,9 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
   });
 });
 
-describe("packaged server selector default", () => {
+describe("server selector default", () => {
+  const devUrl = "http://localhost:5174/server-selector-v2.html";
+
   for (const [name, options, settings, v2] of [
     ["new internal macOS install", { internalFeatures: true }, null, true],
     [
@@ -2313,7 +2315,9 @@ describe("packaged server selector default", () => {
     ],
     ["Linux install", { platform: "linux", internalFeatures: true }, null, false],
     ["Windows install", { platform: "win32", internalFeatures: true }, null, false],
-    ["unpackaged internal macOS build", { isPackaged: false, internalFeatures: true }, null, false],
+    ["unpackaged internal macOS build", { isPackaged: false, internalFeatures: true }, null, true],
+    ["unpackaged public macOS build", { isPackaged: false }, null, false],
+    ["null selector preference", { internalFeatures: true }, { server_selector_v2: null }, true],
     [
       "explicit V2 preference outside the default rollout",
       { platform: "win32" },
@@ -2327,19 +2331,50 @@ describe("packaged server selector default", () => {
       false,
     ],
   ]) {
-    it(`opens the bundled selector for ${name}`, async () => {
-      const h = loadNavigationHarness({ isPackaged: true, platform: "darwin", ...options });
+    it(`opens the expected selector for ${name}`, async () => {
+      const h = loadNavigationHarness({
+        isPackaged: true,
+        platform: "darwin",
+        env: { OMNIGENT_SERVER_SELECTOR_V2_DEV_URL: devUrl },
+        ...options,
+      });
       try {
         if (settings) fs.writeFileSync(h.settingsPath, JSON.stringify(settings));
         h.api.createWindow();
-        await until(() => h.calls.loadFile.length > 0, "setup page load");
-        assert.equal(h.calls.loadFile[0][0], v2 ? h.api.SERVER_SELECTOR_V2_PAGE : h.api.SETUP_PAGE);
-        assert.equal(h.calls.loadURL.length, 0);
+        if (v2 && !h.electron.app.isPackaged) {
+          await until(() => h.calls.loadURL.length > 0, "dev selector load");
+          assert.equal(h.calls.loadURL[0][0], devUrl);
+          assert.equal(h.calls.loadFile.length, 0);
+        } else {
+          await until(() => h.calls.loadFile.length > 0, "setup page load");
+          assert.equal(
+            h.calls.loadFile[0][0],
+            v2 ? h.api.SERVER_SELECTOR_V2_PAGE : h.api.SETUP_PAGE,
+          );
+          assert.equal(h.calls.loadURL.length, 0);
+        }
       } finally {
         h.cleanup();
       }
     });
   }
+
+  it("falls back to bundled V2 when the internal macOS dev server is unavailable", async () => {
+    const h = loadNavigationHarness({
+      internalFeatures: true,
+      env: { OMNIGENT_SERVER_SELECTOR_V2_DEV_URL: devUrl },
+      loadURL: async () => {
+        throw new Error("Dev server unavailable");
+      },
+    });
+    try {
+      await h.api.loadSetupPage(h.win);
+      assert.equal(h.calls.loadURL[0][0], devUrl);
+      assert.equal(h.calls.loadFile[0][0], h.api.SERVER_SELECTOR_V2_PAGE);
+    } finally {
+      h.cleanup();
+    }
+  });
 
   it("persists switching to legacy and back to V2", async () => {
     const h = loadNavigationHarness({ isPackaged: true, internalFeatures: true });
@@ -3157,6 +3192,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
 
   it("goes straight to setup for other windows and non-network errors", async (t) => {
     const embedded = loadNavigationHarness({
+      isPackaged: true,
       serverUrl: workspace,
       databricksMode: "embedded",
       internalFeatures: true,
@@ -3196,6 +3232,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   async function connected(t, delays) {
     const network = createWorkspaceNetwork(origin);
     const h = loadNavigationHarness({
+      isPackaged: true,
       serverUrl: workspace,
       databricksMode: "browser",
       internalFeatures: true,
