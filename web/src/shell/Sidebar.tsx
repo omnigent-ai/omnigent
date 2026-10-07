@@ -92,7 +92,8 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
-import { useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
@@ -1636,6 +1637,9 @@ function ConversationList({
   const [overProject, setOverProject] = useState<string | null>(null);
   const [overPin, setOverPin] = useState<string | null>(null);
   const { mutateAsync: pinAt } = useTogglePinnedConversation();
+  // Pin writes don't overlap (the hooks refuse one while another saves), so the
+  // pinned rows stop taking drops until the current write settles.
+  const pinWriting = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
   const { mutate: reorderPins } = useReorderPinnedConversations();
   const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
     if (saveOrder.isPending) return;
@@ -2197,14 +2201,14 @@ function ConversationList({
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
   const pinOrder = useMemo(
     () =>
-      pinReorderEnabled
+      pinReorderEnabled && !pinWriting
         ? {
             ids: sections.pinned.map((c) => c.id),
             draggingId: activeDrag?.id ?? null,
             overId: overPin,
           }
         : null,
-    [pinReorderEnabled, sections.pinned, activeDrag, overPin],
+    [pinReorderEnabled, pinWriting, sections.pinned, activeDrag, overPin],
   );
 
   // Pinned membership is server-authoritative (the `omnigent.pinned` label),

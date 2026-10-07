@@ -39,6 +39,7 @@ import {
   mergeItemsIntoPages,
   overlayArchivedIntoCaches,
   overlayTitleIntoCaches,
+  PIN_WRITE_MUTATION_KEY,
   PINNED_LABEL_KEY,
   PROJECT_FOLDER_FILTERS,
   PROJECT_LABEL_KEY,
@@ -1779,15 +1780,16 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
   };
 }
 
-// Bumped by every pin, unpin, and reorder write, per session, so a reorder
-// that settles after a newer action on the same session leaves it alone.
-const pinWriteVersions = new Map<string, number>();
-// Pin, unpin, and reorder mutations run one at a time, in the order issued.
-const PIN_WRITE_SCOPE = "pin-writes";
-function bumpPinWriteVersion(id: string): number {
-  const version = (pinWriteVersions.get(id) ?? 0) + 1;
-  pinWriteVersions.set(id, version);
-  return version;
+// Pin, unpin, and reorder writes share a mutation key, and a new one is refused
+// while another is in flight, so each write's rollback and reconcile see only
+// their own changes. The check runs in `onMutate`, where the starting mutation
+// already counts as pending.
+function refuseOverlappingPinWrite(queryClient: QueryClient) {
+  if (queryClient.isMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 1) {
+    const message = "Still saving your pins. Try again in a moment.";
+    showToast(message);
+    throw new Error(message);
+  }
 }
 
 // Apply a pin/unpin to every cache that renders the row. `labels` is the
@@ -1898,8 +1900,7 @@ export function useTogglePinnedConversation() {
     patchPinnedCaches(queryClient, id, labels, pinned, includeShared, viewerId);
 
   return useMutation({
-    // Shares the reorder's scope so pin writes reach the server in the user's order.
-    scope: { id: PIN_WRITE_SCOPE },
+    mutationKey: PIN_WRITE_MUTATION_KEY,
     // `pinnedAt` overrides the pin's sort value; the Pinned section's drag-to-reorder sets it.
     mutationFn: ({ id, pinned, pinnedAt }: { id: string; pinned: boolean; pinnedAt?: number }) => {
       // Against an old server, persist the pin locally instead of PATCHing a
@@ -1921,6 +1922,7 @@ export function useTogglePinnedConversation() {
     // network resolves, which reads as lag. Snapshot the pinned cache so a
     // failed PATCH rolls back.
     onMutate: ({ id, pinned, pinnedAt }) => {
+      refuseOverlappingPinWrite(queryClient);
       const existing = findRow(id);
       if (
         pinned &&
@@ -1953,21 +1955,19 @@ export function useTogglePinnedConversation() {
       const labels: Record<string, string> = pinned
         ? { ...base, [PINNED_LABEL_KEY]: String(pinnedAt ?? Date.now()) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
-      const version = bumpPinWriteVersion(id);
       patch(id, labels, pinned);
-      return { prevPinned, version };
+      return { prevPinned, prevLabels: base };
     },
     onError: (_err, { id }, ctx) => {
-      // Restore the pinned section; the label overlays on the other caches are
-      // cosmetic and self-heal on the next reconcile. A newer pin write on this
-      // session owns its state, so a stale failure leaves it alone.
-      if (ctx && pinWriteVersions.get(id) !== ctx.version) return;
-      if (ctx?.prevPinned !== undefined) {
+      // Put the row's previous labels back on every cache, then restore the
+      // pinned section's exact snapshot.
+      if (!ctx) return;
+      patch(id, ctx.prevLabels, ctx.prevLabels[PINNED_LABEL_KEY] !== undefined);
+      if (ctx.prevPinned !== undefined) {
         queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, ctx.prevPinned);
       }
     },
-    onSuccess: (updated, { id, pinned }, ctx) => {
-      if (ctx && pinWriteVersions.get(id) !== ctx.version) return;
+    onSuccess: (updated, { pinned }) => {
       // No `markConversationSeen` here: a pin PATCH writes only the label row,
       // never conversations.updated_at (unlike rename/archive/move, which bump
       // it and need the anchor to suppress that self-bump). Anchoring here would
@@ -1997,19 +1997,13 @@ export function useTogglePinnedConversation() {
  * Pinned section). Every write is applied optimistically to all caches; once
  * the PATCHes settle, each row is reconciled to what the server stored — the
  * new value if its write landed, its previous value if not — so a failed or
- * partly failed batch leaves the caches matching the persisted order. Batches
- * share a mutation scope so their PATCHes run in order (the latest drag writes
- * last), and a row a newer drag has since moved skips the older reconcile.
+ * partly failed batch leaves the caches matching the persisted order.
  */
 export function useReorderPinnedConversations() {
   const { pinsIncludeShared, sharedAvailable } = useContext(SidebarConfigContext);
   const includeShared = pinsIncludeShared && sharedAvailable;
   const viewerId = getCurrentUserId();
   const queryClient = useQueryClient();
-  // Per row with a reorder still settling: that write's version, and the last
-  // value the server confirmed (what a failed write falls back to).
-  const pending = useRef(new Map<string, number>());
-  const confirmed = useRef(new Map<string, string | undefined>());
   const apply = (id: string, pinnedAt: string) => {
     const base = findCachedConversationRow(queryClient, id)?.labels ?? {};
     patchPinnedCaches(
@@ -2022,37 +2016,24 @@ export function useReorderPinnedConversations() {
     );
   };
   return useMutation({
-    scope: { id: PIN_WRITE_SCOPE },
+    mutationKey: PIN_WRITE_MUTATION_KEY,
     mutationFn: (writes: { id: string; pinnedAt: number }[]) =>
       Promise.allSettled(writes.map((w) => setConversationPinned(w.id, true, w.pinnedAt))),
     onMutate: (writes) => {
-      const versions = writes.map((w) => {
-        if (!pending.current.has(w.id)) {
-          const cached = findCachedConversationRow(queryClient, w.id)?.labels?.[PINNED_LABEL_KEY];
-          confirmed.current.set(w.id, cached);
-        }
-        const version = bumpPinWriteVersion(w.id);
-        pending.current.set(w.id, version);
-        apply(w.id, String(w.pinnedAt));
-        return version;
-      });
-      return { versions };
+      refuseOverlappingPinWrite(queryClient);
+      const previous = writes.map(
+        (w) => findCachedConversationRow(queryClient, w.id)?.labels?.[PINNED_LABEL_KEY],
+      );
+      for (const w of writes) apply(w.id, String(w.pinnedAt));
+      return { previous };
     },
     onSuccess: (results, writes, ctx) => {
       results.forEach((result, index) => {
-        const { id } = writes[index];
-        const version = ctx?.versions[index];
-        if (result.status === "fulfilled") {
-          confirmed.current.set(id, result.value.labels[PINNED_LABEL_KEY]);
-        }
-        const value = confirmed.current.get(id);
-        if (pending.current.get(id) === version) {
-          pending.current.delete(id);
-          confirmed.current.delete(id);
-        }
-        // A newer pin, unpin, or reorder of this row owns its cached state.
-        if (pinWriteVersions.get(id) !== version) return;
-        if (value !== undefined) apply(id, value);
+        const value =
+          result.status === "fulfilled"
+            ? result.value.labels[PINNED_LABEL_KEY]
+            : ctx?.previous[index];
+        if (value !== undefined) apply(writes[index].id, value);
       });
       if (results.some((r) => r.status === "rejected")) {
         showToast("Couldn't save the pinned order.");
