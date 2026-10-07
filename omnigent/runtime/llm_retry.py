@@ -185,8 +185,8 @@ def _classify_http_error(
     """
     Classify an HTTP status error as retryable or permanent.
 
-    HTTP 400 is checked for context-window overflow before the
-    generic retryable/permanent split. This allows the executor's
+    HTTP 400 and 413 are checked for context-window overflow before
+    the generic retryable/permanent split. This allows the executor's
     retry logic to surface ``ContextWindowExceededError`` so the
     workflow can compact and retry.
 
@@ -202,9 +202,9 @@ def _classify_http_error(
     code = str(status)
     message = f"LLM returned HTTP {status}: {body}"
 
-    # HTTP 400 may be a context-window overflow — check before
-    # the generic split so the workflow can compact-retry.
-    if status == 400:
+    # HTTP 400, or a 413 byte-cap rejection from the edge, may be a context
+    # overflow — check before the generic split so the workflow can compact.
+    if status in (400, 413):
         overflow = _detect_context_overflow(body)
         if overflow is not None:
             return ContextWindowExceededError(

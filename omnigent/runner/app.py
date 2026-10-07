@@ -734,11 +734,9 @@ def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
         return None
     error = cast(_JsonObject, event.get("error", {}))
     msg = str(error.get("message", "")).lower()
-    # A deployment byte-cap rejection (e.g. the Databricks Apps front door)
-    # reports bytes (request first, limit second). Parse them specifically,
-    # ahead of the generic pattern gate, so the request/limit pair isn't
-    # inverted by the numeric fallback below and a size-less content-length
-    # phrase stays generic like the native classifier. Express them as tokens.
+    # Parse byte-cap rejections (request first, limit second) ahead of the
+    # generic gate so the numeric fallback can't invert the pair; size-less
+    # content-length phrases stay generic. Sizes are expressed as tokens.
     size_overflow = detect_request_size_overflow(msg)
     if size_overflow is not None:
         return size_overflow.approx_limit_tokens, size_overflow.approx_request_tokens

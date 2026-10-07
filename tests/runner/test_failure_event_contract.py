@@ -204,8 +204,6 @@ async def test_content_length_cap_failure_is_normalized_to_context_overflow() ->
     # The raw rejection — including its RequestSize/Limit bytes — survives
     # normalization rather than being replaced by a token-count approximation,
     # so the expandable detail still names the real cause.
-    # (_assert_failure_on_both_streams already checks the direct and queued
-    # failures are identical, so this retention holds on both streams.)
     assert "exceeds maximum allowed content length" in error["message"]
     assert "RequestSize(bytes): 33967957" in error["message"]
     assert "Limit(bytes): 33554432" in error["message"]

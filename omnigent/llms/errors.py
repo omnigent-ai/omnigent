@@ -55,15 +55,14 @@ def is_context_length_exceeded(exc: BaseException) -> bool:
     return False
 
 
-# Databricks front-door rejection of an oversized request body, e.g.
-# ``Server received a request which exceeds maximum allowed content length.
-# RequestSize(bytes): 33967957, Limit(bytes): 33554432``. The edge rejects
-# the request before the model sees it, so the sizes are bytes, not tokens.
-_REQUEST_SIZE_OVERFLOW = re.compile(
-    r"exceeds maximum allowed content length.*?"
-    r"RequestSize\(bytes\):\s*(\d+).*?Limit\(bytes\):\s*(\d+)",
-    re.IGNORECASE | re.DOTALL,
+# Databricks front-door rejection of an oversized request body; sizes are
+# bytes, not tokens. Scanned field-by-field, not with one combined wildcard
+# regex, whose nested ``.*?`` under ``DOTALL`` backtracks on hostile input.
+_CONTENT_LENGTH_PHRASE = re.compile(
+    r"exceeds maximum allowed content length", re.IGNORECASE
 )
+_REQUEST_SIZE_FIELD = re.compile(r"RequestSize\(bytes\):\s*(\d+)", re.IGNORECASE)
+_LIMIT_SIZE_FIELD = re.compile(r"Limit\(bytes\):\s*(\d+)", re.IGNORECASE)
 
 # Rough bytes-per-token ratio for expressing a byte-cap rejection in the
 # token units the context-overflow plumbing carries.
@@ -106,12 +105,18 @@ def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
         response body or a harness-reported failure string.
     :returns: The parsed sizes, or ``None`` when *message* does not match.
     """
-    match = _REQUEST_SIZE_OVERFLOW.search(message)
-    if match is None:
+    phrase = _CONTENT_LENGTH_PHRASE.search(message)
+    if phrase is None:
+        return None
+    request = _REQUEST_SIZE_FIELD.search(message, phrase.end())
+    if request is None:
+        return None
+    limit = _LIMIT_SIZE_FIELD.search(message, request.end())
+    if limit is None:
         return None
     return RequestSizeOverflow(
-        request_bytes=int(match.group(1)),
-        limit_bytes=int(match.group(2)),
+        request_bytes=int(request.group(1)),
+        limit_bytes=int(limit.group(1)),
     )
 
 

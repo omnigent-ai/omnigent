@@ -785,6 +785,10 @@ async def test_context_overflow_content_length_cap_pattern(
         f"Expected actual=33967957//4, got {exc_info.value.actual_tokens}."
     )
     assert exc_info.value.code == "context_length_exceeded"
+    # The original rejection body is preserved verbatim for the UI detail,
+    # not replaced by the token approximation.
+    assert exc_info.value.detail is not None
+    assert exc_info.value.detail.response_body == databricks_body
 
 
 @pytest.mark.asyncio

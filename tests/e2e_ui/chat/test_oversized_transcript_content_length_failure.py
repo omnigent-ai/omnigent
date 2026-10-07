@@ -1,24 +1,16 @@
-"""An oversized session's turn (and its fork's) fail with the byte-cap error.
+"""Native byte-cap failures render the context-overflow headline, not a generic error.
 
-Journey: a session's transcript grows large enough that a request carrying it
-exceeds the deployment's content-length cap
-(``RequestSize(bytes): 33967957, Limit(bytes): 33554432``). The turn fails with
-a ``BAD_REQUEST`` "exceeds maximum allowed content length" error, every
-subsequent turn re-hits the same cap, and forking inherits the failure because
-the fork deep-copies the same oversized transcript. The failure must classify
-as a context-window overflow — the error pill's headline reads "The
-conversation grew past the model's context window." — not as a generic
-unrecognized turn error, so the user is pointed at compaction instead of a
-dead end.
+Journey: a turn (and its fork's) fails with the Databricks front-door "exceeds
+maximum allowed content length" rejection
+(``RequestSize(bytes): 33967957, Limit(bytes): 33554432``). It must classify as
+a context-window overflow — pill headline "The conversation grew past the
+model's context window." — so the user is pointed at compaction, not a dead end.
 
-Environment fidelity: the ``33554432``-byte (32 MiB) limit is the Databricks
-Apps front-door content-length cap and is NOT present in the omnigent codebase
-(the only omnigent analog is the 10 MiB ``_SessionEventBodyLimitRoute`` on
-``POST /v1/sessions/{id}/events``). This test therefore stands in for the
-Databricks host: it seeds a genuinely oversized (>33554432-byte) transcript so
-the "large session" precondition and the fork's copied history are real, forks
-it through the real UI fork action, and drives the failed turn through the real
-native-forwarder failed-status path carrying the exact reported error string.
+Environment fidelity: the 32 MiB cap is the Databricks Apps front-door limit,
+absent from this codebase, so the test stands in for that host — it seeds a
+genuinely oversized transcript, forks it through the real UI action, and drives
+the failed turn through the real native-forwarder failed-status path carrying
+the exact reported error string.
 """
 
 from __future__ import annotations
