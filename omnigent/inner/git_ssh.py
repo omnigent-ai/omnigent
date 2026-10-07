@@ -255,10 +255,19 @@ def _stop_ssh_group(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=2)
 
 
-class _GitSshServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-    allow_reuse_address = False
-    broker: GitSshBroker
+if sys.platform == "win32":
+
+    class _GitSshServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True
+        allow_reuse_address = False
+        broker: GitSshBroker
+
+else:
+
+    class _GitSshServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+        allow_reuse_address = False
+        broker: GitSshBroker
 
 
 class _GitSshHandler(socketserver.BaseRequestHandler):
@@ -322,6 +331,8 @@ class GitSshBroker:
     """Per-sandbox Unix-socket service that holds the SSH authority in the parent."""
 
     def __init__(self, bindings: Sequence[GitSshBinding], socket_path: Path) -> None:
+        if sys.platform == "win32":
+            raise GitSshDenied("Git SSH broker requires a Unix sandbox backend")
         self.bindings = tuple(normalize_git_ssh_bindings(bindings))
         self.socket_path = socket_path
         self._server = _GitSshServer(str(socket_path), _GitSshHandler)
