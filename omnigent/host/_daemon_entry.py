@@ -60,6 +60,7 @@ def main() -> None:
 
     from omnigent.host.daemon_lifecycle import (
         DAEMON_CONFIG_SIG_ENV_VAR,
+        DAEMON_LAUNCH_ID_ENV_VAR,
         DaemonLifecycleLock,
         HostDaemonRecord,
         normalize_daemon_target,
@@ -90,6 +91,7 @@ def main() -> None:
             started_at=int(time.time()),
             host_id=identity.host_id,
             config_sig=os.environ.get(DAEMON_CONFIG_SIG_ENV_VAR),
+            launch_id=os.environ.get(DAEMON_LAUNCH_ID_ENV_VAR) or None,
         )
         write_daemon_record(record, update_legacy_pidfile=True)
 

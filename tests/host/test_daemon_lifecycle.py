@@ -13,6 +13,7 @@ import pytest
 from omnigent.host import connect
 from omnigent.host.connect import HostProcess
 from omnigent.host.daemon_lifecycle import (
+    DAEMON_LAUNCH_ID_ENV_VAR,
     DaemonLifecycleLock,
     HostDaemonRecord,
     daemon_record_path,
@@ -76,6 +77,8 @@ def test_find_daemon_record_reuses_legacy_url_spelling(
         started_at=100,
     )
     cli._write_daemon_record(legacy_record)
+    record_json = json.loads(daemon_record_path(legacy_target, base_dir=tmp_path).read_text())
+    assert "launch_id" not in record_json
 
     canonical_target = normalize_daemon_target("https://x.example.com/api")
     found = cli._find_daemon_record(canonical_target)
@@ -224,6 +227,7 @@ def test_background_daemon_claims_record_before_connecting(
     log_path = tmp_path / "host.log"
     monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
     monkeypatch.setenv("OMNIGENT_HOST_DAEMON_CONFIG_SIG", "config-signature")
+    monkeypatch.setenv(DAEMON_LAUNCH_ID_ENV_VAR, "launch-123")
     monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--server", target])
     monkeypatch.setattr(
         "omnigent.process_logging.configure_process_logging", lambda *_a, **_kw: log_path
@@ -249,6 +253,7 @@ def test_background_daemon_claims_record_before_connecting(
     assert payload["pid"] == os.getpid()
     assert payload["host_id"] == "host_elected"
     assert payload["config_sig"] == "config-signature"
+    assert payload["launch_id"] == "launch-123"
     assert connected == [f"{target}|{target}"]
     assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is False
 

@@ -38,6 +38,7 @@ _logger = logging.getLogger(__name__)
 
 _LOCAL_DAEMON_MARKER = "local"
 DAEMON_CONFIG_SIG_ENV_VAR = "OMNIGENT_HOST_DAEMON_CONFIG_SIG"
+DAEMON_LAUNCH_ID_ENV_VAR = "OMNIGENT_HOST_DAEMON_LAUNCH_ID"
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class HostDaemonRecord:
     :param host_id: Stable host id advertised to the server.
     :param resolved_server_url: Concrete URL owned by a local-mode daemon.
     :param config_sig: Signature of server-affecting launch configuration.
+    :param launch_id: Per-launch owner id used to distinguish concurrent spawns.
     """
 
     pid: int
@@ -64,6 +66,7 @@ class HostDaemonRecord:
     host_id: str | None = None
     resolved_server_url: str | None = None
     config_sig: str | None = None
+    launch_id: str | None = None
 
 
 def normalize_daemon_target(server_url: str | None) -> str:
@@ -134,7 +137,10 @@ def write_daemon_record(
     root = base_dir if base_dir is not None else data_dir()
     path = daemon_record_path(record.target, base_dir=root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True) + "\n")
+    payload = asdict(record)
+    if record.launch_id is None:
+        payload.pop("launch_id", None)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     if update_legacy_pidfile:
         (root / "host.pid").write_text(f"{record.pid}\n{record.target}\n")
 

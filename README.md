@@ -484,6 +484,38 @@ omnigent login https://your-host    # sign in once; run / attach / host reuse th
 omnigent host  https://your-host    # new sessions can now run on this machine
 ```
 
+#### Wrapping the background host daemon
+
+Deployments that manage host processes themselves can set
+`OMNIGENT_HOST_DAEMON_COMMAND` to a JSON array of argv-prefix strings, for
+example:
+
+```bash
+OMNIGENT_HOST_DAEMON_COMMAND='["/path/to/supervisor", "--"]' omnigent start
+```
+
+Omnigent appends the ordinary `_daemon_entry` invocation and only its target
+arguments (`--local`, or `--server <url>`). The value is passed to
+`subprocess.Popen` as argv with shell execution disabled, so it must be a
+nonempty JSON array of nonblank strings without NUL characters; malformed
+values fail before a process is spawned. An unset or blank value keeps the
+standard launcher exactly. The wrapper owns any supervision and should start
+the appended child while preserving its signals; the child continues to own
+the host registry identity and the normal host log. The default registry-claim
+budget is 10 seconds, extended to a bounded 60 seconds for a configured
+wrapper. Omnigent also passes the non-secret per-launch ownership marker
+`OMNIGENT_HOST_DAEMON_LAUNCH_ID`; wrappers must preserve it for the child, and
+it is never used as an authentication credential.
+Downstream integrations can probe support with
+`omnigent.host.daemon_launch.HOST_DAEMON_COMMAND_SUPPORTED` or
+`supports_host_daemon_command()` instead of guessing from a version.
+Wrapped mode is supported on POSIX hosts with owned process groups; Windows
+reports the capability as unsupported and rejects a nonblank wrapper value.
+
+This contract covers automatic background launches from `run`,
+`host --background`, and `start`. `host enable` continues to use its existing
+OS-service `service_entry` command.
+
 > [!TIP]
 > On your own network you don't need a deploy. Open your machine's LAN
 > address on your phone (e.g. `http://192.168.x.x:6767`).

@@ -110,6 +110,7 @@ def _patch_daemon_spawn(
                 started_at=int(cli.time.time()),
                 host_id=cli._load_existing_host_id(),
                 config_sig=str(env[cli.DAEMON_CONFIG_SIG_ENV_VAR]),
+                launch_id=spawned.launch_id,
             )
         )
         cli._HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
@@ -130,6 +131,7 @@ def _write_daemon_registry_record(
     host_id: str | None = "host_abc",
     config_sig: str | None = None,
     resolved_server_url: str | None = None,
+    launch_id: str | None = None,
 ) -> None:
     """Write a daemon registry JSON fixture.
 
@@ -148,27 +150,25 @@ def _write_daemon_registry_record(
         ``"3f9a1c2b4d5e6f70"``, or ``None`` for a legacy record.
     :param resolved_server_url: Concrete local server URL, e.g.
         ``"http://127.0.0.1:8123"``, or ``None``.
+    :param launch_id: Optional per-launch ownership marker.
     """
     digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
     path = tmp_path / "daemons" / f"{digest}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "pid": pid,
-                "target": target,
-                "mode": mode,
-                "server_url": server_url,
-                "log_path": log_path,
-                "started_at": started_at,
-                "host_id": host_id,
-                "resolved_server_url": resolved_server_url,
-                "config_sig": config_sig,
-            },
-            sort_keys=True,
-        )
-        + "\n"
-    )
+    payload = {
+        "pid": pid,
+        "target": target,
+        "mode": mode,
+        "server_url": server_url,
+        "log_path": log_path,
+        "started_at": started_at,
+        "host_id": host_id,
+        "resolved_server_url": resolved_server_url,
+        "config_sig": config_sig,
+    }
+    if launch_id is not None:
+        payload["launch_id"] = launch_id
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n")
 
 
 def test_ensure_host_daemon_remote_spawns_server_flag(
@@ -794,6 +794,52 @@ def test_ensure_host_daemon_stops_spawned_daemon_that_never_claims(
     assert "did not claim its registry record" in str(excinfo.value)
     assert str(log_path) in str(excinfo.value)
     assert stopped == [4242]
+
+
+def test_delete_spawned_daemon_record_preserves_concurrent_winner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Timeout cleanup removes this launch only, never a different launch's record."""
+    target = "https://server.example.com"
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    winner = cli._HostDaemonRecord(
+        pid=5151,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=str(tmp_path / "winner.log"),
+        started_at=1,
+        launch_id="winner-launch",
+    )
+    cli._write_daemon_record(winner)
+    cli._HOST_PID_PATH.write_text(f"{winner.pid}\n{target}\n")
+
+    spawned = cli._SpawnedDaemonProcess(
+        pid=4242,
+        log_path=str(tmp_path / "ours.log"),
+        launch_id="ours-launch",
+    )
+    cli._delete_spawned_daemon_record(target, spawned)
+
+    assert cli._find_daemon_record(target) == winner
+    assert cli._HOST_PID_PATH.exists()
+
+    ours = cli._HostDaemonRecord(
+        pid=4242,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=spawned.log_path,
+        started_at=2,
+        launch_id=spawned.launch_id,
+    )
+    cli._write_daemon_record(ours)
+    cli._HOST_PID_PATH.write_text(f"{ours.pid}\n{target}\n")
+    cli._delete_spawned_daemon_record(target, spawned)
+
+    assert cli._find_daemon_record(target) is None
+    assert not cli._HOST_PID_PATH.exists()
 
 
 def test_ensure_host_daemon_stops_spawned_daemon_on_identity_mismatch(
@@ -1691,6 +1737,7 @@ def test_host_status_json_reports_daemon_host_and_sessions(
         mode="server",
         server_url="https://server.example.com",
         log_path="/tmp/daemon.log",
+        launch_id="managed-launch",
     )
 
     runner_status_calls: list[str] = []
@@ -1735,6 +1782,7 @@ def test_host_status_json_reports_daemon_host_and_sessions(
     assert result.exit_code == 0, result.output
     assert '"target": "https://server.example.com"' in result.output
     assert '"host_status": "online"' in result.output
+    assert '"launch_id": "managed-launch"' in result.output
     assert '"id": "conv_owned"' in result.output
     assert '"runner_online": true' in result.output
     assert '"id": "conv_other"' not in result.output
@@ -1773,6 +1821,7 @@ def test_host_status_reports_unreachable_daemon_without_traceback(
     assert "mode=server" in result.output
     assert "pid=4242" in result.output
     assert "Traceback" not in result.output
+    assert '"launch_id"' not in result.output
 
 
 def test_host_status_wide_terminal_shows_full_session_and_runner_ids() -> None:

@@ -9,13 +9,21 @@ The daemon owns the runner lifecycle — the CLI only connects.
 
 Harness-agnostic on purpose: the same launch path serves headless
 ``run`` agents and the ``claude``/``codex`` terminal wrappers.
+
+The :func:`host_daemon_command` helper also defines the public background-host
+launcher contract. ``OMNIGENT_HOST_DAEMON_COMMAND`` may contain a JSON argv
+prefix for a deployment-owned wrapper; the wrapper receives the ordinary
+``_daemon_entry`` command as its remaining argv and no shell is involved.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterator
+import os
+import sys
+from collections.abc import Iterator, Mapping
+from typing import cast
 
 import click
 import httpx
@@ -31,6 +39,71 @@ DAEMON_POLL_INTERVAL_S = 0.5
 # off to the steady cadence for the long tail.
 DAEMON_POLL_INITIAL_INTERVAL_S = 0.1
 DAEMON_POLL_BACKOFF_FACTOR = 1.5
+
+# Public contract for deployment-owned wrappers around the background host.
+HOST_DAEMON_COMMAND_ENV_VAR = "OMNIGENT_HOST_DAEMON_COMMAND"
+HOST_DAEMON_COMMAND_SUPPORTED = os.name != "nt"
+
+
+def supports_host_daemon_command() -> bool:
+    """Return whether this build supports ``HOST_DAEMON_COMMAND_ENV_VAR``."""
+    return HOST_DAEMON_COMMAND_SUPPORTED
+
+
+def host_daemon_command(
+    server_url: str | None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Build the argv used to launch a background host daemon.
+
+    When :data:`HOST_DAEMON_COMMAND_ENV_VAR` is unset or blank, the result is
+    the normal Python module invocation. When set, its value must be a JSON
+    array of nonblank strings; those strings are prepended to the normal
+    invocation. The returned argv is intended for ``subprocess.Popen`` with
+    shell execution disabled.
+
+    :param server_url: Server URL for remote mode, or ``None`` / ``""`` for
+        local mode.
+    :param env: Environment to read, defaulting to :data:`os.environ`.
+    :returns: An argv list containing the optional wrapper prefix and the
+        standard daemon entry point.
+    :raises ValueError: If the configured value is not a valid argv prefix or
+        any command argument contains NUL.
+    """
+    effective_env = os.environ if env is None else env
+    raw_prefix = effective_env.get(HOST_DAEMON_COMMAND_ENV_VAR)
+    if raw_prefix is None or (isinstance(raw_prefix, str) and not raw_prefix.strip()):
+        prefix: list[str] = []
+    else:
+        if not HOST_DAEMON_COMMAND_SUPPORTED:
+            raise ValueError(
+                f"{HOST_DAEMON_COMMAND_ENV_VAR} wrapper mode requires POSIX process groups"
+            )
+        if not isinstance(raw_prefix, str):
+            raise ValueError(f"{HOST_DAEMON_COMMAND_ENV_VAR} must be a JSON array of argv strings")
+        try:
+            parsed_prefix = json.loads(raw_prefix)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"{HOST_DAEMON_COMMAND_ENV_VAR} must be a JSON array of argv strings"
+            ) from exc
+        if not isinstance(parsed_prefix, list) or not parsed_prefix:
+            raise ValueError(f"{HOST_DAEMON_COMMAND_ENV_VAR} must be a nonempty JSON array")
+        if any(
+            not isinstance(argument, str) or not argument.strip() or "\x00" in argument
+            for argument in parsed_prefix
+        ):
+            raise ValueError(
+                f"{HOST_DAEMON_COMMAND_ENV_VAR} must contain only nonblank strings without NUL"
+            )
+        prefix = cast(list[str], parsed_prefix)
+
+    mode_args = ["--local"] if not server_url else ["--server", server_url]
+    command = [sys.executable, "-P", "-m", "omnigent.host._daemon_entry", *mode_args]
+    if any("\x00" in argument for argument in command):
+        raise ValueError("host daemon command arguments cannot contain NUL")
+    return [*prefix, *command]
 
 
 def daemon_poll_intervals() -> Iterator[float]:
