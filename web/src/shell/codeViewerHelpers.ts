@@ -1,5 +1,5 @@
 // Pure helpers for CodeViewer: file-type detection and DOM→offset mapping.
-// No React imports - these are plain functions, easy to unit-test in isolation.
+// No React imports — these are plain functions, easy to unit-test in isolation.
 
 import type { BundledLanguage } from "shiki";
 import type { ResolvedThemeMode } from "@/components/theme/themeMode";
@@ -14,7 +14,7 @@ import { findTag } from "./htmlTagScan";
  * file content and the verbatim anchor substring.
  *
  * Exported from here so CodeViewer, CommentsPanel, MonacoDiffViewer, and
- * FileViewer all reference the same shape - no duplicate local definitions.
+ * FileViewer all reference the same shape — no duplicate local definitions.
  */
 export interface ActiveSelection {
   start_index: number;
@@ -27,12 +27,12 @@ export interface ActiveSelection {
 /**
  * Auto-save lifecycle, surfaced from the editor up to the FileViewer toolbar
  * status chip (the editor no longer renders its own Save button).
- *   • idle    - clean, nothing to show.
- *   • unsaved - dirty and online; an auto-save is debouncing (user is typing).
- *   • saving  - a write is in flight.
- *   • saved   - write just landed; transient, the chip clears itself.
- *   • error   - the last write failed.
- *   • offline - dirty but the runner is down, so the save is deferred.
+ *   • idle    — clean, nothing to show.
+ *   • unsaved — dirty and online; an auto-save is debouncing (user is typing).
+ *   • saving  — a write is in flight.
+ *   • saved   — write just landed; transient, the chip clears itself.
+ *   • error   — the last write failed.
+ *   • offline — dirty but the runner is down, so the save is deferred.
  */
 export type SaveStatus = "idle" | "unsaved" | "saving" | "saved" | "error" | "offline";
 
@@ -154,7 +154,7 @@ export function isPdfFile(path: string, contentType?: string | null): boolean {
 }
 
 // 3D model formats we render in an interactive WebGL preview (three.js). Scoped
-// deliberately to the three loaders we ship - STL, 3MF, OBJ - and nothing else.
+// deliberately to the three loaders we ship — STL, 3MF, OBJ — and nothing else.
 export type ModelFormat = "stl" | "3mf" | "obj";
 
 // Model file extensions → the loader format they select.
@@ -167,7 +167,7 @@ const MODEL_EXTENSION_FORMATS: Record<string, ModelFormat> = {
 // MIME types servers commonly report for these formats → the loader format.
 // Extension-driven `guess_type` and some toolchains disagree on the canonical
 // value (STL in particular has several historical types), so match a small
-// explicit set rather than a `model/` prefix - `model/gltf+json` etc. are NOT
+// explicit set rather than a `model/` prefix — `model/gltf+json` etc. are NOT
 // in scope. Generic types (`application/octet-stream`, `text/plain`) are
 // deliberately absent so they fall through to the extension.
 const MODEL_CONTENT_TYPE_FORMATS: Record<string, ModelFormat> = {
@@ -184,12 +184,12 @@ const MODEL_CONTENT_TYPE_FORMATS: Record<string, ModelFormat> = {
  * it isn't a previewable model.
  *
  * This is the SINGLE source of truth shared by both the dispatch decision
- * (`isModelFile`) and the loader selection in `ModelViewer` - so what routes
+ * (`isModelFile`) and the loader selection in `ModelViewer` — so what routes
  * into the viewer is exactly what the parser accepts, with no divergence.
  *
  * MIME-first: a recognized model content type wins and picks the loader
  * (handles files with missing or misleading extensions). Falls back to the
- * file extension otherwise - which is what carries the ambiguous cases, since
+ * file extension otherwise — which is what carries the ambiguous cases, since
  * binary STL/3MF are often served as `application/octet-stream` and ASCII OBJ
  * as `text/plain` (neither of which is a model MIME).
  */
@@ -223,12 +223,12 @@ export function isModelFile(path: string, contentType?: string | null): boolean 
  * (`0xRRGGBB`), and the values track the app's `--background`/`--foreground`
  * tokens so the canvas sits flush with the surrounding panel in both modes.
  *
- *   • `background`       - canvas clear color (the panel background per mode).
- *   • `stlMaterial`      - default surface for STL (which carries no material);
+ *   • `background`       — canvas clear color (the panel background per mode).
+ *   • `stlMaterial`      — default surface for STL (which carries no material);
  *                          a mid-grey that reads against the mode's background.
- *   • `ambientIntensity` - hemisphere fill; higher in dark so the mesh stays
+ *   • `ambientIntensity` — hemisphere fill; higher in dark so the mesh stays
  *                          legible against the dark background.
- *   • `keyIntensity`     - directional key light, likewise boosted in dark.
+ *   • `keyIntensity`     — directional key light, likewise boosted in dark.
  */
 export interface ModelViewerTheme {
   background: number;
@@ -363,16 +363,16 @@ export function detectLang(path: string): BundledLanguage | "text" {
 /**
  * Sandbox flags for the HTML artifact preview iframe.
  *
- * - `allow-scripts` - run the page's JavaScript (without this, JS in rendered
- *   HTML is silently dropped - see issue #778).
- * - `allow-popups` + `allow-popups-to-escape-sandbox` - let links/`window.open`
+ * - `allow-scripts` — run the page's JavaScript (without this, JS in rendered
+ *   HTML is silently dropped — see issue #778).
+ * - `allow-popups` + `allow-popups-to-escape-sandbox` — let links/`window.open`
  *   open a new browsing context that is NOT itself sandboxed, so clicking a
  *   link actually navigates a real tab (see issue #777).
- * - `allow-forms` / `allow-modals` - typical interactive artifacts submit forms
+ * - `allow-forms` / `allow-modals` — typical interactive artifacts submit forms
  *   and call `alert`/`confirm`.
  *
  * NOTE: we deliberately omit `allow-same-origin`. The iframe is fed via
- * `srcDoc`, which would otherwise inherit the embedder's origin - combining
+ * `srcDoc`, which would otherwise inherit the embedder's origin — combining
  * that with `allow-scripts` would let untrusted artifact code reach into the
  * parent app (cookies, storage, DOM). Withholding it gives the document an
  * opaque origin, so scripts run fully sandboxed away from the host page.
@@ -392,7 +392,7 @@ export const HTML_PREVIEW_SANDBOX =
  * embedder, so with `<base target="_blank">` the host page would open in a new window.
  * A capture-phase listener on `window` only arranges for `finish` to run last: a
  * listener added to `window` during a dispatch joins the end of its bubble-phase list,
- * so every handler the artifact registered beforehand - at any level, by any means -
+ * so every handler the artifact registered beforehand — at any level, by any means —
  * has run and may have cancelled the click before the preview decides, and none of
  * them sees a modified event, element or document. `finish` then navigates this
  * document to the fragment, which scrolls, styles `:target`, fires `hashchange` and
@@ -479,7 +479,7 @@ export function prepareHtmlPreviewDoc(html: string): string {
     return `${html.slice(0, htmlEnd)}<head>${HTML_PREVIEW_HEAD}</head>${html.slice(htmlEnd)}`;
   }
 
-  // Bare fragment (no <html>/<head>, hence no doctype to displace) - the browser
+  // Bare fragment (no <html>/<head>, hence no doctype to displace) — the browser
   // wraps it in an implicit head, so leading head markup is safe.
   if (html.startsWith(HTML_PREVIEW_HEAD)) return html;
   return HTML_PREVIEW_HEAD + html;
@@ -929,12 +929,12 @@ export async function loadDesignKit(
  * Open an HTML artifact in its own browser tab, isolated from the host app.
  *
  * Renders the (untrusted, agent-generated) artifact inside a sandboxed iframe
- * within a blank, app-controlled tab, so it runs in an opaque origin - the same
+ * within a blank, app-controlled tab, so it runs in an opaque origin — the same
  * isolation as the in-app preview, just full-window. We deliberately do NOT use
  * a `blob:` or `data:` document: a top-level page there inherits the app's own
  * origin, which would let artifact JS read the app's storage and issue
  * credentialed same-origin requests to our API. The sandboxed-iframe shell
- * avoids that - the artifact cannot reach this shell tab, its `window.opener`,
+ * avoids that — the artifact cannot reach this shell tab, its `window.opener`,
  * or the host app.
  *
  * `opener` is injectable so this is unit-testable without a real browser window.
@@ -984,9 +984,9 @@ function findLineElement(node: Node, container: HTMLElement): HTMLElement | null
  * Compute absolute character offsets for a DOM `Range` within a code
  * container whose line elements carry `data-line` attributes.
  *
- * The within-line column offset is derived from DOM geometry -
+ * The within-line column offset is derived from DOM geometry —
  * `preRange.toString().length` counts the characters before the selection
- * boundary inside the line element - so duplicate text on the same line is
+ * boundary inside the line element — so duplicate text on the same line is
  * handled correctly without any string searching.
  *
  * Returns `null` if either boundary can't be resolved to a `data-line`

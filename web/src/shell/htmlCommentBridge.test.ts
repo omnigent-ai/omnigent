@@ -15,7 +15,7 @@ import {
 } from "./htmlCommentBridge";
 
 // ---------------------------------------------------------------------------
-// injectCommentBridge  -  script/style placement (mirrors prepareHtmlPreviewDoc)
+// injectCommentBridge — script/style placement (mirrors prepareHtmlPreviewDoc)
 // ---------------------------------------------------------------------------
 
 describe("injectCommentBridge", () => {
@@ -87,7 +87,7 @@ describe("injectCommentBridge", () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseBridgeMessage  -  inbound validation (guards against spoofed postMessage)
+// parseBridgeMessage — inbound validation (guards against spoofed postMessage)
 // ---------------------------------------------------------------------------
 
 describe("parseBridgeMessage", () => {
@@ -180,7 +180,7 @@ describe("parseBridgeMessage", () => {
 });
 
 // ---------------------------------------------------------------------------
-// findAnchorInSource  -  rendered selection text -> raw HTML source offsets
+// findAnchorInSource — rendered selection text -> raw HTML source offsets
 // ---------------------------------------------------------------------------
 
 describe("findAnchorInSource", () => {
@@ -217,7 +217,7 @@ describe("findAnchorInSource", () => {
   });
 
   it("resolves the requested occurrence for repeated text", () => {
-    // "Aurora Sync" as a title, then again in body prose  -  selecting the body
+    // "Aurora Sync" as a title, then again in body prose — selecting the body
     // copy (occurrence 1) must anchor to the SECOND match, not the first.
     const src = "<h1>Aurora Sync</h1><p>Aurora Sync keeps state.</p>";
     const first = src.indexOf("Aurora Sync");
@@ -244,7 +244,7 @@ describe("findAnchorInSource", () => {
   it("anchors occurrence 0 to the wrapped first copy, not a later verbatim one", () => {
     // Regression: the old occurrence-0 fast path used a verbatim indexOf, which
     // skipped the whitespace-wrapped first rendered copy and landed on the
-    // second (verbatim) one  -  storing the comment at the wrong offset.
+    // second (verbatim) one — storing the comment at the wrong offset.
     const src = "<p>then\n   latency</p><p>then latency</p>";
     const firstWrapped = src.indexOf("then\n   latency");
     const res = findAnchorInSource(src, "then latency", 0);
@@ -280,11 +280,11 @@ describe("findAnchorInSource", () => {
 });
 
 // ---------------------------------------------------------------------------
-// anchorOccurrence  -  which copy of repeated anchor text a comment refers to
+// anchorOccurrence — which copy of repeated anchor text a comment refers to
 // ---------------------------------------------------------------------------
 
 describe("anchorOccurrence", () => {
-  // A title reused verbatim in the body  -  the exact case that highlighted both.
+  // A title reused verbatim in the body — the exact case that highlighted both.
   const src = "<h1>Aurora Sync</h1><p>Aurora Sync keeps state.</p>";
   const first = src.indexOf("Aurora Sync");
   const second = src.indexOf("Aurora Sync", first + 1);

@@ -108,10 +108,10 @@ const WireframeViewer = lazy(() =>
 );
 
 // ---------------------------------------------------------------------------
-// MarkdownPreview - read-only render of Markdown content via react-markdown + GFM
+// MarkdownPreview — read-only render of Markdown content via react-markdown + GFM
 // ---------------------------------------------------------------------------
 
-// Width of the line-number gutter - must match the `w-12` Tailwind class on the gutter div.
+// Width of the line-number gutter — must match the `w-12` Tailwind class on the gutter div.
 const GUTTER_WIDTH = 48;
 const EMPTY_COMMENTS: Comment[] = [];
 
@@ -136,8 +136,8 @@ const ALERT_CLASS = /^markdown-alert(-\w+)?$/;
 const ALERT_TITLE_CLASS = /^markdown-alert-title$/;
 // Extend the default (GitHub-derived) sanitize schema minimally: allow `class`
 // on the alert wrapper div (markdown-alert*) and its title p (markdown-alert-
-// title) only for those exact tokens. Everything else - <script>, event
-// handlers, javascript: URLs, arbitrary classes - is still stripped, so raw
+// title) only for those exact tokens. Everything else — <script>, event
+// handlers, javascript: URLs, arbitrary classes — is still stripped, so raw
 // HTML in a .md file stays safe to render inline. Keep hast-util-sanitize's
 // default `clobberPrefix: "user-content-"`: heading IDs derive from untrusted
 // markdown (rehype-slug), and the prefix keeps them from clobbering named DOM
@@ -154,13 +154,13 @@ const MARKDOWN_SANITIZE_SCHEMA = {
   },
 };
 
-// Markdown files routinely embed raw HTML that GitHub renders - <details>,
-// <sub>/<sup>, <kbd>, <br>, <div align>, inline <img> - which react-markdown
+// Markdown files routinely embed raw HTML that GitHub renders — <details>,
+// <sub>/<sup>, <kbd>, <br>, <div align>, inline <img> — which react-markdown
 // drops by default, showing the escaped tags as literal text. rehype-raw parses
 // that HTML; rehype-sanitize then strips anything unsafe (<script>, event
 // handlers, javascript: URLs) so this stays safe to render inline without an
 // iframe. Order matters: alerts transform before sanitize, slug adds IDs to
-// headings, and sanitize runs after raw parsing and GFM - only KaTeX comes
+// headings, and sanitize runs after raw parsing and GFM — only KaTeX comes
 // later, rendering math from the already-sanitized tree.
 const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   rehypeRaw,
@@ -175,8 +175,8 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
 
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
 // `width`/`height` *attributes* (presentational hints lose to any author CSS).
-// GitHub honors explicit dimensions, so mirror them onto an inline style -
-// which does win the cascade - for the one image being rendered. This runs
+// GitHub honors explicit dimensions, so mirror them onto an inline style —
+// which does win the cascade — for the one image being rendered. This runs
 // after sanitize (React components render the already-sanitized tree), so it
 // adds no attack surface. Only literal integer pixel values are forwarded.
 const MARKDOWN_COMPONENTS: Components = {
@@ -318,7 +318,7 @@ function PreviewWithSearch({
       {bar}
       {truncated && <TruncatedBanner />}
       {/* A truncated file can't be edited (or commented on) in the editor
-          either, so the hint would send the user to a dead end - suppress it. */}
+          either, so the hint would send the user to a dead end — suppress it. */}
       {commentHint && !truncated && (
         <PreviewCommentBanner
           conversationId={commentHint.conversationId}
@@ -331,7 +331,7 @@ function PreviewWithSearch({
 }
 
 // ---------------------------------------------------------------------------
-// ImageViewer - render an image file via a blob URL
+// ImageViewer — render an image file via a blob URL
 // ---------------------------------------------------------------------------
 
 // A subtle checkerboard so transparent regions of PNG/WebP/SVG are visible
@@ -354,7 +354,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
   // Create the object URL in an effect and revoke it on cleanup so the blob is
   // released when the file changes or the viewer unmounts (avoids a leak).
   useEffect(() => {
-    // A truncated image is a partial (corrupt) byte stream - mounting it would
+    // A truncated image is a partial (corrupt) byte stream — mounting it would
     // flash a broken-image icon before onError fires. Skip the blob and go
     // straight to the error/banner UI.
     if (data.truncated) {
@@ -402,7 +402,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
 }
 
 // ---------------------------------------------------------------------------
-// CodeViewer - syntax-highlighted file body with interleaved comment threads
+// CodeViewer — syntax-highlighted file body with interleaved comment threads
 // ---------------------------------------------------------------------------
 
 export interface CodeViewerProps {
@@ -430,7 +430,7 @@ export interface CodeViewerProps {
   viewMode: "editor" | "preview" | "source" | "diff";
   onDirtyChange?: (isDirty: boolean) => void;
   /**
-   * Forwarded to the Monaco editor only - it reports its auto-save lifecycle so
+   * Forwarded to the Monaco editor only — it reports its auto-save lifecycle so
    * FileViewer can render a status chip. The markdown editor carries its own
    * save status in its toolbar, so it doesn't use this.
    */
@@ -482,12 +482,12 @@ export function CodeViewer({
 
   const [tokenLines, setTokenLines] = useState<ThemedToken[][] | null>(null);
 
-  // Find-in-file state - hooks must appear before early returns.
+  // Find-in-file state — hooks must appear before early returns.
   const [searchQuery, setSearchQuery] = useState("");
   const [currentMatchIdx, setCurrentMatchIdx] = useState(0);
   const matchLineRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
-  // Floating "Add Comment" button state - viewport coordinates.
+  // Floating "Add Comment" button state — viewport coordinates.
   const [selectionAnchor, setSelectionAnchor] = useState<{
     x: number;
     y: number;
@@ -556,7 +556,7 @@ export function CodeViewer({
   }, [position, showMonaco, viewMode, fileQuery.isSuccess, rawLines]);
 
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
-  // composer reads - only the native coding-agent harnesses act on it, so
+  // composer reads — only the native coding-agent harnesses act on it, so
   // gate the button to them (same set as the "@"-mention feature).
   const sessionHarness = useChatStore((s) => s.sessionHarness);
   // ``!!path`` mirrors the Monaco hook's guard: without it an empty path would
@@ -686,7 +686,7 @@ export function CodeViewer({
       const range = sel.getRangeAt(0);
 
       if (sel.isCollapsed) {
-        // Plain click - gutter onClick handles its own comments; skip here.
+        // Plain click — gutter onClick handles its own comments; skip here.
         if ((e.target as Element).closest("[data-gutter-comment]")) return;
         // Check if the caret landed inside a comment range.
         if (container.contains(range.commonAncestorContainer)) {
@@ -709,7 +709,7 @@ export function CodeViewer({
         return;
       }
 
-      // Non-collapsed selection - show the "Add Comment" button.
+      // Non-collapsed selection — show the "Add Comment" button.
       if (!canEditRef.current) return;
       if (!container.contains(range.commonAncestorContainer)) return;
       const anchor_content = sel.toString();
@@ -734,7 +734,7 @@ export function CodeViewer({
 
   // Dismiss the floating buttons on any mousedown outside of them, or on any
   // scroll. Both the "Add comment" and "Attach to agent" buttons must be
-  // exempted from the mousedown dismiss - otherwise a click on "Attach to
+  // exempted from the mousedown dismiss — otherwise a click on "Attach to
   // agent" clears the anchor and unmounts the portal before its own onClick
   // runs. The buttons are ``position: fixed`` at captured viewport coords, so
   // a scroll leaves them hovering over unrelated lines while the anchor's
@@ -1123,7 +1123,7 @@ export function CodeViewer({
               )}
             >
               <div className="flex items-stretch">
-                {/* Gutter - line number; MessageCircleIcon when a comment starts here */}
+                {/* Gutter — line number; MessageCircleIcon when a comment starts here */}
                 <div
                   data-gutter-comment={commentOnLine ? true : undefined}
                   className={cn(
@@ -1147,7 +1147,7 @@ export function CodeViewer({
                   <span>{lineNum}</span>
                 </div>
 
-                {/* Line content - data-line attribute used for offset computation */}
+                {/* Line content — data-line attribute used for offset computation */}
                 <div
                   data-line={lineNum}
                   className="relative flex-1 overflow-hidden whitespace-pre-wrap break-all pl-3 py-0.5 leading-5"
@@ -1201,7 +1201,7 @@ export function CodeViewer({
         })}
       </div>
 
-      {/* Floating selection actions - rendered into document.body so that
+      {/* Floating selection actions — rendered into document.body so that
           CSS transforms on ancestor elements don't break fixed positioning. */}
       {selectionAnchor &&
         createPortal(

@@ -1,6 +1,6 @@
 // Comment-enabled HTML preview: renders agent-generated HTML in the same
 // sandboxed iframe as the read-only preview, but injects a bridge script so
-// users can select rendered text and attach review comments - parity with the
+// users can select rendered text and attach review comments — parity with the
 // Markdown (TipTap) and code (Monaco/Shiki) comment surfaces.
 //
 // The iframe stays sandboxed WITHOUT `allow-same-origin` (see HTML_PREVIEW_SANDBOX),
@@ -18,7 +18,7 @@ import { useHtmlCommentBridge } from "./useHtmlCommentBridge";
 
 interface HtmlCommentViewerProps {
   conversationId: string;
-  /** Raw HTML source - rendered in the iframe and searched for comment anchors. */
+  /** Raw HTML source — rendered in the iframe and searched for comment anchors. */
   content: string;
   truncated: boolean;
   comments: Comment[];

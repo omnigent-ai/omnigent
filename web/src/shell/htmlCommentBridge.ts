@@ -9,7 +9,7 @@
 //   So we inject a small, app-authored script into the iframe that reads the
 //   selection *inside* the frame and relays it over a private MessageChannel,
 //   and paints highlights *inside* the frame on command. The sandbox flags are
-//   unchanged  -  postMessage works fine across the opaque-origin boundary.
+//   unchanged — postMessage works fine across the opaque-origin boundary.
 //
 // Trust model:
 //   Post-handshake messages travel over a MessagePort that only the parent and
@@ -26,7 +26,7 @@
 import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
 import { findTag, tagAt, walkHtmlTags } from "./htmlTagScan";
 
-/** Protocol version  -  bump on any breaking change to the message shapes. */
+/** Protocol version — bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
 
 /** Tag stamped on every message so we ignore unrelated postMessage traffic. */
@@ -104,7 +104,7 @@ function isRect(r: unknown): r is BridgeRect {
 /**
  * Validate and narrow a raw message received from the iframe. Returns the typed
  * message on success, or `null` for anything that isn't a well-formed bridge
- * message carrying the expected `nonce`  -  guarding against arbitrary
+ * message carrying the expected `nonce` — guarding against arbitrary
  * postMessage traffic (including spoofs from artifact JS).
  *
  * @param data  The raw `MessageEvent.data`.
@@ -119,7 +119,7 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
       return { type: BRIDGE_MSG.ready };
     case BRIDGE_MSG.selection:
       if (typeof d.text === "string" && d.text.trim() !== "" && isRect(d.rect)) {
-        // occ is optional for resilience against older frames  -  default to the
+        // occ is optional for resilience against older frames — default to the
         // first occurrence, which is the pre-occurrence behavior.
         const occ = typeof d.occ === "number" && d.occ >= 0 ? d.occ : 0;
         return { type: BRIDGE_MSG.selection, text: d.text, occ, rect: d.rect };
@@ -190,11 +190,11 @@ function inNonRendered(index: number, ranges: [number, number][]): boolean {
 /**
  * Locate `anchor` (text selected in the *rendered* HTML) within the raw HTML
  * `source`, returning absolute character offsets so the comment anchors to the
- * source the agent actually edits  -  consistent with how Markdown/code comments
+ * source the agent actually edits — consistent with how Markdown/code comments
  * store offsets.
  *
  * Rendered prose may collapse whitespace the source spells out (newlines,
- * indentation between tags), so matching is always whitespace-tolerant  -  never
+ * indentation between tags), so matching is always whitespace-tolerant — never
  * a plain `indexOf`. `occurrence` picks which copy (document order, counting
  * only *rendered* regions) the caller selected; matches inside non-rendered
  * source (tags/attributes, comments, `<script>`/`<style>`/`<title>`) are skipped
@@ -225,15 +225,15 @@ export function findAnchorInSource(
       i += 1;
     }
   } catch {
-    // Pathological anchor produced an invalid pattern  -  fall through to null.
+    // Pathological anchor produced an invalid pattern — fall through to null.
   }
   return null;
 }
 
 /**
  * Which occurrence of `anchor` (0-based, document order) the comment at
- * `startIndex` refers to. Anchor text can repeat  -  e.g. a title and a body
- * paragraph both containing "Aurora Sync"  -  and the bridge highlights by text
+ * `startIndex` refers to. Anchor text can repeat — e.g. a title and a body
+ * paragraph both containing "Aurora Sync" — and the bridge highlights by text
  * match, so without this it would light up every copy. Counting the matches
  * before `startIndex` disambiguates to the one the user actually selected.
  *
@@ -267,7 +267,7 @@ export function anchorOccurrence(source: string, anchor: string, startIndex: num
 // The script that runs INSIDE the sandboxed iframe. Authored as a plain string
 // (no template interpolation / backticks) so it can be injected verbatim; the
 // per-mount nonce is substituted via `.replace` in buildBridgeScript(). Must be
-// dependency-free vanilla JS  -  it runs in the artifact's opaque-origin document.
+// dependency-free vanilla JS — it runs in the artifact's opaque-origin document.
 const BRIDGE_SCRIPT_BODY = `(function () {
   var NONCE = "__OMNI_NONCE__";
   var SRC = "__OMNI_SRC__";
@@ -323,7 +323,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
   // Whitespace-normalized view of a string: runs of whitespace collapse to a
   // single space, with a map from each normalized index back to its raw offset
   // (plus a trailing sentinel = raw length). charAt(i) <= " " treats every code
-  // <= U+0020 (space, tab, CR/LF, FF) as whitespace without needing regex  -  which
+  // <= U+0020 (space, tab, CR/LF, FF) as whitespace without needing regex — which
   // matters here because the script is injected as a template-literal string.
   function normWs(text) {
     var norm = "";
@@ -349,7 +349,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
   // All ranges matching the anchor. anchor_content is rendered-selection text
   // (whitespace collapsed) but the haystack is raw text-node data that preserves
   // the source's newlines/indentation, so match on the normalized view and map
-  // normalized offsets back to raw node positions  -  mirroring the parent's
+  // normalized offsets back to raw node positions — mirroring the parent's
   // whitespace-tolerant findAnchorInSource. H (the normalized view of
   // index.text) is passed in so repaint builds it once for all comments.
   function anchorRanges(index, H, anchor) {
@@ -408,7 +408,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
   // Which occurrence (0-based, document order) of the selected text the current
   // selection is, so the parent can anchor to the copy actually selected rather
   // than the first text match. Counts normalized matches starting before the
-  // selection's start  -  mirrors anchorRanges/anchorOccurrence so a wrapped
+  // selection's start — mirrors anchorRanges/anchorOccurrence so a wrapped
   // occurrence still counts. Returns 0 if the position can't be resolved.
   function selectionOccurrence(range, text) {
     var index = buildIndex();
@@ -545,7 +545,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
       });
       return;
     }
-    // A plain click (collapsed selection)  -  did it land inside a comment range?
+    // A plain click (collapsed selection) — did it land inside a comment range?
     var cr = caretRange(e.clientX, e.clientY);
     if (cr) {
       for (var i = 0; i < ranges.length; i++) {
@@ -581,7 +581,7 @@ const BRIDGE_SCRIPT_BODY = `(function () {
           // If a newly-arrived comment covers the still-active native selection
           // (i.e. the user just saved a comment on it), drop that selection.
           // The browser's ::selection paints over Custom Highlights, so the range
-          // would stay grey  -  masking the yellow highlight  -  until the user
+          // would stay grey — masking the yellow highlight — until the user
           // clicked elsewhere to collapse it. Keeping the selection during
           // compose is intentional; we only clear once the comment exists.
           clearSelectionIfCommented();
