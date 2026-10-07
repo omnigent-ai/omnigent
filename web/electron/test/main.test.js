@@ -15,7 +15,7 @@
 // removed or commented out, which the behavior test in workspace-chrome.test.js
 // cannot, because that test never touches main.js.)
 
-const { describe, it } = require("node:test");
+const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const fs = require("node:fs");
@@ -382,6 +382,26 @@ function loadNavigationHarness({
     session: { defaultSession },
     shell: {},
     systemPreferences: {},
+    // The external-sign-in probe answers directly here, so the window loads in
+    // place; a front-door bounce to another origin is covered by the e2e suite.
+    net: {
+      request: () => {
+        const request = Object.assign(new EventEmitter(), {
+          followRedirect() {},
+          abort() {
+            setImmediate(() => request.emit("abort"));
+          },
+          end() {
+            setImmediate(() => {
+              const response = new EventEmitter();
+              request.emit("response", response);
+              setImmediate(() => response.emit("end"));
+            });
+          },
+        });
+        return request;
+      },
+    },
   };
 
   const localRequires = {
@@ -570,7 +590,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, classifyProbeRedirect, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -3896,5 +3916,41 @@ describe("server names from the manifest", () => {
     h.api.windows.get(h.win).ephemeral = true;
     await h.api.loadServerUrl(h.win, server);
     assert.equal(fs.existsSync(h.settingsPath) ? saved(h).server_names : undefined, undefined);
+  });
+});
+
+describe("classifyProbeRedirect — browser sign-in hand-off boundary", () => {
+  let harness;
+  const classify = (server, redirectUrl) =>
+    harness.api.classifyProbeRedirect(new URL(server), redirectUrl);
+
+  before(() => {
+    harness = loadNavigationHarness();
+  });
+  after(() => harness.cleanup());
+
+  it("keeps a same-origin redirect in-window", () => {
+    assert.equal(classify("https://app.example.com", "https://app.example.com/next"), "same-site");
+  });
+
+  it("treats a plain http→https upgrade of the same host as canonicalization", () => {
+    assert.equal(classify("http://app.example.com", "https://app.example.com/"), "same-site");
+    assert.equal(
+      classify("http://app.example.com:8080", "https://app.example.com:8080/"),
+      "same-site",
+    );
+  });
+
+  it("hands off a bounce to a different sign-in host", () => {
+    assert.equal(
+      classify("https://team.databricksapps.com", "https://login.example-idp.com/authorize"),
+      "foreign",
+    );
+    // A different port on the same host is a separate origin, not a canonical upgrade.
+    assert.equal(classify("http://localhost:3000", "http://localhost:9000/authorize"), "foreign");
+  });
+
+  it("rejects an unparseable Location", () => {
+    assert.equal(classify("https://app.example.com", "not a url"), "unparseable");
   });
 });

@@ -24,6 +24,7 @@ const {
   ipcMain,
   nativeImage,
   nativeTheme,
+  net,
   screen,
   session,
   shell,
@@ -53,6 +54,7 @@ const {
   normalizeSavedServerUrl,
   fetchServerManifest,
   isDatabricksManagedServerUrl,
+  isDatabricksAppsServerUrl,
   databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
   parseManifestAuth,
@@ -1124,6 +1126,139 @@ function focusAfterBrowserSignIn(win) {
   if (process.platform === "darwin") app.focus({ steal: true });
 }
 
+/** Short probe timeout: connecting must never stall behind it, so it fails open. */
+const EXTERNAL_SIGN_IN_PROBE_TIMEOUT_MS = 5000;
+/** Guard against a redirect loop while probing a front door. */
+const MAX_SIGN_IN_PROBE_HOPS = 10;
+
+/**
+ * Classify a probe redirect against the server being connected to. Only a hop
+ * that leaves the server for a different host is a browser sign-in hand-off; a
+ * same-origin hop or a plain http→https upgrade of the same host is
+ * canonicalization and must keep loading in the window.
+ *
+ * @param {URL} server The server URL being connected to.
+ * @param {string} redirectUrl The redirect's Location.
+ * @returns {"foreign" | "same-site" | "unparseable"}
+ */
+function classifyProbeRedirect(server, redirectUrl) {
+  let target;
+  try {
+    target = new URL(redirectUrl);
+  } catch {
+    return "unparseable";
+  }
+  if (target.origin === server.origin) return "same-site";
+  const sameHostUpgrade =
+    target.hostname === server.hostname &&
+    server.protocol === "http:" &&
+    target.protocol === "https:" &&
+    (target.port === "" || target.port === server.port);
+  return sameHostUpgrade ? "same-site" : "foreign";
+}
+
+/**
+ * Return the first redirect to a different sign-in host an unauthenticated
+ * navigation to `serverUrl` is bounced to — an external SSO front door — or
+ * null. Carries the session cookies so an already-signed-in server is not
+ * mistaken for one, and fails open rather than blocking a connect.
+ *
+ * @param {string} serverUrl
+ * @param {{ signal?: AbortSignal }} [options]
+ * @returns {Promise<string | null>}
+ */
+function detectExternalSignIn(serverUrl, { signal } = {}) {
+  let server;
+  try {
+    server = new URL(serverUrl);
+  } catch {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve(null);
+      return;
+    }
+    let settled = false;
+    let foreign = null;
+    let hops = 0;
+    const request = net.request({
+      url: serverUrl,
+      session: session.defaultSession,
+      useSessionCookies: true,
+      redirect: "manual",
+    });
+    const timer = setTimeout(() => request.abort(), EXTERNAL_SIGN_IN_PROBE_TIMEOUT_MS);
+    timer.unref?.();
+    const onAbort = () => request.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(foreign);
+    };
+    request.on("redirect", (_status, _method, redirectUrl) => {
+      if (settled || foreign) return;
+      const kind = classifyProbeRedirect(server, redirectUrl);
+      if (kind === "foreign") {
+        // Leaving the server's host is the signal; abort so the foreign sign-in
+        // page is never fetched and the probe resolves deterministically.
+        foreign = redirectUrl;
+        request.abort();
+        return;
+      }
+      // An unparseable Location isn't a page the window could load either.
+      if (kind === "unparseable" || hops++ >= MAX_SIGN_IN_PROBE_HOPS) {
+        request.abort();
+        return;
+      }
+      request.followRedirect();
+    });
+    request.on("response", (response) => {
+      response.on("data", () => {});
+      response.on("end", finish);
+      response.on("error", finish);
+    });
+    request.on("abort", finish);
+    request.on("error", finish);
+    request.end();
+  });
+}
+
+/**
+ * Hand sign-in to the system browser (on an explicit connect) and return the
+ * window to the connect screen: the IdP's security-key / biometric step has no
+ * prompt UI in the Electron window.
+ */
+async function requireBrowserSignIn(win, serverUrl, { interactive = false } = {}) {
+  if (win.isDestroyed()) return;
+  console.warn("[omnigent] connect: sign-in moved to the system browser", {
+    origin: originOf(serverUrl),
+    interactive,
+  });
+  const server = serverDisplayName(serverUrl);
+  let message = interactive
+    ? `${server} signs you in through your browser. Finish there, then select Connect.`
+    : `${server} signs you in through your browser. Select Connect to open it.`;
+  if (interactive) {
+    try {
+      await shell.openExternal(serverUrl);
+    } catch (err) {
+      console.error("[omnigent] connect: could not open the system browser", err);
+      message = `Couldn't open your browser. Visit ${serverUrl} to sign in, then select Connect.`;
+    }
+  }
+  if (win.isDestroyed()) return;
+  const params = new URLSearchParams({ error: message, url: serverUrl });
+  if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
+  pinWindow(win, null);
+  setWindowServerUrl(win, null);
+  win.webContents.stop();
+  void loadSetupPage(win, params.toString());
+}
+
 /** Embedded-auth connections retain their existing reload-to-sign-in recovery. */
 function registerSessionExpiryAccess() {
   registerSessionExpiryReload(
@@ -2037,7 +2172,9 @@ async function loadServerUrl(
     }
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
     let manifest = null;
-    if (usesBrowserAuth(serverUrl)) {
+    let signInCookie = null;
+    const databricksBrowserAuth = usesBrowserAuth(serverUrl);
+    if (databricksBrowserAuth) {
       reportConnectionProgress(win, attempt, "authenticating");
       const auth = getDatabricksAuth();
       win.webContents.stop();
@@ -2095,6 +2232,7 @@ async function loadServerUrl(
       manifest = await fetchServerManifest(serverUrl, { signal });
       assertCurrent();
       const cookieName = oidcSessionCookie(serverUrl, manifest, windowState?.ephemeral);
+      signInCookie = cookieName;
       if (cookieName) {
         if (windowState) {
           windowState.authKind = "oidc";
@@ -2128,6 +2266,23 @@ async function loadServerUrl(
       }
     }
     assertCurrent();
+    // A Databricks App (or a server whose manifest a front door hid) can bounce
+    // an unauthenticated request off-origin to a security-key sign-in the window
+    // cannot prompt for. Hand those off; a same-origin login stays in-window.
+    if (
+      !databricksBrowserAuth &&
+      !signInCookie &&
+      (isDatabricksAppsServerUrl(serverUrl) || manifest?.manifestVersion < 1)
+    ) {
+      const externalSignIn = await detectExternalSignIn(serverUrl, { signal });
+      assertCurrent();
+      if (externalSignIn) {
+        await requireBrowserSignIn(win, serverUrl, { interactive });
+        throw Object.assign(new Error("sign-in continues in the system browser"), {
+          code: "EXTERNAL_BROWSER_SIGN_IN",
+        });
+      }
+    }
     reportConnectionProgress(win, attempt, "connecting");
     if (manifest) {
       setWindowServerManifest(win, manifest);
@@ -3799,6 +3954,9 @@ function registerIpc() {
       return {};
     } catch (error) {
       if (error.name === "AbortError") return { cancelled: true };
+      // Sign-in moved to the system browser; the window already shows how to
+      // finish, so this isn't a connect error for the page to report.
+      if (error.code === "EXTERNAL_BROWSER_SIGN_IN") return { browserSignIn: true };
       // The overlay now covers this page and reconnects on its own.
       if (reconnectOverlay.isShown(win)) return { reconnecting: true };
       throw error;

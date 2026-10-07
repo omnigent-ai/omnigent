@@ -14,6 +14,7 @@ const {
   isPlainHttpRemote,
   normalizeSavedServerUrl,
   isDatabricksManagedServerUrl,
+  isDatabricksAppsServerUrl,
   databricksWorkspaceUiUrl,
   expandDatabricksWorkspaceUrl,
   WORKSPACE_UI_PATH,
@@ -198,6 +199,25 @@ describe("isDatabricksManagedServerUrl", () => {
     // Junk input fails closed:
     assert.equal(isDatabricksManagedServerUrl(null), false);
     assert.equal(isDatabricksManagedServerUrl("not a url"), false);
+  });
+});
+
+describe("isDatabricksAppsServerUrl", () => {
+  it("accepts Databricks Apps hosts only, https, not workspaces", () => {
+    assert.equal(isDatabricksAppsServerUrl("https://omnigent-x-123.aws.databricksapps.com"), true);
+    assert.equal(isDatabricksAppsServerUrl("https://databricksapps.com"), true);
+    // Workspace domains are not Apps:
+    assert.equal(
+      isDatabricksAppsServerUrl("https://my-workspace.cloud.databricks.com/omnigent"),
+      false,
+    );
+    assert.equal(isDatabricksAppsServerUrl("https://adb-1.2.azuredatabricks.net"), false);
+    // A lookalike suffix must not pass, and neither may plain http:
+    assert.equal(isDatabricksAppsServerUrl("https://evildatabricksapps.com"), false);
+    assert.equal(isDatabricksAppsServerUrl("http://x.databricksapps.com"), false);
+    // Junk input fails closed:
+    assert.equal(isDatabricksAppsServerUrl(null), false);
+    assert.equal(isDatabricksAppsServerUrl("not a url"), false);
   });
 });
 

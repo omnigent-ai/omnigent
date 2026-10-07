@@ -37,6 +37,11 @@ backend — no real provider creds.
   with a cookie-carrying redirect follower, so it runs on macOS and Linux. Covers
   connect, silent renewal, relaunch, and sign-out, and asserts the app window
   never loads the IdP.
+- `desktop_in_window_webauthn_sign_in.e2e.js` — connect to an SSO-gated
+  server whose identity provider asks for a security key / biometric
+  verification (`fixtures/fakeSsoFrontDoor.js`: an Apps-style front door plus
+  an Okta-style IdP page that runs a real WebAuthn request). Asserts the shell
+  never renders that step in its own window, where Electron shows no prompt.
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.

@@ -165,6 +165,10 @@
   const WORKSPACE_DOMAINS = ["databricks.com", "azuredatabricks.net"];
   const DATABRICKS_APPS_HOST_SUFFIX = "databricksapps.com";
 
+  /** True for a Databricks Apps host (``databricksapps.com`` or a subdomain). */
+  const isDatabricksAppsHost = (host) =>
+    host === DATABRICKS_APPS_HOST_SUFFIX || host.endsWith(`.${DATABRICKS_APPS_HOST_SUFFIX}`);
+
   /** True when a host is, or sits under, a Databricks workspace domain. */
   function isDatabricksWorkspaceHost(host) {
     const normalized = (host ?? "").toLowerCase();
@@ -258,7 +262,7 @@
     }
     if (url.protocol !== "https:") return false;
     const host = url.hostname.toLowerCase();
-    if (host === DATABRICKS_APPS_HOST_SUFFIX || host.endsWith(`.${DATABRICKS_APPS_HOST_SUFFIX}`)) {
+    if (isDatabricksAppsHost(host)) {
       return true;
     }
     return isDatabricksWorkspaceHost(host);
@@ -278,6 +282,25 @@
     } catch {
       return false;
     }
+  }
+
+  /**
+   * True for a Databricks App host (``*.databricksapps.com``). Apps serve their
+   * content behind the workspace SSO front door and never use the OAuth bridge.
+   *
+   * @param {string | null | undefined} rawUrl
+   * @returns {boolean}
+   */
+  function isDatabricksAppsServerUrl(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return false;
+    }
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    return isDatabricksAppsHost(host);
   }
 
   /**
@@ -323,7 +346,7 @@
     // Databricks Apps share the workspace ``server: databricks`` header but have
     // no workspace UI mount, so never expand them.
     const host = url.hostname.toLowerCase();
-    if (host === DATABRICKS_APPS_HOST_SUFFIX || host.endsWith(`.${DATABRICKS_APPS_HOST_SUFFIX}`)) {
+    if (isDatabricksAppsHost(host)) {
       return normalized;
     }
     let probe;
@@ -530,6 +553,7 @@
     expandDatabricksWorkspaceUrl,
     isDatabricksManagedServerUrl,
     isDatabricksOAuthServerUrl,
+    isDatabricksAppsServerUrl,
     WELL_KNOWN_MANIFEST_PATH,
     MANIFEST_FETCH_TIMEOUT_MS,
     PRE_MANIFEST_BASELINE,
