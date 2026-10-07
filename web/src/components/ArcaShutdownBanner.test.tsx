@@ -9,6 +9,7 @@ import { copyText } from "@/lib/clipboard";
 const MON_5PM = new Date(2026, 9, 5, 17, 0);
 const WED_5PM = new Date(2026, 9, 7, 17, 0);
 const THU_5PM = new Date(2026, 9, 8, 17, 0);
+const TUE_9AM = new Date(2026, 9, 6, 9, 0);
 const state = vi.hoisted(() => ({
   enabled: true,
   now: new Date(2026, 9, 5, 17, 0),
@@ -79,5 +80,16 @@ describe("ArcaShutdownBanner", () => {
     fireEvent(document, new Event("visibilitychange"));
     await waitFor(() => expect(isWarnedToday(state.now)).toBe(true));
     expect(toast.dismiss).toHaveBeenCalledWith("arca-shutdown:2026-10-05");
+  });
+
+  it("does not mark a new day when a sleeping tab wakes before its banner updates", () => {
+    render(<Banner />);
+    expect(isWarnedToday(MON_5PM)).toBe(true);
+    vi.mocked(toast.dismiss).mockClear();
+
+    vi.setSystemTime(TUE_9AM);
+    fireEvent(document, new Event("visibilitychange"));
+    expect(isWarnedToday(TUE_9AM)).toBe(false);
+    expect(toast.dismiss).not.toHaveBeenCalled();
   });
 });

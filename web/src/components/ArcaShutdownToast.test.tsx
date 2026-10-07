@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast, Toaster } from "sonner";
@@ -17,13 +18,11 @@ const state = vi.hoisted(() => ({
   enabled: true,
   now: new Date(2026, 9, 5, 17, 0),
   hosts: [{ host_id: "arca", name: "jackson's arca", status: "online" }],
-  hostsCalls: 0,
   toastCalls: 0,
 }));
 
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => {
-    state.hostsCalls += 1;
     return { data: state.hosts };
   },
 }));
@@ -48,8 +47,8 @@ vi.mock("sonner", async (importOriginal) => {
 function ToastPage({ showBanner = false }: { showBanner?: boolean }) {
   return (
     <>
-      <ArcaShutdownToast />
       {showBanner && <BannerOnArcaHost />}
+      <ArcaShutdownToast />
       <Toaster position="top-center" visibleToasts={100} />
     </>
   );
@@ -68,7 +67,6 @@ beforeEach(() => {
   state.enabled = true;
   state.now = MON_5PM;
   state.hosts = [{ host_id: "arca", name: "jackson's arca", status: "online" }];
-  state.hostsCalls = 0;
   state.toastCalls = 0;
   vi.mocked(copyText).mockReset().mockResolvedValue(undefined);
   toast.dismiss();
@@ -156,18 +154,6 @@ describe("ArcaShutdownToast", () => {
     );
   });
 
-  it("does not mount for a disabled feature or call useHosts", () => {
-    state.enabled = false;
-    render(
-      <>
-        {state.enabled && <ArcaShutdownToast />}
-        <Toaster />
-      </>,
-    );
-    expect(state.hostsCalls).toBe(0);
-    expect(state.toastCalls).toBe(0);
-  });
-
   it("deduplicates across two instances through the warned storage key", () => {
     const view = render(
       <>
@@ -197,6 +183,29 @@ describe("ArcaShutdownToast", () => {
     visibility.mockReturnValue("visible");
     fireEvent(document, new Event("visibilitychange"));
     expect(await screen.findByText("Arca shuts down at about 6 PM")).toBeInTheDocument();
+  });
+
+  it("keeps the toast visible when StrictMode remounts with cached hosts", async () => {
+    render(
+      <StrictMode>
+        <ToastPage />
+      </StrictMode>,
+    );
+    expect(await screen.findByText("Arca shuts down at about 6 PM")).toBeInTheDocument();
+    expect(isWarnedToday(MON_5PM)).toBe(true);
+    expect(state.toastCalls).toBe(1);
+  });
+
+  it("dismisses yesterday's toast before showing today's after a sleep jump", async () => {
+    const view = render(<ToastPage />);
+    expect(await screen.findByText("Arca shuts down at about 6 PM")).toBeInTheDocument();
+    state.now = TUE_5PM;
+    vi.setSystemTime(TUE_5PM);
+    view.rerender(<ToastPage />);
+    await waitFor(() =>
+      expect(screen.getAllByText("Arca shuts down at about 6 PM")).toHaveLength(1),
+    );
+    expect(state.toastCalls).toBe(2);
   });
 
   it("withdraws the toast at midnight", async () => {

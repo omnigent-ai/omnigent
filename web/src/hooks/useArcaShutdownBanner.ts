@@ -12,7 +12,6 @@ import {
   isOptedOut,
   isWarningWindow,
   markWarnedToday,
-  offersWorkweek,
   optOut,
 } from "@/lib/arcaShutdownWarning";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -22,7 +21,9 @@ export function useMarkArcaBannerWhenVisible(day: string) {
   useEffect(() => {
     const markIfVisible = () => {
       if (document.visibilityState !== "visible") return;
-      markWarnedToday(new Date());
+      const now = new Date();
+      if (dateKey(now) !== day || !isWarningWindow(now)) return;
+      markWarnedToday(now);
       toast.dismiss(`arca-shutdown:${day}`);
     };
     markIfVisible();
@@ -34,12 +35,10 @@ export function useMarkArcaBannerWhenVisible(day: string) {
 export function useArcaShutdownBanner() {
   const enabled = isFeatureEnabled(useServerInfo(), "arca_shutdown_warnings");
   const { data: hosts } = useHosts({ enabled });
-  const warningDay = useNowSelector(
-    (now) => (isWarningWindow(now) ? `${dateKey(now)}:${offersWorkweek(now) ? "1" : "0"}` : ""),
-    { enabled },
-  );
+  const warningDay = useNowSelector((now) => (isWarningWindow(now) ? dateKey(now) : ""), {
+    enabled,
+  });
   const [, refresh] = useReducer((value: number) => value + 1, 0);
-  const storedId = readArcaHostId();
 
   useEffect(() => {
     if (!enabled) return;
@@ -56,12 +55,11 @@ export function useArcaShutdownBanner() {
 
   return {
     showForHost(hostId: string | null | undefined): boolean {
+      if (!enabled || !hostId || !warningDay || isOptedOut() || isDismissedToday(new Date())) {
+        return false;
+      }
+      const storedId = readArcaHostId();
       return Boolean(
-        enabled &&
-        hostId &&
-        warningDay &&
-        !isOptedOut() &&
-        !isDismissedToday(new Date()) &&
         hosts?.some(
           (host) =>
             host.host_id === hostId && host.status === "online" && isArcaHost(host, storedId),
@@ -70,7 +68,6 @@ export function useArcaShutdownBanner() {
     },
     dismissToday: () => dismissToday(new Date()),
     optOut,
-    day: warningDay.slice(0, 10),
-    showWorkweek: warningDay.endsWith(":1"),
+    day: warningDay,
   };
 }

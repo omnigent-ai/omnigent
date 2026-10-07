@@ -41,7 +41,7 @@ export function dateKey(now: Date): string {
 
 function read(key: string): string | null {
   try {
-    return localStorage.getItem(key) ?? unavailableStorage.get(key) ?? null;
+    return unavailableStorage.get(key) ?? localStorage.getItem(key) ?? null;
   } catch {
     return unavailableStorage.get(key) ?? null;
   }

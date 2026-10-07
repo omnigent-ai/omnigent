@@ -83,4 +83,14 @@ describe("Arca shutdown rules", () => {
     expect(isWarnedToday(MON_5PM)).toBe(true);
     expect(isOptedOut()).toBe(true);
   });
+
+  it("prefers an in-memory write over an older stored day", () => {
+    localStorage.setItem("omnigent:arca-shutdown:warned", "2026-10-05");
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("storage unavailable");
+    });
+    const tuesday = new Date(2026, 9, 6, 17, 0);
+    markWarnedToday(tuesday);
+    expect(isWarnedToday(tuesday)).toBe(true);
+  });
 });

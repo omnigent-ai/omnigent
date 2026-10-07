@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangleIcon, CheckIcon, CopyIcon } from "lucide-react";
 import { useMarkArcaBannerWhenVisible } from "@/hooks/useArcaShutdownBanner";
+import { offersWorkweek } from "@/lib/arcaShutdownWarning";
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 
@@ -49,18 +50,18 @@ export function ArcaShutdownBanner({
   warning,
   hasTasks = false,
 }: {
-  warning: { day: string; showWorkweek: boolean; dismissToday: () => void; optOut: () => void };
+  warning: { day: string; dismissToday: () => void; optOut: () => void };
   hasTasks?: boolean;
 }) {
   useMarkArcaBannerWhenVisible(warning.day);
   const commands = ["arca extend overnight"];
-  if (warning.showWorkweek) commands.push("arca extend workweek");
+  if (offersWorkweek(new Date(`${warning.day}T12:00:00`))) commands.push("arca extend workweek");
 
   return (
     <div
       role="status"
       className={cn(
-        "arca-shutdown-banner shrink-0 px-3 md:px-4",
+        "shrink-0 px-3 md:px-4",
         hasTasks ? "mt-1" : "chat-plan-accordion mt-14 md:mt-12",
       )}
     >

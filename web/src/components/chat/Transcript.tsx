@@ -326,7 +326,6 @@ function TranscriptImpl({
       conversation area without requiring Conversation to forward refs. */}
       <div
         ref={setConversationEl}
-        data-transcript-viewport
         className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
         <Conversation

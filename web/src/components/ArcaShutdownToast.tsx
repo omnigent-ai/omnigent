@@ -46,14 +46,12 @@ export function ArcaShutdownToast() {
     };
   }, []);
 
-  useEffect(
-    () => () => {
-      if (shownToastId.current) toast.dismiss(shownToastId.current);
-    },
-    [],
-  );
-
   useEffect(() => {
+    const id = `arca-shutdown:${dateKey(now)}`;
+    if (shownToastId.current && shownToastId.current !== id) {
+      toast.dismiss(shownToastId.current);
+      shownToastId.current = null;
+    }
     if (!isWarningWindow(now) || !hasOnlineArcaHost || optedOut || dismissedToday) {
       if (shownToastId.current) toast.dismiss(shownToastId.current);
       shownToastId.current = null;
@@ -61,7 +59,6 @@ export function ArcaShutdownToast() {
     }
     if (visibility !== "visible" || isWarnedToday(now)) return;
 
-    const id = `arca-shutdown:${dateKey(now)}`;
     markWarnedToday(now);
     shownToastId.current = id;
     toast("Arca shuts down at about 6 PM", {
