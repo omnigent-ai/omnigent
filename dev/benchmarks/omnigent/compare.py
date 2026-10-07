@@ -6,7 +6,8 @@ Usage:
         --baseline nightly.json --candidate pr.json [--threshold 0.20] \\
         [--output-markdown report.md] [--backend sqlite]
 
-Exits 0 if no regression, 1 if regression detected.
+Exits 0 if no regression, 1 if regression detected, 3 if a ``--require``d
+journey was not measured on both sides.
 """
 
 from __future__ import annotations
@@ -211,6 +212,23 @@ def compare_reports(
     return passed, rows
 
 
+def _measured(row: dict) -> bool:
+    """Whether both sides produced a real P50 (0.0 is a no-success placeholder)."""
+    if row["status"] == "failed":  # the candidate was measured as unusable
+        return True
+    return row["status"] in ("ok", "regression") and bool(row["b_p50"]) and bool(row["c_p50"])
+
+
+def unmeasured_journeys(rows: list[dict], required: list[str]) -> list[str]:
+    """Return the *required* journeys this comparison could not measure.
+
+    Used to confirm a regression flagged elsewhere: a re-check that never
+    measured the flagged journey on both sides cannot clear it.
+    """
+    by_name = {row["journey"]: row for row in rows}
+    return [name for name in required if name not in by_name or not _measured(by_name[name])]
+
+
 def _status_style(status: str) -> str:
     return {"regression": "red", "new": "cyan", "ok": "green", "skipped": "yellow"}.get(status, "")
 
@@ -330,6 +348,19 @@ def main(argv: list[str] | None = None) -> int:
         "--backend",
         help="Filter to journeys for this backend only (e.g. sqlite, postgres)",
     )
+    parser.add_argument(
+        "--require",
+        type=lambda s: [p.strip() for p in s.split(",") if p.strip()],
+        default=[],
+        metavar="A,B",
+        help="Journeys that must be measured on both sides; exit 3 if any is not",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        metavar="FILE",
+        help="Write {passed, rows, unmeasured} as JSON to FILE",
+    )
     args = parser.parse_args(argv)
 
     baseline = json.loads(args.baseline.read_text())
@@ -344,10 +375,16 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[bold]Backend filter:[/bold] {args.backend}")
 
     passed, rows = compare_reports(baseline, candidate, args.threshold, backend=args.backend)
+    unmeasured = unmeasured_journeys(rows, args.require)
+
+    if args.output_json:
+        args.output_json.write_text(
+            json.dumps({"passed": passed, "rows": rows, "unmeasured": unmeasured}, indent=2)
+        )
 
     if not rows:
         console.print("[yellow]No journeys found to compare.[/yellow]")
-        return 0
+        return 3 if unmeasured else 0
 
     print_table(rows, args.threshold)
 
@@ -372,12 +409,22 @@ def main(argv: list[str] | None = None) -> int:
     else:
         console.print("[green bold]PASS[/green bold] — no regressions detected.")
 
+    if unmeasured:
+        console.print(
+            f"[red bold]INCOMPLETE[/red bold] — required journey(s) not measured on both sides: "
+            f"{', '.join(unmeasured)}"
+        )
+
     if args.output_markdown:
         md = build_markdown(rows, args.threshold, passed)
+        if unmeasured:
+            md += f"\n**INCOMPLETE** — not measured on both sides: {', '.join(unmeasured)}.\n"
         args.output_markdown.write_text(md)
         console.print(f"Markdown report written to {args.output_markdown}")
 
-    return 0 if passed else 1
+    if not passed:
+        return 1
+    return 3 if unmeasured else 0
 
 
 if __name__ == "__main__":

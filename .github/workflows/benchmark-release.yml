@@ -21,10 +21,21 @@ on:
         required: false
         type: string
         default: ""
+      require_journeys:
+        description: "Comma-separated journeys that must be measured on both sides."
+        required: false
+        type: string
+        default: ""
     outputs:
       regression:
         description: "'true' when the candidate regressed past the threshold."
         value: ${{ jobs.benchmark.outputs.regression }}
+      complete:
+        description: "'false' when a required journey was not measured on both sides."
+        value: ${{ jobs.benchmark.outputs.complete }}
+      unmeasured:
+        description: "Comma-separated required journeys that were not measured."
+        value: ${{ jobs.benchmark.outputs.unmeasured }}
   workflow_dispatch:
     inputs:
       candidate_ref:
@@ -49,15 +60,16 @@ jobs:
     if: github.repository == 'omnigent-ai/omnigent'
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # Job-level so a release.yml caller never shares a group with its own
-    # workflow-level `release` concurrency. Keyed on the calling workflow too,
-    # so the PR benchmark's re-check and this file's own PR run never cancel
-    # each other. PR pushes cancel the previous run.
+    # Job-level so a release.yml caller never shares its `release` group; keyed
+    # on the calling workflow so the PR benchmark's re-check and this file's own
+    # PR run never cancel each other. PR pushes cancel the previous run.
     concurrency:
       group: benchmark-release-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     outputs:
       regression: ${{ steps.compare.outputs.regression }}
+      complete: ${{ steps.compare.outputs.complete }}
+      unmeasured: ${{ steps.compare.outputs.unmeasured }}
     env:
       OMNIGENT_SKIP_WEB_UI: "true"
       UV_INDEX_URL: https://pypi.org/simple
@@ -186,16 +198,34 @@ jobs:
         id: compare
         if: steps.refs.outputs.baseline != ''
         working-directory: candidate
+        env:
+          REQUIRE_JOURNEYS: ${{ inputs.require_journeys }}
         run: |
+          require=()
+          if [ -n "$REQUIRE_JOURNEYS" ]; then
+            require=(--require "$REQUIRE_JOURNEYS" --output-json ../comparison.json)
+          fi
           set +e
           uv run --no-sync dev/benchmarks/omnigent/compare.py \
             --baseline ../baseline.json \
             --candidate ../candidate.json \
             --threshold 1.0 \
-            --output-markdown ../comparison.md
+            --output-markdown ../comparison.md "${require[@]}"
           RC=$?
           set -e
-          echo "regression=$([ $RC -ne 0 ] && echo 'true' || echo 'false')" >> "$GITHUB_OUTPUT"
+          # 3 = a required journey was not measured on both sides.
+          complete=true
+          unmeasured=""
+          if [ "$RC" -eq 3 ]; then
+            complete=false
+            unmeasured="$(jq -r '.unmeasured | join(",")' ../comparison.json)"
+            RC=0
+          fi
+          {
+            echo "regression=$([ $RC -ne 0 ] && echo 'true' || echo 'false')"
+            echo "complete=${complete}"
+            echo "unmeasured=${unmeasured}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Write step summary
         if: steps.compare.outcome == 'success'

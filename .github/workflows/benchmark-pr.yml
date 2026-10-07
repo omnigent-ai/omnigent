@@ -4,12 +4,8 @@ name: Benchmark (PR)
 # store-layer or project API code and compares against the latest nightly
 # benchmark artifact as a baseline. Posts results as a PR comment.
 #
-# The nightly ran on a different VM, and hosted VMs vary in speed by up to
-# ~1.5x, so a flagged regression is only a suspect. When the nightly
-# comparison flags one, `confirm` re-runs this PR's base commit and the PR
-# side by side on one runner (benchmark-release.yml), and `verdict` fails the
-# PR only if that same-runner comparison also flags. The unflagged path costs
-# nothing extra.
+# Hosted VMs vary ~1.5x in speed, so a regression flagged against the nightly
+# fails the PR only if a same-runner base-vs-PR re-check also flags it.
 #
 # Only runs on PRs to the main repo (not forks without secrets). Skips
 # comparison if no nightly baseline artifact is available — the benchmark still
@@ -51,6 +47,7 @@ jobs:
     timeout-minutes: 40
     outputs:
       flagged: ${{ steps.compare.outputs.flagged }}
+      journeys: ${{ steps.compare.outputs.journeys }}
       base_sha: ${{ steps.base.outputs.sha }}
 
     steps:
@@ -164,10 +161,18 @@ jobs:
             --candidate candidate.json \
             --backend sqlite \
             --threshold 1.0 \
-            --output-markdown comparison.md
+            --output-markdown comparison.md \
+            --output-json comparison.json
           RC=$?
+          if [ "$RC" -gt 1 ]; then
+            echo "::error::Benchmark comparison failed with exit code ${RC}."
+            exit "$RC"
+          fi
           echo "EXIT_CODE=${RC}" >> "$GITHUB_ENV"
           echo "flagged=$([ "$RC" -eq 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          # The re-check must re-measure exactly these.
+          journeys="$(jq -r '[.rows[] | select(.status == "regression" or .status == "failed") | .journey] | join(",")' comparison.json)"
+          echo "journeys=${journeys}" >> "$GITHUB_OUTPUT"
 
       - name: Build PR comment body
         env:
@@ -230,9 +235,12 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: benchmark-pr-nightly-comparison-${{ github.run_id }}
-          path: comparison.md
+          path: |
+            comparison.md
+            comparison.json
           retention-days: 30
           if-no-files-found: error
+          overwrite: true
 
   # Only when the nightly comparison flagged a regression: run this PR's base
   # commit and the PR concurrently on one runner, so VM speed cancels out.
@@ -245,6 +253,7 @@ jobs:
     with:
       candidate_ref: ${{ github.sha }}
       baseline_ref: ${{ needs.benchmark-pr.outputs.base_sha }}
+      require_journeys: ${{ needs.benchmark-pr.outputs.journeys }}
 
   verdict:
     name: Benchmark regression verdict (same runner)
@@ -255,7 +264,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # A missing artifact must still end in a posted verdict, not a stale comment.
       - name: Download comparisons
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: "{benchmark-pr-nightly-comparison,benchmark-release}-${{ github.run_id }}"
@@ -270,17 +281,29 @@ jobs:
           BASE_SHA: ${{ needs.benchmark-pr.outputs.base_sha }}
           CONFIRM_RESULT: ${{ needs.confirm.result }}
           CONFIRMED: ${{ needs.confirm.outputs.regression }}
+          COMPLETE: ${{ needs.confirm.outputs.complete }}
+          UNMEASURED: ${{ needs.confirm.outputs.unmeasured }}
+          FLAGGED: ${{ needs.benchmark-pr.outputs.journeys }}
         run: |
           set -euo pipefail
           same_runner="artifacts/benchmark-release-${GITHUB_RUN_ID}/comparison.md"
           nightly="artifacts/benchmark-pr-nightly-comparison-${GITHUB_RUN_ID}/comparison.md"
           base="\`${BASE_SHA:0:12}\`"
-          if [ "$CONFIRM_RESULT" = "success" ] && [ "$CONFIRMED" = "false" ]; then
-            verdict="PASS"
-            why="The comparison against the latest nightly flagged a regression, but the base commit ${base} and this PR ran on one runner and that comparison did not reproduce it. The same-runner comparison decided."
-          elif [ "$CONFIRM_RESULT" = "success" ]; then
+          flagged="\`${FLAGGED//,/\`, \`}\`"
+          if [ "$CONFIRM_RESULT" = "success" ] && [ "$CONFIRMED" = "true" ]; then
             verdict="FAIL"
             why="Confirmed: the base commit ${base} and this PR ran on one runner, and that comparison also flags a regression."
+          elif [ "$CONFIRM_RESULT" = "success" ] && [ "$COMPLETE" = "true" ] && [ -f "$same_runner" ]; then
+            verdict="PASS"
+            why="The comparison against the latest nightly flagged ${flagged}, but the base commit ${base} and this PR ran on one runner, both measured every flagged journey, and that comparison did not reproduce the regression. The same-runner comparison decided."
+          elif [ "$CONFIRM_RESULT" = "success" ]; then
+            verdict="FAIL"
+            if [ -n "$UNMEASURED" ]; then
+              gap="did not measure \`${UNMEASURED//,/\`, \`}\` on both sides"
+            else
+              gap="left no comparison report"
+            fi
+            why="The comparison against the latest nightly flagged ${flagged}, and the same-runner re-check against ${base} ${gap}, so the nightly result stands."
           else
             verdict="FAIL"
             why="The comparison against the latest nightly flagged a regression, and the same-runner re-check against ${base} did not complete (${CONFIRM_RESULT}), so the nightly result stands."
@@ -299,11 +322,13 @@ jobs:
               sed '1{/^## /d;}' "$same_runner"
               echo ""
             fi
-            echo "<details><summary>Comparison against the latest nightly (different VM)</summary>"
-            echo ""
-            sed '1{/^## /d;}' "$nightly"
-            echo ""
-            echo "</details>"
+            if [ -f "$nightly" ]; then
+              echo "<details><summary>Comparison against the latest nightly (different VM)</summary>"
+              echo ""
+              sed '1{/^## /d;}' "$nightly"
+              echo ""
+              echo "</details>"
+            fi
           } > comment_body.md
           cat comment_body.md >> "$GITHUB_STEP_SUMMARY"
           # Fork PRs have a read-only token; the comment may fail, the verdict still applies.

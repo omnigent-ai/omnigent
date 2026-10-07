@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from dev.benchmarks.omnigent.compare import build_markdown, compare_reports
+import json
+from pathlib import Path
+
+import pytest
+
+from dev.benchmarks.omnigent.compare import (
+    build_markdown,
+    compare_reports,
+    main,
+    unmeasured_journeys,
+)
 
 
 def _journey(p50: list[float], p95: list[float], n: int | None = None) -> dict:
@@ -108,3 +118,111 @@ def test_compare_skips_p95_gate_when_one_side_is_small() -> None:
 
     assert passed
     assert rows[0]["p95_gated"] is False
+
+
+def _skipped_journey() -> dict:
+    """A journey that errored out of measurement: no runs, no metrics."""
+    return {"backend": "sqlite", "runs": [], "summary": {}, "skipped": True}
+
+
+@pytest.mark.parametrize(
+    ("baseline_journey", "candidate_journey", "unmeasured"),
+    [
+        pytest.param(
+            _journey([100, 101, 102], [120, 125, 130]),
+            _journey([100, 101, 102], [120, 125, 130]),
+            [],
+            id="measured-both-sides",
+        ),
+        pytest.param(
+            _journey([100, 101, 102], [120, 125, 130]),
+            _skipped_journey(),
+            ["interrupt"],
+            id="missing-candidate-metrics",
+        ),
+        pytest.param(
+            None,
+            _journey([100, 101, 102], [120, 125, 130]),
+            ["interrupt"],
+            id="missing-baseline-journey",
+        ),
+        pytest.param(
+            {"backend": "sqlite", "runs": [], "summary": {}},
+            _journey([100, 101, 102], [120, 125, 130]),
+            ["interrupt"],
+            id="missing-baseline-metrics",
+        ),
+    ],
+)
+def test_a_recheck_must_measure_the_flagged_journey_on_both_sides(
+    baseline_journey: dict | None, candidate_journey: dict, unmeasured: list[str]
+) -> None:
+    """A confirmation that never measured the flagged journey cannot clear it."""
+    baseline = {"journeys": {} if baseline_journey is None else {"interrupt": baseline_journey}}
+    candidate = {"journeys": {"interrupt": candidate_journey}}
+
+    _, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+
+    assert unmeasured_journeys(rows, ["interrupt"]) == unmeasured
+
+
+def test_a_required_journey_absent_from_both_reports_is_unmeasured() -> None:
+    report = {"journeys": {"list_sessions": _journey([10, 10, 10], [12, 12, 12])}}
+
+    _, rows = compare_reports(report, report, threshold=1.0, backend="sqlite")
+
+    assert unmeasured_journeys(rows, ["interrupt", "list_sessions"]) == ["interrupt"]
+
+
+def _write_reports(tmp_path: Path, baseline: dict, candidate: dict) -> list[str]:
+    (tmp_path / "b.json").write_text(json.dumps(baseline))
+    (tmp_path / "c.json").write_text(json.dumps(candidate))
+    return ["--baseline", str(tmp_path / "b.json"), "--candidate", str(tmp_path / "c.json")]
+
+
+def test_cli_exits_3_and_reports_unmeasured_required_journeys(tmp_path: Path) -> None:
+    baseline = {"journeys": {"interrupt": _journey([100, 101, 102], [120, 125, 130])}}
+    candidate = {"journeys": {"interrupt": _skipped_journey()}}
+    args = _write_reports(tmp_path, baseline, candidate)
+    out = tmp_path / "out.json"
+    md = tmp_path / "out.md"
+
+    rc = main(
+        [*args, "--require", "interrupt", "--output-json", str(out), "--output-markdown", str(md)]
+    )
+
+    assert rc == 3
+    assert json.loads(out.read_text())["unmeasured"] == ["interrupt"]
+    assert "**INCOMPLETE** — not measured on both sides: interrupt." in md.read_text()
+    # Without --require the same comparison passes, as before.
+    assert main(args) == 0
+
+
+def test_cli_a_regression_outranks_an_incomplete_recheck(tmp_path: Path) -> None:
+    baseline = {
+        "journeys": {
+            "interrupt": _journey([100, 101, 102], [120, 125, 130]),
+            "list_sessions": _journey([10, 10, 10], [12, 12, 12]),
+        }
+    }
+    candidate = {
+        "journeys": {
+            "interrupt": _skipped_journey(),
+            "list_sessions": _journey([30, 30, 30], [36, 36, 36]),
+        }
+    }
+
+    assert main([*_write_reports(tmp_path, baseline, candidate), "--require", "interrupt"]) == 1
+
+
+def test_cli_output_json_lists_rows(tmp_path: Path) -> None:
+    baseline = {"journeys": {"interrupt": _journey([100, 101, 102], [120, 125, 130])}}
+    candidate = {"journeys": {"interrupt": _journey([300, 301, 302], [320, 325, 330])}}
+    out = tmp_path / "out.json"
+
+    rc = main([*_write_reports(tmp_path, baseline, candidate), "--output-json", str(out)])
+
+    data = json.loads(out.read_text())
+    assert rc == 1
+    assert data["passed"] is False
+    assert [(r["journey"], r["status"]) for r in data["rows"]] == [("interrupt", "regression")]
