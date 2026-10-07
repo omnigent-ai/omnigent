@@ -1,167 +1,96 @@
-"""E2E: the GitHub tab's change diff is sized like the rest of the panel.
+"""E2E: the GitHub tab's change diff is sized by the Interface font size.
 
-The stacked diff is rendered by ``@pierre/diffs`` inside a ``diffs-container``
-shadow root. The rest of the Workspace rail (file-section headers, file tree,
-panel heading) uses the app's ``text-ui`` step, which follows the Appearance
-"Interface font size" setting. This pins that the diff's code text never renders
-larger than the panel text beside it, at the default preference and at the
-smallest supported Interface font size.
+``@pierre/diffs`` renders the stacked diff inside a ``diffs-container`` shadow
+root whose stylesheet falls back to a fixed 13px/20px unless the app binds its
+typography variables, while the rest of the Workspace rail uses the ``text-ui``
+step that follows Appearance → "Interface font size". This pins that the diff's
+code renders smaller than the panel text beside it (the app's mono compensation)
+and tracks a live change of that setting while mounted.
 
 The GitHub resource endpoints are answered with canned JSON (see
-``test_github_tab.py``), so no ``gh``/``git`` runs; the sizing under test is
-client-side rendering of the returned patch.
+``test_github_tab.py``), so no ``gh``/``git`` runs.
 """
 
 from __future__ import annotations
 
 import json
-import re
-from pathlib import Path
 from typing import Any
 
 import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
-from tests.e2e_ui.github.test_github_tab import _CHANGES, _INFO
+from tests.e2e_ui.github.test_github_tab import _stub_github
 
-_BEFORE = "\n".join(f"line{i}" for i in range(1, 9)) + "\n"
-_AFTER = (
-    "\n".join(
-        ["line1", "line2", "import os", "import sys", "", "def main():", "    return 0"]
-        + [f"line{i}" for i in range(3, 9)]
-    )
-    + "\n"
-)
-
-_PATCH = (
-    "diff --git a/src/app/main.py b/src/app/main.py\n"
-    "index e69de29..4b825dc 100644\n"
-    "--- a/src/app/main.py\n"
-    "+++ b/src/app/main.py\n"
-    "@@ -1,8 +1,13 @@\n"
-    " line1\n"
-    " line2\n"
-    "+import os\n"
-    "+import sys\n"
-    "+\n"
-    "+def main():\n"
-    "+    return 0\n"
-    " line3\n"
-    " line4\n"
-    " line5\n"
-    " line6\n"
-    " line7\n"
-    " line8\n"
-)
-
-# Computed typography of the first rendered diff line (inside the FileDiff
-# shadow root) and of the panel text around it.
+# Computed typography of the diff's code lines (inside the FileDiff shadow root)
+# and of the sticky file header beside them.
 _MEASURE_JS = """
 () => {
   const rail = document.querySelector(
     'aside[aria-label="Workspace"], [role="complementary"][aria-label="Workspace"]');
-  const style = (el) => {
-    const cs = getComputedStyle(el);
-    return {
-      fontSize: parseFloat(cs.fontSize), lineHeight: cs.lineHeight, fontFamily: cs.fontFamily,
-    };
-  };
-  const out = { diff: null, ui: {} };
-  for (const host of rail.querySelectorAll('diffs-container')) {
-    const lines = Array.from(host.shadowRoot?.querySelectorAll('[data-line]') ?? []);
-    if (!lines.length) continue;
-    const rects = lines.slice(0, 13).map((l) => l.getBoundingClientRect());
-    out.diff = {
-      host: style(host),
-      line: style(lines[0]),
-      lineCount: lines.length,
-      pitches: rects.slice(1).map((r, i) => Math.round((r.top - rects[i].top) * 100) / 100),
-    };
-    break;
-  }
+  const px = (el, prop) => parseFloat(getComputedStyle(el)[prop]);
+  const host = Array.from(rail.querySelectorAll('diffs-container')).find(
+    (h) => h.shadowRoot?.querySelector('[data-line]'));
+  const lines = Array.from(host.shadowRoot.querySelectorAll('[data-line]'));
+  const tops = lines.map((l) => l.getBoundingClientRect().top);
   const header = rail.querySelector('button.sticky span.text-ui');
-  if (header) out.ui.sectionHeader = style(header);
-  const heading = rail.querySelector('h2');
-  if (heading) out.ui.panelHeading = style(heading);
-  const treeRow = Array.from(rail.querySelectorAll('button')).find(
-    (b) => !b.classList.contains('sticky') && /main\\.py/.test(b.textContent || ''));
-  if (treeRow) out.ui.treeRow = style(treeRow.querySelector('span.truncate') || treeRow);
-  out.ui.body = style(document.body);
-  const composer = document.querySelector('textarea[aria-label="Message the agent"]');
-  if (composer) out.ui.composer = style(composer);
-  out.ui.textUiVar = getComputedStyle(document.documentElement)
-    .getPropertyValue('--text-ui').trim();
-  return out;
+  return {
+    diffFontSize: px(lines[0], 'fontSize'),
+    diffLineHeight: px(lines[0], 'lineHeight'),
+    diffFontFamily: getComputedStyle(lines[0]).fontFamily,
+    rowPitch: Math.round((tops[1] - tops[0]) * 100) / 100,
+    headerFontSize: px(header, 'fontSize'),
+    appMonoStack: getComputedStyle(document.documentElement).getPropertyValue('--font-mono'),
+  };
 }
 """
 
 
-def _stub_github_with_patch(page: Page) -> None:
-    page.route(re.compile(r"/resources/github(?:\?|$)"), lambda r: r.fulfill(json=_INFO))
-    page.route(re.compile(r"/resources/github/changes"), lambda r: r.fulfill(json=_CHANGES))
-    page.route(
-        re.compile(r"/resources/github/diff(?:\?|$)"),
-        lambda r: r.fulfill(json={"object": "session.github.pr_diff", "patch": _PATCH}),
-    )
-    page.route(
-        re.compile(r"/resources/github/diff/"),
-        lambda r: r.fulfill(
-            json={
-                "object": "session.github.file_diff",
-                "path": "src/app/main.py",
-                "before": _BEFORE,
-                "after": _AFTER,
-            }
-        ),
-    )
+def _families(stack: str) -> list[str]:
+    return [family.strip().strip("\"'") for family in stack.split(",")]
 
 
-def _open_changes_diff(page: Page, base_url: str, session_id: str) -> None:
+def test_github_diff_text_tracks_interface_font_size(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+) -> None:
+    base_url, session_id = seeded_session
+    page: Page = request.getfixturevalue("page")
+    page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
+    _stub_github(page)
+
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="GitHub").click()
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
     rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
-    # The added lines live in the FileDiff shadow root; Playwright pierces it.
-    expect(rail.locator("diffs-container").get_by_text("def main():")).to_be_visible(
-        timeout=30_000
+    # The diff lines live in the FileDiff shadow root; Playwright pierces it.
+    expect(rail.locator("diffs-container").get_by_text("added line")).to_be_visible(timeout=30_000)
+
+    at_default: dict[str, Any] = page.evaluate(_MEASURE_JS)
+    print(f"GitHub diff typography (Interface 13): {json.dumps(at_default)}")
+    assert at_default["headerFontSize"] == 13
+    assert at_default["diffFontSize"] < at_default["headerFontSize"], (
+        f"diff code renders at {at_default['diffFontSize']}px, not smaller than the panel "
+        f"text beside it at {at_default['headerFontSize']}px"
     )
+    assert at_default["rowPitch"] == pytest.approx(at_default["diffLineHeight"], abs=0.05)
+    assert _families(at_default["diffFontFamily"]) == _families(at_default["appMonoStack"])
 
-
-_PREFERENCES: dict[str, dict[str, int]] = {
-    "default-prefs": {},
-    "interface-font-11": {"omnigent:ui-font-size": 11},
-}
-
-
-@pytest.mark.parametrize("prefs", list(_PREFERENCES), ids=list(_PREFERENCES))
-def test_github_diff_text_is_not_larger_than_panel_text(
-    request: pytest.FixtureRequest,
-    seeded_session: tuple[str, str],
-    tmp_path: Path,
-    prefs: str,
-) -> None:
-    base_url, session_id = seeded_session
-    page: Page = request.getfixturevalue("page")
-    page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
-    for key, value in _PREFERENCES[prefs].items():
-        page.add_init_script(f"window.localStorage.setItem({key!r}, {str(value)!r})")
-    _stub_github_with_patch(page)
-
-    _open_changes_diff(page, base_url, session_id)
-    measured: dict[str, Any] = page.evaluate(_MEASURE_JS)
-    page.get_by_role("complementary", name="Workspace").screenshot(
-        path=tmp_path / f"github-changes-{prefs}.png", animations="disabled"
+    # Lower the Interface font size the way Settings → Appearance applies it
+    # (lib/uiFontPreferences.ts) and re-measure the already-mounted diff.
+    page.evaluate("document.documentElement.style.setProperty('--desktop-ui-font-size', '11px')")
+    at_small: dict[str, Any] = page.evaluate(_MEASURE_JS)
+    print(f"GitHub diff typography (Interface 11): {json.dumps(at_small)}")
+    assert at_small["headerFontSize"] == 11
+    assert at_small["diffFontSize"] < at_small["headerFontSize"], (
+        f"diff code renders at {at_small['diffFontSize']}px, not smaller than the panel "
+        f"text beside it at {at_small['headerFontSize']}px"
     )
-    print(f"GitHub diff typography ({prefs}): {json.dumps(measured)}")
-
-    assert measured["diff"] is not None, measured
-    diff_font = measured["diff"]["line"]["fontSize"]
-    panel_font = measured["ui"]["sectionHeader"]["fontSize"]
-    assert diff_font <= panel_font, (
-        f"diff code renders at {diff_font}px ({measured['diff']['line']['lineHeight']} lines) "
-        f"but the panel text beside it is {panel_font}px "
-        f"({measured['ui']['sectionHeader']['lineHeight']} lines)"
+    # The diff scales with the setting rather than sitting at some fixed size.
+    assert at_small["diffFontSize"] / at_small["headerFontSize"] == pytest.approx(
+        at_default["diffFontSize"] / at_default["headerFontSize"], abs=0.01
     )
+    assert at_small["rowPitch"] == pytest.approx(at_small["diffLineHeight"], abs=0.05)
+    assert at_small["rowPitch"] < at_default["rowPitch"]

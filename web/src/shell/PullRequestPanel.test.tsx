@@ -398,12 +398,7 @@ describe("PullRequestPanel", () => {
     renderChanges();
     const diffs = await screen.findAllByTestId("diff");
     expect(diffs.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py", "src/app.ts"]);
-  });
-
-  it("mounts every diff inside the container that binds the app's diff typography", async () => {
-    renderChanges();
-    const diffs = await screen.findAllByTestId("diff");
-    // index.css sets @pierre/diffs' font variables on this class; without it the
+    // index.css binds @pierre/diffs' font variables on this class; outside it the
     // shadow stylesheet falls back to a fixed 13px that ignores the Interface font size.
     for (const diff of diffs) expect(diff.closest(".github-diff-stack")).not.toBeNull();
   });
