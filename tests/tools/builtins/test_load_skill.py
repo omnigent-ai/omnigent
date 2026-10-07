@@ -372,6 +372,16 @@ def test_find_skill_by_name_label_and_namespace_aliases_are_ambiguous(tmp_path: 
     assert find_skill_by_name([plugin_labelled, bare], "plugina:deploy") is None
 
 
+def test_find_skill_by_name_same_skill_matching_both_aliases_resolves(tmp_path: Path) -> None:
+    """Ambiguity means several skills match, not one skill matching two ways."""
+    from dataclasses import replace
+
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    skill = replace(_plugin_skill(tmp_path, "toolkit", "lint"), display_name="toolkit:lint")
+    assert find_skill_by_name([skill], "toolkit:lint") is skill
+
+
 def test_find_skill_by_name_unknown_names_return_none() -> None:
     """Unknown bare and namespaced names still miss."""
     from omnigent.tools.builtins.load_skill import find_skill_by_name

@@ -285,7 +285,9 @@ def find_skill_by_name(skills: list[SkillSpec], name: str) -> SkillSpec | None:
         aliases += provenanced[:1]
     else:
         aliases += [s for s in skills if ":" in s.name and s.name.split(":", 1)[1] == name]
-    return aliases[0] if len(aliases) == 1 else None
+    # One skill reachable through both alias kinds is still a single match.
+    matches = list({id(s): s for s in aliases}.values())
+    return matches[0] if len(matches) == 1 else None
 
 
 def format_skill_meta_text(skill: SkillSpec, arguments: str) -> str:
