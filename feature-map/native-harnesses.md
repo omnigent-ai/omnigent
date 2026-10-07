@@ -23,6 +23,8 @@ implements them separately, so a fix for one harness does not reach the others.
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `steer`: sending while the harness is mid-turn steers the active turn.
 - `chat-render`: the harness's output renders in chat like other harnesses.
+- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups
+  stay in that thread, and closing it leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
 - `disconnect`: startup waits and active operations settle when their native
@@ -71,6 +73,10 @@ shown for a newly connected or requested host → See more.
 turn, and Stop separately. For an offline host use the reconnect paths in
 [sessions](./sessions.md); a detached terminal has its own paths in
 [terminals](./terminals.md).
+
+**Codex side chat:** type `/side <question>` in the parent composer, send a
+follow-up in the side pane, then close its tab. The parent conversation stays
+separate. See [sessions](./sessions.md) for all side-chat entry points.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -123,6 +129,11 @@ the extra fields. Resolver and raw-tunnel checks:
 
 Cross-harness journeys:
 
+- **`side-chat`, Codex:**
+  `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
+  uses a real Codex CLI/app-server and the local mock model. It verifies inherited
+  model context, distinct native threads on one runner, transcript isolation,
+  follow-ups, and a working parent after side-chat closure.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus

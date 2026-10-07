@@ -209,6 +209,50 @@ describe("prefetchSessionHostChain", () => {
     expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each([false, true])("resolves nested side chats after reload (cached: %s)", async (cached) => {
+    const { client } = harness();
+    const side = {
+      ...routed(`side_${cached}`, null, null),
+      labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": `outer_${cached}` },
+    };
+    const outer = {
+      ...routed(`outer_${cached}`, null, null),
+      labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": `root_${cached}` },
+    };
+    if (cached) client.setQueryData(["session", side.id], side);
+    serve([side, outer, routed(`root_${cached}`, "host_side", null)]);
+
+    await prefetchSessionHostChain(client, side.id);
+
+    expect(getSessionHost(side.id)).toBe("host_side");
+    expect(side.parentSessionId).toBeNull();
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(cached ? 2 : 3);
+  });
+
+  it("prefers side-chat routing ancestry over workspace-fork provenance", async () => {
+    const { client } = harness();
+    serve([
+      {
+        ...routed("side_source_preference", null, null),
+        labels: {
+          "omnigent.side_chat": "1",
+          "omnigent.side_chat.source_id": "routing_source",
+          "omnigent.fork.source_id": "workspace_source",
+        },
+      },
+      routed("routing_source", "host_routing", null),
+      routed("workspace_source", "host_workspace", null),
+    ]);
+
+    await prefetchSessionHostChain(client, "side_source_preference");
+
+    expect(getSessionHost("side_source_preference")).toBe("host_routing");
+    expect(getSessionSlimMock.mock.calls.map((call) => call[0])).toEqual([
+      "side_source_preference",
+      "routing_source",
+    ]);
+  });
+
   it("terminates on a malformed parent cycle", async () => {
     const { client } = harness();
     serve([routed("cycle_a", null, "cycle_b"), routed("cycle_b", null, "cycle_a")]);
@@ -217,5 +261,45 @@ describe("prefetchSessionHostChain", () => {
 
     expect(getSessionHost("cycle_a")).toBeNull();
     expect(getSessionSlimMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([false, true])("bounds acyclic host-chain reads (cached: %s)", async (cached) => {
+    const { client } = harness();
+    const chain = Array.from({ length: 17 }, (_, index) =>
+      routed(
+        `bounded_${cached}_${index}`,
+        index === 16 ? "host_beyond_budget" : null,
+        index === 16 ? null : `bounded_${cached}_${index + 1}`,
+      ),
+    );
+    serve(chain);
+    if (cached) {
+      for (const snapshot of chain) client.setQueryData(["session", snapshot.id], snapshot);
+    }
+    const fetch = vi.spyOn(client, "fetchQuery");
+
+    await prefetchSessionHostChain(client, chain[0].id);
+
+    expect(fetch).toHaveBeenCalledTimes(16);
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(cached ? 0 : 16);
+    expect(getSessionHost(chain[0].id)).toBeNull();
+  });
+
+  it("resolves a host on the last allowed snapshot", async () => {
+    const { client } = harness();
+    serve(
+      Array.from({ length: 16 }, (_, index) =>
+        routed(
+          `boundary_${index}`,
+          index === 15 ? "host_at_budget" : null,
+          index === 15 ? null : `boundary_${index + 1}`,
+        ),
+      ),
+    );
+
+    await prefetchSessionHostChain(client, "boundary_0");
+
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(16);
+    expect(getSessionHost("boundary_0")).toBe("host_at_budget");
   });
 });

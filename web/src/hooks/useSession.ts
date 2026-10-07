@@ -13,7 +13,12 @@
 
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { SessionHostResolveOptions } from "@/lib/identity";
-import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import {
+  getSessionHost,
+  getSessionParent,
+  setSessionHost,
+  setSessionParent,
+} from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import type { Session } from "@/lib/types";
@@ -25,6 +30,9 @@ import type { Session } from "@/lib/types";
  * returning the deepest ancestor reached as a best-effort root.
  */
 const MAX_ROOT_WALK_HOPS = 8;
+
+// Bound cold host-routing lookups, including malformed acyclic ancestry.
+const MAX_HOST_CHAIN_READS = 16;
 
 interface UseSessionResult {
   session: Session | null;
@@ -165,8 +173,8 @@ export function useActiveRootSessionId(
  *
  * Registered as identity's session-host resolver at the app entry
  * (``setSessionHostResolver``); the chat store's stream bind goes through the
- * same resolver. Best-effort: a hostless top-level session, an unknown id, or
- * a cycle ends the walk with whatever is known.
+ * same resolver. Best-effort: a hostless top-level session, an unknown id,
+ * a cycle, or an exhausted read budget ends the walk with whatever is known.
  *
  * @param queryClient - The app QueryClient holding the snapshot cache.
  * @param sessionId - Session whose routing host to resolve, e.g. ``"conv_child"``.
@@ -178,7 +186,12 @@ export async function prefetchSessionHostChain(
 ): Promise<void> {
   const visited = new Set<string>();
   let id: string | null = sessionId;
-  while (id !== null && !visited.has(id) && getSessionHost(sessionId) === null) {
+  while (
+    id !== null &&
+    visited.size < MAX_HOST_CHAIN_READS &&
+    !visited.has(id) &&
+    getSessionHost(sessionId) === null
+  ) {
     visited.add(id);
     const hopId: string = id;
     const queryOptions = {
@@ -202,7 +215,7 @@ export async function prefetchSessionHostChain(
     // `sessionFromWire` records these on a live fetch; re-record so a cached
     // snapshot seeds the map the same way.
     setSessionHost(session.id, session.hostId);
-    setSessionParent(session.id, session.parentSessionId);
-    id = session.parentSessionId;
+    setSessionParent(session.id, session.parentSessionId, session.labels);
+    id = getSessionParent(session.id);
   }
 }
