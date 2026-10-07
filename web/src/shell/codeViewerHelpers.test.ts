@@ -476,6 +476,15 @@ describe("prepareHtmlPreviewDoc", () => {
     expect(out).toBe(`<!-- <head> --><html><head>${HEAD}</head></html>`);
   });
 
+  it('ignores a "<head>" string inside <style> and injects into the real head', () => {
+    const style = `.x{content:"<head>"}`;
+    const html = `<html><style>${style}</style><head></head><body>hi</body></html>`;
+    const out = prepareHtmlPreviewDoc(html);
+    expect(out).toContain(`<style>${style}</style>`);
+    expect(out).toContain(`<head>${HEAD}</head>`);
+    expect(out.indexOf(HEAD)).toBeGreaterThan(out.indexOf(style));
+  });
+
   it("keeps an artifact script intact when it only mentions <head>/<html> (bare fragment)", () => {
     // The injected markup carries its own </script>; landing inside this string
     // would end the artifact's script early.

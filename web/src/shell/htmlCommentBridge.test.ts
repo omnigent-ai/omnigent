@@ -32,6 +32,15 @@ describe("injectCommentBridge", () => {
     expect(scriptAt).toBeLessThan(bodyCloseAt);
   });
 
+  it('ignores a "</body>" string inside a plain-HTML <script>', () => {
+    const script = `var end = "</body>";`;
+    const html = `<html><head></head><body><p>hi</p><script>${script}</script></body></html>`;
+    const out = injectCommentBridge(html, NONCE);
+    expect(out).toContain(`<script>${script}</script>`);
+    expect(out.indexOf(NONCE)).toBeLessThan(out.lastIndexOf("</body>"));
+    expect(out.indexOf(NONCE)).toBeGreaterThan(out.indexOf(script));
+  });
+
   it("falls back to before </html> when there is no body", () => {
     const html = "<html><head></head><p>hi</p></html>";
     const out = injectCommentBridge(html, NONCE);
@@ -318,6 +327,28 @@ describe("appendCommentBridge", () => {
     expect(out).toContain(NONCE);
     // No second <base> from prepareHtmlPreviewDoc.
     expect(out.split('<base target="_blank">').length - 1).toBe(0);
+  });
+
+  it.each([
+    [
+      "script",
+      `<html><body><p>hi</p><script>var end = "</body>";</script></body></html>`,
+      `var end = "</body>";`,
+    ],
+    [
+      "style",
+      `<html><body><p>hi</p><style>.x{content:"</body>"}</style></body></html>`,
+      `.x{content:"</body>"}`,
+    ],
+    ["HTML comment", `<html><body><p>hi</p><!-- </body> --></body></html>`, `<!-- </body> -->`],
+  ])("injects before the real </body> when a fake one sits in a %s", (_label, html, keep) => {
+    const out = appendCommentBridge(html, NONCE);
+    expect(out).toContain(keep);
+    const injectAt = out.indexOf(NONCE);
+    const realClose = out.lastIndexOf("</body>");
+    expect(injectAt).toBeGreaterThan(out.indexOf(keep));
+    expect(injectAt).toBeLessThan(realClose);
+    expect(out.slice(realClose)).toMatch(/^<\/body>/i);
   });
 });
 

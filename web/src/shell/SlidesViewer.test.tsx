@@ -177,6 +177,64 @@ describe("prepareSlidesDoc", () => {
     const doc = prepareSlidesDoc("<section>a</section><!-- </body> -->");
     expect(doc.endsWith("</script>")).toBe(true);
   });
+
+  it.each([
+    [
+      "script",
+      // Trailing fake must not win over the earlier real close (last-match bug).
+      `<html><body><section>a</section></body><script>var end = "</body>";</script></html>`,
+      `var end = "</body>";`,
+    ],
+    [
+      "style",
+      `<html><body><section>a</section></body><style>.x{content:"</body>"}</style></html>`,
+      `.x{content:"</body>"}`,
+    ],
+    [
+      "HTML comment",
+      `<html><body><section>a</section></body><!-- </body> --></html>`,
+      `<!-- </body> -->`,
+    ],
+  ])(
+    "injects the viewer script before the real </body> despite a fake one in a %s",
+    (_label, html, keep) => {
+      const doc = prepareSlidesDoc(html);
+      expect(doc).toContain(keep);
+      const injectAt = doc.indexOf(SLIDES_MSG_SOURCE);
+      const realClose = doc.indexOf("</body>");
+      expect(injectAt).toBeGreaterThan(-1);
+      expect(injectAt).toBeLessThan(realClose);
+      expect(doc.indexOf(keep)).toBeGreaterThan(realClose);
+    },
+  );
+
+  it.each([
+    [
+      "script",
+      `<html><head><script>var h = "<head>";</script><style>body{color:red}</style></head><body><section>a</section></body></html>`,
+      `var h = "<head>";`,
+    ],
+    [
+      "style",
+      `<html><style>.x{content:"<head>"}</style><head><style>body{color:red}</style></head><body><section>a</section></body></html>`,
+      `.x{content:"<head>"}`,
+    ],
+    [
+      "HTML comment",
+      `<html><!-- <head> --><head><style>body{color:red}</style></head><body><section>a</section></body></html>`,
+      `<!-- <head> -->`,
+    ],
+  ])(
+    "injects design-system style into the real <head> despite a fake one in a %s",
+    (_label, html, keep) => {
+      const ds = "<style data-omnigent-design-system>x</style>";
+      const doc = prepareSlidesDoc(html, "", ds);
+      expect(doc).toContain(keep);
+      const dsAt = doc.indexOf(ds);
+      expect(dsAt).toBe(doc.indexOf(HTML_PREVIEW_HEAD) + HTML_PREVIEW_HEAD.length);
+      expect(dsAt).toBeLessThan(doc.indexOf("body{color:red}"));
+    },
+  );
 });
 
 describe("injected deck script", () => {
@@ -234,6 +292,18 @@ describe("prepareSlidesExport", () => {
     expect(doc.replace(HTML_PREVIEW_HEAD, "").match(/<script>/g)).toHaveLength(1);
     expect(doc).not.toContain(SLIDES_MSG_SOURCE);
     expect(doc).not.toContain("postMessage");
+  });
+
+  it('injects export navigation before the real </body> when a trailing script contains "</body>"', () => {
+    const script = `var end = "</body>";`;
+    const html = `<html><body><section>a</section></body><script>${script}</script></html>`;
+    const doc = prepareSlidesExport(html);
+    expect(doc).toContain(`<script>${script}</script>`);
+    const realClose = doc.indexOf("</body>");
+    const navAt = doc.indexOf("data-omnigent-deck");
+    expect(navAt).toBeGreaterThan(-1);
+    expect(navAt).toBeLessThan(realClose);
+    expect(doc.indexOf(script)).toBeGreaterThan(realClose);
   });
 });
 

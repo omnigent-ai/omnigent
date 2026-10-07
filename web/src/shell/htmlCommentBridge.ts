@@ -24,6 +24,7 @@
 // These helpers are pure (no React) so they unit-test in isolation.
 
 import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
+import { findTag, walkHtmlTags } from "./htmlTagScan";
 
 /** Protocol version  -  bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
@@ -664,13 +665,13 @@ export function mapBridgeRectToViewport(
  */
 export function appendCommentBridge(html: string, nonce: string): string {
   const inject = BRIDGE_HIGHLIGHT_STYLE + "<script>" + buildBridgeScript(nonce) + "</script>";
-  const bodyClose = html.search(/<\/body\s*>/i);
-  if (bodyClose !== -1) {
-    return html.slice(0, bodyClose) + inject + html.slice(bodyClose);
+  const bodyClose = findTag(html, "body", "close");
+  if (bodyClose) {
+    return html.slice(0, bodyClose.start) + inject + html.slice(bodyClose.start);
   }
-  const htmlClose = html.search(/<\/html\s*>/i);
-  if (htmlClose !== -1) {
-    return html.slice(0, htmlClose) + inject + html.slice(htmlClose);
+  const htmlClose = findTag(html, "html", "close");
+  if (htmlClose) {
+    return html.slice(0, htmlClose.start) + inject + html.slice(htmlClose.start);
   }
   return html + inject;
 }
@@ -681,109 +682,14 @@ export function appendCommentBridge(html: string, nonce: string): string {
  * append the highlight `<style>` and the bridge `<script>` so the script runs
  * after the document body has been parsed.
  *
- * Placement mirrors prepareHtmlPreviewDoc's deliberately-simple regex approach
- * (NOT a full HTML parse, which could subtly change how the artifact renders):
- * inject before `</body>` when present, else before `</html>`, else append.
+ * Placement uses the raw-text-aware tag walk: inject before the real `</body>`
+ * when present, else before `</html>`, else append.
  *
  * @param html  Raw artifact HTML.
  * @param nonce Per-mount nonce shared with the parent for message validation.
  */
 export function injectCommentBridge(html: string, nonce: string): string {
   return appendCommentBridge(prepareHtmlPreviewDoc(html), nonce);
-}
-
-/** Tags whose contents are raw text (not parsed as HTML) until their close tag. */
-const RAW_TEXT_TAGS = new Set(["script", "style", "textarea", "title"]);
-
-const VOID_TAGS = new Set([
-  "area",
-  "base",
-  "br",
-  "col",
-  "embed",
-  "hr",
-  "img",
-  "input",
-  "link",
-  "meta",
-  "param",
-  "source",
-  "track",
-  "wbr",
-]);
-
-/** Advance past an HTML comment starting at `i`, or to `limit` if unclosed. */
-function skipHtmlComment(html: string, i: number, limit: number): number {
-  const close = html.indexOf("-->", i + 4);
-  return close === -1 || close >= limit ? limit : close + 3;
-}
-
-/**
- * Advance past a raw-text element (`script`/`style`/`textarea`/`title`) whose
- * open tag starts at `openAt`. Contents are not scanned for tags.
- */
-function skipRawTextElement(html: string, openAt: number, name: string, limit: number): number {
-  const openTag = new RegExp(`^<${name}\\b[^>]*>`, "i").exec(html.slice(openAt));
-  if (!openTag) return Math.min(openAt + 1, limit);
-  if (/\/>$/.test(openTag[0]) || VOID_TAGS.has(name)) {
-    return Math.min(openAt + openTag[0].length, limit);
-  }
-  const after = openAt + openTag[0].length;
-  const close = new RegExp(`</${name}\\s*>`, "i").exec(html.slice(after, limit));
-  if (!close || close.index === undefined) return limit;
-  return after + close.index + close[0].length;
-}
-
-/**
- * Walk HTML from `start`, skipping comments and raw-text element contents.
- * Invokes `onTag` for each real open/close tag; return a number to jump `i`,
- * or null to keep the default advance past that tag.
- */
-function walkHtmlTags(
-  html: string,
-  start: number,
-  limit: number,
-  onTag: (
-    kind: "open" | "close",
-    name: string,
-    tagStart: number,
-    tagEnd: number,
-    selfClosing: boolean,
-  ) => number | null,
-): void {
-  let i = start;
-  while (i < limit) {
-    if (html.startsWith("<!--", i)) {
-      i = skipHtmlComment(html, i, limit);
-      continue;
-    }
-    if (html.charAt(i) !== "<") {
-      i += 1;
-      continue;
-    }
-    const closeTag = /^<\/([a-zA-Z][\w:-]*)\s*>/.exec(html.slice(i));
-    if (closeTag) {
-      const name = closeTag[1].toLowerCase();
-      const tagEnd = i + closeTag[0].length;
-      const jump = onTag("close", name, i, tagEnd, false);
-      i = jump ?? tagEnd;
-      continue;
-    }
-    const openTag = /^<([a-zA-Z][\w:-]*)\b[^>]*>/.exec(html.slice(i));
-    if (!openTag) {
-      i += 1;
-      continue;
-    }
-    const name = openTag[1].toLowerCase();
-    const tagEnd = i + openTag[0].length;
-    if (RAW_TEXT_TAGS.has(name)) {
-      i = skipRawTextElement(html, i, name, limit);
-      continue;
-    }
-    const selfClosing = /\/>$/.test(openTag[0]) || VOID_TAGS.has(name);
-    const jump = onTag("open", name, i, tagEnd, selfClosing);
-    i = jump ?? tagEnd;
-  }
 }
 
 /** Index of the matching `</section>` for a `<section` that opens at `openAt`. */

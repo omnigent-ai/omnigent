@@ -3,6 +3,7 @@
 
 import type { BundledLanguage } from "shiki";
 import type { ResolvedThemeMode } from "@/components/theme/themeMode";
+import { findTag } from "./htmlTagScan";
 
 // ---------------------------------------------------------------------------
 // Shared selection type
@@ -437,130 +438,9 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
 /** Markup `prepareHtmlPreviewDoc` places at the start of `<head>`. */
 export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCRIPT;
 
-/** Whitespace as the HTML tokenizer defines it. */
-const TOKENIZER_SPACE = " \t\n\f\r";
-
-/** Characters that end a tag name in the tokenizer: whitespace, `/` and `>`. */
-const TAG_NAME_END = `${TOKENIZER_SPACE}/>`;
-
-/** Whether `html` has the tag opener `name` (e.g. `</script`) at `at`, delimited as the tokenizer requires. */
-function hasTagAt(html: string, at: number, name: string): boolean {
-  const next = html.charAt(at + name.length);
-  return (
-    next !== "" &&
-    TAG_NAME_END.includes(next) &&
-    html.slice(at, at + name.length).toLowerCase() === name
-  );
-}
-
-/**
- * Index just past the `>` that ends the tag whose name ends at `from`, or -1 when
- * the tag is still open at end of input (the parser then drops it and everything
- * after it). Attribute states follow the tokenizer: a quote delimits a value only
- * right after `=`, and inside an unquoted value quotes and `=` are plain text.
- */
-function tagEnd(html: string, from: number): number {
-  let state: "name" | "beforeValue" | "unquoted" = "name";
-  for (let i = from; i < html.length; i++) {
-    const c = html.charAt(i);
-    if (c === ">") return i + 1;
-    if (state === "beforeValue" && (c === '"' || c === "'")) {
-      const close = html.indexOf(c, i + 1);
-      if (close === -1) return -1;
-      i = close;
-      state = "name";
-    } else if (TOKENIZER_SPACE.includes(c)) {
-      if (state === "unquoted") state = "name";
-    } else if (state === "name") {
-      if (c === "=") state = "beforeValue";
-    } else {
-      state = "unquoted";
-    }
-  }
-  return -1;
-}
-
-/**
- * Index just past the end tag that closes a `<script>` whose start tag ended at
- * `from`, or -1 when the element is still open at end of input. Follows the
- * tokenizer's script states: `<!--` enters the escaped state and a `<script`
- * inside it the double-escaped state, where `</script>` only steps back to the
- * escaped state instead of closing the element; `-->` returns to plain script data.
- */
-function scriptEnd(html: string, from: number): number {
-  let state: "data" | "escaped" | "double" = "data";
-  for (let i = from; i < html.length; i++) {
-    const c = html.charAt(i);
-    if (c === "-" && state !== "data") {
-      let j = i + 1;
-      while (html.charAt(j) === "-") j++;
-      if (j - i >= 2 && html.charAt(j) === ">") {
-        state = "data";
-        i = j;
-      } else {
-        i = j - 1;
-      }
-    } else if (c !== "<") {
-      continue;
-    } else if (state === "data" && html.startsWith("<!--", i)) {
-      // `<!--` followed only by dashes and `>` is already back in plain script data.
-      let j = i + 4;
-      while (html.charAt(j) === "-") j++;
-      if (html.charAt(j) === ">") {
-        i = j;
-      } else {
-        state = "escaped";
-        i += 3;
-      }
-    } else if (hasTagAt(html, i, "</script")) {
-      if (state !== "double") return tagEnd(html, i + 8);
-      state = "escaped";
-      i += 7;
-    } else if (state === "escaped" && hasTagAt(html, i, "<script")) {
-      state = "double";
-      i += 6;
-    }
-  }
-  return -1;
-}
-
-/**
- * End offset of the first real `<head>`/`<html>` start tag, or -1: comments and
- * `<script>` elements are skipped whole so nothing is inserted into them, and
- * anything still open at end of input swallows the rest, as in the parser. The
- * scan only moves forward because artifact text is processed on the host page.
- */
+/** End offset of the first real `<head>`/`<html>` start tag, or -1. */
 function startTagEnd(html: string, tag: "head" | "html"): number {
-  for (let i = html.indexOf("<"); i !== -1; i = html.indexOf("<", i)) {
-    if (html.startsWith("<!--", i)) {
-      // An empty comment may close abruptly (`<!-->`, `<!--->`); otherwise `-->` or `--!>` ends it.
-      let j = i + 4;
-      while (html.charAt(j) === "-") j++;
-      if (html.charAt(j) === ">") {
-        i = j + 1;
-        continue;
-      }
-      const terminator = /--!?>/g;
-      terminator.lastIndex = i + 4;
-      const match = terminator.exec(html);
-      if (!match) return -1;
-      i = match.index + match[0].length;
-    } else if (hasTagAt(html, i, "<script")) {
-      const open = tagEnd(html, i + 7);
-      if (open === -1) return -1;
-      const close = scriptEnd(html, open);
-      if (close === -1) return -1;
-      i = close;
-    } else if (hasTagAt(html, i, "<head") || hasTagAt(html, i, "<html")) {
-      const end = tagEnd(html, i + 5);
-      if (end === -1) return -1;
-      if (html.slice(i + 1, i + 5).toLowerCase() === tag) return end;
-      i = end;
-    } else {
-      i += 1;
-    }
-  }
-  return -1;
+  return findTag(html, tag, "open")?.end ?? -1;
 }
 
 /**
@@ -576,12 +456,10 @@ function startTagEnd(html: string, tag: "head" | "html"): number {
  * existing `<head>`/`<html>` when present and only fall back to prepending for
  * bare fragments that have no doctype to displace.
  *
- * The matcher is a small forward-only scanner, NOT a full HTML parser: parsing
- * and re-serializing untrusted artifact content could subtly alter how it
- * renders. Comments and `<script>` blocks are skipped so a look-alike tag inside
- * them is not mistaken for the real one; a literal in other text (a `<style>` or
- * `<title>`) is still matched textually, which can only mis-place the markup
- * *inside the sandboxed preview* - never affect the host app's security.
+ * The matcher is a raw-text-aware forward walk, NOT a full HTML parse-and-
+ * reserialize (which could subtly alter how the artifact renders). Comments and
+ * `script`/`style`/`textarea`/`title` contents are skipped so a look-alike tag
+ * inside them is not mistaken for the real one.
  */
 export function prepareHtmlPreviewDoc(html: string): string {
   const headEnd = startTagEnd(html, "head");
@@ -697,17 +575,9 @@ if(!e.defaultPrevented&&!e.button&&!inside(e,C))show(i+1);
 })();
 </script>`;
 
-/** Index of the last `</body>` outside HTML comments, or -1. */
+/** Index of the last real `</body>`, or -1. */
 function lastBodyCloseIndex(doc: string): number {
-  const comments = Array.from(doc.matchAll(/<!--[\s\S]*?(?:-->|$)/g), (m) => [
-    m.index,
-    m.index + m[0].length,
-  ]);
-  let at = -1;
-  for (const m of doc.matchAll(/<\/body\s*>/gi)) {
-    if (!comments.some(([s, e]) => m.index >= s && m.index < e)) at = m.index;
-  }
-  return at;
+  return findTag(doc, "body", "close", { last: true })?.start ?? -1;
 }
 
 /**

@@ -129,6 +129,31 @@ describe("prepareWireframeDoc", () => {
     expect(doc).not.toContain("overflow:hidden");
     expect(doc).not.toContain("omnigent-slides");
   });
+
+  it.each([
+    [
+      "script",
+      `<html><body>${SCREENS}</body><script>var end = "</body>";</script></html>`,
+      `var end = "</body>";`,
+    ],
+    [
+      "style",
+      `<html><body>${SCREENS}</body><style>.x{content:"</body>"}</style></html>`,
+      `.x{content:"</body>"}`,
+    ],
+    ["HTML comment", `<html><body>${SCREENS}</body><!-- </body> --></html>`, `<!-- </body> -->`],
+  ])(
+    "injects the wireframe script before the real </body> despite a fake one in a %s",
+    (_label, html, keep) => {
+      const doc = prepareWireframeDoc(html);
+      expect(doc).toContain(keep);
+      const realClose = doc.indexOf("</body>");
+      const injectAt = doc.indexOf(WIREFRAME_MSG_SOURCE);
+      expect(injectAt).toBeGreaterThan(-1);
+      expect(injectAt).toBeLessThan(realClose);
+      expect(doc.indexOf(keep)).toBeGreaterThan(realClose);
+    },
+  );
 });
 
 describe("wireframe frame script", () => {
