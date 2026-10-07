@@ -408,6 +408,47 @@ describe("topLevelSectionRanges", () => {
     expect(deck.slice(ranges[0].start, ranges[0].end)).toContain("still one");
     expect(slideIndexForSourceOffset(deck, deck.indexOf("Two close-safe token"))).toBe(1);
   });
+
+  it('ignores a "</body>" string inside a <script> before a later slide', () => {
+    const deck = `<html><body>
+<section><h1>One</h1></section>
+<script>var end = "</body>";</script>
+<section><h1>Two after-fake-body token</h1></section>
+</body></html>`;
+    const ranges = topLevelSectionRanges(deck);
+    expect(ranges).toHaveLength(2);
+    expect(slideIndexForSourceOffset(deck, deck.indexOf("Two after-fake-body token"))).toBe(1);
+  });
+
+  it('ignores a "<body>" string inside a <script> in <head>', () => {
+    const deck = `<html><head><script>var start = "<body>";</script></head><body>
+<section><h1>One</h1></section>
+<section><h1>Two after-fake-open-body token</h1></section>
+</body></html>`;
+    const ranges = topLevelSectionRanges(deck);
+    expect(ranges).toHaveLength(2);
+    expect(slideIndexForSourceOffset(deck, deck.indexOf("Two after-fake-open-body token"))).toBe(1);
+  });
+
+  it('ignores "</body>" / "<body>" strings inside <style>', () => {
+    const deck = `<html><head><style>.x{content:"<body>"}</style></head><body>
+<style>.y{content:"</body>"}</style>
+<section><h1>One</h1></section>
+<section><h1>Two style-body token</h1></section>
+</body></html>`;
+    expect(topLevelSectionRanges(deck)).toHaveLength(2);
+    expect(slideIndexForSourceOffset(deck, deck.indexOf("Two style-body token"))).toBe(1);
+  });
+
+  it('ignores "</body>" / "<body>" strings inside HTML comments', () => {
+    const deck = `<html><!-- <body> --><body>
+<!-- </body> -->
+<section><h1>One</h1></section>
+<section><h1>Two comment-body token</h1></section>
+</body></html>`;
+    expect(topLevelSectionRanges(deck)).toHaveLength(2);
+    expect(slideIndexForSourceOffset(deck, deck.indexOf("Two comment-body token"))).toBe(1);
+  });
 });
 
 describe("slideIndexForSourceOffset", () => {

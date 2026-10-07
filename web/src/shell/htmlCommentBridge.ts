@@ -734,55 +734,24 @@ function skipRawTextElement(html: string, openAt: number, name: string, limit: n
   return after + close.index + close[0].length;
 }
 
-/** Index of the matching `</section>` for a `<section` that opens at `openAt`. */
-function sectionCloseEnd(html: string, openAt: number): number {
-  const openTag = /^<section\b[^>]*>/i.exec(html.slice(openAt));
-  if (!openTag) return openAt;
-  let i = openAt + openTag[0].length;
-  let depth = 1;
-  while (i < html.length && depth > 0) {
-    if (html.startsWith("<!--", i)) {
-      i = skipHtmlComment(html, i, html.length);
-      continue;
-    }
-    if (html.charAt(i) !== "<") {
-      i += 1;
-      continue;
-    }
-    const open = /^<([a-zA-Z][\w:-]*)\b[^>]*>/.exec(html.slice(i));
-    if (open) {
-      const name = open[1].toLowerCase();
-      if (RAW_TEXT_TAGS.has(name)) {
-        i = skipRawTextElement(html, i, name, html.length);
-        continue;
-      }
-      if (name === "section" && !/\/>$/.test(open[0])) depth += 1;
-      i += open[0].length;
-      continue;
-    }
-    const close = /^<\/([a-zA-Z][\w:-]*)\s*>/.exec(html.slice(i));
-    if (close) {
-      if (close[1].toLowerCase() === "section") depth -= 1;
-      i += close[0].length;
-      continue;
-    }
-    i += 1;
-  }
-  return i;
-}
-
 /**
- * Source ranges of `body > section` elements (top-level only), in document
- * order. Used to map a comment's source offset to a slide/screen index.
+ * Walk HTML from `start`, skipping comments and raw-text element contents.
+ * Invokes `onTag` for each real open/close tag; return a number to jump `i`,
+ * or null to keep the default advance past that tag.
  */
-export function topLevelSectionRanges(html: string): { start: number; end: number }[] {
-  const bodyOpen = /<body\b[^>]*>/i.exec(html);
-  const from = bodyOpen && bodyOpen.index !== undefined ? bodyOpen.index + bodyOpen[0].length : 0;
-  const bodyClose = html.slice(from).search(/<\/body\s*>/i);
-  const limit = bodyClose === -1 ? html.length : from + bodyClose;
-  const ranges: { start: number; end: number }[] = [];
-  let i = from;
-  let depth = 0;
+function walkHtmlTags(
+  html: string,
+  start: number,
+  limit: number,
+  onTag: (
+    kind: "open" | "close",
+    name: string,
+    tagStart: number,
+    tagEnd: number,
+    selfClosing: boolean,
+  ) => number | null,
+): void {
+  let i = start;
   while (i < limit) {
     if (html.startsWith("<!--", i)) {
       i = skipHtmlComment(html, i, limit);
@@ -794,8 +763,10 @@ export function topLevelSectionRanges(html: string): { start: number; end: numbe
     }
     const closeTag = /^<\/([a-zA-Z][\w:-]*)\s*>/.exec(html.slice(i));
     if (closeTag) {
-      if (depth > 0) depth -= 1;
-      i += closeTag[0].length;
+      const name = closeTag[1].toLowerCase();
+      const tagEnd = i + closeTag[0].length;
+      const jump = onTag("close", name, i, tagEnd, false);
+      i = jump ?? tagEnd;
       continue;
     }
     const openTag = /^<([a-zA-Z][\w:-]*)\b[^>]*>/.exec(html.slice(i));
@@ -804,20 +775,91 @@ export function topLevelSectionRanges(html: string): { start: number; end: numbe
       continue;
     }
     const name = openTag[1].toLowerCase();
+    const tagEnd = i + openTag[0].length;
     if (RAW_TEXT_TAGS.has(name)) {
       i = skipRawTextElement(html, i, name, limit);
       continue;
     }
     const selfClosing = /\/>$/.test(openTag[0]) || VOID_TAGS.has(name);
-    if (depth === 0 && name === "section") {
-      const start = i;
-      const end = sectionCloseEnd(html, start);
-      ranges.push({ start, end: Math.min(end, limit) });
-      i = end;
-      continue;
+    const jump = onTag("open", name, i, tagEnd, selfClosing);
+    i = jump ?? tagEnd;
+  }
+}
+
+/** Index of the matching `</section>` for a `<section` that opens at `openAt`. */
+function sectionCloseEnd(html: string, openAt: number, limit: number = html.length): number {
+  const openTag = /^<section\b[^>]*>/i.exec(html.slice(openAt));
+  if (!openTag) return openAt;
+  let depth = 1;
+  let end = openAt + openTag[0].length;
+  walkHtmlTags(html, end, limit, (kind, name, _tagStart, tagEnd, selfClosing) => {
+    if (kind === "open" && name === "section" && !selfClosing) depth += 1;
+    if (kind === "close" && name === "section") {
+      depth -= 1;
+      if (depth === 0) {
+        end = tagEnd;
+        return limit; // stop walk
+      }
     }
-    i += openTag[0].length;
+    return null;
+  });
+  return depth === 0 ? end : limit;
+}
+
+/**
+ * Source ranges of `body > section` elements (top-level only), in document
+ * order. Used to map a comment's source offset to a slide/screen index.
+ * Body and section boundaries are located by one raw-text-aware walk so
+ * tag-like strings inside script/style/textarea/title/comments are ignored.
+ */
+export function topLevelSectionRanges(html: string): { start: number; end: number }[] {
+  const ranges: { start: number; end: number }[] = [];
+  let inBody = false;
+  let sawBodyOpen = false;
+  let depth = 0;
+  walkHtmlTags(html, 0, html.length, (kind, name, tagStart, tagEnd, selfClosing) => {
+    if (!inBody) {
+      if (kind === "open" && name === "body" && !selfClosing) {
+        sawBodyOpen = true;
+        inBody = true;
+        depth = 0;
+        return tagEnd;
+      }
+      return null;
+    }
+    if (kind === "close" && name === "body") {
+      inBody = false;
+      return html.length; // stop walk at real </body>
+    }
+    if (kind === "close") {
+      if (depth > 0) depth -= 1;
+      return null;
+    }
+    // open
+    if (depth === 0 && name === "section" && !selfClosing) {
+      const end = sectionCloseEnd(html, tagStart, html.length);
+      ranges.push({ start: tagStart, end });
+      return end;
+    }
     if (!selfClosing) depth += 1;
+    return null;
+  });
+  // Fragments with no <body> still scan the whole document (legacy behavior).
+  if (!sawBodyOpen) {
+    depth = 0;
+    walkHtmlTags(html, 0, html.length, (kind, name, tagStart, _tagEnd, selfClosing) => {
+      if (kind === "close") {
+        if (depth > 0) depth -= 1;
+        return null;
+      }
+      if (depth === 0 && name === "section" && !selfClosing) {
+        const end = sectionCloseEnd(html, tagStart, html.length);
+        ranges.push({ start: tagStart, end });
+        return end;
+      }
+      if (!selfClosing) depth += 1;
+      return null;
+    });
   }
   return ranges;
 }
