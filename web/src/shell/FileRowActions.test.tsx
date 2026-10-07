@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -312,6 +312,24 @@ describe("FileRowActions", () => {
     ).toBeInTheDocument();
     await user.keyboard("{Escape}");
     expect(primary).toHaveFocus();
+  });
+
+  it("prevents the native context menu from opening over the row actions menu", async () => {
+    renderActions();
+    fireEvent.contextMenu(screen.getByTestId("file-row"));
+
+    const menu = await screen.findByRole("menu");
+    const menuItem = within(menu).getByRole("menuitem", { name: "Download" });
+    act(() => menuItem.focus());
+    const nativeContextMenu = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+    });
+
+    fireEvent(menuItem, nativeContextMenu);
+
+    expect(menuItem).toHaveFocus();
+    expect(nativeContextMenu.defaultPrevented).toBe(true);
   });
 
   it("omits Browse folder when no browse action is provided", async () => {
