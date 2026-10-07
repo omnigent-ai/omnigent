@@ -70,6 +70,7 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
+from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
@@ -696,11 +697,21 @@ class _ContextWindowOverflow(Exception):
 
     :param max_tokens: The model's context window.
     :param actual_tokens: The prompt size that overflowed.
+    :param detail_message: Original rejection text to surface verbatim in the
+        error detail (e.g. a deployment byte-cap message carrying its byte
+        sizes), kept instead of the token-count approximation when present.
     """
 
-    def __init__(self, max_tokens: int, actual_tokens: int) -> None:
+    def __init__(
+        self,
+        max_tokens: int,
+        actual_tokens: int,
+        *,
+        detail_message: str | None = None,
+    ) -> None:
         self.max_tokens = max_tokens
         self.actual_tokens = actual_tokens
+        self.detail_message = detail_message
         super().__init__(f"context window exceeded: {actual_tokens} > {max_tokens}")
 
 
@@ -712,29 +723,44 @@ _CONTEXT_OVERFLOW_PATTERNS = (
 )
 
 
-def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
+def _is_context_overflow_error(
+    event: _JsonObject,
+) -> tuple[int, int, str | None] | None:
     """
     Check if a ``response.failed`` SSE event indicates a context-window overflow.
 
     :param event: The parsed SSE event dict.
-    :returns: ``(max_tokens, actual_tokens)`` if overflow detected, else ``None``.
+    :returns: ``(max_tokens, actual_tokens, detail_message)`` on overflow, else
+        ``None``. ``detail_message`` carries a byte-cap rejection's raw text and
+        is ``None`` for token-shaped overflows, which have no extra detail.
     """
     if event.get("type") != "response.failed":
         return None
     error = cast(_JsonObject, event.get("error", {}))
-    msg = str(error.get("message", "")).lower()
+    raw = str(error.get("message", ""))
+    msg = raw.lower()
+    # Parse byte-cap rejections (request first, limit second) ahead of the
+    # generic gate so the numeric fallback can't invert the pair; size-less
+    # content-length phrases stay generic. Sizes are expressed as tokens.
+    size_overflow = detect_request_size_overflow(msg)
+    if size_overflow is not None:
+        return (
+            size_overflow.approx_limit_tokens,
+            size_overflow.approx_request_tokens,
+            raw,
+        )
     if not any(pat in msg for pat in _CONTEXT_OVERFLOW_PATTERNS):
         return None
     actual_gt_max = re.search(r"(\d{4,})\D*>\D*(\d{4,})", msg)
     if actual_gt_max is not None:
-        return int(actual_gt_max.group(2)), int(actual_gt_max.group(1))
+        return int(actual_gt_max.group(2)), int(actual_gt_max.group(1)), None
 
     numbers = re.findall(r"(\d{4,})", msg)
     if len(numbers) >= 2:
-        return int(numbers[-2]), int(numbers[-1])
+        return int(numbers[-2]), int(numbers[-1]), None
     if len(numbers) == 1:
-        return int(numbers[0]), int(numbers[0]) + 1
-    return 128000, 128001
+        return int(numbers[0]), int(numbers[0]) + 1, None
+    return 128000, 128001, None
 
 
 def _response_failed_payload(
@@ -5689,7 +5715,12 @@ def create_runner_app(
 
                                 _overflow = _is_context_overflow_error(event)
                                 if _overflow is not None:
-                                    raise _ContextWindowOverflow(*_overflow)
+                                    _max_tokens, _actual_tokens, _ov_detail = _overflow
+                                    raise _ContextWindowOverflow(
+                                        _max_tokens,
+                                        _actual_tokens,
+                                        detail_message=_ov_detail,
+                                    )
 
                                 _evt_type = event.get("type")
                                 if (
@@ -6029,7 +6060,8 @@ def create_runner_app(
             except _ContextWindowOverflow as overflow:
                 _error = {
                     "code": "context_length_exceeded",
-                    "message": (
+                    "message": overflow.detail_message
+                    or (
                         f"Context window exceeded: {overflow.actual_tokens} tokens "
                         f"> {overflow.max_tokens} max"
                     ),

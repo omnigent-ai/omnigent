@@ -1060,9 +1060,9 @@ describe("routing decision — harness / scope / raw pick", () => {
   // Only an AI-Gateway-routed decision is marked: the built-in judge is the
   // plain case, and a legacy row predates the field entirely.
   const AIGW_MARK = "routing-decision-source-databricks";
-  const AIGW_NAME = "Routed by the Databricks AI Gateway";
+  const AIGW_NAME = "Routed by the Databricks Unity Gateway";
 
-  it("card: marks a decision the Databricks AI Gateway answered", () => {
+  it("card: marks a decision the Databricks Unity Gateway answered", () => {
     render(
       <RoutingDecisionCard
         model="databricks-claude-sonnet-5"

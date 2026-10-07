@@ -162,9 +162,10 @@ def test_multi_file_review_rejects_missing_path_even_if_mentioned_in_prose() -> 
 
 
 @pytest.mark.parametrize("case", ["test_empty", "test_route[/v1/items]"])
-def test_single_changed_test_file_accepts_case_only_rows(case: str) -> None:
+@pytest.mark.parametrize("reference", ["`tests/test_parser.py`", "tests/test_parser.py"])
+def test_single_changed_test_file_accepts_case_only_rows(case: str, reference: str) -> None:
     review = _REVIEW.replace("tests/test_parser.py::test_empty", f"`{case}`").replace(
-        "### Tests\n", "### Tests\nAll changed tests are in `tests/test_parser.py`.\n"
+        "### Tests\n", f"### Tests\nAll changed tests are in {reference}.\n"
     )
 
     result = _HELPERS["compose_review"](
@@ -176,11 +177,82 @@ def test_single_changed_test_file_accepts_case_only_rows(case: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "case",
+    [
+        "test_route[/v1/items]",
+        "**test_route[/v1/items]**",
+        "test_a, test_b",
+        "test_route[/v1/items], test_route[/v2/items]",
+    ],
+)
+def test_single_file_accepts_plain_parameterized_case_labels(case: str) -> None:
+    review = _REVIEW.replace("tests/test_parser.py::test_empty", case).replace(
+        "### Tests\n", "### Tests\nChanged file: tests/test_parser.py.\n"
+    )
+
+    result = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+    assert case in result
+
+
+def test_single_file_accepts_case_row_with_an_example_path() -> None:
+    review = _REVIEW.replace(
+        "tests/test_parser.py::test_empty",
+        "`test_case` — `tests/test_unrelated.py::test_other`",
+    ).replace("### Tests\n", "### Tests\nChanged file: `tests/test_parser.py`.\n")
+
+    result = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+    assert "`test_case` — `tests/test_unrelated.py::test_other`" in result
+
+
+@pytest.mark.parametrize(
     "other_case",
-    ["tests/test_unrelated.py::test_other", "[tests/test_unrelated.py::test_other](#test)"],
+    [
+        "tests/test_unrelated.py::test_other",
+        "`tests/test_unrelated.py::test_other` — example",
+        "[tests/test_unrelated.py::test_other](#test)",
+        "See tests/test_unrelated.py::test_other",
+    ],
 )
 def test_single_changed_test_file_rejects_row_for_another_file(other_case: str) -> None:
     review = _REVIEW.replace("tests/test_parser.py::test_empty", other_case).replace(
+        "### Tests\n", "### Tests\nChanged file: `tests/test_parser.py`.\n"
+    )
+
+    with pytest.raises(ValueError, match=r"unassessed test files: tests/test_parser\.py"):
+        _HELPERS["compose_review"](
+            review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "tests/test_parser.py.backup",
+        "archive/tests/test_parser.py",
+        "tests/test_parser.py-old",
+        "tests/test_parser.py~",
+        "tests/test_parser.py+old",
+        "~tests/test_parser.py",
+    ],
+)
+def test_single_file_requires_exact_path_in_tests(reference: str) -> None:
+    review = _REVIEW.replace("tests/test_parser.py::test_empty", "test_route[/v1/items]").replace(
+        "### Tests\n", f"### Tests\nChanged file: `{reference}`.\n"
+    )
+
+    with pytest.raises(ValueError, match=r"unassessed test files: tests/test_parser\.py"):
+        _HELPERS["compose_review"](
+            review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+
+
+@pytest.mark.parametrize("label", ["**", "` `"])
+def test_single_file_rejects_empty_case_label(label: str) -> None:
+    review = _REVIEW.replace("tests/test_parser.py::test_empty", label).replace(
         "### Tests\n", "### Tests\nChanged file: `tests/test_parser.py`.\n"
     )
 
