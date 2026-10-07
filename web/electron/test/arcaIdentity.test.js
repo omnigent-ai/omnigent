@@ -59,6 +59,45 @@ describe("Arca daemon identity", () => {
     }
   });
 
+  it("reports fixed, bounded reasons without disclosing status fields or output", () => {
+    const privateText = "https://private.example/token-secret";
+    for (const [text, reason] of [
+      [privateText, "status markers missing"],
+      [`${IDENTITY_START}${privateText}${IDENTITY_END}`, "status could not be parsed"],
+      [output([]), "status must contain exactly one daemon"],
+      [output([{ ...daemon, error: privateText }]), "daemon status or target not eligible"],
+    ]) {
+      const reasons = [];
+      assert.equal(
+        readArcaIdentity(text, SERVER, (r) => reasons.push(r)),
+        null,
+      );
+      assert.deepEqual(reasons, [reason]);
+      assert.ok(reason.length < 80);
+      assert.ok(!reason.includes(privateText));
+    }
+    const reasons = [];
+    assert.deepEqual(
+      readArcaIdentity(output([daemon]), SERVER, (r) => reasons.push(r)),
+      identity,
+    );
+    assert.deepEqual(reasons, []);
+  });
+
+  it("requires recapture after relaunch and keeps a failed reconnect denied", () => {
+    const context = { serverTarget: arcaTarget(SERVER), sourceHostId: HOST };
+    const gates = { enabled: true, managed: true, serverTarget: SERVER };
+    const first = createArcaIdentityStore();
+    first.begin(SERVER)({ ok: true, alreadyRunning: true, identity });
+    assert.equal(isArcaAgentContext(first.get(SERVER), context, gates), true);
+    const relaunched = createArcaIdentityStore();
+    assert.equal(isArcaAgentContext(relaunched.get(SERVER), context, gates), false);
+    relaunched.begin(SERVER)({ ok: false });
+    assert.equal(isArcaAgentContext(relaunched.get(SERVER), context, gates), false);
+    relaunched.begin(SERVER)({ ok: true, alreadyRunning: true, identity });
+    assert.equal(isArcaAgentContext(relaunched.get(SERVER), context, gates), true);
+  });
+
   it("does not let a stale connect restore identity after a newer unknown or failed run", () => {
     const store = createArcaIdentityStore();
     const old = store.begin(SERVER);

@@ -309,7 +309,11 @@ const arcaIdentities = createArcaIdentityStore();
 
 function startArcaHostConnect(serverUrl, deps) {
   const finish = arcaIdentities.begin(serverUrl);
-  const run = arca.startArcaConnect(serverUrl, deps);
+  const run = arca.startArcaConnect(serverUrl, {
+    ...deps,
+    onIdentityUnavailable: (reason) =>
+      console.log(`[omnigent] Arca daemon identity unavailable: ${reason}`),
+  });
   return { ...run, promise: run.promise.then(finish) };
 }
 
@@ -4636,6 +4640,30 @@ function registerIpc() {
       serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
     }),
+    getAgentNavigationHintForEvent: (event, url) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const target = windowArcaServerUrl(win);
+      if (
+        !databricksInternalFeaturesEnabled() ||
+        !isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) ||
+        !isDatabricksManagedServerUrl(target) ||
+        arcaIdentities.get(target)
+      ) {
+        return null;
+      }
+      try {
+        const parsed = new URL(url);
+        if (
+          ["http:", "https:"].includes(parsed.protocol) &&
+          ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
+        ) {
+          return "If this session runs on Arca, open New session > Host > Reconnect to Arca (Run on Arca if not remembered), complete the connect flow, then return to this session and retry. Other hosts remain ineligible.";
+        }
+      } catch {
+        // Invalid URLs keep the policy's original error.
+      }
+      return null;
+    },
   });
 }
 

@@ -21,14 +21,21 @@ function arcaTarget(raw) {
 }
 
 /** Read only the bounded, machine-readable status from the Arca connect run. */
-function readArcaIdentity(output, serverUrl) {
+function readArcaIdentity(output, serverUrl, onUnavailable = () => {}) {
+  const unavailable = (reason) => {
+    onUnavailable(reason);
+    return null;
+  };
   const target = arcaTarget(serverUrl);
   const start = output.lastIndexOf(IDENTITY_START);
   const end = output.indexOf(IDENTITY_END, start);
-  if (!target || start < 0 || end < 0) return null;
+  if (!target) return unavailable("invalid selected target");
+  if (start < 0 || end < 0) return unavailable("status markers missing");
   try {
     const body = JSON.parse(output.slice(start + IDENTITY_START.length, end));
-    if (!Array.isArray(body.daemons) || body.daemons.length !== 1) return null;
+    if (!Array.isArray(body.daemons) || body.daemons.length !== 1) {
+      return unavailable("status must contain exactly one daemon");
+    }
     const daemon = body.daemons[0];
     // CLI status normalizes the UI mount to the API mount and drops ?o=.
     // The selected workspace remains bound by the command's --server argument.
@@ -44,11 +51,11 @@ function readArcaIdentity(output, serverUrl) {
       typeof daemon.host_id !== "string" ||
       !/^[a-f0-9]{32}$/i.test(daemon.host_id)
     ) {
-      return null;
+      return unavailable("daemon status or target not eligible");
     }
     return { serverUrl: target, hostId: daemon.host_id.toLowerCase() };
   } catch {
-    return null;
+    return unavailable("status could not be parsed");
   }
 }
 

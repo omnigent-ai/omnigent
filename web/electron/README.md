@@ -520,6 +520,14 @@ navigation denied; the remembered host-picker label alone does not grant it.
 Eligibility is scoped to the selected server/workspace, not all sessions on
 a Databricks server.
 
+After restarting the desktop, or if automatic connect fails, open **New
+session** > **Host** > **Reconnect to Arca** (or **Run on Arca** if the host
+is not remembered). Complete the existing connect console, then select your
+original session in the sidebar and retry the browser tool. Reconnecting can
+capture identity from an already-running daemon; it does not create a new
+session or change automatic-connect preferences. Failed or unrecognized
+capture keeps localhost denied, and the connect action remains available.
+
 The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
 redirects and links that would open a new window (which stay in the same pane).
 Other loopback addresses, private-network and metadata destinations, and

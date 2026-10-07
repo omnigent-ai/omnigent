@@ -261,6 +261,7 @@ function registerBrowserIpc({
   isPinnedOriginSender,
   getRegistryForEvent,
   getAgentContextForEvent = () => null,
+  getAgentNavigationHintForEvent = () => null,
 }) {
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
@@ -313,7 +314,12 @@ function registerBrowserIpc({
       });
     }
     // Strip the non-serializable `entry` before it crosses the IPC boundary.
-    return { ok: r.ok, created: r.created ?? false, error: r.error };
+    const hint = !r.ok && opts?.agent ? getAgentNavigationHintForEvent(event, url) : null;
+    return {
+      ok: r.ok,
+      created: r.created ?? false,
+      error: hint ? `${r.error} ${hint}` : r.error,
+    };
   });
 
   // Attach the named conversation's view to the host window (detaching the

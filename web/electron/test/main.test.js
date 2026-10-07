@@ -3255,6 +3255,30 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
 // detach, so pinWindow must close the window's browser registry when the origin
 // changes — else the native WebContentsView dangles over the setup/welcome page.
 describe("browser-view teardown on server change (src/main.js)", () => {
+  it("offers conditional reconnect guidance only for missing identity on a gated managed target", async (t) => {
+    for (const [serverUrl, internalFeatures, expected] of [
+      ["https://account.databricks.com/omnigent?o=123", true, true],
+      ["https://account.databricks.com/omnigent?o=123", false, false],
+      ["https://public.example", true, false],
+    ]) {
+      const h = loadNavigationHarness({ serverUrl, internalFeatures });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
+      const event = { sender: h.webContents };
+      for (const url of ["http://localhost:5173", "https://127.0.0.1", "http://[::1]"]) {
+        if (expected) {
+          assert.match(hint(event, url), /If this session runs on Arca.*Reconnect to Arca/);
+        } else {
+          assert.equal(hint(event, url), null);
+        }
+      }
+      for (const url of ["https://example.com", "http://10.0.0.1", "file://localhost/x", "bad"]) {
+        assert.equal(hint(event, url), null);
+      }
+    }
+  });
+
   it("uses captured Arca identity for the sender's workspace and revokes a changed context", async (t) => {
     const { arcaTarget } = require("../src/arcaIdentity");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
@@ -3274,9 +3298,12 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     h.api.windows.get(h.win).browserRegistry = registry;
     const context = h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId);
     const eligible = h.browserRegistryDeps().isArcaAgentContext;
+    const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
     assert.equal(eligible(context), false);
+    assert.match(hint({ sender: h.webContents }, "http://localhost"), /Reconnect to Arca/);
     await h.api.startArcaHostConnect(serverUrl).promise;
     assert.equal(eligible(context), true);
+    assert.equal(hint({ sender: h.webContents }, "http://localhost"), null);
     assert.equal(eligible({ ...context, sourceHostId: "b".repeat(32) }), false);
     h.api.setWindowServerUrl(h.win, serverUrl.replace("123", "456"));
     assert.deepEqual(h.browserRegistryCalls.closeAll, ["server-changed"]);

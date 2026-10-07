@@ -303,6 +303,7 @@ function lastLine(text) {
  *   resolveArcaPath?: () => string | null,
  *   spawn?: typeof spawn,
  *   onOutput?: (text: string) => void,
+ *   onIdentityUnavailable?: (reason: string) => void,
  * }} [deps]
  * @returns {{
  *   command: string | null,
@@ -403,7 +404,9 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
       if (code === 0) {
         // `omni host --background` reuses a healthy daemon and says so — the
         // caller can then skip waiting for a host that was online all along.
-        const identity = login ? null : readArcaIdentity(stdout, serverUrl);
+        const identity = login
+          ? null
+          : readArcaIdentity(stdout, serverUrl, deps.onIdentityUnavailable);
         settle({
           ok: true,
           alreadyRunning: /already running/i.test(stdout + stderr),

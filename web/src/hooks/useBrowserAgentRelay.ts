@@ -15,7 +15,8 @@ import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
 import { prefetchSessionHostChain } from "@/hooks/useSession";
-import { getSessionHost } from "@/lib/sessionHost";
+import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { getSessionSlim } from "@/lib/sessionsApi";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -369,22 +370,29 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      if (evt.action === "navigate" && getSessionHost(sourceConversationId) === null) {
+      let sourceHostId: string | null = null;
+      if (evt.action === "navigate") {
         try {
-          await prefetchSessionHostChain(queryClient, sourceConversationId);
+          // Child-list parent links do not establish whether the child has its own host.
+          const source = await queryClient.fetchQuery({
+            queryKey: ["session", sourceConversationId],
+            queryFn: () => getSessionSlim(sourceConversationId),
+            staleTime: Infinity,
+            retry: false,
+          });
+          setSessionHost(source.id, source.hostId);
+          setSessionParent(source.id, source.parentSessionId);
+          if (getSessionHost(sourceConversationId) === null) {
+            await prefetchSessionHostChain(queryClient, sourceConversationId);
+          }
+          sourceHostId = getSessionHost(sourceConversationId);
         } catch {
           // Unknown provenance stays denied for localhost; public browsing still works.
         }
       }
       const result = cancelled
         ? { ok: false, error: "browser relay context changed" }
-        : await dispatch(
-            sourceConversationId,
-            evt.action,
-            evt.args,
-            desktop,
-            getSessionHost(sourceConversationId),
-          );
+        : await dispatch(sourceConversationId, evt.action, evt.args, desktop, sourceHostId);
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 

@@ -182,6 +182,20 @@ describe("arca connect failures", () => {
 });
 
 describe("startArcaConnect / connectArcaHost", () => {
+  it("reports unavailable identity without changing a successful older connect result", async () => {
+    const child = fakeConnectChild();
+    const reasons = [];
+    const run = startArcaConnect("https://srv.example.com", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+      onIdentityUnavailable: (reason) => reasons.push(reason),
+    });
+    child.stdout.emit("data", "Host daemon already running: private-output");
+    child.emit("exit", 0);
+    assert.deepEqual(await run.promise, { ok: true, alreadyRunning: true });
+    assert.deepEqual(reasons, ["status markers missing"]);
+  });
+
   it("settles canceled login without waiting for a remote process exit", async () => {
     const child = fakeConnectChild();
     const run = startArcaLogin("https://account.databricks.com/omnigent?o=123", {
