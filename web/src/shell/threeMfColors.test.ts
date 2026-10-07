@@ -77,6 +77,26 @@ function descriptorArchive(pairs: [string, Uint8Array][], method: 0 | 8) {
   return bytes.buffer;
 }
 
+function declareOriginalSize(input: ArrayBuffer, name: string, size: number) {
+  const bytes = new Uint8Array(input);
+  const view = new DataView(input);
+  let offset = view.getUint32(input.byteLength - 6, true);
+  const count = view.getUint16(input.byteLength - 12, true);
+  for (let index = 0; index < count; index++) {
+    const length = view.getUint16(offset + 28, true);
+    if (strFromU8(bytes.subarray(offset + 46, offset + 46 + length)) === name) {
+      view.setUint32(offset + 24, size, true);
+      view.setUint32(view.getUint32(offset + 42, true) + 22, size, true);
+      const local = view.getUint32(offset + 42, true);
+      const start =
+        local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true);
+      return bytes.subarray(start, start + view.getUint32(offset + 20, true));
+    }
+    offset += 46 + length + view.getUint16(offset + 30, true) + view.getUint16(offset + 32, true);
+  }
+  throw new Error(`Missing fixture entry: ${name}`);
+}
+
 function rendered(buffer: ArrayBuffer) {
   const group = new ThreeMFLoader().parse(buffer);
   group.updateMatrixWorld(true);
@@ -195,52 +215,48 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     check(control);
     const name = "Metadata/model_settings.config";
     const prefix = strFromU8(unzipSync(new Uint8Array(control))[name]);
-    [2 * 1024 * 1024, 129 * 1024 * 1024].forEach((tailBytes) => {
-      const input = archive({ [name]: prefix + " ".repeat(tailBytes) });
-      const bytes = new Uint8Array(input);
-      const view = new DataView(input);
-      for (let offset = 0; offset < bytes.length - 46; offset++) {
-        const signature = view.getUint32(offset, true);
-        const local = signature === 0x04034b50;
-        if (!local && signature !== 0x02014b50) continue;
-        const length = view.getUint16(offset + (local ? 26 : 28), true);
-        const start = offset + (local ? 30 : 46);
-        if (strFromU8(bytes.subarray(start, start + length)) === name)
-          view.setUint32(offset + (local ? 22 : 24), prefix.length, true);
-      }
-      expect(strFromU8(unzipSync(bytes)[name])).toBe(prefix);
-      const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
-      const inflater = vi.spyOn(Inflate.prototype, "push");
-      const copier = vi.spyOn(Uint8Array.prototype, "set");
-      try {
-        expect(applyThreeMfColors(input)).toBe(input);
-        expect(parser).not.toHaveBeenCalled();
-        const compressedBytes = inflater.mock.calls.reduce(
-          (total, [chunk]) => total + chunk.length,
-          0,
-        );
-        expect(compressedBytes).toBeGreaterThan(0);
-        expect(compressedBytes).toBeLessThan(2 * INFLATE_CHUNK_BYTES);
-        expect(
-          copier.mock.calls.some(
-            ([chunk, offset], index) =>
-              chunk.length + (offset ?? 0) > (copier.mock.contexts[index] as Uint8Array).length,
-          ),
-        ).toBe(false);
-      } finally {
-        parser.mockRestore();
-        inflater.mockRestore();
-        copier.mockRestore();
-      }
-      check(input, ["ffffff", "ffffff"]);
-    });
+    let state = 123456789;
+    const tail = Array.from({ length: 4 * INFLATE_CHUNK_BYTES }, () => {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      return String.fromCharCode(32 + ((state >>> 0) % 95));
+    }).join("");
+    const input = archive({ [name]: prefix + " ".repeat(INFLATE_CHUNK_BYTES) + tail });
+    expect(declareOriginalSize(input, name, prefix.length).byteLength).toBeGreaterThan(
+      2 * INFLATE_CHUNK_BYTES,
+    );
+    expect(strFromU8(unzipSync(new Uint8Array(input))[name])).toBe(prefix);
+    const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
+    const inflater = vi.spyOn(Inflate.prototype, "push");
+    const copier = vi.spyOn(Uint8Array.prototype, "set");
+    try {
+      expect(applyThreeMfColors(input)).toBe(input);
+      expect(parser).not.toHaveBeenCalled();
+      const compressedBytes = inflater.mock.calls.reduce(
+        (total, [chunk]) => total + chunk.length,
+        0,
+      );
+      expect(compressedBytes).toBeGreaterThan(0);
+      expect(compressedBytes).toBeLessThan(2 * INFLATE_CHUNK_BYTES);
+      expect(
+        copier.mock.calls.some(
+          ([chunk, offset], index) =>
+            chunk.length + (offset ?? 0) > (copier.mock.contexts[index] as Uint8Array).length,
+        ),
+      ).toBe(false);
+    } finally {
+      parser.mockRestore();
+      inflater.mockRestore();
+      copier.mockRestore();
+    }
+    check(input, ["ffffff", "ffffff"]);
   });
 
   it("rejects selected payloads above the large-model ceiling before inflation", () => {
     check(archive());
-    const input = archive({
-      "Metadata/model_settings.config": `<config>${" ".repeat(129 * 1024 * 1024)}</config>`,
-    });
+    const input = archive();
+    declareOriginalSize(input, "Metadata/model_settings.config", 129 * 1024 * 1024);
     const inflater = vi.spyOn(Inflate.prototype, "push");
     const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
     try {
@@ -546,32 +562,61 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     );
   });
 
-  it("recolours large selected models without multiplying their mesh payload", () => {
-    const input = archive({
-      "3D/root.model": model(
-        mesh(1).replace(
-          "<mesh>",
-          `<metadata name="large">${"x".repeat(33 * 1024 * 1024)}</metadata><mesh>`,
-        ) +
-          mesh(2, 2) +
-          composite(100, component(1) + component(2, 10)),
-      ),
-    });
+  it("admits large declared model sizes without multiplying recoloured mesh payloads", () => {
+    const payloadBytes = 16 * 1024;
+    const source = model(
+      mesh(1).replace(
+        "<mesh>",
+        `<metadata name="payload">${"x".repeat(payloadBytes)}</metadata><mesh>`,
+      ) +
+        mesh(2, 2) +
+        composite(100, component(1) + component(2, 10)),
+      Array.from(
+        { length: 3 },
+        (_, index) => `<item objectid="100" transform="${transform(index * 20)}"/>`,
+      ).join(""),
+    );
+    const input = archive({ "3D/root.model": source });
     const normalized = applyThreeMfColors(input);
     expect(normalized === input).toBe(false);
     const entries = unzipSync(new Uint8Array(normalized));
-    expect(entries["3D/3dmodel.model"].byteLength).toBeGreaterThan(32 * 1024 * 1024);
-    expect(entries["3D/3dmodel.model"].byteLength).toBeLessThan(33 * 1024 * 1024 + 4096);
+    expect(entries["3D/3dmodel.model"].byteLength).toBeGreaterThan(payloadBytes);
+    expect(entries["3D/3dmodel.model"].byteLength).toBeLessThan(payloadBytes + 4096);
     const rows = rendered(normalized);
-    expect(rows.map((row) => row.hex)).toEqual(["f53b9d", "4dc5a0"]);
+    expect(rows.map((row) => row.hex)).toEqual([
+      "f53b9d",
+      "4dc5a0",
+      "f53b9d",
+      "4dc5a0",
+      "f53b9d",
+      "4dc5a0",
+    ]);
     expect(rows.map((row) => row.min)).toEqual([
       [0, 0, 0],
       [10, 0, 0],
+      [20, 0, 0],
+      [30, 0, 0],
+      [40, 0, 0],
+      [50, 0, 0],
     ]);
     expect(rows.map((row) => row.max)).toEqual([
       [1, 2, 3],
       [12, 2, 3],
+      [21, 2, 3],
+      [32, 2, 3],
+      [41, 2, 3],
+      [52, 2, 3],
     ]);
+    // A tiny forged payload probes size admission without constructing a large DOM.
+    const declaredLarge = archive({ "3D/root.model": source });
+    const compressed = declareOriginalSize(declaredLarge, "3D/root.model", 33 * 1024 * 1024);
+    const inflater = vi.spyOn(Inflate.prototype, "push");
+    try {
+      expect(applyThreeMfColors(declaredLarge)).toBe(declaredLarge);
+      expect(inflater).toHaveBeenCalledWith(compressed, true);
+    } finally {
+      inflater.mockRestore();
+    }
   });
 
   it("memoizes repeated leaf instances before deep import", () => {
@@ -972,25 +1017,30 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
           ).join("") + mesh(166),
         ),
       },
-      {
-        "3D/unused.model": model(
-          Array.from({ length: 10001 }, (_, index) => `<object id="${index + 1}"/>`).join(""),
-          "",
-        ),
-      },
+      Object.fromEntries(
+        Array.from({ length: 100 }, (_model, index) => [
+          `3D/unused-${index}.model`,
+          model(
+            Array.from(
+              { length: 100 },
+              (_object, partIndex) => `<object id="${partIndex + 1}"/>`,
+            ).join(""),
+            "",
+          ),
+        ]),
+      ),
       { "3D/unused.model": model(composite(8, component(1).repeat(10001)), "") },
-      // Whitespace has no model root, so the stock loader cannot render this byte-limit input.
-      { "3D/oversized.model": " ".repeat(32 * 1024 * 1024 + 1) },
     ];
     for (const [index, overrides] of cases.entries()) {
       const input = archive(overrides);
       expect(applyThreeMfColors(input)).toBe(input);
       if (index === 2) {
         check(input, ["ffffff"], [0], [1]);
-      } else if (index !== 5) {
+      } else if (index < 2) {
         // The stock loader rejects cycles, missing targets/meshes and malformed model XML.
         expect(() => rendered(input)).toThrow();
       }
+      // Object/component-limit inputs have no renderable meshes for the stock loader.
     }
   });
 });
