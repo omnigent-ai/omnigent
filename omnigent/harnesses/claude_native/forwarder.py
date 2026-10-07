@@ -175,6 +175,11 @@ _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
 # minutes, comfortably covering the dispatch race.
 _SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS = 12
 _SUBAGENT_DROPPED_ITEM_REASON = "sub-agent transcript incomplete: an item could not be delivered"
+# While every loop iteration keeps failing (e.g. the host cannot mint
+# credentials) the forwarder backs off up to this delay and logs a stack only for
+# the first failure, then one summary line per interval.
+_LOOP_FAILURE_MAX_BACKOFF_S = 60.0
+_LOOP_FAILURE_LOG_INTERVAL_S = 300.0
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
@@ -1213,6 +1218,7 @@ async def forward_claude_transcript_to_session(
     subagent_start_retries = _PostRetryTracker()
     subagent_item_retries = _PostRetryTracker()
     subagent_status_retries = _PostRetryTracker()
+    subagent_worker_failures: dict[str, _FailureStreak] = {}
     session_event_batch_capability = _SessionEventBatchCapability()
     delta_batch_capability = _SessionEventBatchCapability()
     subagent_status_capability = _SubagentStatusCapability()
@@ -1239,6 +1245,7 @@ async def forward_claude_transcript_to_session(
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
     subagent_task: asyncio.Task[SubagentForwardState] | None = None
+    loop_failures = _FailureStreak()
     observer_stderr_offset = 0
     transcript_diagnostics = _TranscriptDiscoveryDiagnostics(started_at=time.monotonic())
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
@@ -1330,6 +1337,7 @@ async def forward_claude_transcript_to_session(
                         subagent_start_retries = _PostRetryTracker()
                         subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
+                        subagent_worker_failures = {}
                         external_session_id_mirrored = False
                         task_subjects = {}
                         task_statuses = {}
@@ -1371,6 +1379,7 @@ async def forward_claude_transcript_to_session(
                         subagent_start_retries = _PostRetryTracker()
                         subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
+                        subagent_worker_failures = {}
                         external_session_id_mirrored = False
                         task_subjects = {}
                         task_statuses = {}
@@ -1494,6 +1503,7 @@ async def forward_claude_transcript_to_session(
                                         start_retry_tracker=subagent_start_retries,
                                         item_retry_tracker=subagent_item_retries,
                                         status_retry_tracker=subagent_status_retries,
+                                        worker_failures=subagent_worker_failures,
                                         batch_capability=session_event_batch_capability,
                                         status_capability=subagent_status_capability,
                                     ),
@@ -1549,17 +1559,88 @@ async def forward_claude_transcript_to_session(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
-            except Exception:
-                _logger.exception(
-                    "Claude transcript forwarder loop failed; session=%s",
-                    session_id,
-                    extra={"session_id": session_id},
-                )
+            except Exception as exc:
+                verdict = loop_failures.record(time.monotonic())
+                if verdict == "first":
+                    _logger.exception(
+                        "Claude transcript forwarder loop failed; session=%s",
+                        session_id,
+                        extra={"session_id": session_id},
+                    )
+                elif verdict == "periodic":
+                    _logger.warning(
+                        "Claude transcript forwarder loop still failing; session=%s "
+                        "consecutive_failures=%d error=%s: %s",
+                        session_id,
+                        loop_failures.count,
+                        type(exc).__name__,
+                        exc,
+                        extra={"session_id": session_id},
+                    )
+            else:
+                recovered = loop_failures.recover(time.monotonic())
+                if recovered is not None:
+                    _logger.info(
+                        "Claude transcript forwarder loop recovered after %d failed "
+                        "attempts over %.0fs; session=%s",
+                        recovered[0],
+                        recovered[1],
+                        session_id,
+                        extra={"session_id": session_id},
+                    )
             try:
-                await asyncio.sleep(poll_interval_s)
+                await asyncio.sleep(loop_failures.delay_s(poll_interval_s))
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
                 raise
+
+
+class _FailureStreak:
+    """Track consecutive failures of one retry loop: backoff delay and throttled logging."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self._started_at = 0.0
+        self._last_logged_at = 0.0
+
+    def record(self, now: float) -> str:
+        """
+        Count a failure.
+
+        :param now: Monotonic timestamp of the failure.
+        :returns: ``"first"`` for the streak's first failure (log with a stack),
+            ``"periodic"`` when a summary line is due, else ``"quiet"``.
+        """
+        self.count += 1
+        if self.count == 1:
+            self._started_at = self._last_logged_at = now
+            return "first"
+        if now - self._last_logged_at >= _LOOP_FAILURE_LOG_INTERVAL_S:
+            self._last_logged_at = now
+            return "periodic"
+        return "quiet"
+
+    def delay_s(self, poll_interval_s: float) -> float:
+        """Return the sleep before the next attempt (exponential, capped)."""
+        if self.count == 0:
+            return poll_interval_s
+        exponent = min(self.count - 1, _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT)
+        return min(
+            poll_interval_s * 2**exponent, max(_LOOP_FAILURE_MAX_BACKOFF_S, poll_interval_s)
+        )
+
+    def recover(self, now: float) -> tuple[int, float] | None:
+        """
+        End the streak.
+
+        :param now: Monotonic timestamp of the clean iteration.
+        :returns: ``(failed_attempts, duration_s)`` if a streak was active, else ``None``.
+        """
+        if self.count == 0:
+            return None
+        result = (self.count, now - self._started_at)
+        self.count = 0
+        return result
 
 
 def _subagents_dir_for_transcript(transcript_path: Path) -> Path:
@@ -2469,6 +2550,7 @@ async def _forward_available_subagents(
     start_retry_tracker: _PostRetryTracker,
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
+    worker_failures: dict[str, _FailureStreak] | None = None,
     batch_capability: _SessionEventBatchCapability | None = None,
     status_capability: _SubagentStatusCapability | None = None,
 ) -> SubagentForwardState:
@@ -2499,6 +2581,8 @@ async def _forward_available_subagents(
     :param status_retry_tracker: Backoff tracker for failed
         ``external_session_status`` POSTs (keyed by
         ``status:<child_id>``).
+    :param worker_failures: Per-child failure streaks that throttle repeated
+        worker failure logs across ticks. Direct callers that omit it log every failure.
     :param batch_capability: Process-local cache of whether the server accepts
         event arrays. A new cache is created for direct callers that omit it.
     :param status_capability: Process-local cache of whether the server accepts
@@ -2716,14 +2800,42 @@ async def _forward_available_subagents(
         *(_drain(entry) for entry in entries),
         return_exceptions=True,
     )
+    if worker_failures is None:
+        worker_failures = {}
     for entry, result in zip(entries, results, strict=True):
+        failure_key = entry.child_conversation_id or entry.subagent_id
         if isinstance(result, Exception):
-            _logger.error(
-                "Claude sub-agent transcript worker failed; child=%s",
-                entry.child_conversation_id,
-                exc_info=result,
-                extra={"session_id": parent_session_id},
-            )
+            streak = worker_failures.setdefault(failure_key, _FailureStreak())
+            verdict = streak.record(time.monotonic())
+            if verdict == "first":
+                _logger.error(
+                    "Claude sub-agent transcript worker failed; child=%s",
+                    entry.child_conversation_id,
+                    exc_info=result,
+                    extra={"session_id": parent_session_id},
+                )
+            elif verdict == "periodic":
+                _logger.warning(
+                    "Claude sub-agent transcript worker still failing; child=%s "
+                    "consecutive_failures=%d error=%s: %s",
+                    entry.child_conversation_id,
+                    streak.count,
+                    type(result).__name__,
+                    result,
+                    extra={"session_id": parent_session_id},
+                )
+        else:
+            streak = worker_failures.pop(failure_key, None)
+            recovered = streak.recover(time.monotonic()) if streak is not None else None
+            if recovered is not None:
+                _logger.info(
+                    "Claude sub-agent transcript worker recovered after %d failed "
+                    "attempts over %.0fs; child=%s",
+                    recovered[0],
+                    recovered[1],
+                    entry.child_conversation_id,
+                    extra={"session_id": parent_session_id},
+                )
     return checkpoint.state
 
 
