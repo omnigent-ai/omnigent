@@ -7058,18 +7058,18 @@ async def _stop_session_via_runner_impl(
     Runner-client resolution mirrors the best-effort helper's fallback
     chain: prefer the per-session router binding, fall back to the
     global runner client (in-process / test setups). When neither
-    resolves to a client there is no live runner bound — the session is
-    not running on any runner, so the stop is a no-op success and this
-    returns ``False`` without raising (the caller uses that to discard
-    the turn fence it installed, since no runner means nothing else
-    would ever lift it).
+    resolves to a client, this returns ``False`` to let the caller
+    distinguish an already-idle no-op from an undelivered stop of a
+    running turn. An absent tunnel does not prove the runner has stopped:
+    it may still be executing on an offline host.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param runner_router: The session's ``RunnerRouter`` (may be
         ``None`` in tests / in-process setups).
     :returns: ``True`` if the stop was delivered to a runner (2xx),
-        ``False`` if no runner client resolved (nothing forwarded).
+        ``False`` if no runner client resolved (nothing forwarded; the caller
+        must refuse a stop of an active turn).
     :raises OmnigentError: ``RUNNER_UNAVAILABLE`` (HTTP 503) if the
         runner could not be reached or reported a non-2xx — e.g. the
         claude-native tmux pane is wedged and ``kill_session`` failed.

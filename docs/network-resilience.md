@@ -64,7 +64,7 @@ a run happens to pass. Outages beyond the short default run only with
 | S5 | approve | 20 s | pass | pass |
 | S5 | approve | 150 s | gap: R2 | pass |
 | S5 | send | 20 s / 150 s | gap: [R3](#r3-a-message-sent-while-the-host-is-unreachable-is-lost) | gap: R3 |
-| S5 | stop | 20 s / 150 s | gap: [R4](#r4-stop-reports-success-while-the-host-is-unreachable) | gap: R4 |
+| S5 | stop | 20 s / 150 s | pass | pass |
 | S6 | tool ends during outage, approval pending (half-open and refused) | 20 s / 120 s | gap: [R5](#r5-the-page-never-says-it-is-offline) | gap: R5 |
 | S7 | before the first call, mid-stream | 10 s / 60 s | pass | pass |
 | S7 | before the first call | 180 s | pass | pass |
@@ -103,14 +103,16 @@ the unreachable host and published `failed` with `runner_failed_to_start`. The
 message never reached the runner. The failure stayed after the host
 reconnected, because passive recovery clears only `runner_disconnected`.
 
-### R4: Stop reports success while the host is unreachable
+### R4: Stop reports success while the host is unreachable (fixed)
 
-Both harnesses. With no live tunnel the server finds no runner to stop. It
-treats the Stop as done and shows the session idle. The turn keeps running on
-the host and finishes once the host returns. With Claude, the next message was in
-some runs delivered while Claude was still busy with the "stopped" turn, and
-it never appeared in Claude's transcript. With Codex, the next message is processed
-after the "stopped" turn completes.
+Both harnesses. When the host is offline, the missing runner tunnel does not
+mean the turn has stopped: the host can still be running it. Stop now returns
+`503 runner_unavailable` promptly if no runner receives the stop while the
+session is running. The stop fence is lifted, so the turn remains visible as
+running and completes when the host returns; the user can try Stop again once
+connected. The web Stop action already displays a failure toast for non-2xx
+responses and invalidates status only after success. All four S5 Stop rows
+(20 s and 150 s for both harnesses) pass.
 
 ### R5: The page never says it is offline
 

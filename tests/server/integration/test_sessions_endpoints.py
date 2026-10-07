@@ -9795,11 +9795,39 @@ async def test_stop_session_surfaces_runner_failure_as_error(
     )
 
 
+async def test_stop_session_offline_runner_refuses_active_turn(
+    client: httpx.AsyncClient,
+) -> None:
+    """A missing tunnel cannot turn a running host turn into a successful stop."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    set_runner_client(None)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    try:
+        sessions_module._publish_status(session_id, "running")
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "stop_session", "data": {}},
+        )
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"]["code"] == "runner_unavailable"
+        assert session_id not in _interrupt_fenced_sessions
+        snapshot = await client.get(f"/v1/sessions/{session_id}")
+        assert snapshot.json()["status"] == "running"
+    finally:
+        sessions_module._publish_status(session_id, "idle")
+        _interrupt_fenced_sessions.discard(session_id)
+
+
 async def test_stop_session_no_runner_lifts_stop_fence(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    A stop with no runner bound anywhere still removes the turn fence.
+    An already-idle stop with no runner bound still removes the turn fence.
 
     When neither the session router nor the global fallback resolves a
     runner client, ``_stop_session_via_runner`` treats the stop as a

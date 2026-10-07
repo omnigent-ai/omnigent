@@ -215,7 +215,6 @@ from omnigent.server.routes._sessions.helpers import (
     _stop_session_via_runner,
     _stream_live_events,
     _wait_for_runner_client,
-    reconcile_orphaned_running_status,
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -271,7 +270,6 @@ from omnigent.session_event_batch import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
-from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S, runner_seen_is_fresh
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -1483,8 +1481,22 @@ def register_events_routes(
                 _interrupt_fenced_sessions.discard(session_id)
                 raise
             if not stop_delivered:
-                # No runner resolved: nothing else lifts the fence (same as interrupt).
+                # No runner resolved. An absent tunnel does not prove the turn
+                # stopped: the host may still be executing it while offline.
                 _interrupt_fenced_sessions.discard(session_id)
+                stop_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                if (
+                    _session_status_from_cache(
+                        session_id, stop_conv.live_status if stop_conv is not None else None
+                    )
+                    == "running"
+                ):
+                    raise OmnigentError(
+                        "Could not reach the runner to stop this session. Try again when the host reconnects.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
             # Host-spawned sessions run on a dedicated runner the host
             # launched for this one session. Killing the pane (above) leaves
             # that runner connected, so GET /health keeps reporting
@@ -1504,47 +1516,6 @@ def register_events_routes(
                     getattr(request.app.state, "host_registry", None),
                     conversation_store,
                 )
-            if not stop_delivered:
-                # False-success backstop. The stop reached NO live runner
-                # (``_stop_session_via_runner`` returned False, so there was
-                # no tunnel to deliver to). That path treats "no runner bound"
-                # as a no-op success — correct for an already-idle session,
-                # but WRONG for an orphaned one whose persisted status is
-                # still running/waiting: the runner died (a server replica
-                # outlived it, a crashed host, a graceful disconnect
-                # mid-turn), so nothing is left to emit the terminal edge, and
-                # returning 2xx below would report a stop that never actually
-                # settled the session. Reconcile that exact case to idle so
-                # the success we return is honest. (A host-spawned session
-                # whose runner is still live hits ``stop_delivered=True``
-                # above and its tunnel-drop disconnect handler publishes the
-                # terminal edge, so it never reaches here.)
-                #
-                # Only fire when the runner is confirmed gone from every
-                # replica: no live tunnel here (that's WHY the stop couldn't
-                # be delivered) AND ``runner_last_seen`` stale past the TTL,
-                # so a runner merely mid-reconnect — or alive on another
-                # replica — inside the grace window is left untouched.
-                stop_connectivity = await asyncio.to_thread(
-                    conversation_store.get_session_connectivity, [session_id]
-                )
-                stop_conn = stop_connectivity.get(session_id)
-                if (
-                    stop_conn is not None
-                    and stop_conn.runner_id is not None
-                    and not runner_seen_is_fresh(stop_conn.runner_last_seen)
-                    and _session_status_from_cache(
-                        session_id,
-                        stop_conv.live_status if stop_conv is not None else None,
-                    )
-                    == "running"
-                ):
-                    await asyncio.to_thread(
-                        reconcile_orphaned_running_status,
-                        session_id,
-                        conversation_store,
-                        int(time.time()) - RUNNER_LIVENESS_TTL_S,
-                    )
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
