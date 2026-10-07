@@ -12,6 +12,21 @@ pytestmark = pytest.mark.posix_only
 _WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/polly-review.yml"
 
 
+def test_review_identity_is_recorded_before_the_model_starts() -> None:
+    steps = yaml.safe_load(_WORKFLOW.read_text())["jobs"]["review"]["steps"]
+    record = next(step for step in steps if step.get("name") == "Record review target")
+    context = next(step for step in steps if step.get("id") == "ctx")
+    reviewer = next(step for step in steps if step.get("id") == "polly")
+    publication = next(step for step in steps if step.get("id") == "publish")
+    assert steps.index(context) < steps.index(record) < steps.index(reviewer)
+    assert record["if"] == "steps.ctx.outcome == 'success'"
+    # Runner-generated env headers survive a model timeout or summary failure.
+    # Use the frozen diff's head, which can differ from the earlier duplicate check.
+    assert record["env"]["PR_NUMBER"] == publication["env"]["PR_NUMBER"]
+    assert record["env"]["HEAD_SHA"] == "${{ steps.ctx.outputs.head_sha }}"
+    assert record["env"]["HEAD_SHA"] == publication["env"]["HEAD_SHA"]
+
+
 @pytest.mark.parametrize(
     ("body", "eligible"),
     [

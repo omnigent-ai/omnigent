@@ -1388,10 +1388,20 @@ def register_resource_routes(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         download: bool = False,
+        # ``reach`` admits a workspace symlink whose target lies outside the
+        # workspace but within the environment's reach. Only the server sends
+        # it, for a caller who may browse that target by absolute path.
+        scope: str = Query(default="workspace", pattern="^(workspace|reach)$"),
     ) -> Response:
         await _require_os_env(session_id)
+        follow_outward_links = scope == "reach"
         if download:
-            return await _fs_download(session_id, environment_id, relative_path)
+            return await _fs_download(
+                session_id,
+                environment_id,
+                relative_path,
+                follow_outward_links=follow_outward_links,
+            )
         return await _fs_list_or_read(
             session_id,
             environment_id,
@@ -1400,6 +1410,7 @@ def register_resource_routes(
             after=after,
             before=before,
             order=order,
+            follow_outward_links=follow_outward_links,
         )
 
     @app.put(
@@ -1546,6 +1557,8 @@ def register_resource_routes(
         session_id: str,
         environment_id: str,
         path: str,
+        *,
+        follow_outward_links: bool = False,
     ) -> StreamingResponse:
         """Serve a file's complete bytes as an attachment.
 
@@ -1557,6 +1570,8 @@ def register_resource_routes(
         :param session_id: Session identifier.
         :param environment_id: Environment resource id.
         :param path: Path within the environment, or an absolute path.
+        :param follow_outward_links: Admit a workspace symlink whose target
+            lies outside the workspace but within the environment's reach.
         :returns: The file streamed with ``Content-Disposition: attachment``.
         :raises InvalidPath: If the path names a directory.
         :raises FilesystemPathNotFound: If nothing the caller may see exists
@@ -1567,7 +1582,8 @@ def register_resource_routes(
         await _ensure_session_registered(session_id)
         agent_spec = await _resolve_session_agent_spec(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
-        fobj, resolved, size = await CallerProcessFilesystem(env).open_download(path)
+        fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
+        fobj, resolved, size = await fs.open_download(path)
 
         async def _chunks() -> AsyncIterator[bytes]:
             # Stop at the size announced in Content-Length so a file growing
@@ -1613,8 +1629,9 @@ def register_resource_routes(
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        follow_outward_links: bool = False,
     ) -> JSONResponse:
-        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+        from omnigent.runner.environment_filesystem import _MAX_READ_BYTES, CallerProcessFilesystem
 
         await _ensure_session_registered(session_id)
         agent_spec = await _resolve_session_agent_spec(session_id)
@@ -1624,7 +1641,7 @@ def register_resource_routes(
             agent_spec,
         )
 
-        fs = CallerProcessFilesystem(env)
+        fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
         resolved = fs._resolve(path)
 
         if resolved.is_dir():
@@ -1650,7 +1667,8 @@ def register_resource_routes(
                 },
             )
 
-        content = await fs.read(path)
+        # File previews need every line within the byte cap.
+        content = await fs.read(path, max_bytes=_MAX_READ_BYTES)
         content_type_guess, _ = mimetypes.guess_type(path)
         payload: dict[str, object] = {
             "object": "session.environment.filesystem.file_content",

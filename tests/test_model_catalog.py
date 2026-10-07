@@ -12,7 +12,9 @@ Databricks credential mint is stubbed with the real
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,6 +104,118 @@ def _worker_spec(harness: str, **executor_kwargs: object) -> AgentSpec:
         name="worker",
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}, **executor_kwargs),  # type: ignore[arg-type]
     )
+
+
+@pytest.mark.parametrize("cache_state", ["fresh", "stale", "missing"])
+@pytest.mark.parametrize(
+    "provider_config",
+    ["{}", "providers:\n  claude:\n    kind: subscription\n    cli: claude\n    default: true\n"],
+    ids=["unconfigured", "subscription"],
+)
+def test_managed_claude_gateway_uses_native_catalog(
+    cache_state: str, provider_config: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+    from omnigent.models import model_catalog_store
+
+    _isolate_config(monkeypatch, tmp_path, provider_config)
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                "apiKeyHelper": "echo test-token",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    monkeypatch.setattr(model_catalog_store, "_data_dir", lambda: tmp_path)
+    model_id = "system.ai.claude-sonnet-5-5[1m]"
+    fingerprint = claude_catalog_fingerprint(None)
+    if cache_state != "missing":
+        model_catalog_store.write_catalog(
+            "claude-native",
+            fingerprint,
+            [
+                {"id": "sonnet", "model": model_id, "isDefault": True},
+                {"id": model_id, "model": model_id},
+            ],
+        )
+        if cache_state == "stale":
+            old = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+            os.utime(model_catalog_store.catalog_path("claude-native", fingerprint), (old, old))
+    spec = _worker_spec("claude-native")
+
+    provider = resolve_model_provider(spec, "claude-native")
+    assert provider.kind == "cli-config"
+    assert provider.cli == "claude"
+    assert provider.base_url == "https://gateway.example/anthropic"
+    listing = list_models_for_worker(spec, "claude-native")
+    assert listing.source == ("static" if cache_state == "missing" else "cli")
+    assert listing.verified is (cache_state == "fresh")
+    assert [model.id for model in listing.models] == (
+        [] if cache_state == "missing" else [model_id]
+    )
+    assert "no usable model provider" not in listing.note
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "native-claude", "claude-sdk"])
+def test_managed_claude_gateway_preserves_explicit_provider(
+    harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                "apiKeyHelper": "echo test-token",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    spec = _worker_spec(harness, auth=DatabricksAuth(profile="explicit"))
+
+    provider = resolve_model_provider(spec, harness)
+    assert provider.kind == "databricks"
+    assert provider.profile == "explicit"
+    unconfigured = resolve_model_provider(_worker_spec(harness), harness)
+    assert unconfigured.kind == ("none" if harness == "claude-sdk" else "cli-config")
+    monkeypatch.delenv("OMNIGENT_TEST_MISSING_KEY", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n  explicit:\n    kind: key\n    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $OMNIGENT_TEST_MISSING_KEY\n"
+    )
+    unusable = _worker_spec(harness, auth=ProviderAuth(name="explicit"))
+    assert resolve_model_provider(unusable, harness).kind == "none"
+
+
+@pytest.mark.parametrize(
+    ("managed_url", "helper"),
+    [
+        ("https://gateway.example/anthropic", None),
+        ("https://api.anthropic.com", "echo test-token"),
+        (None, "echo test-token"),
+    ],
+)
+def test_managed_claude_settings_require_gateway_and_credential(
+    managed_url: str | None, helper: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": managed_url}, "apiKeyHelper": helper})
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+
+    assert resolve_model_provider(_worker_spec("claude-native"), "claude-native").kind == "none"
 
 
 @pytest.mark.parametrize(
@@ -1061,6 +1175,75 @@ def test_subscription_listing_is_static_and_unverified(
     assert "probing the harness" in listing.note
     payload = model_catalog._listing_payload(listing)
     assert "static_fallback" not in payload
+
+
+@pytest.mark.parametrize("cache_state", ["fresh", "stale", "empty", "missing"])
+@pytest.mark.parametrize("explicit", [False, True], ids=["default-provider", "spec-provider"])
+def test_codex_cli_config_uses_native_catalog(
+    cache_state: str, explicit: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Discovery uses the selected worker's cached wire IDs, not another provider's."""
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.models import model_catalog_store
+
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  ambient:\n    kind: cli-config\n    cli: codex\n"
+        f"    model_provider: Ambient\n    default: {str(explicit).lower()}\n"
+        "  codex-gateway:\n    kind: cli-config\n    cli: codex\n"
+        f"    model_provider: Databricks\n    default: {str(not explicit).lower()}\n",
+    )
+    source = tmp_path / "codex-source"
+    source.mkdir()
+    (source / "config.toml").write_text('model_provider = "Ambient"\n')
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+    monkeypatch.setattr(app_server, "_find_codex_cli", lambda: "/test-bin/codex")
+    monkeypatch.setattr(model_catalog_store, "_data_dir", lambda: tmp_path / "data")
+    spec = _worker_spec(
+        "codex-native", **({"auth": ProviderAuth(name="codex-gateway")} if explicit else {})
+    )
+    launch = app_server.resolve_native_codex_launch(model=None, spec=spec)
+    fingerprint = app_server.codex_catalog_fingerprint(launch)
+    model_id = "system.ai.gpt-5-6-sol"
+    if explicit:
+        ambient = app_server.resolve_native_codex_launch(model=None)
+        model_catalog_store.write_catalog(
+            "codex-native",
+            app_server.codex_catalog_fingerprint(ambient),
+            [{"id": "system.ai.gpt-other-provider", "isDefault": True}],
+        )
+    if cache_state != "missing":
+        rows = (
+            []
+            if cache_state == "empty"
+            else [
+                {"id": "gpt-5.6-sol", "model": model_id, "isDefault": True},
+                {"id": model_id, "model": model_id},
+                {"id": "gpt-5.6-terra"},
+            ]
+        )
+        model_catalog_store.write_catalog("codex-native", fingerprint, rows)
+        if cache_state == "stale":
+            old = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+            os.utime(model_catalog_store.catalog_path("codex-native", fingerprint), (old, old))
+
+    row = catalog_for_spec(spec)["self"]
+
+    assert row["source"] == ("static" if cache_state == "missing" else "cli")
+    assert row["verified"] is (cache_state in {"fresh", "empty"})
+    assert row["models"] == (
+        []
+        if cache_state in {"empty", "missing"}
+        else [
+            {"id": model_id, "family": "openai"},
+            {"id": "gpt-5.6-terra", "family": "openai"},
+        ]
+    )
+    if cache_state == "stale":
+        assert "refresh" in str(row["note"])
+    assert "no usable model provider" not in str(row["note"])
 
 
 def test_cli_config_listing_is_static_and_unverified(

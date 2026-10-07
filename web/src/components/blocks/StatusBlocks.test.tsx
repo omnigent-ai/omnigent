@@ -277,9 +277,36 @@ describe("ErrorBanner", () => {
       "transient_upstream_error",
       "The model service hit a temporary error mid-response; retrying usually continues the turn.",
     ],
+    [
+      "client_update_required",
+      "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+    ],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
     expect(screen.getByText(sentence)).toBeInTheDocument();
+  });
+
+  it("names both versions and the update command on a client_update_required card", () => {
+    render(
+      <ErrorBanner
+        message={`API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; version 2.1.280 or newer is required."}`}
+        source="execution"
+        code="client_update_required"
+        title="Claude Code needs an update"
+        cause="Claude Code 2.1.217 on the host doesn't support this model; version 2.1.280 or newer is required."
+        remediation="Run `claude update` on the host, then start a new session."
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Claude Code needs an update")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code needs an update/i }));
+    const content = screen.getByTestId("error-message-content");
+    expect(content).toHaveTextContent("Claude Code 2.1.217 on the host");
+    expect(content).toHaveTextContent("version 2.1.280 or newer is required");
+    expect(content).toHaveTextContent("Try this: Run `claude update` on the host");
+    // The running CLI keeps its old version, so neither turn retry nor resume applies.
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
   });
 
   const SIGN_IN_REMEDIATION =

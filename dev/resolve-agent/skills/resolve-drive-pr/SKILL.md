@@ -21,6 +21,10 @@ author runs read only `validation-prompt.md` for deferred body preparation;
 local-only author runs skip this skill. Review-remediation follows its mode's
 exemptions. Load `resolve-handoff` before any interim or final handoff.
 
+A draft proposal with an unresolved design choice follows `resolve-publish`'s
+incomplete handoff exception. Do not enter this readiness loop or promote the
+draft just to satisfy `review_cycle.py`.
+
 ## Step 4 — Land the PR: preview, green CI, clean review, hand it to the maintainer
 
 This step applies to **any PR you are driving toward landable** — the one you

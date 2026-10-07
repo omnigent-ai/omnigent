@@ -559,6 +559,7 @@ start.
 ```yaml
 branding:
   app_name: "Acme Agent"        # tab title, sidebar wordmark, login screen
+  server_name: "Acme Engineering"  # this server's name in the desktop app's server list
   heading: "How can I help?"     # landing hero; "" hides it, omit to keep the default
   logo:                          # a bare string sets `main`; or per-variant:
     main: logo.png               # branding-assets/logo.png
@@ -582,6 +583,13 @@ sign-in. Any unset field keeps its built-in default, so a partial block is fine.
 The small "Powered by Omnigent" credit under the landing composer appears only
 once you set custom branding; `powered_by: false` hides it even then. It always
 shows the Omnigent mascot, never your logo.
+
+`server_name` names this particular server, so people who connect the desktop
+app to several servers can tell them apart. It is published in the
+unauthenticated `GET /.well-known/omnigent.json` manifest, not in `/v1/info`.
+Desktop builds that read it always show the host next to it, and an MDM-provided
+name (`omnigentServerName`) takes precedence. When unset, the desktop shows the
+host; it does not fall back to `app_name`.
 
 ## Adding a new deploy target
 

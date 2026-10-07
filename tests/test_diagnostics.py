@@ -120,7 +120,7 @@ def test_snapshot_contains_no_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     ],
 )
 def test_redact_url(raw: str | None, expected: str | None) -> None:
-    assert diagnostics._redact_url(raw) == expected
+    assert diagnostics.redact_url(raw) == expected
 
 
 def test_snapshot_redacts_server_url_userinfo(monkeypatch: pytest.MonkeyPatch) -> None:

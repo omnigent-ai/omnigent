@@ -16,7 +16,7 @@ import asyncio
 import json
 import math
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,12 +52,38 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
 
 # ── Helpers ──────────────────────────────────────────────
+
+
+@pytest.fixture
+def metadata_rows(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, object]]]:
+    from omnigent.server import session_metadata_logging
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(routes_events, "debug_sink_enabled", lambda: True)
+    monkeypatch.setattr(session_metadata_logging, "debug_sink_enabled", lambda: True)
+    with capture_debug_rows("server") as rows:
+        yield rows
+
+
+def _assert_activity_metadata(
+    rows: list[dict[str, object]], session_id: str, observation: str
+) -> None:
+    observations = [row for row in rows if row["event_name"] == "session_metadata"]
+    assert len(observations) == 1
+    assert observations[0]["session_id"] == session_id
+    attrs = observations[0]["attributes"]
+    assert attrs["observation"] == observation
+    assert attrs["harness"] == "claude-sdk"
+    assert attrs["harness_source"] == "agent_spec"
+    assert attrs["harness_resolution"] == "resolved"
+    assert attrs["root_session_id"] == session_id
 
 
 @pytest.mark.parametrize("role", ["user", "assistant"])
@@ -241,6 +267,7 @@ async def test_first_message_schedules_background_semantic_title(
     client: httpx.AsyncClient,
     app: Any,
     monkeypatch: pytest.MonkeyPatch,
+    metadata_rows: list[dict[str, object]],
 ) -> None:
     """The first user turn returns normally while title generation runs separately."""
     agent = await create_test_agent(client)
@@ -292,6 +319,7 @@ async def test_first_message_schedules_background_semantic_title(
         await fake_runner.aclose()
 
     assert response.status_code == 202, response.text
+    _assert_activity_metadata(metadata_rows, session["id"], "message")
     # The events endpoint seeds the title synchronously before returning, so the
     # coordinator observes the expected seed and renames it. Writing our own seed
     # here would race that rename and clobber it, so rely on the endpoint's seed.
@@ -1512,6 +1540,7 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from omnigent.server.routes.sessions import routes_events as event_routes
 
@@ -1560,6 +1589,22 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
         app=app, headers=Headers({}), owner=None, runner_id="runner-a", batch=batch
     )
     assert first.applied == 1 and first.retryable
+    (failure,) = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_event_ingest_failed"
+    ]
+    assert failure.session_id == session["id"]
+    assert failure.attributes == {
+        "runner_id": "runner-a",
+        "batch_id": "first",
+        "batch_size": 2,
+        "applied_count": 1,
+        "event_type": "external_conversation_item",
+        "failure_stage": "apply",
+        "error_type": "RuntimeError",
+        "retryable": True,
+    }
     retry = await ingest(
         app=app,
         headers=Headers({}),
@@ -1571,6 +1616,13 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
     assert [event["type"] for event in published].count("response.output_text.delta") == 1
     items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
     assert [item["content"][0]["text"] for item in items] == ["saved"]
+    assert (
+        sum(
+            getattr(record, "event_name", None) == "runner_event_ingest_failed"
+            for record in caplog.records
+        )
+        == 1
+    )
 
 
 async def test_runner_ingest_retries_internal_server_failures(
@@ -2270,6 +2322,7 @@ async def test_external_subagent_start_rejects_missing_required_keys(
 async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    metadata_rows: list[dict[str, object]],
 ) -> None:
     """
     Structured skill slash commands persist two durable records.
@@ -2344,6 +2397,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
         )
         assert resp.status_code == 202, resp.text
 
+    _assert_activity_metadata(metadata_rows, session["id"], "slash_command")
     assert resp.json()["queued"] is True
     assert len(resp.json()["item_id"]) == 32
 
@@ -2363,6 +2417,8 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert "<user_request>\nreview this rollout\n</user_request>" in text
     assert "Use the load_skill tool" not in text
 
+    # The bundle revision lets the runner notice a reinstall under the same id.
+    assert forwarded[0].pop("agent_revision").startswith(f"{agent['id']}/")
     assert forwarded == [
         {
             "type": "message",
@@ -2558,7 +2614,7 @@ async def test_skill_slash_command_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(
@@ -4805,6 +4861,7 @@ async def test_post_external_session_status_failed_surfaces_output_and_reauth(
 async def test_post_external_session_status_failure_detail_keeps_native_code(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A harness ``failure_detail`` names the failure without the Codex wire label.
@@ -4825,6 +4882,19 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
             "data": {
                 "status": "failed",
                 "failure_detail": "API Error: 400 The request was malformed.",
+                "failure_context": {
+                    "native_error_category": "invalid_request",
+                    "detail_source": "hook_last_assistant_message",
+                    "failure_source": "claude_hook",
+                    "native_session_id": "native-session",
+                    "failure_id": "native-failure-synthetic",
+                    "http_status": 400,
+                    "provider_error_param": "user",
+                    "origin": "forged-origin",
+                    "code": "forged-code",
+                    "session_id": "forged-session",
+                    "request_id": "must-not-be-an-inference-request",
+                },
             },
         },
     )
@@ -4835,6 +4905,51 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
     assert error is not None
     assert error["code"] == "native_turn_error"
     assert error["message"] == "API Error: 400 The request was malformed."
+    (record,) = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+    ]
+    assert record.session_id == session["id"]
+    attrs = record.attributes
+    assert attrs["origin"] == "external_session_status"
+    assert attrs["code"] == "native_turn_error"
+    assert attrs["native_error_category"] == "invalid_request"
+    assert attrs["detail_source"] == "hook_last_assistant_message"
+    assert attrs["failure_source"] == "claude_hook"
+    assert attrs["native_session_id"] == "native-session"
+    assert attrs["failure_id"] == "native-failure-synthetic"
+    assert attrs["http_status"] == "400"
+    assert attrs["provider_error_param"] == "user"
+    assert "native_request_id" in attrs["failure_context_missing_fields"].split(",")
+    assert "must-not-be-an-inference-request" not in str(attrs)
+
+
+@pytest.mark.parametrize("context", [None, [], "invalid", {"native_error_category": ["invalid"]}])
+async def test_malformed_native_failure_context_does_not_reject_status(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    context: object,
+) -> None:
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "failure_context": context},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert published[0][1]["status"] == "failed"
+    (record,) = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+    ]
+    assert record.attributes["detail_source"] == "missing"
+    assert "native_error_category" in record.attributes["failure_context_missing_fields"].split(
+        ","
+    )
 
 
 async def test_post_external_session_status_carries_response_id(
@@ -5033,6 +5148,8 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         _runner_id: str,
         _runner_client: _RecoveringRunnerClient,
         _conversation_store: Any,
+        *,
+        conversation: Any = None,
     ) -> None:
         """
         Skip relay startup; this test targets the PATCH init branch.
@@ -5041,6 +5158,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         :param _runner_id: Runner id, e.g. ``"runner_recovered"``.
         :param _runner_client: Runner client stub.
         :param _conversation_store: Conversation store from the route.
+        :param conversation: Saved session row from the route.
         :returns: None.
         """
         relay_bindings.append((_session_id, _runner_id))
@@ -5276,7 +5394,14 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
 
     assert status_resp.status_code == 202, status_resp.text
     assert forwarded, "the failed edge was never forwarded to the runner"
-    assert forwarded[0]["body"]["data"] == {"status": "failed", "output": detail}
+    assert forwarded[0]["body"]["data"] == {
+        "status": "failed",
+        "output": detail,
+        "failure_context": {
+            "failure_source": "external_status",
+            "detail_source": "assistant_output_fallback",
+        },
+    }
     failed_events = [ev for _sid, ev in published if ev.get("status") == "failed"]
     assert failed_events, f"no failed status was published: {published}"
     error = failed_events[0]["error"]
@@ -5400,6 +5525,96 @@ async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     assert snapshot_resp.json()["last_task_error"] == {
         **expected,
         "agent_name": "claude-native-ui",
+    }
+
+
+_OLD_CLI_DETAIL = (
+    'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+    "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
+    'desktop app, then try again."}'
+)
+_OLD_CLI_CARD = {
+    "title": "Claude Code needs an update",
+    "cause": (
+        "Claude Code 2.1.217 on the host doesn't support this model; "
+        "version 2.1.280 or newer is required."
+    ),
+    "remediation": "Run `claude update` on the host, then start a new session.",
+}
+
+
+@pytest.mark.parametrize("wire_output", [False, True])
+@pytest.mark.parametrize(
+    ("detail", "expected_code", "card"),
+    [
+        (
+            'API Error: 499 {"error_code":"CANCELLED","message":""}',
+            "transient_upstream_error",
+            {},
+        ),
+        (_OLD_CLI_DETAIL, "client_update_required", _OLD_CLI_CARD),
+    ],
+)
+async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_after_reload(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_output: bool,
+    detail: str,
+    expected_code: str,
+    card: dict[str, str],
+) -> None:
+    """A gateway 499 is retryable and an old-CLI refusal names its fix, live and on reload."""
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    response_id = "resp_native_coded_failure"
+    item_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": response_id,
+                "source_id": "src_native_coded_failure",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": detail}],
+                },
+            },
+        },
+    )
+    assert item_resp.status_code == 202, item_resp.text
+
+    data: dict[str, Any] = {"status": "failed", "response_id": response_id}
+    if wire_output:
+        data["output"] = detail
+    status_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    assert status_resp.status_code == 202, status_resp.text
+    failed_events = [event for event in published if event.get("status") == "failed"]
+    assert len(failed_events) == 1
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == expected_code
+    assert error["message"] == detail
+    for field in ("title", "cause", "remediation"):
+        assert error[field] == card.get(field)
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    assert snapshot_resp.json()["last_task_error"] == {
+        "code": expected_code,
+        "message": detail,
+        "agent_name": "claude-native-ui",
+        **card,
     }
 
 
@@ -9540,6 +9755,7 @@ async def test_stop_session_no_runner_lifts_stop_fence(
 async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    metadata_rows: list[dict[str, object]],
 ) -> None:
     """A live non-native runner is not falsely reported as recovered."""
     from omnigent.server.routes.sessions import routes_events
@@ -9560,6 +9776,7 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     )
 
     assert response.status_code == 202, response.text
+    _assert_activity_metadata(metadata_rows, session["id"], "retry_session")
     initialize.assert_awaited_once()
     assert initialize.await_args.kwargs["suppress_recovery_turn"] is True
     assert response.json() == {

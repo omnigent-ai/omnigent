@@ -565,7 +565,11 @@ jobs:
           ### Tests
           Include a compact table with columns: Test / case, Behavior protected,
           Layer, Needed?, and Action / rationale. Use exact file paths and test/case
-          names. Account for every added, modified, or removed test; parameterized
+          names in the table. When only one test/support file changed, you may
+          name its exact path in the Tests subsection above the table and use
+          case names alone in the rows; otherwise include the file path in the
+          rows for each changed file.
+          Account for every added, modified, or removed test; parameterized
           cases may share a row only when their purpose and recommendation match.
           Use one of keep, consolidate, move layer, remove, or uncertain in Needed?,
           and explain each one. All five fields are required for each assessment row.
@@ -723,6 +727,14 @@ jobs:
           """
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
+
+      # Resolve reads these runner-generated headers even if review later times out.
+      - name: Record review target
+        if: steps.ctx.outcome == 'success'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+        run: ':'
 
       - name: Mint App token
         id: app-token

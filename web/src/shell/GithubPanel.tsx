@@ -901,7 +901,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
     <div className="flex h-full min-h-0 flex-col">
       {showTrackingControls ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <h2 className="shrink-0 font-medium text-ui">GitHub</h2>
+          <h2 className="shrink-0 pl-1 font-medium text-ui">GitHub</h2>
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
             {prs.length > 0 && (
               <TooltipProvider>
@@ -997,7 +997,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
         </div>
       ) : (
         <div className="flex h-11 shrink-0 items-center border-b border-border px-2">
-          <h2 className="font-medium text-ui">GitHub</h2>
+          <h2 className="pl-1 font-medium text-ui">GitHub</h2>
         </div>
       )}
       {showTrackingControls && (linking || update.isError) && (

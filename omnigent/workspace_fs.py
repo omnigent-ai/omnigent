@@ -43,7 +43,6 @@ from typing import TypeAlias, cast
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import paginate_in_memory
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
-from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
 from omnigent.runner import github_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -224,19 +223,16 @@ class WorkspaceReader:
         self,
         rel: str,
         resolved: Path,
-        *,
-        limit: int | None = _DEFAULT_READ_LIMIT,
     ) -> _WorkspacePayload:
         """Build the file-content payload for a resolved file.
 
-        Text files are UTF-8 decoded and line-capped at ``limit``; binary
-        files are base64-encoded.  Both are byte-capped at
-        :data:`_MAX_READ_BYTES`.  Shape matches the runner's file-content
+        Text files are UTF-8 decoded; binary files are base64-encoded.
+        Both are byte-capped at :data:`_MAX_READ_BYTES`.
+        Shape matches the runner's file-content
         response, including the mimetype guess.
 
-        Reads at most ``_MAX_READ_BYTES`` from disk (like the runner's
-        bounded read) rather than slurping the whole file, so opening a
-        multi-GB file in the viewer can't OOM the host process.
+        Reads at most ``_MAX_READ_BYTES + 1`` from disk, bounding memory
+        use before decoding oversized files.
         """
         try:
             with resolved.open("rb") as fh:
@@ -246,14 +242,12 @@ class WorkspaceReader:
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
 
-        return self._file_content_payload(rel, capped, limit=limit)
+        return self._file_content_payload(rel, capped)
 
     def _file_content_payload(
         self,
         rel: str,
         raw: bytes,
-        *,
-        limit: int | None,
     ) -> _WorkspacePayload:
         """Assemble the file-content dict from raw bytes."""
         content_type_guess, _ = mimetypes.guess_type(rel)
@@ -285,11 +279,6 @@ class WorkspaceReader:
             "content_type": content_type_guess,
         }
         if text is not None:
-            if limit is not None:
-                lines = text.splitlines(keepends=True)
-                if len(lines) > limit:
-                    text = "".join(lines[:limit])
-                    truncated = True
             data = text.encode("utf-8")
             payload["bytes"] = len(data)
             payload["truncated"] = truncated

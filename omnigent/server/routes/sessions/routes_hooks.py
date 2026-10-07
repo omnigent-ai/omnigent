@@ -820,7 +820,7 @@ def register_hooks_routes(
             )
 
         loaded = _sf.get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
 
         _caps = _sf.get_caps()
