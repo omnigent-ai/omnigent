@@ -14,6 +14,11 @@ stays the source of truth — Omnigent never modifies cursor's JS bundle and nev
 the TUI prompt. The failure mode is benign: if detection ever breaks, the embedded TUI prompt
 still works and the user answers there.
 
+Pending verdict requests belong to the transcript supervisor. When a call resolves
+in the terminal, its parked request is cancelled before clearing the web card.
+When the supervisor stops, it cancels and joins every remaining verdict task before
+closing its HTTP client, so a late web answer cannot start typing into a retired terminal.
+
 One exception: a session the *caller* launched with `--yolo` / `--force` / `-f` has already
 declared it wants no approvals, and a card mirrored to a piloted parent is a stall nobody can
 click. Those sessions answer lingering gates in the pane instead — see
