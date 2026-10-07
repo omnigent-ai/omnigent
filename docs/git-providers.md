@@ -5,6 +5,19 @@ server, SDK, or network client. The descriptor preserves the provider ID, host,
 full repository path, request number, and canonical URL. Existing stored
 references without a provider ID continue to mean GitHub.
 
+## Host upgrade and rollback
+
+The legacy session registry remains GitHub-only. Other providers' associations
+live in a sibling `*.providers.json` file, coordinated by the same per-session
+lock. Reading a mixed registry from an earlier prerelease migrates it to this
+layout without dropping titles, removal history, or replay protection.
+
+An older host sees and updates only GitHub associations. Other providers remain
+saved but unavailable until the host is upgraded again; old-host GitHub edits
+and removals are preserved. Removal and observation history stay in the legacy
+file because older hosts already preserve those opaque values. This is local
+host downgrade protection, separate from server/host wire compatibility.
+
 ## Add an installed provider
 
 Install a Python package in the Omnigent host environment with an entry point:

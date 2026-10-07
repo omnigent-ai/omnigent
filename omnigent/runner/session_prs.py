@@ -54,11 +54,18 @@ class SessionPullRequest(PullRequestRef):
     title_lookup_timed_out: bool = False
 
 
-class _Registry(BaseModel):
+class _Associations(BaseModel):
     schema_version: Literal[1] = 1
     prs: list[SessionPullRequest] = Field(default_factory=list)
+
+
+class _Registry(_Associations):
     excluded: list[str] = Field(default_factory=list)
     observations: list[str] = Field(default_factory=list)
+
+
+class _ProviderRegistry(_Associations):
+    order: list[str] = Field(default_factory=list)
 
 
 class SessionPrRegistry:
@@ -68,25 +75,59 @@ class SessionPrRegistry:
         # Conversation IDs are globally allocated; hashing also confines disk paths.
         key = hashlib.sha256(session_id.encode()).hexdigest()
         self.path = (root or data_dir() / "github" / "session-prs") / f"{key}.json"
+        self._providers_path = self.path.with_suffix(".providers.json")
 
     def _read(self) -> _Registry:
+        """Read both files under the legacy lock, migrating pre-split registries."""
         try:
-            return _Registry.model_validate_json(self.path.read_text(encoding="utf-8"))
+            state = _Registry.model_validate_json(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return _Registry()
+            state = _Registry()
+        try:
+            providers = _ProviderRegistry.model_validate_json(
+                self._providers_path.read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            providers = _ProviderRegistry()
+        needs_migration = any(pr.provider != "github" for pr in state.prs)
+        # The companion is written first, so it wins after an interrupted migration.
+        entries = {pr.url: pr for pr in [*state.prs, *providers.prs]}
+        # Equal timestamps retain insertion order across files and process restarts.
+        order = {url: index for index, url in enumerate(providers.order)}
+        state.prs = sorted(entries.values(), key=lambda pr: order.get(pr.url, len(order)))
+        if needs_migration:
+            self._write(state)
+        return state
 
     def list(self) -> list[SessionPullRequest]:
-        """Read an atomic snapshot; corruption is reported without overwriting it."""
-        return sorted(self._read().prs, key=lambda pr: pr.last_seen_at, reverse=True)
+        """Read a locked snapshot; corruption is reported without overwriting it."""
+        if not self.path.parent.exists():
+            return []
+        with FileLock(str(self.path) + ".lock", timeout=1):
+            return sorted(self._read().prs, key=lambda pr: pr.last_seen_at, reverse=True)
 
     def _write(self, state: _Registry) -> None:
-        fd, temporary = tempfile.mkstemp(prefix=".session-prs-", dir=self.path.parent)
+        foreign = [pr for pr in state.prs if pr.provider != "github"]
+        if foreign or self._providers_path.exists():
+            self._write_file(
+                self._providers_path,
+                _ProviderRegistry(prs=foreign, order=[pr.url for pr in state.prs]),
+            )
+        # Old hosts may rewrite this file; keep foreign associations out of it.
+        legacy = state.model_copy(
+            update={"prs": [pr for pr in state.prs if pr.provider == "github"]}
+        )
+        self._write_file(self.path, legacy)
+
+    @staticmethod
+    def _write_file(path: Path, state: _Associations) -> None:
+        fd, temporary = tempfile.mkstemp(prefix=".session-prs-", dir=path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 stream.write(state.model_dump_json() + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
+            os.replace(temporary, path)
         finally:
             Path(temporary).unlink(missing_ok=True)
 
