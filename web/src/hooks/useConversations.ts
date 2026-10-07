@@ -1977,8 +1977,10 @@ export function useTogglePinnedConversation() {
 
 /**
  * Rewrite the pin sort value of already-pinned sessions (drag-to-reorder in the
- * Pinned section). One mutation for the whole batch, so the optimistic patch
- * and its rollback share a single snapshot even when every pin is renumbered.
+ * Pinned section). Every write is applied optimistically to all caches; once
+ * the PATCHes settle, each row is reconciled to what the server stored — the
+ * new value if its write landed, its previous value if not — so a failed or
+ * partly failed batch leaves the caches matching the persisted order.
  */
 export function useReorderPinnedConversations() {
   const { pinsIncludeShared, sharedAvailable } = useContext(SidebarConfigContext);
@@ -1998,23 +2000,28 @@ export function useReorderPinnedConversations() {
   };
   return useMutation({
     mutationFn: (writes: { id: string; pinnedAt: number }[]) =>
-      Promise.all(writes.map((w) => setConversationPinned(w.id, true, w.pinnedAt))),
+      Promise.allSettled(writes.map((w) => setConversationPinned(w.id, true, w.pinnedAt))),
     onMutate: (writes) => {
-      const prevPinned =
-        queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+      const previous = new Map(
+        writes.map((w) => [
+          w.id,
+          findCachedConversationRow(queryClient, w.id)?.labels?.[PINNED_LABEL_KEY],
+        ]),
+      );
       for (const w of writes) apply(w.id, String(w.pinnedAt));
-      return { prevPinned };
+      return { previous };
     },
-    onError: (_err, _writes, ctx) => {
-      if (ctx?.prevPinned !== undefined) {
-        queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, ctx.prevPinned);
-      }
-      showToast("Couldn't save the pinned order.");
-    },
-    onSuccess: (updated) => {
-      for (const row of updated) {
-        const value = row.labels[PINNED_LABEL_KEY];
-        if (value !== undefined) apply(row.id, value);
+    onSuccess: (results, writes, ctx) => {
+      results.forEach((result, index) => {
+        const id = writes[index].id;
+        const value =
+          result.status === "fulfilled"
+            ? result.value.labels[PINNED_LABEL_KEY]
+            : ctx?.previous.get(id);
+        if (value !== undefined) apply(id, value);
+      });
+      if (results.some((r) => r.status === "rejected")) {
+        showToast("Couldn't save the pinned order.");
       }
     },
   });

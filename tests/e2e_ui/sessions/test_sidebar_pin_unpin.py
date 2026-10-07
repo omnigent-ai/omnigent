@@ -233,11 +233,7 @@ def test_drag_reorders_pinned_sessions(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Dragging a pinned row onto another pinned row reorders the Pinned section.
-
-    Pins ``a`` then ``b`` (so ``b`` starts below ``a``), drags ``b`` onto
-    ``a``, and asserts ``b`` now sits on top. A reload proves the new order
-    is persisted in the pin labels rather than held only in the client cache.
+    """Drag a pinned row above another and verify the order persists after reload.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session_pair: ``(base_url, session_a, session_b)`` — two

@@ -33,6 +33,7 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
   useTogglePinnedConversation,
+  useReorderPinnedConversations,
   fetchPinnedConversations,
   clearSessionTombstones,
   markRecentlyCreated,
@@ -1589,6 +1590,70 @@ describe("useTogglePinnedConversation cache patching", () => {
     expect(invalidateSpy).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
+  });
+});
+
+describe("useReorderPinnedConversations failure reconcile", () => {
+  const pinnedRow = (id: string, value: string) =>
+    conversation({ id, updated_at: 150, labels: { [PINNED_LABEL_KEY]: value } });
+
+  // The sidebar prefers the list cache's copy of a row over the pinned cache's,
+  // so both must carry the reconciled value.
+  function seed() {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const rows = [pinnedRow("conv_a", "1000"), pinnedRow("conv_b", "2000")];
+    queryClient.setQueryData(["conversations", "", false], infinitePage(rows));
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: rows,
+      filterHonored: true,
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useReorderPinnedConversations(), { wrapper });
+    const values = (id: string) => [
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
+        ?.pages.flatMap((p) => p.data)
+        .find((c) => c.id === id)?.labels?.[PINNED_LABEL_KEY],
+      queryClient
+        .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+        ?.conversations.find((c) => c.id === id)?.labels?.[PINNED_LABEL_KEY],
+    ];
+    return { rendered, values };
+  }
+
+  it("restores the previous value in every cache when the PATCH fails", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const { rendered, values } = seed();
+
+    act(() => rendered.result.current.mutate([{ id: "conv_b", pinnedAt: 999 }]));
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(values("conv_b")).toEqual(["2000", "2000"]);
+  });
+
+  it("keeps landed writes and restores failed ones in a partly failed batch", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_a",
+          object: "conversation",
+          labels: { [PINNED_LABEL_KEY]: "3000" },
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const { rendered, values } = seed();
+
+    act(() =>
+      rendered.result.current.mutate([
+        { id: "conv_a", pinnedAt: 3000 },
+        { id: "conv_b", pinnedAt: 4000 },
+      ]),
+    );
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(values("conv_a")).toEqual(["3000", "3000"]);
+    expect(values("conv_b")).toEqual(["2000", "2000"]);
   });
 });
 
