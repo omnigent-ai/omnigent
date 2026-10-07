@@ -92,7 +92,8 @@ class SessionPrRegistry:
             providers = _ProviderRegistry()
         needs_migration = any(pr.provider != "github" for pr in state.prs)
         # The companion is written first, so it wins after an interrupted migration.
-        entries = {pr.url: pr for pr in [*state.prs, *providers.prs]}
+        excluded = set(state.excluded)
+        entries = {pr.url: pr for pr in [*state.prs, *providers.prs] if pr.url not in excluded}
         # Equal timestamps retain insertion order across files and process restarts.
         order = {url: index for index, url in enumerate(providers.order)}
         state.prs = sorted(entries.values(), key=lambda pr: order.get(pr.url, len(order)))
@@ -110,18 +111,21 @@ class SessionPrRegistry:
         except FileLockTimeout as exc:
             raise ValueError("PR tracking is busy; try again.") from exc
 
-    def _write(self, state: _Registry) -> None:
+    def _write(self, state: _Registry, *, legacy_first: bool = False) -> None:
+        # Old hosts may rewrite this file; keep foreign associations out of it.
+        legacy = state.model_copy(
+            update={"prs": [pr for pr in state.prs if pr.provider == "github"]}
+        )
+        if legacy_first:
+            self._write_file(self.path, legacy)
         foreign = [pr for pr in state.prs if pr.provider != "github"]
         if foreign or self._providers_path.exists():
             self._write_file(
                 self._providers_path,
                 _ProviderRegistry(prs=foreign, order=[pr.url for pr in state.prs]),
             )
-        # Old hosts may rewrite this file; keep foreign associations out of it.
-        legacy = state.model_copy(
-            update={"prs": [pr for pr in state.prs if pr.provider == "github"]}
-        )
-        self._write_file(self.path, legacy)
+        if not legacy_first:
+            self._write_file(self.path, legacy)
 
     @staticmethod
     def _write_file(path: Path, state: _Associations) -> None:
@@ -216,7 +220,8 @@ class SessionPrRegistry:
             state.prs = [pr for pr in state.prs if pr.url != reference.url]
             if reference.url not in state.excluded:
                 state.excluded.append(reference.url)
-            self._write(state)
+            # Commit the exclusion before deleting its companion association.
+            self._write(state, legacy_first=reference.provider != "github")
 
 
 def observation_key(source: str, call_id: str, payload: object) -> str:

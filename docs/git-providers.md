@@ -11,6 +11,10 @@ The legacy session registry remains GitHub-only. Other providers' associations
 live in a sibling `*.providers.json` file, coordinated by the same per-session
 lock. Reading a mixed registry from an earlier prerelease migrates it to this
 layout without dropping titles, removal history, or replay protection.
+Foreign removals save their exclusion first, and reads suppress excluded
+associations. An interruption between file replacements therefore cannot let
+discovery restore an unlinked request. Migration and explicit reattachment
+still write the companion first.
 
 An older host sees and updates only GitHub associations. Other providers remain
 saved but unavailable until the host is upgraded again; old-host GitHub edits

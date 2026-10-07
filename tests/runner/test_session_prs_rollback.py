@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -184,10 +185,30 @@ def test_concurrent_writers_preserve_both_providers(tmp_path: Path, references) 
     assert [pr["url"] for pr in json.loads(store.path.read_text())["prs"]] == [GITHUB]
 
 
-def test_foreign_removal_stays_removed_and_can_be_reattached(tmp_path: Path, references) -> None:
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_foreign_removal_stays_removed_and_can_be_reattached(
+    tmp_path: Path, references, interrupt: bool
+) -> None:
     store = SessionPrRegistry("mixed", root=tmp_path)
     store.record(references, relationship="created", source="native", observation_id="first")
-    store.remove(FOREIGN)
+    if interrupt:
+        replace = os.replace
+        replacements = 0
+
+        def interrupted(src, dst):
+            nonlocal replacements
+            replacements += 1
+            if replacements == 2:
+                raise OSError("interrupted")
+            replace(src, dst)
+
+        with patch("omnigent.runner.session_prs.os.replace", side_effect=interrupted):
+            with pytest.raises(OSError, match="interrupted"):
+                store.remove(FOREIGN)
+    else:
+        store.remove(FOREIGN)
+    store = SessionPrRegistry("mixed", root=tmp_path)
+    assert [pr.url for pr in store.list()] == [GITHUB]
     store.record(references, relationship="created", source="native", observation_id="first")
     store.record(references, relationship="inferred", source="branch")
     assert [pr.url for pr in store.list()] == [GITHUB]
