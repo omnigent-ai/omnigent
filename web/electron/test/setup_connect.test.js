@@ -63,6 +63,18 @@ async function harness(
   };
 }
 
+it("provides a full-width 48px window drag region and a clickable settings gear", async (t) => {
+  const { document } = await harness(t);
+  const style = document.querySelector("style").textContent;
+  const dragRule = style.match(/\.drag-strip\s*\{[^}]*\}/)[0];
+  assert.match(dragRule, /height:\s*48px/);
+  assert.match(dragRule, /left:\s*0/);
+  assert.match(dragRule, /right:\s*0/);
+  assert.match(dragRule, /-webkit-app-region:\s*drag/);
+  const gearRule = style.match(/\.gear-btn\s*\{[^}]*\}/)[0];
+  assert.match(gearRule, /-webkit-app-region:\s*no-drag/);
+});
+
 it("shows a concise expiry message without repeating the prefilled server URL", async (t) => {
   const message = "Session expired. Connect to sign in again.";
   const params = new URLSearchParams({ error: message, url: SERVER });

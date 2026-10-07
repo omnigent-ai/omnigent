@@ -20,6 +20,19 @@ function stubBridge(over: Record<string, unknown>) {
   };
 }
 
+it("provides a full-width 48px window drag region", async () => {
+  stubBridge({});
+  const { container } = render(<BridgeSetupApp />);
+  await screen.findByRole("button", { name: /open omnigent/i });
+  expect(container.firstElementChild).toHaveStyle({
+    position: "fixed",
+    top: "0px",
+    left: "0px",
+    right: "0px",
+    height: "48px",
+  });
+});
+
 it("tags a connect with a request ID, shows only its phases, and cancels it", async () => {
   let progress: (p: { requestId?: string; phase?: string }) => void = () => {};
   let finish: (r: { cancelled?: boolean }) => void = () => {};

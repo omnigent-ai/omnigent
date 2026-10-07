@@ -838,16 +838,11 @@ aside[aria-label="Workspace"][data-maximized] {
     padding-top: 2.75rem;
   }
 }
-/* The strip spans the top of the window but stops 20rem short of the right
- * edge, keeping the chat header's action cluster (share, panel toggles) and
- * devtools chrome clear of the drag region. Interactive elements that
- * overlap the strip elsewhere stay clickable via the blanket no-drag rule
- * below — including the sidebar's own header buttons, which now live inside
- * this strip's band since the sidebar starts at the window's top edge. */
+/* Match the full desktop header; controls opt out of dragging below. */
 [data-electron-mac] .electron-drag-strip {
   position: absolute;
-  inset: 0 20rem auto 0;
-  height: 2.25rem;
+  inset: 0 0 auto 0;
+  height: 3rem;
   -webkit-app-region: drag;
 }
 /* The title-bar cluster (Search/Settings/toggle), pinned beside the traffic
@@ -860,12 +855,8 @@ aside[aria-label="Workspace"][data-maximized] {
  * controls, while the DOM keeps Search → Settings → toggle (tab order follows
  * importance), so the toggle is reordered visually rather than in the markup.
  *
- * Geometry: left 5.5rem clears the three lights plus their inset. The buttons
- * align to the LIGHTS, not to a text row — macOS paints them OUTSIDE the page
- * (absent from the DOM and from page screenshots), so there is nothing to
- * measure; anchor to the same 2.25rem strip the drag region uses and centre a
- * 1.5rem button in it: (48px - 24px) / 2 = 12px, landing on the
- * lights' centre line. */
+ * Geometry: left 5.5rem clears the lights; a 0.75rem top inset centers
+ * the 1.5rem buttons in the 3rem title bar, level with the lights. */
 [data-electron-mac] .electron-sidebar-header-actions {
   position: absolute;
   top: 0.75rem;
@@ -914,7 +905,18 @@ aside[aria-label="Workspace"][data-maximized] {
 /* Drag regions are geometric, not z-ordered: anything that overlaps the
  * strip (e.g. the mobile full-screen sidebar overlay) would lose clicks
  * without an explicit counter-region on interactive elements. */
-[data-electron-mac] :is(a, button, input, textarea, [role="button"]) {
+[data-electron-mac]
+  :is(
+    a,
+    button,
+    input,
+    textarea,
+    select,
+    [role="button"],
+    [role="tab"],
+    [role="separator"],
+    [contenteditable="true"]
+  ) {
   -webkit-app-region: no-drag;
 }
 /* The title-bar breadcrumb doubles as a window-drag handle (its title is a

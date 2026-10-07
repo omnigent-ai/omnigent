@@ -956,6 +956,62 @@ describe("index.css mobile settings title", () => {
   });
 });
 
+describe("index.css electron-mac window drag region", () => {
+  const dragRule = cssBlocks
+    .map(([block]) => block)
+    .find((block) => selectorOf(block) === "[data-electron-mac] .electron-drag-strip")!;
+  const controlsRule = cssBlocks
+    .map(([block]) => block)
+    .find((block) =>
+      selectorOf(block).replace(/\s+/g, " ").startsWith("[data-electron-mac] :is("),
+    )!;
+
+  it("covers the full width and height of the desktop header", () => {
+    expect(dragRule).toContain("inset: 0 0 auto 0");
+    expect(dragRule).toContain("height: 3rem");
+    expect(dragRule).toContain("-webkit-app-region: drag");
+  });
+
+  it.each<[string, ComponentProps<"div">]>([
+    ["a", {}],
+    ["button", {}],
+    ["input", {}],
+    ["textarea", {}],
+    ["select", {}],
+    ["div", { role: "button" }],
+    ["div", { role: "tab" }],
+    ["div", { role: "separator" }],
+    ["div", { contentEditable: true }],
+  ])("keeps %s %j interactive inside the drag band", (tag, props) => {
+    const { container } = render(
+      createElement("div", { "data-electron-mac": "true" }, createElement(tag, props)),
+    );
+    expect(container.firstElementChild!.firstElementChild!.matches(selectorOf(controlsRule))).toBe(
+      true,
+    );
+    expect(controlsRule).toContain("-webkit-app-region: no-drag");
+    cleanup();
+  });
+
+  it("leaves noninteractive title-bar space draggable and other platforms unchanged", () => {
+    const { container } = render(
+      createElement(
+        "div",
+        { "data-electron-mac": "true" },
+        createElement("div", { className: "electron-drag-strip" }),
+        createElement("span", {}, "Session title"),
+      ),
+    );
+    const shell = container.firstElementChild!;
+    const strip = shell.firstElementChild!;
+    expect(strip.matches(selectorOf(dragRule))).toBe(true);
+    expect(shell.lastElementChild!.matches(selectorOf(controlsRule))).toBe(false);
+    shell.removeAttribute("data-electron-mac");
+    expect(strip.matches(selectorOf(dragRule))).toBe(false);
+    cleanup();
+  });
+});
+
 /* On the macOS desktop shell the window's top strip carries the OS traffic
  * lights plus the Search/Settings/toggle cluster, and the cluster is owned by
  * AppShell rather than the sidebar so it holds that spot whether the sidebar is
