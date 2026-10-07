@@ -252,6 +252,7 @@ describe("DesignPage list", () => {
     searchMock.mockResolvedValue({
       status: "ok",
       paths: ["decks/q3.slides.html", "wireframes/sign-up.wireframe.html"],
+      truncated: false,
     });
 
     renderPage();
@@ -285,7 +286,7 @@ describe("DesignPage list", () => {
 
   it("titles a design-system badge with its name and kind", async () => {
     stubSessions([row("a", 1)]);
-    searchMock.mockResolvedValue({ status: "ok", paths: ["d.slides.html"] });
+    searchMock.mockResolvedValue({ status: "ok", paths: ["d.slides.html"], truncated: false });
     kitMock.mockResolvedValue({ status: "system", name: "Brand", kind: "full" });
 
     renderPage();
@@ -394,7 +395,7 @@ describe("DesignPage landing", () => {
   });
 
   it("shows chips in the empty state", async () => {
-    searchMock.mockResolvedValue({ status: "ok", paths: [] });
+    searchMock.mockResolvedValue({ status: "ok", paths: [], truncated: false });
     renderPage();
     await screen.findByText(/No designs yet/);
     fireEvent.click(screen.getByRole("button", { name: "Product launch" }));
@@ -473,7 +474,7 @@ describe("DesignPage server index", () => {
 
   it("scans every recent session and never reconciles without the index", async () => {
     stubSessions([row("a", 2), row("asleep", 1, { runner_online: false })]);
-    searchMock.mockResolvedValue({ status: "ok", paths: ["q3.slides.html"] });
+    searchMock.mockResolvedValue({ status: "ok", paths: ["q3.slides.html"], truncated: false });
 
     renderPage();
 
@@ -494,6 +495,7 @@ describe("DesignPage server index", () => {
     searchMock.mockResolvedValue({
       status: "ok",
       paths: ["decks/q3.slides.html", "w/flow.wireframe.html", "node_modules/x/y.slides.html"],
+      truncated: false,
     });
 
     renderPage();

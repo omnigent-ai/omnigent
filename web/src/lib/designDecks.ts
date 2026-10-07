@@ -256,6 +256,7 @@ export function indexDesignGroups(
         status: "indexed",
         decks: [],
         kit: { status: "none" },
+        truncated: false,
         offline: !known || !isSessionLive(known),
       };
       groups.set(path, group);

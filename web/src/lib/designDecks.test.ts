@@ -285,8 +285,12 @@ describe("filterDesignGroups", () => {
       null,
     ),
     [
-      { status: "ok", paths: ["decks/pitch.slides.html", "decks/roadmap.slides.html"] },
-      { status: "ok", paths: ["decks/launch.slides.html"] },
+      {
+        status: "ok",
+        paths: ["decks/pitch.slides.html", "decks/roadmap.slides.html"],
+        truncated: false,
+      },
+      { status: "ok", paths: ["decks/launch.slides.html"], truncated: false },
       { status: "loading" },
     ],
     [],
