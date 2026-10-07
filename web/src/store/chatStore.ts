@@ -2829,7 +2829,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   switchTo: async (conversationId) => {
-    if (get().conversationId === conversationId) return;
+    if (
+      get().conversationId === conversationId &&
+      (conversationId === null || conversationRegistry.peek(conversationId) !== undefined)
+    )
+      return;
 
     // Whether this conversation is already live AND current decides everything
     // below, so read it before anything can create the entry. A retained entry

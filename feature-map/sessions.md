@@ -41,6 +41,9 @@ the header menu), and each place is a separate entry point.
   reaches the available runner without a false failed turn. Native sessions
   initialize before delivery; SDK sub-agents reuse their loaded session state.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
+- `import-refresh`: Settings → Import sessions → Session by ID can replace an
+  already-imported snapshot with the latest source transcript after a
+  confirmation; recent-session imports keep skipping duplicates.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
@@ -93,6 +96,12 @@ control is a separate action that leaves the session connected.
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
 create or select a closable Browser soft tab automatically.
+
+**Import refresh:** open Settings → Import sessions, pick the online machine,
+choose Session by ID and the harness, enter the id, turn on Replace existing
+snapshot, click Import, and confirm the warning. The result links the same
+session, which now shows the refreshed transcript. Without the toggle the result
+reports the session as already imported and nothing changes.
 
 **Desktop recent sessions:** hold Control and press Tab to open the five most
 recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control
@@ -223,6 +232,13 @@ plain `uv run pytest`, which starts a private server for the test.
   without initializing the SDK child's already-loaded session again.
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`
+- **`import-refresh` (own environment):**
+  `tests/e2e_ui/sessions/test_import_refresh_drifted_session.py::test_import_by_id_refreshes_drifted_session`
+  imports a seeded Claude session from a real host daemon, appends a turn on the
+  host, checks that a plain re-import is skipped, then replaces the snapshot and
+  opens the refreshed session. Confirmation and partial-failure handling:
+  `tests/e2e_ui/sessions/test_import_sessions.py` (`replaces_exact_snapshot`,
+  `rehydrates_after_partial_stream_failure`).
 - **`recent-switcher` (manual Electron):** open at least six sessions, hold
   Control and press Tab to show the five most recent, cycle with Tab and
   Shift+Tab, release Control to switch, then reopen and press Escape to cancel.

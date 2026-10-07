@@ -3175,6 +3175,11 @@
       "LocalImportRequest": {
         "description": "Request to import local harness sessions from a host.\n\nUnlike `/imports` (the CLI posts already-normalized items), the server\nasks the chosen host to read + normalize its own transcripts over the\ntunnel \u2014 the transcripts live on the caller's machine, not the server. A\nsupplied `session_id` loads that exact session without enumerating local\nhistory.",
         "properties": {
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
           "host_id": {
             "title": "Host Id",
             "type": "string"

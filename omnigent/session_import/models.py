@@ -44,6 +44,25 @@ class LocalSessionImport:
         return self.native_title or title_from_items(self.items)
 
 
+def local_session_identity_matches(source: str, requested_id: str, canonical_id: str) -> bool:
+    """
+    Return whether a harness's canonical session id identifies the session a
+    caller requested by ``requested_id``.
+
+    Every loader except Qwen echoes the requested id as its
+    ``external_session_id``, so identity is literal equality. Qwen accepts a
+    bare recording id but canonicalizes it to a project-qualified
+    ``<project>:<id>`` locator, so a bare request legitimately resolves to a
+    qualified id whose recording component is the requested id. A request that
+    is already qualified must still match the canonical id exactly.
+    """
+    if canonical_id == requested_id:
+        return True
+    if source == "qwen" and ":" not in requested_id:
+        return canonical_id.rsplit(":", 1)[-1] == requested_id
+    return False
+
+
 def title_from_items(items: Sequence[NewConversationItem]) -> str | None:
     """Return a sidebar title derived from the first user message."""
     for item in items:
