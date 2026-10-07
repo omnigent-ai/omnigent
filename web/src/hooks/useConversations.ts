@@ -1796,6 +1796,36 @@ function refuseOverlappingPinWrite(queryClient: QueryClient) {
 // authoritative label map to write; membership in the Pinned section is
 // driven by the PINNED_CONVERSATIONS_KEY cache, so that patch is what makes
 // the row visibly move.
+// Set only the pin key on the row's own copy in each label cache (lists,
+// backfill, session), leaving labels other writes changed meanwhile intact.
+function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: string | undefined) {
+  const withPin = (labels: Record<string, string> | undefined) => {
+    const rest = Object.fromEntries(
+      Object.entries(labels ?? {}).filter(([k]) => k !== PINNED_LABEL_KEY),
+    );
+    return pin === undefined ? rest : { ...rest, [PINNED_LABEL_KEY]: pin };
+  };
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    const row = data?.pages.flatMap((p) => p.data).find((c) => c.id === id);
+    if (!row) continue;
+    const { data: next } = mergeItemsIntoPages(
+      data,
+      new Map([[id, { id, labels: withPin(row.labels) } satisfies SessionListWireItem]]),
+      filtersFromConversationQueryKey(key),
+      undefined,
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+    old ? { ...old, labels: withPin(old.labels) } : old,
+  );
+  queryClient.setQueryData<Session>(["session", id], (old) =>
+    old ? { ...old, labels: withPin(old.labels) } : old,
+  );
+}
+
 function patchPinnedCaches(
   queryClient: QueryClient,
   id: string,
@@ -1956,13 +1986,13 @@ export function useTogglePinnedConversation() {
         ? { ...base, [PINNED_LABEL_KEY]: String(pinnedAt ?? Date.now()) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
       patch(id, labels, pinned);
-      return { prevPinned, prevLabels: base };
+      return { prevPinned, prevPin: base[PINNED_LABEL_KEY] };
     },
     onError: (_err, { id }, ctx) => {
-      // Put the row's previous labels back on every cache, then restore the
-      // pinned section's exact snapshot.
+      // Roll back only the pin key (other labels may have changed meanwhile),
+      // then restore the pinned section's own snapshot.
       if (!ctx) return;
-      patch(id, ctx.prevLabels, ctx.prevLabels[PINNED_LABEL_KEY] !== undefined);
+      restorePinLabelInCaches(queryClient, id, ctx.prevPin);
       if (ctx.prevPinned !== undefined) {
         queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, ctx.prevPinned);
       }

@@ -42,7 +42,7 @@ import {
   type Conversation,
   type PinnedConversationsResult,
 } from "./useConversations";
-import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 
@@ -1793,6 +1793,73 @@ describe("overlapping pin writes", () => {
       expect(fetchMock).toHaveBeenCalledOnce();
       // A failed pin leaves no ghost: it's out of the pinned section and labels.
       expect(state()).toEqual(expected);
+    },
+  );
+});
+
+describe("useTogglePinnedConversation failure rollback", () => {
+  it.each([
+    ["unpin", "3000", false],
+    ["pin", undefined, true],
+  ] as const)(
+    "a failed %s rolls back only the pin key, keeping labels changed meanwhile",
+    async (_action, pinValue, pinned) => {
+      let rejectPatch!: (r: Response) => void;
+      fetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            rejectPatch = resolve;
+          }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const labels = (project: string) => ({
+        [PROJECT_LABEL_KEY]: project,
+        ...(pinValue === undefined ? {} : { [PINNED_LABEL_KEY]: pinValue }),
+      });
+      const row = conversation({ id: "conv_x", updated_at: 150, labels: labels("A") });
+      queryClient.setQueryData(["conversations", "", false], infinitePage([row]));
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+        conversations: pinValue === undefined ? [] : [row],
+        filterHonored: true,
+      });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useTogglePinnedConversation(), { wrapper });
+      const listLabels = () =>
+        queryClient
+          .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
+          ?.pages.flatMap((p) => p.data)
+          .find((c) => c.id === "conv_x")?.labels;
+
+      act(() => result.current.mutate({ id: "conv_x", pinned }));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      // A project move lands while the pin PATCH is pending.
+      queryClient.setQueryData<ConversationsInfiniteData>(["conversations", "", false], (old) =>
+        old
+          ? {
+              ...old,
+              pages: old.pages.map((page) => ({
+                ...page,
+                data: page.data.map((c) =>
+                  c.id === "conv_x"
+                    ? { ...c, labels: { ...c.labels, [PROJECT_LABEL_KEY]: "B" } }
+                    : c,
+                ),
+              })),
+            }
+          : old,
+      );
+
+      rejectPatch(mockResponse({}, { ok: false, status: 500 }));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+
+      // The move's label survives; only the pin key is rolled back.
+      expect(listLabels()).toEqual(labels("B"));
+      const pinnedIds =
+        queryClient
+          .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+          ?.conversations.map((c) => c.id) ?? [];
+      expect(pinnedIds).toEqual(pinValue === undefined ? [] : ["conv_x"]);
     },
   );
 });
