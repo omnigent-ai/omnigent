@@ -81,7 +81,7 @@ journey needs no server or runner; registering it here rides hook spawn cost
 on the same nightly/release regression comparison as everything else
 (`omnigent/__init__` re-exports lazily so this stays ~interpreter-sized). The
 import-graph side of the guarantee is pinned deterministically by
-`tests/test_claude_native_message_display_hook.py`.
+`tests/harnesses/claude_native/test_claude_native_message_display_hook.py`.
 
 ### Full-turn (runner + mock LLM)
 
@@ -368,6 +368,18 @@ head + `seed.py` + corpus config, so a migration busts the cache and forces a
 reseed; Postgres and MySQL are fresh per run), runs the benchmark, and uploads
 `benchmark-results-<backend>-<run_id>.json`. The workspace notebook pulls those
 artifacts.
+
+`.github/workflows/benchmark-release.yml` gates release cuts (called from
+`release.yml`). It benchmarks the previous stable release and the candidate
+concurrently on **one** runner, because hosted VMs vary in speed by up to ~1.5x
+between runs and a cross-runner comparison reports that as a regression. Each
+side gets its own checkout, venv, `HOME`, and copy of a corpus seeded at the
+baseline's schema. Dispatch it with `baseline_ref` == `candidate_ref` for an A/A
+noise check.
+
+`compare.py` (used by the release and PR gates) flags a regression on run-median
+P50 or P95. Journeys with fewer than 20 samples per run (the capped full-turn and
+`cli_startup` journeys) gate on P50 only, since their P95 is the slowest sample.
 
 Schema changes need no manual step: the seed always targets the current
 migrated schema (migrations run when the store is constructed), the reuse

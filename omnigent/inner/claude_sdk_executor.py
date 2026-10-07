@@ -59,6 +59,7 @@ from omnigent.models.claude_model_vocabulary import (
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 
@@ -97,12 +98,12 @@ logger = logging.getLogger(__name__)
 # Default auth-token refresh cadence (ms) for the vendor-neutral gateway
 # transport when ``HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` is
 # unset. Not Databricks-specific: the same fallback applies to any gateway
-# producer (Databricks AI gateway or a generic key/gateway provider).
+# producer (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
-# request headers. The Databricks AI gateway only serves Claude requests
+# request headers. The Databricks Unity Gateway only serves Claude requests
 # in coding-agent mode when this header is present, so the Databricks
 # gateway env (not the generic-provider gateway env) must carry it.
 _ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
@@ -899,7 +900,7 @@ def _build_mcp_tools(
                         "content": [
                             {
                                 "type": "text",
-                                "text": json.dumps(
+                                "text": json_dumps_transport_safe(
                                     {"error": f"No tool executor for '{tool_name}'"}
                                 ),
                             }
@@ -919,7 +920,7 @@ def _build_mcp_tools(
                         response["is_error"] = image_result.is_error
                         return response
                     response = {
-                        "content": [{"type": "text", "text": json.dumps(result)}],
+                        "content": [{"type": "text", "text": json_dumps_transport_safe(result)}],
                     }
                     if result.get("blocked") is True or (
                         "error" in result and result.get("error")
@@ -928,7 +929,12 @@ def _build_mcp_tools(
                     return response
                 except Exception as exc:  # noqa: BLE001 — tool handler converts any error to MCP error response
                     return {
-                        "content": [{"type": "text", "text": json.dumps({"error": str(exc)})}],
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json_dumps_transport_safe({"error": str(exc)}),
+                            }
+                        ],
                         "isError": True,
                     }
 
@@ -1249,7 +1255,7 @@ def _resolve_gateway_env(
     # already fixed this by negotiating betas with the gateway instead
     # (`claude_native.py` CLAUDE_CODE_USE_GATEWAY=1); claude-sdk — the harness
     # behind Polly and Debby — never got that change. Scope it to a real
-    # Databricks AI Gateway base URL so a generic gateway (or a mock server)
+    # Databricks Unity Gateway base URL so a generic gateway (or a mock server)
     # that cannot negotiate betas keeps the original workaround.
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
@@ -1608,7 +1614,7 @@ class ClaudeSDKExecutor(Executor):
             gateway: If True, route through a vendor-neutral gateway
                 (base URL + bearer-token command + model). Enables the
                 gateway path regardless of which producer fed it (the
-                Databricks AI gateway or a generic provider).
+                Databricks Unity Gateway or a generic provider).
             databricks_profile: Databricks-specific config profile from
                 ~/.databrickscfg, e.g. ``"<your-profile>"``.  Only used by the
                 Databricks producer path (deriving base URL / auth command
@@ -2005,6 +2011,27 @@ class ClaudeSDKExecutor(Executor):
         task = asyncio.create_task(self._force_close_client(state.client))
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
+
+    async def _evict_terminated_client(self, session_key: str) -> None:
+        """Discard a cached client after its CLI child exits."""
+        state = self._clients.get(session_key)
+        if state is None:
+            return
+        transport = getattr(state.client, "_transport", None)
+        process = getattr(transport, "_process", None)
+        # A non-None returncode is exactly the reaped-corpse state the SDK's
+        # write() refuses; a missing transport/process reads as alive and is skipped.
+        returncode = getattr(process, "returncode", None)
+        if returncode is None:
+            return
+        logger.warning(
+            "Claude SDK CLI for session %s terminated between turns "
+            "(exit code: %s); discarding the dead client so this turn "
+            "rebuilds a fresh one.",
+            session_key,
+            returncode,
+        )
+        await self._close_live_client(session_key)
 
     async def close(self) -> None:
         session_keys = list(self._clients)
@@ -2489,6 +2516,7 @@ class ClaudeSDKExecutor(Executor):
                 )
             )
             return
+        await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
         prompt = self._build_prompt(
             messages,
@@ -3511,6 +3539,19 @@ class ClaudeSDKExecutor(Executor):
         trailing: list[Message] = []
         for msg in reversed(messages):
             if msg.get("role") == "user":
+                content = msg.get("content")
+                if content == "/compact" or (
+                    isinstance(content, list)
+                    and len(content) == 1
+                    and isinstance(content[0], dict)
+                    and content[0].get("type") in {"text", "input_text"}
+                    and content[0].get("text") == "/compact"
+                ):
+                    # The runner dispatches earlier input before a compact control.
+                    # Compaction may emit no assistant text; keep it out of later prompts.
+                    if not trailing:
+                        return "/compact"
+                    break
                 trailing.append(msg)
             else:
                 break

@@ -29,6 +29,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
                 "HARNESS_CODEX_ENABLE_WEB_SEARCH": "0",
                 "HARNESS_CODEX_MINIMAL_CONFIG": "1",
                 "HARNESS_CODEX_SKILLS_FILTER": json.dumps("none"),
+                "HARNESS_CODEX_SKILLS_DIR": "",
             }
         )
         spawn_env.pop("HARNESS_CODEX_AGENT_NAME", None)

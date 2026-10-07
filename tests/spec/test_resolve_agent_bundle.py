@@ -30,6 +30,7 @@ def test_resolve_procedures_survive_transport_outside_target_checkout(
     bundle = tmp_path / "runner-agent"
     spec = load(payload, dest=bundle)
     assert not (workspace / "dev" / "resolve-agent").exists()
+    assert "resolve-investigate" in {skill.name for skill in spec.skills}
 
     for skill in spec.skills:
         assert skill.skill_dir is not None and skill.skill_dir.is_relative_to(bundle)

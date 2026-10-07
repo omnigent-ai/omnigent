@@ -44,6 +44,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 # Interim: any test using the ``fs_setup`` mock host tunnel can flake
 # with a 409 "host is offline" under parallel CI load (mock-WS starved
@@ -57,26 +58,6 @@ pytestmark = [
 
 _HOST_ID = "9ab0645ef9c07bb922a404d4ec2466a9"
 _HOST_NAME = "fs-test-laptop"
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build a minimal ASGI WebSocket scope.
-
-    :param path: WebSocket path, e.g. ``"/v1/hosts/X/tunnel"``.
-    :returns: ASGI scope dict.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 def _hello_text(name: str = _HOST_NAME) -> str:
@@ -294,7 +275,20 @@ async def test_list_filesystem_survives_idle_mock_host(
         (
             {"skills": [{"name": "toolkit:review", "description": "Review changes"}]},
             200,
-            {"skills": [{"name": "toolkit:review", "description": "Review changes"}]},
+            {
+                "skills": [
+                    {
+                        "name": "toolkit:review",
+                        "description": "Review changes",
+                        "display_name": None,
+                    }
+                ]
+            },
+        ),
+        (
+            {"skills": [{"name": "ste", "description": "STE", "display_name": "Simplified STE"}]},
+            200,
+            {"skills": [{"name": "ste", "description": "STE", "display_name": "Simplified STE"}]},
         ),
         ({"skills": []}, 200, {"skills": []}),
         (

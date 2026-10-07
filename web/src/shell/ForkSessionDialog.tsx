@@ -813,8 +813,8 @@ export function ForkSessionForm({
   // "databricks_coding_agent (fork ag_a) (fork ag_b)" or
   // "claude-native-ui (switch ag_c)", neither of which matches a built-in by
   // name. agentRootName peels ALL layers — a single-layer / fork-only strip
-  // (the previous regex here) would miss nested clones and every "(switch …)"
-  // clone the in-place switch-agent flow creates — so the label resolves and
+  // (the previous regex here) would miss nested clones and the "(switch …)"
+  // clones older sessions still carry, so the label resolves and
   // the dedup below still hides the source's own agent.
   const sourceAgentName = sourceAgent?.name ?? null;
   const sourceAgentBaseName = sourceAgentName ? agentRootName(sourceAgentName) : null;

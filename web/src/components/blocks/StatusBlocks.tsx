@@ -76,10 +76,13 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   runner_error: "Something went wrong setting up the turn on the host.",
   runner_disconnected: "The connection to the host dropped unexpectedly.",
   runner_unavailable: "The session's runner isn't connected to the server.",
-  connection_error: "The connection to the agent dropped mid-turn.",
+  connection_error:
+    "The connection to the agent dropped mid-turn; retrying usually continues the turn.",
   context_length_exceeded: "The conversation grew past the model's context window.",
   executor_error: "The agent runtime hit an error while running the turn.",
   workspace_missing: "The session workspace no longer exists on the host.",
+  session_agent_missing:
+    "This agent no longer exists. Fork this session into another agent to continue.",
   codex_thread_reset:
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
   codex_turn_error: "Codex ran into an error during this turn.",
@@ -90,8 +93,12 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   native_turn_error: "The agent ran into an error during this turn.",
   native_prompt_not_recorded: "Message not delivered. Try sending it again.",
   rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
+  transient_upstream_error:
+    "The model service hit a temporary error mid-response; retrying usually continues the turn.",
   budget_exhausted:
     "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
+  client_update_required:
+    "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
@@ -101,6 +108,18 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_failed_to_start",
   "runner_unavailable",
   "rate_limit_exceeded",
+  "transient_upstream_error",
+  "connection_error",
+]);
+
+// Failed turns the runner itself survived: the session is healthy, so retry
+// continues the turn in place (posts a continuation) instead of resuming the
+// runner. Includes a dropped harness stream — the runner marks the session
+// desynced, and the continuation message triggers the rebind.
+export const CONTINUE_TURN_ERROR_CODES = new Set([
+  "rate_limit_exceeded",
+  "transient_upstream_error",
+  "connection_error",
 ]);
 
 interface ParsedErrorMessage {
@@ -284,7 +303,10 @@ export function ErrorBanner({
     ...relatedErrors,
   ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
   const retryable = onRetry !== undefined && actionableError !== undefined;
-  const retryLabel = actionableError?.code === "rate_limit_exceeded" ? "Retry" : "Resume session";
+  const retryLabel =
+    actionableError && CONTINUE_TURN_ERROR_CODES.has(actionableError.code)
+      ? "Retry"
+      : "Resume session";
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {
@@ -890,8 +912,8 @@ export function RoutingDecisionCard({
         {routerSource === "databricks-aigw" ? (
           <span
             className="text-muted-foreground"
-            title="Routed by the Databricks AI Gateway"
-            aria-label="Routed by the Databricks AI Gateway"
+            title="Routed by the Databricks Unity Gateway"
+            aria-label="Routed by the Databricks Unity Gateway"
             role="img"
             data-testid="routing-decision-source-databricks"
           >

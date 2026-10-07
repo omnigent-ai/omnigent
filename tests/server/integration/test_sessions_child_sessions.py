@@ -2037,6 +2037,122 @@ async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
     assert resp.status_code == 503, resp.text
 
 
+@pytest.mark.parametrize(
+    ("parent_runner", "expected_status"),
+    [("runner_replacement", 409), ("runner_side", 409), ("runner_side", 202)],
+    ids=["parent-relaunched", "host-reports-runner-gone", "transient-outage"],
+)
+async def test_side_chat_message_after_runner_loss(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    parent_runner: str,
+    expected_status: int,
+) -> None:
+    """Only a replaced parent runner proves the fork is gone; an outage is not sealed."""
+    child = await _create_native_child(client, name=f"msg-side-chat-{request.node.callspec.id}")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(
+        child["id"],
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+        },
+    )
+    conv_store.replace_runner_id(child["id"], "runner_side")
+    conv_store.replace_runner_id(child["parent_session_id"], parent_runner)
+
+    async def _none(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _none)
+    monkeypatch.setattr(routes_events_module, "_heal_subagent_runner_binding_via_parent", _none)
+
+    real_fork_lost = routes_events_module._codex_side_chat_fork_lost
+
+    async def _fork_lost(*args: Any, **kwargs: Any) -> bool:
+        # Stand in for the launching host's "dead" verdict; the helper has its own unit test.
+        if request.node.callspec.id == "host-reports-runner-gone":
+            return True
+        return await real_fork_lost(*args, **kwargs)
+
+    async def _no_policy(*_args: Any, **_kwargs: Any) -> None:
+        # A denying policy would persist a reply, so a lost fork must be rejected first.
+        if expected_status == 409:
+            pytest.fail("input policy ran for a side chat whose fork is gone")
+
+    monkeypatch.setattr(routes_events_module, "_codex_side_chat_fork_lost", _fork_lost)
+    monkeypatch.setattr(routes_events_module, "_evaluate_input_policy", _no_policy)
+
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    }
+    resp = await client.post(f"/v1/sessions/{child['id']}/events", json=message)
+
+    assert resp.status_code == expected_status, resp.text
+    after = conv_store.get_conversation(child["id"])
+    assert after is not None
+    if expected_status == 409:
+        assert conv_store.list_items(child["id"]).data == []
+        assert after.labels.get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE
+    else:
+        assert CLOSED_LABEL_KEY not in after.labels
+
+
+@pytest.mark.parametrize(
+    ("parent_runner", "host_reports_dead", "expected_status"),
+    [
+        ("runner_replacement", False, 409),
+        ("runner_side", True, 409),
+        ("runner_side", False, 503),
+    ],
+    ids=["parent-relaunched", "host-reports-runner-gone", "transient-outage"],
+)
+async def test_side_chat_retry_after_runner_loss(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_runner: str,
+    host_reports_dead: bool,
+    expected_status: int,
+) -> None:
+    """Resume seals a lost fork, while a temporary outage remains recoverable."""
+    child = await _create_native_child(client, name="retry-side-chat")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(
+        child["id"],
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+        },
+    )
+    conv_store.replace_runner_id(child["id"], "runner_side")
+    conv_store.replace_runner_id(child["parent_session_id"], parent_runner)
+
+    async def _none(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    real_fork_lost = routes_events_module._codex_side_chat_fork_lost
+
+    async def _fork_lost(*args: Any, **kwargs: Any) -> bool:
+        return host_reports_dead or await real_fork_lost(*args, **kwargs)
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _none)
+    monkeypatch.setattr(routes_events_module, "_codex_side_chat_fork_lost", _fork_lost)
+    response = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == expected_status, response.text
+    after = conv_store.get_conversation(child["id"])
+    assert after is not None
+    assert (after.labels.get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE) == (expected_status == 409)
+    assert conv_store.list_items(child["id"]).data == []
+
+
 async def test_non_subagent_session_not_healed_via_parent(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -2081,9 +2197,11 @@ async def test_non_subagent_session_not_healed_via_parent(
     assert not heal_called, "heal must not run for a top-level session"
 
 
-async def test_sdk_subagent_heal_skips_session_init(
+@pytest.mark.parametrize("recovery_path", ["heal", "refresh"])
+async def test_sdk_subagent_recovery_skips_session_init(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    recovery_path: str,
 ) -> None:
     """
     For SDK (non-native) sub-agents, message-send after heal must NOT call
@@ -2123,8 +2241,12 @@ async def test_sdk_subagent_heal_skips_session_init(
         base_url="http://runner",
     )
 
-    async def _heal_spy(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
-        return fake_runner
+    heal_attempted = False
+
+    async def _heal_spy(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient | None:
+        nonlocal heal_attempted
+        heal_attempted = True
+        return fake_runner if recovery_path == "heal" else None
 
     init_called: list[bool] = []
 
@@ -2132,10 +2254,10 @@ async def test_sdk_subagent_heal_skips_session_init(
         init_called.append(True)
         return False
 
-    async def _runner_none(*_a: Any, **_k: Any) -> None:
-        return None
+    async def _runner_after_heal(*_a: Any, **_k: Any) -> httpx.AsyncClient | None:
+        return fake_runner if heal_attempted else None
 
-    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_none)
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_after_heal)
     monkeypatch.setattr(
         routes_events_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
     )
@@ -2150,8 +2272,9 @@ async def test_sdk_subagent_heal_skips_session_init(
     )
 
     assert resp.status_code in {200, 202}, resp.text
+    assert heal_attempted
     assert not init_called, (
-        "_ensure_runner_session_initialized must not be called for SDK sub-agents after heal"
+        "_ensure_runner_session_initialized must not be called for recovered SDK sub-agents"
     )
 
 

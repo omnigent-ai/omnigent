@@ -691,7 +691,7 @@ async def test_list_session_resources_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -1323,7 +1323,7 @@ async def test_get_resource_by_id_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -2464,7 +2464,7 @@ async def test_downscaled_upload_reaches_native_resolver(
 
     from omnigent.inner.codex_native_executor import _content_to_input_items
     from omnigent.inner.native_attachments import framework_notices
-    from omnigent.runner.app import _resolve_forwarded_message_content
+    from omnigent.runner.app_support import _resolve_forwarded_message_content
     from omnigent.runtime import content_resolver
 
     monkeypatch.setattr(content_resolver, "IMAGE_MODEL_BUDGET_BYTES", 1024)
@@ -3483,11 +3483,16 @@ async def test_filesystem_download_streams_runner_attachment(
     client: httpx.AsyncClient,
     tmp_path: Path,
 ) -> None:
-    """``?download=true`` forwards the runner's attachment and headers verbatim."""
+    """``?download=true`` forwards the runner's attachment and headers verbatim.
+
+    The download URL is assembled separately from the listing/read URL, so
+    this also pins that the owner's workspace-relative download carries the
+    ``scope=reach`` mark the runner needs to follow an outward symlink.
+    """
     payload = bytes(range(256)) * 64
     (tmp_path / "big.bin").write_bytes(payload)
     runner = FastAPI()
-    seen: list[tuple[str, bool]] = []
+    seen: list[tuple[str, bool, str | None]] = []
 
     @runner.get(_FS_ROUTE)
     async def _serve(
@@ -3495,9 +3500,10 @@ async def test_filesystem_download_streams_runner_attachment(
         environment_id: str,
         relative_path: str,
         download: bool = False,
+        scope: str | None = None,
     ) -> FileResponse:
         del session_id, environment_id
-        seen.append((relative_path, download))
+        seen.append((relative_path, download, scope))
         return FileResponse(
             tmp_path / "big.bin",
             filename="big.bin",
@@ -3512,7 +3518,7 @@ async def test_filesystem_download_streams_runner_attachment(
     assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
     assert resp.headers["content-length"] == str(len(payload))
     assert resp.headers["cache-control"] == "no-store"
-    assert seen == [("data/big.bin", True)]
+    assert seen == [("data/big.bin", True, "reach")]
 
 
 @pytest.mark.asyncio
@@ -3609,7 +3615,7 @@ async def test_filesystem_download_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -3652,7 +3658,7 @@ async def test_filesystem_write_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -5150,6 +5156,7 @@ async def test_claude_native_mirror_matches_text_behind_attachment_markers() -> 
         assert [item.type for item in store.appended_items] == ["message", "error", "message"]
         lost_user, _lost_error, matched_user = store.appended_items
         assert lost_user.data.content == [{"type": "input_text", "text": "lost"}]
+        assert lost_user.data.user_authored is True
         assert image in matched_user.data.content
         assert {"type": "input_text", "text": mirrored_text} in matched_user.data.content
         assert pending_inputs.snapshot_for(sid) == []
@@ -7051,6 +7058,7 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         ]
         assert [e.get("response_id") for e in failed_edges] == ["resp_fail"]
         message, error = store.appended_items
+        assert message.data.user_authored is True
         assert message.data.role == "user"
         assert "".join(b["text"] for b in message.data.content) == "set up the worktree"
         assert message.created_by == "alice@example.com"

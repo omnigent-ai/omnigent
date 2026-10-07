@@ -23,6 +23,7 @@ import {
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
+import { RevealBaseContext, useRevealMenu } from "./RevealInFileManager";
 import { useCursorTooltip } from "./useCursorTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
@@ -395,7 +396,15 @@ function defaultExpandedPaths(files: WorkspaceFile[]): Set<string> {
 // FolderTree
 // ---------------------------------------------------------------------------
 
-export function FolderTree({
+export function FolderTree(props: Parameters<typeof FolderTreeInner>[0]) {
+  return (
+    <RevealBaseContext.Provider value={props.browseLocation ?? ""}>
+      <FolderTreeInner {...props} />
+    </RevealBaseContext.Provider>
+  );
+}
+
+function FolderTreeInner({
   files,
   isLoading,
   isError,
@@ -961,10 +970,12 @@ function FileRowItem({
         ? "text-amber-500 dark:text-amber-400"
         : undefined;
   const { handlers, tooltip } = useCursorTooltip(path);
+  const reveal = useRevealMenu(isDeleted ? null : path);
 
   return (
     <li className="list-none">
       <div
+        onContextMenu={reveal.onContextMenu}
         className={cn(
           "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1",
           isDeleted ? "opacity-50" : "hover:bg-muted",
@@ -1032,6 +1043,7 @@ function FileRowItem({
             <CopyPathButton path={path} revealOnHover />
           </span>
         </span>
+        {reveal.menu}
       </div>
       {tooltip}
     </li>
@@ -1089,9 +1101,13 @@ function SearchDirRow({
   file: WorkspaceFile;
   onRevealDir: (path: string) => void;
 }) {
+  const reveal = useRevealMenu(file.path, true);
   return (
     <li className="list-none">
-      <div className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted">
+      <div
+        onContextMenu={reveal.onContextMenu}
+        className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted"
+      >
         <button
           type="button"
           className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
@@ -1110,6 +1126,7 @@ function SearchDirRow({
             <CopyPathButton path={file.path} label="Copy folder path" revealOnHover />
           </span>
         </span>
+        {reveal.menu}
       </div>
     </li>
   );
@@ -1181,6 +1198,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   /** Briefly flash this row — used when a folder is revealed from search. */
   highlighted?: boolean;
 }) {
+  const reveal = useRevealMenu(node.type === "file" ? null : node.path, true);
   if (node.type === "file") {
     return (
       <TreeFileRow
@@ -1207,6 +1225,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
     // The row is a div so the copy control can remain a sibling of the folder
     // toggle rather than nesting one button inside another.
     <div
+      onContextMenu={reveal.onContextMenu}
       className={cn(
         "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 hover:bg-muted",
         // Reveal flash: reuse the chat nav-jump ring pulse so a folder opened
@@ -1258,6 +1277,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
           <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
         </span>
       </span>
+      {reveal.menu}
     </div>
   );
 });

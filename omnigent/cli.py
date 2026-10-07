@@ -17,7 +17,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from importlib import import_module, resources
 from pathlib import Path
@@ -237,7 +237,7 @@ def _build_default_databricks_routing_client(
     cfg: Any,  # type: ignore[explicit-any]  # parsed server config
     settings: Any,  # type: ignore[explicit-any]  # RoutingSettings
 ) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
-    """Route through the workspace's AI Gateway when no ``routing:`` block exists.
+    """Route through the workspace's Unity Gateway when no ``routing:`` block exists.
 
     A Databricks-backed deployment gets smart routing without extra
     config: the client points at that workspace's routing API and authenticates
@@ -388,7 +388,7 @@ def _build_routing_backends(
 ) -> Any:  # type: ignore[explicit-any]  # RoutingBackends
     """Build BOTH routing backends from configuration alone — no opt-in env needed.
 
-    They are not alternatives. The external client's picks are AI Gateway catalog
+    They are not alternatives. The external client's picks are Unity Gateway catalog
     ids, so a harness whose inference runs off something else is served by the
     built-in judge instead (see :mod:`omnigent.server.routing_backend`).
 
@@ -399,7 +399,7 @@ def _build_routing_backends(
     * anything else — no external side, the built-in judge only.
 
     With no ``routing:`` block at all, a Databricks-backed deployment gets its
-    own workspace AI Gateway as the external side. Managed deployments override
+    own workspace Unity Gateway as the external side. Managed deployments override
     ``RuntimeCaps.routing_backends`` themselves.
 
     :param cfg: The parsed server ``--config`` mapping.
@@ -1754,6 +1754,7 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
         "antigravity",
         "claude",
         "codex",
+        "copilot",
         "cursor",
         "debby",
         "devin",
@@ -1791,9 +1792,11 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     The predicates use ``importlib.util.find_spec`` (no heavy import).
     Commands absent from this map are always listed.
     """
+    from omnigent.onboarding.copilot_auth import copilot_sdk_installed
     from omnigent.onboarding.cursor_auth import cursor_sdk_installed
 
     return {
+        "copilot": copilot_sdk_installed,
         "cursor": cursor_sdk_installed,
     }
 
@@ -2093,12 +2096,14 @@ def cli() -> None:
 # Keep in sync with ``@cli.command()`` decorations below.
 _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     {
+        "agent",
         "agy",
         "antigravity",
         "attach",
         "claude",
         "codex",
         "config",
+        "copilot",
         "cursor",
         "debby",
         "debug",
@@ -4724,9 +4729,8 @@ def server(
             # read that loss as ours, not as the runners dying.
             _shutdown_state.mark_server_shutting_down()
             _session_stream.shutdown_all()
-            # Yield to the event loop so generators can consume _DONE,
-            # flush their final "data: [DONE]\n\n" chunk, and exit before
-            # super().shutdown() calls connection.shutdown() / transport.close().
+            # Yield so streams consume _DONE and exit before transports close.
+            # No [DONE] reaches browsers: they must reconnect after restart.
             # Without this pause the generators write to an already-closing
             # transport, leaving connections open past the graceful window.
             await _asyncio.sleep(0)
@@ -6051,9 +6055,11 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
 
     - ``config.yaml``: ``llm.connection.*`` and
       ``executor.connection.*`` values, ``executor.auth``
-      ``api_key`` / ``base_url`` (when ``type: api_key``), and
-      ``tools.builtins[*]`` dict-entry values (except ``name``)
-    - ``tools/mcp/*.yaml``: ``headers.*`` and ``env.*`` values
+      ``api_key`` / ``base_url`` (when ``type: api_key``),
+      ``tools.builtins[*]`` dict-entry values (except ``name``), and
+      inline ``tools.<name>`` MCP servers' ``url``, ``headers.*`` and
+      ``env.*`` values
+    - ``tools/mcp/*.yaml``: ``url``, ``headers.*`` and ``env.*`` values
 
     These mirror the server-side parser's ``${VAR}`` expansion
     sites. Resolving here, against the client's own environment,
@@ -6083,24 +6089,13 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
                 )
 
     # ── tools/mcp/*.yaml ─────────────────────────────
-    # ``headers`` (HTTP transport auth) and ``env`` (stdio transport
-    # process env) are both secret-bearing and both expanded by the
-    # server-side parser, so resolve both client-side.
     mcp_dir = source / "tools" / "mcp"
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
             raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 continue
-            changed = False
-            for field in ("headers", "env"):
-                value = raw.get(field)
-                if isinstance(value, dict):
-                    raw[field] = expand_env_vars(
-                        {str(k): str(v) for k, v in value.items()},
-                    )
-                    changed = True
-            if changed:
+            if _expand_mcp_server_env_vars(raw, expand_env_vars):
                 arcname = str(yaml_file.relative_to(source))
                 resolved[arcname] = yaml.dump(
                     raw,
@@ -6217,6 +6212,8 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
     - ``executor.auth`` — ``api_key`` / ``base_url`` when
       ``type == "api_key"``
     - ``tools.builtins[*]`` — dict-entry values except ``name``
+    - ``tools.<name>`` inline MCP servers — ``url``, ``headers`` and
+      ``env`` values
 
     :param raw: The parsed config.yaml dict (modified in-place).
     :param expand_fn: Callable that expands env var references
@@ -6261,6 +6258,81 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
             or changed
         )
 
+    return _expand_inline_mcp_env_vars(raw.get("tools"), expand_fn) or changed
+
+
+def _expand_inline_mcp_env_vars(
+    raw_tools: object,
+    expand_fn: Callable[[dict[str, str]], dict[str, str]],
+) -> bool:
+    """
+    Expand ``${VAR}`` references in inline ``type: mcp`` entries of
+    config.yaml's ``tools:`` block, modifying them in-place.
+
+    Selects the same entries the parser's ``_parse_inline_mcp_servers``
+    expands: mappings with ``type: mcp`` under a non-reserved key that
+    declare a ``command`` or ``url``.
+
+    :param raw_tools: The raw ``tools:`` value from config.yaml, e.g.
+        ``{"search": {"type": "mcp", "url": "${SEARCH_URL}"}}``.
+        Non-dict values are ignored.
+    :param expand_fn: Callable that expands env var references
+        in a string-to-string dict.
+    :returns: ``True`` if any values were expanded.
+    """
+    from omnigent.spec.parser import _TOOLS_CONFIG_KEYS
+
+    if not isinstance(raw_tools, dict):
+        return False
+    changed = False
+    for key, entry in raw_tools.items():
+        if key in _TOOLS_CONFIG_KEYS or not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")) != "mcp":
+            continue
+        if entry.get("command") is None and entry.get("url") is None:
+            continue
+        changed = _expand_mcp_server_env_vars(entry, expand_fn) or changed
+    return changed
+
+
+def _expand_mcp_server_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
+    raw: dict[str, Any],
+    expand_fn: Callable[[dict[str, str]], dict[str, str]],
+) -> bool:
+    """
+    Expand ``${VAR}`` references in one MCP server declaration's
+    ``url``, ``headers`` and ``env``, modifying *raw* in-place.
+
+    These are the fields the parser expands for MCP servers. The
+    server re-parses uploaded bundles without expansion, so they are
+    resolved here from the uploading user's environment instead.
+
+    :param raw: One MCP server mapping from ``tools/mcp/*.yaml`` or an
+        inline ``tools.<name>`` entry, e.g.
+        ``{"url": "${MCP_URL}", "headers": {"Authorization": "Bearer ${TOKEN}"}}``.
+    :param expand_fn: Callable that expands env var references
+        in a string-to-string dict.
+    :returns: ``True`` if expansion changed any value; literal-only
+        fields are left untouched so the file can ship unmodified.
+    :raises OmnigentError: If a ``${VAR}`` reference cannot be
+        resolved from the environment.
+    """
+    changed = False
+    url = raw.get("url")
+    if url is not None:
+        expanded_url = expand_fn({"url": str(url)})["url"]
+        if expanded_url != str(url):
+            raw["url"] = expanded_url
+            changed = True
+    for field in ("headers", "env"):
+        value = raw.get(field)
+        if isinstance(value, dict):
+            original = {str(k): str(v) for k, v in value.items()}
+            expanded = expand_fn(original)
+            if expanded != original:
+                raw[field] = expanded
+                changed = True
     return changed
 
 
@@ -6348,6 +6420,20 @@ def debby(run_args: tuple[str, ...]) -> None:
       omnigent debby -p "name ideas for a CLI that runs agents"
     """
     _run_bundled_agent("debby", run_args)
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
+def copilot(run_args: tuple[str, ...]) -> None:
+    """Launch GitHub Copilot with Omnigent.
+
+    Shorthand for ``omnigent run --harness copilot``; every ``run`` option is forwarded."""
+    _run_harness_shorthand("copilot", run_args)
 
 
 @cli.command()
@@ -11346,6 +11432,186 @@ if _sandbox_providers():
 # built-in accounts provider to OIDC.
 
 
+_AGENT_SERVER_OPTION = click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+
+
+def _agent_cli_error(message: str) -> click.ClickException:
+    """An ``omnigent agent`` error; the stale-host recovery hint can't fix these."""
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    exc = click.ClickException(message)
+    setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    return exc
+
+
+@contextlib.contextmanager
+def _agent_api_client(server: str | None) -> Iterator[Any]:  # type: ignore[explicit-any]  # httpx imported lazily
+    """Yield an authenticated client for ``/v1/agents`` on the resolved server."""
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    configured = _load_effective_config().get("server")
+    chosen = server if server is not None else configured
+    resolved = (
+        None
+        if isinstance(chosen, str) and _is_local_server_request(chosen)
+        else _resolve_attach_server_url(server, configured)
+    )
+    if resolved is None:
+        resolved = ServerUrl(ensure_local_omnigent_server().url)
+    base_url = resolved.api_base
+    with httpx.Client(
+        base_url=base_url,
+        headers=_remote_headers(server_url=base_url, host_id=None, org_id=resolved.org_id),
+        timeout=60.0,
+        trust_env=_trust_env_for(base_url),
+    ) as client:
+        # Older servers lack user agents; say so rather than failing with a
+        # 405 or reporting an empty list.
+        info = client.get("/v1/info")
+        if not (info.is_success and info.json().get("agent_install") is True):
+            raise _agent_cli_error(
+                f"{base_url} does not support installing agents; upgrade the server "
+                "to use `omnigent agent`."
+            )
+        yield client
+
+
+def _raise_for_agent_api(resp: Any) -> None:  # type: ignore[explicit-any]  # httpx.Response
+    """Turn a failed ``/v1/agents`` response into a clean CLI error."""
+    if resp.is_success:
+        return
+    try:
+        body = resp.json()
+        detail = body.get("error", {}).get("message") or body.get("detail") or resp.text
+    except (ValueError, AttributeError):  # non-JSON, or JSON of an unexpected shape
+        detail = resp.text
+    raise _agent_cli_error(f"{resp.status_code}: {detail}")
+
+
+@cli.group("agent")
+def agent_grp() -> None:
+    """Install reusable agents so they stay in the new-session picker.
+
+    Installed agents are stored on the server under your account, so they
+    appear on every host you use, beside the built-ins, without a restart.
+    """
+
+
+@agent_grp.command("add")
+@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@_AGENT_SERVER_OPTION
+def agent_add(source: Path, server: str | None) -> None:
+    """Install SOURCE (an agent directory, YAML file, or .tar.gz bundle).
+
+    Re-adding an agent with the same name replaces your copy in place.
+    Workers, skills, guardrails, and supporting files in the directory are
+    all kept. For a directory, ``${VAR}`` references are resolved from this
+    shell, as ``omnigent run`` does; a YAML file or tarball is uploaded as is.
+
+    \b
+    Examples:
+      omnigent agent add ./orion
+      omnigent agent add ./orion.tar.gz --server https://myserver.com
+    """
+    with _agent_api_client(server) as client:
+        bundle_bytes = _bundle(source)
+        resp = client.post(
+            "/v1/agents",
+            files={"bundle": ("bundle.tar.gz", bundle_bytes, "application/gzip")},
+        )
+    _raise_for_agent_api(resp)
+    agent = resp.json()
+    click.echo(f"Installed {agent['name']} (version {agent['version']}, id {agent['id']})")
+    if agent["version"] > 1:
+        # Terminal (TUI) harnesses keep the agent they launched with.
+        click.echo(
+            "Sessions using it pick up this version on their next turn; "
+            "terminal sessions do when they relaunch."
+        )
+
+
+def _list_agents(client: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]  # httpx.Client + JSON rows
+    """Page through the caller's own agents (``GET /v1/agents?scope=user``), newest first."""
+    rows: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON rows
+    after: str | None = None
+    while True:
+        params = {"scope": "user", "limit": 50, **({"after": after} if after else {})}
+        resp = client.get("/v1/agents", params=params)
+        _raise_for_agent_api(resp)
+        page = resp.json()
+        rows.extend(page["data"])
+        next_after = page.get("last_id")
+        if not page.get("has_more") or not next_after or next_after == after:
+            return rows
+        after = next_after
+
+
+@agent_grp.command("list")
+@_AGENT_SERVER_OPTION
+def agent_list(server: str | None) -> None:
+    """List your agents (installed with ``omnigent agent add`` or uploaded)."""
+    with _agent_api_client(server) as client:
+        rows = _list_agents(client)
+    if not rows:
+        click.echo("No agents yet. Install one with: omnigent agent add <path>")
+        return
+    table = _host_table("Your agents")
+    table.add_column("Name", style="bold", overflow="fold")
+    table.add_column("Version", justify="right", no_wrap=True)
+    table.add_column("Harness", no_wrap=True)
+    # The id is what `omnigent agent remove` takes when two agents share a name.
+    table.add_column("ID", no_wrap=True, min_width=32)
+    for agent in rows:
+        table.add_row(
+            agent["name"], str(agent["version"]), agent.get("harness") or "-", agent["id"]
+        )
+    _host_console().print(table)
+
+
+@agent_grp.command("remove")
+@click.argument("agent")
+@click.option("--yes", "-y", is_flag=True, help="Remove without asking, even if sessions use it.")
+@_AGENT_SERVER_OPTION
+def agent_remove(agent: str, yes: bool, server: str | None) -> None:
+    """Remove your AGENT, given by name or by the id ``omnigent agent list`` shows.
+
+    Sessions using it keep running while they can, then must be forked into
+    another agent to continue, so you are asked to confirm first.
+    """
+    with _agent_api_client(server) as client:
+        rows = _list_agents(client)
+        matches = [a for a in rows if a["id"] == agent] or [a for a in rows if a["name"] == agent]
+        if not matches:
+            raise _agent_cli_error(f"You have no agent named {agent!r}.")
+        if len(matches) > 1:
+            ids = ", ".join(a["id"] for a in matches)
+            raise _agent_cli_error(
+                f"You have {len(matches)} agents named {agent!r}; remove one by id: {ids}"
+            )
+        name = matches[0]["name"]
+        path = f"/v1/agents/{matches[0]['id']}"
+        resp = client.delete(path, params={"force": "true"} if yes else None)
+        if resp.status_code == 409 and "sessions_in_use" in resp.json():
+            count = resp.json()["sessions_in_use"]
+            click.confirm(
+                f"{count} session(s) still use {name}; removing it will break them. "
+                "Remove anyway?",
+                abort=True,
+            )
+            resp = client.delete(path, params={"force": "true"})
+        _raise_for_agent_api(resp)
+    click.echo(f"Removed {name}")
+
+
 @cli.group("debug")
 def debug() -> None:
     """Internal maintenance commands.
@@ -13392,6 +13658,22 @@ def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     # matching the outer `cli(args=argv, standalone_mode=False)` dispatch.
     run.main(
         args=[_bundled_example_path(name), *extra_args, *run_args],
+        prog_name="omnigent run",
+        standalone_mode=False,
+    )
+
+
+def _run_harness_shorthand(harness: str, run_args: tuple[str, ...]) -> None:
+    """Forward a harness shorthand (``omnigent copilot``) to ``run --harness``, the
+    way :func:`_run_bundled_agent` forwards ``polly``; an explicit ``--harness`` in
+    *run_args* is a usage error rather than a silent override."""
+    if any(arg == "--harness" or arg.startswith("--harness=") for arg in run_args):
+        raise click.UsageError(
+            f"`{cli_invocation()} {harness}` always uses the {harness} harness; drop "
+            f"--harness, or use `{cli_invocation()} run --harness <name>` to pick another."
+        )
+    run.main(
+        args=["--harness", harness, *run_args],
         prog_name="omnigent run",
         standalone_mode=False,
     )

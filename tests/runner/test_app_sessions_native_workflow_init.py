@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
 from omnigent.native import native_dispatch
@@ -32,6 +33,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
 from tests.runner.conftest import (
+    _build_app_for_spec,
     _build_app_with_mcp_tool,
     _build_interrupt_app,
     _build_lifecycle_app,
@@ -330,7 +332,14 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
         (
             "codex-native",
             "_auto_create_codex_terminal",
-            {"bundle_dir", "skills_filter", "agent_spec", "server_client", "ensure_comment_relay"},
+            {
+                "bundle_dir",
+                "skills_filter",
+                "agent_spec",
+                "server_client",
+                "session_init",
+                "ensure_comment_relay",
+            },
         ),
     ],
 )
@@ -1111,7 +1120,7 @@ async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
     )
 
     async with _runner_client(app) as client:
-        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        with caplog.at_level(logging.WARNING, logger="omnigent.inner.native_attachments"):
             resp = await client.post(
                 "/v1/sessions/conv_hist_fail/events",
                 json={
@@ -1124,7 +1133,15 @@ async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
             )
 
     assert resp.status_code == 202
-    assert "failed to resolve file_id" in caplog.text
+    failures = [
+        record_to_row(record, source="runner")
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_attachment_read_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["session_id"] == "conv_hist_fail"
+    assert failures[0]["attributes"]["stage"] == "metadata"
+    assert failures[0]["attributes"]["exception_type"] == "ConnectError"
     for _ in range(20):
         if harness_client.posted_bodies:
             break
@@ -2110,17 +2127,8 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
         name="override-agent",
         executor=ExecutorSpec(config={"harness": "claude-sdk"}),
     )
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, pm = await _build_app_for_spec(spec)
     session_id = "5b0c1f7a4d2e4c8fa1b3d6e9c0f2a4b6"
     agent_id = "9d3e2b1c7a504f6e8c2d1b0a3f5e7c9d"
     payload = {
@@ -2173,17 +2181,8 @@ async def test_message_turn_resolves_the_recorded_harness_override() -> None:
         name="override-agent",
         executor=ExecutorSpec(config={"harness": "claude-sdk"}),
     )
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, pm = await _build_app_for_spec(spec)
     session_id = "6c1d2e8b5f3a4d9eb2c4e7fad1a3b5c7"
     agent_id = "8e4f3c2d1b6a05f79d3e2c1b4a6f8dae"
     payload = {

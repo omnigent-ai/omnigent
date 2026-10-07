@@ -1,28 +1,14 @@
-"""E2E: a transient runner-tunnel outage must not fail an active turn.
+"""E2E: tunnel reconnections preserve in-flight work on the same or a new replica.
 
-This test drives the production process topology: a real Omnigent server, a
-real runner connected through the production WebSocket tunnel, and a real
-openai-agents turn blocked inside the mock LLM. A TCP ingress proxy then cuts
-the established runner tunnel and returns HTTP 503 for 45 seconds before
-recovering. The runner keeps executing the turn while its tunnel reconnects.
+Real server and runner processes communicate through the production WebSocket
+tunnel and a TCP ingress proxy. A deterministic mock LLM holds an openai-agents
+turn in flight while the proxy cuts the tunnel and returns HTTP 503. The runner
+then reconnects to the original server or a second server sharing its database.
 
-The 45-second blackout is deliberately longer than any fixed disconnect grace
-the server has shipped (10 s historically, 20 s on current main) and longer
-than a mere constant bump to 30 s would cover, yet well inside the 90 s runner
-liveness lease (``RUNNER_LIVENESS_TTL_S``). It reproduces the production
-false-fatal that a laptop Wi-Fi roam, a VPN stall, or a sleep/resume produces:
-the runner is alive the whole time and reconnects, but the server marks the
-mid-turn session ``failed`` with ``runner_disconnected`` and discards the
-in-flight turn.
-
-On unchanged main the server publishes ``runner_disconnected`` ~20 s into the
-outage, so this test fails. Riding the drop out for the liveness lease, the
-same runner reconnects, the original turn's answer is delivered, and the
-session never shows a failed edge or a persisted ``runner_disconnected`` label.
-
-No relay, runner, or server function is patched. The only injected fault is at
-the TCP boundary in front of the runner WebSocket, matching a transient ingress
-outage in production.
+The cross-replica case also covers an unavailable conversation database on the
+old replica, with metadata in a separate database. Only queries on A's
+conversation engine are fault-injected; the servers, runner, WebSocket
+reconnection, shared heartbeat writes, and turn execution are real.
 
 Run::
 
@@ -62,9 +48,7 @@ from tests.e2e.conftest import (
     reset_mock_llm,
 )
 
-# Longer than main's 20 s disconnect grace, longer than a 30 s bump, shorter
-# than the 90 s liveness lease: only riding the drop out for the lease keeps
-# the turn alive, so this proves the lease-based fix rather than a bigger grace.
+# Exercise a substantial outage within the 90-second runner liveness lease.
 _BLACKOUT_S = 45.0
 _ANSWER = "RUNNER_RECONNECT_GRACE_E2E_COMPLETED"
 # Both server paths that fail a turn on a runner drop log through the same
@@ -77,7 +61,40 @@ _FAILURE_SIGNATURE = re.compile(
 )
 _HEALTH_TIMEOUT_S = 90.0
 
-pytestmark = [pytest.mark.timeout(300, method="signal")]
+# Only replica A uses this bootstrap; the file arms its backend outage after
+# the real runner has reconnected to B. The metadata database remains readable.
+_UNAVAILABLE_BACKEND_BOOTSTRAP = """
+import sys
+from pathlib import Path
+
+import grpc
+from sqlalchemy import event
+from sqlalchemy.engine import Engine, make_url
+
+fault_file = Path(sys.argv.pop(1))
+conversation_database = make_url(sys.argv.pop(1))
+
+class BackendUnavailable(grpc.RpcError):
+    def code(self):
+        return grpc.StatusCode.UNAVAILABLE
+
+    def details(self):
+        return "injected conversation backend outage"
+
+    def __str__(self):
+        return f"{self.code()}: {self.details()}"
+
+@event.listens_for(Engine, "before_cursor_execute")
+def fail_conversation_query(connection, cursor, statement, parameters, context, executemany):
+    if connection.engine.url == conversation_database and fault_file.exists():
+        raise BackendUnavailable()
+
+from omnigent.cli import main
+
+main()
+"""
+
+pytestmark = [pytest.mark.timeout(420, method="signal")]
 
 
 def _ambient_free_environ() -> dict[str, str]:
@@ -221,6 +238,11 @@ class _TunnelIngressProxy:
         with self._lock:
             self._reject = False
 
+    def retarget(self, backend_host: str, backend_port: int) -> None:
+        """Forward new connections to a different server replica."""
+        with self._lock:
+            self._backend = (backend_host, backend_port)
+
     def close(self) -> None:
         """Stop the proxy and close all active sockets."""
         self.end_blackout()
@@ -236,17 +258,31 @@ class _TunnelIngressProxy:
 class _ReconnectStack:
     """Dedicated server, ingress proxy, and runner for the reconnect journey."""
 
-    def __init__(self, mock_llm_server_url: str, tmp_path: Path) -> None:
+    def __init__(
+        self,
+        mock_llm_server_url: str,
+        tmp_path: Path,
+        *,
+        fail_conversation_reads: bool = False,
+    ) -> None:
         self._mock_base = f"{mock_llm_server_url}/v1"
         self._port = find_free_port()
         self.base_url = f"http://127.0.0.1:{self._port}"
         self._binding_token = uuid.uuid4().hex + uuid.uuid4().hex
         self.runner_id = token_bound_runner_id(self._binding_token)
         self._database_uri = f"sqlite:///{tmp_path / 'reconnect.db'}"
+        self._conversation_database_uri = f"sqlite:///{tmp_path / 'conversations.db'}"
         self._artifact_dir = tmp_path / "artifacts"
         self._artifact_dir.mkdir()
         self.server_log = tmp_path / "server.log"
+        # The server's own log file. Its stderr mirroring is env-dependent,
+        # so assertions on server log lines read this path, which
+        # configure_process_logging always writes when the variable is set.
+        self.process_log = tmp_path / "server-process.log"
         self.runner_log = tmp_path / "runner.log"
+        self.conversation_read_fault = (
+            tmp_path / "conversation-backend-unavailable" if fail_conversation_reads else None
+        )
         self._server_handle = self.server_log.open("w")
         self._runner_handle = self.runner_log.open("w")
         self._server_proc: subprocess.Popen[bytes] | None = None
@@ -254,23 +290,31 @@ class _ReconnectStack:
         self.proxy: _TunnelIngressProxy | None = None
         self.client = httpx.Client(base_url=self.base_url, timeout=30.0, trust_env=False)
 
-    def _server_env(self) -> dict[str, str]:
+    def _server_env(self, process_log: Path | None = None) -> dict[str, str]:
         env = {
             **_ambient_free_environ(),
             "OPENAI_API_KEY": "mock-key",
             "OPENAI_BASE_URL": self._mock_base,
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": self._binding_token,
+            "OMNIGENT_PROCESS_LOG_FILE": str(process_log or self.process_log),
         }
         apply_server_env(env, _REPO_ROOT)
         return env
 
     def start(self) -> None:
         """Start the server, proxy, and runner, then wait for registration."""
+        entrypoint = ["-m", "omnigent.cli"]
+        if self.conversation_read_fault is not None:
+            entrypoint = [
+                "-c",
+                _UNAVAILABLE_BACKEND_BOOTSTRAP,
+                str(self.conversation_read_fault),
+                self._conversation_database_uri,
+            ]
         self._server_proc = subprocess.Popen(
             [
                 sys.executable,
-                "-m",
-                "omnigent.cli",
+                *entrypoint,
                 "server",
                 "--host",
                 "127.0.0.1",
@@ -278,6 +322,8 @@ class _ReconnectStack:
                 str(self._port),
                 "--database-uri",
                 self._database_uri,
+                "--conversation-database-uri",
+                self._conversation_database_uri,
                 "--artifact-location",
                 str(self._artifact_dir),
             ],
@@ -294,7 +340,9 @@ class _ReconnectStack:
         proxy_url = f"http://127.0.0.1:{self.proxy.port}"
         runner_env = apply_runner_env(
             {
-                **self._server_env(),
+                **{
+                    k: v for k, v in self._server_env().items() if k != "OMNIGENT_PROCESS_LOG_FILE"
+                },
                 "OMNIGENT_RUNNER_ID": self.runner_id,
                 "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": self._binding_token,
                 "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
@@ -330,6 +378,12 @@ class _ReconnectStack:
             what="the runner WebSocket tunnel to register",
         )
 
+    def start_second_replica(self) -> _Replica:
+        """Start a second server replica sharing this stack's database."""
+        replica = _Replica(self, self.server_log.parent)
+        replica.start()
+        return replica
+
     def teardown(self) -> None:
         """Stop processes, proxy, HTTP client, and log handles."""
         _terminate(self._runner_proc)
@@ -341,13 +395,78 @@ class _ReconnectStack:
         self._server_handle.close()
 
 
+class _Replica:
+    """A second real server process over the same database as a stack."""
+
+    def __init__(self, stack: _ReconnectStack, log_dir: Path) -> None:
+        self._stack = stack
+        self.port = find_free_port()
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self.server_log = log_dir / "server-b.log"
+        self.process_log = log_dir / "server-b-process.log"
+        self._handle = self.server_log.open("w")
+        self._proc: subprocess.Popen[bytes] | None = None
+        self.client = httpx.Client(base_url=self.base_url, timeout=30.0, trust_env=False)
+
+    def start(self) -> None:
+        self._proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "omnigent.cli",
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.port),
+                "--database-uri",
+                self._stack._database_uri,
+                "--conversation-database-uri",
+                self._stack._conversation_database_uri,
+                "--artifact-location",
+                str(self._stack._artifact_dir),
+            ],
+            env=self._stack._server_env(process_log=self.process_log),
+            stdout=self._handle,
+            stderr=subprocess.STDOUT,
+        )
+        _poll_until(
+            self._healthy,
+            timeout=_HEALTH_TIMEOUT_S,
+            what="the second Omnigent replica to become healthy",
+        )
+
+    def _healthy(self) -> bool:
+        try:
+            return self.client.get("/health", timeout=2.0).status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    def runner_online(self) -> bool:
+        try:
+            response = self.client.get(f"/v1/runners/{self._stack.runner_id}/status", timeout=2.0)
+            return response.status_code == 200 and response.json().get("online") is True
+        except httpx.HTTPError:
+            return False
+
+    def teardown(self) -> None:
+        _terminate(self._proc)
+        self.client.close()
+        self._handle.close()
+
+
 @pytest.fixture
 def reconnect_stack(
     mock_llm_server_url: str,
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> Iterator[_ReconnectStack]:
     """Yield a dedicated real server/runner stack behind a fault proxy."""
-    stack = _ReconnectStack(mock_llm_server_url, tmp_path)
+    stack = _ReconnectStack(
+        mock_llm_server_url,
+        tmp_path,
+        fail_conversation_reads=getattr(request, "param", False),
+    )
     stack.start()
     try:
         yield stack
@@ -367,18 +486,31 @@ def _session_snapshot(client: httpx.Client, session_id: str) -> dict:
     return response.json()
 
 
+def _session_list_entry(client: httpx.Client, session_id: str) -> dict:
+    response = client.get(
+        "/v1/sessions",
+        params={"visibility": "all", "limit": 100},
+    )
+    response.raise_for_status()
+    return next(entry for entry in response.json()["data"] if entry["id"] == session_id)
+
+
 def _session_blob(client: httpx.Client, session_id: str) -> str:
     return json.dumps(_session_snapshot(client, session_id).get("items", []))
 
 
-def _send_user_message(client: httpx.Client, session_id: str) -> None:
+def _send_user_message(
+    client: httpx.Client,
+    session_id: str,
+    text: str = "Finish after reconnecting.",
+) -> None:
     response = client.post(
         f"/v1/sessions/{session_id}/events",
         json={
             "type": "message",
             "data": {
                 "role": "user",
-                "content": [{"type": "input_text", "text": "Finish after reconnecting."}],
+                "content": [{"type": "input_text", "text": text}],
             },
         },
     )
@@ -389,7 +521,7 @@ def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
     reconnect_stack: _ReconnectStack,
     mock_llm_server_url: str,
 ) -> None:
-    """A 45-second ingress outage must not fail or discard the active turn."""
+    """A 45-second outage must recover without failure, lost output or relay polling."""
     stack = reconnect_stack
     proxy = stack.proxy
     assert proxy is not None
@@ -443,13 +575,27 @@ def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
         what="the original in-flight turn to complete after runner reconnect",
     )
 
-    server_log = stack.server_log.read_text()
+    server_log = stack.process_log.read_text()
     assert _FAILURE_SIGNATURE.search(server_log) is None, (
         f"The server failed session {session_id} during a {_BLACKOUT_S:.0f}s transient "
         "runner-tunnel outage even though the same runner reconnected and the original "
         "turn completed. This reproduces the production false-fatal path.\n"
         f"Rejected reconnect handshakes: {proxy.rejected_connections}.\n"
         f"Server log tail:\n{server_log[-5000:]}"
+    )
+
+    # One transport-lost row proves the outage occurred; a polling relay then
+    # logs a retry per attempt. Count both in the server's own log file.
+    outages = server_log.count(f"Relay: runner transport lost for session={session_id} (")
+    assert outages >= 1, "the blackout never registered as a transport loss in the server log"
+    retry_lines = [
+        line
+        for line in server_log.splitlines()
+        if f"transport lost for session={session_id}; retrying" in line
+    ]
+    assert len(retry_lines) <= 1, (
+        f"The relay re-opened GET /stream {len(retry_lines)} times during a single "
+        f"{_BLACKOUT_S:.0f}s outage instead of waiting once for the runner to re-register."
     )
 
     # The failed edge is an SSE event that vanishes on reload; the durable
@@ -467,3 +613,147 @@ def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
         f"Session {session_id} still carries a persisted runner_disconnected label after "
         f"recovery; snapshot={snapshot_text[:2000]}"
     )
+
+
+@pytest.mark.parametrize(
+    "reconnect_stack",
+    [False, True],
+    ids=["healthy-store", "unavailable-conversation-backend"],
+    indirect=True,
+)
+def test_reconnect_to_another_replica_does_not_fail_the_turn(
+    reconnect_stack: _ReconnectStack,
+    mock_llm_server_url: str,
+) -> None:
+    """A runner that reconnects to a different replica must not be failed by the first.
+
+    Replica A relays the turn. Its tunnel is cut, and the runner reconnects to
+    replica B (same database). Keep the turn running beyond A's grace period,
+    with A's conversation database queries optionally raising UNAVAILABLE.
+    B's shared heartbeat must prevent A from failing the turn, and B must
+    deliver both the original answer and a follow-up turn.
+    """
+    from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
+
+    stack = reconnect_stack
+    proxy = stack.proxy
+    assert proxy is not None
+    replica_b = stack.start_second_replica()
+    try:
+        reset_mock_llm(mock_llm_server_url)
+        model = f"runner-cross-replica-{uuid.uuid4().hex[:8]}"
+        follow_up_answer = f"{_ANSWER}_FOLLOW_UP"
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": _ANSWER, "block": True}, {"text": follow_up_answer}],
+            key=model,
+        )
+        agent_name = register_inline_agent(
+            stack.client,
+            name=f"runner-cross-replica-{uuid.uuid4().hex[:8]}",
+            harness="openai-agents",
+            model=model,
+            profile="",
+            prompt="Return the configured answer.",
+            mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        )
+        session_id = create_runner_bound_session(
+            stack.client,
+            agent_name=agent_name,
+            runner_id=stack.runner_id,
+        )
+        _send_user_message(stack.client, session_id)
+        _poll_until(
+            lambda: _gate_pending(mock_llm_server_url),
+            timeout=60.0,
+            what="the real turn to block inside the mock LLM on replica A",
+        )
+
+        # Cut A's tunnel, then hand the runner's next connection to B.
+        proxy.begin_blackout()
+        _poll_until(
+            lambda: proxy.rejected_connections > 0,
+            timeout=10.0,
+            what="the real runner to attempt a reconnect through the 503 ingress",
+        )
+        proxy.retarget("127.0.0.1", replica_b.port)
+        proxy.end_blackout()
+        _poll_until(
+            replica_b.runner_online,
+            timeout=_HEALTH_TIMEOUT_S,
+            what="the runner WebSocket tunnel to register on replica B",
+        )
+
+        if stack.conversation_read_fault is not None:
+            stack.conversation_read_fault.touch()
+            response = stack.client.get(f"/v1/sessions/{session_id}")
+            assert response.status_code == 500, response.text
+            _poll_until(
+                lambda: (
+                    "StatusCode.UNAVAILABLE: injected conversation backend outage"
+                    in stack.process_log.read_text()
+                ),
+                timeout=10.0,
+                what="replica A to log the injected conversation database failure",
+            )
+        assert _session_snapshot(replica_b.client, session_id).get("status") == "running"
+
+        # Keep the original turn in flight until A makes its disconnect decision.
+        recovered = f"Relay: runner transport lost for session={session_id} (live_elsewhere)"
+        _poll_until(
+            lambda: (
+                recovered in stack.process_log.read_text()
+                or bool(_FAILURE_SIGNATURE.search(stack.process_log.read_text()))
+            ),
+            timeout=RUNNER_DISCONNECT_GRACE_S + 30.0,
+            what="replica A to resolve the disconnect while the turn is still running on B",
+        )
+
+        server_a_log = stack.process_log.read_text()
+        failed_edges = _FAILURE_SIGNATURE.findall(server_a_log)
+        assert not failed_edges, (
+            f"Replica A failed session {session_id} after the runner reconnected to "
+            "replica B. The fresh heartbeat B wrote must remain readable even when "
+            "A's conversation database is unavailable.\n"
+            f"Failure lines: {failed_edges}\n"
+            f"Replica A log tail:\n{server_a_log[-4000:]}"
+        )
+        assert recovered in server_a_log
+        if stack.conversation_read_fault is not None:
+            stack.conversation_read_fault.unlink()
+
+        release_mock_gate(mock_llm_server_url)
+        _poll_until(
+            lambda: _ANSWER in _session_blob(replica_b.client, session_id),
+            timeout=60.0,
+            what="the original in-flight turn to complete via replica B",
+        )
+        _send_user_message(replica_b.client, session_id, "Continue after switching replicas.")
+        _poll_until(
+            lambda: follow_up_answer in _session_blob(replica_b.client, session_id),
+            timeout=60.0,
+            what="a follow-up turn to complete on the same session and runner on replica B",
+        )
+
+        snapshot_a = _session_snapshot(stack.client, session_id)
+        assert snapshot_a.get("status") != "running", (
+            f"Replica A still reports the completed session as running; "
+            f"snapshot={json.dumps(snapshot_a)[:2000]}"
+        )
+        assert snapshot_a.get("active_response_id") is None
+        list_entry_a = _session_list_entry(stack.client, session_id)
+        assert list_entry_a.get("status") == snapshot_a.get("status"), (
+            f"Replica A's list and snapshot disagree after handoff; "
+            f"list_entry={json.dumps(list_entry_a)[:2000]}"
+        )
+
+        snapshot = _session_snapshot(replica_b.client, session_id)
+        assert snapshot.get("status") != "failed", (
+            f"Session {session_id} reads failed after completing on replica B; "
+            f"snapshot={json.dumps(snapshot)[:2000]}"
+        )
+        assert "runner_disconnected" not in json.dumps(snapshot)
+        assert not _FAILURE_SIGNATURE.search(stack.process_log.read_text())
+        assert not _FAILURE_SIGNATURE.search(replica_b.process_log.read_text())
+    finally:
+        replica_b.teardown()

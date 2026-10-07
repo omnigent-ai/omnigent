@@ -13,6 +13,7 @@ that shared decode-and-write step.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import contextlib
@@ -32,9 +33,13 @@ from typing import Any, Literal
 
 import httpx
 
+from omnigent.debug_logging import debug_event
 from omnigent.process_logging import data_dir
 
 _logger = logging.getLogger(__name__)
+_ATTACHMENT_READ_ATTEMPTS = 3
+_ATTACHMENT_RESOLVE_TIMEOUT_S = 60.0
+_ATTACHMENT_RETRY_STATUSES = frozenset({408, 500, 502, 503, 504})
 
 # Characters that would corrupt a "[Attached: ...]" / "[Attachment ...]"
 # marker line for the consumers that regex-match it (forwarders, title
@@ -529,6 +534,55 @@ def codex_resize_metadata_path(path: Path, source_metadata: object) -> Path:
     return alias
 
 
+async def _read_attachment_resource(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    session_id: str,
+    stage: str,
+    timeout_s: float,
+) -> httpx.Response:
+    """Retry transient GET failures within the enclosing attachment deadline."""
+    for attempt in range(1, _ATTACHMENT_READ_ATTEMPTS + 1):
+        try:
+            response = await client.get(path, timeout=timeout_s)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+            retryable = status in _ATTACHMENT_RETRY_STATUSES or isinstance(
+                exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+            )
+            if not retryable or attempt == _ATTACHMENT_READ_ATTEMPTS:
+                raise
+            _logger.warning(
+                "Retrying attachment %s read after transient failure",
+                stage,
+                extra=debug_event(
+                    "native_attachment_read_retry",
+                    session_id=session_id,
+                    stage=stage,
+                    attempt=attempt,
+                    http_status=status,
+                    exception_type=type(exc).__name__,
+                ),
+            )
+            await asyncio.sleep(0.25 * 2 ** (attempt - 1))
+        else:
+            if attempt > 1:
+                _logger.info(
+                    "Attachment %s read recovered",
+                    stage,
+                    extra=debug_event(
+                        "native_attachment_read_recovered",
+                        session_id=session_id,
+                        stage=stage,
+                        attempts=attempt,
+                    ),
+                )
+            return response
+    raise AssertionError("attachment retry loop exited without a result")
+
+
 async def resolve_file_id_block(
     block: Mapping[str, object],
     *,
@@ -558,17 +612,30 @@ async def resolve_file_id_block(
         f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
         f"/resources/files/{urllib.parse.quote(file_id, safe='')}"
     )
+    stage = "metadata"
     try:
-        meta_resp = await client.get(base, timeout=10.0)
-        content_resp = await client.get(f"{base}/content", timeout=30.0)
-        meta_resp.raise_for_status()
-        content_resp.raise_for_status()
-    except httpx.HTTPError:
+        async with asyncio.timeout(_ATTACHMENT_RESOLVE_TIMEOUT_S):
+            meta_resp = await _read_attachment_resource(
+                client, base, session_id=session_id, stage=stage, timeout_s=10.0
+            )
+            stage = "content"
+            content_resp = await _read_attachment_resource(
+                client, f"{base}/content", session_id=session_id, stage=stage, timeout_s=30.0
+            )
+    except (httpx.HTTPError, TimeoutError) as exc:
         _logger.warning(
-            "failed to resolve file_id=%s for session=%s",
-            file_id,
-            session_id,
-            exc_info=True,
+            "Attachment %s read failed",
+            stage,
+            extra=debug_event(
+                "native_attachment_read_failed",
+                session_id=session_id,
+                stage=stage,
+                http_status=exc.response.status_code
+                if isinstance(exc, httpx.HTTPStatusError)
+                else None,
+                exception_type=type(exc).__name__,
+                deadline_exceeded=isinstance(exc, TimeoutError),
+            ),
         )
         return None
 

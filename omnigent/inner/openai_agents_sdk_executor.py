@@ -829,7 +829,7 @@ def _build_reasoning_model_settings(effort: str | None) -> dict[str, object]:
 
 
 def _is_databricks_openai_client(client: AsyncOpenAIClient) -> bool:
-    """Return whether *client* targets a Databricks AI Gateway base URL."""
+    """Return whether *client* targets a Databricks Unity Gateway base URL."""
     return "/ai-gateway/" in str(getattr(client, "base_url", ""))
 
 
@@ -1854,21 +1854,19 @@ class OpenAIAgentsSDKExecutor(Executor):
             in_tok = sum(getattr(r.usage, "input_tokens", 0) or 0 for r in raw_responses)
             out_tok = sum(getattr(r.usage, "output_tokens", 0) or 0 for r in raw_responses)
             total_tok = sum(getattr(r.usage, "total_tokens", 0) or 0 for r in raw_responses)
-            # OpenAI's ``input_tokens`` (aka ``prompt_tokens``) is the
-            # TOTAL input count *including* cached tokens, whereas
-            # ``compute_llm_cost`` expects Anthropic semantics where
-            # ``input_tokens`` is the non-cached portion and
-            # ``cache_read_input_tokens`` is additive. Extract cached
-            # tokens from ``prompt_tokens_details.cached_tokens`` and
-            # subtract so downstream billing uses the cheaper cache rate.
+            # SDK ``input_tokens`` INCLUDES cached tokens; ``compute_llm_cost`` expects
+            # Anthropic semantics (non-cached input + additive cache_read), so subtract
+            # ``Usage.input_tokens_details.cached_tokens`` (its only cache field).
             cached_tok = 0
             for r in raw_responses:
-                details = getattr(r.usage, "prompt_tokens_details", None)
+                details = getattr(r.usage, "input_tokens_details", None)
                 if details is not None:
                     cached = getattr(details, "cached_tokens", None)
                     if cached is None and isinstance(details, dict):
                         cached = details.get("cached_tokens")
-                    cached_tok += cached or 0
+                    # Clamp per response to [0, input] so malformed counts never go negative.
+                    r_in = getattr(r.usage, "input_tokens", 0) or 0
+                    cached_tok += min(max(cached or 0, 0), r_in)
             last_r = raw_responses[-1]
             last_in = getattr(last_r.usage, "input_tokens", 0) or 0
             last_out = getattr(last_r.usage, "output_tokens", 0) or 0

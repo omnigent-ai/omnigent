@@ -4,7 +4,7 @@ import pytest
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError, make_tunnel_ws_factory
 
 
@@ -132,7 +132,8 @@ def test_runner_absent_code_no_store_registry_only_returns_wrong_replica():
 
 
 @pytest.mark.parametrize("surface", ["resources", "existing", "dispatch", "terminal_attach"])
-def test_colocated_child_on_another_replica_is_not_reported_offline(surface):
+@pytest.mark.parametrize("ancestry", ["direct", "nested", "nested_hostless_root"])
+def test_colocated_child_on_another_replica_is_not_reported_offline(surface, ancestry):
     parent = Conversation(
         id="parent",
         created_at=1,
@@ -150,11 +151,35 @@ def test_colocated_child_on_another_replica_is_not_reported_offline(surface):
         kind="sub_agent",
         runner_id=parent.runner_id,
     )
+    conversations = [parent, child]
+    if ancestry != "direct":
+        root = Conversation(
+            id="root",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="root",
+            host_id="host_root" if ancestry == "nested" else None,
+        )
+        intermediate = Conversation(
+            id="intermediate",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id=root.id,
+            parent_conversation_id=parent.id,
+            kind="sub_agent",
+            runner_id=parent.runner_id,
+        )
+        parent.parent_conversation_id = root.id
+        parent.root_conversation_id = root.id
+        parent.kind = "sub_agent"
+        child.parent_conversation_id = intermediate.id
+        child.root_conversation_id = root.id
+        conversations.extend([root, intermediate])
     registry = MockTunnelRegistry()
     router = RunnerRouter(
         registry=registry,
-        conversation_store=MockConversationStore(parent, child),
-        host_registry=MockHostRegistry(),
+        conversation_store=MockConversationStore(*conversations),
+        host_registry=MockHostRegistry({"host_root": "local_connection"}),
         host_store=MockHostStore({"host_parent": True}),
     )
     if surface == "terminal_attach":
@@ -171,3 +196,33 @@ def test_colocated_child_on_another_replica_is_not_reported_offline(surface):
                 router.client_for_conversation(conversation_id=child.id, harness="pi-native")
         assert caught.value.code == ErrorCode.WRONG_REPLICA
     assert child.host_id is None
+
+
+@pytest.mark.parametrize("root_host", [None, "host_root"])
+@pytest.mark.parametrize("broken_parent", ["missing", "cycle"])
+def test_routing_host_handles_broken_ancestry(root_host, broken_parent):
+    root = Conversation(
+        id="root", created_at=1, updated_at=1, root_conversation_id="root", host_id=root_host
+    )
+    child = Conversation(
+        id="child",
+        created_at=1,
+        updated_at=1,
+        kind="sub_agent",
+        parent_conversation_id="parent",
+        root_conversation_id=root.id,
+    )
+    conversations = [root, child]
+    if broken_parent == "cycle":
+        conversations.append(
+            Conversation(
+                id="parent",
+                created_at=1,
+                updated_at=1,
+                kind="sub_agent",
+                parent_conversation_id=child.id,
+                root_conversation_id=root.id,
+            )
+        )
+
+    assert routing_host_id(child, MockConversationStore(*conversations)) == root_host

@@ -48,13 +48,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 import pytest
 from playwright.async_api import Request, Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
@@ -77,33 +77,6 @@ _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
 # The worktree-list endpoint the branch combobox queries for the picked repo.
 # Distinct ``/worktrees`` segment, so it never collides with ``/filesystem``.
 _WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    The e2e_ui suite runs many pytest-playwright **sync** tests in the same
-    session; once one has run, pytest-asyncio can't start a loop on the main
-    thread. Running the coroutine from a fresh thread via :func:`asyncio.run`
-    sidesteps that. Any exception (including assertion failures) is captured
-    and re-raised on the calling thread so the test fails normally.
-
-    :param coro: The coroutine to run to completion.
-    :raises Exception: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
@@ -516,6 +489,7 @@ async def _register_common_routes(
     )
     await page.route(_WORKTREES_RE, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/agents", handle_agents)
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
 
@@ -743,6 +717,7 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -896,6 +871,7 @@ async def _drive_ignore_uncorrelated_announcement(base_url: str, session_id: str
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -1078,6 +1054,7 @@ async def _drive_no_redirect_after_navigating_away(
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             def note_create_response(response) -> None:
                 if response.request.method == "POST" and _SESSIONS_RE.search(response.url):
@@ -1225,6 +1202,7 @@ async def _drive_landing_clears_after_navigating_away(
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             def note_create_response(response) -> None:
                 if response.request.method == "POST" and _SESSIONS_RE.search(response.url):
@@ -3692,6 +3670,7 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
             # Per-agent enrich fetch for whichever agent survives the dedup.
             await page.route(re.compile(r"/v1/sessions/[^/]+/agent$"), handle_enrich)
 

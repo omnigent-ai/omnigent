@@ -22,8 +22,7 @@ from omnigent.harnesses.claude_native.forwarder import (
     _forward_available_subagents,
     _PostRetryTracker,
 )
-from omnigent.runner import app as runner_app
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -41,26 +40,26 @@ SUBAGENT_ID = "afalsecompletelull"
 def _clean_registry() -> Iterator[None]:
     """Snapshot and restore the process-wide sub-agent / inbox registries."""
     saved = (
-        dict(runner_app._subagent_work_by_child),
-        {k: set(v) for k, v in runner_app._subagent_work_by_parent.items()},
-        dict(runner_app._session_inboxes_ref),
-        set(runner_app._drained_delivered_subagent_children),
+        dict(subagent_work._subagent_work_by_child),
+        {k: set(v) for k, v in subagent_work._subagent_work_by_parent.items()},
+        dict(subagent_work._session_inboxes_ref),
+        set(subagent_work._drained_delivered_subagent_children),
     )
-    runner_app._subagent_work_by_child.clear()
-    runner_app._subagent_work_by_parent.clear()
-    runner_app._session_inboxes_ref.clear()
-    runner_app._drained_delivered_subagent_children.clear()
+    subagent_work._subagent_work_by_child.clear()
+    subagent_work._subagent_work_by_parent.clear()
+    subagent_work._session_inboxes_ref.clear()
+    subagent_work._drained_delivered_subagent_children.clear()
     try:
         yield
     finally:
-        runner_app._subagent_work_by_child.clear()
-        runner_app._subagent_work_by_child.update(saved[0])
-        runner_app._subagent_work_by_parent.clear()
-        runner_app._subagent_work_by_parent.update(saved[1])
-        runner_app._session_inboxes_ref.clear()
-        runner_app._session_inboxes_ref.update(saved[2])
-        runner_app._drained_delivered_subagent_children.clear()
-        runner_app._drained_delivered_subagent_children.update(saved[3])
+        subagent_work._subagent_work_by_child.clear()
+        subagent_work._subagent_work_by_child.update(saved[0])
+        subagent_work._subagent_work_by_parent.clear()
+        subagent_work._subagent_work_by_parent.update(saved[1])
+        subagent_work._session_inboxes_ref.clear()
+        subagent_work._session_inboxes_ref.update(saved[2])
+        subagent_work._drained_delivered_subagent_children.clear()
+        subagent_work._drained_delivered_subagent_children.update(saved[3])
 
 
 class _CapturingForwarderClient:
@@ -198,8 +197,8 @@ async def _post_status_to_runner(
     :param output: Optional forwarded output text.
     :returns: ``(http_status, drained_parent_inbox_items)``.
     """
-    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    subagent_work.register_subagent_work(
         parent_session_id=PARENT_SESSION_ID,
         child_session_id=CHILD_SESSION_ID,
         agent="general-purpose",
@@ -231,7 +230,7 @@ async def _post_status_to_runner(
             json={"type": "external_session_status", "data": data},
         )
 
-    inbox = runner_app._session_inboxes_ref.get(PARENT_SESSION_ID)
+    inbox = subagent_work._session_inboxes_ref.get(PARENT_SESSION_ID)
     items: list[dict[str, Any]] = []
     if inbox is not None:
         while not inbox.empty():

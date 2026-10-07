@@ -989,11 +989,13 @@ class ExecutorAdapter(HarnessApp):
     def _build_error_detail(self, exception: BaseException) -> Any:
         """Map an exception to a semantic code the Omnigent retry allowlist recognizes.
 
-        OmnigentError uses its own ``code``; others go through ``classify_inner_exception``.
-        Unknown types fall back to base class (``type(exception).__name__``).
+        OmnigentError uses its own ``code``; others go through ``classify_inner_exception``,
+        then a text check for a CLI too old for the model. Unknown types fall back to base
+        class (``type(exception).__name__``).
         """
         from omnigent.errors import OmnigentError
         from omnigent.inner.model_auth import ProviderAuthRequired
+        from omnigent.runner.launch_failure import diagnose_client_update_required
         from omnigent.server.schemas import ErrorDetail
 
         if isinstance(exception, ProviderAuthRequired):
@@ -1018,6 +1020,18 @@ class ExecutorAdapter(HarnessApp):
         code = classify_inner_exception(exception)
         if code is not None:
             return ErrorDetail(code=code, message=str(exception))
+
+        # An old-CLI model refusal reaches here as a bare RuntimeError; its text names the fix.
+        message = str(exception)
+        diagnosis = diagnose_client_update_required(message)
+        if diagnosis is not None:
+            return ErrorDetail(
+                code="client_update_required",
+                message=message,
+                title=diagnosis.title,
+                cause=diagnosis.cause,
+                remediation=diagnosis.remediation,
+            )
 
         return super()._build_error_detail(exception)
 

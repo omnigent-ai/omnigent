@@ -33,7 +33,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
-from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
+from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS, SIDE_CHAT_LABEL_KEY
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -252,6 +252,7 @@ class _ConversationStore:
                 "up_to_response_id": up_to_response_id,
                 "project_id": project_id,
                 "file_id_map": file_id_map,
+                "created_by": created_by,
             }
         )
         src = self._convs.get(source_conversation_id)
@@ -603,8 +604,8 @@ def _build_app(
 
 @pytest.mark.asyncio
 async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """POST /sessions/{id}/fork returns 201, clones the agent, and
-    binds the fork to the cloned agent.
+    """POST /sessions/{id}/fork returns 201 and binds the fork to the
+    source's own agent row (no copy within one user).
 
     Verifies that the route clones the source agent, calls
     fork_conversation with the cloned agent_id, applies runner
@@ -651,11 +652,8 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resp.status_code == 201, f"Expected 201 Created, got {resp.status_code}: {resp.text}"
     body = resp.json()
     assert body["id"] == "c538360473d41c84c1eee13918fbeca0"
-    # The agent_id should be the cloned agent, NOT the original.
-    assert body["agent_id"] != "087b7cb7ac30abf4debfaa578d052ec6", (
-        "Fork should be bound to a cloned agent, not the source's agent"
-    )
-    assert len(body["agent_id"]) == 32, "Cloned agent ID must use the ag_ prefix"
+    # The fork shares the source's agent row.
+    assert body["agent_id"] == "087b7cb7ac30abf4debfaa578d052ec6"
     assert body["status"] == "idle", "Freshly forked session should be idle"
     # 2 items copied from the source — proves the store's items were
     # included in the response, not an empty list.
@@ -674,13 +672,7 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert body["title"] == "My Fork"
     assert chokepoint_calls == 1
 
-    # The agent clone is created INSIDE fork_conversation (atomically), not
-    # via a separate agent_store.create — a pre-created row would leak as a
-    # phantom built-in on a fork failure. So the route must NOT pre-create,
-    # and must hand the clone's bundle/description to the store instead.
-    assert len(agent_store.create_calls) == 0, (
-        "Route must not pre-create the clone; it's created atomically in the fork txn"
-    )
+    assert len(agent_store.create_calls) == 0, "A fork must not create agent rows"
 
     # Exactly 1 store fork — more means the route called fork_conversation
     # multiple times; 0 means it never forked.
@@ -688,19 +680,23 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     fork_call = conv_store.fork_calls[0]
     assert fork_call["source"] == "e9f8f58523cec9a57d3bdf93be543e8c"
     assert fork_call["title"] == "My Fork"
-    # The store receives the clone's bundle/name/description so it can mint
-    # the session-scoped agent row in the same transaction.
-    assert fork_call["cloned_agent_bundle_location"] == "087b7cb7ac30abf4debfaa578d052ec6/fakehash"
-    assert fork_call["cloned_agent_description"] == "A test agent"
-    # The clone keeps the source's ROOT name — no "(fork …)" suffix. Being
-    # session-scoped it's exempt from the unique built-in-name index, so no
-    # disambiguator is needed and the name matches its origin directly.
-    assert fork_call["cloned_agent_name"] == "test-agent", (
-        f"Cloned agent should keep the source's root name, got {fork_call['cloned_agent_name']!r}"
-    )
-    assert fork_call["agent_id"] == body["agent_id"], (
-        "Fork must bind the same cloned agent id it asked the store to create"
-    )
+    # No copy: the store is asked to bind the existing agent.
+    assert fork_call["cloned_agent_bundle_location"] is None
+    assert fork_call["agent_id"] == "087b7cb7ac30abf4debfaa578d052ec6"
+
+
+@pytest.mark.asyncio
+async def test_normal_fork_of_side_chat_drops_sidebar_hiding_label() -> None:
+    """Promoting a side chat creates a normal session visible in the sidebar."""
+    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    conv = _make_conversation(labels={SIDE_CHAT_LABEL_KEY: "1"})
+    conv_store = _ConversationStore(conversations={source_id: conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(f"/v1/sessions/{source_id}/fork", json={})
+
+    assert resp.status_code == 201, resp.text
+    assert SIDE_CHAT_LABEL_KEY not in resp.json()["labels"]
 
 
 @pytest.mark.asyncio
@@ -1254,20 +1250,44 @@ async def test_fork_switch_binds_target_agent_bundle() -> None:
     )
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
-    # The clone is minted inside fork_conversation, so the route hands it the
-    # TARGET agent's bundle (not ag_test/hash) — not a separate create call.
     assert len(agent_store.create_calls) == 0
     fork_call = conv_store.fork_calls[0]
-    assert fork_call["cloned_agent_bundle_location"] == "44b4151dd6cdfed6ee19430832398e05/hash", (
-        "Switch must clone the target agent's bundle; cloning the source's "
-        "bundle would launch the wrong harness."
+    # The fork binds the TARGET agent row itself; binding the source's would
+    # launch the wrong harness.
+    assert fork_call["agent_id"] == "44b4151dd6cdfed6ee19430832398e05"
+    assert fork_call["cloned_agent_bundle_location"] is None
+
+
+@pytest.mark.asyncio
+async def test_fork_of_a_removed_agent_needs_another_agent() -> None:
+    """A plain fork has nothing to run once the agent is removed; forking into
+    another agent still works."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hello")
+            ]
+        },
     )
-    # Clone keeps the TARGET agent's root name ("codex"), proving the
-    # response reflects the bound (switched) agent — not the source.
-    assert fork_call["cloned_agent_name"] == "codex"
-    # The fork binds the cloned agent id it asked the store to create.
-    assert fork_call["agent_id"] is not None
-    assert fork_call["agent_id"] != "087b7cb7ac30abf4debfaa578d052ec6"
+    agent_store = _switch_agent_store()
+    del agent_store._agents["087b7cb7ac30abf4debfaa578d052ec6"]
+    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+
+    plain = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    assert plain.status_code == 410, plain.text
+    error = plain.json()["error"]
+    assert error["code"] == "session_agent_missing"
+    assert "Fork this session into another agent to continue" in error["message"]
+    assert conv_store.fork_calls == []
+
+    into_codex = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
+    )
+    assert into_codex.status_code == 201, into_codex.text
+    assert conv_store.fork_calls[0]["agent_id"] == "44b4151dd6cdfed6ee19430832398e05"
 
 
 @pytest.mark.asyncio
@@ -1406,7 +1426,7 @@ async def test_fork_codex_bypass_rejected_on_non_codex_target(
 
 @pytest.mark.asyncio
 async def test_fork_switch_binds_session_scoped_target() -> None:
-    """Switching to a session-scoped agent clones its bundle into the fork."""
+    """Without auth (one user), forking into a session-scoped agent shares its row."""
     conv = _make_conversation()
     conv_store = _ConversationStore(
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
@@ -1425,7 +1445,8 @@ async def test_fork_switch_binds_session_scoped_target() -> None:
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
-    assert fork_call["cloned_agent_bundle_location"] == "a98bb825ebd41391c19637c58fe3c0b7/hash"
+    assert fork_call["agent_id"] == "a98bb825ebd41391c19637c58fe3c0b7"
+    assert fork_call["cloned_agent_bundle_location"] is None
 
 
 @pytest.mark.asyncio
@@ -1828,20 +1849,26 @@ async def test_fork_managed_schedules_sandbox_launch(
 
 
 @pytest.mark.asyncio
-async def test_fork_managed_launch_uses_session_scoped_clone(
+async def test_fork_managed_launch_classifies_like_a_fresh_builtin_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The managed launch is handed the fork's OWN session-scoped agent clone.
+    """A fork into a built-in binds the built-in row itself, so its managed runner
+    is classified exactly like a fresh session started from that built-in.
 
-    Only a genuine built-in may classify a managed runner (the ``omnigent.ai/
-    agent`` label an admission policy selects on to inject a privileged
-    credential). A fork always binds a session-scoped clone, which fails that
-    gate — so a forked runner carries no classifier and attracts no injected
-    credential. Passing the built-in the clone derives from would re-stamp the
-    label and hand a clone of anyone's session the built-in's credential.
+    The ``omnigent.ai/agent`` label (which an admission policy uses to inject a
+    credential) goes only to a genuine built-in. Forks no longer copy the agent,
+    and a built-in row is read-only, so labeling the fork grants nothing a fresh
+    session from the same built-in would not.
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    builtin = Agent(
+        id=builtin_agent_id("code-reviewer"),
+        created_at=1,
+        name="code-reviewer",
+        bundle_location="builtin/hash",
+        version=1,
+    )
     agent_store = _AgentStore(
         agents={
             "087b7cb7ac30abf4debfaa578d052ec6": Agent(
@@ -1851,14 +1878,7 @@ async def test_fork_managed_launch_uses_session_scoped_clone(
                 bundle_location="087b7cb7ac30abf4debfaa578d052ec6/hash",
                 version=1,
             ),
-            # The built-in a "switch the fork's agent" pick would name.
-            builtin_agent_id("code-reviewer"): Agent(
-                id=builtin_agent_id("code-reviewer"),
-                created_at=1,
-                name="code-reviewer",
-                bundle_location="builtin/hash",
-                version=1,
-            ),
+            builtin.id: builtin,
         }
     )
     app = _build_app(conv_store, agent_store=agent_store)
@@ -1867,40 +1887,20 @@ async def test_fork_managed_launch_uses_session_scoped_clone(
 
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed", "agent_id": builtin_agent_id("code-reviewer")},
+        json={"host_type": "managed", "agent_id": builtin.id},
     )
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
-    fork_agent_id = resp.json()["agent_id"]
-    launch_agent_id = launches[0]["agent_id"]
-    assert launch_agent_id == fork_agent_id, (
-        "the launch must classify on the fork's own bound agent, not the source's"
-    )
-    assert launch_agent_id != builtin_agent_id("code-reviewer"), (
-        "a fork must never launch under the built-in id — that would restore the "
-        "runner's agent classifier and with it the injected credential"
-    )
-    # The gate the classifier applies to that id: a fork's clone is
-    # session-scoped, so it resolves to no label.
+    assert resp.json()["agent_id"] == builtin.id
+    assert launches[0]["agent_id"] == builtin.id
     assert (
         resolve_managed_agent_label(
-            _AgentStore(
-                agents={
-                    fork_agent_id: Agent(
-                        id=fork_agent_id,
-                        created_at=1,
-                        name="code-reviewer",
-                        bundle_location="builtin/hash",
-                        version=1,
-                        session_id=resp.json()["id"],
-                    ),
-                }
-            ),  # type: ignore[arg-type]
-            fork_agent_id,
+            _AgentStore(agents={builtin.id: builtin}),  # type: ignore[arg-type]
+            builtin.id,
             session_id=resp.json()["id"],
         )
-        is None
-    ), "a forked session's runner must carry no omnigent.ai/agent classifier"
+        == "code-reviewer"
+    )
 
 
 @pytest.mark.asyncio
@@ -2210,11 +2210,32 @@ async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
 
 
 @pytest.mark.asyncio
-async def test_fork_clone_reuses_source_agent_name_verbatim() -> None:
-    """The fork clone reuses the source agent's name as-is — no suffix added."""
-    conv = _make_conversation(agent_id="30f9aa4d441e344d3eb273f8cc13e4a5")
+@pytest.mark.parametrize(
+    ("caller", "source_owner", "user_agent", "expect_copy"),
+    [
+        ("owner@example.com", "owner@example.com", True, False),
+        ("forker@example.com", "owner@example.com", True, True),
+        ("forker@example.com", None, True, True),
+        ("forker@example.com", None, False, False),
+    ],
+    ids=[
+        "own-agent-shared",
+        "other-users-agent-copied",
+        "ownerless-agent-copied",
+        "server-agent-shared",
+    ],
+)
+async def test_fork_copies_only_another_users_agent(
+    caller: str, source_owner: str | None, user_agent: bool, expect_copy: bool
+) -> None:
+    """Forking your own session shares your agent row; forking another user's (or
+    an ownerless) agent gives you your own copy, stored under a new blob key and
+    owned by you, so the original's owner can never change code in your session.
+    Server agents (no session, no owner) are always shared."""
+    agent_id = "30f9aa4d441e344d3eb273f8cc13e4a5"
+    location = f"{agent_id}/e70dc208"
     conv_store = _ConversationStore(
-        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": _make_conversation(agent_id=agent_id)},
         items_by_conv={
             "e9f8f58523cec9a57d3bdf93be543e8c": [
                 _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
@@ -2223,23 +2244,128 @@ async def test_fork_clone_reuses_source_agent_name_verbatim() -> None:
     )
     agent_store = _AgentStore(
         agents={
-            "30f9aa4d441e344d3eb273f8cc13e4a5": Agent(
-                id="30f9aa4d441e344d3eb273f8cc13e4a5",
+            agent_id: Agent(
+                id=agent_id,
                 created_at=1,
-                name="claude-native-ui",
-                bundle_location="3a9725fd4de1720e83e53a632da41da8/hash",
+                name="orion",
+                bundle_location=location,
                 version=1,
+                description="coordinator",
+                session_id="e9f8f58523cec9a57d3bdf93be543e8c" if user_agent else None,
+                created_by=source_owner,
             ),
         }
     )
-    client = TestClient(_build_app(conv_store, agent_store=agent_store))
-
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
-
-    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
-    assert conv_store.fork_calls[0]["cloned_agent_name"] == "claude-native-ui", (
-        "Fork clone should reuse the source name verbatim, no '(fork …)' suffix"
+    artifacts = _ArtifactStore({location: b"bundle-bytes"})
+    client = TestClient(
+        _build_app(
+            conv_store,
+            agent_store=agent_store,
+            auth_provider=UnifiedAuthProvider(source="header"),
+            artifact_store=artifacts,
+        )
     )
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={},
+        headers={"X-Forwarded-Email": caller},
+    )
+
+    assert resp.status_code == 201, resp.text
+    call = conv_store.fork_calls[0]
+    if not expect_copy:
+        assert call["agent_id"] == agent_id
+        assert call["cloned_agent_bundle_location"] is None
+        return
+    copy_id = call["agent_id"]
+    assert copy_id != agent_id
+    assert call["cloned_agent_name"] == "orion", "the copy keeps the source's name verbatim"
+    assert call["cloned_agent_description"] == "coordinator"
+    assert call["cloned_agent_bundle_location"].startswith(f"{copy_id}/"), (
+        "the copy's bundle lives under its own id, so it lists as the forker's agent"
+    )
+    assert artifacts.blobs[call["cloned_agent_bundle_location"]] == b"bundle-bytes"
+    assert call["created_by"] == caller
+
+
+def _cross_user_fork(
+    artifact_store: _ArtifactStore | None,
+) -> tuple[TestClient, _ConversationStore]:
+    """A forker's client for a session whose agent belongs to another user."""
+    agent_id = "30f9aa4d441e344d3eb273f8cc13e4a5"
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": _make_conversation(agent_id=agent_id)},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
+    )
+    agent_store = _AgentStore(
+        agents={
+            agent_id: Agent(
+                id=agent_id,
+                created_at=1,
+                name="orion",
+                bundle_location=f"{agent_id}/e70dc208",
+                session_id="e9f8f58523cec9a57d3bdf93be543e8c",
+                created_by="owner@example.com",
+            ),
+        }
+    )
+    app = _build_app(
+        conv_store,
+        agent_store=agent_store,
+        auth_provider=UnifiedAuthProvider(source="header"),
+        artifact_store=artifact_store,
+    )
+    return TestClient(app, raise_server_exceptions=False), conv_store
+
+
+@pytest.mark.asyncio
+async def test_cross_user_fork_without_an_artifact_store_fails_before_forking() -> None:
+    client, conv_store = _cross_user_fork(artifact_store=None)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={},
+        headers={"X-Forwarded-Email": "forker@example.com"},
+    )
+
+    assert resp.status_code == 500, resp.text
+    assert resp.json()["error"]["code"] == "internal_error"
+    assert conv_store.fork_calls == []
+
+
+@pytest.mark.asyncio
+async def test_failed_cross_user_fork_removes_its_copied_bundle() -> None:
+    """The copy's blob is written just before the fork; a failed fork deletes it."""
+    original = "30f9aa4d441e344d3eb273f8cc13e4a5/e70dc208"
+    artifacts = _ArtifactStore({original: b"bundle-bytes"})
+    written: list[str] = []
+    real_put = artifacts.put
+
+    def recording_put(key: str, content: bytes) -> None:
+        written.append(key)
+        real_put(key, content)
+
+    artifacts.put = recording_put  # type: ignore[method-assign]
+    client, conv_store = _cross_user_fork(artifact_store=artifacts)
+
+    def failing_fork(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("database unavailable")
+
+    conv_store.fork_conversation = failing_fork  # type: ignore[method-assign]
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={},
+        headers={"X-Forwarded-Email": "forker@example.com"},
+    )
+
+    assert resp.status_code == 500, resp.text
+    assert len(written) == 1 and not written[0].startswith("30f9aa4d"), written
+    assert set(artifacts.blobs) == {original}, "the unused copy must be deleted"
 
 
 def _attachment_fork_client(

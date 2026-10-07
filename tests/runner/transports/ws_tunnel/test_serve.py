@@ -16,6 +16,7 @@ import pytest
 from typing_extensions import Unpack
 from websockets.exceptions import (
     ConnectionClosedError,
+    ConnectionClosedOK,
     InvalidStatus,
     InvalidURI,
     WebSocketException,
@@ -28,6 +29,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
+from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     RequestCancelFrame,
@@ -68,6 +70,55 @@ class _Closed(WebSocketException):
         self.rcvd = _Close(code)
 
 
+class _CleanCloseWS:
+    """WebSocket fake whose connection is already cleanly closed.
+
+    Supports both styles ``_serve_tunnel_once`` may read frames with: the
+    explicit ``recv()`` loop, and the ``async for`` sugar (which internally
+    calls ``recv()`` and turns a clean close into ``StopAsyncIteration``) —
+    so the same fake works whichever one a test is pinned to.
+
+    :param code: Received close code, e.g. ``1001``. ``None`` mimics a
+        close carrying no code info.
+    """
+
+    def __init__(self, code: int | None = None) -> None:
+        self._close_code = code
+
+    async def send(self, data: str) -> None:
+        """Discard the outgoing hello frame.
+
+        :param data: Encoded tunnel frame JSON.
+        :returns: None.
+        """
+        del data
+
+    async def recv(self) -> str:
+        """Raise the configured clean close.
+
+        :raises ConnectionClosedOK: Always.
+        """
+        rcvd = _Close(self._close_code) if self._close_code is not None else None
+        raise ConnectionClosedOK(rcvd, rcvd, None if rcvd is None else True)
+
+    def __aiter__(self) -> _CleanCloseWS:
+        """Return the async iterator.
+
+        :returns: This fake WebSocket.
+        """
+        return self
+
+    async def __anext__(self) -> str:
+        """Mirror ``websockets``: a clean close ends iteration quietly.
+
+        :raises StopAsyncIteration: Always.
+        """
+        try:
+            return await self.recv()
+        except ConnectionClosedOK:
+            raise StopAsyncIteration from None
+
+
 async def _noop_app(
     scope: dict[str, Any],
     receive: Any,
@@ -97,6 +148,29 @@ def test_websocket_close_code_returns_none_without_code() -> None:
     :returns: None.
     """
     assert _websocket_close_code(WebSocketException("boom")) is None
+
+
+def test_websocket_close_code_prefers_rcvd_over_legacy_code_shim() -> None:
+    """The code the peer actually sent wins over the deprecated ``.code`` shim.
+
+    :returns: None.
+    """
+
+    class _MisleadingClosed(WebSocketException):
+        """Exception whose deprecated ``.code`` disagrees with ``rcvd``."""
+
+        def __init__(self, rcvd_code: int, legacy_code: int) -> None:
+            super().__init__("closed")
+            self.rcvd = _Close(rcvd_code)
+            self._legacy_code = legacy_code
+
+        @property
+        def code(self) -> int:
+            """Return a deliberately-wrong code to prove it's not used."""
+            return self._legacy_code
+
+    exc = _MisleadingClosed(rcvd_code=1001, legacy_code=4003)
+    assert _websocket_close_code(exc) == 1001
 
 
 def test_websocket_http_status_reads_invalid_status_response() -> None:
@@ -630,9 +704,11 @@ async def test_serve_tunnel_replaces_rejected_host_bootstrap_token(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("keepalive", [(17.0, 41.0), (None, None)], ids=["enabled", "disabled"])
 async def test_serve_tunnel_once_sends_bearer_header(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    keepalive: tuple[float | None, float | None],
 ) -> None:
     """Authenticated remote tunnels pass the bearer on the WS handshake.
 
@@ -659,9 +735,11 @@ async def test_serve_tunnel_once_sends_bearer_header(
 
     captured: dict[str, str | _ConnectKwargs] = {}
 
-    class _FakeWS:
-        """WebSocket stub that accepts hello then closes iteration."""
+    class _FakeWS(_CleanCloseWS):
+        """WebSocket stub that accepts hello then closes the connection."""
 
+        # Deliberately differ from the requested defaults: read the connection.
+        ping_interval, ping_timeout = keepalive
         # What a real connection retains after the peer's clean 1001 close.
         close_code = 1001
         close_reason = "server shutdown"
@@ -677,22 +755,6 @@ async def test_serve_tunnel_once_sends_bearer_header(
             :returns: None.
             """
             captured["sent"] = data
-
-        def __aiter__(self) -> _FakeWS:
-            """
-            Return the async iterator.
-
-            :returns: This fake WebSocket iterator.
-            """
-            return self
-
-        async def __anext__(self) -> str:
-            """
-            End the fake WebSocket stream immediately.
-
-            :raises StopAsyncIteration: Always.
-            """
-            raise StopAsyncIteration
 
     class _ConnectContext:
         """Async context manager returned by fake ``websockets.connect``."""
@@ -774,6 +836,10 @@ async def test_serve_tunnel_once_sends_bearer_header(
     assert attributes["attempt"] == 1
     assert attributes["pid"] == os.getpid()
     assert attributes["downtime_s"] is None
+    assert attributes["protocol_keepalive_source"] == "websockets_connection"
+    assert attributes["protocol_ping_interval_s"] == keepalive[0]
+    assert attributes["protocol_ping_timeout_s"] == keepalive[1]
+    assert attributes["last_sent_frame_age_s"] >= 0
     sent = captured["sent"]
     assert isinstance(sent, str)
     assert json.loads(sent)["connection_id"] == attributes["connection_id"]
@@ -847,15 +913,9 @@ async def test_serve_tunnel_once_sends_org_header(
 
     captured: dict[str, object] = {}
 
-    class _FakeWS:
+    class _FakeWS(_CleanCloseWS):
         async def send(self, data: str) -> None:
             del data
-
-        def __aiter__(self) -> _FakeWS:
-            return self
-
-        async def __anext__(self) -> str:
-            raise StopAsyncIteration
 
     class _Ctx:
         async def __aenter__(self) -> _FakeWS:
@@ -885,6 +945,262 @@ async def test_serve_tunnel_once_sends_org_header(
     headers = captured["headers"]
     assert isinstance(headers, dict)
     assert headers["X-Databricks-Org-Id"] == "2850744067564480"
+
+
+class _CleanCloseCtx:
+    """Async-CM returned by a fake ``websockets.connect`` whose ``ws``
+    is already cleanly closed with the given received code."""
+
+    def __init__(self, code: int | None) -> None:
+        self._code = code
+
+    async def __aenter__(self) -> _CleanCloseWS:
+        return _CleanCloseWS(self._code)
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        return False
+
+
+async def test_runner_retry_row_retains_application_heartbeat_observations(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    import websockets
+
+    class HeartbeatWS(_CleanCloseWS):
+        ping_interval = 30.0
+        ping_timeout = 90.0
+        close_code = 1000
+        close_reason = ""
+
+        def __init__(self) -> None:
+            super().__init__(1000)
+            self.received_ping = False
+
+        async def recv(self) -> str:
+            if not self.received_ping:
+                self.received_ping = True
+                return encode_frame(PingFrame(ts=123))
+            return await super().recv()
+
+    attempts = 0
+
+    @contextlib.asynccontextmanager
+    async def connect(_url, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            raise asyncio.CancelledError
+        yield HeartbeatWS()
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    monkeypatch.setattr(serve_module, "_INITIAL_RECONNECT_DELAY_S", 0.001)
+    caplog.set_level(logging.INFO, logger=serve_module.__name__)
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner-diag",
+            runner_version="0.1.0",
+        )
+    connected = next(
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_connected"
+    )
+    closed = next(
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel_disconnected"
+    )
+    assert closed["connection_id"] == connected["connection_id"]
+    assert closed["tunnel_side"] == "runner"
+    assert closed["protocol_ping_timeout_s"] == 90.0
+    assert closed["last_app_ping_received_age_s"] >= 0
+    assert closed["last_app_pong_sent_age_s"] >= 0
+    assert closed["last_app_pong_received_age_s"] is None
+    assert closed["sends_in_flight"] == 0
+    assert closed["send_errors"] == 0
+
+
+async def test_runner_close_freezes_pending_response_send(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancelling dispatch tasks during disconnect cannot hide an outstanding send."""
+    import websockets
+
+    from omnigent.runner.transports.ws_tunnel import diagnostics as diagnostics_module
+
+    monkeypatch.setattr(diagnostics_module, "_SAMPLE_INTERVAL_S", 0.005)
+    monkeypatch.setattr(diagnostics_module, "_SLOW_OPERATION_S", 0.01)
+    send_entered = asyncio.Event()
+    error = ConnectionClosedError(Close(1011, "keepalive ping timeout"), None, None)
+
+    class BlockedWS(_CleanCloseWS):
+        async def send(self, data: str) -> None:
+            if json.loads(data)["kind"] == "response.head":
+                send_entered.set()
+                await asyncio.Future()
+
+        async def recv(self) -> str:
+            if not send_entered.is_set():
+                if not hasattr(self, "requested"):
+                    self.requested = True
+                    return encode_frame(
+                        RequestFrame(id="req-1", method="GET", path="/", headers={})
+                    )
+                await send_entered.wait()
+            while not any(
+                getattr(record, "event_name", None) == "runner_tunnel_health"
+                for record in caplog.records
+            ):
+                await asyncio.sleep(0.001)
+            raise error
+
+    @contextlib.asynccontextmanager
+    async def connect(_url, **_kwargs):
+        yield BlockedWS()
+
+    async def app(_scope, _receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    diagnostics = TunnelDiagnostics()
+    tasks_before = asyncio.all_tasks()
+    with pytest.raises(ConnectionClosedError) as raised:
+        await asyncio.wait_for(
+            _serve_tunnel_once(
+                app,
+                tunnel_url="ws://127.0.0.1:8000/v1/runners/runner-diag/tunnel",
+                server_url="http://127.0.0.1:8000",
+                runner_id="runner-diag",
+                runner_version="0.1.0",
+                connection_id="conn-blocked-response",
+                diagnostics=diagnostics,
+            ),
+            timeout=2,
+        )
+    assert raised.value is error
+    snapshot = diagnostics.snapshot()
+    assert snapshot["sends_in_flight"] == 1
+    assert snapshot["oldest_tracked_send_age_s"] >= 0
+    assert snapshot["last_received_frame_age_s"] >= 0
+    health = next(
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_tunnel_health"
+    )
+    assert health["connection_id"] == "conn-blocked-response"
+    assert health["tunnel_side"] == "runner"
+    assert asyncio.all_tasks() == tasks_before
+
+
+@pytest.mark.parametrize("graceful_shutdown", [False, True])
+async def test_runner_cancelled_pong_send_keeps_heartbeat_and_send_timings(
+    monkeypatch: pytest.MonkeyPatch, graceful_shutdown: bool
+) -> None:
+    import websockets
+
+    pong_started = asyncio.Event()
+
+    class BlockedPongWS(_CleanCloseWS):
+        async def send(self, data: str) -> None:
+            if json.loads(data)["kind"] == "pong":
+                pong_started.set()
+                await asyncio.Future()
+
+        async def recv(self) -> str:
+            return encode_frame(PingFrame(ts=123))
+
+    @contextlib.asynccontextmanager
+    async def connect(_url, **_kwargs):
+        yield BlockedPongWS()
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    now = 100.0
+    diagnostics = TunnelDiagnostics(clock=lambda: now)
+    tasks_before = asyncio.all_tasks()
+    task = asyncio.create_task(
+        _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="ws://127.0.0.1:8000/v1/runners/runner-diag/tunnel",
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner-diag",
+            runner_version="0.1.0",
+            diagnostics=diagnostics,
+            shutdown_event=asyncio.Event() if graceful_shutdown else None,
+        )
+    )
+    try:
+        await asyncio.wait_for(pong_started.wait(), timeout=2)
+        now += 6
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    snapshot = diagnostics.snapshot()
+    assert snapshot["last_app_ping_received_age_s"] == 6.0
+    assert snapshot["last_app_pong_sent_age_s"] is None
+    assert snapshot["send_cancellations"] == 1
+    assert snapshot["last_send_outcome"] == "cancelled"
+    assert snapshot["send_duration_max_s"] == 6.0
+    assert asyncio.all_tasks() == tasks_before
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_reraises_received_recycle_close_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean, server-sent 1001 must reach ``serve_tunnel``, not vanish.
+
+    ``ws.recv()`` swallows an OK close code (``ConnectionClosedOK``) by
+    design; a server-initiated recycle needs that code to escape so the
+    reconnect loop can classify it and use the spread-jitter reconnect
+    instead of treating it as an ordinary quiet clean close.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    monkeypatch.setattr(websockets, "connect", lambda *_a, **_kw: _CleanCloseCtx(1001))
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+
+    with pytest.raises(ConnectionClosedOK):
+        await _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="ws://127.0.0.1:8000/v1/runners/runner_recycle/tunnel",
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_recycle",
+            runner_version="0.1.0",
+        )
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_swallows_non_recycle_clean_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain 1000 close still ends the read loop quietly, as before.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    monkeypatch.setattr(websockets, "connect", lambda *_a, **_kw: _CleanCloseCtx(1000))
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+
+    # No exception -> the function returned normally, same as today's
+    # ``async for`` swallow of an ordinary clean close.
+    await _serve_tunnel_once(
+        _noop_app,
+        tunnel_url="ws://127.0.0.1:8000/v1/runners/runner_clean/tunnel",
+        server_url="http://127.0.0.1:8000",
+        runner_id="runner_clean",
+        runner_version="0.1.0",
+    )
 
 
 @pytest.mark.asyncio
@@ -1946,17 +2262,11 @@ async def test_serve_tunnel_reconnect_uses_fresh_token_not_stale(
     )
 
 
-class _StubWS:
+class _StubWS(_CleanCloseWS):
     """Minimal websocket: accepts the hello frame, then closes immediately."""
 
     async def send(self, _text: str) -> None:
         return None
-
-    def __aiter__(self) -> _StubWS:
-        return self
-
-    async def __anext__(self) -> str:
-        raise StopAsyncIteration
 
 
 class _StubConnect:

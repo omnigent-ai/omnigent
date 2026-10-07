@@ -32,11 +32,25 @@ function storage(initial = {}) {
   };
 }
 
-function harness({ url = `${ORIGIN}/signin`, visible = true, saved = storage() } = {}) {
+function permissionSession() {
+  return {
+    setPermissionRequestHandler(handler) {
+      this.requestHandler = handler;
+    },
+    setPermissionCheckHandler(handler) {
+      this.checkHandler = handler;
+    },
+  };
+}
+
+function harness({
+  url = `${ORIGIN}/signin`,
+  visible = true,
+  saved = storage(),
+  session = permissionSession(),
+} = {}) {
   let currentUrl = url;
   let isVisible = visible;
-  let requestHandler;
-  let checkHandler;
   let destroyed = false;
   const dialogs = [];
   const responses = [];
@@ -47,10 +61,6 @@ function harness({ url = `${ORIGIN}/signin`, visible = true, saved = storage() }
   wc.reload = () => {
     wc.reloads++;
     wc.emit("did-start-navigation", {}, currentUrl, false, true);
-  };
-  const session = {
-    setPermissionRequestHandler: (handler) => (requestHandler = handler),
-    setPermissionCheckHandler: (handler) => (checkHandler = handler),
   };
   const policy = registerBrowserPermissions(session, {
     canPrompt: () => isVisible,
@@ -72,10 +82,10 @@ function harness({ url = `${ORIGIN}/signin`, visible = true, saved = storage() }
     respond: (choice) => responses.shift().resolve(choice),
     fail: () => responses.shift().reject(new Error("Window closed")),
     check: (permission = "loopback-network", origin = ORIGIN, details = {}, sender = wc) =>
-      checkHandler(sender, permission, origin, { isMainFrame: true, ...details }),
+      session.checkHandler(sender, permission, origin, { isMainFrame: true, ...details }),
     request: (permission = "loopback-network", details = {}, sender = wc) =>
       new Promise((resolve) => {
-        requestHandler(sender, permission, resolve, {
+        session.requestHandler(sender, permission, resolve, {
           requestingUrl: currentUrl,
           isMainFrame: true,
           ...details,
@@ -98,6 +108,111 @@ function harness({ url = `${ORIGIN}/signin`, visible = true, saved = storage() }
 }
 
 describe("browser local network permissions", () => {
+  it("rejects reattaching a policy without disrupting the original tab", async () => {
+    const session = permissionSession();
+    const saved = storage();
+    const a = harness({ session, saved });
+    const b = harness({ session, saved, visible: false });
+    assert.throws(() => a.policy.attach(b.wc), /already attached/);
+    b.destroy();
+    const result = a.request();
+    await tick();
+    assert.equal(a.dialogs.length, 1);
+    a.respond("allow-once");
+    assert.equal(await result, true);
+    assert.equal(a.check(), true);
+  });
+
+  it("routes shared-partition permissions to each tab and preserves surviving tabs on close", async () => {
+    const session = permissionSession();
+    const saved = storage();
+    const a = harness({ session, saved });
+    const b = harness({ session, saved, visible: false });
+    const result = a.request();
+    await tick();
+    assert.equal(a.dialogs.length, 1);
+    assert.equal(b.dialogs.length, 0);
+    a.respond("allow-once");
+    assert.equal(await result, true);
+    assert.equal(a.check(), true);
+    assert.equal(b.check(), false, "one-visit consent belongs to the requesting tab");
+
+    a.setVisible(false);
+    b.setVisible(true);
+    const second = b.request();
+    await tick();
+    assert.equal(b.dialogs.length, 1);
+    b.respond("allow-once");
+    assert.equal(await second, true);
+    b.destroy();
+    assert.equal(b.check(), false);
+    assert.equal(await b.request(), false);
+    assert.equal(b.dialogs.length, 1, "closing a tab must not queue another prompt");
+    assert.equal(a.check(), true);
+    assert.equal(await a.request(), true);
+  });
+
+  it("routes context-free checks to the foreground tab in a shared partition", async () => {
+    const session = permissionSession();
+    const saved = storage();
+    const a = harness({ session, saved });
+    const b = harness({ session, saved, visible: false });
+    const details = { embeddingOrigin: ORIGIN, isMainFrame: false };
+    assert.equal(a.check("loopback-network", ORIGIN, details, null), false);
+    await tick();
+    assert.equal(a.dialogs.length, 1);
+    assert.equal(b.dialogs.length, 0);
+    a.respond("allow-once");
+    await tick();
+    assert.equal(a.check("loopback-network", ORIGIN, details, null), true);
+    a.setVisible(false);
+    b.setVisible(true);
+    assert.equal(b.check("loopback-network", ORIGIN, details, null), false);
+    await tick();
+    assert.equal(b.dialogs.length, 1);
+    b.respond("deny");
+    await tick();
+    assert.equal(a.check(), false, "a saved denial revokes the sibling tab's one-visit grant");
+  });
+
+  for (const choice of ["allow-once", "always-allow"]) {
+    it(`uses only saved grants for context-free checks when all tabs are hidden: ${choice}`, async () => {
+      const session = permissionSession();
+      const saved = storage();
+      const a = harness({ session, saved });
+      const b = harness({ session, saved, visible: false });
+      const result = a.request();
+      await tick();
+      a.respond(choice);
+      assert.equal(await result, true);
+      a.setVisible(false);
+      const details = { embeddingOrigin: ORIGIN };
+      assert.equal(a.check("loopback-network", ORIGIN, details, null), choice === "always-allow");
+      assert.equal(a.check("media", ORIGIN, details, null), false);
+      assert.equal(a.check("loopback-network", ORIGIN, {}, null), false);
+      assert.equal(a.check("loopback-network", "https://other.example", details, null), false);
+      await tick();
+      assert.equal(a.dialogs.length, 1);
+      assert.equal(b.dialogs.length, 0);
+      b.navigate("https://other.example");
+      b.setVisible(true);
+      assert.equal(a.check("loopback-network", ORIGIN, details, null), choice === "always-allow");
+      saved.store.set(ORIGIN, false);
+      assert.equal(a.check("loopback-network", ORIGIN, details, null), false);
+    });
+  }
+
+  it("tolerates a discarded request after its tab is destroyed", () => {
+    const session = permissionSession();
+    const h = harness({ session });
+    h.destroy();
+    assert.doesNotThrow(() => {
+      session.requestHandler(h.wc, "loopback-network", () => {
+        throw new Error("Request discarded");
+      });
+    });
+  });
+
   for (const permission of NETWORK_PERMISSIONS) {
     it(`requires native approval for ${permission}`, async () => {
       const h = harness();

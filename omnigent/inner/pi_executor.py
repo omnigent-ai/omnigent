@@ -750,11 +750,7 @@ def _build_models_json(
     mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
     is_databricks_openai_gateway = bool(
-        raw_openai_base_url
-        and (
-            "/ai-gateway/" in raw_openai_base_url
-            or _is_databricks_ai_gateway_url(raw_openai_base_url)
-        )
+        raw_openai_base_url and _is_databricks_gateway_base_url(raw_openai_base_url)
     )
     # Databricks Codex URLs only accept Responses; Chat uses the workspace.
     if raw_openai_base_url and is_databricks_openai_gateway:
@@ -801,7 +797,7 @@ def _build_models_json(
         provider_models[provider_name].append(entry)
     config: _PiModelsConfig = {
         "providers": {
-            # Models advertising Responses support use the AI Gateway's Codex
+            # Models advertising Responses support use the Unity Gateway's Codex
             # surface, including tool-result chaining on subsequent turns.
             "databricks-openai": {
                 "baseUrl": codex_gateway_url,
@@ -877,6 +873,7 @@ def _build_models_json(
                 model,
                 wire_catalog.get(model.lower()),
                 generic_openai_wire_api=generic_openai_wire_api,
+                only_family=_only_configured_family(base_urls),
             )
         ]
         if not any(entry.get("id") == model for entry in provider["models"]):
@@ -924,15 +921,80 @@ def _pi_needs_responses_api(
     return "gpt" in lower
 
 
+def _is_databricks_gateway_base_url(base_url: str) -> bool:
+    """Return whether a family base URL fronts a Databricks Unity Gateway.
+
+    The one generic-provider vs. Databricks-gateway distinction this module
+    makes: a workspace-hosted ``/ai-gateway/`` path or a canonical gateway
+    host (:func:`_is_databricks_ai_gateway_url`). Shared by the openai-family
+    wire selection and by :func:`_only_configured_family` so that model
+    registration and the launch selector reach the same answer.
+
+    :param base_url: A provider family's configured base URL.
+    :returns: ``True`` for a Databricks gateway URL, ``False`` for a generic
+        (OpenAI-compatible / Anthropic-compatible) vendor URL.
+    """
+    return "/ai-gateway/" in base_url or _is_databricks_ai_gateway_url(base_url)
+
+
+def _only_configured_family(base_urls: Mapping[str, str] | None) -> str | None:
+    """Return the lone family key when a generic provider configures exactly one.
+
+    An empty URL counts as unconfigured — the reading
+    :func:`_build_models_json` itself gives the dict — so a lone family with
+    an empty URL is not "configured" and never pins routing.
+
+    A lone *Databricks gateway* URL never pins either: one serialized family
+    does not mean one served surface there. The cli-config path emits only
+    the gateway's Anthropic surface (``{"claude": ".../ai-gateway/anthropic"}``)
+    while the same workspace serves GPT / Gemini / OSS models on the sibling
+    ``/ai-gateway/codex/v1``, ``/ai-gateway/mlflow/v1`` and
+    ``/serving-endpoints`` surfaces :func:`_build_models_json` derives, so an
+    explicit GPT override must keep its Responses routing.
+
+    :param base_urls: Provider base URLs keyed by family (``"claude"`` /
+        ``"openai"``), from ucode state or a provider entry.
+    :returns: The single configured family of a generic provider, or
+        ``None`` when both families (or neither) carry a URL or the lone URL
+        is a Databricks gateway.
+    """
+    configured = {family: url for family, url in (base_urls or {}).items() if url}
+    if len(configured) != 1:
+        return None
+    ((family, url),) = configured.items()
+    if _is_databricks_gateway_base_url(url):
+        return None
+    return family
+
+
 def _pi_provider_for_model(
     model: str,
     wire_apis: frozenset[ModelWireAPI] | None = None,
     *,
     generic_openai_wire_api: str | None = None,
+    only_family: str | None = None,
 ) -> str:
-    """Return the Pi provider name to use for a given Databricks model."""
+    """Return the Pi provider name to use for a given Databricks model.
+
+    :param model: Model id to route.
+    :param wire_apis: Catalog-reported wire surfaces, when known.
+    :param generic_openai_wire_api: Configured wire for a generic
+        (non-Databricks) OpenAI-compatible provider.
+    :param only_family: The lone family a *generic* provider entry
+        configures, from :func:`_only_configured_family` (``None`` for a
+        Databricks gateway, whose sibling surfaces are real). A one-family
+        generic provider has no other real endpoint, so every
+        dynamically-registered model routes to that family's surface
+        regardless of name tokens; name heuristics would otherwise pick a
+        provider whose base URL was fabricated for the Databricks workspace
+        host and 404 at the vendor.
+    """
     lower = model.lower()
-    if "claude" in lower:
+    if "claude" in lower and only_family != "openai":
+        return "databricks-anthropic"
+    # A claude-only provider fronts non-Claude-named ids (e.g. moonshot
+    # serving kimi) on its anthropic wire, so they route there too.
+    if only_family == "claude":
         return "databricks-anthropic"
     if generic_openai_wire_api is not None:
         if generic_openai_wire_api == RESPONSES_WIRE_API:
@@ -1767,7 +1829,7 @@ class PiExecutor(Executor):
         :param pi_path: Absolute path to a ``pi`` CLI binary.  When ``None``
             the executor searches ``PATH``.
         :param gateway: When ``True``, write a ``models.json`` pointing Pi
-            at a vendor-neutral gateway. The Databricks AI gateway is one
+            at a vendor-neutral gateway. The Databricks Unity Gateway is one
             producer of this transport; generic providers are another.
         :param databricks_profile: Databricks-specific config profile from
             ``~/.databrickscfg``, e.g. ``"<your-profile>"``.  Only used on the
@@ -2057,7 +2119,7 @@ class PiExecutor(Executor):
                 raise TypeError("Databricks model resolution returned a non-string model id")
             return model_id
         # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
-        # by the direct Anthropic API but not by the Databricks AI Gateway.
+        # by the direct Anthropic API but not by the Databricks Unity Gateway.
         if model and self._gateway and not self._preserve_model_ids:
             model = re.sub(r"\[.*?\]$", "", model)
         return model
@@ -2065,12 +2127,8 @@ class PiExecutor(Executor):
     def _generic_openai_wire_api(self) -> str | None:
         """Return the configured wire only for a non-Databricks gateway."""
         openai_base_url = (self._base_urls_override or {}).get("openai")
-        if openai_base_url:
-            is_databricks_gateway = (
-                "/ai-gateway/" in openai_base_url or _is_databricks_ai_gateway_url(openai_base_url)
-            )
-            if not is_databricks_gateway:
-                return self._openai_wire_api or CHAT_WIRE_API
+        if openai_base_url and not _is_databricks_gateway_base_url(openai_base_url):
+            return self._openai_wire_api or CHAT_WIRE_API
         return None
 
     def _gateway_model_service_workspace_url(self) -> str | None:
@@ -2407,6 +2465,7 @@ class PiExecutor(Executor):
                 effective_model,
                 wire_catalog.get(effective_model.lower()),
                 generic_openai_wire_api=self._generic_openai_wire_api(),
+                only_family=_only_configured_family(self._base_urls_override),
             )
             pi_model = f"{provider}/{effective_model}"
         else:

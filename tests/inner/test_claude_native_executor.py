@@ -1618,7 +1618,8 @@ async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
 
     The person answers the dialog in the embedded terminal and resends, so
     killing the pane would destroy the very thing they need. Only readiness
-    timeouts reap; the dialog error takes the plain delivery-failure path.
+    timeouts reap. The gate raised before anything was typed, so the error
+    is classified undelivered and the sender's queued copy is settled.
     """
     bridge_dir = tmp_path / "bridge"
     killed: list[Path] = []
@@ -1651,6 +1652,75 @@ async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "waiting for an answer" in events[0].message
+    assert events[0].undelivered is True
+
+
+@pytest.mark.asyncio
+async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A ``/model`` switch refused at an occupied input box fails the turn as undelivered.
+
+    ``inject_slash_command`` raises :class:`ClaudeTerminalDialog` instead of
+    typing into a surface Escape cannot clear (wrapper output before the
+    input box mounts, a hintless confirmation). The routed switch runs before
+    the message, so nothing has reached Claude Code: the message must not be
+    injected behind it, the pane stays alive for the person to clear the
+    surface, and the error is classified undelivered so the sender's queued
+    copy is settled rather than lost on reload.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    bridge_dir = tmp_path / "bridge"
+    messages: list[str] = []
+    killed: list[Path] = []
+
+    def refuse_slash_command(bridge_dir_arg: Path, *, command: str, **kwargs: object) -> None:
+        """Refuse the switch the way the bridge does at a surface Escape cannot clear."""
+        del bridge_dir_arg, kwargs
+        raise ClaudeTerminalDialog(
+            f"Claude Code's input box is occupied by an overlay, so the command was "
+            f"not sent ({command})."
+        )
+
+    def record_message(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        """Record a message inject that must never happen."""
+        del bridge_dir_arg, timeout_s
+        messages.append(content)
+
+    monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_env",
+        lambda _bridge: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", refuse_slash_command)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", record_message)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "review this function"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="databricks-claude-sonnet-5"),
+        )
+    ]
+
+    assert messages == [], f"No message may follow a refused switch; got {messages}."
+    assert killed == []
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert "occupied by an overlay" in error.message
+    assert error.undelivered is True
 
 
 @pytest.mark.asyncio

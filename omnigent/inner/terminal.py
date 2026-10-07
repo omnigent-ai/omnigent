@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -54,6 +56,12 @@ from .sandbox import (
     with_denied_unix_sockets,
 )
 from .terminal_clipboard import TerminalClipboardBridge
+from .terminal_lifecycle import (
+    TERMINAL_INSTANCE_ID_ENV,
+    TERMINAL_LAUNCH_ID_ENV,
+    TERMINAL_LAUNCH_SESSION_ID_ENV,
+    TerminalLifecycleTrace,
+)
 
 # Heterogeneous JSON-shaped result returned by :meth:`TerminalInstance.send`
 # and :meth:`TerminalInstance.read`. In practice the dicts carry a mix of
@@ -1073,11 +1081,13 @@ class TerminalInstance:
         repr=False,
     )
     diagnostic_id: str = field(default_factory=lambda: uuid.uuid4().hex, init=False, repr=False)
-    # Exit status of the pane's inner process, captured from tmux
-    # ``#{pane_dead_status}`` the first time a dead pane is observed (only
-    # meaningful with ``keep_alive_after_exit`` / ``remain-on-exit``). ``None``
-    # until the process exits or when tmux reports no numeric status.
+    lifecycle_trace: TerminalLifecycleTrace = field(
+        default_factory=TerminalLifecycleTrace, init=False, repr=False
+    )
+    # Launched-command status (possibly a wrapper), captured from tmux
+    # ``#{pane_dead_status}``; see ``last_exit_status`` for ``None`` semantics.
     _last_exit_status: int | None = field(default=None, repr=False)
+    _last_exit_signal: str | None = field(default=None, repr=False)
     # Diagnostics for the "tmux unavailable" exit path: the stderr of the last
     # failed capture-pane probe, and of the has-session probe that then
     # confirmed the session gone. The has-session stderr is what separates a
@@ -1223,7 +1233,9 @@ class TerminalInstance:
         """Correlate probe failures with lifecycle events without recording pane contents."""
         extra = debug_event(
             event_name,
+            session_id=self.lifecycle_trace.session_id,
             terminal_instance_id=self.diagnostic_id,
+            terminal_launch_id=self.lifecycle_trace.launch_id,
             terminal_name=self.name,
             terminal_key=self.session_key,
             consecutive_probe_failures=consecutive_failures,
@@ -1361,14 +1373,19 @@ class TerminalInstance:
         return "; ".join(parts)
 
     def last_exit_status(self) -> int | None:
-        """Return the inner process's exit code, if the pane has died.
+        """Return the launched command's exit code, if the pane has died.
 
         Captured from tmux ``#{pane_dead_status}`` when a dead pane is first
         observed (see :meth:`_pane_is_dead` / :meth:`_pane_is_dead_async`).
         Only meaningful for terminals launched with ``keep_alive_after_exit``
         (``remain-on-exit``); ``None`` otherwise or before exit.
+        A configured wrapper's status does not necessarily describe its child.
         """
         return self._last_exit_status
+
+    def last_exit_signal(self) -> str | None:
+        """Return tmux's observed signal, without attributing who sent it."""
+        return self._last_exit_signal
 
     def _remember_exit_status(self, fields: str) -> None:
         """Record the exit code from a ``#{pane_dead} #{pane_dead_status}`` row.
@@ -1391,9 +1408,19 @@ class TerminalInstance:
         parts = fields.strip().split("|")
         if len(parts) != 3:
             return False
-        dead, status, signal = parts
+        dead, status, raw_signal = parts
         self._remember_exit_status(f"{dead} {status}")
-        return dead == "1" and not status and not signal
+        if dead == "1" and raw_signal:
+            self._last_exit_signal = raw_signal[:64]
+            with contextlib.suppress(ValueError, KeyError):
+                self._last_exit_signal = (
+                    signal.Signals(int(raw_signal)).name
+                    if raw_signal.isdigit()
+                    else signal.Signals[
+                        raw_signal if raw_signal.startswith("SIG") else "SIG" + raw_signal
+                    ].name
+                )
+        return dead == "1" and not status and not raw_signal
 
     async def _refresh_exit_status(self) -> None:
         """Allow a short grace period for tmux to reap a confirmed-dead pane."""
@@ -1488,6 +1515,7 @@ class TerminalInstance:
             return
         self._last_exit_snapshot = None
         self._last_exit_status = None
+        self._last_exit_signal = None
         effective_cwd = str(cwd or self.private_dir)
 
         # Do NOT advertise the tmux control socket path to the
@@ -1506,6 +1534,17 @@ class TerminalInstance:
         # Apply exclusions last so overrides cannot leak credentials to MCP servers.
         for key in self.env_unset:
             env.pop(key, None)
+        # Never reuse a parent's launch identity if diagnostic initialization fails.
+        for key in (
+            TERMINAL_INSTANCE_ID_ENV,
+            TERMINAL_LAUNCH_ID_ENV,
+            TERMINAL_LAUNCH_SESSION_ID_ENV,
+        ):
+            env.pop(key, None)
+        try:
+            env.update(self.lifecycle_trace.launch_environment(self.diagnostic_id))
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent launch.
+            logger.debug("Terminal lifecycle correlation unavailable (%s)", type(exc).__name__)
         # Strip the runner-auth secret: native agents run their shell in
         # this tmux pane, so the binding token must never reach it.
         # After ``env.update`` so ``self.env`` can't re-admit it.
@@ -1553,7 +1592,7 @@ class TerminalInstance:
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
-        inner_str = " ".join(_shell_quote(c) for c in inner_cmd)
+        inner_str = shlex.join(inner_cmd)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
 
@@ -1795,6 +1834,21 @@ class TerminalInstance:
 
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
+        try:
+            if self.lifecycle_trace.note_cleanup():
+                logger.info(
+                    "Terminal cleanup started",
+                    extra=debug_event(
+                        "terminal_cleanup_started",
+                        session_id=self.lifecycle_trace.session_id,
+                        terminal_instance_id=self.diagnostic_id,
+                        terminal_name=self.name,
+                        terminal_key=self.session_key,
+                        **self.lifecycle_trace.log_attributes(),
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent cleanup.
+            logger.debug("Terminal cleanup telemetry failed (%s)", type(exc).__name__)
         # Cancel both idle-watcher variants first so they don't race
         # the socket teardown. Order doesn't matter — they're
         # independent.
@@ -2561,16 +2615,6 @@ class TerminalInstance:
         if proc.returncode != 0:
             raise _tmux_command_failed_error(cmd, proc.returncode, proc.stderr)
         return proc.stdout.decode()
-
-
-def _shell_quote(s: str) -> str:
-    """Quote a string for shell use."""
-    if not s:
-        return "''"
-    # Simple quoting for common cases.
-    if re.match(r"^[a-zA-Z0-9_./:@=-]+$", s):
-        return s
-    return "'" + s.replace("'", "'\\''") + "'"
 
 
 @dataclass(frozen=True)

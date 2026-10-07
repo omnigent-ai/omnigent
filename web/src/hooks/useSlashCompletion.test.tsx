@@ -246,6 +246,17 @@ describe("useSlashCompletion arrow navigation", () => {
 });
 
 describe("useSlashCompletion Tab/Enter completion", () => {
+  it("uses the completion-only callback for Tab while Enter still selects", () => {
+    const onTabComplete = vi.fn();
+    const { view, onSelect } = setup({ text: "/comp", onTabComplete });
+    expect(view.result.current.handleKey(keyEvent("Tab"), NO_PREFERENCE)).toBe(true);
+    expect(onTabComplete).toHaveBeenCalledExactlyOnceWith("/compact");
+    expect(onSelect).not.toHaveBeenCalled();
+
+    expect(view.result.current.handleKey(keyEvent("Enter"), NO_PREFERENCE)).toBe(true);
+    expect(onSelect).toHaveBeenCalledExactlyOnceWith("/compact");
+  });
+
   it("completes the highlighted match with Tab", () => {
     const { view, onSelect } = setup({ text: "/rev" });
     const event = keyEvent("Tab");
@@ -497,6 +508,22 @@ describe("inline skill completion", () => {
     expect(view.result.current.open).toBe(false);
   });
 
+  it("preserves adjacent text that is not a command continuation", () => {
+    const text = "please /revthis change";
+    const { view } = setup({ text });
+    const element = document.createElement("textarea");
+    element.value = text;
+    element.setSelectionRange(11, 11);
+    act(() => view.result.current.onSelectionChange(element));
+
+    act(() => {
+      expect(view.result.current.complete("/review-pr")).toEqual({
+        text: "please /review-pr this change",
+        caret: 18,
+      });
+    });
+  });
+
   it.each(["please /rev", "please $rev"])("uses the native skill prefix in %j", (text) => {
     const { view } = setup({
       text,
@@ -507,6 +534,27 @@ describe("inline skill completion", () => {
     expect(view.result.current.matches).toEqual(["$review"]);
     act(() => {
       expect(view.result.current.complete("$review").text).toBe("please $review ");
+    });
+  });
+
+  it("compares command bodies case-insensitively across native prefix conversion", () => {
+    const text = "please /rEvIeW this change";
+    const { view } = setup({
+      text,
+      prefix: "$",
+      commands: { $Review: "Review" },
+      skills: { $Review: "Review" },
+    });
+    const element = document.createElement("textarea");
+    element.value = text;
+    element.setSelectionRange(11, 11);
+    act(() => view.result.current.onSelectionChange(element));
+
+    act(() => {
+      expect(view.result.current.complete("$Review")).toEqual({
+        text: "please $Review this change",
+        caret: 15,
+      });
     });
   });
 
