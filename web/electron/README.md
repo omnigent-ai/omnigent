@@ -494,14 +494,13 @@ Companion's forwarding and local port selection separately. Normal TLS, CORS,
 authentication, and local-network permission rules still apply. This pane is
 desktop-only; it is not available in the plain web UI.
 
-Manual URL entry does not enable agent navigation to localhost or private
-addresses: `browser_navigate` keeps its existing restrictions, even after
-you open the page yourself. The existing `browser_snapshot`, `browser_screenshot`,
-`browser_click`, and `browser_type` actions target the session's agent browser
-view and can inspect or interact with a manually opened page in **that** view;
-they do not target additional user-created Browser tabs. Manual opening is
-therefore not a read-only boundary for the agent browser view. This workflow
-adds no automatic agent localhost navigation or new permission grants.
+`browser_navigate` keeps its restrictions on localhost and private addresses,
+even after you open a page manually. A manually opened page in the session's
+agent browser view remains available to existing agent inspection and
+interaction, including navigation caused by interacting with the page. Manual
+opening is therefore not a read-only boundary for that view. The user-created
+Browser tab opened through **+** > **Browser** is separate from the agent relay
+and is not targeted by the session's agent browser actions.
 
 ### Local network permission
 
