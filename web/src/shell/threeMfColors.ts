@@ -94,6 +94,60 @@ function utf8Length(text: string): number {
   return bytes;
 }
 
+function boundedSerialization(source: Element, limit: number): string {
+  const escapedBytes = (text: string, attribute = false) => {
+    let size = utf8Length(text);
+    for (let index = 0; index < text.length; index++) {
+      const code = text.charCodeAt(index);
+      if (code === 38) size += 4;
+      else if (code === 60 || code === 62) size += 3;
+      else if (attribute && code === 34) size += 5;
+      else if (attribute && (code === 9 || code === 10 || code === 13)) size += 5;
+    }
+    return size;
+  };
+  let bound = 0;
+  const namespaceSizes = new Map<string, number>();
+  const namespace = (element: Element, prefix: string | null, uri: string | null) => {
+    if (!uri || uri === XMLNS || prefix === "xml") return;
+    const name = prefix ? `xmlns:${prefix}` : "xmlns";
+    for (let ancestor: Element | null = element; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.getAttributeNS(XMLNS, prefix || "xmlns") === uri) return;
+      if (ancestor !== element && ancestor.prefix === prefix && ancestor.namespaceURI === uri)
+        return;
+      if (ancestor === source) break;
+    }
+    let size = namespaceSizes.get(uri);
+    if (size === undefined) {
+      size = escapedBytes(uri, true);
+      namespaceSizes.set(uri, size);
+    }
+    bound += utf8Length(name) + size + 4;
+  };
+  // Standalone serialization can repeat namespace bindings inherited outside this subtree.
+  const walker = source.ownerDocument.createTreeWalker(source, NodeFilter.SHOW_ALL);
+  do {
+    const node = walker.currentNode;
+    if (node instanceof Element) {
+      bound += 2 * utf8Length(node.tagName) + 5;
+      namespace(node, node.prefix, node.namespaceURI);
+      for (const name of node.getAttributeNames()) {
+        bound += utf8Length(name) + escapedBytes(node.getAttribute(name) ?? "", true) + 4;
+        const separator = name.indexOf(":");
+        if (separator >= 0 && !name.startsWith("xmlns:")) {
+          const prefix = name.slice(0, separator);
+          namespace(node, prefix, node.lookupNamespaceURI(prefix));
+        }
+      }
+    } else {
+      bound += escapedBytes(node.nodeValue ?? "");
+      if (node.nodeType !== Node.TEXT_NODE) bound += utf8Length(node.nodeName) + 16;
+    }
+    if (bound > limit) throw new Error("3MF serialization byte limit");
+  } while (walker.nextNode());
+  return new XMLSerializer().serializeToString(source);
+}
+
 function xml(bytes: Uint8Array): Document {
   const text = strFromU8(bytes);
   let offset = 0;
@@ -383,11 +437,12 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const memo = new Map<string, { id: string; height: number }>();
     const sourceSizes = new Map<string, number>();
     const moved = new Set<string>();
-    let emittedBytes = utf8Length(new XMLSerializer().serializeToString(outputModel));
+    const emittedLimit = selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD;
+    let emittedBytes = utf8Length(boundedSerialization(outputModel, emittedLimit));
     const reserve = (source: Element, key: string) => {
       let size = sourceSizes.get(key);
       if (size === undefined) {
-        size = utf8Length(new XMLSerializer().serializeToString(source));
+        size = utf8Length(boundedSerialization(source, emittedLimit - emittedBytes));
         sourceSizes.set(key, size);
       }
       emittedBytes += size;
@@ -512,8 +567,11 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     sourceSizes.clear();
     memo.clear();
     moved.clear();
-    const serialized = new XMLSerializer().serializeToString(output);
+    let serialized = new XMLSerializer().serializeToString(output);
+    resources.replaceChildren();
+    outputModel.replaceChildren();
     const encoded = strToU8(serialized);
+    serialized = "";
     const modelBytes = new Uint8Array(encoded.buffer, encoded.byteOffset, encoded.byteLength);
     if (modelBytes.byteLength > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD)
       return buffer;
