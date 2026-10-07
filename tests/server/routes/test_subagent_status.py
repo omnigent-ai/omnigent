@@ -16,6 +16,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.errors import OmnigentError
 from omnigent.runtime import session_stream
 from omnigent.server import session_live_state, session_metadata_logging
@@ -27,6 +28,7 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.debug_log_helpers import capture_debug_rows
+from tests.server.routes.test_sessions_runner_relay import _ScriptedRunnerClient
 
 _BACKGROUND_TASK = BackgroundTaskInfo(status="running", description="Wait for CI")
 
@@ -493,3 +495,68 @@ async def test_external_child_activity_uses_confirmed_outcome(
         assert len(items) == 1
         assert items[0].data.event_type == "session.subagent.returned"
         assert items[0].data.resource["status"] == expected
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+async def test_native_child_completes_once_per_confirmed_turn(
+    status_route: _StatusRoute, harness: str
+) -> None:
+    """Delivery acknowledgments and repeated status posts do not duplicate actual results."""
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    route = status_route
+    route.store.update_conversation(route.child_id, harness_override=harness)
+    release = asyncio.Event()
+    release.set()
+    for index in range(2):
+        submission_id = f"submission-{index}"
+        await _relay_runner_stream_once(
+            route.child_id,
+            _ScriptedRunnerClient(
+                release,
+                [
+                    {"type": "response.in_progress", "response": {"id": submission_id}},
+                    {"type": "response.completed", "response": {"id": submission_id}},
+                    {"type": "session.status", "status": "idle"},
+                    {"type": "session.status", "status": "idle"},
+                ],
+            ),
+            route.store,
+        )
+        assert len(route.store.list_items(route.parent_id).data) == index
+        if index == 0:
+            assert route.store.list_items(route.child_id).data == []
+
+        native_turn_id = f"native-turn-{index}"
+        route.store.append(
+            route.child_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=native_turn_id,
+                    data=MessageData(
+                        role="assistant",
+                        agent=harness,
+                        content=[{"type": "output_text", "text": "Finished the child task."}],
+                    ),
+                )
+            ],
+        )
+        for _ in range(2):
+            response = await route.client.post(
+                f"/v1/sessions/{route.child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {
+                        "status": "idle",
+                        "response_id": native_turn_id,
+                        "turn_completed": True,
+                    },
+                },
+            )
+            assert response.status_code == 202, response.text
+        notices = route.store.list_items(route.parent_id).data
+        assert len(notices) == index + 1
+        assert all(item.data.event_type == "session.subagent.returned" for item in notices)
+        assert all(item.data.resource_id == route.child_id for item in notices)
+        assert all(item.data.resource["status"] == "completed" for item in notices)

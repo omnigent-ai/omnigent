@@ -16,6 +16,7 @@ from omnigent.entities import (
     NewConversationItem,
     ResourceEventData,
 )
+from omnigent.harness_aliases import is_native_harness
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.runtime import session_stream
 from omnigent.server.schemas import OutputItemDoneEvent
@@ -142,6 +143,7 @@ async def record_subagent_activity(
     parent_id: str | None = None,
     turn_id: str | None = None,
     status: str | None = None,
+    from_runner: bool = False,
 ) -> None:
     """Persist and publish a child lifecycle edge once, including across retries."""
     try:
@@ -156,6 +158,14 @@ async def record_subagent_activity(
         if parent_id is not None and child.parent_conversation_id != parent_id:
             return
         parent_id = child.parent_conversation_id
+        if phase == "returned" and status == "completed" and from_runner:
+            from omnigent.server.routes._sessions.orchestration import _native_pane_harness
+
+            # Native runner completion acknowledges prompt delivery; the
+            # forwarder confirms when the child actually finishes.
+            harness = await asyncio.to_thread(_native_pane_harness, child)
+            if is_native_harness(harness):
+                return
         if (
             phase == "delegated"
             and child.labels.get("omnigent.wrapper") == "codex-native-ui-subagent"

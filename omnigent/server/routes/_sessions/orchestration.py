@@ -8066,7 +8066,12 @@ async def _relay_runner_stream_once(
                                 "returned",
                                 conversation_store,
                                 turn_id=pending_subagent_return_id,
-                                status=pending_subagent_return_status,
+                                status=(
+                                    "failed"
+                                    if status == "failed"
+                                    else pending_subagent_return_status
+                                ),
+                                from_runner=True,
                             )
                             pending_subagent_return_id = None
                         if status:

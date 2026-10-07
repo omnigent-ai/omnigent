@@ -329,6 +329,62 @@ async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(
     assert items[-1].data.resource["status"] == outcome
 
 
+@pytest.mark.parametrize(
+    ("harness", "wrapper", "native"),
+    [
+        ("claude-native", None, True),
+        ("codex-native", None, True),
+        (None, "claude-code-native-ui", True),
+        ("auto", "claude-code-native-ui", True),
+        ("claude-sdk", "claude-code-native-ui", False),
+        ("claude-sdk", None, False),
+        (None, None, False),
+    ],
+)
+@pytest.mark.parametrize(
+    ("outcome", "status"),
+    [("completed", "idle"), ("failed", "failed"), ("cancelled", "idle"), ("completed", "failed")],
+)
+@pytest.mark.asyncio
+async def test_subagent_activity_uses_effective_harness_for_runner_completion(
+    db_uri: str, harness: str | None, wrapper: str | None, native: bool, outcome: str, status: str
+) -> None:
+    """Native prompt delivery cannot finish a child; errors and SDK results can."""
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        harness_override=harness,
+        labels={"omnigent.wrapper": wrapper} if wrapper is not None else {},
+    )
+    release = asyncio.Event()
+    release.set()
+    await _relay_runner_stream_once(
+        child.id,
+        _ScriptedRunnerClient(
+            release,
+            [
+                {"type": "response.in_progress", "response": {"id": "runner-turn"}},
+                {"type": f"response.{outcome}", "response": {"id": "runner-turn"}},
+                {"type": "session.status", "status": status},
+                {"type": "session.status", "status": status},
+            ],
+        ),
+        store,
+    )
+    notices = store.list_items(parent.id, type="resource_event").data
+    if native and outcome == "completed" and status == "idle":
+        assert notices == []
+    else:
+        assert len(notices) == 1
+        assert notices[0].data.event_type == "session.subagent.returned"
+        assert notices[0].data.resource_id == child.id
+        assert notices[0].data.resource["status"] == ("failed" if status == "failed" else outcome)
+
+
 @pytest.mark.asyncio
 async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
     """
