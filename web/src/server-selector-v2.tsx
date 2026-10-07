@@ -1,4 +1,4 @@
-// Standalone entry for the default packaged Electron server selector.
+// Standalone entry for the Electron server selector V2.
 //
 // Loaded from a file:// window (see electron/src/main.js `setupPagePath`).
 // Renders the ServerSelectorV2, wiring it

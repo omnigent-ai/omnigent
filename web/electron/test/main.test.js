@@ -133,6 +133,7 @@ function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } 
 
 function loadNavigationHarness({
   isPackaged = false,
+  platform,
   env = {},
   serverUrl = "https://host.example/ml/omnigents",
   savedServerUrl,
@@ -597,7 +598,7 @@ function loadNavigationHarness({
     module,
     process: {
       ...process,
-      platform: internalFeatures ? "darwin" : process.platform,
+      platform: platform ?? (internalFeatures ? "darwin" : process.platform),
       env: { ...process.env, OMNIGENT_SERVER_SELECTOR_V2: "", ...env },
     },
     require: (specifier) => {
@@ -2294,14 +2295,40 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
 });
 
 describe("packaged server selector default", () => {
-  for (const [name, settings, v2] of [
-    ["new install", null, true],
-    ["existing install", { recent_servers: ["https://team.example.com/"] }, true],
-    ["explicit V2 preference", { server_selector_v2: true }, true],
-    ["explicit legacy preference", { server_selector_v2: false }, false],
+  for (const [name, options, settings, v2] of [
+    ["new internal macOS install", { internalFeatures: true }, null, true],
+    [
+      "existing internal macOS install",
+      { internalFeatures: true },
+      { recent_servers: ["https://team.example.com/"] },
+      true,
+    ],
+    ["new public macOS install", {}, null, false],
+    ["existing public macOS install", {}, { recent_servers: ["https://team.example.com/"] }, false],
+    [
+      "MDM server presets without internal features",
+      { managedServers: ["https://team.example.com/"] },
+      null,
+      false,
+    ],
+    ["Linux install", { platform: "linux", internalFeatures: true }, null, false],
+    ["Windows install", { platform: "win32", internalFeatures: true }, null, false],
+    ["unpackaged internal macOS build", { isPackaged: false, internalFeatures: true }, null, false],
+    [
+      "explicit V2 preference outside the default rollout",
+      { platform: "win32" },
+      { server_selector_v2: true },
+      true,
+    ],
+    [
+      "explicit legacy preference",
+      { internalFeatures: true },
+      { server_selector_v2: false },
+      false,
+    ],
   ]) {
     it(`opens the bundled selector for ${name}`, async () => {
-      const h = loadNavigationHarness({ isPackaged: true });
+      const h = loadNavigationHarness({ isPackaged: true, platform: "darwin", ...options });
       try {
         if (settings) fs.writeFileSync(h.settingsPath, JSON.stringify(settings));
         h.api.createWindow();
@@ -2315,7 +2342,7 @@ describe("packaged server selector default", () => {
   }
 
   it("persists switching to legacy and back to V2", async () => {
-    const h = loadNavigationHarness({ isPackaged: true });
+    const h = loadNavigationHarness({ isPackaged: true, internalFeatures: true });
     try {
       h.api.registerIpc();
       await h.api.loadSetupPage(h.win, "error=offline&ephemeral=1");

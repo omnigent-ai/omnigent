@@ -747,11 +747,12 @@ name; output lands in `electron/dist-dev/` (the DMG is named
 install production desktop updates. `build:mac:release` retains
 `ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
 
-Packaged apps default to the V2 onboarding and server selector for both new and
-existing profiles. A saved server still reconnects on launch. The selector's
-settings menu offers **Switch to legacy**; that explicit choice persists across
-restarts. Unpackaged development keeps V2 opt-in through the setup-page switch
-or `OMNIGENT_SERVER_SELECTOR_V2=1`, which forces V2 regardless of the saved choice.
+Packaged macOS apps default to V2 onboarding only when the MDM preference
+`databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
+Public macOS users, Windows/Linux, and unpackaged development keep the legacy
+default. The setup-page switch still persists an explicit choice on every
+platform, and `OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved
+choice. A saved server still reconnects on launch.
 
 Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
 bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly

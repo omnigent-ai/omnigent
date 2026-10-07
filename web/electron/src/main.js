@@ -121,7 +121,7 @@ const ABOUT_PAGE = path.join(__dirname, "..", "about", "index.html");
 /** The setup page's file:// URL, for verifying IPC sender frames. */
 const SETUP_PAGE_URL = pathToFileURL(SETUP_PAGE);
 
-/** Default packaged server selector (built by web's `build:server-selector-v2`). */
+/** React server selector (built by web's `build:server-selector-v2`). */
 const SERVER_SELECTOR_V2_PAGE = path.join(
   __dirname,
   "..",
@@ -135,10 +135,13 @@ function serverSelectorV2EnvForced() {
   return process.env.OMNIGENT_SERVER_SELECTOR_V2 === "1";
 }
 
-/** V2 defaults on in packaged builds; the setup-page switch persists an override. */
+/** V2 defaults on for packaged, MDM-enabled Databricks macOS users. */
 function serverSelectorV2Enabled() {
   return (
-    serverSelectorV2EnvForced() || (loadSettings().server_selector_v2 ?? app.isPackaged) === true
+    serverSelectorV2EnvForced() ||
+    (loadSettings().server_selector_v2 ??
+      (app.isPackaged && process.platform === "darwin" && databricksInternalFeaturesEnabled())) ===
+      true
   );
 }
 

@@ -1,7 +1,7 @@
 /**
  * The Electron server-selector-v2 flow: landing → deployment mode → server
  * select, inside one card that resizes between steps. Mounted only by
- * `server-selector-v2.tsx` (the default packaged Electron setup page), wired to the native
+ * `server-selector-v2.tsx` (the Electron setup page), wired to the native
  * `omnigentSetup` bridge via the `setup` prop.
  */
 
