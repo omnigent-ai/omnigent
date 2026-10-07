@@ -138,7 +138,7 @@ function FileListItem({
         linesRemoved={file.lines_removed}
         onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        {(rowRef, primaryActionRef, actionsOpen) => (
+        {(rowRef, actionsOpen) => (
           <div
             ref={rowRef}
             data-actions-open={actionsOpen}
@@ -149,7 +149,6 @@ function FileListItem({
             )}
           >
             <button
-              ref={primaryActionRef}
               type="button"
               className="flex min-w-0 flex-1 cursor-pointer items-baseline gap-1.5 text-left"
               onClick={() => onFileSelect(file.path)}

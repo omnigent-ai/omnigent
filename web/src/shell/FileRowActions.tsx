@@ -56,16 +56,11 @@ interface FileRowActionsProps extends FileRowInfo {
   onBrowse?: () => void;
   actionName?: string;
   onOpenInfo: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
-  children: (
-    rowRef: RefObject<HTMLDivElement | null>,
-    primaryActionRef: RefObject<HTMLButtonElement | null>,
-    contextOpen: boolean,
-  ) => ReactElement;
+  children: (rowRef: RefObject<HTMLDivElement | null>, contextOpen: boolean) => ReactElement;
 }
 
 export function FileRowActions({ children, ...props }: FileRowActionsProps) {
   const rowRef = useRef<HTMLDivElement>(null);
-  const primaryActionRef = useRef<HTMLButtonElement>(null);
   const focusReturnRef = useRef<HTMLElement | null>(null);
   const contextFocusRef = useRef<HTMLElement | null>(null);
   const infoOpenedRef = useRef(false);
@@ -161,8 +156,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
             canReceiveFocus(active)
               ? active
               : null);
-          focusReturnRef.current =
-            target ?? (canReceiveFocus(rowRef.current) ? rowRef.current : primaryActionRef.current);
+          focusReturnRef.current = target ?? rowRef.current;
           contextFocusRef.current = null;
         }
       }}
@@ -193,7 +187,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
               : null;
         }}
       >
-        {children(rowRef, primaryActionRef, contextOpen)}
+        {children(rowRef, contextOpen)}
       </ContextMenuTrigger>
       <ContextMenuContent
         aria-label={actionLabel}
