@@ -591,9 +591,9 @@ def extract_prs(
             ref := _created_pr_metadata(result)
         ):
             references.append(ref)
-        # Shared stdout cannot attribute a result to a write when reads/comments also ran.
-        if len(commands) == len(gh_commands) and (
-            len(commands) > 1 or not _content_only(commands[0])
+        # Shared stdout is ambiguous when reads, comments, or content-only outputs also ran.
+        if len(commands) == len(gh_commands) and not any(
+            _content_only(tokens) for tokens in commands
         ):
             graphql_fields = [
                 field for tokens in commands if (field := _graphql_create_field(tokens))

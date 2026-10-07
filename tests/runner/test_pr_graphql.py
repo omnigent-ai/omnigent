@@ -12,7 +12,6 @@ from omnigent.runner.pr_observer import extract_prs, observe_hook
 from omnigent.runner.session_prs import SessionPrRegistry
 
 URL = "https://github.com/example/project/pull/42"
-OTHER_URL = "https://github.com/other/repo/pull/99"
 QUERY = """mutation CreatePullRequest($repositoryId: ID!, $headRepositoryId: ID!) {
   createPullRequest(input: {
     repositoryId: $repositoryId, headRepositoryId: $headRepositoryId,
@@ -105,11 +104,39 @@ def test_unsuccessful_graphql_create_does_not_attach_pr(exit_code: int | None) -
     assert not references
 
 
-def test_graphql_body_projection_is_not_pr_identity() -> None:
+@pytest.mark.parametrize("compound", [False, True], ids=["single", "shared-output"])
+@pytest.mark.parametrize("formatter", ["--jq", "--template", "-t"])
+def test_graphql_body_projection_is_not_pr_identity(formatter: str, compound: bool) -> None:
+    query = QUERY.replace("number url title isDraft", "number url title isDraft body")
+    path = ".data.createPullRequest.pullRequest.body"
+    projection = path if formatter == "--jq" else "{{" + path + "}}"
+    shell = command(query) + " " + shlex.join([formatter, projection])
+    if compound:
+        shell += "; gh pr create --repo example/another"
     references, _ = extract_prs(
-        "shell", {"command": command(projection=".data.createPullRequest.pullRequest.body")}, URL
+        "shell", {"command": shell}, "https://github.com/example/mentioned/pull/99"
     )
     assert not references
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_graphql_nested_aliases_do_not_supply_pr_identity(projection: str | None) -> None:
+    query = QUERY.replace("number url title isDraft", "url: body")
+    body_url = "https://github.com/example/mentioned/pull/99"
+    pr = {"url": body_url}
+    output = (
+        body_url
+        if projection and projection.endswith(".url")
+        else json.dumps(pr if projection else {"data": {"createPullRequest": {"pullRequest": pr}}})
+    )
+    references, created = extract_prs(
+        "shell", {"command": command(query, projection=projection)}, output
+    )
+    assert not references
+    assert not created
 
 
 def test_graphql_alias_uses_its_response_identity() -> None:
@@ -153,38 +180,8 @@ def test_graphql_errors_do_not_supply_pr_identity() -> None:
     assert not references
 
 
+@pytest.mark.timeout(5)
 def test_unterminated_block_string_fails_fast() -> None:
     # A backslash before every character is the worst case for string scanning.
     query = '"""' + "\\a" * 2000
     assert extract_prs("shell", {"command": command(query)}, URL) == ([], False)
-
-
-@pytest.mark.parametrize(
-    "projection,result",
-    [
-        (None, {"data": {"createPullRequest": {"pullRequest": {"url": OTHER_URL}}}}),
-        (".data.createPullRequest.pullRequest", {"url": OTHER_URL}),
-    ],
-)
-def test_nested_alias_cannot_relabel_body_as_identity(
-    projection: str | None, result: dict[str, object]
-) -> None:
-    query = QUERY.replace("pullRequest { number url title", "pullRequest { number url: body title")
-    assert "url: body" in query
-    assert extract_prs("shell", {"command": command(query, projection)}, result) == ([], False)
-
-
-def test_template_output_is_not_pr_identity() -> None:
-    shell = shlex.join(
-        [
-            "gh",
-            "api",
-            "graphql",
-            "-f",
-            f"query={QUERY}",
-            "--template",
-            "{{.data.createPullRequest.pullRequest.body}}",
-        ]
-    )
-    references, _ = extract_prs("shell", {"command": shell}, OTHER_URL)
-    assert not references
