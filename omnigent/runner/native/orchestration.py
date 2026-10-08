@@ -7438,13 +7438,11 @@ def _build_claude_native_base_args(
         the same plain ``--resume`` path serves both cold resume and
         fork resume. ``None`` (a fresh launch, or no local transcript
         could be synthesized) adds nothing.
-    :param resume_fork: When resuming, also pass ``--fork-session`` so Claude
-        branches a copy instead of reattaching in place; the CLI refuses a bare
-        ``--resume <id>`` while a separate live process holds ``<id>``. The host
-        launch passes ``False`` because it clones a held transcript under a
-        fresh id before launch; the default ``True`` keeps a resume working
-        when liveness was not checked. Ignored when
-        ``resume_external_session_id`` is ``None``.
+    :param resume_fork: Append ``--fork-session`` when resuming so Claude
+        branches a copy instead of reattaching in place, which the CLI refuses
+        while a separate live process holds the id. Defaults to ``True`` for
+        that safety; host launches pass ``False`` because they clone a held
+        transcript first. Ignored without a resume id.
     :returns: The assembled base args, e.g.
         ``("--resume", "<sid>", "--effort", "high")``.
     """
