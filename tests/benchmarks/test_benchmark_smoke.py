@@ -1044,6 +1044,9 @@ def test_bench_child_environ_drops_caller_session_vars() -> None:
         "OMNIGENT_TERMINAL_LAUNCH_ID": "launch_caller",
         "OMNIGENT_REMOTE_AUTH_TOKEN": "caller-bearer",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"X-Routing": "caller"}',
+        "OMNIGENT_HARNESS_AUTH_TOKEN": "caller-harness-token",
+        "OMNIGENT_SESSION_ID": "conv_caller",
+        "OMNIGENT_POLICY_URL": "http://caller:6767",
     }
 
     assert bench_child_environ(caller) == {
@@ -1057,16 +1060,28 @@ def test_caller_session_env_literals_match_the_runtime() -> None:
     """Names kept as literals (no cheap public constant) must track the runtime."""
     from dev.benchmarks.omnigent.environment import _CALLER_SESSION_ENV_VARS
     from omnigent.chat import _REMOTE_AUTH_TOKEN_ENV
+    from omnigent.runner.native import orchestration
     from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
+    from omnigent.runtime.harnesses.process_manager import _HARNESS_AUTH_TOKEN_ENV
 
-    assert {_REMOTE_AUTH_TOKEN_ENV, HARNESS_TMP_PARENT_ENV_VAR} <= _CALLER_SESSION_ENV_VARS
+    assert {
+        _REMOTE_AUTH_TOKEN_ENV,
+        HARNESS_TMP_PARENT_ENV_VAR,
+        _HARNESS_AUTH_TOKEN_ENV,
+    } <= _CALLER_SESSION_ENV_VARS
+    # The native policy hooks' env is built from literals in orchestration.
+    source = Path(orchestration.__file__).read_text()
+    for name in ("OMNIGENT_SESSION_ID", "OMNIGENT_POLICY_URL"):
+        assert f'policy_env["{name}"]' in source
+        assert name in _CALLER_SESSION_ENV_VARS
 
 
-def _wait_gone(pid: int, timeout: float = 5.0) -> bool:
+def _wait_gone(proc: psutil.Process, timeout: float = 5.0) -> bool:
+    """Wait for *proc* to exit; a recycled pid doesn't count as it running."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+            if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
                 return True
         except psutil.NoSuchProcess:
             return True
@@ -1075,24 +1090,39 @@ def _wait_gone(pid: int, timeout: float = 5.0) -> bool:
 
 
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")
-def test_stop_process_group_kills_descendants_that_ignore_sigterm() -> None:
-    """Stopping a bench child also kills what it forked, even past SIGTERM."""
+def test_stop_process_group_kills_descendants_that_ignore_sigterm(tmp_path: Path) -> None:
+    """Stopping a bench child also kills what it forked, even past SIGTERM.
+
+    That includes a child its SIGTERM handler forks just before it exits.
+    """
+    late_pid_file = tmp_path / "late.pid"
+    ignore_term = '(trap "" TERM; exec sleep 60) &'
+    script = (
+        f"trap '{ignore_term} echo $! > \"$1\"; exit 0' TERM; "
+        f"{ignore_term} echo $!; "
+        "while :; do sleep 0.1; done"
+    )
     proc = subprocess.Popen(
-        ["sh", "-c", '(trap "" TERM; exec sleep 60) & echo $!; wait'],
+        ["sh", "-c", script, "sh", str(late_pid_file)],
         stdout=subprocess.PIPE,
         start_new_session=True,
     )
     assert proc.stdout is not None
-    grandchild = int(proc.stdout.readline())
+    descendants = [psutil.Process(int(proc.stdout.readline()))]
     try:
         _stop_process_group(proc)
 
         assert proc.poll() is not None
-        assert _wait_gone(grandchild)
+        with contextlib.suppress(psutil.NoSuchProcess):  # already killed and reaped
+            descendants.append(psutil.Process(int(late_pid_file.read_text())))
+        for descendant in descendants:
+            assert _wait_gone(descendant)
     finally:
-        for pid in (grandchild, proc.pid):
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
+        for descendant in descendants:
+            with contextlib.suppress(psutil.Error):
+                descendant.kill()
+        if proc.poll() is None:
+            proc.kill()
         proc.wait(timeout=5)
 
 
@@ -1104,14 +1134,24 @@ def test_teardown_kills_terminals_under_the_bench_tmpdir() -> None:
     terminal_dir.mkdir(parents=True)
     socket_path = terminal_dir / "tmux.sock"
     subprocess.run(["tmux", "-S", str(socket_path), "new-session", "-d", "sleep 60"], check=True)
+    # Teardown deletes the socket, so only the server's pid can show it exited.
+    server = psutil.Process(
+        int(
+            subprocess.run(
+                ["tmux", "-S", str(socket_path), "display-message", "-p", "#{pid}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        )
+    )
     try:
         env._stop()
-        alive = subprocess.run(
-            ["tmux", "-S", str(socket_path), "has-session"], capture_output=True
-        )
-        assert alive.returncode != 0
+
+        assert _wait_gone(server)
     finally:
-        subprocess.run(["tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
+        with contextlib.suppress(psutil.Error):
+            server.kill()
         shutil.rmtree(env._tmp, ignore_errors=True)
 
 
@@ -1189,8 +1229,11 @@ async def test_cancelled_start_cannot_leave_a_child_behind() -> None:
     finally:
         release.set()
         for child in env._children:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(child.pid, signal.SIGKILL)
+            # An unreaped leader keeps its group id from being recycled.
+            if child.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=5)
 
 
 @pytest.mark.asyncio
@@ -1266,7 +1309,7 @@ def test_sigterm_mid_run_leaves_no_processes(tmp_path: Path) -> None:
         proc.send_signal(signal.SIGTERM)
         proc.communicate(timeout=60)
         assert proc.returncode == 128 + signal.SIGTERM
-        assert all(_wait_gone(child.pid) for child in descendants)
+        assert all(_wait_gone(child) for child in descendants)
     finally:
         if proc.poll() is None:
             proc.kill()

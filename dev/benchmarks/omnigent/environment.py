@@ -120,6 +120,10 @@ _CALLER_SESSION_ENV_VARS = frozenset(
         "OMNIGENT_RUNNER_TUNNEL_TOKEN",
         "OMNIGENT_REMOTE_AUTH_TOKEN",
         "OMNIGENT_HARNESS_TMP_PARENT",
+        "OMNIGENT_HARNESS_AUTH_TOKEN",
+        # Stamped for native harnesses' policy hooks.
+        "OMNIGENT_SESSION_ID",
+        "OMNIGENT_POLICY_URL",
     }
 )
 _CALLER_SESSION_ENV_PREFIXES = ("OMNIGENT_TERMINAL_",)
@@ -249,7 +253,7 @@ def _signal_group(proc: subprocess.Popen[bytes], sig: int) -> None:
 
 
 def _group_members(proc: subprocess.Popen[bytes]) -> list[psutil.Process]:
-    """Return the live processes, other than *proc*, in *proc*'s process group.
+    """Return the live, non-zombie processes, other than *proc*, in *proc*'s group.
 
     Empty when the group id has been recycled: a new process leads a group
     with that id after *proc* was reaped.
@@ -266,18 +270,21 @@ def _group_members(proc: subprocess.Popen[bytes]) -> list[psutil.Process]:
                 if leader_gone:
                     return []
                 continue
-            members.append(candidate)
+            if candidate.status() != psutil.STATUS_ZOMBIE:
+                members.append(candidate)
     return members
 
 
 def _stop_process_group(proc: subprocess.Popen[bytes]) -> None:
     """SIGTERM *proc*'s process group, then kill whatever is left of it.
 
-    The group is only signalled while its leader is alive; members that
-    outlive the leader are killed individually from a snapshot, so a
-    recycled group id is never signalled.
+    The group is only signalled while its leader is alive. Afterwards members
+    are killed one by one and the group is rescanned until it is empty, so
+    processes forked during shutdown don't escape and a recycled group id is
+    never signalled.
     """
-    members = _group_members(proc)
+    # Members seen before shutdown are killed even if they have since left the group.
+    seen = set(_group_members(proc))
     if proc.poll() is None:
         _signal_group(proc, signal.SIGTERM)
         with contextlib.suppress(subprocess.TimeoutExpired):
@@ -286,9 +293,17 @@ def _stop_process_group(proc: subprocess.Popen[bytes]) -> None:
         _signal_group(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
-    for member in members:
-        with contextlib.suppress(psutil.Error):
-            member.kill()  # psutil refuses a recycled pid
+    deadline = time.monotonic() + _STOP_GRACE_S
+    while True:
+        # Once the group is empty, a later member would belong to a recycled id.
+        current = _group_members(proc)
+        seen.update(current)
+        for member in seen:
+            with contextlib.suppress(psutil.Error):
+                member.kill()  # psutil refuses a recycled pid
+        if not current or time.monotonic() >= deadline:
+            return
+        psutil.wait_procs(current, timeout=0.2)
 
 
 class BenchEnvironment:
