@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
+from concurrent.futures import Future
 from dataclasses import dataclass
 from functools import partial
 
@@ -2304,11 +2305,81 @@ async def test_keepalive_loop_fires_faster_than_the_ping_interval(
     monkeypatch.setattr(
         runner_tunnel.managed_host_keepalive, "keepalive_interval_s", lambda _rid: 0.01
     )
+    monkeypatch.setattr(
+        runner_tunnel.managed_host_keepalive, "next_keepalive_delay_s", lambda _rid: 0.01
+    )
     task = asyncio.create_task(runner_tunnel._keepalive_loop("r1"))
     await asyncio.sleep(0.05)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert len(calls) >= 3 and set(calls) == {"r1"}
+
+
+@pytest.mark.parametrize("legacy_full_interval", [False, True])
+async def test_keepalive_loop_retries_from_the_worker_start_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_full_interval: bool,
+) -> None:
+    """A delayed first worker does not make the second refresh wait 2x cadence."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes import runner_tunnel
+
+    interval = 60.0
+    clock = 0.0
+    sleeps = 0
+    worker_starts: list[float] = []
+    queued: list[tuple[Callable[[], object], Future[None]]] = []
+
+    class StopLoop(Exception):
+        pass
+
+    class QueuedExecutor:
+        def submit(self, fn: Callable[..., object], *args: object) -> Future[None]:
+            future: Future[None] = Future()
+            queued.append((partial(fn, *args), future))
+            return future
+
+    def _record_keepalive(_runner_id: str) -> None:
+        worker_starts.append(clock)
+
+    async def virtual_sleep(delay: float) -> None:
+        nonlocal clock, sleeps
+        sleeps += 1
+        assert sleeps <= 6, "the loop did not schedule its second refresh"
+        wake_at = clock + delay
+        if queued:
+            job, future = queued.pop(0)
+            # Only the first worker is delayed; later jobs start immediately.
+            clock += 0.25 if not worker_starts else 0.0
+            assert clock <= wake_at
+            assert future.set_running_or_notify_cancel()
+            job()
+            future.set_result(None)
+        clock = wake_at
+        if len(worker_starts) == 2:
+            raise StopLoop
+
+    managed_keepalive = runner_tunnel.managed_host_keepalive
+    monkeypatch.setattr(managed_keepalive, "time", SimpleNamespace(monotonic=lambda: clock))
+    monkeypatch.setattr(runner_tunnel, "asyncio", SimpleNamespace(sleep=virtual_sleep))
+    monkeypatch.setattr(managed_keepalive, "_executor", QueuedExecutor())
+    monkeypatch.setattr(managed_keepalive, "_sandbox_config", object())
+    monkeypatch.setattr(managed_keepalive, "_host_store", object())
+    monkeypatch.setattr(managed_keepalive, "_keep_alive_for_runner", _record_keepalive)
+    monkeypatch.setattr(managed_keepalive, "_runner_interval_s", {"r1": interval})
+    monkeypatch.setattr(managed_keepalive, "_last_kept", {})
+    monkeypatch.setattr(managed_keepalive, "_inflight", set())
+    monkeypatch.setattr(managed_keepalive, "_retry_after", {})
+    if legacy_full_interval:
+        monkeypatch.setattr(managed_keepalive, "next_keepalive_delay_s", lambda _rid: interval)
+
+    with pytest.raises(StopLoop):
+        await runner_tunnel._keepalive_loop("r1")
+
+    assert worker_starts == [0.25, 120.0 if legacy_full_interval else 60.25]
+    assert not queued
+    assert not managed_keepalive._inflight
 
 
 class _FakeSenderWebSocket:
