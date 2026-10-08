@@ -285,6 +285,195 @@ async def test_handle_event_ignores_retrying_error_notification(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("detail", [None, "unstructured diagnostic", [], {}])
+async def test_malformed_terminal_error_settles_only_its_active_turn(
+    tmp_path: Path, detail: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed_active_turn(tmp_path, "turn_123")
+    client = _RecordingClient()
+    forwarder_state = fwd._CodexForwarderState()
+    event = {
+        "method": "error",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "willRetry": False,
+            "error": detail,
+        },
+    }
+    for _ in range(2):
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=event,  # type: ignore[arg-type]
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            expected_thread_id="thread_123",
+            forwarder_state=forwarder_state,
+        )
+
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"] == {
+        "status": "failed",
+        "response_id": "codex_turn_123",
+        "output": "Codex turn ended with an unspecified error.",
+    }
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id is None
+    fallbacks = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_terminal_error_fallback"
+    ]
+    assert len(fallbacks) == (0 if isinstance(detail, dict) else 1)
+    if fallbacks:
+        assert fallbacks[0].session_id == "conv_x"
+        assert fallbacks[0].turn_id == "turn_123"
+        assert fallbacks[0].attributes == {"reason": "missing_or_non_object_error"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_id", ["old_turn", None])
+async def test_stale_or_ambiguous_error_cannot_fail_a_newer_turn(
+    tmp_path: Path, turn_id: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger=fwd.__name__)
+    _seed_active_turn(tmp_path, "new_turn")
+    client = _RecordingClient()
+    forwarder_state = fwd._CodexForwarderState()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": turn_id,
+                "willRetry": False,
+                "error": {"message": "old turn failed"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        forwarder_state=forwarder_state,
+    )
+
+    assert client.posts == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "new_turn"
+    assert forwarder_state.surfaced_terminal_error_turns == set()
+    ignored = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_terminal_error_ignored"
+    ]
+    assert len(ignored) == 1
+    assert ignored[0].session_id == "conv_x"
+    assert ignored[0].attributes == {"reason": "stale_or_ambiguous_turn"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge_exists", [False, True])
+async def test_stateful_idless_error_cannot_fail_an_idle_bridge(
+    tmp_path: Path, bridge_exists: bool
+) -> None:
+    if bridge_exists:
+        _seed_active_turn(tmp_path, "previous_turn")
+        assert fwd.clear_active_turn_id_if_matches(tmp_path, "previous_turn")
+    client = _RecordingClient()
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "willRetry": False,
+                "error": {"message": "unattributed error"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        forwarder_state=fwd._CodexForwarderState(),
+    )
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["retrying", "unknown_retry", "other_thread", "old_turn", "no_turn", "no_state"]
+)
+async def test_malformed_error_requires_an_explicit_correlated_terminal_edge(
+    tmp_path: Path, case: str
+) -> None:
+    _seed_active_turn(tmp_path, "turn_123")
+    client = _RecordingClient()
+    params: dict[str, object] = {
+        "threadId": "thread_123",
+        "turnId": "turn_123",
+        "willRetry": False,
+    }
+    if case == "retrying":
+        params["willRetry"] = True
+    elif case == "unknown_retry":
+        params.pop("willRetry")
+    elif case == "other_thread":
+        params["threadId"] = "unrelated_thread"
+    elif case == "old_turn":
+        params["turnId"] = "old_turn"
+    elif case == "no_turn":
+        params.pop("turnId")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={"method": "error", "params": params},  # type: ignore[arg-type]
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        forwarder_state=None if case == "no_state" else fwd._CodexForwarderState(),
+    )
+    assert client.posts == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_123"
+
+
+@pytest.mark.asyncio
+async def test_correlated_error_recovers_a_missed_turn_start(tmp_path: Path) -> None:
+    _seed_active_turn(tmp_path, "previous_turn")
+    assert fwd.clear_active_turn_id_if_matches(tmp_path, "previous_turn")
+    client = _RecordingClient()
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "missed_start_turn",
+                "willRetry": False,
+                "error": {"message": "turn failed before its start was observed"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        forwarder_state=fwd._CodexForwarderState(),
+    )
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"]["status"] == "failed"
+    assert client.posts[0][1]["data"]["response_id"] == "codex_missed_start_turn"
+
+
+@pytest.mark.asyncio
 async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: Path) -> None:
     """A standalone error owns the terminal status for its turn."""
     write_bridge_state(
