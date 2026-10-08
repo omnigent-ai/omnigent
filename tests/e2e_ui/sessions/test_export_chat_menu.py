@@ -6,7 +6,8 @@ local file from the UI (the CLI ``omnigent session export`` is the only
 path). The first test pins the Export affordance in the kebab menu; the
 second drives the full journey — click Export, receive a file download
 whose content preserves the transcript: both turns in order, the code
-block, and the link.
+block, and the link — and is a well-formed ``omnigent.transcript/1`` file,
+the same one ``GET /v1/sessions/{id}/export`` and the CLI write.
 
 Content markers are single-line and quote-free so they survive any export
 format unchanged (a JSONL export JSON-escapes newlines and quotes).
@@ -19,6 +20,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.export import TRANSCRIPT_SCHEMA, read_transcript
 from tests.e2e_ui.conftest import seed_committed_items
 
 _PROMPT_ONE = "Export repro first turn: write a hello constant"
@@ -100,7 +102,7 @@ def test_header_export_downloads_transcript(
     page: Page,
     transcript_session: tuple[str, str],
 ) -> None:
-    """Export saves a local file preserving turn order, code, and links."""
+    """Export saves a versioned transcript preserving turn order, code, and links."""
     base_url, session_id = transcript_session
     _open_session_menu(page, base_url, session_id)
 
@@ -109,10 +111,24 @@ def test_header_export_downloads_transcript(
     with page.expect_download() as download_info:
         export_item.click()
     download = download_info.value
-    assert download.suggested_filename
+    assert download.suggested_filename == f"{session_id}.jsonl"
 
     exported = Path(str(download.path())).read_text(encoding="utf-8")
     positions = [exported.find(marker) for marker in _MARKERS_IN_ORDER]
     missing = [m for m, pos in zip(_MARKERS_IN_ORDER, positions, strict=True) if pos == -1]
     assert not missing, f"export is missing transcript content: {missing}"
     assert positions == sorted(positions), f"export lost turn order: {positions}"
+
+    # The download is the portable format, not a raw API dump: a schema
+    # header, then one entry per committed item with turns numbered.
+    transcript = read_transcript(exported.splitlines(keepends=True))
+    assert transcript.header.schema_ == TRANSCRIPT_SCHEMA
+    assert transcript.header.session == session_id
+    assert [(e.turn, e.role, e.kind) for e in transcript.entries] == [
+        (1, "user", "message"),
+        (1, "assistant", "message"),
+        (2, "user", "message"),
+        (2, "assistant", "message"),
+    ]
+    assert transcript.entries[1].text == _REPLY_ONE
+    assert transcript.entries[1].agent == "hello_world"
