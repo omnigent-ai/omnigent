@@ -77,8 +77,10 @@ def pr_session(
 ) -> Iterator[tuple[str, str, str, Path]]:
     binary = tmp_path / "bin"
     binary.mkdir()
+    impl = binary / "gh_impl.py"
+    impl.write_text(_GH)
     gh = binary / "gh"
-    gh.write_text(f"#!{sys.executable}\n" + _GH)
+    gh.write_text("#!/bin/sh\nexec " + shlex.join([sys.executable, str(impl)]) + ' "$@"\n')
     gh.chmod(0o755)
     workspace = tmp_path / "checkout"
     for args in (
