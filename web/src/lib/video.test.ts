@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { isRemoteVideoUrl, isVideoFile } from "./video";
+import { formatVideoTime, isRemoteVideoUrl, isVideoFile } from "./video";
+
+it("formats chapter offsets", () => {
+  expect(formatVideoTime(125.9)).toBe("2:05");
+});
 
 describe("video detection", () => {
   it.each([

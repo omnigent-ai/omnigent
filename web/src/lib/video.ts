@@ -1,5 +1,10 @@
 const VIDEO_EXTENSIONS = /\.(?:mp4|webm|mov|m4v|ogv)$/i;
 
+export function formatVideoTime(seconds: number): string {
+  const whole = Math.floor(seconds);
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
+}
+
 /** Recognize recording files without mistaking TypeScript's video/mp2t MIME for video. */
 export function isVideoFile(path: string, contentType?: string | null): boolean {
   const type = contentType?.split(";")[0].trim().toLowerCase();

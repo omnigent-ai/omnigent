@@ -83,7 +83,124 @@ def _seed_video(session: BrowserSession, recording: bytes, *, fail: bool = False
         route.fulfill(status=503 if fail else 200, content_type="video/webm", body=recording)
 
     session.contract.route(f"{session.contract.base_url}{api}/filesystem/demo.webm?*", serve)
+    session.contract.json(
+        f"{api}/filesystem/demo.webm.chapters.vtt", {"detail": "Not found"}, status=404
+    )
     return reads
+
+
+@pytest.mark.parametrize("width", [1600, 390])
+@pytest.mark.parametrize("entry", ["chat", "file-link", "deep-link", "files", "changes"])
+def test_recording_action_navigation(
+    page: Page, seeded_session: BrowserSession, recording: bytes, width: int, entry: str
+) -> None:
+    """Annotations seek a real recording and track native playback on each preview."""
+    session = seeded_session
+    reads = _seed_video(session, recording)
+    api = f"/v1/sessions/{session.session_id}/resources/environments/default"
+    content = (
+        "WEBVTT\n\n"
+        "00:00.000 --> 00:00.400\nOpen the app\n\n"
+        "00:00.500 --> 00:10.000\nVerify the result\n\n"
+        "00:16:39.000 --> 00:16:40.000\nOutside the recording\n"
+    )
+    session.contract.json(
+        f"{api}/filesystem/demo.webm.chapters.vtt",
+        {
+            "object": "session.environment.filesystem.file_content",
+            "path": "demo.webm.chapters.vtt",
+            "encoding": "utf-8",
+            "content_type": "text/vtt",
+            "bytes": len(content),
+            "content": content,
+        },
+    )
+    _post_message(session, "[Screen recording](demo.webm)")
+    page.set_viewport_size({"width": width, "height": 1000})
+    page.goto(
+        f"{session.contract.base_url}/c/{session.session_id}"
+        + ("?file=demo.webm" if entry == "deep-link" else "")
+    )
+    if entry == "file-link":
+        page.get_by_role("button", name="Screen recording", exact=True).click()
+    elif entry in {"files", "changes"}:
+        if width == 390:
+            page.get_by_role("banner").get_by_role(
+                "button", name="Conversation actions", exact=True
+            ).click()
+            page.get_by_role(
+                "menuitem", name="Files" if entry == "files" else re.compile(r"^Changes")
+            ).click()
+        else:
+            page.get_by_role("button", name="Expand right panel", exact=True).click()
+            page.get_by_role(
+                "tab", name="Files" if entry == "files" else re.compile(r"^Changes")
+            ).click()
+        page.get_by_role("button", name=re.compile(r"^demo.webm\b")).click()
+    title = "Screen recording" if entry == "chat" else "demo.webm"
+    actions = page.get_by_role("group", name=f"Recording actions: {title}", exact=True).filter(
+        visible=True
+    )
+    verify = actions.get_by_role("button", name=re.compile("Verify the result"))
+    expect(verify).to_be_visible()
+    assert not reads, "Annotations must not download video bytes"
+    verify.focus()
+    verify.press("Enter")
+    player = page.locator(f'video[aria-label="{title}"]:visible')
+    page.wait_for_function(
+        "el => el.readyState >= 2 && el.currentTime >= 0.5", arg=player.element_handle()
+    )
+    player.evaluate("el => el.pause()")
+    expect(verify).to_have_attribute("aria-current", "step")
+    expect(
+        actions.get_by_role("button", name=re.compile("Outside the recording"))
+    ).to_be_disabled()
+    player.evaluate("el => {el.currentTime = 0.1;}")
+    expect(actions.get_by_role("button", name=re.compile("Open the app"))).to_have_attribute(
+        "aria-current", "step"
+    )
+    player.evaluate("el => {el.currentTime = 0.45;}")
+    expect(actions.locator('[aria-current="step"]')).to_have_count(0)
+    verify.click()
+    page.wait_for_function(
+        "el => !el.seeking && Math.abs(el.currentTime - 0.5) < 0.1", arg=player.element_handle()
+    )
+    assert player.evaluate("el => el.paused"), "Seeking preserves paused playback"
+    vb, ab = player.bounding_box(), actions.bounding_box()
+    assert vb is not None and ab is not None
+    if width == 390:
+        assert ab["y"] >= vb["y"] + vb["height"]
+    elif entry == "chat":
+        assert ab["x"] >= vb["x"] + vb["width"]
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_optional_recording_annotations(
+    page: Page, seeded_session: BrowserSession, recording: bytes, truncated: bool
+) -> None:
+    """Malformed or truncated chapters preserve ordinary video playback."""
+    session = seeded_session
+    _seed_video(session, recording)
+    api = f"/v1/sessions/{session.session_id}/resources/environments/default"
+    session.contract.json(
+        f"{api}/filesystem/demo.webm.chapters.vtt",
+        {
+            "object": "session.environment.filesystem.file_content",
+            "path": "demo.webm.chapters.vtt",
+            "encoding": "utf-8",
+            "content_type": "text/vtt",
+            "bytes": 8,
+            "content": "WEBVTT\n\n00:00.000 --> 00:01.000\nPartial\n"
+            if truncated
+            else "bad header",
+            "truncated": truncated,
+        },
+    )
+    _post_message(session, "[Screen recording](demo.webm)")
+    page.goto(f"{session.contract.base_url}/c/{session.session_id}")
+    page.get_by_role("button", name="Play video: Screen recording").click()
+    _assert_playback(page, page.locator('video[aria-label="Screen recording"]'))
+    expect(page.get_by_role("group", name="Recording actions: Screen recording")).to_have_count(0)
 
 
 def _assert_playback(page: Page, player: Locator) -> None:
@@ -154,6 +271,7 @@ def test_workspace_recording_playback(
     play.click()
     player = page.locator(f'video[aria-label="{title}"]:visible')
     _assert_playback(page, player)
+    expect(page.get_by_role("group", name=re.compile("^Recording actions:"))).to_have_count(0)
     expect(player).to_have_attribute("src", re.compile(r"^blob:"))
     assert len(reads) == 1
 
