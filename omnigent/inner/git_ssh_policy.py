@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from pathlib import Path
 
 from omnigent.errors import OmnigentError
 
@@ -70,9 +69,9 @@ def parse_git_ssh_bindings(raw: object) -> list[GitSshBinding] | None:
         paths: dict[str, str] = {}
         for key in ("identity_file", "known_hosts_file"):
             value = entry.get(key)
-            if not isinstance(value, str) or not Path(value).expanduser().is_absolute():
+            if not isinstance(value, str) or not value.startswith("/") or "\x00" in value:
                 raise OmnigentError(f"{label}.{key} must be an absolute path")
-            paths[key] = str(Path(value).expanduser())
+            paths[key] = value
         raw_cidrs = entry.get("allowed_cidrs", [])
         if not isinstance(raw_cidrs, list) or any(not isinstance(v, str) for v in raw_cidrs):
             raise OmnigentError(f"{label}.allowed_cidrs must be a list of CIDRs")

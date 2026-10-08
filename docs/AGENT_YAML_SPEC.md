@@ -539,7 +539,8 @@ os_env:
 The `known_hosts_file` must contain one exact host key entry for `host`, for
 example `github.com ssh-ed25519 <public-key>`. Record the expected key through
 a trusted channel; do not accept an unverified `ssh-keyscan` result. Keep both
-files outside sandbox read and write paths. The same binding can be used from
+files outside sandbox read and write paths. Use literal absolute file paths;
+`~` is not expanded. The same binding can be used from
 `sys_os_shell` and sandboxed terminals. Run `git clone
 git@github.com:my-org/my-repo.git` or `git fetch` as usual. Add `push` to
 `operations` only for a write-capable key, and add separate bindings for
