@@ -1507,6 +1507,9 @@ def _build_session_response(
     )
 
 
+_WARNED_UNCONFIGURED_PRICING_PROVIDERS: set[str] = set()
+
+
 def _resolve_session_provider_entry(
     conv: Any,
 ) -> Any | None:
@@ -1532,9 +1535,8 @@ def _resolve_session_provider_entry(
         if agent is None:
             return None
         agent_cache = get_agent_cache()
-        # ``operator_authored`` (not merely ``session_id is None``) gates env
-        # expansion: a user-uploaded agent can have no session yet still be
-        # tenant input, so expanding its ``${VAR}`` would leak server secrets.
+        # Gate env expansion on operator_authored, not session_id: a user bundle
+        # can have no session yet still be tenant input whose ${VAR} must not expand.
         loaded = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
@@ -1543,8 +1545,6 @@ def _resolve_session_provider_entry(
         # and the synthesized web_fetch researcher use their own provider.
         executor = loaded.spec.executor
         if conv.sub_agent_name:
-            from omnigent.runtime.workflow import _find_spec_by_name
-
             sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
             if sub is not None and sub is not loaded.spec:
                 executor = sub.executor
@@ -1553,10 +1553,11 @@ def _resolve_session_provider_entry(
             return None
         providers = load_providers(load_config())
         entry = providers.get(auth.name)
-        if entry is None:
+        if entry is None and auth.name not in _WARNED_UNCONFIGURED_PRICING_PROVIDERS:
             # A declared provider absent from config silently reverts to
-            # default-provider pricing; surface it so persistent mispricing
-            # is operator-visible.
+            # default-provider pricing; warn once per name so persistent
+            # mispricing is visible without spamming this per-event path.
+            _WARNED_UNCONFIGURED_PRICING_PROVIDERS.add(auth.name)
             _logger.warning(
                 "session executor names provider %r but it is not configured; "
                 "pricing falls back to the default provider",

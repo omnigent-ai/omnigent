@@ -365,12 +365,18 @@ def fetch_model_pricing_with_provider(
         (e.g. via ``executor.auth: {type: provider, name: ...}``) should
         pass it here so sessions on non-default providers are priced
         correctly. Callers that omit it get default-provider pricing for
-        the harness family.
+        the harness family. ``harness`` must also be supplied; without it
+        the provider family cannot be resolved and the entry is ignored.
     :returns: A :class:`ModelPricing` (per-token rates), or ``None`` when
         pricing is unavailable.
     """
     # Step 1: Check provider config custom pricing first (configured rates take precedence)
     # Canonicalize harness to handle SDK executor spellings (claude_sdk -> claude-sdk)
+    if provider_entry is not None and harness is None:
+        _logger.debug(
+            "provider_entry supplied without harness; cannot resolve the pricing "
+            "family, falling through to catalog"
+        )
     if harness is not None:
         from omnigent.harness_aliases import canonicalize_harness
 
@@ -414,7 +420,9 @@ def fetch_model_pricing_with_provider(
             # provider_entry failing is a real misconfiguration, so log louder.
             if provider_entry is not None:
                 _logger.warning(
-                    "pricing lookup failed for explicit provider entry; using catalog",
+                    "pricing lookup failed for provider %r (model %r); using catalog",
+                    getattr(provider_entry, "name", None),
+                    model,
                     exc_info=True,
                 )
             else:

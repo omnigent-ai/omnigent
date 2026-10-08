@@ -859,9 +859,10 @@ def build_policy_engine(
                         _executor.auth.name,
                     )
             except Exception:
-                # Provider resolution must never break policy pricing; fall
-                # back to the default-provider lookup.
-                _logger.debug("named-provider lookup failed for pricing", exc_info=True)
+                # Provider resolution must never break policy pricing; fall back
+                # to the default-provider lookup. Warn, not debug: this runs once
+                # per policy build, so a broken config is worth surfacing.
+                _logger.warning("named-provider lookup failed for pricing", exc_info=True)
         token_pricing = fetch_model_pricing_with_provider(
             initial_model,
             provider_config=provider_config,

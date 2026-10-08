@@ -233,7 +233,9 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
-def test_fetch_pricing_with_explicit_provider_entry_beats_default():
+def test_fetch_pricing_with_explicit_provider_entry_beats_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """An explicit provider_entry uses that entry's rates, not the default's.
 
     This is the unit-level guard for the bug where _accumulate_session_usage
@@ -269,6 +271,12 @@ def test_fetch_pricing_with_explicit_provider_entry_beats_default():
             }
         }
     }
+
+    # catalog must not be consulted
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda _model: (_ for _ in ()).throw(AssertionError("catalog must not be called")),
+    )
 
     # Without provider_entry: returns the default (cheap) provider's rate.
     default_pricing = fetch_model_pricing_with_provider(

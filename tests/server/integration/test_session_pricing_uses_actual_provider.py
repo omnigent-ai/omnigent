@@ -81,7 +81,7 @@ _DEFAULT_PROVIDER_COST = (
 
 async def _create_agent_with_named_provider(client: httpx.AsyncClient) -> dict[str, Any]:
     """Create an agent bound to the ``expensive-named`` provider via
-    ``executor.auth`` and return its metadata (with ``_session_id``)."""
+    ``executor.auth`` and return its metadata."""
     bundle = build_agent_bundle(
         name="named-provider-agent",
         executor={
@@ -98,9 +98,7 @@ async def _create_agent_with_named_provider(client: httpx.AsyncClient) -> dict[s
     owning_session_id = resp.json()["session_id"]
     agent_resp = await client.get(f"/v1/sessions/{owning_session_id}/agent")
     assert agent_resp.status_code == 200, agent_resp.text
-    agent = agent_resp.json()
-    agent["_session_id"] = owning_session_id
-    return agent
+    return agent_resp.json()
 
 
 async def _create_session(client: httpx.AsyncClient, agent_id: str) -> dict[str, Any]:
@@ -265,9 +263,7 @@ def test_resolve_session_provider_entry_does_not_expand_user_bundle_env(
             auth=ProviderAuth(name="expensive-named"), config={"harness": "claude-sdk"}
         ),
     )
-    agent = Agent(
-        id="a1", created_at=0, name="user-agent", bundle_location="loc", kind="user"
-    )
+    agent = Agent(id="a1", created_at=0, name="user-agent", bundle_location="loc", kind="user")
     assert agent.session_id is None and agent.operator_authored is False
 
     captured: dict[str, Any] = {}
