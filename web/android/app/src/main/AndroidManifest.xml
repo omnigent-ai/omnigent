@@ -42,7 +42,11 @@
             </intent-filter>
         </activity>
 
-        <!-- Compatibility receiver for browsers that fall back from Auth Tab to Custom Tabs. -->
+        <!--
+          Compatibility receiver for browsers that fall back from Auth Tab to Custom Tabs: the
+          Databricks return page, and the native OIDC redirect (PKCE keeps an intercepted code
+          useless to any other app claiming the scheme).
+        -->
         <activity
             android:name=".OAuthCallbackActivity"
             android:exported="true">
@@ -62,6 +66,14 @@
                 <data
                     android:scheme="ai.omnigent.android"
                     android:host="mobile-redirect" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="ai.omnigent.android"
+                    android:sspPrefix="/oauth/callback" />
             </intent-filter>
         </activity>
 
