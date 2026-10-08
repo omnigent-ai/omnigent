@@ -379,7 +379,7 @@ def _content_only(tokens: list[str]) -> bool:
     )
 
 
-def _graphql_prs(result: object, *, field: str) -> list[PullRequestRef]:
+def _graphql_prs(result: object, *, field: str, allow_bare_url: bool) -> list[PullRequestRef]:
     """Read the validated mutation's response or an identity-only projection."""
     references: list[PullRequestRef] = []
     for obj in result_objects(result):
@@ -389,7 +389,7 @@ def _graphql_prs(result: object, *, field: str) -> list[PullRequestRef]:
         pr = mutation.get("pullRequest") if isinstance(mutation, dict) else None
         if isinstance(pr, dict) and (ref := pr_reference(pr.get("url"))):
             references.append(ref)
-    if not references:
+    if not references and allow_bare_url:
         for line in output_text(result).splitlines():
             if len(line.split()) == 1 and (ref := pr_reference(line.strip())):
                 references.append(ref)
@@ -432,13 +432,22 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         if not tokens or tokens[0] not in {"pr", "api"}:
             continue
         field = _graphql_create_field(tokens)
+        projection = (_flag(tokens, "--jq", "-q") or "").strip()
         ops.append(
             ShellPrOp(
                 tracks=_tracks_pr(tokens),
                 creates=_creates_pr(tokens),
                 target=_command_target(tokens),
                 content_only=_content_only(tokens),
-                parse_result=functools.partial(_graphql_prs, field=field) if field else None,
+                parse_result=(
+                    functools.partial(
+                        _graphql_prs,
+                        field=field,
+                        allow_bare_url=projection == f".data.{field}.pullRequest.url",
+                    )
+                    if field
+                    else None
+                ),
             )
         )
     return ops

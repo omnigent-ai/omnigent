@@ -1,4 +1,4 @@
-"""Real session resources refresh both PR surfaces after GraphQL creation.
+"""Session PR discovery and GraphQL creation populate both PR surfaces.
 
 This test owns its server and runner so their gh executable can be replaced
 without touching another environment. Git and the product run normally;
@@ -136,7 +136,9 @@ os_env:
         response.raise_for_status()
         session_id = response.json()["session_id"]
         httpx.patch(
-            f"{base_url}/v1/sessions/{session_id}", json={"runner_id": stack.runner_id}
+            f"{base_url}/v1/sessions/{session_id}",
+            json={"runner_id": stack.runner_id},
+            timeout=30,
         ).raise_for_status()
         yield base_url, session_id, model, binary
 
@@ -212,7 +214,9 @@ def test_pr_appears_in_composer_and_workspace(
     expect(rail.get_by_role("link", name=f"{_TITLE} #42")).to_have_attribute("href", _URL)
     expect(rail.get_by_text("Created from the active session checkout.")).to_be_visible()
     page.screenshot(path=str(tmp_path / "pr-displayed.png"), animations="disabled")
-    info = httpx.get(f"{base_url}/v1/sessions/{session_id}/resources/github", timeout=30).json()
+    response = httpx.get(f"{base_url}/v1/sessions/{session_id}/resources/github", timeout=30)
+    response.raise_for_status()
+    info = response.json()
     assert info["selected_pr_url"] == _URL
     assert info["repo"]["name_with_owner"] == "example/project"
     assert info["pr"]["head_ref"] == "contributor/topic"

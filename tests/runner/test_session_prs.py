@@ -1048,6 +1048,7 @@ def test_background_or_interrupted_shell_does_not_attach_target(result: dict) ->
             True,
         ),
         (["gh api repos/example/one/pulls -X POST", "gh pr create"], [A, B], True),
+        (["gh api repos/example/one/pulls -X POST --jq .body", "gh pr create"], [], True),
     ],
 )
 @pytest.mark.parametrize("reverse", [False, True])

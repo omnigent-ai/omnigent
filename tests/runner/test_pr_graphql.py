@@ -51,6 +51,22 @@ def test_graphql_create_tracks_returned_pr(wrapped: bool, projection: str | None
     assert created
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_graphql_and_cli_creations_preserve_both_identities(reverse: bool) -> None:
+    other = "https://github.com/example/another/pull/7"
+    commands = [
+        command(projection=".data.createPullRequest.pullRequest.url"),
+        "gh pr create -R example/another",
+    ]
+    references, created = extract_prs(
+        "shell",
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
+        URL + "\n" + other,
+    )
+    assert {ref.url for ref in references} == {URL, other}
+    assert created
+
+
 def test_native_graphql_creation_persists_explicit_repo_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -193,6 +209,15 @@ def test_graphql_errors_do_not_supply_pr_identity() -> None:
         {"command": command()},
         {"data": {"createPullRequest": None}, "errors": [{"message": URL}]},
     )
+    assert not references
+
+
+@pytest.mark.parametrize("projection", [None, ".data.createPullRequest.pullRequest"])
+def test_graphql_json_output_does_not_fall_back_to_unrelated_url(
+    projection: str | None,
+) -> None:
+    output = json.dumps({"data": {"createPullRequest": None}}) + "\n" + URL
+    references, _ = extract_prs("shell", {"command": command(projection=projection)}, output)
     assert not references
 
 
