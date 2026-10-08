@@ -100,6 +100,7 @@ export type OmnigentAnalyticsEvent =
  * access to the host app. Expose the content iframe before forwarding every load.
  */
 export interface HtmlPreviewFrameProps {
+  /** Prepared HTML includes an inline comment bridge; the frame's CSP must allow it. */
   htmlContent: string;
   iframeRef: Ref<HTMLIFrameElement>;
   onLoad: () => void;

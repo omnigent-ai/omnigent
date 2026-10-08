@@ -82,7 +82,9 @@ describe("HtmlCommentViewer", () => {
     const srcDoc = iframe.getAttribute("srcdoc") ?? "";
     expect(srcDoc).toContain("<p>Host artifact</p>");
     expect(srcDoc).toContain('<base target="_blank">');
-    expect(srcDoc).toContain("htmlCommentBridgeRuntime.js");
+    expect(srcDoc).toContain("<script data-omni-nonce=");
+    expect(srcDoc).toContain("omni-html-comment");
+    expect(srcDoc).not.toContain("htmlCommentBridgeRuntime.js");
 
     if (!iframe.contentWindow) throw new Error("Host preview has no content window");
     const postMessage = vi.spyOn(iframe.contentWindow, "postMessage");

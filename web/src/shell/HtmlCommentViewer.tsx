@@ -89,8 +89,11 @@ export function HtmlCommentViewer({
   onSetActiveSelection,
 }: HtmlCommentViewerProps) {
   const canEdit = useCanEdit(conversationId);
-  const loadBridgeExternally = useIsEmbedded();
+  const isEmbedded = useIsEmbedded();
   const HtmlPreviewFrame = getOmnigentHtmlPreviewFrame();
+  // Only the default srcdoc frame inherits the host CSP. Isolated host frames
+  // use the inline bridge to avoid cross-origin requests back to the host.
+  const loadBridgeExternally = isEmbedded && !HtmlPreviewFrame;
 
   // A fresh nonce + srcDoc per content load. The nonce key remounts either frame,
   // which re-runs the bridge and (via the new nonce) re-establishes
