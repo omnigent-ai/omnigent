@@ -15,7 +15,8 @@ filesystem PUT endpoint (no agent run).
 The filesystem PUT is text-only: latin-1 is rejected because the writer
 decodes as UTF-8. The binary 3MF is written to the workspace root returned
 by the environment API, then checked byte-for-byte through the raw GET.
-Coloured cases skip if that root is not local: binary seeding needs a same-host workspace.
+Coloured cases skip a nonlocal root only with an external server configured;
+local spawned servers must provide a same-host workspace for binary seeding.
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ import httpx
 import pytest
 from PIL import Image
 from playwright.sync_api import Page, expect
+
+from tests.helpers.ui_configuration import prepared_repro_environment
 
 # ---------------------------------------------------------------------------
 # Test fixtures — tiny, valid single-triangle models
@@ -222,6 +225,7 @@ def test_coloured_3mf_keeps_filament_hues_across_themes(
     page: Page,
     seeded_session: tuple[str, str],
     theme: str,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Filament hues survive initial themes and a live Settings theme toggle."""
     base_url, session_id = seeded_session
@@ -242,8 +246,13 @@ def test_coloured_3mf_keeps_filament_hues_across_themes(
     )
     response.raise_for_status()
     workspace = Path(response.json()["metadata"]["root"])
-    if not workspace.is_absolute() or not workspace.is_dir():
+    external = (
+        request.config.getoption("--ui-base-url")
+        or prepared_repro_environment()["OMNIGENT_REPRO_SERVER_URL"]
+    )
+    if external and (not workspace.is_absolute() or not workspace.is_dir()):
         pytest.skip("binary seeding needs a same-host workspace; filesystem PUT is text-only")
+    assert workspace.is_absolute() and workspace.is_dir()
     (workspace / file_path).write_bytes(blob)
     response = httpx.get(file_url, params={"download": "true"}, timeout=10.0)
     response.raise_for_status()
