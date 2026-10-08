@@ -11,7 +11,14 @@ import {
   ZipDeflate,
   ZipPassThrough,
 } from "three/examples/jsm/libs/fflate.module.js";
-import { applyThreeMfColors, INFLATE_CHUNK_BYTES, MAX_SELECTED_BYTES } from "./threeMfColors";
+import {
+  applyThreeMfColors,
+  INFLATE_CHUNK_BYTES,
+  MAX_SELECTED_BYTES,
+  MAX_EMITTED_RATIO,
+  MAX_EMITTED_OVERHEAD,
+  MAX_EMITTED_BYTES,
+} from "./threeMfColors";
 
 const core = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 const production = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06";
@@ -131,8 +138,7 @@ function check(
   return rows;
 }
 
-function multibyteVariants(note: string) {
-  const count = 6;
+function multibyteVariants(note: string, count = 6) {
   return archive({
     "3D/root.model": model(
       mesh(1).replace("<mesh>", `<metadata name="note">${note}</metadata><mesh>`) +
@@ -773,10 +779,131 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     check(input);
   });
 
+  it.each([false, true])(
+    "indexes source mesh presence for repeated components=%s",
+    (components) => {
+      const count = 128;
+      const input = archive({
+        "3D/root.model": model(
+          mesh(1).replace("<mesh>", `${'<metadata name="bulk">x</metadata>'.repeat(count)}<mesh>`) +
+            mesh(2, 2) +
+            (components
+              ? composite(
+                  100,
+                  Array.from({ length: count }, (_, index) => component(1, index * 10)).join("") +
+                    component(2, count * 10),
+                )
+              : ""),
+          components
+            ? '<item objectid="100"/>'
+            : Array.from(
+                { length: count },
+                (_, index) => `<item objectid="1" transform="${transform(index * 10)}"/>`,
+              ).join("") + `<item objectid="2" transform="${transform(count * 10)}"/>`,
+        ),
+        "Metadata/model_settings.config": `<config>${
+          components
+            ? config(part(1, 1) + part(2, 2))
+            : config(part(1, 1), undefined, 1) + config(part(2, 2), undefined, 2)
+        }</config>`,
+      });
+      const getter = Object.getOwnPropertyDescriptor(Element.prototype, "children")!.get!;
+      let visits = 0;
+      const observer = vi.spyOn(Element.prototype, "children", "get").mockImplementation(function (
+        this: Element,
+      ) {
+        const result = getter.call(this) as HTMLCollection;
+        if (
+          this.localName === "object" &&
+          this.firstElementChild?.getAttribute("name") === "bulk"
+        ) {
+          visits += result.length;
+          if (visits > count * 8) throw new Error("Repeated source mesh scan");
+        }
+        return result;
+      });
+      try {
+        check(
+          input,
+          [...Array(count).fill("f53b9d"), "4dc5a0"],
+          Array.from({ length: count + 1 }, (_, index) => index * 10),
+          [...Array(count).fill(1), 2],
+        );
+        expect(visits).toBeLessThan(count * 8);
+      } finally {
+        observer.mockRestore();
+      }
+    },
+  );
+
+  it("recolours three ShareMesh copies larger than one MiB in different filaments", () => {
+    const shared = mesh(1).replace('x="0"', `x="0.${"0".repeat(1200 * 1024)}"`);
+    const input = archive({
+      "3D/root.model": model(
+        [100, 101, 102]
+          .map((id, index) => composite(id, component(1, index * 10, "/3D/shared.model")))
+          .join(""),
+        [100, 101, 102].map((id) => `<item objectid="${id}"/>`).join(""),
+      ),
+      "3D/shared.model": model(shared, ""),
+      "Metadata/model_settings.config": `<config>${[100, 101, 102].map((id, index) => config(part(1, index + 1), undefined, id)).join("")}</config>`,
+    });
+    const selected = Object.values(unzipSync(new Uint8Array(input))).reduce(
+      (sum, bytes) => sum + bytes.length,
+      0,
+    );
+    expect(selected).toBeGreaterThan(1024 * 1024);
+    const normalized = applyThreeMfColors(input);
+    expect(normalized).not.toBe(input);
+    const outputBytes = unzipSync(new Uint8Array(normalized))["3D/3dmodel.model"].length;
+    expect(outputBytes).toBeGreaterThan(selected * 2 + MAX_EMITTED_OVERHEAD);
+    expect(outputBytes).toBeLessThan(selected * 3 + MAX_EMITTED_OVERHEAD);
+    expect(outputBytes).toBeLessThan(MAX_EMITTED_BYTES);
+    const rows = rendered(normalized);
+    expect(rows.map((row) => row.hex)).toEqual(["f53b9d", "4dc5a0", "212329"]);
+    expect(rows.map((row) => row.min)).toEqual([
+      [0, 0, 0],
+      [10, 0, 0],
+      [20, 0, 0],
+    ]);
+    expect(rows.map((row) => row.max)).toEqual([
+      [1, 2, 3],
+      [11, 2, 3],
+      [21, 2, 3],
+    ]);
+  });
+
+  it("reserves generated appearance bytes before serializing a near-budget model", () => {
+    const count = MAX_EMITTED_RATIO + 1;
+    const admitted = multibyteVariants("x".repeat(64), count);
+    check(
+      admitted,
+      ["112233", "223344", "334455", "445566", "556677"],
+      [0, 10, 20, 30, 40],
+      Array(count).fill(1),
+    );
+    const empty = multibyteVariants("", count);
+    const selected = Object.values(unzipSync(new Uint8Array(empty))).reduce(
+      (sum, bytes) => sum + bytes.length,
+      0,
+    );
+    const outputSize = unzipSync(new Uint8Array(applyThreeMfColors(empty)))["3D/3dmodel.model"]
+      .length;
+    const length = selected * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD - outputSize + 1;
+    const input = multibyteVariants("x".repeat(length), count);
+    const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+    try {
+      expect(applyThreeMfColors(input)).toBe(input);
+      expect(serializer).not.toHaveBeenCalled();
+    } finally {
+      serializer.mockRestore();
+    }
+  });
+
   it("reserves rewritten ID growth before serializing near-budget references", () => {
     const fixture = (length: number, count: number, components: boolean) => {
       const dummyIds = Array.from({ length: 8 }, (_, index) => index + 20);
-      const composites = [100, 101, 102];
+      const composites = [100, 101, 102, 103, 104];
       return archive({
         "3D/root.model": model(
           dummyIds.map((id) => mesh(id)).join("") +
@@ -795,9 +922,17 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     [false, true].forEach((components) => {
       check(
         fixture(32, 8, components),
-        [...Array(8).fill("ffffff"), "f53b9d", "4dc5a0", "212329", ...Array(8).fill("f53b9d")],
-        Array(19).fill(0),
-        Array(19).fill(1),
+        [
+          ...Array(8).fill("ffffff"),
+          "f53b9d",
+          "4dc5a0",
+          "212329",
+          "ff7a18",
+          "fefefe",
+          ...Array(8).fill("f53b9d"),
+        ],
+        Array(21).fill(0),
+        Array(21).fill(1),
       );
       const base = fixture(0, 2400, components);
       const selected = Object.values(unzipSync(new Uint8Array(base))).reduce(
@@ -807,9 +942,9 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       const normalized = applyThreeMfColors(base);
       expect(normalized).not.toBe(base);
       const outputSize = unzipSync(new Uint8Array(normalized))["3D/3dmodel.model"].length;
-      const length = selected * 2 + 1024 * 1024 - outputSize + 1;
+      const length = selected * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD - outputSize + 1;
       const input = fixture(length, 2400, components);
-      const budget = (selected + length) * 2 + 1024 * 1024;
+      const budget = (selected + length) * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD;
       const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
       try {
         expect(applyThreeMfColors(input)).toBe(input);
@@ -885,14 +1020,20 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       Array.from({ length: count }, (_, index) => index * 10),
       Array.from({ length: count }, () => 1),
     );
-    const input = fixture("x".repeat(1024 * 1024));
+    const payloadBytes = 64 * 1024;
+    const input = fixture("x".repeat(payloadBytes));
+    const selected = Object.values(unzipSync(new Uint8Array(input))).reduce(
+      (sum, bytes) => sum + bytes.length,
+      0,
+    );
+    const budget = Math.min(selected * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD, MAX_EMITTED_BYTES);
     const importer = vi.spyOn(Document.prototype, "importNode");
     try {
       expect(applyThreeMfColors(input) === input).toBe(true);
       const meshCopies = importer.mock.calls.filter(
         ([node]) => node instanceof Element && node.querySelector("mesh"),
       );
-      expect(meshCopies.length).toBeLessThan(32);
+      expect(meshCopies.length).toBeLessThan(Math.floor(budget / payloadBytes));
     } finally {
       importer.mockRestore();
     }
@@ -913,14 +1054,14 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       [0, 10, 20, 30, 40, 50],
       Array(6).fill(1),
     );
-    const input = multibyteVariants("漢".repeat(150_000));
+    const input = multibyteVariants("漢".repeat(200_000));
     const importer = vi.spyOn(Document.prototype, "importNode");
     try {
       expect(applyThreeMfColors(input) === input).toBe(true);
       const copies = importer.mock.calls.filter(
         ([node]) => node instanceof Element && node.querySelector("mesh"),
       );
-      expect(copies.length).toBeLessThan(4);
+      expect(copies.length).toBeLessThan(5);
     } finally {
       importer.mockRestore();
     }
@@ -937,7 +1078,7 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     );
     const bytes = unzipSync(new Uint8Array(normalized))["3D/3dmodel.model"];
     expect(bytes.byteLength).toBeGreaterThan(strFromU8(bytes).length);
-    expect(bytes.byteLength).toBeLessThan(selected * 2 + 1024 * 1024);
+    expect(bytes.byteLength).toBeLessThan(selected * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD);
     const rows = rendered(normalized);
     expect(rows.map((row) => row.hex)).toEqual([
       "112233",
@@ -949,7 +1090,7 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     ]);
     expect(rows.map((row) => row.min)).toEqual([0, 10, 20, 30, 40, 50].map((x) => [x, 0, 0]));
     expect(rows.map((row) => row.max)).toEqual([1, 11, 21, 31, 41, 51].map((x) => [x, 2, 3]));
-    const oversized = multibyteVariants("aé漢🦄".repeat(50_000));
+    const oversized = multibyteVariants("aé漢🦄".repeat(60_000));
     expect(applyThreeMfColors(oversized) === oversized).toBe(true);
     check(oversized, Array(6).fill("ffffff"), [0, 10, 20, 30, 40, 50], Array(6).fill(1));
   });
