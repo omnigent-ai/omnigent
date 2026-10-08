@@ -132,6 +132,21 @@ def test_graphql_creation_with_targeted_edit_keeps_both_prs(
 
 
 @pytest.mark.parametrize(
+    "body_argument",
+    ["--body '>'", '--body "<"', r"--body \>", "--body='>'", r"--body=\>", "--body '>>'"],
+)
+def test_quoted_redirect_arguments_do_not_suppress_creation(body_argument: str) -> None:
+    other = "https://github.com/example/other/pull/7"
+    references, created = extract_prs(
+        "shell",
+        {"command": command() + f"; gh pr edit 7 -R example/other {body_argument}"},
+        {"exit_code": 0, "stdout": creation_output(None) + "\n" + other},
+    )
+    assert {ref.url for ref in references} == {URL, other}
+    assert not created
+
+
+@pytest.mark.parametrize(
     "shell_pattern",
     [
         "{create}; cat saved-pr-output.txt",
@@ -208,16 +223,26 @@ def test_graphql_assignment_prefix_does_not_hide_an_output_command() -> None:
     assert [ref.url for ref in references] == [edited]
 
 
-def test_graphql_checkout_preparation_keeps_creation_identity() -> None:
+@pytest.mark.parametrize("hook_pr_url", [False, True], ids=["no-hook-url", "hook-url"])
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_graphql_checkout_preparation_checks_output_ambiguity(
+    projection: str | None, hook_pr_url: bool
+) -> None:
+    prefix = "https://github.com/example/other/pull/7\n" if hook_pr_url else ""
     references, created = extract_prs(
         "shell",
         {
             "command": "set -euo pipefail; cd /repo; git -C /repo add . && "
-            "git -C /repo commit -m 'A change' && git -C /repo push && " + command()
+            "git -C /repo commit -m 'A change' && git -C /repo push && "
+            + command(projection=projection)
         },
-        {"exit_code": 0, "stdout": creation_output(None)},
+        {"exit_code": 0, "stdout": prefix + creation_output(projection)},
     )
-    assert [ref.url for ref in references] == [URL]
+    ambiguous = hook_pr_url and projection == ".data.createPullRequest.pullRequest.url"
+    assert [ref.url for ref in references] == ([] if ambiguous else [URL])
     assert created
 
 

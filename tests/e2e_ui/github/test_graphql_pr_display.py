@@ -22,7 +22,7 @@ from playwright.sync_api import Page, expect
 
 from dev.repro_env.runtime import isolated_env
 from tests._helpers.server_runner import server_runner
-from tests._helpers.session import bundle_files, post_session_bundle
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _URL = "https://github.com/example/project/pull/42"
@@ -158,11 +158,7 @@ os_env:
         )
         response.raise_for_status()
         session_id = response.json()["session_id"]
-        httpx.patch(
-            f"{base_url}/v1/sessions/{session_id}",
-            json={"runner_id": stack.runner_id},
-            timeout=30,
-        ).raise_for_status()
+        bind_session_runner(httpx.patch, base_url, session_id, stack.runner_id, timeout=30)
         yield base_url, session_id, model, binary
 
 

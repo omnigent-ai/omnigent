@@ -49,10 +49,11 @@ def _failed(result: object) -> bool:
     return False
 
 
-def _join_shell_lines(command: str) -> str:
-    """Apply shell line continuations while preserving single-quoted literals."""
+def _prepare_shell_text(command: str) -> tuple[str, bool]:
+    """Join shell continuations and detect unquoted redirection without changing argv."""
     result: list[str] = []
     quote: str | None = None
+    redirected = False
     index = 0
     while index < len(command):
         char = command[index]
@@ -70,6 +71,8 @@ def _join_shell_lines(command: str) -> str:
             result.append(command[index:end])
             index = end
             continue
+        if quote is None and char in "<>":
+            redirected = True
         if char in {"'", '"'}:
             if quote is None:
                 quote = char
@@ -77,7 +80,7 @@ def _join_shell_lines(command: str) -> str:
                 quote = None
         result.append(char)
         index += 1
-    return "".join(result)
+    return "".join(result), redirected
 
 
 def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
@@ -89,18 +92,13 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
     if depth > MAX_SHELL_NESTING:
         return []
     found: list[ShellSegment] = []
-    joined = _join_shell_lines(command)
+    joined, redirected = _prepare_shell_text(command)
     lexer = shlex.shlex(joined, posix=True, punctuation_chars=";&|\n")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     segments: list[list[str]] = [[]]
+    output_eligible = not redirected
     try:
-        # Keep redirect file descriptors out of argv so they cannot become PR numbers.
-        redirects = shlex.shlex(joined, posix=True, punctuation_chars="<>")
-        redirects.whitespace_split = True
-        output_eligible = not any(
-            token and all(char in "<>" for char in token) for token in redirects
-        )
         for token in lexer:
             if token == "||":
                 return []
