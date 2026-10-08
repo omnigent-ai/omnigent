@@ -1012,6 +1012,39 @@ def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
     assert out == []
 
 
+def test_claude_provider_survives_cyclic_plugin_cache_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``plugins/cache`` symlink loop skips only the plugins behind it."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    cfg = tmp_path / "profile"
+    (cfg / "plugins").mkdir(parents=True)
+    (cfg / "plugins" / "cache").symlink_to("cache")
+    ordinary = cfg / "plugins" / "ordinary" / "sp" / "1.0.0"
+    _write_skill(ordinary / "skills", "using-superpowers")
+    looped = cfg / "plugins" / "cache" / "mkt" / "cached" / "1.0.0"
+    (cfg / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"sp@mkt": True, "cached@mkt": True}})
+    )
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {
+                    "sp@mkt": [{"installPath": str(ordinary)}],
+                    "cached@mkt": [{"installPath": str(looped)}],
+                },
+            }
+        )
+    )
+
+    out = resolve_harness_skills(
+        _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
+    )
+    assert [s.name for s in out] == ["sp:using-superpowers"]
+
+
 def test_cursor_provider_tolerates_unreadable_skills_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
