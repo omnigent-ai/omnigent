@@ -8,26 +8,41 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { JSDOM } = require("jsdom");
 
-it("renders consent, sign-in, retry, and completion", (t) => {
+/**
+ * Load the console page in JSDOM behind a fake `arcaConnect` bridge (Electron
+ * supplies the real one; no remote process is launched by a renderer test).
+ * Returns the main→page event senders. A fake xterm `Terminal` mounts the
+ * output pane synchronously; without one it stays hidden.
+ */
+function loadConsolePage(t, { Terminal } = {}) {
   const dom = new JSDOM(
     fs.readFileSync(path.join(__dirname, "../arca-connect/index.html"), "utf8"),
-    {
-      runScripts: "outside-only",
-    },
+    { runScripts: "outside-only" },
   );
   t.after(() => dom.window.close());
   const events = {};
-  let confirms = 0;
-  // Electron supplies this bridge; no remote process is launched by a renderer test.
-  dom.window.arcaConnect = { confirm: () => confirms++, cancel() {} };
+  const bridge = { confirms: 0, confirm: () => bridge.confirms++, cancel() {} };
   for (const event of ["Init", "Started", "Output", "Done"]) {
-    dom.window.arcaConnect[`on${event}`] = (listener) => {
+    bridge[`on${event}`] = (listener) => {
       events[event] = listener;
     };
   }
-  dom.window.requestAnimationFrame = () => {};
+  dom.window.arcaConnect = bridge;
+  dom.window.requestAnimationFrame = Terminal ? (callback) => callback() : () => {};
+  if (Terminal) {
+    dom.window.Terminal = Terminal;
+    dom.window.FitAddon = {
+      FitAddon: class {
+        fit() {}
+      },
+    };
+  }
   dom.window.eval(fs.readFileSync(path.join(__dirname, "../arca-connect/console.js"), "utf8"));
-  const document = dom.window.document;
+  return { window: dom.window, document: dom.window.document, events, bridge };
+}
+
+it("renders consent, sign-in, retry, and completion", (t) => {
+  const { document, events, bridge } = loadConsolePage(t);
   const confirm = document.getElementById("confirm");
   const command = document.getElementById("command");
   events.Init({
@@ -47,7 +62,7 @@ it("renders consent, sign-in, retry, and completion", (t) => {
   assert.equal(confirm.textContent, "Sign in and retry");
   assert.equal(document.activeElement, confirm);
   confirm.click();
-  assert.equal(confirms, 2);
+  assert.equal(bridge.confirms, 2);
   events.Started({ login: true, command: "login command" });
   assert.equal(command.textContent, "login command");
   assert.equal(confirm.textContent, "Signing in…");
@@ -61,6 +76,48 @@ it("renders consent, sign-in, retry, and completion", (t) => {
   assert.match(document.getElementById("status").textContent, /Connected/);
 });
 
+it("keeps the failure text selectable and lets the copy shortcut copy terminal output", (t) => {
+  let term = null;
+  class FakeTerminal {
+    constructor() {
+      term = this;
+      this.selected = false;
+      this.keyHandler = null;
+    }
+    loadAddon() {}
+    open() {}
+    write() {}
+    hasSelection() {
+      return this.selected;
+    }
+    attachCustomKeyEventHandler(handler) {
+      this.keyHandler = handler;
+    }
+  }
+  const { window, document, events } = loadConsolePage(t, { Terminal: FakeTerminal });
+  events.Init({ serverUrl: "https://srv.example.com", command: "host command" });
+  events.Started({ login: false, command: "host command" });
+  events.Output("Error: OMNIGENT_AUTH_REQUIRED\n");
+  events.Done({ ok: false, error: "Run `isaac omni login` on this machine, then retry." });
+
+  const userSelect = (id) => window.getComputedStyle(document.getElementById(id)).userSelect;
+  assert.equal(window.getComputedStyle(document.body).userSelect, "none");
+  assert.equal(userSelect("console"), "text");
+  assert.equal(userSelect("status"), "text");
+
+  // `false` leaves the event to the browser's native copy; `true` lets xterm handle it.
+  const key = (type, init) => new window.KeyboardEvent(type, init);
+  term.selected = true;
+  assert.equal(term.keyHandler(key("keydown", { key: "c", ctrlKey: true })), false);
+  assert.equal(term.keyHandler(key("keydown", { key: "c", metaKey: true })), false);
+  assert.equal(term.keyHandler(key("keyup", { key: "c", ctrlKey: true })), false);
+  assert.equal(term.keyHandler(key("keydown", { key: "c", ctrlKey: true, altKey: true })), true);
+  assert.equal(term.keyHandler(key("keydown", { key: "v", ctrlKey: true })), true);
+  assert.equal(term.keyHandler(key("keydown", { key: "c" })), true);
+  term.selected = false;
+  assert.equal(term.keyHandler(key("keydown", { key: "c", ctrlKey: true })), true);
+});
+
 /** A fake Electron world: BrowserWindow + ipcMain + a controllable connect. */
 function flowHarness() {
   const world = {
@@ -68,6 +125,7 @@ function flowHarness() {
     ipc: new EventEmitter(),
     connects: [],
     logins: [],
+    popups: [],
   };
 
   class FakeWindow extends EventEmitter {
@@ -109,6 +167,13 @@ function flowHarness() {
   }
   const flow = createArcaConnectFlow({
     BrowserWindow: FakeWindow,
+    Menu: {
+      buildFromTemplate: (template) => ({
+        popup: (options) => {
+          world.popups.push({ template, options });
+        },
+      }),
+    },
     ipcMain: {
       on: (channel, fn) => world.ipc.on(channel, fn),
     },
@@ -303,5 +368,15 @@ describe("arca connect console flow", () => {
     // After settling, a new run opens a fresh console.
     void flow.run(null, "https://srv.example.com");
     assert.equal(world.windows.length, 2);
+  });
+
+  it("offers Copy from the right-click menu only over selected text", () => {
+    const { world, flow } = flowHarness();
+    void flow.run(null, "https://srv.example.com");
+    const win = world.windows[0];
+    win.webContents.emit("context-menu", {}, { selectionText: " " });
+    assert.equal(world.popups.length, 0);
+    win.webContents.emit("context-menu", {}, { selectionText: "arca ssh isaac omni host …" });
+    assert.deepEqual(world.popups, [{ template: [{ role: "copy" }], options: { window: win } }]);
   });
 });

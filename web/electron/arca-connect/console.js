@@ -49,6 +49,11 @@ window.arcaConnect.onStarted(({ login, command }) => {
 let term = null;
 let fitAddon = null;
 
+/** Ctrl+C / Cmd+C, on any of the keydown/keypress/keyup events xterm forwards. */
+function isCopyShortcut(event) {
+  return (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "c";
+}
+
 function ensureTerminal() {
   if (term !== null) return term;
   term = new window.Terminal({
@@ -58,6 +63,9 @@ function ensureTerminal() {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
     theme: { background: "#0d1117", foreground: "#e6edf3" },
   });
+  // xterm swallows Ctrl+C as ETX and drops the selection; hand the copy
+  // shortcut back to the browser so it copies the selected output instead.
+  term.attachCustomKeyEventHandler((event) => !(isCopyShortcut(event) && term.hasSelection()));
   fitAddon = new window.FitAddon.FitAddon();
   term.loadAddon(fitAddon);
   term.open(terminalEl);
