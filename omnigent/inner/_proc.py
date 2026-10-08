@@ -432,6 +432,7 @@ def run_isolated(
     :param popen_kwargs: Remaining :class:`subprocess.Popen` keyword arguments
         (``stdin``, ``text``, ``env``, ...).
     :returns: The completed process; a non-zero exit is returned, not raised.
+    :raises ValueError: For ``capture_output`` conflicts or kwargs this helper owns.
     :raises subprocess.TimeoutExpired: After the tree has been killed.
     :raises OSError: When the child cannot be started.
     """
@@ -440,7 +441,11 @@ def run_isolated(
             raise ValueError("stdout and stderr arguments may not be used with capture_output.")
         popen_kwargs["stdout"] = subprocess.PIPE
         popen_kwargs["stderr"] = subprocess.PIPE
-    with subprocess.Popen(args, **popen_kwargs, **spawn_kwargs()) as process:
+    isolation = spawn_kwargs()
+    conflicts = popen_kwargs.keys() & isolation.keys()
+    if conflicts:
+        raise ValueError(f"run_isolated manages process isolation; remove {sorted(conflicts)}")
+    with subprocess.Popen(args, **popen_kwargs, **isolation) as process:
         remember_process_group(process)
         try:
             stdout, stderr = process.communicate(timeout=timeout)

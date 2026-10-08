@@ -780,8 +780,7 @@ def _parse_harness_cli_version(text: str) -> str | None:
 # CLI can't stall the refresh — and, through it, the host tunnel's keepalive.
 # The readiness cap matches goose's status-probe budget (``_INFO_TIMEOUT_S``):
 # enough for a healthy ``auth status`` keychain read / token refresh, short
-# enough that a wedged CLI fails fast. Probes run through ``run_isolated`` so a
-# timeout tears down the CLI's descendants instead of leaking them to the daemon.
+# enough that a wedged CLI fails fast.
 _DEFAULT_CLI_PROBE_TIMEOUT_S = 30.0
 READINESS_CLI_PROBE_TIMEOUT_S = 10.0
 
