@@ -38,6 +38,7 @@ workspace: only the owner's workspace-relative reads reach the runner marked
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -600,12 +601,32 @@ async def test_filesystem_absolute_delete_is_owner_only(
     runner_client: _RecordingRunnerClient,
     caller: str,
     expected: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Destructive operations outside the workspace are owner-only too."""
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"unchanged until confirmed")
     resp = await client.request("DELETE", _FS_ABSOLUTE, headers={"X-Forwarded-Email": caller})
 
-    assert resp.status_code == expected, resp.text
+    assert victim.read_bytes() == b"unchanged until confirmed"
+    assert resp.status_code == (502 if expected == 200 else expected), resp.text
     assert bool(runner_client.deletes) is (expected == 200)
+    if expected == 200:
+
+        async def confirmed_delete(url: str, *, timeout: float | None = None) -> httpx.Response:
+            del timeout
+            victim.unlink()
+            return httpx.Response(
+                status_code=200,
+                json={"deleted": True, "operation": "delete", "type": "file", "bytes_deleted": 25},
+                request=httpx.Request("DELETE", url),
+            )
+
+        monkeypatch.setattr(runner_client, "delete", confirmed_delete)
+        resp = await client.request("DELETE", _FS_ABSOLUTE, headers={"X-Forwarded-Email": caller})
+        assert resp.status_code == 200
+        assert not victim.exists()
 
 
 @pytest.mark.asyncio

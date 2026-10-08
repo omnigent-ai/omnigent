@@ -304,6 +304,9 @@ def register_resource_routes(
                 if os.path.isabs(home):
                     metadata["home"] = home
                 metadata["reachable"] = _environment_reach(root, agent_spec)
+                from omnigent.inner.os_env import workspace_delete_metadata
+
+                metadata["workspace_delete"] = workspace_delete_metadata()
                 content = {**content, "metadata": metadata}
         return JSONResponse(
             status_code=200,
@@ -1534,7 +1537,7 @@ def register_resource_routes(
         )
         fs = CallerProcessFilesystem(env)
         result = await fs.delete(relative_path, recursive=recursive)
-        if filesystem_registry is not None and result.type == "file":
+        if filesystem_registry is not None and result.type in ("file", "symlink"):
             filesystem_registry.record_change(relative_path, "deleted", session_id)
         return JSONResponse(
             status_code=200,

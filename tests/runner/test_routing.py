@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 import pytest
 
@@ -12,6 +13,7 @@ from omnigent.runner.routing import RunnerRouter, runner_dispatch_harness
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.spec import AgentSpec, ExecutorSpec, LLMConfig
+from omnigent.stores import ConversationStore
 
 
 class _FakeWebSocket:
@@ -283,6 +285,30 @@ async def test_runner_router_resources_reuses_preloaded_conversation() -> None:
         )
 
         assert routed.runner_id == "runner_one"
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resource_routing_carries_only_the_pinned_runners_delete_capability() -> None:
+    registry = TunnelRegistry()
+    hello = _hello(harnesses=["codex"])
+    hello.capabilities.append("workspace_delete_nofollow_v1")
+    registry.register("capable", _FakeWebSocket(), hello)
+    registry.register("old", _FakeWebSocket(), _hello(harnesses=["codex"]))
+    conversation = _conversation(runner_id="old")
+    router = RunnerRouter(
+        registry=registry,
+        conversation_store=cast(
+            ConversationStore, _ConversationStore({"conv_test": conversation})
+        ),
+    )
+    try:
+        assert router.client_for_session_resources("conv_test").capabilities == ()
+        conversation.runner_id = "capable"
+        assert router.client_for_session_resources("conv_test").capabilities == (
+            "workspace_delete_nofollow_v1",
+        )
     finally:
         await router.aclose()
 

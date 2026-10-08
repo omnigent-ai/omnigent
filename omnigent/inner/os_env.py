@@ -6,15 +6,17 @@ import atexit
 import base64
 import codecs
 import contextlib
+import errno
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
@@ -77,6 +79,64 @@ OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # A single ``edit`` list entry — an {oldText, newText} pair of strings.
 EditEntry: TypeAlias = dict[str, str]
+
+CAP_WORKSPACE_DELETE = "workspace_delete_nofollow_v1"
+SAFE_WORKSPACE_DELETE_SUPPORTED = (
+    all(operation in os.supports_dir_fd for operation in (os.open, os.stat, os.unlink, os.rmdir))
+    and os.stat in os.supports_follow_symlinks
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+)
+
+
+def workspace_delete_metadata() -> dict[str, object]:
+    """Advertise whether this platform can safely delete workspace entries."""
+    if SAFE_WORKSPACE_DELETE_SUPPORTED:
+        return {"available": True}
+    return {
+        "available": False,
+        "reason": "No-follow workspace delete is unsupported on this platform",
+    }
+
+
+class _WorkspaceRootChanged(RuntimeError):
+    """The environment root no longer names its original directory."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Workspace root changed since environment creation; "
+            "create a new environment before deleting"
+        )
+
+
+@contextlib.contextmanager
+def _open_parent_beneath(
+    root: Path,
+    relative_path: str,
+    *,
+    nofollow_root: bool = False,
+    root_identity: tuple[int, int] | None = None,
+) -> Iterator[tuple[int, str]]:
+    """Keep a no-follow parent descriptor open through a leaf operation."""
+    parts = relative_path.split("/")
+    root_flags = os.O_RDONLY | os.O_DIRECTORY
+    if nofollow_root:
+        root_flags |= os.O_NOFOLLOW
+    descriptor = os.open(root, root_flags)
+    try:
+        if root_identity is not None:
+            root_stat = os.fstat(descriptor)
+            if (root_stat.st_dev, root_stat.st_ino) != root_identity:
+                raise _WorkspaceRootChanged()
+        for name in parts[:-1]:
+            next_descriptor = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=descriptor
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        yield descriptor, parts[-1]
+    finally:
+        os.close(descriptor)
 
 
 class _PopenKwargs(TypedDict, total=False):
@@ -349,6 +409,11 @@ class OSEnvironment(ABC):
     ) -> OpResult:
         raise NotImplementedError
 
+    async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
+        """Refuse deletion unless the environment implements the helper operation."""
+        del path, recursive
+        return {"error": "This environment does not support safe delete", "code": "unsupported"}
+
     def prepare_sandbox(self, policy: SandboxPolicy) -> None:
         """Attach environment-owned resources before launching a consumer."""
         if policy.copy_on_write_roots:
@@ -418,11 +483,24 @@ class _HelperProcessClient:
         self._egress_handle: EgressProxyHandle | None = None
         self._lock = threading.Lock()
         self._closed = False
+        if self._copy_on_write_environment is not None:
+            self._copy_on_write_environment.prepare(self.sandbox)
+        self._root_identity = self._stat_root_identity(self.cwd)
         atexit.register(self.close)
+
+    def _stat_root_identity(self, root: Path) -> tuple[int, int] | None:
+        namespace = self.sandbox.copy_on_write_namespace
+        if namespace is not None:
+            root = Path(f"/proc/{namespace[0]}/root") / root.relative_to(root.anchor)
+        try:
+            root_stat = root.stat()
+        except FileNotFoundError:
+            return None
+        return root_stat.st_dev, root_stat.st_ino
 
     def request(self, payload: OpRequest) -> OpResult:
         with self._lock:
-            return self._request_locked(payload, allow_retry=True)
+            return self._request_locked(payload, allow_retry=payload.get("op") != "delete")
 
     def close(self) -> None:
         with self._lock:
@@ -485,7 +563,7 @@ class _HelperProcessClient:
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])
             set_sandbox_env(env, self._tmpdir)
             if self.start_in_scratch:
-                helper_cwd = self._tmpdir
+                helper_cwd = self._tmpdir.resolve()
                 env["PWD"] = str(self._tmpdir)
             if sandbox.credential_proxy is not None:
                 # Resolve real secrets in the parent. Real secrets stay
@@ -528,10 +606,17 @@ class _HelperProcessClient:
         if self._tmpdir is not None:
             set_sandbox_env(env, self._tmpdir)
 
+        expected_root_identity = (
+            self._stat_root_identity(helper_cwd) if self.start_in_scratch else self._root_identity
+        )
+        root_identity: list[JsonValue] | None = None
+        if expected_root_identity is not None:
+            root_identity = [expected_root_identity[0], expected_root_identity[1]]
         config: dict[str, JsonValue] = {
             "cwd": str(helper_cwd),
             "shell_path": self.shell_path,
             "sandbox": sandbox.to_jsonable(),
+            "root_identity": root_identity,
         }
         # S4 (security): include the per-helper Proxy-Authorization
         # token IF egress is active. Delivered ONLY via the pipe FD,
@@ -586,6 +671,7 @@ class _HelperProcessClient:
             config_arg = ["--config-fd", str(r_fd)]
         helper_argv = [
             sys.executable,
+            "-P",
             "-m",
             "omnigent.inner.os_env",
             "helper",
@@ -877,24 +963,28 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 raise RuntimeError("Missing copy-on-write environment")
 
     def __post_init__(self) -> None:
-        if (
-            self.sandbox.copy_on_write_roots
-            and self._copy_on_write_environment is None
-            and self.sandbox.copy_on_write_namespace is None
-        ):
-            self._copy_on_write_environment = CopyOnWriteEnvironment(
+        try:
+            if (
                 self.sandbox.copy_on_write_roots
+                and self._copy_on_write_environment is None
+                and self.sandbox.copy_on_write_namespace is None
+            ):
+                self._copy_on_write_environment = CopyOnWriteEnvironment(
+                    self.sandbox.copy_on_write_roots
+                )
+                self._owns_copy_on_write = True
+            self._helper = _HelperProcessClient(
+                cwd=self.cwd,
+                shell_path=self.shell_path,
+                sandbox=self.sandbox,
+                start_in_scratch=self._start_in_scratch,
+                egress_rules=self._egress_rules,
+                egress_allow_private_destinations=self._egress_allow_private_destinations,
+                copy_on_write_environment=self._copy_on_write_environment,
             )
-            self._owns_copy_on_write = True
-        self._helper = _HelperProcessClient(
-            cwd=self.cwd,
-            shell_path=self.shell_path,
-            sandbox=self.sandbox,
-            start_in_scratch=self._start_in_scratch,
-            egress_rules=self._egress_rules,
-            egress_allow_private_destinations=self._egress_allow_private_destinations,
-            copy_on_write_environment=self._copy_on_write_environment,
-        )
+        finally:
+            if getattr(self, "_helper", None) is None:
+                self.close()
 
     async def read(
         self,
@@ -971,8 +1061,17 @@ class CallerProcessOSEnvironment(OSEnvironment):
         result = await run_sync_on_thread(self._helper.request, request)
         return cast(OpResult, result)
 
+    async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
+        """Delete through the sandboxed helper, without replaying a lost response."""
+        result = await run_sync_on_thread(
+            self._helper.request, {"op": "delete", "path": path, "recursive": recursive}
+        )
+        return cast(OpResult, result)
+
     def close(self) -> None:
-        self._helper.close()
+        helper = getattr(self, "_helper", None)
+        if helper is not None:
+            helper.close()
         if self._owns_copy_on_write and self._copy_on_write_environment is not None:
             self._copy_on_write_environment.close()
         if self._fork_dir is not None:
@@ -999,7 +1098,7 @@ def create_os_environment(
     cwd = Path(spec.cwd or os.getcwd()).resolve(strict=False)
     fork_dir: Path | None = None
     if spec.fork:
-        fork_dir = Path(tempfile.mkdtemp(prefix="omnigent-fork-"))
+        fork_dir = Path(tempfile.mkdtemp(prefix="omnigent-fork-")).resolve()
         effective_cwd = fork_dir / "root"
         _copy_tree(cwd, effective_cwd)
         cwd = effective_cwd
@@ -1052,8 +1151,24 @@ def _handle_helper_request(
     cwd: Path,
     shell_path: str,
     sandbox: SandboxPolicy,
+    root_identity: tuple[int, int] | None = None,
+    root_matches: bool = True,
 ) -> OpResult:
     op = request.get("op")
+    if op == "delete":
+        raw_path = request.get("path")
+        recursive = request.get("recursive", False)
+        if not isinstance(raw_path, str) or not isinstance(recursive, bool):
+            return {"error": "Invalid delete request", "code": "invalid_path"}
+        return _delete_impl(
+            cwd,
+            raw_path,
+            sandbox,
+            recursive=recursive,
+            root_identity=root_identity,
+            root_matches=root_matches,
+        )
+
     if op == "read":
         raw_path = request.get("path")
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -1140,6 +1255,85 @@ def _handle_helper_request(
         )
 
     return {"error": f"Unsupported os_env helper operation: {op!r}"}
+
+
+def _delete_impl(
+    cwd: Path,
+    raw_path: str,
+    sandbox: SandboxPolicy,
+    *,
+    recursive: bool,
+    root_identity: tuple[int, int] | None = None,
+    root_matches: bool = True,
+) -> OpResult:
+    """Delete a leaf inside the helper using its anchored parent descriptor."""
+    if "\x00" in raw_path:
+        return {"error": "Path contains NUL bytes", "code": "invalid_path"}
+    path = os.path.normpath(raw_path)
+    absolute = os.path.isabs(path)
+    if path == "." or path == str(cwd) or (not absolute and ".." in path.split(os.sep)):
+        return {
+            "error": "Cannot delete the environment root or traverse outside it",
+            "code": "invalid_path",
+        }
+    if not absolute and not SAFE_WORKSPACE_DELETE_SUPPORTED:
+        return {"error": "No-follow workspace delete is unsupported", "code": "unsupported"}
+    try:
+        if not absolute and not root_matches:
+            raise _WorkspaceRootChanged()
+        if absolute:
+            target = Path(path)
+            if sandbox.active:
+                _assert_within_reach(cwd, sandbox, target, need_write=True)
+            _assert_write_allowed(sandbox, target)
+            return _delete_leaf(path, recursive=recursive)
+        _assert_write_allowed(sandbox, cwd / path)
+        with _open_parent_beneath(cwd, path, nofollow_root=True, root_identity=root_identity) as (
+            parent_descriptor,
+            name,
+        ):
+            return _delete_leaf(name, recursive=recursive, parent_descriptor=parent_descriptor)
+    except _WorkspaceRootChanged as exc:
+        return {"error": str(exc), "code": "workspace_root_changed"}
+    except OSError as exc:
+        code = "delete_failed"
+        if exc.errno == errno.ENOENT:
+            code = "not_found"
+        elif exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            code = "invalid_path"
+        elif exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+            code = "directory_not_empty"
+        return {"error": str(exc), "code": code}
+
+
+def _delete_leaf(path: str, *, recursive: bool, parent_descriptor: int | None = None) -> OpResult:
+    """Mutate the leaf without following it; rmdir checks emptiness atomically."""
+    leaf_stat = os.stat(path, dir_fd=parent_descriptor, follow_symlinks=False)
+    if stat.S_ISDIR(leaf_stat.st_mode):
+        if recursive:
+            if not shutil.rmtree.avoids_symlink_attacks:
+                return {
+                    "error": "Symlink-safe recursive delete is unsupported",
+                    "code": "unsupported",
+                }
+            shutil.rmtree(path, dir_fd=parent_descriptor)
+        else:
+            os.rmdir(path, dir_fd=parent_descriptor)
+        entry_type = "directory"
+    else:
+        os.unlink(path, dir_fd=parent_descriptor)
+        if stat.S_ISLNK(leaf_stat.st_mode):
+            entry_type = "symlink"
+        elif stat.S_ISREG(leaf_stat.st_mode):
+            entry_type = "file"
+        else:
+            entry_type = "other"
+    return {
+        "deleted": True,
+        "exit_code": 0,
+        "type": entry_type,
+        "bytes_deleted": leaf_stat.st_size if entry_type in ("file", "symlink") else None,
+    }
 
 
 def _resolve_path(cwd: Path, path: str) -> Path:
@@ -1731,6 +1925,20 @@ def _run_helper(config: JsonValue) -> int:
         raise ValueError("Invalid os_env helper config payload")
     if not isinstance(sandbox_value, dict):
         raise ValueError("Invalid os_env helper sandbox payload")
+    root_identity_value = config.get("root_identity")
+    root_identity: tuple[int, int] | None = None
+    if root_identity_value is not None:
+        if not isinstance(root_identity_value, list) or len(root_identity_value) != 2:
+            raise ValueError("Invalid os_env helper root identity")
+        root_device, root_inode = root_identity_value
+        if (
+            not isinstance(root_device, int)
+            or isinstance(root_device, bool)
+            or not isinstance(root_inode, int)
+            or isinstance(root_inode, bool)
+        ):
+            raise ValueError("Invalid os_env helper root identity")
+        root_identity = (root_device, root_inode)
 
     # S4 (security): if the parent shipped a Proxy-Authorization
     # token via the config FD, splice it into HTTP_PROXY / HTTPS_PROXY
@@ -1764,6 +1972,8 @@ def _run_helper(config: JsonValue) -> int:
 
     sandbox = SandboxPolicy.from_jsonable(sandbox_value)
     activate_sandbox(sandbox)
+    root_stat = os.stat(".")
+    root_matches = (root_stat.st_dev, root_stat.st_ino) == root_identity
 
     for line in sys.stdin:
         line = line.strip()
@@ -1778,6 +1988,8 @@ def _run_helper(config: JsonValue) -> int:
                 cwd=cwd,
                 shell_path=shell_path_value,
                 sandbox=sandbox,
+                root_identity=root_identity,
+                root_matches=root_matches,
             )
         except Exception as exc:  # noqa: BLE001 — helper loop surfaces any error through the JSON response envelope
             response = {"error": f"os_env helper exception: {exc}"}
