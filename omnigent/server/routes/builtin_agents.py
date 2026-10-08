@@ -208,6 +208,9 @@ def install_user_agent(
             if existing is None:
                 raise
     if existing.bundle_location == location:
+        # Same files: restore the blob if it vanished while the row survived.
+        if not artifact_store.exists(location):
+            artifact_store.put(location, bundle_bytes)
         return existing
     artifact_store.put(location, bundle_bytes)
     updated = agent_store.update(agent_id, location)
