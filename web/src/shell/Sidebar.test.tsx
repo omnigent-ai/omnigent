@@ -559,7 +559,7 @@ describe("Sidebar session list", () => {
       renderSidebar();
 
       const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
-      expect(scroller).toHaveClass("overflow-y-auto", "md:mr-1", "[scrollbar-width:thin]");
+      expect(scroller).toHaveClass("overflow-y-auto", "px-2", "[scrollbar-width:thin]");
       expect(scroller.className).toContain("[&::-webkit-scrollbar]:w-2");
       expect(scroller).not.toHaveClass("[scrollbar-width:none]");
       expect(scroller.className).not.toContain("[&::-webkit-scrollbar]:hidden");
