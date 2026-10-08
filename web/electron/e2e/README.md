@@ -37,6 +37,13 @@ backend — no real provider creds.
   with a cookie-carrying redirect follower, so it runs on macOS and Linux. Covers
   connect, silent renewal, relaunch, and sign-out, and asserts the app window
   never loads the IdP.
+- `desktop_arca_connect_copy.e2e.js` — native copying (mouse selection, the
+  copy shortcut, right-click → Copy) from the Arca connect console, against
+  `fixtures/arcaFeatureGates.cjs` (stands in for the Databricks-only gates) and
+  `fixtures/fakeArca.sh` (an `arca` that replays a sign-in-required run). Run
+  from `web/electron` after building the SPA:
+  `OMNIGENT_PYTHON=../../.venv/bin/python node --test e2e/desktop_arca_connect_copy.e2e.js`
+  (prefix `OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a` to supply the display yourself).
 - `desktop_display_lifecycle.e2e.js` — checks that a lane which only closes
   Electron still releases the harness-owned Xvfb (headless Linux).
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:

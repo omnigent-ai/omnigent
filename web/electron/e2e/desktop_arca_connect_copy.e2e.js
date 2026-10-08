@@ -1,15 +1,6 @@
-// Desktop-shell regression lane: copying text out of the Arca connect console.
-//
-// Journey: a connected desktop window → host chip → "Run on Arca" → the
-// shell-owned "Connect Arca" console shows the command; the user tries to copy
-// from it (the command line, and after Connect the status line and the streamed
-// output) by mouse selection, the copy shortcut, and right-click → Copy.
-//
-// Run from web/electron after building the SPA:
-//   OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python \
-//     xvfb-run -a node --test e2e/desktop_arca_connect_copy.e2e.js
-// The Databricks-only gates are stood in by fixtures/arcaFeatureGates.cjs and
-// the arca CLI by fixtures/fakeArca.sh, which replays a sign-in-required run.
+// Desktop-shell lane: native copying from the Arca connect console — the
+// command line, the failure status and the streamed output — by mouse
+// selection, the copy shortcut and right-click → Copy. See e2e/README.md.
 
 "use strict";
 
@@ -123,7 +114,8 @@ describe(
           globalThis.openContextMenus += 1;
           const copy = this.items.find((item) => item.role === "copy");
           setTimeout(() => {
-            // Activate Copy as a user would, then dismiss the menu.
+            // Hold the menu briefly for the recording, then activate Copy through
+            // Electron's documented menuItem.click(event, window, webContents).
             copy?.click(undefined, options?.window, options?.window?.webContents);
             this.closePopup();
             globalThis.openContextMenus -= 1;

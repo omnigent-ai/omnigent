@@ -55,7 +55,7 @@ function isCopyShortcut(event) {
     (event.ctrlKey || event.metaKey) &&
     !event.altKey &&
     !event.shiftKey &&
-    event.key.toLowerCase() === "c"
+    (event.key ?? "").toLowerCase() === "c"
   );
 }
 

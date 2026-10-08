@@ -47,9 +47,9 @@ describe(
     it("releases the owned Xvfb when the app closes without stopDisplayCapture", async () => {
       // No server URL: the shell boots to its bundled setup page.
       const app = await launchDesktop({ recordDir });
-      assert.match(app.display ?? "", /^:\d+$/, "harness did not provide an owned display");
-      const socket = displaySocketPath(app.display);
       try {
+        assert.match(app.display ?? "", /^:\d+$/, "harness did not provide an owned display");
+        const socket = displaySocketPath(app.display);
         assert.ok(fs.existsSync(socket), `no X socket at ${socket}`);
         await app.electronApp.close();
         assert.ok(
@@ -57,6 +57,7 @@ describe(
           `X socket left at ${socket}`,
         );
       } finally {
+        await app.electronApp.close().catch(() => {});
         await app.stopDisplayCapture();
         fs.rmSync(app.userDataDir, { recursive: true, force: true });
       }

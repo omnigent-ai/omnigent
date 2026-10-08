@@ -544,12 +544,8 @@ async function launchDesktop(opts) {
       args.push("--no-sandbox", "--disable-dev-shm-usage");
     }
 
-    // Film the composited display (window + embedded WebContentsViews) alongside
-    // Playwright's per-page clips: the per-page screencast of the shell window
-    // omits any WebContentsView composited over it, so on its own the "desktop
-    // recording" would silently drop the very content a journey renders inside
-    // an embedded browser view. The display capture becomes the primary clip in
-    // saveRecording; the per-page clips remain as context.
+    // Capture the full display: per-page screencasts omit WebContentsViews
+    // composited over the shell, so this becomes the primary clip in saveRecording.
     displayCapture = startDisplayCapture(opts.recordDir, display);
 
     electronApp = await electron.launch({

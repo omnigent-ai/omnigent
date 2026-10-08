@@ -21,6 +21,19 @@ const {
   xvfbAvailable,
 } = require("../e2e/desktopHarness");
 
+/** PIDs of Xvfb processes whose parent is this test process (Linux /proc). */
+function ownedXvfbPids() {
+  return fs.readdirSync("/proc").filter((name) => {
+    if (!/^\d+$/.test(name)) return false;
+    try {
+      const match = /^\d+ \((.*)\) \S+ (\d+) /.exec(fs.readFileSync(`/proc/${name}/stat`, "utf8"));
+      return match !== null && match[1] === "Xvfb" && Number(match[2]) === process.pid;
+    } catch {
+      return false; // the process exited between readdir and read
+    }
+  });
+}
+
 const hasXvfb = xvfbAvailable();
 
 describe("saveRecording", () => {
@@ -130,17 +143,14 @@ describe("launchDesktop setup failure", () => {
     },
     async () => {
       delete process.env.DISPLAY;
-      const sockets = () =>
-        fs.existsSync("/tmp/.X11-unix") ? fs.readdirSync("/tmp/.X11-unix") : [];
-      const before = new Set(sockets());
+      assert.deepEqual(ownedXvfbPids(), [], "an Xvfb child already exists");
       // A regular file where the record dir must go makes mkdirSync throw.
       const blocker = path.join(dir, "not-a-directory");
       fs.writeFileSync(blocker, "");
       await assert.rejects(launchDesktop({ recordDir: path.join(blocker, "recordings") }));
-      const leftover = () => sockets().filter((name) => !before.has(name));
       assert.ok(
-        await pollUntil(() => leftover().length === 0, 3_000),
-        `X sockets left: ${leftover()}`,
+        await pollUntil(() => ownedXvfbPids().length === 0, 3_000),
+        `Xvfb still running: ${ownedXvfbPids()}`,
       );
     },
   );
