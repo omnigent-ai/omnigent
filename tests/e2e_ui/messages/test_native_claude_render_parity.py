@@ -397,27 +397,66 @@ def _occupy_tui_surface(
     )
 
 
+def _ran_as_shell_command(base_url: str, session_id: str, marker: str) -> bool:
+    """Whether *marker* reached the canonical transcript as a ``!`` shell exec's command.
+
+    Text handed to shell mode is mirrored as a ``terminal_command`` input item
+    (plus a ``!``-prefixed user echo), so this is what tells a swallowed
+    message from a delivered chat turn.
+
+    :param base_url: Spawned server base URL.
+    :param session_id: The session/conversation id.
+    :param marker: Unique text the turn carried.
+    :returns: ``True`` when a terminal-command input item carries *marker*.
+    """
+    resp = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/items",
+        params={"limit": 1000, "order": "asc"},
+        timeout=15.0,
+    )
+    resp.raise_for_status()
+    return any(
+        item.get("type") == "terminal_command"
+        and item.get("kind") == "input"
+        and marker in str(item.get("input") or "")
+        for item in resp.json().get("data", [])
+    )
+
+
 def _wait_for_transcript_message(
     page: Page, base_url: str, session_id: str, marker: str, *, role: str
 ) -> None:
     """Block until the canonical transcript holds *marker* in a *role* message.
 
-    Reads the same ``type == "message"`` items the TUI renders from, which is
-    what tells a delivered chat message from a shell-mode one: text handed to
-    bash comes back as a ``terminal_command`` item, so it never lands here —
-    even though it does draw a bubble and does make Claude answer.
+    Reads the same ``type == "message"`` items the TUI renders from. A user
+    message that shell mode ran instead draws a bubble, makes Claude answer and
+    is echoed as a ``!``-prefixed user message too, so the command item is
+    checked directly: see :func:`_ran_as_shell_command`.
 
     :param page: The Playwright page (used for its polling sleep).
     :param base_url: Spawned server base URL.
     :param session_id: The session/conversation id.
     :param marker: Unique text the turn carried.
     :param role: ``"user"`` or ``"assistant"``.
-    :raises AssertionError: If the marker never reaches such an item.
+    :raises AssertionError: If the marker never reaches such an item, or ran
+        as a shell command.
     """
     deadline = time.monotonic() + _TRANSCRIPT_SETTLE_TIMEOUT_S
     while time.monotonic() < deadline:
+        if role == "user" and _ran_as_shell_command(base_url, session_id, marker):
+            raise AssertionError(
+                f"{marker!r} ran as a `!` shell command instead of landing as a chat turn"
+            )
         items = _ordered_message_items(base_url, session_id)
-        if any(item.get("role") == role and marker in _item_text(item) for item in items):
+        # A `!`-prefixed user item is shell mode's echo of the exec, not the
+        # chat turn; skip it so the shell-command check still fires instead of
+        # this matching the echo and passing before the command item lands.
+        if any(
+            item.get("role") == role
+            and marker in _item_text(item)
+            and not (role == "user" and _item_text(item).lstrip().startswith("!"))
+            for item in items
+        ):
             return
         page.wait_for_timeout(500)
     raise AssertionError(

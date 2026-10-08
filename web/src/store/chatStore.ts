@@ -7492,10 +7492,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation((s) => {
         const eventContent = userContentFromEvent(event);
         const pendingHead = s.pendingUserMessages[0];
-        // Bare envelopes typed in the terminal must not consume unrelated web input.
+        // A native shell-mode (`!`) exec echo drains no pending entry and owns no
+        // optimistic bubble here, so unless its text matches the head it must leave
+        // an unrelated queued web bubble in place. The server flags it explicitly.
+        const shellCommandEcho = event.shellCommandEcho === true;
         const unmatchedEnvelope =
           eventContent !== null &&
-          isClaudeAgentMessageContent(eventContent) &&
+          (isClaudeAgentMessageContent(eventContent) || shellCommandEcho) &&
           (!pendingHead || contentKeyOf(pendingHead.content) !== contentKeyOf(eventContent));
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored

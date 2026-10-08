@@ -1824,6 +1824,9 @@ def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, o
     return {
         "type": "external_conversation_item",
         "data": {
+            # Server-side idempotency key: the forwarder retries a timed-out
+            # POST it cannot confirm, so the server derives the item id from
+            # this and treats a re-post as a no-op instead of a duplicate.
             "source_id": item.source_id,
             "item_type": item.item_type,
             "item_data": item.data,
@@ -1834,6 +1837,7 @@ def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, o
                 else {}
             ),
             **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
+            **({"shell_command_echo": True} if item.shell_command_echo else {}),
         },
     }
 
@@ -5324,25 +5328,7 @@ async def _post_external_conversation_item(
     ):
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": item.item_type,
-                    "item_data": item.data,
-                    "response_id": item.response_id,
-                    # Server-side idempotency key: the forwarder retries a
-                    # timed-out POST it cannot know the disposition of, so
-                    # the server derives the item's id from this and treats
-                    # a re-post as a no-op instead of a duplicate.
-                    "source_id": item.source_id,
-                    **(
-                        {"subagent_return_id": item.subagent_return_id}
-                        if item.subagent_return_id is not None
-                        else {}
-                    ),
-                    **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
-                },
-            },
+            json=_external_conversation_item_event(item),
         )
         resp.raise_for_status()
 

@@ -143,6 +143,7 @@ class _SideEffectRecorder:
         *,
         message_id: str | None = None,
         cleared_pending_id: str | None = None,
+        shell_command_echo: bool = False,
     ) -> None:
         self.published.append(item.id)
 

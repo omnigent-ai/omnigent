@@ -57,6 +57,33 @@ async def test_handback_provenance_is_transported_outside_message_content(candid
     assert forwarder._external_conversation_item_event(item) == captured[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("echo", [False, True])
+async def test_shell_command_echo_is_transported_outside_message_content(echo: bool) -> None:
+    """The bang-echo flag rides the event envelope, never the persisted item data."""
+    captured: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(202)
+
+    item = ClaudeTranscriptItem(
+        source_id="bash-in:0:message",
+        item_type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "! pwd"}]},
+        response_id="resp_claude_bash",
+        shell_command_echo=echo,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await forwarder._post_external_conversation_item(client, session_id="parent", item=item)
+    assert captured[0]["data"].get("shell_command_echo", False) == echo
+    assert captured[0]["data"]["item_data"] == item.data
+    assert "shell_command_echo" not in captured[0]["data"]["item_data"]
+    assert forwarder._external_conversation_item_event(item) == captured[0]
+
+
 class _CountingAuth(httpx.Auth):
     """
     Test httpx Auth that mints a unique bearer per request.

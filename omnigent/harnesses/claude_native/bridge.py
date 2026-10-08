@@ -819,6 +819,9 @@ class ClaudeTranscriptItem:
         handback; transported separately from model-visible message content.
     :param agent_message_candidate: Unproven team-shaped user text; the server
         must correlate it by text without draining unrelated pending input.
+    :param shell_command_echo: The user-message echo of a ``!`` shell exec. A
+        bang typed in the terminal queues no web input, so the server must
+        drain only an exact pending match, never the oldest entry.
     :param failure_context: Explicit API-error evidence for diagnostic logging;
         kept outside model-visible conversation content.
     """
@@ -831,6 +834,7 @@ class ClaudeTranscriptItem:
     is_compact_noop: bool = False
     subagent_return_id: str | None = None
     agent_message_candidate: bool = False
+    shell_command_echo: bool = False
     failure_context: FailureContext | None = None
 
 
@@ -8462,7 +8466,46 @@ def _local_command_transcript_items_from_entry(
     )
     if not items:
         return current_response_id, []
+    echo = _bang_echo_item(content, source_key=source_key, response_id=response_id)
+    if echo is not None:
+        items.insert(0, echo)
     return response_id, items
+
+
+def _bang_echo_item(
+    content: str,
+    *,
+    source_key: str,
+    response_id: str,
+) -> ClaudeTranscriptItem | None:
+    """
+    Build the user-message echo of a shell-mode exec, e.g. ``"! pwd"``.
+
+    Claude records a ``!`` send only as ``<bash-input>`` and resumes the
+    model turn on its output, so without this echo the previous reply,
+    exec cards, and follow-up merge into one assistant bubble. The echo
+    carries the composer's exact text, so its persist drains only a
+    matching web-composer pending entry; a terminal bang matches none.
+
+    :param content: Transcript markup carrying ``<bash-input>``.
+    :param source_key: Base transcript record key used for source ids.
+    :param response_id: The exec's terminal-command group response id.
+    :returns: The echo item, or ``None`` when *content* has no
+        ``<bash-input>`` tag (an output-only record).
+    """
+    input_match = _BASH_INPUT_RE.search(content)
+    if input_match is None:
+        return None
+    return ClaudeTranscriptItem(
+        source_id=_source_id(source_key, 0, "message"),
+        item_type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": f"!{input_match.group(1)}"}],
+        },
+        response_id=response_id,
+        shell_command_echo=True,
+    )
 
 
 def _terminal_command_items_from_content(
@@ -8672,6 +8715,11 @@ def _user_transcript_items_from_entry(
             response_id=terminal_response_id,
         )
         if terminal_items:
+            echo = _bang_echo_item(
+                content, source_key=source_key, response_id=terminal_response_id
+            )
+            if echo is not None:
+                terminal_items.insert(0, echo)
             return terminal_response_id, terminal_items
         # Other CLI-scaffolding records (stdout/stderr from /effort, etc.)
         # arrive as standalone ``role=user`` records and must drop instead

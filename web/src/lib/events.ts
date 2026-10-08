@@ -769,6 +769,13 @@ export interface SessionInputConsumedEvent {
    * that matched no pending entry (e.g. typed directly in the TUI).
    */
   clearedPendingId?: string | null;
+  /**
+   * True when this item is the user echo of a native shell-mode (`!`)
+   * exec. Such an echo drains no pending entry, so the store uses this
+   * explicit marker — not authorship — to avoid popping an unrelated
+   * queued web bubble for it.
+   */
+  shellCommandEcho?: boolean;
 }
 
 /**

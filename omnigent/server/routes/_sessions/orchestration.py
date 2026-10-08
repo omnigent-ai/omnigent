@@ -2924,9 +2924,14 @@ async def _persist_external_conversation_item_unlocked(
         # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
+        shell_command_echo = body.data.get("shell_command_echo") is True
+        # A ``!`` shell exec typed in the terminal mirrors like a web one but
+        # queued nothing, so a positional drain would hand it another user's
+        # message. Like ambiguous team markup, it may only drain an exact match.
+        exact_match_only = agent_message_candidate or shell_command_echo
         matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
         drained = matched.matched
-        if agent_message_candidate:
+        if exact_match_only:
             # Ambiguous markup can be direct terminal input. Only its exact
             # pending match is evidence of a web submission; preserve others.
             held_older = [*matched.skipped, *matched.uncertain]
@@ -2941,7 +2946,7 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
+        if drained is None and not exact_match_only and not _is_kiro_native_session(conv):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 # The mirror's true owner may be any entry still queued, so none
@@ -2967,7 +2972,10 @@ async def _persist_external_conversation_item_unlocked(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
-        if agent_message_candidate:
+        if exact_match_only:
+            # Human-authored terminal input (agent-message candidate or bang
+            # echo): mark it so it renders as a user bubble on reload. FIFO
+            # protection rides the consumed event's shell_command_echo flag.
             item = item.model_copy(
                 update={"data": item.data.model_copy(update={"user_authored": True})}
             )
@@ -3100,6 +3108,7 @@ def _publish_persisted_external_item(
         persisted,
         cleared_pending_id=cleared_pending_id,
         message_id=message_id if isinstance(message_id, str) else None,
+        shell_command_echo=body.data.get("shell_command_echo") is True,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
 

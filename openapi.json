@@ -6196,6 +6196,12 @@
             "title": "Item Id",
             "type": "string"
           },
+          "shell_command_echo": {
+            "default": false,
+            "description": "`True` when this item is the user echo of a native shell-mode (`!`) exec that the server mirrors without a composer send. A terminal bang drains no pending entry, so clients key off this explicit marker \u2014 not authorship \u2014 to skip popping an unrelated queued web bubble for it.",
+            "title": "Shell Command Echo",
+            "type": "boolean"
+          },
           "type": {
             "description": "The item type discriminator \u2014 `\"message\"` for user messages, `\"function_call_output\"` for tool results, etc. Mirrors `omnigent.server.schemas.SessionEventInput`'s `type` field.",
             "title": "Type",

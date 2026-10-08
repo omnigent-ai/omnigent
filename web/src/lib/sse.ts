@@ -841,6 +841,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(typeof createdBy === "string" ? { createdBy } : {}),
       data: payload,
       clearedPendingId: typeof clearedPendingId === "string" ? clearedPendingId : null,
+      shellCommandEcho: p.shell_command_echo === true,
     } satisfies SessionInputConsumedEvent;
   }
   if (eventType === "session.interrupted") {

@@ -1681,6 +1681,7 @@ def _publish_input_consumed(
     session_id: str,
     item: ConversationItem,
     cleared_pending_id: str | None = None,
+    shell_command_echo: bool = False,
 ) -> None:
     """
     Publish a ``session.input.consumed`` event for a just-persisted
@@ -1699,6 +1700,10 @@ def _publish_input_consumed(
         web message mirrored back from the transcript), that entry's
         id, e.g. ``"pending_a1b2c3"`` — so clients drop the optimistic
         bubble by id. ``None`` when nothing was drained.
+    :param shell_command_echo: ``True`` when ``item`` is the user echo of
+        a native shell-mode (``!``) exec; clients then skip popping an
+        unrelated queued web bubble for an input that drained no pending
+        entry. ``False`` for ordinary web/terminal messages.
 
     Hidden context items (``is_meta``, e.g. injected skill text or a
     Claude background-task notification) are published too, flagged in
@@ -1714,6 +1719,7 @@ def _publish_input_consumed(
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
             cleared_pending_id=cleared_pending_id,
+            shell_command_echo=shell_command_echo,
         ),
     )
     session_stream.publish(session_id, event.model_dump())
@@ -3015,6 +3021,7 @@ def _publish_external_conversation_item(
     item: ConversationItem,
     cleared_pending_id: str | None = None,
     message_id: str | None = None,
+    shell_command_echo: bool = False,
 ) -> None:
     """
     Broadcast a terminal-observed conversation item.
@@ -3034,11 +3041,18 @@ def _publish_external_conversation_item(
         — because it also folds the entry's file blocks into the durable
         item before append.
     :param message_id: Optional live-preview stream finalized by this item.
+    :param shell_command_echo: Forwarded to :func:`_publish_input_consumed`
+        for a native shell-mode (``!``) user echo; see that helper.
     :returns: None.
     """
     if item.type == "message" and isinstance(item.data, MessageData):
         if item.data.role == "user":
-            _publish_input_consumed(session_id, item, cleared_pending_id=cleared_pending_id)
+            _publish_input_consumed(
+                session_id,
+                item,
+                cleared_pending_id=cleared_pending_id,
+                shell_command_echo=shell_command_echo,
+            )
             return
         if item.data.is_meta:
             # Hidden context on a non-user message has no live rendering

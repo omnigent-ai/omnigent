@@ -3537,6 +3537,11 @@ class SessionInputConsumedPayload(BaseModel):
         client drop the matching optimistic bubble by id instead of
         by position. ``None`` for non-native messages and for messages
         that matched no pending entry (e.g. typed directly in the TUI).
+    :param shell_command_echo: ``True`` when this item is the user echo
+        of a native shell-mode (``!``) exec that the server mirrors
+        without a composer send. A terminal bang drains no pending entry,
+        so clients key off this explicit marker — not authorship — to
+        skip popping an unrelated queued web bubble for it.
     """
 
     item_id: str
@@ -3546,6 +3551,7 @@ class SessionInputConsumedPayload(BaseModel):
     data: dict[str, Any]
     created_by: str | None = None
     cleared_pending_id: str | None = None
+    shell_command_echo: bool = False
 
     model_config = ConfigDict(extra="ignore")
 
