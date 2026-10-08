@@ -1124,6 +1124,89 @@ async def test_launch_runner_validates_workspace_boundary(
     assert refetched.runner_id is None, "a rejected launch must not bind a runner"
 
 
+async def test_launch_runner_missing_agent_bundle_returns_409(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    POST /v1/hosts/{id}/runners for a session whose agent row outlived its
+    bundle blob answers a structured 409, not a 500, and binds no runner.
+
+    Models a replaced server instance: the agent and session rows are in the
+    durable database, but the artifact store no longer holds the bundle the
+    row names.
+    """
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+
+    registry = HostRegistry()
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
+
+    app = FastAPI()
+    app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        ),
+        prefix="/v1",
+    )
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """Mirror the production handler: code -> status."""
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    host_store.upsert_on_connect(_HOST_ID, "laptop", "local")
+    registry.register(
+        _HOST_ID,
+        type(
+            "FakeWS",
+            (),
+            {"send_text": lambda self, d: None, "receive_text": lambda self: ""},
+        )(),
+        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="laptop"),
+        owner="local",
+    )
+    agent_id = "ab5e97bd41c34fa2b0c9d5c3f1e2a6d4"
+    agent = agent_store.create(
+        agent_id=agent_id,
+        name="resume-missing-bundle",
+        bundle_location=f"{agent_id}/deadbeefdeadbeef",
+    )
+    conv = conv_store.create_conversation(agent_id=agent.id)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/v1/hosts/{_HOST_ID}/runners",
+            json={"session_id": conv.id, "workspace": str(tmp_path)},
+        )
+
+    assert resp.status_code == 409, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == ErrorCode.AGENT_BUNDLE_MISSING
+    assert "Re-upload the same agent bundle" in error["message"]
+    # `omnigent claude` retries a 409 whose message mentions an offline host;
+    # a lost bundle must fail fast instead.
+    assert "offline" not in error["message"].lower()
+    refetched = conv_store.get_conversation(conv.id)
+    assert refetched is not None
+    assert refetched.runner_id is None, "a failed launch must not leave a runner bound"
+
+
 async def test_tunnel_rejects_unauthenticated_when_auth_enabled(
     multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:

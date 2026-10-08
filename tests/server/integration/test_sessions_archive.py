@@ -17,18 +17,22 @@ import dataclasses
 import gzip
 import io
 import tarfile
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
+from omnigent.errors import ErrorCode
 from omnigent.server.routes import sessions as _sessions_facade
 from omnigent.server.routes._sessions import common as _sessions_common
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
-from tests.server.helpers import create_test_session
+from tests.server.helpers import build_agent_bundle, create_test_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -713,3 +717,86 @@ async def test_agent_contents_404_for_nonexistent_session(
     """GET /v1/sessions/{id}/agent/contents returns 404 for a missing session."""
     resp = await client.get("/v1/sessions/conv_nonexistent/agent/contents")
     assert resp.status_code == 404
+
+
+def _lose_bundle_blob(db_uri: str, tmp_path: Path, agent_id: str) -> str:
+    """Delete the agent's bundle from the ``client`` app's artifact store, keeping its row.
+
+    Models a replaced server instance whose database persisted while its
+    artifact directory did not.
+
+    :returns: The row's ``bundle_location``, now dangling.
+    """
+    agent = SqlAlchemyAgentStore(db_uri).get(agent_id)
+    assert agent is not None
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    assert artifacts.exists(agent.bundle_location)
+    artifacts.delete(agent.bundle_location)
+    return agent.bundle_location
+
+
+async def test_agent_contents_409_when_bundle_blob_is_missing(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A surviving agent row whose bundle blob is gone answers 409, not 500."""
+    session = await create_test_session(client, name="contents-lost-bundle")
+    session_id = session["id"]
+    before = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+    assert before.status_code == 200
+
+    _lose_bundle_blob(db_uri, tmp_path, session["agent_id"])
+
+    resp = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+    assert resp.status_code == 409, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == ErrorCode.AGENT_BUNDLE_MISSING
+    assert "Re-upload the same agent bundle" in error["message"]
+
+
+async def test_update_agent_restores_a_lost_bundle_blob(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """PUT /agent with the bundle the row already names stores its lost blob again.
+
+    The first PUT moves the row onto a location keyed by these exact bytes, so
+    the second PUT takes the idempotent branch; that branch must still repair
+    the artifact store rather than return before writing anything.
+    """
+    session = await create_test_session(client, name="contents-restore")
+    session_id = session["id"]
+    replacement = build_agent_bundle(name="contents-restore", description="replacement")
+    files = {"bundle": ("agent.tar.gz", replacement, "application/gzip")}
+    first = await client.put(f"/v1/sessions/{session_id}/agent", files=files)
+    assert first.status_code == 200, first.text
+
+    location = _lose_bundle_blob(db_uri, tmp_path, session["agent_id"])
+    lost = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+    assert lost.status_code == 409, lost.text
+
+    store = SqlAlchemyAgentStore(db_uri)
+    before = store.get(session["agent_id"])
+    assert before is not None
+
+    again = await client.put(f"/v1/sessions/{session_id}/agent", files=files)
+    assert again.status_code == 200, again.text
+    assert LocalArtifactStore(str(tmp_path / "artifacts")).exists(location)
+
+    # The restore repairs the blob in place; it must not rebind or re-version
+    # the surviving agent row.
+    after = store.get(session["agent_id"])
+    assert after is not None
+    assert after.id == before.id
+    assert after.name == before.name
+    assert after.bundle_location == before.bundle_location == location
+    assert after.version == before.version
+    assert after.session_id == before.session_id
+    assert after.created_by == before.created_by
+    assert after.kind == before.kind
+
+    restored = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+    assert restored.status_code == 200, restored.text
+    assert restored.content == replacement

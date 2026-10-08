@@ -34,7 +34,7 @@ from omnigent.debug_logging import (
     set_current_runner_id,
     set_current_session_id,
 )
-from omnigent.entities import Conversation
+from omnigent.entities import Conversation, LoadedAgent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
@@ -59,6 +59,7 @@ from omnigent.onboarding.harness_install import (
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
+from omnigent.server.bundles import agent_bundle_missing_error
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
@@ -575,6 +576,35 @@ class LaunchRunnerRequest(BaseModel):
     git: SessionGitOptions | None = None
 
 
+async def _load_bound_agent(
+    conv: Conversation,
+    agent_store: AgentStore,
+    agent_cache: AgentCache,
+) -> LoadedAgent | None:
+    """
+    Load the parsed spec of the agent a session is bound to.
+
+    :param conv: The session/conversation a runner is launching for.
+    :param agent_store: Store to resolve ``conv.agent_id`` to an agent.
+    :param agent_cache: Cache to load the agent's parsed spec.
+    :returns: The loaded agent, or ``None`` when the session has no agent
+        or the agent has no bundle.
+    :raises OmnigentError: ``agent_bundle_missing`` (409) when the agent row
+        exists but the artifact store no longer holds its bundle. The launch
+        must stop here: proceeding without the spec would also skip the
+        workspace-boundary check.
+    """
+    if conv.agent_id is None:
+        return None
+    agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+    if agent is None or agent.bundle_location is None:
+        return None
+    try:
+        return await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
+    except KeyError as exc:
+        raise agent_bundle_missing_error(agent) from exc
+
+
 async def _resolve_agent_spec_cwd(
     conv: Conversation,
     agent_store: AgentStore,
@@ -589,13 +619,12 @@ async def _resolve_agent_spec_cwd(
     :returns: The agent's ``os_env.cwd`` (absolute or relative), or
         ``None`` when the session has no agent, no bundle, or no
         ``os_env`` block (headless / unconstrained boundary).
+    :raises OmnigentError: ``agent_bundle_missing`` when the bundle is gone
+        (see :func:`_load_bound_agent`).
     """
-    if conv.agent_id is None:
+    loaded = await _load_bound_agent(conv, agent_store, agent_cache)
+    if loaded is None:
         return None
-    agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
-    if agent is None or agent.bundle_location is None:
-        return None
-    loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
     os_env = getattr(loaded.spec, "os_env", None)
     return getattr(os_env, "cwd", None) if os_env is not None else None
 
@@ -619,13 +648,12 @@ async def _resolve_agent_harness(
     :returns: The canonical harness id, e.g. ``"claude-sdk"``, or
         ``None`` when the session has no agent or no bundle (the host
         then skips the configuration check — fail open).
+    :raises OmnigentError: ``agent_bundle_missing`` when the bundle is gone
+        (see :func:`_load_bound_agent`).
     """
-    if conv.agent_id is None:
+    loaded = await _load_bound_agent(conv, agent_store, agent_cache)
+    if loaded is None:
         return None
-    agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
-    if agent is None or agent.bundle_location is None:
-        return None
-    loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
     return canonicalize_harness(loaded.spec.executor.harness_kind)
 
 
@@ -841,6 +869,8 @@ def create_hosts_router(
         :raises HTTPException: 404 if host not found, 409 if host
             offline, 403 if caller doesn't own the host, 400 if
             session already has a runner.
+        :raises OmnigentError: 409 ``agent_bundle_missing`` when the
+            session's agent bundle is gone from the artifact store.
         """
         # require_user: resolve_host_launch skips its ownership checks
         # for user_id=None (the auth-disabled single-user case), so an

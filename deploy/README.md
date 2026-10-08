@@ -186,6 +186,24 @@ remote DB.
 256 MB default does not, so the Fly config pins a 1 GB machine, and the
 Modal app pins `memory=1024` for the same reason.
 
+## Artifact store: agent bundles need durable storage too
+
+Session-scoped agent bundles (the files `omnigent run` / `omnigent claude`
+upload when a session starts) are not stored in the database. They live in the
+artifact store: the local directory `ARTIFACT_DIR` (`/data/artifacts` in the
+official image) or, with `OMNIGENT_ARTIFACT_URI=s3://<bucket>/<prefix>`, an
+S3-compatible bucket. A persistent Postgres alone therefore does **not** make
+sessions resumable: when an instance is replaced with an ephemeral
+`/data/artifacts` (Cloud Run, an autoscaled container without a volume), the
+session and agent rows survive but their bundles are gone, and resuming such a
+session fails with `409 agent_bundle_missing` until the same bundle is uploaded
+again — starting a new session from the same agent files restores it, as does
+`PUT /v1/sessions/{id}/agent` for a session's own editable agent (built-in
+and shared agents are read-only there). Mount `/data/artifacts` on a
+persistent volume or point `OMNIGENT_ARTIFACT_URI` at a bucket, as the Fly,
+Render, and Cloudflare targets already do; on Railway, add a Volume mounted at
+`/data/artifacts`.
+
 ## Serving: put an HTTP/2 proxy in front for many concurrent views
 
 Each open session in the web UI holds a long-lived streaming HTTP

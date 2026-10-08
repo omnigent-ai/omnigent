@@ -22,8 +22,10 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omnigent.entities import Agent
 from omnigent.errors import OmnigentError
 from omnigent.server.bundles import validate_agent_bundle
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 
 _SECRET_ENV_VAR = "OMNIGENT_W7_BUNDLE_SECRET"
 _SECRET_VALUE = "server-side-secret-token"
@@ -524,3 +526,64 @@ def test_content_digest_is_none_for_an_unreadable_bundle() -> None:
     assert bundle_content_digest(b"not a tarball") is None
     # The location still names the bytes, so nothing is ever stored keyless.
     assert content_bundle_location("ag", b"not a tarball").startswith("ag/")
+
+
+class _MemoryAgentStore:
+    """Just enough of ``AgentStore`` for :func:`uploaded_agent_for`."""
+
+    supports_user_agents = True
+
+    def __init__(self) -> None:
+        self.rows: dict[str, Agent] = {}
+
+    def get(self, agent_id: str) -> Agent | None:
+        return self.rows.get(agent_id)
+
+    def create_user_agent(
+        self,
+        agent_id: str,
+        name: str,
+        bundle_location: str,
+        owner: str | None,
+        description: str | None = None,
+    ) -> Agent:
+        agent = Agent(
+            id=agent_id,
+            created_at=1,
+            name=name,
+            bundle_location=bundle_location,
+            description=description,
+            created_by=owner,
+            kind="user",
+        )
+        self.rows[agent_id] = agent
+        return agent
+
+
+def test_uploaded_agent_for_restores_a_lost_bundle_blob(tmp_path: Path) -> None:
+    """An identical upload re-stores the blob a matching row lost, under the same key.
+
+    After a server instance is replaced with an empty artifact directory the
+    row survives without its bundle; the next ``omnigent run`` of the same
+    files must heal it (and every session bound to it) instead of binding the
+    row as-is.
+    """
+    from omnigent.server.bundles import uploaded_agent_for
+
+    bundle = _single_file_yaml_bundle(
+        "name: clean_agent\nprompt: hello\nexecutor:\n  harness: claude-sdk\n"
+    )
+    spec = validate_agent_bundle(bundle)
+    store = _MemoryAgentStore()
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    first = uploaded_agent_for(store, artifacts, owner="alice", spec=spec, bundle_bytes=bundle)
+    assert first is not None
+    assert artifacts.get(first.bundle_location) == bundle
+    artifacts.delete(first.bundle_location)
+
+    again = uploaded_agent_for(store, artifacts, owner="alice", spec=spec, bundle_bytes=bundle)
+    assert again is not None
+    assert again.id == first.id
+    assert again.bundle_location == first.bundle_location
+    assert artifacts.get(first.bundle_location) == bundle

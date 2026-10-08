@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import posixpath
 import tarfile
 import tempfile
@@ -15,7 +16,8 @@ from typing import TYPE_CHECKING
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import generate_agent_id, uploaded_agent_id
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.debug_logging import debug_event
+from omnigent.errors import AGENT_BUNDLE_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
 
@@ -23,6 +25,31 @@ if TYPE_CHECKING:
     from omnigent.entities import Agent
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.artifact_store import ArtifactStore
+
+_logger = logging.getLogger(__name__)
+
+
+def agent_bundle_missing_error(agent: Agent) -> OmnigentError:
+    """
+    Client error for an agent row whose stored bundle is gone.
+
+    The row outlives its blob when the database is durable but the artifact
+    store is not (an ephemeral ``/data/artifacts`` behind PostgreSQL). Logs the
+    affected row for operators and returns the error for the route to raise.
+
+    :param agent: The surviving agent row, e.g. with ``bundle_location
+        == "0f1a2b3c.../a1b2c3d4..."``.
+    :returns: An ``agent_bundle_missing`` (HTTP 409) error.
+    """
+    _logger.warning(
+        "Agent bundle missing from the artifact store",
+        extra=debug_event(
+            "agent_bundle_missing",
+            agent_id=agent.id,
+            bundle_location=agent.bundle_location,
+        ),
+    )
+    return OmnigentError(AGENT_BUNDLE_MISSING_MESSAGE, code=ErrorCode.AGENT_BUNDLE_MISSING)
 
 
 def _is_dotted_callable_path(path: str) -> bool:
@@ -321,7 +348,8 @@ def uploaded_agent_for(
     every identical upload binds one row and concurrent ones collide on its
     primary key. A row whose bundle an MCP edit has changed no longer matches
     and is passed over for the next id, so a session always starts on the
-    uploaded files.
+    uploaded files. A matching row whose blob the artifact store lost gets the
+    bundle stored again, which also repairs the sessions already bound to it.
 
     :param owner: Uploading user, or ``None`` on an auth-less server.
     :param spec: The upload's validated spec (its name and description).
@@ -354,5 +382,17 @@ def uploaded_agent_for(
             and agent.name == name
             and agent.bundle_location == location
         ):
+            # The row can outlive its blob on an ephemeral artifact store; this
+            # upload holds the same content, so it restores the blob.
+            if not artifact_store.exists(location):
+                _logger.warning(
+                    "Restoring an agent bundle lost from the artifact store",
+                    extra=debug_event(
+                        "agent_bundle_restored",
+                        agent_id=agent.id,
+                        bundle_location=location,
+                    ),
+                )
+                artifact_store.put(location, bundle_bytes)
             return agent
     return None

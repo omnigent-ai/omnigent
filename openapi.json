@@ -10928,7 +10928,7 @@
     },
     "/v1/hosts/{host_id}/runners": {
       "post": {
-        "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.",
+        "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.\n- `OmnigentError` \u2014 409 `agent_bundle_missing` when the session's agent bundle is gone from the artifact store.",
         "operationId": "launch_runner_v1_hosts__host_id__runners_post",
         "parameters": [
           {
@@ -12451,7 +12451,7 @@
         ]
       },
       "put": {
-        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\nRequires session-owner permission because a bundle can replace MCP servers.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
+        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged,\nexcept that a blob the artifact store lost is stored again.\nRequires session-owner permission because a bundle can replace MCP servers.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
         "operationId": "update_session_agent_v1_sessions__session_id__agent_put",
         "parameters": [
           {
@@ -12558,7 +12558,7 @@
     },
     "/v1/sessions/{session_id}/agent/contents": {
       "get": {
-        "description": "Download the raw `.tar.gz` agent bundle for the session's\nbound agent.\n\nReplaces `GET /api/agents/{id}/contents`. Runners call this\non cache miss to fetch the spec + bundled files.\n\n**Returns:** Raw bundle bytes as `application/gzip`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session, agent, or bundle is not found.",
+        "description": "Download the raw `.tar.gz` agent bundle for the session's\nbound agent.\n\nReplaces `GET /api/agents/{id}/contents`. Runners call this\non cache miss to fetch the spec + bundled files.\n\n**Returns:** Raw bundle bytes as `application/gzip`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, or `agent_bundle_missing` (409) when the agent row exists but the artifact store no longer holds its bundle.",
         "operationId": "get_session_agent_contents_v1_sessions__session_id__agent_contents_get",
         "parameters": [
           {
@@ -12581,6 +12581,9 @@
           },
           "404": {
             "description": "Session or agent not found"
+          },
+          "409": {
+            "description": "Agent bundle missing from the artifact store"
           },
           "422": {
             "content": {

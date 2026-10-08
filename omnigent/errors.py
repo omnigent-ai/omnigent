@@ -203,6 +203,11 @@ class ErrorCode:
         exists on the selected host (HTTP 410). Retrying cannot recreate
         deleted workspace state; the user must start a session in a valid
         workspace.
+    :cvar AGENT_BUNDLE_MISSING: The session's agent row survives but the
+        artifact store no longer holds its bundle, typically because the
+        server was replaced with an ephemeral artifact directory while the
+        database persisted (HTTP 409). Recoverable, unlike
+        ``SESSION_AGENT_MISSING``: re-uploading the same bundle restores it.
     :cvar SESSION_AGENT_MISSING: The session's bound agent no longer
         resolves — its stored bundle was deleted or rebound out from under
         an active session (HTTP 410). A session-lifecycle condition, not a
@@ -250,6 +255,7 @@ class ErrorCode:
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
     WORKSPACE_MISSING = "workspace_missing"
+    AGENT_BUNDLE_MISSING = "agent_bundle_missing"
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
     UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
@@ -260,6 +266,15 @@ class ErrorCode:
 # removed (``omnigent agent remove``), so the session can't load it.
 SESSION_AGENT_MISSING_MESSAGE = (
     "This agent no longer exists. Fork this session into another agent to continue."
+)
+
+# Client-facing text for ``AGENT_BUNDLE_MISSING``: the agent row still exists
+# but the artifact store no longer holds its bundle.
+AGENT_BUNDLE_MISSING_MESSAGE = (
+    "This session's agent bundle is missing from the server's artifact store, so the "
+    "session cannot start. Re-upload the same agent bundle to restore it, or fork this "
+    "session into another agent. Session agent bundles need durable artifact storage to "
+    "survive a server instance replacement."
 )
 
 
@@ -291,6 +306,9 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
     ErrorCode.WORKSPACE_MISSING: 410,
+    # 409, not 410: the row still names the bundle and re-uploading it restores
+    # the blob, so the same request succeeds once the caller resolves that.
+    ErrorCode.AGENT_BUNDLE_MISSING: 409,
     # 410 Gone, like WORKSPACE_MISSING: a valid request whose bound agent was
     # deleted; a retry cannot recreate it.
     ErrorCode.SESSION_AGENT_MISSING: 410,
@@ -337,6 +355,9 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # The session's agent was deleted or rebound; the caller must recreate the
     # agent or start a new session. Not a runner/server fault.
     ErrorCode.SESSION_AGENT_MISSING: ErrorCategory.USER,
+    # The deployment lost the stored bundle (an ephemeral artifact directory
+    # behind a durable database); no caller input caused it.
+    ErrorCode.AGENT_BUNDLE_MISSING: ErrorCategory.CONFIG,
     # A dependency tore down the in-flight call; the fix (if any) is upstream.
     ErrorCode.UPSTREAM_CANCELLED: ErrorCategory.UPSTREAM,
     # A dependency refused the call; whether the user lacks access there or
@@ -374,6 +395,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorImpact.BLOCKING,
     ErrorCode.WORKSPACE_MISSING: ErrorImpact.BLOCKING,
     ErrorCode.SESSION_AGENT_MISSING: ErrorImpact.BLOCKING,
+    ErrorCode.AGENT_BUNDLE_MISSING: ErrorImpact.BLOCKING,
     # Self-healing: a session state that resumes on reconnect, a routing
     # artifact the client re-addresses, and an upstream cancellation a retry
     # outlives. No progress is lost.
@@ -420,6 +442,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.AGENT_BUNDLE_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,
     ErrorCode.INTERNAL_ERROR: ErrorPhase.UNKNOWN,
     # Context-driven: a backing call can be cancelled or denied while serving
