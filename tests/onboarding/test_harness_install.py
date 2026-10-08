@@ -26,10 +26,10 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     developer's real claude/codex install can't flip a ``which``-returns-None
     assertion.
 
-    Also stub ``--version`` probes so tests that simply need "binary present"
-    are not tripped up by an unexpected subprocess call once a harness spec
-    declares a version floor. Tests that care about the version can override
-    the stub explicitly.
+    Also stub ``--version`` probes (which run through ``run_isolated``) so tests
+    that simply need "binary present" are not tripped up by an unexpected
+    subprocess call once a harness spec declares a version floor. Tests that
+    care about the version can override the stub explicitly.
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
 
@@ -40,6 +40,7 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
             )
         raise AssertionError(f"unexpected subprocess in harness_install tests: {argv!r}")
 
+    monkeypatch.setattr(hi, "run_isolated", _stub_version_run)
     monkeypatch.setattr(hi.subprocess, "run", _stub_version_run)
 
 
@@ -186,7 +187,7 @@ def test_cli_probe_timeout_defaults_lenient_but_readiness_passes_short(
             args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", _record_run)
+    monkeypatch.setattr(hi, "run_isolated", _record_run)
 
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
     assert recorded[-1] == 30.0
@@ -220,7 +221,7 @@ def test_login_probe_caches_positive_verdicts_with_ttl(
             args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", _positive_run)
+    monkeypatch.setattr(hi, "run_isolated", _positive_run)
 
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
@@ -250,7 +251,7 @@ def test_login_probe_never_caches_negative_verdicts(
             args=argv, returncode=1, stdout='{"loggedIn": false}', stderr=""
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", _negative_run)
+    monkeypatch.setattr(hi, "run_isolated", _negative_run)
 
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
@@ -274,6 +275,7 @@ def test_logout_invalidates_login_probe_cache(
             args=argv, returncode=0 if logged_in else 1, stdout=body, stderr=""
         )
 
+    monkeypatch.setattr(hi, "run_isolated", _stateful_run)
     monkeypatch.setattr(hi.subprocess, "run", _stateful_run)
 
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
@@ -304,7 +306,7 @@ def test_version_probe_caches_by_binary_signature(
             raise OSError("scripted probe failure")
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout="1.2.3", stderr="")
 
-    monkeypatch.setattr(hi.subprocess, "run", _version_run)
+    monkeypatch.setattr(hi, "run_isolated", _version_run)
 
     # A failed probe is not cached — the next call tries again.
     assert hi._harness_cli_version_string(spec, str(binary)) is None
@@ -351,7 +353,7 @@ def test_failed_version_probe_does_not_admit_or_cache_a_broken_cli(
             stderr=diagnostic if output_stream == "stderr" else "",
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", run_probe)
+    monkeypatch.setattr(hi, "run_isolated", run_probe)
 
     assert not hi.harness_cli_installed(OPENAI_FAMILY)
     assert hi.missing_harness_cli("codex-native") == spec
@@ -744,6 +746,7 @@ def test_try_install_harness_cli_success_when_binary_off_path(
             return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
+    monkeypatch.setattr(hi, "run_isolated", _run)
     monkeypatch.setattr(hi.subprocess, "run", _run)
 
     # Install verdict agrees with readiness: both see it installed.
@@ -1136,7 +1139,7 @@ def test_harness_cli_logged_in_uses_claude_json_verdict(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is expected
 
 
@@ -1163,7 +1166,7 @@ def test_harness_cli_logged_in_codex_uses_exit_code(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_logged_in(OPENAI_FAMILY) is expected
 
 
@@ -1194,7 +1197,7 @@ def test_harness_cli_logged_in_uses_cursor_json_verdict(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_logged_in(hi.CURSOR_KEY) is expected
 
 
@@ -1230,7 +1233,7 @@ def test_harness_cli_logged_in_agy_uses_exit_code(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_logged_in(GEMINI_FAMILY) is expected
 
 
@@ -1241,7 +1244,7 @@ def test_harness_cli_logged_in_false_when_binary_missing(monkeypatch: pytest.Mon
     def _explode(*a: object, **k: object) -> None:
         raise AssertionError("status spawned despite missing binary")
 
-    monkeypatch.setattr(hi.subprocess, "run", _explode)
+    monkeypatch.setattr(hi, "run_isolated", _explode)
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
 
 
@@ -1254,7 +1257,7 @@ def test_harness_cli_logged_in_false_for_harness_without_status(
     def _explode(*a: object, **k: object) -> None:
         raise AssertionError("status spawned for a harness with no status_args")
 
-    monkeypatch.setattr(hi.subprocess, "run", _explode)
+    monkeypatch.setattr(hi, "run_isolated", _explode)
     assert hi.harness_cli_logged_in(hi.PI_KEY) is False
 
 
@@ -1390,7 +1393,7 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_installed(hi.OPENCODE_KEY) is expected
 
 
@@ -1421,7 +1424,7 @@ def test_harness_cli_installed_checks_minimum_for_other_versioned_specs(
             return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_installed(key) is False
 
 
@@ -1445,7 +1448,7 @@ def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_installed(OPENAI_FAMILY) is True
 
 
@@ -1469,7 +1472,7 @@ def test_the_kimi_floor_accepts_the_cli_this_spec_installs(
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_installed(hi.KIMI_KEY) is True
 
 
@@ -1499,7 +1502,7 @@ def test_the_kimi_floor_accepts_the_floor_and_the_reported_version(
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_installed(hi.KIMI_KEY) is True
 
 
@@ -1545,7 +1548,7 @@ def test_the_hermes_floor_accepts_the_shipping_version_line(
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_installed(hi.HERMES_KEY) is True
 
 
@@ -1561,7 +1564,7 @@ def test_harness_cli_installed_true_when_version_in_range(
             return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_installed(hi.OPENCODE_KEY) is True
 
 
@@ -1605,7 +1608,7 @@ def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_installed(key) is False
 
     def _run_ok(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
@@ -1615,7 +1618,7 @@ def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run_ok)
+    monkeypatch.setattr(hi, "run_isolated", _run_ok)
     assert hi.harness_cli_installed(key) is True
 
 
@@ -1633,7 +1636,7 @@ def test_harness_cli_installed_false_when_version_unparseable(
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     assert hi.harness_cli_installed(hi.OPENCODE_KEY) is False
 
 
@@ -1647,7 +1650,7 @@ def test_harness_cli_version_satisfies_short_circuits_when_binary_missing(
     def _explode(*a: object, **k: object) -> None:
         raise AssertionError("version probe spawned despite missing binary")
 
-    monkeypatch.setattr(hi.subprocess, "run", _explode)
+    monkeypatch.setattr(hi, "run_isolated", _explode)
     assert hi.harness_cli_version_satisfies(hi.OPENCODE_KEY) is False
 
 
@@ -1664,7 +1667,7 @@ def test_missing_harness_cli_flags_outdated_version(
             return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     spec = hi.missing_harness_cli("opencode-native")
     assert spec is not None
     assert spec.binary == "opencode"

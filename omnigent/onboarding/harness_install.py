@@ -56,6 +56,7 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.inner._proc import run_isolated
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
@@ -779,7 +780,9 @@ def _parse_harness_cli_version(text: str) -> str | None:
 # CLI can't stall the refresh — and, through it, the host tunnel's keepalive.
 # The readiness cap matches goose's status-probe budget (``_INFO_TIMEOUT_S``):
 # enough for a healthy ``auth status`` keychain read / token refresh, short
-# enough that a wedged CLI fails fast.
+# enough that a wedged CLI fails fast. Probes run through ``run_isolated`` so a
+# timeout also stops whatever the CLI spawned (an updater's ``git fetch``)
+# instead of leaking it to the host daemon on every readiness refresh.
 _DEFAULT_CLI_PROBE_TIMEOUT_S = 30.0
 READINESS_CLI_PROBE_TIMEOUT_S = 10.0
 
@@ -981,13 +984,12 @@ def _harness_cli_version_string(
         if cached is not None:
             return cached
     try:
-        completed = subprocess.run(
+        completed = run_isolated(
             [binary, "--version"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
-            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1183,9 +1185,8 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
             return True
     argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     try:
-        result = subprocess.run(
+        result = run_isolated(
             [argv_binary, *spec.status_args],
-            check=False,
             timeout=timeout,
             # Concurrent probes must not change or restore a shared terminal's input mode.
             stdin=subprocess.DEVNULL,

@@ -406,6 +406,36 @@ def test_kill_tree_reaps_descendant_that_left_process_group(tmp_path: Path) -> N
                 psutil.Process(child_pid).kill()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX shell")
+def test_run_isolated_timeout_kills_the_whole_tree(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    # The direct child forks a long-lived grandchild, then hangs past the timeout.
+    script = f"sleep 300 & echo $! > '{child_pid_path}'; exec sleep 300"
+    child_pid: int | None = None
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            _proc.run_isolated(["sh", "-c", script], timeout=0.5, capture_output=True, text=True)
+        child_pid = int(child_pid_path.read_text())
+        deadline = time.monotonic() + 5
+        while _proc.process_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _proc.process_alive(child_pid)
+    finally:
+        if child_pid is not None and _proc.process_alive(child_pid):
+            with contextlib.suppress(psutil.Error):
+                psutil.Process(child_pid).kill()
+
+
+def test_run_isolated_returns_the_completed_process() -> None:
+    completed = _proc.run_isolated(
+        [sys.executable, "-c", "import sys; print('out'); sys.exit(3)"],
+        timeout=30,
+        capture_output=True,
+        text=True,
+    )
+    assert (completed.returncode, completed.stdout.strip()) == (3, "out")
+
+
 # --------------------------------------------------------------------------
 # Harness IPC endpoint abstraction
 # --------------------------------------------------------------------------
