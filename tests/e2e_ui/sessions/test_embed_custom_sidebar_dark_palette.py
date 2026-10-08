@@ -1,53 +1,33 @@
-"""E2E: opaque custom-theme sidebar must keep the dark palette in the embed.
+"""E2E: an opaque custom-theme sidebar must keep the dark palette in the embed island.
 
-Reproduces a reported regression: with a
-custom color theme active in dark mode, disabling **Translucent sidebars**
-renders the conversations sidebar near-white while the main pane stays dark.
-Enabling the toggle switches the sidebar to the expected dark palette;
-disabling it brings the near-white panel back.
+Omnigent Desktop shows whatever page its server serves; pointed at a
+workspace-hosted server that page is the embed island (``web/src/embed.tsx``),
+where the ``--custom-*`` theme variables are set on the outer ``.omnigent-app``
+scope root while the host-driven ``.dark`` class lives on an inner div. With a
+custom color theme in dark mode and **Translucent sidebars** off, the
+conversations sidebar paints near-white while the main pane stays dark; turning
+the toggle on makes it dark, turning it off brings the light panel back.
 
-The failure is specific to the **embed island** (``web/src/embed.tsx``) — the
-build the Omnigent Desktop shell shows when it points at a workspace-hosted
-server, where the SPA mounts inside a host page. The embed's scoped stylesheet
-(``web/vite.embed.config.ts``) rewrites ``:root`` → ``.omnigent-app`` and
-``.dark`` → ``.omnigent-app .dark``, so the ``.dark`` class lives on an INNER
-div while the ``--custom-*`` variables land on the OUTER scope root, which
-never carries ``.dark``. ``rebaseVariant()`` (``web/src/lib/customTheme.ts``)
-keeps ``sidebarBackground`` as the palette's base value — for every base but
-omni the literal ``var(--sidebar)`` — so ``--custom-dark-sidebar-background: var(--sidebar)``
-substitutes on the scope root against the scope root's LIGHT ``--sidebar``
-(matched by ``.omnigent-app:not(.dark)[data-theme=custom]``) and inherits down
-as a light color. The opaque dark rule ``.dark[data-theme=custom]
-.conversations-sidebar { background: var(--custom-dark-sidebar-background) }``
-then paints the sidebar near-white; the translucent rule uses the correctly
-derived ``--custom-dark-sidebar`` literal and stays dark. The standalone SPA
-(everything on ``<html>``) resolves the same var chain against the dark tokens
-and does not exhibit the bug.
-
-The test drives the REAL user journey on the real artifacts: it builds the
-actual embed island (``vite build --config vite.embed.config.ts``), wraps it in
-a minimal host page (host-owned React + react-router, host-driven dark mode —
-what the workspace monolith's bundler does), serves the host page same-origin
-over the live e2e server via Playwright route interception, and then walks the
-reported steps: open Settings → Appearance in dark mode → apply a custom theme
-with a dark sidebar (tune the Dracula preset, deriving a Custom theme based on
-it) → observe the opaque sidebar → toggle Translucent sidebars on → observe →
-toggle it off → observe. It asserts the CORRECT behavior — the opaque sidebar keeps the dark
-palette — so it FAILS while the bug is live and guards the fix afterwards.
-
-No LLM turn is involved.
+The real embed island is built (``vite build --config vite.embed.config.ts``),
+wrapped in a minimal dark host page (host-owned React + react-router, like the
+workspace monolith's bundle), and served same-origin over the live server via
+route interception. The standalone SPA, whose style root and dark root are both
+``<html>``, runs the same journey as a control. No LLM turn is involved.
 """
 
 from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import filelock
 import pytest
-from playwright.sync_api import Locator, Page, Route, expect
+from playwright.sync_api import Locator, Page, Playwright, Route, expect
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WEB_DIR = _REPO_ROOT / "web"
@@ -56,8 +36,7 @@ _HOST_DIR = _DIST_EMBED / "e2e-host"
 _HOST_DIST = _HOST_DIR / "dist"
 _VITE = _WEB_DIR / "node_modules" / ".bin" / "vite"
 
-# The path prefix the host page's own assets are served under (same-origin with
-# the live server, fulfilled from disk by the route handler below).
+# Same-origin prefix for the host page's own assets (fulfilled from disk).
 _HOST_BASE = "/embed-host/"
 
 _HOST_INDEX_HTML = """\
@@ -68,7 +47,6 @@ _HOST_INDEX_HTML = """\
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Host app (embed harness)</title>
     <style>
-      /* Minimal host chrome: a dark host page, like the desktop shell in dark mode. */
       html, body { height: 100%; margin: 0; background: #1f272e; }
       #host-root { height: 100vh; width: 100vw; }
     </style>
@@ -81,8 +59,6 @@ _HOST_INDEX_HTML = """\
 """
 
 _HOST_ENTRY_JS = """\
-// Minimal host: render the embed island (OmnigentApp) the way the workspace
-// monolith does - host-owned React + react-router, host-driven dark mode.
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
@@ -99,15 +75,9 @@ createRoot(document.getElementById("host-root")).render(
 """
 
 _HOST_VITE_CONFIG = """\
-// Host-wrapper build: bundles entry.js (host React + router + the embed
-// island) into a self-contained page, standing in for the monolith's bundler
-// ingest of the embed intermediate. Bare deps resolve from web/node_modules by
-// walking up from this directory; "react-router" (a transitive dep of
-// react-router-dom, not hoisted by pnpm) is aliased to the copy
-// react-router-dom itself resolves, so the island and the host share one
-// router instance exactly like the monolith build. The "react-router/dom"
-// subpath is aliased to its resolved file first: the bare directory alias
-// bypasses the package's export map, where the subpath has no on-disk twin.
+// pnpm does not hoist react-router (a dependency of react-router-dom), so alias
+// it to the copy react-router-dom resolves; the subpath goes first because the
+// bare directory alias bypasses the package export map.
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -133,24 +103,21 @@ export default {
 };
 """
 
+# The dark custom sidebar is near-black (luminance ~0.02); the light palette's
+# sidebar is near-white (~0.88). Anything above this reads as a light panel.
+_DARK_LUMINANCE_MAX = 0.35
+
 
 @pytest.fixture(scope="session")
-def embed_host_dist() -> Path:
-    """Build the embed island + a minimal host page bundle; return the host dist dir.
+def embed_host_dist(request: pytest.FixtureRequest) -> Path:
+    """Build the embed island and the host page bundle; return the host dist dir.
 
-    Two builds, serialized under a cross-process lock (concurrent pytest
-    shards would clobber each other's ``dist-embed``):
-
-    1. the REAL embed island — ``vite build --config vite.embed.config.ts`` —
-       exactly the artifact the workspace monolith ingests (scoped CSS, bare
-       React externals);
-    2. a tiny host wrapper that provides React/react-router and mounts
-       ``OmnigentApp`` in dark mode, bundled into ``dist-embed/e2e-host/dist``.
-
-    The embed build must run first: its ``emptyOutDir`` wipes ``dist-embed/``.
+    ``--ui-skip-build`` reuses an existing host build, mirroring the SPA option.
+    The embed build runs first because its ``emptyOutDir`` wipes ``dist-embed/``.
     """
-    lock_path = _WEB_DIR / ".build-embed.lock"
-    with filelock.FileLock(str(lock_path), timeout=600):
+    if request.config.getoption("--ui-skip-build") and (_HOST_DIST / "index.html").is_file():
+        return _HOST_DIST
+    with filelock.FileLock(str(_WEB_DIR / ".build-embed.lock"), timeout=900):
         subprocess.run(
             [str(_VITE), "build", "--config", "vite.embed.config.ts"],
             cwd=_WEB_DIR,
@@ -162,37 +129,56 @@ def embed_host_dist() -> Path:
         (_HOST_DIR / "entry.js").write_text(_HOST_ENTRY_JS)
         (_HOST_DIR / "vite.config.mjs").write_text(_HOST_VITE_CONFIG)
         subprocess.run(
-            [
-                str(_VITE),
-                "build",
-                "--config",
-                str(_HOST_DIR / "vite.config.mjs"),
-                str(_HOST_DIR),
-            ],
+            [str(_VITE), "build", "--config", str(_HOST_DIR / "vite.config.mjs"), str(_HOST_DIR)],
             cwd=_WEB_DIR,
             check=True,
             stdin=subprocess.DEVNULL,
         )
-    assert (_HOST_DIST / "index.html").is_file(), "host wrapper build produced no index.html"
+    assert (_HOST_DIST / "index.html").is_file(), "host page build produced no index.html"
     return _HOST_DIST
 
 
-def _install_embed_host(page: Page, host_dist: Path) -> None:
-    """Serve the embed-host page same-origin over the live server.
+@contextmanager
+def embed_capable_page(
+    playwright: Playwright,
+    browser_type_launch_args: dict[str, Any],
+    browser_context_args: dict[str, Any],
+) -> Iterator[Page]:
+    """A page whose route-fulfilled host document may open loopback sockets.
 
-    Document navigations get the host page (so ANY app path — e.g.
-    ``/settings/appearance`` — boots the embed island, which then routes on the
-    real pathname, like the monolith mount does); ``/embed-host/*`` asset
-    requests are fulfilled from the host build; everything else (``/v1/*`` API
-    calls, websockets are never intercepted) passes through to the real server.
+    Chromium's Local Network Access check gives a fulfilled document no address
+    space and blocks its loopback WebSocket; the real same-origin host page
+    never hits that, so the check is disabled for this harness only.
+    """
+    launch_args = {**browser_type_launch_args}
+    launch_args["args"] = [
+        *launch_args.get("args", []),
+        "--disable-features=LocalNetworkAccessChecks",
+    ]
+    browser = playwright.chromium.launch(**launch_args)
+    try:
+        context = browser.new_context(**browser_context_args)
+        try:
+            yield context.new_page()
+        finally:
+            context.close()
+    finally:
+        browser.close()
+
+
+def install_embed_host(page: Page, host_dist: Path) -> None:
+    """Serve the embed host page same-origin over the live server.
+
+    Document navigations get the host page, so any app path boots the island,
+    which then routes on the real pathname like the monolith mount does.
+    ``/embed-host/*`` assets come from the host build; everything else passes
+    through to the real server.
     """
 
     def _serve(route: Route) -> None:
         request = route.request
         path = urlparse(request.url).path
         if path.startswith(_HOST_BASE):
-            # Contain the URL-derived suffix: an absolute or ../ suffix must
-            # never let the handler serve files outside the built host page.
             asset = (host_dist / path[len(_HOST_BASE) :].lstrip("/")).resolve()
             if asset.is_relative_to(host_dist.resolve()) and asset.is_file():
                 route.fulfill(path=str(asset))
@@ -206,11 +192,14 @@ def _install_embed_host(page: Page, host_dist: Path) -> None:
     page.route("**/*", _serve)
 
 
-def _parse_css_color(value: str) -> tuple[int, int, int, float]:
-    """Parse ``rgb(...)`` / ``rgba(...)`` computed colors into (r, g, b, alpha)."""
-    match = re.match(
-        r"rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)",
-        value,
+def parse_css_color(value: str) -> tuple[int, int, int, float]:
+    """Parse ``rgb()`` / ``rgba()`` / ``#rrggbb`` colors into (r, g, b, alpha)."""
+    value = value.strip()
+    if hex_match := re.fullmatch(r"#([0-9a-fA-F]{6})", value):
+        digits = hex_match.group(1)
+        return int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16), 1.0
+    match = re.fullmatch(
+        r"rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)", value
     )
     assert match, f"unexpected computed color {value!r}"
     red, green, blue = (round(float(match.group(i))) for i in (1, 2, 3))
@@ -218,100 +207,121 @@ def _parse_css_color(value: str) -> tuple[int, int, int, float]:
     return red, green, blue, alpha
 
 
-def _luminance(value: str) -> float:
-    """WCAG relative luminance of a computed CSS color (alpha ignored)."""
+def luminance(value: str) -> float:
+    """WCAG relative luminance of a CSS color (alpha ignored)."""
 
     def linear(channel: int) -> float:
         scaled = channel / 255
         return scaled / 12.92 if scaled <= 0.04045 else ((scaled + 0.055) / 1.055) ** 2.4
 
-    red, green, blue, _alpha = _parse_css_color(value)
+    red, green, blue, _alpha = parse_css_color(value)
     return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
 
 
-def _sidebar_background(sidebar: Locator) -> str:
-    return sidebar.evaluate("el => getComputedStyle(el).backgroundColor")
+def background_color(element: Locator) -> str:
+    return element.evaluate("el => getComputedStyle(el).backgroundColor")
 
 
-# The dark custom palette's sidebar is near-black (luminance ~0.01); the buggy
-# resolution paints it near-white (~0.94). Anything above this threshold is a
-# light panel a dark-mode user would see as broken.
-_DARK_LUMINANCE_MAX = 0.35
+def apply_dracula_custom_theme(page: Page, style_root: Locator) -> None:
+    """Pick the Dracula preset, then tune it so the selection becomes Custom.
 
-
-def test_embed_opaque_custom_sidebar_keeps_dark_palette(
-    page: Page, live_server: str, embed_host_dist: Path
-) -> None:
-    """Opaque and translucent custom sidebars must both use the dark palette.
-
-    Journey (mirrors the report): dark embed → Settings → Appearance → apply a
-    custom theme with a dark sidebar (tune the Dracula preset into a Custom
-    theme) → opaque sidebar (Translucent sidebars OFF, the custom default) →
-    toggle ON → toggle OFF. The setting must only change opacity/material,
-    never flip the sidebar to the light palette.
+    Every non-omni preset leaves ``sidebarBackground`` at the palette default
+    ``var(--sidebar)``, which is the value the report's failing state resolves.
     """
-    _install_embed_host(page, embed_host_dist)
-
-    page.goto(f"{live_server}/settings/appearance")
-
-    # The embed island booted: outer scope root + inner host-driven dark root.
-    scope_root = page.locator("div.omnigent-app")
-    expect(scope_root).to_be_visible(timeout=30_000)
-    expect(page.locator("div.omnigent-app > div.dark")).to_be_attached()
-
-    # Apply a custom theme with a dark sidebar: pick the Dracula preset, then
-    # nudge the contrast slider — tuning any control derives a Custom theme
-    # based on that palette (``basePalette: "dracula"``), whose
-    # ``sidebarBackground`` is the palette-tokens default ``var(--sidebar)``
-    # (the omni base overrides it with concrete gradients, which sidesteps the
-    # bug — the report's failing rgba values come from a non-omni base).
-    # Translucent sidebars starts OFF: the opaque failing state from the report.
     palette_select = page.get_by_test_id("color-theme-select")
     expect(palette_select).to_be_visible(timeout=30_000)
     palette_select.click()
     page.get_by_test_id("palette-dracula").click()
-    expect(scope_root).to_have_attribute("data-theme", "dracula")
+    expect(style_root).to_have_attribute("data-theme", "dracula")
     contrast = page.get_by_test_id("custom-theme-contrast")
     contrast.focus()
     contrast.press("ArrowRight")
-    expect(scope_root).to_have_attribute("data-theme", "custom")
+    expect(style_root).to_have_attribute("data-theme", "custom")
+    expect(palette_select).to_contain_text("Custom")
 
-    translucent_toggle = page.get_by_test_id("custom-theme-translucent-sidebar")
-    expect(translucent_toggle).to_be_visible()
-    expect(translucent_toggle).to_have_attribute("aria-checked", "false")
 
+def drive_translucency_journey(page: Page, style_root: Locator) -> dict[str, str]:
+    """Report the sidebar's computed background for opaque -> translucent -> opaque."""
+    toggle = page.get_by_test_id("custom-theme-translucent-sidebar")
+    expect(toggle).to_be_visible()
+    expect(toggle).to_have_attribute("aria-checked", "false")
     sidebar = page.locator("aside.conversations-sidebar")
     expect(sidebar).to_be_visible()
 
-    # 1. Opaque (Translucent sidebars OFF — the reported failing state).
-    opaque_background = _sidebar_background(sidebar)
+    backgrounds = {"opaque": background_color(sidebar)}
 
-    # 2. Translucent ON — the report's known-good contrast state.
-    translucent_toggle.click()
-    expect(scope_root).to_have_attribute("data-custom-translucent-sidebar", "")
-    translucent_background = _sidebar_background(sidebar)
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-checked", "true")
+    expect(style_root).to_have_attribute("data-custom-translucent-sidebar", "")
+    backgrounds["translucent"] = background_color(sidebar)
 
-    # 3. Opaque again — the report re-disables the toggle and the light panel returns.
-    translucent_toggle.click()
-    expect(scope_root).not_to_have_attribute("data-custom-translucent-sidebar", "")
-    opaque_background_again = _sidebar_background(sidebar)
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-checked", "false")
+    expect(style_root).not_to_have_attribute("data-custom-translucent-sidebar", "")
+    backgrounds["opaque_again"] = background_color(sidebar)
+    return backgrounds
 
-    # The translucent path resolves the derived dark sidebar token — dark today
-    # and after any fix. It anchors what "the same dark palette" means.
-    assert _luminance(translucent_background) < _DARK_LUMINANCE_MAX, (
-        f"translucent custom sidebar is not dark in dark mode: "
-        f"{translucent_background} (luminance {_luminance(translucent_background):.3f})"
+
+def assert_sidebar_stays_dark(backgrounds: dict[str, str], pane_background: str) -> None:
+    """Both opaque states must share the dark palette the pane and translucent state use."""
+    assert luminance(pane_background) < _DARK_LUMINANCE_MAX, (
+        f"main pane is not dark in dark mode: {pane_background}"
     )
+    translucent = backgrounds["translucent"]
+    assert luminance(translucent) < _DARK_LUMINANCE_MAX, (
+        f"translucent custom sidebar is not dark in dark mode: {translucent} "
+        f"(luminance {luminance(translucent):.3f})"
+    )
+    for state in ("opaque", "opaque_again"):
+        value = backgrounds[state]
+        assert luminance(value) < _DARK_LUMINANCE_MAX, (
+            f"with Translucent sidebars off ({state}) the custom sidebar uses the light "
+            f"palette in dark mode: {value} (luminance {luminance(value):.3f}) while the "
+            f"translucent state is dark ({translucent}) and the pane is {pane_background}"
+        )
 
-    # THE BUG: with Translucent sidebars OFF the sidebar must stay on the
-    # dark palette, not flip to a near-white panel.
-    assert _luminance(opaque_background) < _DARK_LUMINANCE_MAX, (
-        f"opaque custom sidebar uses the light palette in dark mode: "
-        f"background {opaque_background} (luminance {_luminance(opaque_background):.3f}) "
-        f"while the translucent state is dark ({translucent_background})"
+
+def test_embed_opaque_custom_sidebar_keeps_dark_palette(
+    playwright: Playwright,
+    browser_type_launch_args: dict[str, Any],
+    browser_context_args: dict[str, Any],
+    live_server: str,
+    embed_host_dist: Path,
+) -> None:
+    """Embedded, dark host: opaque and translucent custom sidebars both stay dark."""
+    with embed_capable_page(playwright, browser_type_launch_args, browser_context_args) as page:
+        install_embed_host(page, embed_host_dist)
+        page.goto(f"{live_server}/settings/appearance")
+
+        scope_root = page.locator("div.omnigent-app")
+        expect(scope_root).to_be_visible(timeout=30_000)
+        dark_root = page.locator("div.omnigent-app > div.dark")
+        expect(dark_root).to_be_attached()
+
+        apply_dracula_custom_theme(page, scope_root)
+        backgrounds = drive_translucency_journey(page, scope_root)
+        pane_background = dark_root.evaluate(
+            "el => getComputedStyle(el).getPropertyValue('--background').trim()"
+        )
+    assert_sidebar_stays_dark(backgrounds, pane_background)
+
+
+def test_standalone_opaque_custom_sidebar_keeps_dark_palette(page: Page, live_server: str) -> None:
+    """Standalone SPA control: the same journey keeps the sidebar dark throughout."""
+    page.emulate_media(color_scheme="light")
+    page.goto(f"{live_server}/settings/appearance")
+
+    mode = page.get_by_role("radiogroup", name="Mode", exact=True)
+    expect(mode).to_be_visible(timeout=30_000)
+    dark = mode.get_by_role("radio", name="Dark")
+    dark.click()
+    expect(dark).to_have_attribute("aria-checked", "true")
+    html_root = page.locator("html")
+    expect(html_root).to_have_class(re.compile(r"\bdark\b"))
+
+    apply_dracula_custom_theme(page, html_root)
+    backgrounds = drive_translucency_journey(page, html_root)
+    pane_background = html_root.evaluate(
+        "el => getComputedStyle(el).getPropertyValue('--background').trim()"
     )
-    assert _luminance(opaque_background_again) < _DARK_LUMINANCE_MAX, (
-        f"re-disabling Translucent sidebars flips the sidebar back to the light "
-        f"palette: {opaque_background_again} "
-        f"(luminance {_luminance(opaque_background_again):.3f})"
-    )
+    assert_sidebar_stays_dark(backgrounds, pane_background)
