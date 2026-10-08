@@ -34,7 +34,9 @@ def test_finishing_a_clip_requires_frame_inspection_or_a_disclosed_dom_only_capt
 
     assert "Check the clip's last frame before captioning it" in lanes
     assert "Look at the frame, not at a proxy for it" in lanes
-    assert "-sseof -0.5 -i <clip> -frames:v 1 -update 1 last-frame.png" in lanes
+    assert "ffmpeg -i <clip> -update 1 last-frame.png" in lanes
+    assert "keeps the last decoded frame" in lanes
+    assert "-frames:v 1 -update 1 last-frame.png" not in lanes
     assert "Pixel-colour counts, file sizes, or the test's own intent" in lanes
     assert "If the frames cannot be inspected" in lanes
     assert "caption only the state the driver's DOM assertions established" in lanes
@@ -48,7 +50,10 @@ def test_before_clip_of_an_absence_must_rule_out_a_different_failure() -> None:
     assert "must rule out a different failure" in lanes
     assert "will also pass on a session that failed for an unrelated reason" in lanes
     assert "assert that no generic error notice is on screen" in lanes
-    assert "page.locator('[data-testid=\"error-pill\"]')).to_have_count(0)" in lanes
+    assert (
+        'page.locator(\'[data-testid="error-pill"][data-level="error"]\')).to_have_count(0)'
+        in lanes
+    )
     assert "the stall context the caption describes is visible" in lanes
     assert "demonstrates that error, not a silent stall" in lanes
 

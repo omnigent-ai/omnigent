@@ -325,11 +325,13 @@ session, a result list emptied by fixture cleanup — means the recording outliv
 the test body. Fix the stop point and re-record; do not caption around it.
 
 Look at the frame, not at a proxy for it. Extract the final frame with
-`ffmpeg -sseof -0.5 -i <clip> -frames:v 1 -update 1 last-frame.png` (works on
-Playwright's duration-less `.webm` as well as the converted `.mp4`) and open the
-image; when the caption names several states, sample a frame for each.
-Pixel-colour counts, file sizes, or the test's own intent do not tell you what
-is on screen.
+`ffmpeg -i <clip> -update 1 last-frame.png` and open the image; when the
+caption names several states, sample a frame for each. That command decodes the
+whole clip and keeps the last decoded frame, so it does not depend on the
+container knowing its duration (Playwright's `.webm` does not). A seek-and-grab
+such as `-sseof -0.5 … -frames:v 1` returns an earlier frame instead — the
+first one on a duration-less `.webm`. Pixel-colour counts, file sizes, or the
+test's own intent do not tell you what is on screen.
 
 **If the frames cannot be inspected** — no image viewer, `ffmpeg` filter
 errors, a missing image library — caption only the state the driver's DOM
@@ -345,12 +347,13 @@ will also pass on a session that failed for an unrelated reason, and the clip
 then shows that failure instead: a red "Something went wrong" pill in an
 otherwise empty transcript, an error badge on the session row. Alongside the
 missing-element assertion, assert that no generic error notice is on screen
-(`expect(page.locator('[data-testid="error-pill"]')).to_have_count(0)` in the
-web lane) and that the stall context the caption describes is visible — the
-user message, the pending tool call, or the running-turn indicator. If an error
-notice does appear, find what raised it (the seeded session's own turn or the
-injected event) and fix the setup before filming; a clip of an error notice
-demonstrates that error, not a silent stall.
+(`expect(page.locator('[data-testid="error-pill"][data-level="error"]')).to_have_count(0)`
+in the web lane; the same pill with `data-level="info"` is an informational
+notice, not a failure) and that the stall context the caption describes is
+visible — the user message, the pending tool call, or the running-turn
+indicator. If an error notice does appear, find what raised it (the seeded
+session's own turn or the injected event) and fix the setup before filming; a
+clip of an error notice demonstrates that error, not a silent stall.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in
