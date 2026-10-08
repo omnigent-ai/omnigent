@@ -120,15 +120,16 @@ def test_header_export_downloads_transcript(
     assert positions == sorted(positions), f"export lost turn order: {positions}"
 
     # The download is the portable format, not a raw API dump: a schema
-    # header, then one entry per committed item with turns numbered.
+    # header, then one entry per committed item with turns numbered. The
+    # live runner may also have written lifecycle items (resource events
+    # become ``note`` entries), so only the seeded messages are pinned.
     transcript = read_transcript(exported.splitlines(keepends=True))
     assert transcript.header.schema_ == TRANSCRIPT_SCHEMA
     assert transcript.header.session == session_id
-    assert [(e.turn, e.role, e.kind) for e in transcript.entries] == [
-        (1, "user", "message"),
-        (1, "assistant", "message"),
-        (2, "user", "message"),
-        (2, "assistant", "message"),
-    ]
-    assert transcript.entries[1].text == _REPLY_ONE
-    assert transcript.entries[1].agent == "hello_world"
+    messages = [e for e in transcript.entries if e.kind == "message"]
+    assert [e.role for e in messages] == ["user", "assistant", "user", "assistant"]
+    turns = [e.turn for e in messages]
+    assert turns[0] == turns[1] < turns[2] == turns[3], turns
+    assert messages[1].text == _REPLY_ONE
+    assert messages[1].agent == "hello_world"
+    assert all(e.kind == "note" for e in transcript.entries if e.kind != "message")
